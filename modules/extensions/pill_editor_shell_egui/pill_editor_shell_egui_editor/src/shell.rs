@@ -53,18 +53,20 @@ pub use tab_systems::systems_tab;
 /// The [`toasts`] module: the host's notices drawn as a short-lived stack.
 pub mod toasts;
 
+pub use toasts::{draw_toasts, push_notices};
+
 /// The [`bar`] module: the menu bar's rows and the actions they run.
 pub mod bar;
 
 pub use bar::about_window;
 pub use bar::menu_bar;
+pub use bar::menu_body;
+pub use bar::run_menu_action;
+pub use bar::MENU_TITLE_GAP;
 
 /// The [`palette`] module: the searchable command popup.
 pub mod palette;
 
-pub use bar::menu_body;
-pub use bar::run_menu_action;
-pub use bar::MENU_TITLE_GAP;
 pub use palette::palette_window;
 
 /// The [`tab_console`] module: the Console tab's filters and rows.
@@ -270,7 +272,6 @@ pub use assets_tiles::ASSETS_TILE_ICON_INSET;
 pub use assets_tiles::ASSETS_TILE_LABEL_GAP;
 pub use assets_tiles::ASSETS_TILE_LABEL_HEIGHT;
 pub use assets_tiles::ASSETS_TILE_LABEL_ROWS;
-pub use toasts::{draw_toasts, push_notices};
 
 /// The [`tests`] module: the shell's unit tests; the parent compiles it into
 /// the test build only.

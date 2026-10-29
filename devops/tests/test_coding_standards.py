@@ -214,6 +214,14 @@ SHELL_PRELUDE_USE = "use pill_editor_shell_egui_editor::shell::prelude::*;"
 SHELL_SIBLING_USE = "use pill_editor_shell_egui_editor::shell::*;"
 SHELL_EXEMPT_FILES = ("prelude.rs", "tests.rs")
 
+# The editor shell's crate root, whose `pub use` wall answers "what does this
+# module publish" for every patch-related edit. One block per module, in the
+# order the modules are declared: a reader deciding whether a name is
+# re-exported must not have to scan two regions and compare them.
+SHELL_ROOT_SOURCE = "/pill_editor_shell_egui_editor/src/shell.rs"
+PUB_MODULE_DECLARATION_PATTERN = re.compile(r"^pub mod ([A-Za-z0-9_]+);$")
+PUB_MODULE_REEXPORT_PATTERN = re.compile(r"^pub use ([A-Za-z0-9_]+)::")
+
 # The APIs that keep boxed `Any`/`Fn` values inside egui's `Context` (plan
 # decision E4, W-0017). A reloadable crate that stores its own types or
 # callbacks through them leaves dangling type IDs, drop code and vtables
@@ -781,6 +789,48 @@ def check_shell_patch_openings(
     )
 
 
+# Flags a re-export that sits outside its own module's block; see
+# `SHELL_ROOT_SOURCE`.
+def check_shell_reexport_blocks(
+    lines: List[str], display_path: str, collector: ViolationCollector
+) -> None:
+    """Requires one contiguous `pub use` block per module in the shell's root.
+
+    The wall is scanned, not read top to bottom, so an export that lives in
+    another module's block is found the hard way: by grepping its module name
+    and getting hits in two regions. A declaration opens a block and the block
+    runs until the next item; blank lines, comments and attributes stay inside
+    it, which is what lets the usual blank line between a `pub mod` and its
+    exports pass.
+    """
+    if not display_path.endswith(SHELL_ROOT_SOURCE):
+        return
+    open_module = None
+    for line in lines:
+        stripped = line.strip()
+        declaration = PUB_MODULE_DECLARATION_PATTERN.match(stripped)
+        if declaration:
+            open_module = declaration.group(1)
+            continue
+        reexport = PUB_MODULE_REEXPORT_PATTERN.match(stripped)
+        if reexport:
+            module = reexport.group(1)
+            if module != open_module:
+                inside = (
+                    f"inside the `{open_module}` block" if open_module else "before its `pub mod`"
+                )
+                collector.record(
+                    display_path,
+                    "shell re-export block",
+                    f"`pub use {module}::...` sits {inside}; every module's "
+                    "exports belong in the block that follows its own `pub mod`",
+                )
+            continue
+        if not stripped or stripped.startswith("//") or stripped.startswith("#["):
+            continue
+        open_module = None
+
+
 # =============================================================================
 # Check 6/6 - no egui context storage in reloadable crates
 # =============================================================================
@@ -1301,6 +1351,75 @@ def self_test() -> int:
         outcome = "PASS" if collector.violation_count == expected else "FAIL"
         passed &= outcome == "PASS"
         print(f"  {outcome}  {description}")
+
+    # Rule 11: the shell root's re-export wall keeps one block per module.
+    shell_root = (
+        "modules/extensions/pill_editor_shell_egui/pill_editor_shell_egui_editor/src/shell.rs"
+    )
+    reexport_cases = (
+        (
+            "one block per module passes",
+            shell_root,
+            "pub mod bar;\n"
+            "\n"
+            "pub use bar::menu_bar;\n"
+            "pub use bar::menu_body;\n"
+            "\n"
+            "pub mod palette;\n"
+            "\n"
+            "pub use palette::palette_window;\n",
+            0,
+        ),
+        (
+            "an export left in the previous module's block fails",
+            shell_root,
+            "pub mod bar;\n"
+            "\n"
+            "pub use bar::menu_bar;\n"
+            "\n"
+            "pub mod palette;\n"
+            "\n"
+            "pub use bar::menu_body;\n"
+            "pub use palette::palette_window;\n",
+            1,
+        ),
+        (
+            "an export before any declaration fails",
+            shell_root,
+            "pub use toasts::draw_toasts;\n"
+            "\n"
+            "pub mod toasts;\n",
+            1,
+        ),
+        (
+            "an attribute and a doc comment stay inside the block",
+            shell_root,
+            "pub mod toasts;\n"
+            "\n"
+            "pub use toasts::draw_toasts;\n"
+            "\n"
+            "/// The tests module.\n"
+            "#[cfg(test)]\n"
+            "pub mod tests;\n",
+            0,
+        ),
+        (
+            "the same wall in another crate's root is outside the guard",
+            "modules/editor/pill_editor_core/src/editor_state.rs",
+            "pub mod bar;\n"
+            "\n"
+            "pub mod palette;\n"
+            "\n"
+            "pub use bar::menu_body;\n",
+            0,
+        ),
+    )
+    for description, display_path, source, expected in reexport_cases:
+        collector = SilentCollector()
+        check_shell_reexport_blocks(source.splitlines(), display_path, collector)
+        outcome = "PASS" if collector.violation_count == expected else "FAIL"
+        passed &= outcome == "PASS"
+        print(f"  {outcome}  {description}")
     return 0 if passed else 1
 
 
@@ -1451,51 +1570,55 @@ def main() -> int:
     # shell version re-read each file per check.
     sources = [(path, display_path_for(path), *read_lines(path)) for path in files]
 
-    section("(1/10) Module header")
+    section("(1/11) Module header")
     for _, display_path, lines, text in sources:
         check_module_header(lines, text, display_path, collector)
 
-    section("(2/10) Safety comments")
+    section("(2/11) Safety comments")
     for _, display_path, lines, _text in sources:
         check_safety_comments(lines, display_path, collector)
 
-    section("(3/10) Public item docs")
+    section("(3/11) Public item docs")
     for _, display_path, lines, _text in sources:
         check_public_item_docs(lines, display_path, collector)
 
-    section("(4/10) Import groups")
+    section("(4/11) Import groups")
     for _, display_path, lines, _text in sources:
         check_import_group_order(lines, display_path, collector)
         check_import_group_contents(lines, display_path, collector)
 
-    section("(5/10) Tests at the bottom")
+    section("(5/11) Tests at the bottom")
     for _, display_path, lines, text in sources:
         check_tests_at_bottom(lines, text, display_path, collector)
 
-    section("(6/10) egui state (reloadable crates)")
+    section("(6/11) egui state (reloadable crates)")
     for _, display_path, lines, _text in sources:
         check_egui_context_storage(lines, display_path, collector)
 
-    section("(7/10) colour literals (editor UI)")
+    section("(7/11) colour literals (editor UI)")
     for _, display_path, lines, _text in sources:
         check_colour_literals(lines, display_path, collector)
 
-    section("(8/10) comment content (modules/)")
+    section("(8/11) comment content (modules/)")
     for _, display_path, lines, _text in sources:
         check_comment_content(lines, display_path, collector)
+
+    section("(9/11) shell patch openings (editor shell)")
+    for _, display_path, lines, _text in sources:
+        check_shell_patch_openings(lines, display_path, collector)
 
     shaders: List[Path] = []
     excluded = [Path(entry) for entry in arguments.exclude]
     for target in targets:
         shaders.extend(find_shader_files(target, excluded))
-    section("(10/10) shell patch openings (editor shell)")
-    for _, display_path, lines, _text in sources:
-        check_shell_patch_openings(lines, display_path, collector)
-
-    section(f"(9/10) shader comment content ({len(shaders)} shader source(s))")
+    section(f"(10/11) shader comment content ({len(shaders)} shader source(s))")
     for path in shaders:
         _lines, text = read_lines(path)
         check_shader_comment_content(text, display_path_for(path), collector)
+
+    section("(11/11) shell re-export blocks (editor shell)")
+    for _, display_path, lines, _text in sources:
+        check_shell_reexport_blocks(lines, display_path, collector)
 
     if arguments.report:
         write_report(Path(arguments.report), files, collector)

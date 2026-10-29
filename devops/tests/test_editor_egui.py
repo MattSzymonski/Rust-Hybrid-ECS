@@ -5085,8 +5085,11 @@ def main() -> int:
         # EditorTabViewer<'_>` until it moved to the free `tab_body`, and the
         # scanner refuses an impl header carrying a lifetime, so a patch could
         # never address it there. The probe sits in the Scene arm, the first
-        # one, where a statement is legal.
-        dispatch_anchor = newline.join(
+        # one, where a statement is legal. This anchor is in the shell's own
+        # file, so it carries that file's endings rather than the tab body's:
+        # the two are written by different tools and need not agree.
+        shell_newline = "\r\n" if "\r\n" in original_source else "\n"
+        dispatch_anchor = shell_newline.join(
             (
                 "        EditorTab::Scene(view) => {",
                 "            let view = view as usize;",
@@ -5095,7 +5098,7 @@ def main() -> int:
         assert dispatch_anchor in patched_frame, "the tab dispatch moved; update the step"
         patched_dispatch = patched_frame.replace(
             dispatch_anchor,
-            newline.join(
+            shell_newline.join(
                 (
                     "        EditorTab::Scene(view) => {",
                     "            // A patch probe: one statement, inside the dispatch only.",
