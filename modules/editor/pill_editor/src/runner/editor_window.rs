@@ -335,8 +335,19 @@ pub(super) struct ScriptedDrag {
     pub(super) from: (f32, f32),
     /// The position the single move goes to.
     pub(super) to: (f32, f32),
-    /// 0 = press pending, 1 = move pending, 2 = release pending.
-    pub(super) stage: u8,
+    /// How far along the drag is.
+    pub(super) stage: ScriptedDragStage,
+}
+
+/// The stage a [`ScriptedDrag`] is waiting to inject, one per frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScriptedDragStage {
+    /// The pointer has not gone down yet.
+    PressPending,
+    /// The button is down and the pointer has not moved yet.
+    MovePending,
+    /// The move landed and the button is still down.
+    ReleasePending,
 }
 
 impl EditorWindow {

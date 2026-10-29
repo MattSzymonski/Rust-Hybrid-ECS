@@ -19,9 +19,12 @@
 //! Arguments are whitespace-separated words, except a trailing free-text
 //! value (`edit set`, a path, a name), which takes the rest of the line so it
 //! keeps its spaces; surrounding double quotes are removed and a backslash
-//! escapes the character after it. `key <chord>` takes `ctrl`, `shift`, `alt`
-//! or `super` joined with `+`, then a letter, a digit, `f1`..`f24` or a named
-//! editing key from [`key_code_name`].
+//! escapes the character after it. A path that is *not* the last argument
+//! (`edit asset move <from> <to>`, `edit asset create <type> <folder> <name>`)
+//! keeps its spaces by being quoted, which is what the cursor's `path` reader
+//! reads; a bare path in one of those positions stops at the first space. `key
+//! <chord>` takes `ctrl`, `shift`, `alt` or `super` joined with `+`, then a
+//! letter, a digit, `f1`..`f24` or a named editing key from [`key_code_name`].
 
 // External crates
 use pill_engine::KeyCode;
@@ -152,6 +155,9 @@ pub enum ScriptedCommand {
     SelectAdd(String),
     /// `select range <handle>` - extend the selection over the Entities list's
     /// range from the primary, as a Shift-click does.
+    ///
+    /// Reserved: the native runner answers it, the browser editor refuses it
+    /// by name, and no suite drives it - the grammar table is its only pin.
     SelectRange(String),
     /// `select resource <name>` - move the shared selection onto an editable
     /// world resource.
@@ -193,6 +199,8 @@ pub enum ScriptedCommand {
     EditAsset(AssetEdit),
     /// `pick entity <entity> <component> <field>` - arm an entity reference
     /// row, so the next scene press names its reference.
+    ///
+    /// Reserved: no suite drives it, so the grammar table is its only pin.
     PickEntity {
         /// The entity the field belongs to.
         entity: String,
@@ -810,10 +818,11 @@ fn scene_action(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> 
     let command = match cursor.word() {
         Some("new") => ScriptedCommand::SceneNew,
         Some("open") => {
-            let path = cursor
-                .word()
-                .ok_or_else(|| ParseError::new("scene open needs a .scene path"))?;
-            ScriptedCommand::SceneOpen(path.to_string())
+            // The rest of the line, so a path with spaces in it parses - the
+            // header promises as much, and `save` next door already reads it
+            // that way.
+            let path = cursor.text("scene open needs a .scene path")?;
+            ScriptedCommand::SceneOpen(path)
         }
         // Save with no path writes the open scene; one argument is a save-as.
         Some("save") => {
@@ -1130,11 +1139,11 @@ fn asset_edit(cursor: &mut Cursor<'_>) -> Result<AssetEdit, ParseError> {
     match action.as_str() {
         "create" => {
             let type_name = cursor.word().ok_or_else(|| ParseError::new(reason))?;
-            let folder = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+            let folder = cursor.path("edit asset create needs a folder")?;
             let name = cursor.text("edit asset create needs a name")?;
             Ok(AssetEdit::Create {
                 type_name: type_name.to_string(),
-                folder: folder.to_string(),
+                folder,
                 name,
             })
         }
@@ -1143,12 +1152,9 @@ fn asset_edit(cursor: &mut Cursor<'_>) -> Result<AssetEdit, ParseError> {
             Ok(AssetEdit::Delete { path })
         }
         "move" => {
-            let from = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+            let from = cursor.path("edit asset move needs a source")?;
             let to = cursor.text("edit asset move needs a destination")?;
-            Ok(AssetEdit::Move {
-                from: from.to_string(),
-                to,
-            })
+            Ok(AssetEdit::Move { from, to })
         }
         "meta" => {
             let path = cursor.text("edit asset meta needs a path")?;
@@ -1481,6 +1487,40 @@ impl<'a> Cursor<'a> {
         Ok(unquote(rest))
     }
 
+    /// One path argument: a quoted path, which may hold spaces, or one word.
+    ///
+    /// A path is not always the last argument, so it cannot take the rest of
+    /// the line the way [`Cursor::text`] does. The quoted form is how one in
+    /// the middle keeps a space; the bare form stops at the first one.
+    fn path(&mut self, reason: &str) -> Result<String, ParseError> {
+        let rest = self.rest.trim();
+        if let Some(body) = rest.strip_prefix('"') {
+            let mut escaped = false;
+            for (index, character) in body.char_indices() {
+                match character {
+                    '\\' if !escaped => escaped = true,
+                    '"' if !escaped => {
+                        let length = index + 2;
+                        self.take(length);
+                        return Ok(unquote(&rest[..length]));
+                    }
+                    _ => escaped = false,
+                }
+            }
+            return Err(ParseError::new("path opens a quote it never closes"));
+        }
+        self.word()
+            .map(str::to_string)
+            .ok_or_else(|| ParseError::new(reason))
+    }
+
+    /// Consumes the first `length` bytes of what is left, after its leading
+    /// whitespace.
+    fn take(&mut self, length: usize) {
+        let rest = self.rest.trim_start();
+        self.rest = &rest[length.min(rest.len())..];
+    }
+
     /// What is left of the line, trimmed, without consuming it.
     fn rest(&self) -> &'a str {
         self.rest.trim()
@@ -1774,6 +1814,18 @@ mod tests {
                 command: ScriptedCommand::Dump(Dump::Assets),
             },
             Accept {
+                line: "dump entities",
+                command: ScriptedCommand::Dump(Dump::Entities),
+            },
+            Accept {
+                line: "dump selection",
+                command: ScriptedCommand::Dump(Dump::Selection),
+            },
+            Accept {
+                line: "dump resources",
+                command: ScriptedCommand::Dump(Dump::Resources),
+            },
+            Accept {
                 line: "dump browser",
                 command: ScriptedCommand::Dump(Dump::Browser),
             },
@@ -1910,8 +1962,42 @@ mod tests {
                 command: ScriptedCommand::HoverUi { x: 640.0, y: 312.0 },
             },
             Accept {
+                // Reserved for the shell's reference rows: armed here, named by
+                // the next scene press. No suite drives it, so the table is the
+                // only thing that pins the arm.
+                line: "pick entity 3v1 ShowcaseComponent note",
+                command: ScriptedCommand::PickEntity {
+                    entity: "3v1".to_string(),
+                    component: "ShowcaseComponent".to_string(),
+                    field: "note".to_string(),
+                },
+            },
+            Accept {
+                line: "drop local/temp/a b.png",
+                command: ScriptedCommand::Drop("local/temp/a b.png".to_string()),
+            },
+            Accept {
+                line: "hover file local/temp/a b.png",
+                command: ScriptedCommand::HoverFile("local/temp/a b.png".to_string()),
+            },
+            Accept {
                 line: "select asset textures/wall.png",
                 command: ScriptedCommand::SelectAsset("textures/wall.png".to_string()),
+            },
+            Accept {
+                line: "select add 3v2",
+                command: ScriptedCommand::SelectAdd("3v2".to_string()),
+            },
+            Accept {
+                // Reserved for the shell's Entities list: the native runner
+                // answers it, the browser editor refuses it by name, and no
+                // suite drives it - the table is the only thing that pins it.
+                line: "select range 3v4",
+                command: ScriptedCommand::SelectRange("3v4".to_string()),
+            },
+            Accept {
+                line: "select resource lighting",
+                command: ScriptedCommand::SelectResource("lighting".to_string()),
             },
             Accept {
                 line: "select entity 3v1",
@@ -1967,6 +2053,27 @@ mod tests {
                 }),
             },
             Accept {
+                // A path in a non-trailing position keeps its spaces by being
+                // quoted; the destination is the trailing free text.
+                line: "edit asset move \"res/my file.mat\" res/other.mat",
+                command: ScriptedCommand::EditAsset(AssetEdit::Move {
+                    from: "res/my file.mat".to_string(),
+                    to: "res/other.mat".to_string(),
+                }),
+            },
+            Accept {
+                line: "edit asset create Texture \"res/my folder\" my name",
+                command: ScriptedCommand::EditAsset(AssetEdit::Create {
+                    type_name: "Texture".to_string(),
+                    folder: "res/my folder".to_string(),
+                    name: "my name".to_string(),
+                }),
+            },
+            Accept {
+                line: "scene open \"res/my scene.scene\"",
+                command: ScriptedCommand::SceneOpen("res/my scene.scene".to_string()),
+            },
+            Accept {
                 line: "edit asset meta textures/s16_stage.png",
                 command: ScriptedCommand::EditAsset(AssetEdit::Meta {
                     path: "textures/s16_stage.png".to_string(),
@@ -1988,6 +2095,22 @@ mod tests {
                     component: "ShowcaseComponent".to_string(),
                     field: "note".to_string(),
                     value: "hello world".to_string(),
+                },
+            },
+            Accept {
+                line: "edit selection ShowcaseComponent note two words",
+                command: ScriptedCommand::EditSelection {
+                    component: "ShowcaseComponent".to_string(),
+                    field: "note".to_string(),
+                    value: "two words".to_string(),
+                },
+            },
+            Accept {
+                line: "edit resource lighting intensity 1.5",
+                command: ScriptedCommand::EditResource {
+                    resource: "lighting".to_string(),
+                    field: "intensity".to_string(),
+                    value: "1.5".to_string(),
                 },
             },
             Accept {
@@ -2197,6 +2320,14 @@ mod tests {
             Refuse {
                 line: "camera spin 1",
                 reason: "camera needs orbit, pan, dolly or zoom",
+            },
+            Refuse {
+                line: "scene open",
+                reason: "scene open needs a .scene path",
+            },
+            Refuse {
+                line: "edit asset move \"res/my file.mat",
+                reason: "path opens a quote it never closes",
             },
         ];
         for case in refused {
