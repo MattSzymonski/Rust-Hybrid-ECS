@@ -253,6 +253,10 @@ ASSET_ROW_TOKEN = "[test] asset"
 BROWSER_FOLDER_TOKEN = "[editor] browser folder"
 BROWSER_DUMP_TOKEN = "[test] browser"
 BROWSER_ITEM_TOKEN = "[test] browser item"
+# A module's resources are listed and inspected, never written: the section
+# says so once per selected asset, and a delete is refused instead of queued.
+ASSET_READ_ONLY_ROW_TOKEN = "[editor] inspector row kind=asset-read-only"
+ASSET_DELETE_REFUSED_TOKEN = "[editor] delete refused: a module's resources are read-only"
 STANDALONE_TYPE_TOKEN = "[test] standalone type"
 SYSTEMS_DUMP_TOKEN = "[test] systems"
 SYSTEM_ROW_TOKEN = "[test] system"
@@ -3077,6 +3081,106 @@ def main() -> int:
             re.escape(BROWSER_FOLDER_TOKEN) + r'\s+path=""',
             30,
             "the browser returned to the asset root",
+            begin,
+        )
+
+        # A module's resources are listed beside the project's and can never be
+        # written. The listing marks the root and the rule; the tree opens that
+        # root; the Inspector says its section is read-only; and a delete is
+        # refused with a warning instead of being queued, so no history step
+        # appears to undo.
+        module_rows = [
+            match.groups()
+            for match in re.finditer(
+                r'path="?(extensions/[^\s"]+)"?\s+kind="?([^\s"]+)"?\s+standalone=\S+'
+                r'\s+has_meta=\S+\s+root="?([^\s"]+)"?\s+read_only=(true|false)',
+                dump,
+            )
+        ]
+        module_files = [
+            row for row in module_rows if row[1] != "folder" and row[3] == "true" and row[2]
+        ]
+        assert module_files, "no module resource is listed read-only: " + dump[-800:]
+        module_key, _, module_root, _ = module_files[0]
+        module_folder = module_key.rsplit("/", 1)[0]
+        # The browser's grid names a row by its path inside its root, so the
+        # root's own prefix comes off before it is matched.
+        module_relative = module_key.split(f"extensions/{module_root}/", 1)[-1]
+        print(f"  [OK] {module_root} lists {module_key} read-only")
+
+        begin = len(session.read_log())
+        session.send(f"browser {module_folder}")
+        session.wait(
+            re.escape(BROWSER_FOLDER_TOKEN)
+            + r'\s+path="'
+            + re.escape(module_folder)
+            + r'"',
+            30,
+            "the module's folder opened",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("dump browser")
+        session.wait(re.escape(BROWSER_DUMP_TOKEN), 30, "the module folder dumped", begin)
+        module_grid = session.read_log()[begin:]
+        assert re.search(
+            re.escape(BROWSER_ITEM_TOKEN) + r'\s+path="?' + re.escape(module_relative), module_grid
+        ), "the grid misses the module's own file: " + module_grid[-800:]
+
+        # Select the module's file: the Inspector draws its section read-only,
+        # which is the one line the tab prints for it.
+        begin = len(session.read_log())
+        session.send(f"select asset {module_key}")
+        session.wait(
+            re.escape(ASSET_SELECTED_TOKEN) + r'\s+path="' + re.escape(module_key) + r'"',
+            30,
+            "the module's file selected",
+            begin,
+        )
+        # The Inspector draws the section, so it has to be the open tab for
+        # the row line to appear at all.
+        session.send("tab inspector")
+        session.wait(
+            re.escape(ASSET_READ_ONLY_ROW_TOKEN) + r'\s+asset="?' + re.escape(module_key) + r'"?',
+            30,
+            "the Inspector drew the module asset read-only",
+            begin,
+        )
+
+        # The delete is refused where the toolbar's enablement already says it
+        # would be: no queued delete, no history step, and the file is still
+        # listed afterwards.
+        begin = len(session.read_log())
+        session.send("toolbar delete")
+        session.wait(
+            re.escape(ASSET_DELETE_REFUSED_TOKEN) + r'\s+path="' + re.escape(module_key) + r'"',
+            30,
+            "the module asset's delete refused",
+            begin,
+        )
+        refused_window = session.read_log()[begin:]
+        assert ASSET_DELETE_QUEUED_TOKEN not in refused_window, (
+            "a module asset's delete was queued: " + refused_window[-800:]
+        )
+        assert HISTORY_PUSH_TOKEN not in refused_window, (
+            "the refused delete pushed a history step: " + refused_window[-800:]
+        )
+        begin = len(session.read_log())
+        session.send("dump assets")
+        session.wait(re.escape(ASSETS_DUMP_TOKEN), 30, "the listing re-dumped", begin)
+        assert re.search(
+            r'path="?' + re.escape(module_key), session.read_log()[begin:]
+        ), "the refused delete removed the module asset from the listing"
+        print("  [OK] a module asset's delete was refused with no history step")
+
+        # Back to the Assets tab and the project's root for the steps below.
+        session.send("tab assets")
+        begin = len(session.read_log())
+        session.send("browser root")
+        session.wait(
+            re.escape(BROWSER_FOLDER_TOKEN) + r'\s+path=""',
+            30,
+            "the browser returned to the asset root again",
             begin,
         )
 

@@ -99,6 +99,16 @@ pub fn inspector_tab(
         // A module's resource is shown as it is: every row reads, and nothing
         // here can repoint it.
         if detail.row.read_only {
+            // The one line that says the section refused to offer an edit,
+            // printed once per selected asset: the tab redraws every frame, so
+            // the notice alone is not something a suite could wait on.
+            if remember_inspector_row(session, &detail.key(), "asset-read-only", &[]) {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    asset = detail.key().as_str(),
+                    "[editor] inspector row kind=asset-read-only"
+                );
+            }
             ui.label(
                 egui::RichText::new("provided by the engine - read-only")
                     .weak()

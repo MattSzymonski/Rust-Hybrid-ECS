@@ -51,6 +51,7 @@ python devops/tests/test_hot_reload_suite.py
 python devops/tests/test_hot_reload_migration.py --cycles 2
 python devops/tests/test_csharp_bridge.py
 python devops/tests/test_ui_theme.py            # the UI theme pipeline, `circus_demo`
+python devops/tests/test_module_resource_assert.py  # a module's declared resource is missing
 python devops/tests/test_shipping_smoke.py
 python devops/tests/test_web_smoke.py          # browser build in headless Chrome/Edge
 
@@ -59,6 +60,15 @@ python devops/tests/test_coding_standards.py
 python devops/tests/test_examples.py
 python devops/ci_cd/verify.py --quick           # the CI gate's inner loop
 ```
+
+A module ships its own `res` as a read-only asset root: the host lists it
+beside the project's files, the editor shows it under the `extensions` root and
+offers no create, rename, move, delete or settings write there, and a file the
+module declares that goes missing stops the host naming the module and the
+path (`test_module_resource_assert.py` drives exactly that). The engine's
+default material, `pill_master_renderer_data`'s
+`res/defaults/pill.pbr.material`, is the resource the editor and the suite both
+show.
 
 `test_coding_standards.py` lints every `.rs` file against the Pill comment and
 layout rules, and `test_examples.py` builds each example in release and reports
