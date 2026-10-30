@@ -73,8 +73,17 @@ show.
 `test_coding_standards.py` lints every `.rs` file against the Pill comment and
 layout rules, and `test_examples.py` builds each example in release and reports
 artifact sizes. The lint's eighth check refuses work-item ids, stage numbers,
-plan decisions and construction-site paths in `modules/` comments, with no
-allowance: a reintroduced reference fails the check. Formatting, clippy and the
+plan decisions, audit-finding ids, audit opportunity numbers, plan sections and
+construction-site paths in `modules/` comments, with no allowance: a
+reintroduced reference fails the check. The same check covers the managed
+sources under `modules/csharp/` and the three example projects' `src/`
+folders, where the existing debt is held in
+`devops/tests/comment_content_baseline.json`: a file's recorded count is its
+allowance, a missing entry allows zero, and `--write-comment-baseline`
+rewrites the file after a sweep. The `devops/` Python tree is covered the same
+way - full-line `#` comments and module, class and function docstrings, one
+allowance per file - while `TIER:` and `PROTECTS:` docstring lines stay
+untouched. Formatting, clippy and the
 cargo test lanes are `verify.py`
 steps; those two lanes run through `cargo-nextest` (`modules/.config/nextest.toml`)
 when it is installed and through `cargo test` when it is not, and always run

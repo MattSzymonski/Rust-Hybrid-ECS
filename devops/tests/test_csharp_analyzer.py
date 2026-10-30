@@ -17,17 +17,19 @@ DESCRIPTION
     static event that roots the retiring load context - so a rule that quietly
     stops firing removes a protection nobody would notice was gone.
 
-    Two checks, both driven by `dotnet build` on `examples/project_cs`:
+    Three checks, all driven by `dotnet build` on `examples/project_cs`:
 
-      1. clean_project_is_diagnostic_free - the real gameplay project builds
-         with no PILL diagnostic at all. This is what makes the second check
-         meaningful: a rule that fires on correct code would be worse than no
-         rule, and it also proves the analyzer is actually wired into the
-         project rather than silently absent.
+      1. scenario_clean_project_is_diagnostic_free - the real gameplay project
+         builds with no PILL diagnostic at all, which proves the analyzer is
+         wired into the project rather than silently absent.
 
-      2. every_rule_fires - a probe file declaring exactly one violation of
-         each rule produces every expected diagnostic. The probe is written
-         into the project, built, and removed afterwards.
+      2. scenario_correct_parallel_body_is_clean - a well-formed
+         `ForEachParallel` body stays diagnostic-free, the negative half of
+         PILL0202: a rule that fires on correct code is worse than no rule.
+
+      3. scenario_every_rule_fires - a probe file declaring exactly one
+         violation of each rule produces every expected diagnostic. The probe
+         is written into the project, built, and removed afterwards.
 
     The probe is deliberately not committed: it does not compile by
     construction, so it can only exist for the duration of this suite.
@@ -95,9 +97,6 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
-// The generated engine components (`Position`) live in their own namespace.
-using pill_engine.common_components;
-
 namespace TracyLive.AnalyzerProbe;
 
 [StructLayout(LayoutKind.Auto)]
@@ -118,6 +117,13 @@ internal struct UnsupportedFieldComponent                // PILL0403
     public bool Flag;
 }
 
+// A valid row type, so the query terms below name something the project
+// declares itself rather than a mirror it may not load.
+internal struct ProbeRow
+{
+    public float X;
+}
+
 internal class ProbeSystems
 {
     internal static int MutableCounter;                  // PILL0301
@@ -125,14 +131,14 @@ internal class ProbeSystems
 
     [EcsSystem]
     internal async void InstanceAsyncSystem(             // PILL0101 + PILL0201
-        Query<Read<Position>> query)
+        Query<Read<ProbeRow>> query)
     {
         _ = query;
         await Task.Yield();
     }
 
     [EcsSystem]
-    internal static int WrongReturnSystem(Query<Read<Position>> query)   // PILL0103
+    internal static int WrongReturnSystem(Query<Read<ProbeRow>> query)   // PILL0103
     {
         _ = query;
         return 0;
@@ -142,7 +148,7 @@ internal class ProbeSystems
     internal static void NoParameterSystem() { }         // PILL0102
 
     [EcsSystem]
-    internal static void StartsBackgroundWork(Query<Read<Position>> query)
+    internal static void StartsBackgroundWork(Query<Read<ProbeRow>> query)
     {
         _ = query;
         new Thread(() => { }).Start();                   // PILL0303
@@ -152,9 +158,9 @@ internal class ProbeSystems
 
     [EcsSystem]
     internal static void ParallelBodyTouchesEngine(
-        Query<Write<Position>> query, Commands commands)
+        Query<Write<ProbeRow>> query, Commands commands)
     {
-        query.ForEachParallel((ref Position position) =>
+        query.ForEachParallel((ref ProbeRow position) =>
         {
             _ = position;
             _ = Engine.Time;                             // PILL0202
@@ -173,17 +179,20 @@ internal sealed class OwnsAFinalizer                     // PILL0305
 # so the suite proves the PILL0202 rule does not fire on correct code.
 CLEAN_PARALLEL_PROBE_SOURCE = '''\
 // Written by devops/tests/test_csharp_analyzer.py; removed afterwards.
-using pill_engine.common_components;
-
 namespace TracyLive.AnalyzerCleanProbe;
+
+internal struct ProbeRow
+{
+    public float X;
+}
 
 internal static class CleanParallelProbeSystem
 {
     [EcsSystem]
     internal static void ParallelBodyTouchesOnlyItsRows(
-        Query<Write<Position>> query)
+        Query<Write<ProbeRow>> query)
     {
-        query.ForEachParallel((ref Position position) =>
+        query.ForEachParallel((ref ProbeRow position) =>
         {
             _ = position;
         });
@@ -315,6 +324,7 @@ def scenario_every_rule_fires() -> bool:
     return True
 
 
+# The three scenarios, in run order; the header lists them by these names.
 SCENARIOS = (
     scenario_clean_project_is_diagnostic_free,
     scenario_correct_parallel_body_is_clean,
@@ -328,7 +338,7 @@ SCENARIOS = (
 
 
 def main() -> None:
-    """Runs both analyzer scenarios and reports one summary."""
+    """Runs all three analyzer scenarios and reports one summary."""
     parser = argparse.ArgumentParser(
         description="Gameplay scripting analyzer suite for Rust-Hybrid-ECS"
     )

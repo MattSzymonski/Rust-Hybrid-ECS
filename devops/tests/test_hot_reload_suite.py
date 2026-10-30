@@ -70,7 +70,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers. The
-# host's log tokens live in one place (audit opportunity 5.14).
+# host's log tokens live in one place.
 # Standalone-runnable: put `devops/` on `sys.path` before reaching `core`, so
 # the suite works from any working directory without a package import.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -78,8 +78,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers.
 from core.suite_common import *  # noqa: E402,F401,F403
 
-# The shared scenario runner: one definition for every hot-reload suite
-# (audit SA-0057). This suite adds only its tokens and scenario tables.
+# The shared scenario runner: one definition for every hot-reload suite.
+# This suite adds only its tokens and scenario tables.
 from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario  # noqa: E402
 
 # =============================================================================
@@ -120,7 +120,7 @@ MODULE_FORGOTTEN_WARN_TOKEN = "no longer registered by this module"
 PROBE_PREFIX = "midpoint ("
 PROBE_MIDPOINT_PATTERN = re.compile(r"midpoint \((-?[0-9.]+), (-?[0-9.]+)\)")
 # One entity's stable id, as the project re-reads it from the world on every
-# generation (W-0048 Stage 5). The handle a query yields names a recycled slot;
+# generation. The handle a query yields names a recycled slot;
 # this id is what must not change across a reload.
 PROBE_ID_PATTERN = re.compile(r"entityid ([0-9a-f]{32})")
 
@@ -498,7 +498,7 @@ def session_b_scenarios(monitor: OutputMonitor) -> Optional[Sequence[Scenario]]:
     Reading the baseline from the running host rather than writing the
     coordinate down is the check the folded `test_module_project_auto_reload.py`
     made on its own, folded here so one host launch proves both the cascade and
-    that the new offset reached the project's view (audit SA-0067).
+    that the new offset reached the project's view.
 
     The table is built after the host is up for that reason; returns None when
     the probe never reported, which fails the session.
@@ -529,9 +529,7 @@ def session_b_scenarios(monitor: OutputMonitor) -> Optional[Sequence[Scenario]]:
                     # `#[pill(shared)]`, so the module DLL's copy and the project's
                     # are one component with one column, and both artifacts top up
                     # to a single spline rather than each seeding its own. After
-                    # both reloads the probe therefore still sees exactly one -
-                    # previously for the opposite reason, that the two copies were
-                    # distinct types the project could not see across.
+                    # both reloads the probe therefore still sees exactly one.
                     #
                     # The count alone carries that meaning; the surrounding probe
                     # wording in `examples/project_rs/src/lib.rs` is incidental and
@@ -555,7 +553,7 @@ def session_b_scenarios(monitor: OutputMonitor) -> Optional[Sequence[Scenario]]:
                     # offset. The value is derived above, from the baseline the
                     # host itself printed.
                     #
-                    # The id token is the Stage 5 check: the probe re-reads the
+                    # The id token: the probe re-reads the
                     # spline's stable id from the world every generation, so a
                     # report carrying the baseline id after the reload says the
                     # id survived it.
@@ -774,7 +772,7 @@ def main() -> None:
         # Always restore the developer's files, even on failure. Rewind the
         # mtimes only when every session finished: a failed or aborted run can
         # leave an artifact the host built from an edit, and rewinding there
-        # would make the next start trust that stale artifact (W-0110).
+        # would make the next start trust that stale artifact.
         BACKUP.restore_all(reset_mtime=all_passed)
         # Restore the project settings files last.
         for path in (

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Suite lint for `devops/tests`: the header `run_all.py` reads, and the rules
-that keep what W-0010 deduplicated from coming back.
+that keep the shared helpers from being forked again.
 
 PROTECTS: Suites keep their run_all header, stop re-forking the core helpers, say
           why they sleep, and anchor their output before they write.
@@ -33,7 +33,7 @@ DESCRIPTION
                     body-only edit within the write's own turn, and a line
                     counted into the anchor never appears in
                     `output_since(start_index)` - the crate then reads as
-                    `TIMED OUT` while its fast path is healthy (W-0111).
+                    `TIMED OUT` while its fast path is healthy.
 
     Each rule ships with a planted-violation self-test (`--self-test`), so a
     rule that stopped matching fails here, where it is cheap to see, instead
@@ -65,10 +65,10 @@ sys.path.insert(0, str(SUITES_DIRECTORY))
 
 import run_all  # noqa: E402
 
-# A helper under one of these names belongs to `devops/core/`. `read_log` and
-# `atomic_write` moved to `core/suite_common.py`, `wait_token` to the editor
-# driver (Stage 13), `require` to `core/suite_common.py` (W-0112), and `kill_*`
-# covers stray-host cleanup, which may only run under the lock.
+# A helper under one of these names belongs to `devops/core/`: `read_log`,
+# `atomic_write` and `require` live in `core/suite_common.py`, `wait_token`
+# in the editor driver, and `kill_*` covers stray-host cleanup, which may
+# only run under the lock.
 FORKED_HELPER_PATTERN = re.compile(
     r"^\s*def (read_log|wait_token|atomic_write|require|kill_[a-z_]*)\s*\(", re.MULTILINE
 )

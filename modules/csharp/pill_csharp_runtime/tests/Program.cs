@@ -9,6 +9,8 @@
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using TracyLive;
 using TracyLive.Loader;
 // The renderer's components, generated from their Rust registration.
@@ -78,7 +80,7 @@ internal sealed class ProbeMeshAsset
 
 /// <summary>
 /// A project component holding an asset reference, used to prove the manifest
-/// describes a <c>Handle&lt;T&gt;</c> field by the Rust type path of T (W-0048).
+/// describes a <c>Handle&lt;T&gt;</c> field by the Rust type path of T.
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 internal struct HandleProbe
@@ -690,6 +692,22 @@ internal static class Program
         throw new InvalidOperationException(message);
     }
 
+    /// <summary>Expect a refusal whose message names the reason.</summary>
+    private static void Refused(Action action, string expected, string message)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception exception)
+        {
+            Assert(exception.Message.Contains(expected), $"{message}: {exception.Message}");
+            return;
+        }
+
+        throw new InvalidOperationException($"{message}: nothing was refused");
+    }
+
     private static void Test(string name, Action test)
     {
         test();
@@ -831,7 +849,7 @@ internal static class Program
                     typeof(HandleProbe).FullName);
                 var mesh = probe.GetProperty("fields").EnumerateArray().Single(field =>
                     field.GetProperty("name").GetString() == "Mesh");
-                Equal(mesh.GetProperty("primitive_type").GetString(),
+                Equal(mesh.GetProperty("primitive_type").GetString() ?? string.Empty,
                     "handle:probe::assets::mesh::ProbeMesh", "the handle's type was not carried");
                 Equal(mesh.GetProperty("size").GetInt32(), 8, "a handle is two uints");
                 Equal(mesh.GetProperty("fields").GetArrayLength(), 0,
@@ -2332,6 +2350,111 @@ internal static class Program
                 {
                     MockNativeWorld.NativeResourceStatus = 0;
                 }
+            });
+
+            Test("every query status produces its own message", () =>
+            {
+                Refused(() => Engine.ValidateStatus((byte)QueryStatus.NotRegistered, "TestPosition", QueryAccess.Read),
+                    "is not registered by the Rust host", "an unknown component must be named");
+                Refused(() => Engine.ValidateStatus((byte)QueryStatus.NoInvocation, "TestPosition", QueryAccess.Read),
+                    "outside its scheduled system call", "an out-of-scope query must be named");
+                Refused(() => Engine.ValidateStatus((byte)QueryStatus.AccessNotDeclared, "TestPosition", QueryAccess.Write),
+                    "did not declare this write access", "an undeclared access must be named");
+                Refused(() => Engine.ValidateStatus((byte)QueryStatus.NullOutput, "TestPosition", QueryAccess.Read),
+                    "was given no result buffer", "a null output must be named");
+            });
+
+            Test("every command status produces its own message", () =>
+            {
+                Engine.ValidateCommandStatus((byte)CommandStatus.Ok, "probe");
+                Refused(() => Engine.ValidateCommandStatus((byte)CommandStatus.NotRegistered, "probe"),
+                    "the component is not registered", "an unknown component must be named");
+                Refused(() => Engine.ValidateCommandStatus((byte)CommandStatus.NoInvocation, "probe"),
+                    "outside an active startup", "an out-of-scope command must be named");
+                Refused(() => Engine.ValidateCommandStatus((byte)CommandStatus.CommandsNotDeclared, "probe"),
+                    "did not declare a Commands parameter", "an undeclared Commands must be named");
+                Refused(() => Engine.ValidateCommandStatus((byte)CommandStatus.StaleEntity, "probe"),
+                    "stale", "a stale handle must be named");
+                Refused(() => Engine.ValidateCommandStatus((byte)CommandStatus.InvalidComponentList, "probe"),
+                    "ABI layout is invalid", "an invalid component list must be named");
+                Refused(() => Engine.ValidateCommandStatus(9, "probe"),
+                    "native status 9", "an unknown status must keep its number");
+            });
+
+            Test("every resource view status produces its own message", () =>
+            {
+                Assert(ResourceAccess.Failure<SimulationTime>((byte)ResourceViewStatus.NotRegistered, QueryAccess.Read)
+                        .Message.Contains("not registered with the engine"),
+                    "an unknown resource must be named");
+                Assert(ResourceAccess.Failure<SimulationTime>((byte)ResourceViewStatus.AccessNotDeclared, QueryAccess.Write)
+                        .Message.Contains("did not declare Write access"),
+                    "an undeclared access must be named");
+                Assert(ResourceAccess.Failure<SimulationTime>((byte)ResourceViewStatus.NoInvocation, QueryAccess.Read)
+                        .Message.Contains("No ECS system is running"),
+                    "an out-of-scope view must be named");
+                Assert(ResourceAccess.Failure<SimulationTime>((byte)ResourceViewStatus.NoValue, QueryAccess.Read)
+                        .Message.Contains("holds no value"),
+                    "a missing value must be named");
+                Assert(ResourceAccess.Failure<SimulationTime>(9, QueryAccess.Read)
+                        .Message.Contains("could not be reached (status 9)"),
+                    "an unknown status must keep its number");
+            });
+
+            Test("every mirrored resource status produces its own message", () =>
+            {
+                Assert(MirrorCall.NativeResourceFailure("SimulationTime", nameof(SimulationTime), QueryAccess.Read,
+                            (byte)NativeResourceStatus.NoValue).Message.Contains("holds no SimulationTime resource"),
+                    "a missing value must be named");
+                Assert(MirrorCall.NativeResourceFailure("SimulationTime", nameof(SimulationTime), QueryAccess.Write,
+                            (byte)NativeResourceStatus.AccessNotDeclared).Message.Contains("did not declare Write access"),
+                    "an undeclared access must be named");
+                Assert(MirrorCall.NativeResourceFailure("SimulationTime", nameof(SimulationTime), QueryAccess.Read,
+                            (byte)NativeResourceStatus.NoInvocation).Message.Contains("inside an [EcsSystem] or [EcsStartup] call"),
+                    "an out-of-scope resource must be named");
+                Assert(MirrorCall.NativeResourceFailure("SimulationTime", nameof(SimulationTime), QueryAccess.Read, 9)
+                        .Message.Contains("could not be reached (status 9)"),
+                    "an unknown status must keep its number");
+            });
+
+            Test("the AOT registry refuses a startup the reflection path refuses", () =>
+            {
+                const string source = """
+                    using TracyLive;
+                    namespace Probe;
+                    internal static class ProbeStartups
+                    {
+                        [EcsStartup]
+                        public static void Supported(Commands commands, Res<SimulationTime> read, ResMut<SimulationTime> write) { }
+
+                        [EcsStartup]
+                        public static void Unsupported(string value) { }
+                    }
+                    """;
+                var references = AppDomain.CurrentDomain.GetAssemblies()
+                    .Where(assembly => !assembly.IsDynamic && !string.IsNullOrEmpty(assembly.Location))
+                    .Select(assembly => MetadataReference.CreateFromFile(assembly.Location))
+                    .ToArray();
+                CSharpCompilation compilation = CSharpCompilation.Create(
+                    "ProbeProject",
+                    [CSharpSyntaxTree.ParseText(source)],
+                    references,
+                    new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, allowUnsafe: true));
+                GeneratorDriver driver = CSharpGeneratorDriver.Create(
+                    new PillCSharpRuntimeMacros.EcsAotRegistryGenerator().AsSourceGenerator());
+                driver = driver.RunGenerators(compilation);
+                GeneratorRunResult result = driver.GetRunResult().Results.Single();
+                Diagnostic[] refusals = result.Diagnostics
+                    .Where(diagnostic => diagnostic.Id == "PCS0002")
+                    .ToArray();
+                Equal(refusals.Length, 1, "exactly the unsupported startup must be refused");
+                Assert(refusals[0].GetMessage().Contains("value"), refusals[0].GetMessage());
+                string generated = result.GeneratedSources
+                    .Single(source => source.HintName == "GeneratedAotRegistry.g.cs")
+                    .SourceText.ToString();
+                Assert(generated.Contains("Probe.ProbeStartups.Supported"),
+                    "the supported startup must be registered");
+                Assert(!generated.Contains("Probe.ProbeStartups.Unsupported"),
+                    "the refused startup must not be registered");
             });
 
             Test("an object is moved once and dropped once", () =>

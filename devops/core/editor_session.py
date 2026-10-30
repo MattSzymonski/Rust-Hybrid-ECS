@@ -41,7 +41,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
 from core.environment import filesystem_timestamp
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name
@@ -52,6 +52,9 @@ EDITOR_BINARY = executable_name("pill_editor")
 
 # Every suite's run artifacts live here, one folder per suite and run.
 EDITOR_VALIDATION_ROOT = REPOSITORY_ROOT / "local" / "editor-validation"
+
+# What a wait's probe produces; `wait_until` returns it unchanged.
+T = TypeVar("T")
 
 # =============================================================================
 # Shared editor log tokens
@@ -68,7 +71,7 @@ EDITOR_HISTORY_UNDO_TOKEN = "[editor] history undo"
 EDITOR_HISTORY_REDO_TOKEN = "[editor] history redo"
 # The command registry's report after a keybindings file lands: the preset it
 # activated, how many overrides it resolved, and one line per chord two
-# commands answer to (W-0038 Stage 2).
+# commands answer to.
 EDITOR_KEYBINDINGS_APPLIED_TOKEN = "[editor] keybindings applied"
 EDITOR_KEYBINDING_CONFLICT_TOKEN = "[editor] keybinding conflict"
 # A chord the registry resolved, and the same chord when the command it named
@@ -355,6 +358,46 @@ class EditorSession:
         except OSError:
             return ""
 
+    def wait_until(
+        self,
+        probe: Callable[[str], Optional[T]],
+        timeout: float,
+        timeout_message: str,
+        label: str = "",
+        exit_note: str = "",
+        poll: float = 0.5,
+        announce: bool = True,
+    ) -> T:
+        """Polls the log until `probe` returns something other than None.
+
+        The one deadline/poll/timeout shape the session and the suites share.
+        The probe sees the log text and returns None while it is not
+        satisfied, so a wait for a pattern, a count, or a frame counter past
+        a threshold all read the same way. Prints `[OK] <label>` on success,
+        raises `RuntimeError` when a running editor exits first and
+        `TimeoutError` (with `timeout_message` and the log tail) on timeout.
+        """
+        deadline = time.monotonic() + timeout
+        prefix = "{}: ".format(label) if label else ""
+        process = self._process
+        while time.monotonic() < deadline:
+            text = self.read_log()
+            found = probe(text)
+            if found is not None:
+                if announce and label:
+                    print("  [OK] {}".format(label))
+                return found
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(
+                    prefix
+                    + "the editor exited {}{}\n".format(process.returncode, exit_note)
+                    + text[-4000:]
+                )
+            # Half a second is the editor's log cadence: polling faster only
+            # re-reads the same bytes.
+            time.sleep(poll)
+        raise TimeoutError(timeout_message + self.read_log()[-4000:])
+
     def wait(self, pattern: str, timeout: float, label: str, start: int = 0) -> int:
         """Waits for `pattern` after byte offset `start`; returns the new length.
 
@@ -365,14 +408,10 @@ class EditorSession:
         it lands, so a typo never waits out the timeout; a refusal an earlier
         wait already raised on is not raised again.
         """
-        deadline = time.monotonic() + timeout
         expression = re.compile(pattern)
-        process = self._process
-        while time.monotonic() < deadline:
-            text = self.read_log()
-            window = text[start:]
-            if expression.search(window):
-                print("  [OK] {}".format(label))
+
+        def probe(text: str) -> Optional[int]:
+            if expression.search(text[start:]):
                 return len(text)
             if EDITOR_SCRIPTED_REJECTED_TOKEN in text:
                 rejected = REJECTION_PATTERN.findall(text)
@@ -380,14 +419,13 @@ class EditorSession:
                     self._rejections_seen = len(rejected)
                     command, reason = rejected[-1]
                     raise ScriptedCommandRejected(command, reason)
-            if process is not None and process.poll() is not None:
-                raise RuntimeError(
-                    "{}: the editor exited {}\n".format(label, process.returncode)
-                    + text[-4000:]
-                )
-            time.sleep(0.5)
-        raise TimeoutError(
-            "{}: timeout waiting for {}\n".format(label, pattern) + self.read_log()[-4000:]
+            return None
+
+        return self.wait_until(
+            probe,
+            timeout,
+            "{}: timeout waiting for {}\n".format(label, pattern),
+            label=label,
         )
 
     def wait_token(self, token: str, timeout: float, label: str, start: int = 0) -> int:
@@ -453,25 +491,20 @@ class EditorSession:
         would satisfy a plain search before the new one has happened. Returns
         the matched text, which suites compare (a frame count, a placement).
         """
-        deadline = time.monotonic() + timeout
         expression = re.compile(pattern)
-        process = self._process
-        while time.monotonic() < deadline:
-            matches = [match.group(0) for match in expression.finditer(self.read_log())]
-            if len(matches) >= occurrence:
-                print("  [OK] {}".format(label))
-                return matches[occurrence - 1]
-            if process is not None and process.poll() is not None:
-                raise RuntimeError(
-                    "{}: the editor exited {} before occurrence {} of {}\n".format(
-                        label, process.returncode, occurrence, pattern
-                    )
-                    + self.read_log()[-4000:]
-                )
-            time.sleep(0.5)
-        raise TimeoutError(
-            "{}: timeout waiting for occurrence {} of {}\n".format(label, occurrence, pattern)
-            + self.read_log()[-4000:]
+
+        def probe(text: str) -> Optional[str]:
+            matches = [match.group(0) for match in expression.finditer(text)]
+            return matches[occurrence - 1] if len(matches) >= occurrence else None
+
+        return self.wait_until(
+            probe,
+            timeout,
+            "{}: timeout waiting for occurrence {} of {}\n".format(
+                label, occurrence, pattern
+            ),
+            label=label,
+            exit_note=" before occurrence {} of {}".format(occurrence, pattern),
         )
 
     def wait_either(self, patterns: List[str], timeout: float, start: int = 0) -> Tuple[str, int]:
@@ -480,25 +513,21 @@ class EditorSession:
         Same contract as `wait`: `RuntimeError` when a running editor exits
         first, `TimeoutError` when none of the patterns appear in time.
         """
-        deadline = time.monotonic() + timeout
         expressions = [(pattern, re.compile(pattern)) for pattern in patterns]
-        process = self._process
-        while time.monotonic() < deadline:
-            text = self.read_log()
+
+        def probe(text: str) -> Optional[Tuple[str, int]]:
+            window = text[start:]
             for pattern, expression in expressions:
-                if expression.search(text[start:]):
+                if expression.search(window):
                     return pattern, len(text)
-            if process is not None and process.poll() is not None:
-                raise RuntimeError(
-                    "the editor exited {} before any of {}\n".format(
-                        process.returncode, patterns
-                    )
-                    + text[-4000:]
-                )
-            time.sleep(0.5)
-        raise TimeoutError(
-            "timeout waiting for any of {}\n".format(patterns)
-            + self.read_log()[-4000:]
+            return None
+
+        return self.wait_until(
+            probe,
+            timeout,
+            "timeout waiting for any of {}\n".format(patterns),
+            exit_note=" before any of {}".format(patterns),
+            announce=False,
         )
 
     def find(self, pattern: str, start: int = 0) -> re.Match:

@@ -172,6 +172,7 @@ def main() -> int:
         while time.monotonic() < drain_deadline:
             if MISSING_RESOURCE_TOKEN in monitor.output_since(0):
                 break
+            # Poll so the assert's line is seen as soon as the drain lands.
             time.sleep(0.1)
         output = monitor.output_since(0)
         if exit_code == 0:

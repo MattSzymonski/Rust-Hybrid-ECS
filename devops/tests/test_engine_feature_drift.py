@@ -16,9 +16,8 @@ DESCRIPTION
     names the host's copy does not export, and fails to load with "procedure
     could not be found".
 
-    For each host posture (headless `pill_standalone` with and without
-    `hot_patch`, windowed `pill_standalone`, the native editor, the egui
-    editor), this resolves each shared dylib's subtree for the host alone,
+    For each host posture - one per key of `FRONTENDS` - this resolves each
+    shared dylib's subtree for the host alone,
     then for every build a host spawns for a project: each extension's module
     build - the crate selected directly with the feature set its generated
     `host_module_<name>` wrapper would enable - the project's own build, and
@@ -37,12 +36,10 @@ DESCRIPTION
     therefore measure the same builds, and the count is printed so a drop is
     visible.
 
-    Both editors are ordinary native frontends: they receive their engine
-    features explicitly, exactly like the standalone builders, because nothing
-    in their graph unions host-side macro features the way the retired dioxus
-    editor's macros did. The host keeps the anchor machinery for that retired
-    posture (`build_runner::apply_cargo_host_overrides`), but no frontend
-    reaches it.
+    Every posture receives its engine features explicitly, exactly like the
+    standalone builders. An editor host additionally anchors its module builds
+    to its own package, because only that package's graph reproduces the
+    renderer and UI feature unions onto the engine dylibs.
 
     Extensions are found by convention (every `extensions/<folder>/<crate>`
     crate); the projects are every example with both a `project_settings.yaml`
@@ -88,18 +85,15 @@ ENGINE_DYLIBS = (
 )
 
 # The egui editor's shared dylibs: the egui boundary and its model, and the
-# theme pipeline's plain data it links (W-0127). Only the postures that load
+# theme pipeline's plain data it links. Only the postures that load
 # egui editor parts resolve them.
 EGUI_EDITOR_DYLIBS = (
     "pill_editor_core",
     "pill_ui_theme",
 )
 
-# The editor family is the egui one alone (W-0043 retired the `pill_ui`
-# editor). A posture that never loads its parts would report drift nothing can
-# act on - the dylib's subtree is pulled in by the host's graph-only entries,
-# not linked.
-EGUI_DYLIBS = ENGINE_DYLIBS + EGUI_EDITOR_DYLIBS
+# A posture is measured only against the dylibs it loads: the standalone
+# postures resolve the engine dylibs alone, and the editor adds its own parts.
 ALL_DYLIBS = ENGINE_DYLIBS + EGUI_EDITOR_DYLIBS
 
 # The host postures module and project builds run under: the host's own cargo
@@ -132,7 +126,8 @@ FRONTENDS = {
         ["--package", "pill_editor"],
         ["pill_engine/hot_patch"],
         None,
-        EGUI_DYLIBS,
+        # The editor loads every shared dylib, including its own parts.
+        ALL_DYLIBS,
     ),
 }
 

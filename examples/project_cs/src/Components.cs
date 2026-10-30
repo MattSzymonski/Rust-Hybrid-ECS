@@ -1,5 +1,9 @@
 // Components owned by this project.
 //
+// Responsibilities
+// - Declare the ball physics state and the spline sample dot the systems read
+//   and write.
+//
 // Mirrors the component declarations in examples/project_rs/src/lib.rs: same
 // names, same field order, same field types. The native host discovers these
 // layouts from the managed component manifest and registers them itself - no

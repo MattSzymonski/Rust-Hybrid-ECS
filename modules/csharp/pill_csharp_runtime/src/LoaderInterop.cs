@@ -116,30 +116,14 @@ public static unsafe class LoaderInterop
 {
     /// <summary>
     /// Unmanaged ABI contract version shared with the Rust host.
-    /// Bump whenever any unmanaged export signature changes, when the
-    /// <c>EngineApi</c> struct's field layout does - the runtime copies that
-    /// struct field by field, so a new slot makes the two sides disagree about
-    /// every slot after it - or when a struct the exports exchange changes
-    /// shape. Bumped to 4 by the mirror-epoch slot and to 5 by the const
-    /// <c>Entities</c> pointer in <c>NativeComponentChunk</c>, which a stale
-    /// runtime would otherwise read as a 48-byte struct. Bumped to 9 by
-    /// resources, which added both a slot (<c>GetResourceView</c>) and a field
-    /// to an exchanged struct (<c>NativeSystemAccess.Kind</c>) - a stale
-    /// runtime would leave that field unwritten and every resource access
-    /// would be resolved against the component table. Bumped to 11 by the
-    /// managed logging and profiling callbacks appended to the API table.
-    /// Bumped to 12 by the version and size header that opens the API table,
-    /// which <see cref="Engine.Bind(EngineApi*)"/> checks before copying it.
-    /// Bumped to 13 by the three asset import slots appended to the API table.
-    /// Bumped to 14 by the rendering pipeline clear slot appended to the API
-    /// table. Bumped to 15 by the standalone-material import and skybox slots,
-    /// and the input and time query slots, appended to the API table.
-    /// Bumped to 16 by the parallel-dispatch slot appended to the API table.
-    /// Bumped to 17 by the mirror ABI: the renderer- and audio-specific asset
-    /// slots left the table, and the mirror text, native resource and asset
-    /// store slots were appended. Bumped to 18 by the entity stable-id slot
-    /// appended to the table.
     /// </summary>
+    /// <remarks>
+    /// Bump when an export signature, the <c>EngineApi</c> layout or an
+    /// exchanged struct's shape changes. The runtime copies the table field by
+    /// field, so a stale version must fail <see cref="Engine.Bind(EngineApi*)"/>'s
+    /// version-and-size check instead of misreading every slot after a new one.
+    /// New slots go at the end of the table; no existing slot moves.
+    /// </remarks>
     public const uint InteropContractVersion = 18;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>

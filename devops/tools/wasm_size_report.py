@@ -35,9 +35,6 @@
 #   later build of another project, and is skipped with a warning; rebuild the
 #   project (or pass `--build`) to analyse it.
 #
-#   Ported from the previous engine's launcher (`pill_launcher`'s
-#   `wasm_target.rs`, `--wasm-analyze`).
-#
 # USAGE: python devops/tools/wasm_size_report.py [options] [project_path]
 #          [project_path]       workspace-relative project directory; defaults
 #                               to the PROJECT_PATH environment variable

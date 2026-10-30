@@ -24,7 +24,7 @@ DESCRIPTION
     1. `shared_identity_binds_both_binaries` - with the attribute in place, the
        engine's registry reports a declared shared identity for
        `pill_spline::Spline` at registration, the host starts without a peer
-       collision, and the ECS report the fixture opts in to shows exactly ONE
+       collision, and the ECS report the example project opts in to shows exactly ONE
        `pill_spline::Spline` column under `shared identity`. The registration
        line is the required observation: it needs no frames, so the scenario
        fails when the declaration is removed or made a no-op.
@@ -262,7 +262,8 @@ TIME_PROBE = """\
 
 # The ECS state report is opt-in: `Engine::new` registers nothing, so a host
 # that wants one asks for it. The first scenario's second confirmation is the
-# report's `shared identity` section, so the fixture opts in before it starts.
+# report's `shared identity` section, so the example project opts in before it
+# starts.
 REPORT_OPT_IN = """\
     // Injected by the shared-identity suite: the engine's periodic ECS report
     // is opt-in (W-0094), and this scenario reads the column count from it.
@@ -605,7 +606,8 @@ def scenario_shared_identity_binds_both_binaries() -> bool:
     for the component (`SHARED_IDENTITY_TOKEN`, printed at registration), which
     needs no frames: without the declaration, or with it made a no-op, nothing
     is printed and this scenario fails. The per-second ECS report is parsed too
-    as a second confirmation of the column count - the fixture opts the report
+    as a second confirmation of the column count - the example project opts the
+    report
     in, since the engine registers none by default - but the pass does not rest
     on it.
     """
@@ -668,7 +670,8 @@ def scenario_shared_identity_binds_both_binaries() -> bool:
             f"declared shared identity."
         )
 
-        # Direct confirmation from the report the fixture opted in to: exactly
+        # Direct confirmation from the report the example project opted in to:
+        # exactly
         # one column for the component, listed under its `shared identity`
         # section.
         if monitor.wait_for(ECS_REPORT_TOKEN, REPORT_SAMPLE_TIMEOUT, start_index):
@@ -771,8 +774,8 @@ def scenario_one_compiled_copy_needs_no_declaration() -> bool:
             f"{SHARED_COMPONENT_NAME}."
         )
 
-        # Direct confirmation from the report the fixture opted in to, exactly
-        # as in the first scenario: one column for the component.
+        # Direct confirmation from the report the example project opted in to,
+        # exactly as in the first scenario: one column for the component.
         if monitor.wait_for(ECS_REPORT_TOKEN, REPORT_SAMPLE_TIMEOUT, start_index):
             report = extract_latest_report(monitor.output_since(start_index))
             if report is None:

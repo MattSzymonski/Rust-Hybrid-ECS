@@ -299,6 +299,11 @@ pub struct ToolboxSession {
     /// Per-scene-view panel rectangles whose rows the log already reported,
     /// so the rect lines appear once per placement and once per drag.
     pub logged: Vec<Option<Rect>>,
+    /// Per-scene-view row rectangles, in [`crate::toolbox::TOOLBOX_ITEMS`]
+    /// order: the face a row's button drew this pass, which is what a click
+    /// aims at. A row's face is narrower than the row it sits in, so the
+    /// logged row rectangle alone would not say where the button is.
+    pub faces: Vec<Vec<Rect>>,
 }
 
 impl Default for ToolboxSession {
@@ -306,6 +311,7 @@ impl Default for ToolboxSession {
         Self {
             origins: vec![None; SCENE_VIEWS_MAX],
             logged: vec![None; SCENE_VIEWS_MAX],
+            faces: vec![Vec::new(); SCENE_VIEWS_MAX],
         }
     }
 }
@@ -335,6 +341,19 @@ impl ToolboxSession {
             self.logged.resize(view + 1, None);
         }
         self.logged[view] = Some(rect);
+    }
+
+    /// The face `view`'s row `index` drew this pass, when it drew one.
+    pub fn face(&self, view: usize, index: usize) -> Option<Rect> {
+        self.faces.get(view)?.get(index).copied()
+    }
+
+    /// Record the faces `view`'s rows drew this pass, in row order.
+    pub fn set_faces(&mut self, view: usize, faces: Vec<Rect>) {
+        if self.faces.len() <= view {
+            self.faces.resize(view + 1, Vec::new());
+        }
+        self.faces[view] = faces;
     }
 }
 

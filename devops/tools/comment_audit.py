@@ -11,7 +11,7 @@
 #     2. Process references in comments - work-item ids, stage numbers, plan
 #        decisions and site paths. These describe the work that produced the
 #        code, not the code, so they are the debt a cleanup removes first.
-#     3. History wording ("previously", "used to be", "formerly", ...), which
+#     3. History wording (the HISTORY_REFERENCE_PATTERNS list), which
 #        describes an older version of the file rather than the current one.
 #     4. TODO markers, and doc blocks longer than their budget (item docs and
 #        module headers have separate budgets).
@@ -105,11 +105,14 @@ PROCESS_REFERENCE_PATTERNS = (
     ("stage", re.compile(r"\bstage \d+\b", re.IGNORECASE)),
     ("plan decision", re.compile(r"\bdecision [A-Z]\d+\b")),
     ("site path", re.compile(r"\.construction_site\b|\.agents/")),
+    ("audit finding", re.compile(r"\bSA-\d{4}\b")),
+    ("audit opportunity", re.compile(r"\baudit opportunity \d+\b", re.IGNORECASE)),
+    ("plan section", re.compile(r"\b[a-z][a-z0-9_-]* plan, section [A-Z]\b", re.IGNORECASE)),
 )
 
 # Comment text that describes an older version of the code. "used to" alone is
 # excluded because "used to compute" states a current purpose; only the
-# history form "used to be" is counted.
+# history form ("used to" followed by "be") is counted.
 HISTORY_REFERENCE_PATTERNS = (
     ("previously", re.compile(r"\bpreviously\b", re.IGNORECASE)),
     ("used to be", re.compile(r"\bused to be\b", re.IGNORECASE)),

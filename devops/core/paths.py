@@ -15,7 +15,9 @@ DESCRIPTION
       tests/       standalone pass/fail suites plus their fixture crate
       core/        this package: shared code every script imports
       pill_lab/    the web app and the CLI that drives the scripts
-      ci_cd/       the container, the shell orchestrators, doc generation
+      ci_cd/       the CI gate, the release builds and the container
+      docs/        the rustdoc -> Markdown documentation pipeline
+      tools/       builders, probes and one-off repository tools
 
 --- SCRIPT ---
 """
@@ -29,7 +31,8 @@ DEVOPS_ROOT = Path(__file__).resolve().parent.parent
 # devops -> repository root
 REPOSITORY_ROOT = DEVOPS_ROOT.parent
 
-# The five devops directories, so no script has to hardcode a relative hop.
+# The devops directories a script reaches by constant, so none has to
+# hardcode a relative hop. `docs/` and `tools/` have no constant on purpose.
 BENCHMARKS_ROOT = DEVOPS_ROOT / "benchmarks"
 TESTS_ROOT = DEVOPS_ROOT / "tests"
 CORE_ROOT = DEVOPS_ROOT / "core"
@@ -63,18 +66,12 @@ TEST_FIXTURE_PROJECT = TESTS_ROOT / "project"
 MEASUREMENTS_ROOT = PILL_LAB_ROOT / "measurements"
 MANIFEST_PATH = MEASUREMENTS_ROOT / "index.json"
 
-# The standalone host binary the startup measurements launch.
-HOST_EXECUTABLE = CARGO_TARGET_ROOT / "debug" / "pill_standalone.exe"
-# The `pill_engine` smoke binary used for the engine-initialization timing.
-ENGINE_SMOKE_EXECUTABLE = CARGO_TARGET_ROOT / "debug" / "pill_engine.exe"
-
-
 def executable_name(stem: str) -> Path:
     """Returns the debug-profile binary path for a crate, per platform.
 
-    Windows appends `.exe`; every other platform uses the bare stem. The
-    constants above are the Windows spelling because development happens
-    there, and this helper keeps the non-Windows case working.
+    Windows appends `.exe`; every other platform uses the bare stem. This is
+    the one spelling of a built binary: a caller that hardcodes `.exe` breaks
+    `--skip-build` everywhere else.
     """
     import platform
 

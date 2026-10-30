@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- The one Roslyn version every project in this workspace shares, read by
+       the generator test's in-memory compilation. -->
+  <Import Project="../../../Roslyn.props" />
+
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
@@ -22,6 +26,14 @@
     <ProjectReference Include="../generators/PillIterationGenerators.csproj"
                       OutputItemType="Analyzer"
                       ReferenceOutputAssembly="false" />
+    <!-- The AOT registry generator, referenced as an ordinary assembly so the
+         test can drive it over an in-memory compilation. -->
+    <ProjectReference Include="../macros/PillCSharpRuntimeMacros.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp"
+                      Version="$(PillRoslynVersion)" />
   </ItemGroup>
 
 </Project>

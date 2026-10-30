@@ -17,7 +17,7 @@ DESCRIPTION
 
       0. The committed bundle stub is project-agnostic, so no shipping binary
          can be type-checked against a stale generation of another project
-         (W-0082). This runs before the bundle is generated, over the
+. This runs before the bundle is generated, over the
          committed files.
       1. The binary contains none of the strings only the reloading path
          produces, which shows that machinery was gated out rather than merely
@@ -95,7 +95,7 @@ PROJECT_TOKEN = "[project]"
 # Proof that the statically linked modules initialized too.
 MODULE_TOKEN = "extension linked"
 
-# The embedded pack indexed by guid (W-0048): the example ships one standalone
+# The embedded pack indexed by guid: the example ships one standalone
 # asset (`res/dwdw.render_pass`), so the index holds at least one record.
 PACK_DATABASE_PATTERN = re.compile(r"database indexed from the embedded pack\s+assets=([0-9]+)")
 
@@ -138,7 +138,7 @@ def stub_failure() -> str:
     The stub is committed only so cargo can resolve `pill_standalone`'s
     optional path dependency on a fresh clone. A stub that is a real
     generation is a bundle that compiles, so the shipping posture can be
-    type-checked - and shipped - against some other project (W-0082).
+    type-checked - and shipped - against some other project.
 
     A tree that holds a generated bundle (an earlier build's output) is asked
     to restore the stub rather than skipped: the file it leaves behind is
@@ -262,8 +262,8 @@ def cargo_child_processes(parent_id: int) -> int:
     actually promising.
 
     `Get-CimInstance Win32_Process` is the query that survives on current
-    Windows: `wmic` was removed, and its absence used to be swallowed as "zero
-    children". Raises [`ProcessToolUnavailable`] when the query cannot be run.
+    Windows: `wmic` is gone, and its absence is reported as
+    [`ProcessToolUnavailable`] rather than swallowed as "zero children".
     """
     if os.name != "nt":
         try:

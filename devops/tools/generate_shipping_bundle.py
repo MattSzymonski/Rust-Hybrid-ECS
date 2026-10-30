@@ -35,7 +35,7 @@
 #   assets from its own binary, wherever it runs. A browser build cannot: a
 #   wasm module is downloaded whole, so `--web` packs the directory beside the
 #   crate instead and the bundle names it in `StaticProject::asset_pack_url`
-#   for `pill_web` to fetch (W-0105). `devops/tools/build_web.py` copies the
+#   for `pill_web` to fetch. `devops/tools/build_web.py` copies the
 #   file next to the page.
 #
 #   With `--web` it also writes the web app crate, `build/pill_web_app`: a
@@ -101,7 +101,7 @@ EXTENSION_DIRECTORY = Path("modules") / "extensions"
 # `modules/extensions/<extension>/<crate>/`.
 # Suffix of an extension's editor crate, which no shipped build ever links.
 EDITOR_CRATE_SUFFIX = "_editor"
-# An editor build (W-0029) also links the egui shell, an editor-only
+# An editor build also links the egui shell, an editor-only
 # extension crate, and compiles the UI canvas's element id into the web app.
 EDITOR_EGUI_SHELL_CRATE_NAME = "pill_editor_shell_egui_editor"
 EDITOR_FRONTENDS = ("egui",)
@@ -129,7 +129,7 @@ ASSETS_DIRECTORY_NAME = "res"
 ASSETS_CRATE_DIRECTORY = Path("modules") / "assets" / "pill_assets"
 ASSET_PACK_FILE_NAME = "assets.pillpack"
 # Where a web bundle's build script packs it: beside the crate, because a
-# browser fetches it and must not carry it inside the module (W-0105).
+# browser fetches it and must not carry it inside the module.
 WEB_PACK_DIRECTORY = "pack"
 BUILD_SCRIPT_FILE_NAME = "build.rs"
 # The web app crate `--web` writes, the frontend it runs on, and the id of the
@@ -500,10 +500,10 @@ def build_cargo_manifest(
         # The native project itself, so `project::init` is nameable. Any
         # requested feature the project actually declares is enabled so the
         # static binary matches a dev build; cargo does not propagate the
-        # host's features here. `rendering` used to be such a feature and no
-        # longer is: the renderer left `pill_engine`, so a windowed ship is
-        # requested on the HOST (`pill_standalone/rendering`) and the filter
-        # below simply drops the name here. A managed project is a dotnet
+        # host's features here. `rendering` is not a project feature: the
+        # renderer lives outside `pill_engine`, so a windowed ship is requested
+        # on the HOST (`pill_standalone/rendering`) and the filter below drops
+        # the name here. A managed project is a dotnet
         # assembly, so it has no cargo dependency to declare.
         # The feature list is built outside the f-string: nesting the same
         # quote character inside an f-string expression is only valid on
@@ -545,7 +545,7 @@ def build_build_script(bundle_directory: Path, assets_directory: Path, web: bool
     """Builds the bundle's build.rs, which packs `assets_directory`.
 
     A native bundle packs into `OUT_DIR`, where `src/lib.rs` embeds it. A web
-    bundle cannot embed it - the whole point of the split (W-0105) is that the
+    bundle cannot embed it - the whole point of the split is that the
     module stays small - so it packs beside the crate instead, where
     `build_web.py` picks the file up and puts it next to the page.
 
@@ -556,7 +556,7 @@ def build_build_script(bundle_directory: Path, assets_directory: Path, web: bool
     if web:
         output_lines = [
             "    // Beside the crate, not in OUT_DIR: the browser fetches it, so it",
-            "    // must not be inside the module (W-0105).",
+            "    // must not be inside the module.",
             f'    let output = manifest_directory.join("{WEB_PACK_DIRECTORY}")',
             f'        .join("{ASSET_PACK_FILE_NAME}");',
             f'    std::fs::create_dir_all(output.parent().expect("{WEB_PACK_DIRECTORY} has a parent"))',
@@ -565,7 +565,7 @@ def build_build_script(bundle_directory: Path, assets_directory: Path, web: bool
         responsibilities = [
             "//! - Pack the project's `res` directory beside this crate, where",
             "//!   `build_web.py` copies it next to the page: a browser build",
-            "//!   fetches its assets instead of embedding them (W-0105).",
+            "//!   fetches its assets instead of embedding them.",
         ]
     else:
         output_lines = [
@@ -628,12 +628,12 @@ def build_library_source(
     `logging` is the validated `logging:` section, from `load_logging`.
     `debug_draw` is the `debug_draw:` key, from `load_debug_draw`.
     `web` emits the browser posture's asset fields: a fetched pack instead of
-    an embedded one (W-0105).
+    an embedded one.
     """
     assets_responsibility = (
         [
             "//! - Fetch the project's asset pack beside the page instead of",
-            "//!   embedding it (W-0105), and describe them as the `StaticProject`",
+            "//!   embedding it, and describe them as the `StaticProject`",
             "//!   the browser frontends run.",
         ]
         if web
@@ -814,9 +814,8 @@ def build_web_app_source(
     """Builds the web app crate's src/lib.rs: the browser entry point.
 
     `editor` emits the editor posture's entry point: the shell draws on a
-    second canvas above the scene's. `editor_frontend` names the runner; only
-    the egui one (W-0029) exists since the `pill_ui` posture retired
-    (W-0030 Stage 2).
+    second canvas above the scene's. `editor_frontend` names the runner, and
+    the only runner the page accepts is the egui one.
     """
     if editor:
         entry = (
@@ -828,7 +827,7 @@ def build_web_app_source(
         )
         responsibilities = (
             "//! - Run the shipping bundle's project as the egui editor in the\n"
-            "//!   page's canvases (W-0029) when the browser has instantiated\n"
+            "//!   page's canvases when the browser has instantiated\n"
             "//!   this module: the scene below, the egui shell's UI above."
         )
     else:

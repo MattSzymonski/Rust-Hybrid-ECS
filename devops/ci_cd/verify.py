@@ -153,7 +153,7 @@ STEPS: List[Step] = [
     #
     # `--all-targets` adds the test, example and bench targets. Without it a
     # warning in a `#[cfg(test)]` module went unseen: those targets are built
-    # by `cargo test` and nextest, and neither denies warnings (W-0087).
+    # by `cargo test` and nextest, and neither denies warnings.
     Step(
         "clippy",
         "Clippy (default posture, every target)",
@@ -165,7 +165,7 @@ STEPS: List[Step] = [
     # variable would replace the workspace's `-C prefer-dynamic` instead of
     # adding to it (see `modules/.cargo/config.toml`). `-- -D warnings` reaches
     # rustc without touching rustflags, so a warning in a posture fails its
-    # step (W-0087).
+    # step.
     Step(
         "check-hot-patch",
         "Clippy (hot_patch posture)",
@@ -179,8 +179,8 @@ STEPS: List[Step] = [
         #
         # The bundle is generated first: the committed stub is deliberately
         # project-agnostic and refuses to compile, so without this step the
-        # shipping posture would either fail on the stub or - as it did before
-        # W-0082 - type-check against a stale generation of some other project.
+        # shipping posture would either fail on the stub or type-check against
+        # a stale generation of some other project.
         [
             # The generator is named by absolute path: the step runs from
             # `modules/`, where the cargo command below has to run.
@@ -210,9 +210,8 @@ STEPS: List[Step] = [
         "Coding standards lint",
         # Repository-root scope, through the lint's own `is_linted`: the
         # changed-files hook imports the same predicate, so the two select the
-        # same file set (SA-0070; this step used to scan `--root modules`
-        # only, which left every example, the test project and the shipping
-        # bundle unlinted in CI while the hook still flagged them).
+        # same file set - every example, the test project and the shipping
+        # bundle included.
         # The self test first proves the egui-state rule still fails its
         # planted violation; the run then holds every .rs file to the rules.
         [
@@ -325,7 +324,7 @@ STEPS: List[Step] = [
         ],
         environment={"RUSTFLAGS": "", "RUSTC_WRAPPER": ""},
     ),
-    # The theme pipeline's game half (W-0127): the headless host on
+    # The theme pipeline's game half: the headless host on
     # `circus_demo`, the `.theme` override re-applying live, a refusal keeping
     # the applied theme, a project reload keeping it too, and the pack writer
     # keeping editor content out. A host-tier suite, so it runs before the

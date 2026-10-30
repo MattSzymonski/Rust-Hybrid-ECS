@@ -95,7 +95,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 
 # The shared settle: restoring a source and waiting for the reload it triggers
 # is the same step a suite scenario performs, so the harness uses that one
-# definition rather than its own copy (audit SA-0057).
+# definition rather than its own copy.
 from core.scenario import settle_restored_source  # noqa: E402
 
 # =============================================================================

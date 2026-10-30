@@ -7,9 +7,10 @@
     <LangVersion>latest</LangVersion>
 
     <!-- Unmanaged function pointers, [UnmanagedCallersOnly] entry points, and
-         the raw-pointer EngineApi/Engine facade all live in this project —
-         see csharp_features.md's "Trust and sandboxing model" section for why this is
-         deliberately the *only* project in the C# path allowed to do so. -->
+         the raw-pointer EngineApi/Engine facade all live in this project, the
+         only project in the C# path allowed to use them. The project assembly
+         is trusted because it is the user's own build output; AllowUnsafeBlocks
+         guards a keyword, not memory safety. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
     <!-- This is a library, but the Rust host loads it via hostfxr, which needs

@@ -3,7 +3,8 @@
 //! # Responsibilities
 //!
 //! - `preferences_tab`: the editor-wide rows (seeded into the session's draft
-//!   buffers, saved as one batch) and the project's gizmo rows.
+//!   buffers, saved as one batch or thrown away by a cancel) and the project's
+//!   gizmo rows.
 //!
 //! The globs below are absolute paths: a generated patch crate replays this
 //! file's top-level `use` lines, so a `super::`-relative glob would not
@@ -14,9 +15,10 @@ use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
 /// The Preferences tab: the editor-wide rows seeded from the preferences file
-/// and saved as one read-modify-write batch, then the project's remembered
-/// gizmo choices - the same `SetGizmoTool` commands the shortcuts, the menus
-/// and the scripted channel queue.
+/// and saved as one read-modify-write batch - or thrown away by a cancel,
+/// which re-seeds them from the file - then the project's remembered gizmo
+/// choices: the same `SetGizmoTool` commands the shortcuts, the menus and the
+/// scripted channel queue.
 #[pill_hot_fn]
 pub fn preferences_tab(
     ui: &mut egui::Ui,
@@ -66,13 +68,15 @@ pub fn preferences_tab(
             });
         }
         let mut save = false;
+        let mut cancel = false;
+        // The pair wears the kit's chunky face: Save is the accent one, the
+        // action the tab exists for.
+        let theme = style::current_theme();
         ui.horizontal(|ui| {
             save = ui
-                .add(icons::IconButton::new(
-                    icons::Icon::FloppyDisk,
-                    "Save preferences",
-                ))
+                .add(kit::ChunkyButton::new("Save preferences", &theme).accent(true))
                 .clicked();
+            cancel = ui.add(kit::ChunkyButton::new("Cancel", &theme)).clicked();
         });
         if save {
             let values = preferences::PREFERENCE_FIELDS
@@ -91,6 +95,15 @@ pub fn preferences_tab(
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,
                 "[editor] preferences save queued"
+            );
+        }
+        if cancel {
+            // A cancel throws the edits away: the rows re-seed from the file
+            // on the next frame, exactly as they do after a save.
+            *draft = None;
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                "[editor] preferences cancel"
             );
         }
         ui.separator();

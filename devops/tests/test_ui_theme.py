@@ -1,5 +1,5 @@
 """
-End-to-end theme suite for Rust-Hybrid-ECS (W-0127 Stage 9).
+End-to-end theme suite for Rust-Hybrid-ECS.
 
 PROTECTS: The game half of the theme pipeline: the `.theme` override, live re-apply, refusals, fonts and packing.
 TIER: host
@@ -13,7 +13,7 @@ DESCRIPTION
     Drives the headless dev host on `examples/circus_demo` - whose code default
     is the brutalist recipe, whose `res/ui/accent.theme` overrides the accent
     and the heading size, and whose body font is `res/fonts/Silkscreen`
-    (W-0127) - and checks the game half of the theme pipeline end to end:
+ - and checks the game half of the theme pipeline end to end:
 
       1. startup - the UI logs `[ui] fonts installed` with a signature, then
          `[ui] theme applied layers=code,file path=ui/accent.theme` with the

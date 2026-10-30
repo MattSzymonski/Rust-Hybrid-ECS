@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pill comment and layout lint for every Rust source file in the repository.
+Pill comment and layout lint for the Rust, shader, managed and devops sources.
 
 PROTECTS: Every .rs file follows the Pill comment and layout rules.
 TIER: static
@@ -9,42 +9,21 @@ REQUIREMENTS: Python 3.8+ (standard library only).
 
 DESCRIPTION
     Lints every `.rs` file under the repository against the Pill comment and
-    layout rules (see the Pill Guide, "Contributing / Coding standards"). The
-    checks are line-oriented heuristics, so they are a fast first-pass signal,
-    not a substitute for a full per-file audit.
+    layout rules (see the Pill Guide, "Contributing / Coding standards"), and
+    holds shader sources and the managed and devops comment trees to the same
+    comment-content ban. The checks are line-oriented heuristics, so they are
+    a fast first-pass signal, not a substitute for a full per-file audit.
 
-    The heuristics were ported from an earlier shell script, deliberate
-    exemptions included.
+    Deliberate exemptions are listed beside the rule they weaken.
 
-    Checks performed:
-      1. module header   - every file opens with a `//!` block and contains a
-                           `# Responsibilities` section.
-      2. safety comments - every `unsafe` token outside a string literal has a
-                           `// SAFETY:` (or `# Safety`) justification within a
-                           bounded window
-                           above it.
-      3. public docs     - every `pub` item (fn/struct/enum/trait/const/
-                           static/type/mod) is preceded by a `///` doc comment.
-      4. import groups   - the `// Standard library`, `// External crates` and
-                           `// Current crate` headers appear in that order.
-      5. tests at bottom - no new top-level section starts after `mod tests`.
-      6. egui state     - a reloadable crate (`extensions/**`, `examples/**`)
-                          never stores its own types or callbacks inside
-                          egui's `Context` (plan decision E4, W-0017): no
-                          `data`/`data_mut`, repaint callbacks, plugin
-                          callbacks or `PaintCallback` shapes.
-      7. colour literals - the editor's UI code takes its colours from the
-                          theme (W-0127): `pill_editor_core::style` owns the
-                          tokens and the shell asks for a role, so a
-                          `Color32::` literal there is refused except at the
-                          colour-maths sites listed beside the rule.
-      8. comment content - a `modules/` comment carries no work-item id,
-                          stage number, plan decision or construction-site
-                          path. The rule is strict: there is no allowance.
+    The checks are the eleven `section()` titles `main()` prints, in run
+    order: module headers, safety comments, public docs, import groups, tests
+    placement, egui state, colour literals, comment content (Rust, managed and
+    devops), shell patch openings, shader comment content and shell re-export
+    blocks. That list is the single source; this header does not repeat it.
 
-    The two window sizes are tunable through the environment, matching the
-    shell version: `SAFETY_WINDOW_LINES` (default 30) and `DOC_WINDOW_LINES`
-    (default 12).
+    The two window sizes are tunable through the environment:
+    `SAFETY_WINDOW_LINES` (default 30) and `DOC_WINDOW_LINES` (default 12).
 
 USAGE
   python devops/tests/test_coding_standards.py [--root <path>] [--list]
@@ -70,11 +49,14 @@ EXAMPLE USAGE
 """
 
 import argparse
+import ast
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tokenize
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -137,10 +119,8 @@ BUILD_SOURCE_CRATES = ("pill_shipping_bundle",)
 # =============================================================================
 # Patterns
 #
-# Translated from the awk programs in the shell version. awk's `\b` is a
-# backspace, so the original spelled word boundaries out as explicit character
-# classes; those are kept verbatim rather than replaced with `\b`, so the two
-# implementations cannot diverge on an edge case.
+# Word boundaries are spelled out as explicit character classes rather than
+# `\b`, so a pattern cannot depend on a regex engine's boundary rules.
 # =============================================================================
 
 SAFETY_MARKER_PATTERN = re.compile(r"// *SAFETY:|# *Safety")
@@ -199,11 +179,42 @@ PROCESS_REFERENCE_PATTERNS = (
     ("stage", re.compile(r"\bstage \d+\b", re.IGNORECASE)),
     ("plan decision", re.compile(r"\bdecision [A-Z]\d+\b")),
     ("site path", re.compile(r"\.construction_site\b|\.agents/")),
+    ("audit finding", re.compile(r"\bSA-\d{4}\b")),
+    ("audit opportunity", re.compile(r"\baudit opportunity \d+\b", re.IGNORECASE)),
+    ("plan section", re.compile(r"\b[a-z][a-z0-9_-]* plan, section [A-Z]\b", re.IGNORECASE)),
 )
 
-# The content guard covers the engine's sources only. Example projects and
-# the non-Rust tooling have their own cleanup item.
-COMMENT_CONTENT_SCOPE = "modules/"
+# The content guard covers the engine's sources and the one tracked crate
+# under `build/` (the shipping bundle stub). The managed and devops trees have
+# their own scopes and carry a per-file allowance while their debt is swept; a
+# path with no entry is allowed zero references.
+COMMENT_CONTENT_SCOPE = (
+    "modules",
+    "build/pill_shipping_bundle",
+)
+CSHARP_COMMENT_CONTENT_ROOTS = (
+    "modules/csharp",
+    "examples/project_cs/src",
+    "examples/italian_brainrot_cs/src",
+    "examples/project_cs_bench/src",
+)
+# Build output inside a C# tree, never source.
+CSHARP_EXCLUDED_DIRECTORY_NAMES = {"bin", "obj"}
+
+# The devops tooling's own guard: full-line `#` comments and docstrings.
+DEVOPS_COMMENT_CONTENT_SCOPE = "devops/"
+PYTHON_EXCLUDED_DIRECTORY_NAMES = {
+    "__pycache__",
+    ".git",
+    "local",
+    "node_modules",
+    "target",
+}
+
+COMMENT_BASELINE_PATH = (
+    REPOSITORY_ROOT / "devops" / "tests" / "comment_content_baseline.json"
+)
+COMMENT_BASELINE_FORMAT_VERSION = 1
 
 # The editor shell's hot-patch contract. A patch crate is the edited file's
 # top-level `use` lines plus the crate's own glob, so a module that names
@@ -222,8 +233,8 @@ SHELL_ROOT_SOURCE = "/pill_editor_shell_egui_editor/src/shell.rs"
 PUB_MODULE_DECLARATION_PATTERN = re.compile(r"^pub mod ([A-Za-z0-9_]+);$")
 PUB_MODULE_REEXPORT_PATTERN = re.compile(r"^pub use ([A-Za-z0-9_]+)::")
 
-# The APIs that keep boxed `Any`/`Fn` values inside egui's `Context` (plan
-# decision E4, W-0017). A reloadable crate that stores its own types or
+# The APIs that keep boxed `Any`/`Fn` values inside egui's `Context`.
+# A reloadable crate that stores its own types or
 # callbacks through them leaves dangling type IDs, drop code and vtables
 # behind after a reload, so the egui shell keeps its long-lived state in a
 # world resource instead; the contract is documented in `pill_editor_core`'s
@@ -279,7 +290,7 @@ EGUI_CONTEXT_STORAGE_PATTERNS = (
 # never does, and the exemption is per line so it cannot cover a module.
 EGUI_STATE_MARKER_PATTERN = re.compile(r"egui-state-ok")
 
-# The editor's look lives in theme tokens (W-0127): `pill_editor_core::style`
+# The editor's look lives in theme tokens: `pill_editor_core::style`
 # owns the tokens and the shell asks for a role ([`text`], [`panel`], ...). A
 # `Color32::` literal in the editor's UI code is a colour that bypasses the
 # theme, so it is refused everywhere except at the sites whose job IS colour
@@ -291,7 +302,7 @@ COLOUR_LITERAL_AREAS = (
     "modules/extensions/pill_editor_shell_egui/",
     "modules/frontends/pill_web/src",
     # The kit translates and draws from the same tokens: a literal here would
-    # bypass the theme for both UIs at once (W-0127 Stage 8).
+    # bypass the theme for both UIs at once.
     "modules/ui/pill_ui_kit/src",
 )
 
@@ -471,8 +482,7 @@ def find_rust_files(root: Path, excludes: Optional[List[Path]] = None) -> List[P
     """Returns every `.rs` file under a root, skipping build and VCS output.
 
     A single `.rs` file is a valid root, mirroring `find` accepting a file
-    path. Results are sorted by their POSIX string so the order matches the
-    shell version's `LC_ALL=C sort`.
+    path. Results are sorted by their POSIX string.
 
     `excludes` names files or directory subtrees to leave out entirely - the
     escape hatch for a tree that is being brought to the standard rather than
@@ -523,6 +533,117 @@ def find_shader_files(root: Path, excludes: Optional[List[Path]] = None) -> List
     return sorted(discovered, key=lambda path: path.as_posix())
 
 
+def find_csharp_files(root: Path) -> List[Path]:
+    """Every `.cs` source under a root, skipping build output and VCS data."""
+    if root.is_file():
+        return [root] if root.suffix == ".cs" else []
+    discovered: List[Path] = []
+    for path in root.rglob("*.cs"):
+        if any(
+            part in CSHARP_EXCLUDED_DIRECTORY_NAMES or part in EXCLUDED_DIRECTORY_NAMES
+            for part in path.parts
+        ):
+            continue
+        discovered.append(path)
+    return sorted(discovered, key=lambda path: path.as_posix())
+
+
+def find_python_files(root: Path) -> List[Path]:
+    """Every `.py` source under a root, skipping caches and scratch trees."""
+    if root.is_file():
+        return [root] if root.suffix == ".py" else []
+    discovered: List[Path] = []
+    for path in root.rglob("*.py"):
+        if any(part in PYTHON_EXCLUDED_DIRECTORY_NAMES for part in path.parts):
+            continue
+        discovered.append(path)
+    return sorted(discovered, key=lambda path: path.as_posix())
+
+
+def collect_python_files(targets: List[Path]) -> List[Path]:
+    """The devops Python files the guard owns under the scan targets."""
+    if len(targets) == 1 and targets[0].resolve() == REPOSITORY_ROOT:
+        roots = [REPOSITORY_ROOT / "devops"]
+    else:
+        roots = targets
+    found: List[Path] = []
+    seen = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in find_python_files(root):
+            if not display_path_for(path).startswith(DEVOPS_COMMENT_CONTENT_SCOPE):
+                continue
+            key = path.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(path)
+    return sorted(found, key=lambda path: path.as_posix())
+
+
+def collect_csharp_files(targets: List[Path]) -> List[Path]:
+    """The C# files the guard owns under the given scan targets.
+
+    A bare run walks the three declared roots; a targeted run walks only what
+    the caller named, and the scope filter still keeps example projects that
+    are outside the guard out of the selection.
+    """
+    if len(targets) == 1 and targets[0].resolve() == REPOSITORY_ROOT:
+        roots = [REPOSITORY_ROOT / name for name in CSHARP_COMMENT_CONTENT_ROOTS]
+    else:
+        roots = targets
+    found: List[Path] = []
+    seen = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in find_csharp_files(root):
+            if not is_under_roots(display_path_for(path), CSHARP_COMMENT_CONTENT_ROOTS):
+                continue
+            key = path.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(path)
+    return sorted(found, key=lambda path: path.as_posix())
+
+
+def write_comment_baseline() -> int:
+    """Writes the C# process-reference counts as per-file allowances."""
+    csharp_counts: Dict[str, int] = {}
+    for root_name in CSHARP_COMMENT_CONTENT_ROOTS:
+        root = REPOSITORY_ROOT / root_name
+        if not root.exists():
+            continue
+        for path in find_csharp_files(root):
+            lines, _text = read_lines(path)
+            total, _counts = count_references_in_texts(csharp_comment_texts(lines))
+            if total:
+                csharp_counts[display_path_for(path)] = total
+    devops_counts: Dict[str, int] = {}
+    for path in find_python_files(REPOSITORY_ROOT / "devops"):
+        _lines, text = read_lines(path)
+        total, _counts = count_references_in_texts(python_comment_texts(text))
+        if total:
+            devops_counts[display_path_for(path)] = total
+    document = {
+        "format_version": COMMENT_BASELINE_FORMAT_VERSION,
+        "scopes": {
+            "csharp": dict(sorted(csharp_counts.items())),
+            "devops": dict(sorted(devops_counts.items())),
+        },
+    }
+    COMMENT_BASELINE_PATH.write_text(
+        json.dumps(document, indent=2) + "\n", encoding="utf-8"
+    )
+    print(
+        f"Wrote {len(csharp_counts)} C# and {len(devops_counts)} devops "
+        f"allowance(s) to {display_path_for(COMMENT_BASELINE_PATH)}"
+    )
+    return 0
+
+
 def display_path_for(path: Path) -> str:
     """Renders a path relative to the repository root when possible."""
     try:
@@ -542,7 +663,7 @@ def read_lines(path: Path) -> Tuple[List[str], str]:
 
 
 # =============================================================================
-# Check 1/5 - module header
+# Check - module header
 # =============================================================================
 
 
@@ -570,7 +691,7 @@ def check_module_header(
 
 
 # =============================================================================
-# Check 2/5 - safety comments near every `unsafe` token
+# Check - safety comments near every `unsafe` token
 # =============================================================================
 
 
@@ -637,7 +758,7 @@ def check_safety_comments(
 
 
 # =============================================================================
-# Check 3/5 - public items carry a `///` doc comment
+# Check - public items carry a `///` doc comment
 # =============================================================================
 
 
@@ -681,7 +802,7 @@ def check_public_item_docs(
 
 
 # =============================================================================
-# Check 4/5 - import group headers appear in order
+# Check - import group headers appear in order
 # =============================================================================
 
 
@@ -715,7 +836,7 @@ def check_import_group_order(
 
 
 # =============================================================================
-# Check 5/5 - tests section sits at the bottom
+# Check - tests section sits at the bottom
 # =============================================================================
 
 
@@ -832,7 +953,7 @@ def check_shell_reexport_blocks(
 
 
 # =============================================================================
-# Check 6/6 - no egui context storage in reloadable crates
+# Check - no egui context storage in reloadable crates
 # =============================================================================
 
 
@@ -882,7 +1003,7 @@ def check_colour_literals(
 ) -> None:
     """Flags `Color32::` literals outside the theme's colour-maths allowlist.
 
-    The editor's look is a theme (W-0127): `pill_editor_core::style` translates
+    The editor's look is a theme: `pill_editor_core::style` translates
     the tokens and the shell asks for a role, so a literal here is a colour the
     next restyle will miss. The allowlist is per line fragment, so an exempt
     site cannot cover the file it sits in.
@@ -905,12 +1026,12 @@ def check_colour_literals(
             display_path,
             "colour literal",
             f"line {index + 1}: `{match.group(0)}` bypasses the theme; ask "
-            "`pill_editor_core::style` for a role instead (W-0127)",
+            "`pill_editor_core::style` for a role instead",
         )
 
 
 # =============================================================================
-# Check 8/8 - comments carry no development-process references
+# Check - comments carry no development-process references
 # =============================================================================
 
 
@@ -938,18 +1059,32 @@ def count_process_references(lines: List[str]) -> Tuple[int, List[str]]:
     return sum(counts.values()), details
 
 
+def count_references_in_texts(texts: List[str]) -> Tuple[int, Dict[str, int]]:
+    """Counts process references across already-extracted comment texts.
+
+    The managed and devops extractors differ from the Rust one, so they hand
+    over the comment lines they found instead of sharing its `//` filter.
+    """
+    counts = {name: 0 for name, _pattern in PROCESS_REFERENCE_PATTERNS}
+    for text in texts:
+        for name, pattern in PROCESS_REFERENCE_PATTERNS:
+            counts[name] += len(pattern.findall(text))
+    return sum(counts.values()), {name: count for name, count in counts.items() if count}
+
+
 def check_comment_content(
     lines: List[str],
     display_path: str,
     collector: ViolationCollector,
 ) -> None:
-    """Refuses a process reference in a `modules/` comment.
+    """Refuses a process reference in an engine or shipping-stub comment.
 
-    Applies to `modules/` only: example projects are outside this guard's
+    Applies to `modules/` and the tracked `build/pill_shipping_bundle` crate:
+    example projects and generated build output are outside this guard's
     scope. A reference in code (a string literal, for instance) is not a
     comment and is not measured.
     """
-    if not display_path.startswith(COMMENT_CONTENT_SCOPE):
+    if not is_under_roots(display_path, COMMENT_CONTENT_SCOPE):
         return
     total, details = count_process_references(lines)
     if total == 0:
@@ -959,6 +1094,153 @@ def check_comment_content(
         display_path,
         "comment content",
         f"{total} process reference(s): {detail}",
+    )
+
+
+def csharp_comment_texts(lines: List[str]) -> List[str]:
+    """The full-line comments of a C# source: `//`, `///` and `/* ... */`.
+
+    A trailing comment after code is not measured, matching the Rust rule; a
+    block comment is measured on every line it spans.
+    """
+    texts: List[str] = []
+    in_block = False
+    for line in lines:
+        stripped = line.strip()
+        if in_block:
+            texts.append(stripped)
+            if "*/" in stripped:
+                in_block = False
+            continue
+        if stripped.startswith("//"):
+            texts.append(stripped)
+            continue
+        if stripped.startswith("/*"):
+            texts.append(stripped)
+            if "*/" not in stripped:
+                in_block = True
+    return texts
+
+
+def is_under_roots(display_path: str, roots: Tuple[str, ...]) -> bool:
+    """Whether a repo-relative path sits under one of the given roots."""
+    return any(
+        display_path == root or display_path.startswith(root + "/") for root in roots
+    )
+
+
+@lru_cache(maxsize=1)
+def comment_baseline() -> Dict[str, Dict[str, int]]:
+    """The per-file allowances by scope; an unreadable file allows nothing."""
+    try:
+        document = json.loads(COMMENT_BASELINE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(document, dict):
+        return {}
+    if document.get("format_version") != COMMENT_BASELINE_FORMAT_VERSION:
+        return {}
+    scopes = document.get("scopes")
+    return scopes if isinstance(scopes, dict) else {}
+
+
+def check_csharp_comment_content(
+    lines: List[str],
+    display_path: str,
+    collector: ViolationCollector,
+    allowance: Optional[int] = None,
+) -> None:
+    """Refuses a process reference in a managed source's comment.
+
+    The managed tree carries debt while it is swept, so each file gets the
+    allowance the baseline records; the stage that sweeps a file lowers it.
+    """
+    if not is_under_roots(display_path, CSHARP_COMMENT_CONTENT_ROOTS):
+        return
+    total, counts = count_references_in_texts(csharp_comment_texts(lines))
+    allowed = (
+        comment_baseline().get("csharp", {}).get(display_path, 0)
+        if allowance is None
+        else allowance
+    )
+    if total <= allowed:
+        return
+    detail = ", ".join(f"{name} {count}" for name, count in counts.items())
+    collector.record(
+        display_path,
+        "comment content (csharp)",
+        f"{total} process reference(s), allowance {allowed}: {detail or 'no details'}",
+    )
+
+
+def python_comment_texts(text: str) -> List[str]:
+    """The full-line `#` comments and docstrings of a Python source.
+
+    `tokenize` supplies the comments, `ast` the module, class and function
+    docstrings. A trailing comment after code is not measured, matching the
+    Rust rule; an unparsable file still yields its comments.
+    """
+    texts: List[str] = []
+    docstring_lines = set()
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        for node in ast.walk(tree):
+            if not isinstance(
+                node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                continue
+            body = getattr(node, "body", [])
+            if not body or not isinstance(body[0], ast.Expr):
+                continue
+            value = body[0].value
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                end = getattr(body[0], "end_lineno", body[0].lineno) or body[0].lineno
+                for number in range(body[0].lineno, end + 1):
+                    docstring_lines.add(number)
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type != tokenize.COMMENT:
+                continue
+            if token.line[: token.start[1]].strip():
+                continue
+            texts.append(token.string)
+    except (tokenize.TokenError, IndentationError):
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                texts.append(stripped)
+    lines = text.splitlines()
+    for number in sorted(docstring_lines):
+        if 1 <= number <= len(lines):
+            texts.append(lines[number - 1].strip())
+    return texts
+
+
+def check_python_comment_content(
+    text: str,
+    display_path: str,
+    collector: ViolationCollector,
+    allowance: Optional[int] = None,
+) -> None:
+    """Refuses a process reference in a devops Python comment or docstring."""
+    if not display_path.startswith(DEVOPS_COMMENT_CONTENT_SCOPE):
+        return
+    total, counts = count_references_in_texts(python_comment_texts(text))
+    allowed = (
+        comment_baseline().get("devops", {}).get(display_path, 0)
+        if allowance is None
+        else allowance
+    )
+    if total <= allowed:
+        return
+    detail = ", ".join(f"{name} {count}" for name, count in counts.items())
+    collector.record(
+        display_path,
+        "comment content (devops)",
+        f"{total} process reference(s), allowance {allowed}: {detail or 'no details'}",
     )
 
 
@@ -974,7 +1256,7 @@ def check_shader_comment_content(
     comments, and the header block a shader file opens with, carry the same
     ban the Rust rule enforces.
     """
-    if not display_path.startswith(COMMENT_CONTENT_SCOPE):
+    if not is_under_roots(display_path, COMMENT_CONTENT_SCOPE):
         return
     total, details = count_process_references(text.splitlines())
     if total == 0:
@@ -1184,7 +1466,8 @@ def self_test() -> int:
         passed &= outcome == "PASS"
         print(f"  {outcome}  {description}")
 
-    # Rule 7: a colour literal in the editor's UI code, unless allowlisted.
+    # Colour literals: a colour literal in the editor's UI code, unless
+    # allowlisted.
     colour_cases = (
         (
             "a colour literal in the editor shell fails",
@@ -1224,7 +1507,7 @@ def self_test() -> int:
         passed &= outcome == "PASS"
         print(f"  {outcome}  {description}")
 
-    # Rule 8: process references in engine comments.
+    # Comment content: process references in engine comments.
     comment_cases = (
         (
             "a clean comment passes",
@@ -1282,8 +1565,116 @@ def self_test() -> int:
         passed &= outcome == "PASS"
         print(f"  {outcome}  {description}")
 
-    # Rule 9: the same ban reaches a shader source, which has no code that
-    # could name a work item.
+    # Comment content, managed scope: the per-file allowance that the sweep
+    # lowers to zero.
+    csharp_cases = (
+        (
+            "a clean C# comment passes",
+            "modules/csharp/acme/src/Widget.cs",
+            "// The widget caches its layout until the next frame.\n",
+            0,
+            None,
+        ),
+        (
+            "a work item in a C# comment fails",
+            "modules/csharp/acme/src/Widget.cs",
+            "// the cache exists for this path (W-0001)\n",
+            1,
+            None,
+        ),
+        (
+            "a work item in a C# block comment fails",
+            "modules/csharp/acme/src/Widget.cs",
+            "/*\n * Cached (W-0001).\n */\n",
+            1,
+            None,
+        ),
+        (
+            "a C# path outside the scope passes",
+            "modules/engine/pill_core/src/Widget.cs",
+            "// W-0001\n",
+            0,
+            None,
+        ),
+        (
+            "one reference within the allowance passes",
+            "modules/csharp/acme/src/Widget.cs",
+            "// W-0001\n",
+            0,
+            1,
+        ),
+        (
+            "a reference above the allowance fails",
+            "modules/csharp/acme/src/Widget.cs",
+            "// W-0001 W-0002\n",
+            1,
+            1,
+        ),
+    )
+    for description, display_path, source, expected, allowance in csharp_cases:
+        collector = SilentCollector()
+        check_csharp_comment_content(
+            source.splitlines(), display_path, collector, allowance
+        )
+        outcome = "PASS" if collector.violation_count == expected else "FAIL"
+        passed &= outcome == "PASS"
+        print(f"  {outcome}  {description}")
+
+    # Comment content, devops scope: `#` comments and docstrings, with the
+    # same per-file allowance as the managed tree.
+    python_cases = (
+        (
+            "a clean Python comment passes",
+            "devops/tests/test_acme.py",
+            "# The cache holds one frame.\n",
+            0,
+            None,
+        ),
+        (
+            "a work item in a Python comment fails",
+            "devops/tests/test_acme.py",
+            "# the cache exists for this path (W-0001)\n",
+            1,
+            None,
+        ),
+        (
+            "a work item in a docstring fails",
+            "devops/tests/test_acme.py",
+            '"""The cache (W-0001)."""\n',
+            1,
+            None,
+        ),
+        (
+            "a trailing comment after code passes",
+            "devops/tests/test_acme.py",
+            "value = 1  # W-0001\n",
+            0,
+            None,
+        ),
+        (
+            "a Python path outside devops/ passes",
+            "modules/engine/pill_core/tool.py",
+            "# W-0001\n",
+            0,
+            None,
+        ),
+        (
+            "one reference within the Python allowance passes",
+            "devops/tests/test_acme.py",
+            "# W-0001\n",
+            0,
+            1,
+        ),
+    )
+    for description, display_path, source, expected, allowance in python_cases:
+        collector = SilentCollector()
+        check_python_comment_content(source, display_path, collector, allowance)
+        outcome = "PASS" if collector.violation_count == expected else "FAIL"
+        passed &= outcome == "PASS"
+        print(f"  {outcome}  {description}")
+
+    # Shader comment content: the same ban reaches a shader source, which has
+    # no code that could name a work item.
     shader_cases = (
         (
             "a work item in a shader header fails",
@@ -1352,7 +1743,8 @@ def self_test() -> int:
         passed &= outcome == "PASS"
         print(f"  {outcome}  {description}")
 
-    # Rule 11: the shell root's re-export wall keeps one block per module.
+    # Shell re-export blocks: the shell root's re-export wall keeps one block
+    # per module.
     shell_root = (
         "modules/extensions/pill_editor_shell_egui/pill_editor_shell_egui_editor/src/shell.rs"
     )
@@ -1472,6 +1864,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the planted-violation self tests, then exit",
     )
     parser.add_argument(
+        "--write-comment-baseline",
+        action="store_true",
+        dest="write_comment_baseline",
+        help="Write the per-file comment-content allowances, then exit",
+    )
+    parser.add_argument(
         "--report",
         metavar="PATH",
         help="Write a JSON report of the checked files and violations to PATH",
@@ -1524,8 +1922,7 @@ def write_report(path: Path, files: List[Path], collector: ViolationCollector) -
 def resolve_targets(arguments: argparse.Namespace) -> List[Path]:
     """Resolves the scan targets from `--root` or the positional paths.
 
-    Raises `SystemExit(2)` on a usage error, matching the shell version's
-    exit-status contract.
+    Raises `SystemExit(2)` on a usage error.
     """
     if arguments.target:
         targets = [Path(entry) for entry in arguments.target]
@@ -1546,6 +1943,8 @@ def main() -> int:
     if arguments.self_test:
         print(colorize("Pill comment & layout lint - self test", ANSI_BOLD))
         return self_test()
+    if arguments.write_comment_baseline:
+        return write_comment_baseline()
     targets = resolve_targets(arguments)
     files = collect_files(targets, [Path(entry) for entry in arguments.exclude])
 
@@ -1566,9 +1965,16 @@ def main() -> int:
         return 0
 
     collector = ViolationCollector()
-    # Every file is read once and its lines reused by all eight checks; the
-    # shell version re-read each file per check.
+    # Every file is read once and its lines reused by all eleven checks.
     sources = [(path, display_path_for(path), *read_lines(path)) for path in files]
+    csharp_files = collect_csharp_files(targets)
+    csharp_sources = [
+        (display_path_for(path), *read_lines(path)) for path in csharp_files
+    ]
+    python_files = collect_python_files(targets)
+    python_sources = [
+        (display_path_for(path), read_lines(path)[1]) for path in python_files
+    ]
 
     section("(1/11) Module header")
     for _, display_path, lines, text in sources:
@@ -1599,9 +2005,13 @@ def main() -> int:
     for _, display_path, lines, _text in sources:
         check_colour_literals(lines, display_path, collector)
 
-    section("(8/11) comment content (modules/)")
+    section("(8/11) comment content (modules/, csharp, devops)")
     for _, display_path, lines, _text in sources:
         check_comment_content(lines, display_path, collector)
+    for display_path, lines, _text in csharp_sources:
+        check_csharp_comment_content(lines, display_path, collector)
+    for display_path, text in python_sources:
+        check_python_comment_content(text, display_path, collector)
 
     section("(9/11) shell patch openings (editor shell)")
     for _, display_path, lines, _text in sources:

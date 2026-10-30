@@ -188,7 +188,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     if has("modules/editor/pill_editor/**", "modules/extensions/pill_editor_shell_egui/**"):
         selected.append(suite_check("test_editor_egui.py", "editor shell or frontend changed"))
 
-    # pill_project_ui: the in-game egui UI (W-0028). Its own unit tests cover the
+    # pill_project_ui: the in-game egui UI. Its own unit tests cover the
     # input bridge, the tessellator and the texture mirror; the painter it
     # feeds is the renderer's `ui` module, whose tests cover the draw lists. The slot it
     # publishes into is `pill_ui_frame`'s, so a change here also moves what every
@@ -200,7 +200,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                     ("test", "-p", "pill_ui_frame", "--offline"),
                                     "pill_project_ui changed"))
 
-    # The theme pipeline (W-0127): the token crate, the UI kit and the three
+    # The theme pipeline: the token crate, the UI kit and the three
     # places that configure it - the editor's style module, the editor's
     # settings file in the host, and the game UI that installs it. The crates'
     # unit tests plus the two suites that read the pipeline's log lines; the

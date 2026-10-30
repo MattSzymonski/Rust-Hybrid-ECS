@@ -100,7 +100,7 @@ harness = load_module("benchmarks/hot_reload_harness.py", "hot_reload_harness")
 coverage = load_module("tests/test_hot_patch_coverage.py", "test_hot_patch_coverage")
 
 # The engine sources the two rules under test are defined in. Read as text: a
-# rule that moved, was renamed or was reworded fails the check that reads it.
+# rule that moves, is renamed or is reworded fails the check that reads it.
 PILL_HOST_SOURCE = MODULES_ROOT / "hosting" / "pill_host" / "src"
 ANALYTICS_SOURCE = PILL_HOST_SOURCE / "analytics.rs"
 BUILD_RUNNER_SOURCE = PILL_HOST_SOURCE / "build_runner.rs"
@@ -645,13 +645,13 @@ def check_example_projects_come_from_manifests() -> None:
 
 
 def check_hook_and_ci_lint_the_same_files() -> None:
-    """Stage 16's acceptance check (SA-0070): one scope predicate.
+    """The hook and CI select the same files: one scope predicate.
 
     CI scans the repository through the lint's `is_linted`, and the
     changed-files hook imports that same predicate, so a file can no longer
-    pass one and fail the other. The CI step must also stop overriding its
-    root - the `--root modules` scan is how 27 tracked files outside
-    `modules/` went unlinted while the hook still flagged them.
+    pass one and fail the other. The CI step must run from the repository
+    root: a `--root modules` scan leaves tracked files outside `modules/`
+    unlinted while the hook still flags them.
     """
     verify_steps = load_module("ci_cd/verify.py", "verify_steps")
     step = next((step for step in verify_steps.STEPS if step.name == "coding-standards"), None)
@@ -716,7 +716,7 @@ def check_hook_and_ci_lint_the_same_files() -> None:
 
 
 def check_the_gate_denies_warnings_everywhere() -> None:
-    """Stage W-0087: `-D warnings` reaches every target and every posture.
+    """`-D warnings` reaches every target and every posture.
 
     The workspace's `Cargo.toml` promises a zero-warning build in every
     feature configuration, but a lint only fails a build when the command

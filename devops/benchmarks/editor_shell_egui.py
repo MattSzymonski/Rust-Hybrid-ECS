@@ -2,7 +2,7 @@
 """
 Editor Shell (egui) benchmark: the egui editor's warm startup, steady-state
 frame rate, idle CPU and its per-update UI time, with the D32 comparison
-ratios (W-0037 Stage 0; the measured baseline W-0008's targets were about).
+ratios: the targets the native editor missed, measured on its replacement.
 
 REQUIREMENTS: Python 3.8+, a built `pill_editor` and `pill_standalone`
 (prefers the `dev-optimized` profile: `cargo build -p pill_editor
@@ -10,9 +10,8 @@ REQUIREMENTS: Python 3.8+, a built `pill_editor` and `pill_standalone`
 and a GPU the windowed editor can render with.
 
 DESCRIPTION
-    The egui counterpart of `editor_shell.py`, so W-0037's performance stage
-    has a number to move and W-0008's missed D32 targets are visible on the
-    editor that replaces the native one:
+    The egui counterpart of `editor_shell.py`, so the D32 targets the native
+    editor missed stay measurable on the editor that replaces it:
 
       editor_startup         spawn -> "[editor] window created", warm start
       editor_first_frame     spawn -> the first "[editor] scene frame report"
@@ -48,12 +47,15 @@ EXAMPLE USAGE
 
 import argparse
 import os
+import ctypes
+import os
 import re
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -64,21 +66,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core.cli import add_json_flag, banner, run_standalone, store_measurement  # noqa: E402
 from core.paths import MODULES_ROOT  # noqa: E402
-from editor_shell import (  # noqa: E402
-    D32_FPS_RATIO_MIN,
-    D32_IDLE_CPU_LIMIT_PERCENT,
-    D32_STARTUP_RATIO_MAX,
-    D32_UI_REDRAW_LIMIT_MS,
-    IDLE_SETTLE_SECONDS,
-    STARTUP_TIMEOUT_SECONDS,
-    WARMUP_SECONDS,
-    kill_standalones,
-    measure_standalone,
-    process_cpu_seconds,
-    profile_binary,
-    read_log,
-    wait_for,
-)
 
 CATEGORY = "editor_shell_egui"
 
@@ -99,6 +86,26 @@ PAUSE_TOKEN = re.compile(r"\[editor\] engine commands applied")
 
 DEFAULT_PROJECT = "../examples/circus_demo"
 EDITOR_START_BUDGET_SECONDS = 30
+
+# A first launch after module changes compiles them; it is discarded so the
+# measured startups are warm.
+WARMUP_SECONDS = 180
+STARTUP_TIMEOUT_SECONDS = 300
+STANDALONE_START_TIMEOUT_SECONDS = 300
+
+# The D32 targets.
+D32_UI_REDRAW_LIMIT_MS = 2.0
+D32_IDLE_CPU_LIMIT_PERCENT = 1.0
+D32_FPS_RATIO_MIN = 0.95
+D32_STARTUP_RATIO_MAX = 1.5
+
+# Seconds between pausing the project and sampling the idle CPU, so the loop
+# has settled into its quiet heartbeat first.
+IDLE_SETTLE_SECONDS = 3.0
+
+# The standalone's own tokens: the project-loop entry and its frame line.
+STANDALONE_LOOP_TOKEN = re.compile(r"Entering project loop")
+STANDALONE_FPS_PATTERN = re.compile(r"(\d+(?:\.\d+)?) FPS \|")
 
 # The profile `--profile` selected; `None` keeps `profile_binary`'s preference
 # order (dev-optimized, release, debug).
@@ -130,6 +137,163 @@ def kill_editors() -> None:
         stderr=subprocess.DEVNULL,
         check=False,
     )
+
+
+# =============================================================================
+# Shared launch and sampling helpers
+#
+# The native benchmark this file replaced was their only other consumer; it
+# is gone, so they live here instead of in a module that no longer exists.
+# =============================================================================
+
+
+def profile_binary(name: str) -> Path:
+    """A built binary: the dev-optimized profile first (hot reload works at
+    opt-level 3), then release, then the dev build."""
+    suffix = ".exe" if os.name == "nt" else ""
+    for profile in ("dev-optimized", "release", "debug"):
+        candidate = MODULES_ROOT / "target" / profile / f"{name}{suffix}"
+        if candidate.is_file():
+            return candidate
+    raise SystemExit(
+        f"{name} binary not found; build it first (in modules/): "
+        f"cargo build -p {name} --profile dev-optimized"
+    )
+
+
+def standalone_binary() -> Path:
+    """The standalone executable for the fps comparison."""
+    return profile_binary("pill_standalone")
+
+
+def kill_standalones() -> None:
+    """Kills stray standalone hosts so they cannot fight this run over the
+    module build directory."""
+    subprocess.run(
+        ["taskkill", "/F", "/IM", "pill_standalone.exe"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def process_cpu_seconds(pid: int) -> float:
+    """The process's own kernel+user CPU time, in seconds (Windows)."""
+    query_limited_information = 0x1000
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(query_limited_information, False, pid)
+    if not handle:
+        raise RuntimeError(f"could not open process {pid} for CPU sampling")
+    try:
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        ok = kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+        if not ok:
+            raise RuntimeError(f"GetProcessTimes failed for process {pid}")
+
+        def seconds(filetime: "wintypes.FILETIME") -> float:
+            ticks = (filetime.dwHighDateTime << 32) | filetime.dwLowDateTime
+            return ticks / 1e7
+
+        return seconds(kernel) + seconds(user)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def read_log(path: Path) -> str:
+    """The log so far, tolerant of a file the writer holds open."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def wait_for(
+    process: subprocess.Popen, log_path: Path, pattern: re.Pattern, timeout: float
+) -> float:
+    """Waits for `pattern` in the log; returns the wall time when it began
+    waiting, so the caller can time from just before the launch."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pattern.search(read_log(log_path)):
+            return time.monotonic()
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"the editor exited {process.returncode} before {pattern.pattern}\n"
+                + read_log(log_path)[-3000:]
+            )
+        time.sleep(0.05)
+    raise TimeoutError(
+        f"timeout waiting for {pattern.pattern}\n" + read_log(log_path)[-3000:]
+    )
+
+
+def launch_standalone(
+    project: str, appdata: Path, log_path: Path, binary: Optional[Path] = None
+) -> subprocess.Popen:
+    """Starts the windowed standalone on the same project and present mode,
+    so the two frame rates compare."""
+    environment = dict(os.environ)
+    environment["PROJECT_PATH"] = project
+    environment["LOCALAPPDATA"] = str(appdata)
+    environment["PILL_PRESENT_MODE"] = "immediate"
+    log = log_path.open("w", encoding="utf-8")
+    process = subprocess.Popen(
+        [str(binary or standalone_binary())],
+        cwd=str(MODULES_ROOT),
+        env=environment,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
+    log.close()
+    return process
+
+
+def measure_standalone(
+    project: str,
+    steady_seconds: int,
+    appdata: Path,
+    log_path: Path,
+    binary: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """One standalone session: spawn -> project loop, and the frame rate over
+    the same steady window the editor's rate is measured in. `binary`
+    overrides the profile `profile_binary` would pick."""
+    kill_standalones()
+    process = launch_standalone(project, appdata, log_path, binary)
+    started = time.monotonic()
+    wait_for(process, log_path, STANDALONE_LOOP_TOKEN, STANDALONE_START_TIMEOUT_SECONDS)
+    startup_ms = (time.monotonic() - started) * 1000.0
+    wait_for(process, log_path, STANDALONE_FPS_PATTERN, STANDALONE_START_TIMEOUT_SECONDS)
+    window_start = len(read_log(log_path))
+    time.sleep(steady_seconds)
+    window_text = read_log(log_path)[window_start:]
+    rates = [float(value) for value in STANDALONE_FPS_PATTERN.findall(window_text)]
+    if not rates:
+        rates = [
+            float(value)
+            for value in STANDALONE_FPS_PATTERN.findall(read_log(log_path))
+        ][-1:]
+    process.terminate()
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=30)
+    if not rates:
+        raise RuntimeError("the standalone printed no frame statistics")
+    return {
+        "startup_ms": startup_ms,
+        "frames_per_second": statistics.mean(rates),
+    }
 
 
 def clear_layouts(appdata: Path) -> None:
@@ -618,9 +782,9 @@ def execute(arguments: argparse.Namespace) -> int:
         result,
         f"egui editor shell ({arguments.project}, {arguments.steady_seconds}s steady)",
         [
-            "W-0037 Stage 0 baseline for the egui editor, the vehicle for "
-            "W-0008's D32 targets: warm startup, steady frame rate, idle CPU "
-            "and the shell's per-update UI time, with PILL_PRESENT_MODE=immediate. "
+            "Baseline for the egui editor, the vehicle for the D32 targets: "
+            "warm startup, steady frame rate, idle CPU and the shell's "
+            "per-update UI time, with PILL_PRESENT_MODE=immediate. "
             "The UI case uses the default workspace (the native benchmark's "
             "all-panels layout has no egui equivalent yet). D32: "
             + ", ".join(

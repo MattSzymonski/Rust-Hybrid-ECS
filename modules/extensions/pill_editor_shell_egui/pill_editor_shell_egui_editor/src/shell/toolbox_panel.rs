@@ -74,20 +74,31 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
         egui::TextStyle::Small.resolve(ui.style()),
         style::text_muted(),
     );
+    // The rows wear the kit's chunky face: the panel floats over the scene, so
+    // its buttons are the one place the editor draws the brutalist look the
+    // theme's tokens describe. The face is narrower than the row it sits in -
+    // the shadow's offset is part of the button's own size - so it is centred
+    // in the row and its rectangle is recorded for the scripted suite, which
+    // clicks the face rather than the row.
+    let theme = style::current_theme();
+    let mut faces = Vec::with_capacity(toolbox::TOOLBOX_ITEMS.len());
     for item in toolbox::TOOLBOX_ITEMS {
         let rect = toolbox::item_rect(item, origin);
-        let fill = if item.active(&state) {
-            style::selection()
-        } else {
-            style::control()
-        };
-        let button = ui.put(
-            rect,
-            icons::IconButton::new(item.icon(&state), item.label(&state))
-                .active(item.active(&state))
-                .fill(fill)
-                .fixed_size(rect.size()),
-        );
+        let button = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.with_layout(
+                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                    |ui| {
+                        ui.add(
+                            kit::ChunkyButton::new(item.label(&state), &theme)
+                                .selected(item.active(&state)),
+                        )
+                    },
+                )
+                .inner
+            })
+            .inner;
+        faces.push(button.rect);
         if button.clicked() {
             viewer.pending.push(vec![item.command(&state)]);
             pill_core::info!(
@@ -98,6 +109,7 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
             );
         }
     }
+    viewer.toolbox.set_faces(view, faces);
     viewer.overlay_regions.push(shell_rect(panel));
     if viewer.toolbox.logged(view) != Some(panel) {
         viewer.toolbox.set_logged(view, panel);
