@@ -40,7 +40,7 @@ DESCRIPTION
     earlier one left the tree mid-edit. `--keep-going` runs the rest anyway.
 
     `--catalogue` prints the suite table with each suite's last recorded
-    result from `.construction_site/runs/`, where one exists;
+    run outcome, where one exists;
     `--write-catalogue` writes the table without that column (it is local
     state) into `devops/tests/README.md` between the catalogue markers.
 

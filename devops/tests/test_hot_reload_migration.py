@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import List, Sequence, Tuple
 
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers. The
-# host's log tokens live in one place (audit opportunity 5.14).
+# host's log tokens live in one place.
 # Standalone-runnable: put `devops/` on `sys.path` before reaching `core`, so
 # the suite works from any working directory without a package import.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -50,9 +50,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers.
 from core.suite_common import *  # noqa: E402,F401,F403
 
-# The shared scenario runner: one definition for every hot-reload suite
-# (audit SA-0057). This suite adds only its tokens, its validators and the
-# scenario table below.
+# The shared scenario runner: one definition for every hot-reload suite.
+# This suite adds only its tokens, its validators and the scenario table
+# below.
 from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario  # noqa: E402
 
 # =============================================================================

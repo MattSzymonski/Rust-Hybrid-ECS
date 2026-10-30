@@ -358,15 +358,6 @@ def plan_edit(crate: Crate) -> bool:
                 candidates.append((annotated, path, name, snippet, changed))
                 break
 
-    # Note the annotation scan above must finish before choosing, so
-    # `crate.annotated` reflects the whole crate rather than the chosen function.
-    for path in sorted(crate.source_root.rglob("*.rs")):
-        source = read_source(path)
-        runtime_end = runtime_code_end(source)
-        for _, body_start, _ in find_function_bodies(source):
-            if body_start < runtime_end and declaration_is_annotated(source, body_start):
-                crate.annotated = True
-
     if not candidates:
         return False
     candidates.sort(key=lambda entry: (not entry[0], str(entry[1]), entry[2]))
@@ -452,7 +443,7 @@ def exercise(crate: Crate, monitor: OutputMonitor, backups: BackupRegistry) -> N
             return
         # The anchor is taken before the write: the host can answer a body-only
         # edit within the write's own turn, and an outcome line counted into the
-        # anchor would never appear in `output_since` (W-0111).
+        # anchor would never appear in `output_since`.
         start_index = monitor.line_count
         atomic_write(crate.edit_file, edited)
 
@@ -564,7 +555,8 @@ def inspect_flag_caches(since: float) -> Tuple[List[str], List[str], int]:
             if cache.stat().st_mtime < since:
                 continue
             lines = cache.read_text(encoding="utf-8").splitlines()
-        except OSError:
+        except OSError as error:
+            notes.append(f"{cache.name}: unreadable ({error}), not inspected")
             continue
         # Line 0 is the tokenizer version, line 1 the build command, line 2 the
         # compiler; the arguments follow.
@@ -651,12 +643,17 @@ def print_report(crates: List[Crate], strict: bool, run_started_at: float) -> bo
             print(f"         {crate.name}: {crate.detail}")
     for note in cache_notes:
         print(f"  [NOTE] {note}")
+    cache_unread = bool(patched) and caches_read == 0
+    if cache_unread:
+        print("  [FAIL] A patch landed but no compiler-flag cache was read:")
+        print("         the narrow net saw nothing, so the replay is unproven.")
 
     failed = (
         bool(fell_back)
         or bool(fragments)
         or bool(timed_out)
         or not patched
+        or cache_unread
         or (strict and bool(no_fast_path))
     )
     return not failed

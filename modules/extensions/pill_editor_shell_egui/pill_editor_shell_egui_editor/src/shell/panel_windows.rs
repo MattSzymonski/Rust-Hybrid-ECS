@@ -97,10 +97,17 @@ pub fn panel_windows(
                     ui.separator();
                     body(ui, commands);
                     ui.separator();
+                    // The modal's two answers wear the kit's chunky face, the
+                    // accept one in the accent: a modal is the one place the
+                    // editor asks a question, so its answers are the loudest
+                    // buttons on screen.
+                    let theme = style::current_theme();
                     let accepted = ui
                         .horizontal(|ui| {
-                            let accept = ui.button("Apply").clicked();
-                            let cancel = ui.button("Cancel").clicked();
+                            let accept = ui
+                                .add(kit::ChunkyButton::new("Apply", &theme).accent(true))
+                                .clicked();
+                            let cancel = ui.add(kit::ChunkyButton::new("Cancel", &theme)).clicked();
                             (accept, cancel)
                         })
                         .inner;

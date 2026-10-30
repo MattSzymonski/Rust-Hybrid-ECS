@@ -27,7 +27,7 @@ DESCRIPTION
     restore - is one level up in `core/scenario.py`.
 
     Keeping this in one module means a reworded host log line is fixed in
-    exactly one place (audit opportunity 5.14), and the OutputMonitor's
+    exactly one place, and the OutputMonitor's
     rolling-buffer / tick-tail behavior cannot drift between suites.
 
 USAGE
@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from .paths import HOST_EXECUTABLE, MODULES_ROOT, REPOSITORY_ROOT
+from .paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name
 
 # The host's output is UTF-8 (its renderer prints a box-drawing frame
 # dashboard), while CPython encodes redirected output with the locale code
@@ -72,7 +72,8 @@ for _stream in (sys.stdout, sys.stderr):
 
 # The roots come from `core.paths`; the suites know them by these names.
 WORKSPACE_ROOT = REPOSITORY_ROOT
-HOST_EXE = HOST_EXECUTABLE
+# The standalone host binary the suites drive, per platform.
+HOST_EXE = executable_name("pill_standalone")
 
 # Known project roots. Each declares its own `project_settings.yaml`, the only
 # source of the extension list; the project itself is selected by
@@ -678,7 +679,7 @@ def has_crash_signals(output: str) -> bool:
 # in one window fight over all three. That was paid for once already: a
 # migration scenario looked flaky until the cause turned out to be a second
 # suite started in parallel, each one's `kill_stale_hosts` killing the other's
-# host (storage plan, section K). The fix is an exclusive lock on a
+# host. The fix is an exclusive lock on a
 # machine-global file, taken by every process that owns a host and held until
 # the process exits - the OS releases it on death, so there is no stale lock to
 # recover from.
@@ -843,7 +844,8 @@ HOST_DEV_RENDERING = HostPosture(
     ("--offline",),
 )
 
-# What a host build compiles, for `verify_host_build`'s staleness check.
+# The roots of every crate `pill_host` compiles, for `verify_host_build`'s
+# staleness check. A path dependency added to its manifest belongs here too.
 # Extension and project sources are deliberately absent: the host loads those as
 # DLLs, so editing `pill_spline` - which several suites do, leaving the file
 # stamped "now" - does not make cargo rebuild the host, and counting it here
@@ -866,6 +868,9 @@ HOST_SOURCE_ROOTS = (
     MODULES_ROOT / "ui",
     MODULES_ROOT / "hosting",
     MODULES_ROOT / "frontends" / "pill_standalone",
+    # `pill_host` links the C# bridge by path; the managed runtime beside it
+    # is not a cargo crate and does not rebuild the host.
+    MODULES_ROOT / "csharp" / "pill_csharp_bridge",
 )
 
 # What `build_host` records about the binary it produced. A binary carries no

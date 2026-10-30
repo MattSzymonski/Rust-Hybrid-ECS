@@ -1,4 +1,4 @@
-"""The editor suite's side of the Windows clipboard (W-0038 Stage 17).
+"""The editor suite's side of the Windows clipboard.
 
 REQUIREMENTS
     Windows, a 64-bit CPython, no third-party packages.

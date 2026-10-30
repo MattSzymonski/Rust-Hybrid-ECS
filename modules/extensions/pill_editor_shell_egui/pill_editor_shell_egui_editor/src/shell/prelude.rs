@@ -36,6 +36,7 @@ pub use pill_editor_core::entities;
 pub use pill_editor_core::gizmo::{GizmoMode, GizmoSpace};
 pub use pill_editor_core::icons;
 pub use pill_editor_core::inspector;
+pub use pill_editor_core::kit;
 pub use pill_editor_core::layout::EditorTab;
 pub use pill_editor_core::menubar;
 pub use pill_editor_core::notices::{EditorNotices, Notice, NoticeLevel, ProblemRow};

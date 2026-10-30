@@ -1,22 +1,21 @@
-// Safe C# ECS facade and composable scheduler-aware queries.
+// The engine facade: the managed entry points into the native world.
 //
 // Responsibilities:
 // - Binds the native engine function table supplied by the Rust host.
-// - Describes queries as independent Read/Write/Optional/Entity terms.
-// - Joins native archetype columns without reflection or allocation per frame.
-// - Keeps every native pointer inside stack-only enumerator and row values.
+// - Serves the calls a system makes: entity counts and identities, chunk and
+//   resource resolution under the scheduler's declared access, and the
+//   deferred commands queued for the end of the call.
+// - Refreshes the mirrored-method table when the host republishes it, and owns
+//   the stable component identity both sides hash a name into.
 //
 // Design:
-// - Closed Query<T...> types build and validate their descriptor once and
-//   return a typed enumerator through a hidden `new` GetEnumerator; the base
-//   type keeps the shape-erased enumerator for consumers that need it.
-// - ProjectHost consumes IQueryDescriptor without knowing query arity or shape.
-// - QueryRow<T...> is a ref struct holding references into the enumerator's
-//   joined columns. Typed accessors resolve against the query's own term list
-//   at JIT time and return writable or read-only references into the active
-//   native chunk, with no per-row column lookup and no per-row column copy.
+// - Every call checks the native status against its slot's named vocabulary
+//   and turns a refusal into an exception that names the reason.
+// - The table is copied once at bind time; a slot the host does not provide
+//   fails closed rather than being dereferenced.
+// - Queries and rows live in their own files (QueryTerms.cs, QueryRows.cs);
+//   this file holds only what a call into the engine needs.
 
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
@@ -25,283 +24,6 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 namespace TracyLive;
-
-// =============================================================================
-// System Declaration
-// =============================================================================
-
-/// <summary>Marks a static method for automatic ECS system discovery.</summary>
-[AttributeUsage(AttributeTargets.Method)]
-public sealed class EcsSystemAttribute : Attribute;
-
-/// <summary>Marks a one-shot method run before the first ECS frame.</summary>
-[AttributeUsage(AttributeTargets.Method)]
-public sealed class EcsStartupAttribute : Attribute;
-
-/// <summary>
-/// Marks a component whose layout the native host already knows and binds
-/// natively, rather than registering as a descriptor byte-level component.
-/// </summary>
-/// <remarks>
-/// This is the managed half of a shared ABI: the host holds a canonical schema
-/// for the type and validates this declaration against it, so the two cannot
-/// drift. The renderer's components carry it.
-///
-/// It used to be inferred from assembly identity - "declared in csharp_runtime"
-/// stood in for "the host binds it natively". That proxy broke once shared
-/// components moved out to the crate that owns them, so the property is now
-/// declared rather than guessed.
-/// </remarks>
-[AttributeUsage(AttributeTargets.Struct)]
-public sealed class EcsSharedComponentAttribute : Attribute;
-
-/// <summary>
-/// Declares a name this struct used to be known by, so a rename migrates the
-/// rows instead of reading as a disappearance.
-/// </summary>
-/// <remarks>
-/// The manifest carries these names, and the host resolves each one to the
-/// registration that answered to it: that registration's rows move onto this
-/// type's new identity, in place, with fields matched by name exactly as a
-/// layout change matches them. Without the alias a rename is not migratable -
-/// the old declaration's storage cannot be safely retired - so the host
-/// refuses the manifest and asks for a restart.
-///
-/// One hop only: an alias must name a declaration that was live when this
-/// type was last registered, not another alias.
-/// </remarks>
-[AttributeUsage(AttributeTargets.Struct, AllowMultiple = true)]
-public sealed class EcsComponentAliasAttribute : Attribute
-{
-    /// <summary>Declare one previous name of this component.</summary>
-    /// <param name="oldName">
-    /// The full name the type was declared under, as it appeared in the
-    /// manifest - for example <c>"project_cs.SplineSample"</c>.
-    /// </param>
-    public EcsComponentAliasAttribute(string oldName) => OldName = oldName;
-
-    /// <summary>The previous name this declaration claims.</summary>
-    public string OldName { get; }
-}
-
-/// <summary>
-/// Declares the value a newly added or reset field starts from, instead of
-/// zero. Applies to component and resource fields alike.
-/// </summary>
-/// <remarks>
-/// Read when the host migrates stored bytes: a field the migration carries
-/// over keeps its value, and only a field the new layout leaves empty takes
-/// the default. Literals only - the value travels as text in the manifest, and
-/// the host refuses one that does not parse as the field's own type, so the
-/// choice of constructor here is what makes a default on a field it cannot
-/// describe a compile error rather than a runtime surprise.
-/// </remarks>
-[AttributeUsage(AttributeTargets.Field)]
-public sealed class EcsFieldDefaultAttribute : Attribute
-{
-    /// <summary>Declare a floating-point default.</summary>
-    public EcsFieldDefaultAttribute(double value) =>
-        Literal = value.ToString("R", CultureInfo.InvariantCulture);
-
-    /// <summary>Declare a single-precision default.</summary>
-    public EcsFieldDefaultAttribute(float value) =>
-        Literal = value.ToString("R", CultureInfo.InvariantCulture);
-
-    /// <summary>Declare a signed integer default.</summary>
-    public EcsFieldDefaultAttribute(long value) =>
-        Literal = value.ToString(CultureInfo.InvariantCulture);
-
-    /// <summary>Declare a signed integer default from an <see cref="int"/>.</summary>
-    public EcsFieldDefaultAttribute(int value) =>
-        Literal = value.ToString(CultureInfo.InvariantCulture);
-
-    /// <summary>Declare an unsigned integer default.</summary>
-    public EcsFieldDefaultAttribute(ulong value) =>
-        Literal = value.ToString(CultureInfo.InvariantCulture);
-
-    /// <summary>Declare a boolean default.</summary>
-    public EcsFieldDefaultAttribute(bool value) => Literal = value ? "true" : "false";
-
-    /// <summary>The literal the host parses against the field's declared type.</summary>
-    public string Literal { get; }
-}
-
-// =============================================================================
-// Query Terms and Descriptors
-// =============================================================================
-
-/// <summary>Compile-time metadata every query term carries.</summary>
-/// <remarks>
-/// The static abstract members let a typed row resolve an accessor against the
-/// query's own ordered term list instead of searching the joined columns: for
-/// a closed value-type query both sides of every comparison are compile-time
-/// constants, so the JIT folds every non-matching branch.
-/// </remarks>
-public interface IQueryTerm
-{
-    /// <summary>Declared component type; null for padding slots.</summary>
-    static abstract Type? DataType { get; }
-
-    /// <summary>Scheduler access the term declares.</summary>
-    static abstract QueryAccess Access { get; }
-
-    /// <summary>Whether the term tolerates archetypes without the component.</summary>
-    static abstract bool Optional { get; }
-
-    /// <summary>Whether the term exposes the entity column.</summary>
-    static abstract bool IsEntity { get; }
-}
-
-/// <summary>Required read-only component term.</summary>
-public readonly struct Read<T> : IQueryTerm where T : unmanaged
-{
-    static Type? IQueryTerm.DataType => typeof(T);
-    static QueryAccess IQueryTerm.Access => QueryAccess.Read;
-    static bool IQueryTerm.Optional => false;
-    static bool IQueryTerm.IsEntity => false;
-}
-
-/// <summary>Required writable component term.</summary>
-public readonly struct Write<T> : IQueryTerm where T : unmanaged
-{
-    static Type? IQueryTerm.DataType => typeof(T);
-    static QueryAccess IQueryTerm.Access => QueryAccess.Write;
-    static bool IQueryTerm.Optional => false;
-    static bool IQueryTerm.IsEntity => false;
-}
-
-/// <summary>Optional read-only component term.</summary>
-public readonly struct OptionalRead<T> : IQueryTerm where T : unmanaged
-{
-    static Type? IQueryTerm.DataType => typeof(T);
-    static QueryAccess IQueryTerm.Access => QueryAccess.Read;
-    static bool IQueryTerm.Optional => true;
-    static bool IQueryTerm.IsEntity => false;
-}
-
-/// <summary>Optional writable component term.</summary>
-public readonly struct OptionalWrite<T> : IQueryTerm where T : unmanaged
-{
-    static Type? IQueryTerm.DataType => typeof(T);
-    static QueryAccess IQueryTerm.Access => QueryAccess.Write;
-    static bool IQueryTerm.Optional => true;
-    static bool IQueryTerm.IsEntity => false;
-}
-
-/// <summary>Term exposing the current entity without scheduler component access.</summary>
-public readonly struct EntityTerm : IQueryTerm
-{
-    static Type? IQueryTerm.DataType => typeof(Entity);
-    static QueryAccess IQueryTerm.Access => QueryAccess.Read;
-    static bool IQueryTerm.Optional => false;
-    static bool IQueryTerm.IsEntity => true;
-}
-
-/// <summary>Padding term filling the unused slots of a closed query's row.</summary>
-/// <remarks>Never matches an accessor: it declares no component type.</remarks>
-public readonly struct None : IQueryTerm
-{
-    static Type? IQueryTerm.DataType => null;
-    static QueryAccess IQueryTerm.Access => QueryAccess.Read;
-    static bool IQueryTerm.Optional => false;
-    static bool IQueryTerm.IsEntity => false;
-}
-
-/// <summary>Native access mode declared to the Rust scheduler.</summary>
-public enum QueryAccess : byte
-{
-    Read = 0,
-    Write = 1,
-}
-
-/// <summary>Immutable metadata for one ordered query term.</summary>
-public readonly record struct QueryTermDescriptor(
-    Type? ComponentType,
-    ulong ComponentKey,
-    ulong ComponentKeyHigh,
-    int ComponentSize,
-    QueryAccess Access,
-    bool Optional,
-    bool IsEntity);
-
-/// <summary>Validated metadata shared by discovery and iteration.</summary>
-public sealed class QueryDescriptor
-{
-    private readonly QueryTermDescriptor[] _terms;
-
-    internal QueryDescriptor(params Type[] termTypes)
-    {
-        if (termTypes.Length == 0)
-            throw new InvalidOperationException("An ECS query must contain at least one term.");
-
-        _terms = termTypes.Select(CreateTerm).ToArray();
-        var components = new HashSet<UInt128>();
-        var hasEntity = false;
-        foreach (var term in _terms)
-        {
-            if (term.IsEntity)
-            {
-                if (hasEntity)
-                    throw new InvalidOperationException("An ECS query cannot contain EntityTerm more than once.");
-                hasEntity = true;
-            }
-            else if (!components.Add(((UInt128)term.ComponentKeyHigh << 64) | term.ComponentKey))
-            {
-                throw new InvalidOperationException(
-                    $"An ECS query cannot contain component {term.ComponentType!.FullName} more than once.");
-            }
-        }
-    }
-
-    /// <summary>Ordered terms exactly as written in the system signature.</summary>
-    public IReadOnlyList<QueryTermDescriptor> Terms => _terms;
-
-    internal QueryTermDescriptor[] TermArray => _terms;
-
-    private static QueryTermDescriptor CreateTerm(Type termType)
-    {
-        if (termType == typeof(EntityTerm))
-            return new QueryTermDescriptor(null, 0, 0, Marshal.SizeOf<Entity>(), QueryAccess.Read, false, true);
-        if (!termType.IsGenericType)
-            throw UnsupportedTerm(termType);
-
-        Type definition = termType.GetGenericTypeDefinition();
-        Type component = termType.GetGenericArguments()[0];
-        QueryAccess access;
-        bool optional;
-        if (definition == typeof(Read<>))
-            (access, optional) = (QueryAccess.Read, false);
-        else if (definition == typeof(Write<>))
-            (access, optional) = (QueryAccess.Write, false);
-        else if (definition == typeof(OptionalRead<>))
-            (access, optional) = (QueryAccess.Read, true);
-        else if (definition == typeof(OptionalWrite<>))
-            (access, optional) = (QueryAccess.Write, true);
-        else
-            throw UnsupportedTerm(termType);
-
-        var stableId = Engine.ComponentStableId(component);
-        return new QueryTermDescriptor(
-            component,
-            stableId.Low,
-            stableId.High,
-            TracyLive.Loader.NativeLayout.SizeOf(component),
-            access,
-            optional,
-            false);
-    }
-
-    private static InvalidOperationException UnsupportedTerm(Type termType) => new(
-        $"{termType} is not a query term. Use Read<T>, Write<T>, OptionalRead<T>, " +
-        "OptionalWrite<T>, or EntityTerm.");
-}
-
-/// <summary>Implemented by every composable closed query type.</summary>
-public interface IQueryDescriptor
-{
-    /// <summary>Return cached ordered query metadata.</summary>
-    QueryDescriptor Descriptor { get; }
-}
 
 // =============================================================================
 // Native Engine Facade
@@ -337,10 +59,10 @@ public static unsafe class Engine
     /// <remarks>
     /// This is the sharpest edge on the safe surface: anything holding a
     /// plausible <see cref="IntPtr"/> can bind an arbitrary function table.
-    /// That is deliberate - hot-reloadable project code is trusted, and the
-    /// loader handshake has no safer channel - and <c>AllowUnsafeBlocks</c>
-    /// does not stand in the way of it either way; see the trust note in the
-    /// project's `.csproj`.
+    /// That is deliberate: hot-reloadable project code is trusted because it
+    /// is the user's own build output, and the loader handshake has no safer
+    /// channel. <c>AllowUnsafeBlocks</c> guards the keyword, not memory
+    /// safety.
     /// </remarks>
     internal static void Bind(IntPtr api) => Bind((EngineApi*)api);
 
@@ -483,13 +205,13 @@ public static unsafe class Engine
     public static uint EntityCount()
     {
         uint count;
-        byte status = _api.EntityCount(&count);
-        if (status == 0)
+        EntityCountStatus status = (EntityCountStatus)_api.EntityCount(&count);
+        if (status == EntityCountStatus.Ok)
             return count;
-        if (status == 3)
+        if (status == EntityCountStatus.NoInvocation)
             throw new InvalidOperationException(
                 "EntityCount is only available while a system is scheduled.");
-        throw new InvalidOperationException($"EntityCount failed with native status {status}.");
+        throw new InvalidOperationException($"EntityCount failed with native status {(byte)status}.");
     }
 
     /// <summary>
@@ -506,28 +228,28 @@ public static unsafe class Engine
     /// <remarks>
     /// The handle a query hands out names a slot that is recycled, so it cannot
     /// be stored in anything meant to outlive the run. This reads the stable id
-    /// instead (W-0048 Stage 5).
+    /// instead.
     /// </remarks>
     public static bool TryGetStableId(Entity entity, out StableEntityId id)
     {
         ulong low;
         ulong high;
         Entity target = entity;
-        byte status = _api.EntityStableId(&target, &low, &high);
-        if (status == 0)
+        StableIdStatus status = (StableIdStatus)_api.EntityStableId(&target, &low, &high);
+        if (status == StableIdStatus.Ok)
         {
             id = new StableEntityId(low, high);
             return true;
         }
-        if (status == 1)
+        if (status == StableIdStatus.NotLive)
         {
             id = default;
             return false;
         }
-        if (status == 3)
+        if (status == StableIdStatus.NoInvocation)
             throw new InvalidOperationException(
                 "TryGetStableId is only available while a system is scheduled.");
-        throw new InvalidOperationException($"TryGetStableId failed with native status {status}.");
+        throw new InvalidOperationException($"TryGetStableId failed with native status {(byte)status}.");
     }
 
     /// <summary>
@@ -604,8 +326,8 @@ public static unsafe class Engine
     /// its own, so the hash is reachable from a string as well as a type. Both
     /// go through here, so the two can never drift apart. The two offsets and
     /// the mixing function are a contract with the host's
-    /// `csharp/components.rs` (`stable_component_id`), which carries the full
-    /// derivation chain.
+    /// `pill_csharp_bridge/src/components.rs` (`stable_component_id`), which
+    /// carries the full derivation chain.
     /// </remarks>
     internal static StableComponentId StableIdOf(string name) =>
         new StableComponentId(HashName(name, 0xcbf29ce484222325),
@@ -687,21 +409,28 @@ public static unsafe class Engine
         return true;
     }
 
-    private static void ValidateStatus(byte status, string name, QueryAccess access)
+    internal static void ValidateStatus(byte status, string name, QueryAccess access)
     {
-        // Status 5 reports a caller bug on this side: every managed call site
-        // passes a real result buffer, so a null one reached the native table
-        // by some other route.
-        if (status == 5)
-            throw new ArgumentException(
-                $"The native query for {name} was given no result buffer.", nameof(status));
-        if (status == 2)
-            throw new InvalidOperationException($"Component {name} is not registered by the Rust host.");
-        if (status == 3)
-            throw new InvalidOperationException("An ECS query was used outside its scheduled system call.");
-        if (status != 1)
-            throw new InvalidOperationException(
-                $"The current system did not declare this {access.ToString().ToLowerInvariant()} access to {name}.");
+        switch ((QueryStatus)status)
+        {
+            case QueryStatus.Chunk:
+                return;
+            // Status 5 reports a caller bug on this side: every managed call
+            // site passes a real result buffer, so a null one reached the
+            // native table by some other route.
+            case QueryStatus.NullOutput:
+                throw new ArgumentException(
+                    $"The native query for {name} was given no result buffer.", nameof(status));
+            case QueryStatus.NotRegistered:
+                throw new InvalidOperationException(
+                    $"Component {name} is not registered by the Rust host.");
+            case QueryStatus.NoInvocation:
+                throw new InvalidOperationException(
+                    "An ECS query was used outside its scheduled system call.");
+            default:
+                throw new InvalidOperationException(
+                    $"The current system did not declare this {access.ToString().ToLowerInvariant()} access to {name}.");
+        }
     }
 
     internal static Entity ReserveEntity()
@@ -740,17 +469,20 @@ public static unsafe class Engine
             $"remove component {typeof(T).FullName}");
     }
 
-    private static void ValidateCommandStatus(byte status, string operation)
+    internal static void ValidateCommandStatus(byte status, string operation)
     {
-        if (status == 1)
+        if ((CommandStatus)status == CommandStatus.Ok)
             return;
-        string reason = status switch
+        string reason = ((CommandStatus)status) switch
         {
-            2 => "the component is not registered",
-            3 => "Commands was used outside an active startup or scheduled system",
-            4 => "the current system did not declare a Commands parameter",
-            5 => "the entity handle is stale, invalid, or was not reserved by this invocation",
-            6 => "the component list or ABI layout is invalid",
+            CommandStatus.NotRegistered => "the component is not registered",
+            CommandStatus.NoInvocation =>
+                "Commands was used outside an active startup or scheduled system",
+            CommandStatus.CommandsNotDeclared =>
+                "the current system did not declare a Commands parameter",
+            CommandStatus.StaleEntity =>
+                "the entity handle is stale, invalid, or was not reserved by this invocation",
+            CommandStatus.InvalidComponentList => "the component list or ABI layout is invalid",
             _ => $"native status {status}",
         };
         throw new InvalidOperationException($"Could not {operation}: {reason}.");
@@ -872,392 +604,9 @@ public static unsafe class Engine
 /// <summary>
 /// The 128-bit stable identity of one managed component or resource, stored as
 /// the same low/high halves the C ABI carries. The host's
-/// `csharp/components.rs` documents the full derivation chain.
+/// `pill_csharp_bridge/src/components.rs` documents the full derivation chain.
 /// </summary>
 internal readonly record struct StableComponentId(ulong Low, ulong High);
-
-// =============================================================================
-// Mirrored Rust Methods
-// =============================================================================
-
-/// <summary>
-/// Registry of the Rust methods mirrored into generated C# structs.
-///
-/// Populated once at startup from the host's native table (see
-/// <see cref="Engine.Bind"/>). Generated mirror methods resolve a typed
-/// delegate over each method's exported C-ABI trampoline and invoke it with
-/// the receiver's live address, so a call boxes and pins nothing. Generated
-/// heap-field accessors skip the delegate layer
-/// entirely: they resolve the trampoline's raw address once per host bind
-/// (guarded by <see cref="Generation"/>) and call it through the
-/// <c>Invoke*</c> helpers below, which use C-ABI function pointers with no
-/// marshalling between managed and native code. Both paths stay callable from
-/// code compiled without the `unsafe` keyword, so the reloadable project
-/// assembly needs no <c>AllowUnsafeBlocks</c> - which guards that keyword,
-/// not memory safety: the addresses these methods exchange are raw, and the
-/// project's code is trusted the same way any other code the user builds is.
-/// </summary>
-/// <summary>
-/// The address of a live value the runtime handed out.
-/// </summary>
-/// <remarks>
-/// A script cannot construct one: the field and the constructor are both
-/// internal, so the only way to hold a row address is to have been given it by
-/// <see cref="MirrorMethods.AddressOf{T}(ref T)"/>. That does not make the
-/// address safe to *keep* - it points into a native archetype column that a
-/// structural change or a module reload can move - it makes it impossible to
-/// invent, which removes the accidental path without pretending to remove the
-/// deliberate one.
-/// </remarks>
-public readonly struct RowPointer
-{
-    internal readonly IntPtr Address;
-    internal RowPointer(IntPtr address) => Address = address;
-}
-
-/// <summary>
-/// A mirrored-method trampoline address the host published for the module
-/// generation currently loaded.
-/// </summary>
-/// <remarks>
-/// Opaque for the same reason as <see cref="RowPointer"/>, and with a shorter
-/// life: a module reload republishes the table at fresh addresses, so a
-/// trampoline resolved before a reload is stale after it.
-/// </remarks>
-public readonly struct MirrorTrampoline
-{
-    internal readonly IntPtr Address;
-    internal MirrorTrampoline(IntPtr address) => Address = address;
-}
-
-/// <summary>
-/// A borrowed window over a native buffer, exactly as a Rust trampoline
-/// reported it.
-/// </summary>
-/// <remarks>
-/// The pointer and the length always travel together and can only be produced
-/// by a trampoline call, so managed code cannot pair an address with a length
-/// of its own choosing. The lease ends when the call that produced it returns:
-/// anything that resizes or replaces the container on the Rust side
-/// invalidates it.
-/// </remarks>
-public readonly struct BufferView
-{
-    internal readonly IntPtr Data;
-
-    /// <summary>Number of elements the trampoline reported.</summary>
-    public readonly int Length;
-
-    internal BufferView(IntPtr data, IntPtr length)
-    {
-        Data = data;
-        Length = checked((int)length);
-    }
-}
-
-public static class MirrorMethods
-{
-    // Concurrent because `Resolve` is reachable from scheduled systems, and the
-    // scheduler runs batches of disjoint systems on parallel threads: a plain
-    // `Dictionary` mutated from two of them at once is a lost update at best
-    // and a corrupted bucket chain at worst. Every operation here is a single
-    // `TryGetValue` or indexer write, so the concurrent forms cover it without
-    // a lock.
-    private static readonly ConcurrentDictionary<(string TypeName, string Method), (int Generation, Delegate Delegate)> Cache = new();
-
-    // One immutable table, swapped whole. A refresh builds the next one beside
-    // the live table and publishes it in one exchange, so a call in flight reads
-    // either the previous bind's complete table or the new bind's - never the
-    // cleared state in between (W-0079).
-    private static Dictionary<(string TypeName, string Method), IntPtr> _addresses = new();
-    private static int _generation;
-
-    /// <summary>
-    /// Counts host binds. Generated accessors cache trampoline addresses and
-    /// re-resolve whenever this value changes: reloading an extension
-    /// maps it at a fresh base address, so the addresses from the previous
-    /// bind dangle from then on.
-    /// </summary>
-    public static int Generation => global::System.Threading.Volatile.Read(ref _generation);
-
-    /// <summary>An empty table for a refresh to fill before it is published.</summary>
-    internal static Dictionary<(string TypeName, string Method), IntPtr> NewTable()
-        => new();
-
-    /// <summary>
-    /// Replace the address table in one step and invalidate every cached
-    /// delegate, which is what a host bind means.
-    /// </summary>
-    internal static void Publish(Dictionary<(string TypeName, string Method), IntPtr> table)
-    {
-        global::System.Threading.Interlocked.Exchange(ref _addresses, table);
-        Cache.Clear();
-        global::System.Threading.Volatile.Write(ref _generation, _generation + 1);
-    }
-
-    /// <summary>Drop all registered methods; called when the host rebinds.</summary>
-    internal static void Reset() => Publish(NewTable());
-
-    /// <summary>Register one mirrored method's trampoline address in a table.</summary>
-    internal static void Register(
-        Dictionary<(string TypeName, string Method), IntPtr> table,
-        string typeName,
-        string method,
-        IntPtr address)
-        => table[(typeName, method)] = address;
-
-    /// <summary>
-    /// Register one mirrored method into the live table, publishing a copy of
-    /// it so a concurrent reader never sees the write half done.
-    /// </summary>
-    internal static void Register(string typeName, string method, IntPtr address)
-    {
-        Dictionary<(string TypeName, string Method), IntPtr> table =
-            new(global::System.Threading.Volatile.Read(ref _addresses));
-        Register(table, typeName, method, address);
-        global::System.Threading.Interlocked.Exchange(ref _addresses, table);
-    }
-
-    /// <summary>
-    /// Drop the resolved delegates without touching the addresses or the
-    /// generation.
-    /// </summary>
-    /// <remarks>
-    /// A collectible context unloading takes its delegate types with it, so the
-    /// cache that holds them must go - but the trampoline addresses the host
-    /// published are still the ones the next context calls, so the unload must
-    /// not clear them (W-0079).
-    /// </remarks>
-    internal static void DropDelegateCache() => Cache.Clear();
-
-    /// <summary>
-    /// Address of a mirrored Rust method's C-ABI trampoline, for generated
-    /// accessors that call it through the <c>Invoke*</c> helpers.
-    /// </summary>
-    /// <exception cref="InvalidOperationException">
-    /// No trampoline is registered for the method - most often because the
-    /// module was statically linked rather than loaded as a dynamic library.
-    /// </exception>
-    public static MirrorTrampoline Address(string typeName, string method)
-    {
-        if (!global::System.Threading.Volatile.Read(ref _addresses)
-                .TryGetValue((typeName, method), out IntPtr address))
-        {
-            throw new InvalidOperationException(
-                $"No mirrored Rust method {typeName}::{method} is registered. " +
-                "Mirrored methods are only available when the declaring module is " +
-                "loaded as a dynamic library by the developer host.");
-        }
-        return new MirrorTrampoline(address);
-    }
-
-    /// <summary>
-    /// Resolve (and cache) the typed delegate that calls a mirrored Rust
-    /// method's C-ABI trampoline.
-    /// </summary>
-    /// <typeparam name="T">The generated delegate type for the method.</typeparam>
-    public static T Resolve<T>(string typeName, string method) where T : Delegate
-    {
-        // A host republish since the last check invalidates every address this
-        // cache holds; refreshing first means the generation read below is the
-        // one the entries are compared against.
-        Engine.RefreshMirrorMethodsIfStale();
-        (string, string) key = (typeName, method);
-        int generation = Generation;
-        if (Cache.TryGetValue(key, out (int Generation, Delegate Delegate) cached)
-            && cached.Generation == generation)
-        {
-            return (T)cached.Delegate;
-        }
-        T created = (T)Marshal.GetDelegateForFunctionPointer(
-            Address(typeName, method).Address, typeof(T));
-        Cache[key] = (generation, created);
-        return created;
-    }
-
-    // One helper per heap-field trampoline shape. The address comes from the
-    // host's registration table and the caller passes the component row's
-    // live address, so the call reads and writes the real container: one
-    // boundary call per member use, no delegate stub, no marshalling.
-
-    /// <summary>
-    /// Call a `(row, out data, out length)` trampoline - a `Vec`/`String` view
-    /// or the count view of a `Vec&lt;String&gt;`.
-    /// </summary>
-    public static unsafe byte InvokeView(
-        MirrorTrampoline address, RowPointer row, out BufferView view)
-    {
-        byte status = ((delegate* unmanaged[Cdecl]<IntPtr, out IntPtr, out IntPtr, byte>)
-            address.Address)(row.Address, out IntPtr data, out IntPtr length);
-        view = new BufferView(data, length);
-        return status;
-    }
-
-    /// <summary>Call a `(row, count)` trampoline that resizes a container field.</summary>
-    public static unsafe byte InvokeResize(MirrorTrampoline address, RowPointer row, int count)
-        => ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, byte>)address.Address)(
-            row.Address, (IntPtr)count);
-
-    /// <summary>
-    /// Call a `(row, index, out data, out length)` trampoline - one element of
-    /// a `Vec&lt;String&gt;` (status: 0 reachable, 1 dead row, 2 out of range).
-    /// </summary>
-    public static unsafe byte InvokeItem(
-        MirrorTrampoline address, RowPointer row, int index, out BufferView view)
-    {
-        byte status = ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, out IntPtr, out IntPtr, byte>)
-            address.Address)(row.Address, (IntPtr)index, out IntPtr data, out IntPtr length);
-        view = new BufferView(data, length);
-        return status;
-    }
-
-    /// <summary>
-    /// Call a `(row, index, utf8, length)` trampoline that replaces one
-    /// element of a `Vec&lt;String&gt;` (status: 0 ok, 1 dead row, 2 out of
-    /// range, 3 invalid UTF-8).
-    /// </summary>
-    /// <remarks>
-    /// The payload crosses as a span rather than an address and a length, so
-    /// the caller cannot pair a pointer with a length of its own choosing, and
-    /// generated accessors no longer pin a byte array by hand.
-    /// </remarks>
-    public static unsafe byte InvokeSetItem(
-        MirrorTrampoline address, RowPointer row, int index, ReadOnlySpan<byte> utf8)
-    {
-        fixed (byte* payload = utf8)
-            return ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr, IntPtr, byte>)
-                address.Address)(
-                    row.Address, (IntPtr)index, (IntPtr)payload, (IntPtr)utf8.Length);
-    }
-
-    /// <summary>
-    /// Call a `(row, utf8, length)` trampoline - writing a `String` field or
-    /// appending to a `Vec&lt;String&gt;`.
-    /// </summary>
-    public static unsafe byte InvokeUtf8Write(
-        MirrorTrampoline address, RowPointer row, ReadOnlySpan<byte> utf8)
-    {
-        fixed (byte* payload = utf8)
-            return ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr, byte>)address.Address)(
-                row.Address, (IntPtr)payload, (IntPtr)utf8.Length);
-    }
-
-    /// <summary>
-    /// Address of a live value passed by reference, for generated heap-field
-    /// accessors and mirrored method receivers.
-    ///
-    /// The address points at the storage the reference names - for a component
-    /// row, the native column slot - so a trampoline reached through it reads
-    /// and writes the real container rather than a copy of its header.
-    /// </summary>
-    public static unsafe RowPointer AddressOf<T>(ref T value) where T : unmanaged
-        => new RowPointer(
-            (IntPtr)global::System.Runtime.CompilerServices.Unsafe.AsPointer(ref value));
-}
-
-/// <summary>
-/// Span helpers for generated heap-field accessors.
-///
-/// A generated accessor hands these methods the address and element count a
-/// Rust trampoline (or a mirrored `DynamicBuffer` handle) reported, so managed
-/// code iterates a component's live buffer with no per-element boundary call.
-/// An empty buffer carries a null element pointer, which a zero count turns
-/// into the empty span rather than an invalid one. A span is a lease, not
-/// ownership: resizing or replacing the container on the Rust side invalidates
-/// it.
-/// </summary>
-public static class ComponentViews
-{
-    /// <summary>Writable span over the buffer a trampoline reported.</summary>
-    public static unsafe Span<T> AsSpan<T>(BufferView view) where T : unmanaged
-        => view.Length == 0 ? Span<T>.Empty : new Span<T>((void*)view.Data, view.Length);
-
-    /// <summary>Read-only span over the buffer a trampoline reported.</summary>
-    public static unsafe ReadOnlySpan<T> AsReadOnlySpan<T>(BufferView view) where T : unmanaged
-        => view.Length == 0 ? ReadOnlySpan<T>.Empty : new ReadOnlySpan<T>((void*)view.Data, view.Length);
-
-    /// <summary>Decode a UTF-8 buffer a trampoline reported into a string.</summary>
-    /// <remarks>
-    /// The copy is the point: the view is a lease that ends when the call that
-    /// produced it returns, and a string is the only form of the data that can
-    /// outlive it.
-    /// </remarks>
-    public static string ToUtf8String(BufferView view)
-        => view.Length == 0
-            ? string.Empty
-            : Marshal.PtrToStringUTF8(view.Data, view.Length) ?? string.Empty;
-
-    /// <summary>
-    /// Span over an engine-owned dynamic buffer whose `(ptr, len, cap)` handle
-    /// is mirrored into a component row.
-    /// </summary>
-    /// <remarks>
-    /// Separate from <see cref="AsSpan{T}(BufferView)"/> because this handle is
-    /// mirrored *data* rather than the result of a trampoline call: the pointer
-    /// is read out of the row itself, so there is no call to hand back a
-    /// <see cref="BufferView"/>. Generated accessors are the only intended
-    /// caller, and they read the pointer from private fields of the generated
-    /// mirror struct.
-    ///
-    /// This is the one raw entry point left in the public surface. It survives
-    /// because the alternative would be to expose the mirror's handle fields,
-    /// which is strictly worse. The address-stability contract that makes a
-    /// retained handle legal at all is the buffer allocator's, not this
-    /// method's: resizing is a native call that ends every outstanding lease.
-    /// </remarks>
-    public static unsafe Span<T> OverDynamicBuffer<T>(UIntPtr data, int count) where T : unmanaged
-        => count == 0 ? Span<T>.Empty : new Span<T>((void*)data, count);
-
-    /// <summary>Read-only twin of <see cref="OverDynamicBuffer{T}"/>.</summary>
-    public static unsafe ReadOnlySpan<T> OverDynamicBufferReadOnly<T>(UIntPtr data, int count)
-        where T : unmanaged
-        => count == 0 ? ReadOnlySpan<T>.Empty : new ReadOnlySpan<T>((void*)data, count);
-}
-
-/// <summary>
-/// Per-closed-component metadata initialized once outside row iteration.
-/// Generic static initialization avoids repeated Type.FullName lookup,
-/// UTF-8 allocation, hashing, and Marshal.SizeOf calls in managed hot paths.
-/// </summary>
-internal static class ComponentTypeMetadata<T> where T : unmanaged
-{
-    internal static readonly StableComponentId StableId =
-        Engine.ComponentStableId(typeof(T));
-
-    /// <summary>
-    /// Native size of one component row, taken from the runtime itself.
-    /// </summary>
-    /// <remarks>
-    /// <c>Unsafe.SizeOf&lt;T&gt;()</c> is the number a row write actually
-    /// touches: <c>((T*)column.Data)[row] = value</c> moves exactly this many
-    /// bytes. <c>NativeLayout</c> predicts the same number by walking fields,
-    /// because NativeAOT denies it <c>Marshal.SizeOf</c>, and the manifest the
-    /// host registers a column stride from is built from that prediction.
-    ///
-    /// If the two ever disagree the column stride is wrong and every row write
-    /// runs off the end of its slot, so the prediction is checked against the
-    /// authority here - the one place a real <c>T</c> is in scope, which keeps
-    /// the check working under NativeAOT where <c>MakeGenericMethod</c> over a
-    /// value type is not available. Every component reachable from a query row
-    /// or a deferred command resolves this class, so the check covers the
-    /// whole reachable set without a registry to keep in sync.
-    /// </remarks>
-    internal static readonly int Size = SizeCheckedAgainstManifest();
-
-    /// <summary>Return the runtime size after proving the manifest agrees.</summary>
-    private static int SizeCheckedAgainstManifest()
-    {
-        int actual = Unsafe.SizeOf<T>();
-        int describedByManifest = TracyLive.Loader.NativeLayout.SizeOf(typeof(T));
-        if (describedByManifest != actual)
-            throw new InvalidOperationException(
-                $"Component {typeof(T).FullName} is {actual} bytes to the runtime but the " +
-                $"component manifest describes {describedByManifest}. The native column would " +
-                "be strided by the manifest size, so every row write would address the wrong " +
-                "bytes. Remove StructLayout Pack, or declare an explicit Size that matches.");
-        return actual;
-    }
-}
 
 // =============================================================================
 // Deferred Entity Commands
@@ -1346,530 +695,4 @@ public sealed class DeferredEntityBuilder
                     handle.Free();
         }
     }
-}
-
-// =============================================================================
-// Stack-only Row Views
-// =============================================================================
-
-/// <summary>ABI-compatible managed entity handle.</summary>
-[StructLayout(LayoutKind.Sequential)]
-public readonly struct Entity
-{
-    public readonly ulong Id;
-    public readonly uint Generation;
-
-    public Entity(ulong id, uint generation) => (Id, Generation) = (id, generation);
-}
-
-/// <summary>
-/// The stable 128-bit identity of one entity, as saved data names it.
-/// </summary>
-/// <remarks>
-/// A handle names a slot the world recycles; this id names the entity. Read it
-/// with <see cref="Engine.TryGetStableId"/> and keep it for anything that has
-/// to find the entity again later. The id is random, so it says nothing about
-/// spawn order, and it stops resolving when its entity is destroyed.
-///
-/// Two halves rather than a 128-bit value: no C ABI in the engine table carries
-/// one. The textual form is the hex string Rust's `EntityId` prints - high half
-/// first - which is what a saved scene records.
-/// </remarks>
-public readonly struct StableEntityId : IEquatable<StableEntityId>
-{
-    public readonly ulong Low;
-    public readonly ulong High;
-
-    public StableEntityId(ulong low, ulong high) => (Low, High) = (low, high);
-
-    public bool Equals(StableEntityId other) => Low == other.Low && High == other.High;
-
-    public override bool Equals(object? obj) => obj is StableEntityId other && Equals(other);
-
-    public override int GetHashCode() => HashCode.Combine(Low, High);
-
-    public static bool operator ==(StableEntityId left, StableEntityId right) => left.Equals(right);
-
-    public static bool operator !=(StableEntityId left, StableEntityId right) => !left.Equals(right);
-
-    /// <summary>The 32-digit hex form saved data records.</summary>
-    public override string ToString() => $"{High:x16}{Low:x16}";
-}
-
-/// <summary>One archetype of the native world, by the two halves of its id.</summary>
-internal readonly record struct ArchetypeKey(ulong Low, ulong High);
-
-/// <summary>One component (or the entity column) of a query enumeration.</summary>
-internal struct QueryColumn
-{
-    internal QueryTermDescriptor Term;
-    /// <summary>Invocation the chunk behind this column was issued to.</summary>
-    internal uint ScopeToken;
-    internal IntPtr Data;
-    internal int Length;
-    internal bool Present;
-    internal IntPtr Ticks;
-    internal uint ChangeTick;
-}
-
-/// <summary>The joined columns of one query enumeration, stored inline.</summary>
-/// <remarks>Eight slots: the widest query shape.</remarks>
-[InlineArray(8)]
-internal struct QueryColumns
-{
-    private QueryColumn _first;
-}
-
-/// <summary>Optional writable reference valid only for the current row.</summary>
-public readonly unsafe ref struct OptionalWriteRef<T> where T : unmanaged
-{
-    private readonly T* _value;
-    private readonly NativeComponentTicks* _ticks;
-    private readonly uint _changeTick;
-    internal OptionalWriteRef(T* value, NativeComponentTicks* ticks, uint changeTick)
-    {
-        _value = value;
-        _ticks = ticks;
-        _changeTick = changeTick;
-    }
-    public bool HasValue => _value != null;
-    public ref T Value
-    {
-        get
-        {
-            if (_value == null)
-                throw new InvalidOperationException($"Optional component {typeof(T).FullName} is absent.");
-            if (_ticks == null)
-                throw new InvalidOperationException(
-                    $"Writable component {typeof(T).FullName} has no native change-tick column.");
-            _ticks->Changed = _changeTick;
-            return ref *_value;
-        }
-    }
-}
-
-/// <summary>Optional read-only reference valid only for the current row.</summary>
-public readonly unsafe ref struct OptionalReadRef<T> where T : unmanaged
-{
-    private readonly T* _value;
-    internal OptionalReadRef(T* value) => _value = value;
-    public bool HasValue => _value != null;
-    public ref readonly T Value
-    {
-        get
-        {
-            if (_value == null)
-                throw new InvalidOperationException($"Optional component {typeof(T).FullName} is absent.");
-            return ref *_value;
-        }
-    }
-}
-
-/// <summary>Stack-only view over one joined ECS row.</summary>
-public readonly unsafe ref struct QueryRow
-{
-    private readonly QueryColumn _c0, _c1, _c2, _c3, _c4, _c5, _c6, _c7;
-    private readonly int _count;
-    private readonly int _row;
-
-    internal QueryRow(
-        QueryColumn c0, QueryColumn c1, QueryColumn c2, QueryColumn c3,
-        QueryColumn c4, QueryColumn c5, QueryColumn c6, QueryColumn c7,
-        int count, int row) =>
-        (_c0, _c1, _c2, _c3, _c4, _c5, _c6, _c7, _count, _row) =
-        (c0, c1, c2, c3, c4, c5, c6, c7, count, row);
-
-    /// <summary>Borrow a required writable component declared by Write&lt;T&gt;.</summary>
-    public ref T Write<T>() where T : unmanaged
-    {
-        QueryColumn column = Find<T>(QueryAccess.Write, optional: false);
-        MarkChanged(column);
-        return ref ((T*)column.Data)[_row];
-    }
-
-    /// <summary>Borrow a required read-only component declared by Read&lt;T&gt;.</summary>
-    public ref readonly T Read<T>() where T : unmanaged
-    {
-        QueryColumn column = Find<T>(QueryAccess.Read, optional: false);
-        return ref ((T*)column.Data)[_row];
-    }
-
-    /// <summary>Borrow an optional writable component when it is present.</summary>
-    public OptionalWriteRef<T> OptionalWrite<T>() where T : unmanaged
-    {
-        QueryColumn column = Find<T>(QueryAccess.Write, optional: true);
-        return new OptionalWriteRef<T>(
-            column.Present ? &((T*)column.Data)[_row] : null,
-            column.Present ? &((NativeComponentTicks*)column.Ticks)[_row] : null,
-            column.ChangeTick);
-    }
-
-    /// <summary>Borrow an optional read-only component when it is present.</summary>
-    public OptionalReadRef<T> OptionalRead<T>() where T : unmanaged
-    {
-        QueryColumn column = Find<T>(QueryAccess.Read, optional: true);
-        return new OptionalReadRef<T>(column.Present ? &((T*)column.Data)[_row] : null);
-    }
-
-    /// <summary>Return the current entity declared by EntityTerm.</summary>
-    public Entity Entity
-    {
-        get
-        {
-            for (var i = 0; i < _count; i++)
-            {
-                QueryColumn column = Column(i);
-                if (column.Term.IsEntity)
-                    return ((Entity*)column.Data)[_row];
-            }
-            throw new InvalidOperationException("This query does not declare EntityTerm.");
-        }
-    }
-
-    private QueryColumn Find<T>(QueryAccess access, bool optional) where T : unmanaged
-    {
-        StableComponentId key = ComponentTypeMetadata<T>.StableId;
-        for (var i = 0; i < _count; i++)
-        {
-            QueryColumn column = Column(i);
-            if (!column.Term.IsEntity && column.Term.ComponentKey == key.Low &&
-                column.Term.ComponentKeyHigh == key.High &&
-                column.Term.Access == access && column.Term.Optional == optional)
-            {
-                // Every typed accessor resolves its column here, so one check
-                // covers Read, Write, OptionalRead and OptionalWrite. Compiled
-                // out of release builds.
-                if (column.Present)
-                    Engine.ValidateChunkScope(column.ScopeToken, typeof(T).FullName ?? typeof(T).Name);
-                return column;
-            }
-        }
-        throw new InvalidOperationException(
-            $"This query does not declare {(optional ? "optional " : "")}{access.ToString().ToLowerInvariant()} " +
-            $"access to {typeof(T).FullName}.");
-    }
-
-    private void MarkChanged(QueryColumn column)
-    {
-        if (column.Ticks == IntPtr.Zero)
-            throw new InvalidOperationException(
-                $"Writable component {column.Term.ComponentType!.FullName} has no native change-tick column.");
-        ((NativeComponentTicks*)column.Ticks)[_row].Changed = column.ChangeTick;
-    }
-
-    private QueryColumn Column(int index)
-    {
-        switch (index)
-        {
-            case 0: return _c0;
-            case 1: return _c1;
-            case 2: return _c2;
-            case 3: return _c3;
-            case 4: return _c4;
-            case 5: return _c5;
-            case 6: return _c6;
-            case 7: return _c7;
-            default: throw new ArgumentOutOfRangeException(nameof(index));
-        }
-    }
-}
-
-// =============================================================================
-// Shared Query Iterator
-// =============================================================================
-
-/// <summary>Stack-only iterator shared by every composable query shape.</summary>
-public ref struct QueryEnumerator
-{
-    private readonly QueryTermDescriptor[] _terms;
-    // The joined columns live in one contiguous buffer so a typed row can
-    // address every slot through a single reference to element zero. The
-    // buffer is inline in the enumerator, not a heap array: a query is
-    // enumerated every frame, and an array here cost every system one
-    // 536-byte allocation per query per frame.
-    private QueryColumns _columns;
-    private readonly int _driver;
-    private uint _nextDriverChunk;
-    private int _row;
-    private int _length;
-
-    internal QueryEnumerator(QueryDescriptor descriptor)
-    {
-        _terms = descriptor.TermArray;
-        _columns = default;
-        _driver = FindDriver(_terms);
-        _nextDriverChunk = 0;
-        _row = -1;
-        _length = 0;
-    }
-
-    /// <summary>Return the current stack-only joined row.</summary>
-    public QueryRow Current => new(
-        _columns[0],
-        _columns[1],
-        _columns[2],
-        _columns[3],
-        _columns[4],
-        _columns[5],
-        _columns[6],
-        _columns[7],
-        _terms.Length,
-        _row);
-
-    /// <summary>Advance one row inside the joined chunk.</summary>
-    /// <remarks>
-    /// This is the per-row hot path, so it is deliberately one branch: the
-    /// typed enumerator's MoveNext inlines it, and everything that happens
-    /// once per chunk lives in <see cref="MoveToNextChunk"/>. Merging the two
-    /// makes MoveNext big enough that the JIT stops inlining it, which
-    /// measurably moves the per-row cost from ~0.4 ns to ~3 ns.
-    /// </remarks>
-    internal bool TryAdvanceRow() => ++_row < _length;
-
-    /// <summary>Join the next archetype chunk; runs once per chunk, not per row.</summary>
-    internal bool MoveToNextChunk()
-    {
-        while (TryLoadDriver(_nextDriverChunk++, out var archetype, out var driverChunk))
-        {
-            _length = checked((int)driverChunk.Length);
-            if (_length == 0)
-                continue;
-
-            var matched = true;
-            for (var i = 0; i < _terms.Length; i++)
-            {
-                QueryTermDescriptor term = _terms[i];
-                NativeComponentChunk chunk;
-                bool present;
-                if (i == _driver)
-                {
-                    chunk = driverChunk;
-                    present = true;
-                }
-                else
-                {
-                    present = Engine.TryGetArchetypeChunk(
-                        term, archetype.Low, archetype.High, out chunk);
-                    if (!present && !term.Optional)
-                    {
-                        matched = false;
-                        break;
-                    }
-                }
-
-                if (present && chunk.Length != driverChunk.Length)
-                    throw new InvalidOperationException("ECS component chunk lengths are inconsistent.");
-                // Entity rows arrive in the const `Entities` slot, which the
-                // native ABI leaves the writable `Data` slot null for; the
-                // joined column keeps one row-base field either way.
-                IntPtr rows = term.IsEntity ? chunk.Entities : chunk.Data;
-                SetColumn(i, new QueryColumn
-                {
-                    Term = term,
-                    Data = rows,
-                    Length = present ? checked((int)chunk.Length) : 0,
-                    Present = present,
-                    Ticks = present ? chunk.Ticks : IntPtr.Zero,
-                    ChangeTick = present ? chunk.ChangeTick : 0,
-                    ScopeToken = present ? chunk.ScopeToken : 0,
-                });
-            }
-
-            if (!matched)
-                continue;
-            _row = 0;
-            return true;
-        }
-        return false;
-    }
-
-    /// <summary>Advance within the current archetype or join the next one.</summary>
-    public bool MoveNext()
-    {
-        if (TryAdvanceRow())
-            return true;
-        return MoveToNextChunk();
-    }
-
-    private static int FindDriver(QueryTermDescriptor[] terms)
-    {
-        for (var i = 0; i < terms.Length; i++)
-            if (!terms[i].IsEntity && !terms[i].Optional)
-                return i;
-        for (var i = 0; i < terms.Length; i++)
-            if (terms[i].IsEntity)
-                return i;
-        return -1; // An implicit entity driver makes optional-only queries useful.
-    }
-
-    private bool TryLoadDriver(
-        uint index, out ArchetypeKey archetype, out NativeComponentChunk chunk)
-    {
-        bool found = _driver >= 0 && !_terms[_driver].IsEntity
-            ? Engine.TryGetChunk(_terms[_driver], index, out chunk)
-            : Engine.TryGetEntityChunk(index, out chunk);
-        archetype = found
-            ? new ArchetypeKey(chunk.ArchetypeLow, chunk.ArchetypeHigh)
-            : default;
-        return found;
-    }
-
-    private void SetColumn(int index, QueryColumn value) => _columns[index] = value;
-
-    /// <summary>Reference to one joined column, for the typed row wrappers.</summary>
-    /// <remarks>
-    /// Ref-returning an element of this enumerator's own column buffer needs
-    /// the explicit [UnscopedRef] opt-in.
-    /// The contract is narrow: only the typed enumerator calls this, and the
-    /// row it feeds never outlives the enumerator that owns the columns.
-    /// </remarks>
-    [UnscopedRef]
-    internal ref QueryColumn ColumnRef(int index) => ref _columns[index];
-
-    /// <summary>Index of the current row inside the joined chunk.</summary>
-    internal int RowIndex => _row;
-
-    /// <summary>
-    /// Run one slice per contiguous row range of every matched chunk across
-    /// the host's shared pool, joining before returning.
-    /// </summary>
-    /// <remarks>
-    /// Resolution - walking chunks, joining columns, validating scope tokens -
-    /// runs here on the calling thread exactly as the sequential walk does.
-    /// Workers then see only the snapshot (<see cref="ParallelSegment"/>), and
-    /// a slice body must not call engine APIs: workers carry no managed
-    /// invocation scope and every entry point refuses them.
-    ///
-    /// A single work item runs inline on this thread (no FFI, no pool hop).
-    /// <paramref name="rowsPerSlice"/> is clamped to
-    /// <see cref="ParallelRows.MinimumRowsPerSlice"/>. The enumerator is
-    /// consumed, like the sequential walk: create it fresh per call.
-    /// </remarks>
-    /// <exception cref="InvalidOperationException">
-    /// The calling thread has no managed invocation scope, or a parallel pass
-    /// is already running on it.
-    /// </exception>
-    public void ForEachSliceParallel(
-        ParallelSliceRunner runner, int rowsPerSlice = ParallelRows.DefaultRowsPerSlice)
-    {
-        ArgumentNullException.ThrowIfNull(runner);
-        ParallelRows.EnterPass();
-        try
-        {
-            if (rowsPerSlice < ParallelRows.MinimumRowsPerSlice)
-                rowsPerSlice = ParallelRows.MinimumRowsPerSlice;
-
-            var items = new List<ParallelWorkItem>();
-            while (MoveToNextChunk())
-            {
-                ParallelSegment segment = SnapshotSegment();
-                for (var start = 0; start < segment.RowCount; start += rowsPerSlice)
-                {
-                    items.Add(new ParallelWorkItem(
-                        segment, start, Math.Min(rowsPerSlice, segment.RowCount - start)));
-                }
-            }
-            if (items.Count == 0)
-                return;
-            ParallelRows.RunSlices(items.ToArray(), runner);
-        }
-        finally
-        {
-            ParallelRows.ExitPass();
-        }
-    }
-
-    /// <summary>Snapshot the current joined chunk into a worker-safe segment.</summary>
-    private ParallelSegment SnapshotSegment()
-    {
-        var data = new IntPtr[8];
-        var ticks = new IntPtr[8];
-        var present = new bool[8];
-        var changeTick = new uint[8];
-        for (var i = 0; i < _terms.Length; i++)
-        {
-            QueryColumn column = _columns[i];
-            data[i] = column.Data;
-            ticks[i] = column.Ticks;
-            present[i] = column.Present;
-            changeTick[i] = column.ChangeTick;
-            if (column.Present)
-            {
-                // The check QueryRow's typed accessors make lazily, done once
-                // here: workers inherit pointers that were validated already.
-                Engine.ValidateChunkScope(
-                    column.ScopeToken,
-                    column.Term.ComponentType?.FullName ?? "component");
-            }
-        }
-        return new ParallelSegment(data, ticks, present, changeTick, _length);
-    }
-}
-
-// =============================================================================
-// Composable Query Arities
-// =============================================================================
-
-/// <summary>Shared behavior for all composable query arities.</summary>
-public abstract class QueryBase : IQueryDescriptor
-{
-    protected QueryBase(QueryDescriptor descriptor) => Descriptor = descriptor;
-    public QueryDescriptor Descriptor { get; }
-    public QueryEnumerator GetEnumerator() => new(Descriptor);
-}
-
-public sealed class Query<T1> : QueryBase where T1 : IQueryTerm
-{
-    private static readonly QueryDescriptor Cached = new(typeof(T1));
-    public Query() : base(Cached) { }
-    public new QueryEnumerator<T1, None, None, None, None, None, None, None> GetEnumerator() => new(Descriptor);
-}
-
-public sealed class Query<T1, T2> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm
-{
-    private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2));
-    public Query() : base(Cached) { }
-    public new QueryEnumerator<T1, T2, None, None, None, None, None, None> GetEnumerator() => new(Descriptor);
-}
-
-public sealed class Query<T1, T2, T3> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm
-{
-    private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3));
-    public Query() : base(Cached) { }
-    public new QueryEnumerator<T1, T2, T3, None, None, None, None, None> GetEnumerator() => new(Descriptor);
-}
-
-public sealed class Query<T1, T2, T3, T4> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm where T4 : IQueryTerm
-{
-    private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4));
-    public Query() : base(Cached) { }
-    public new QueryEnumerator<T1, T2, T3, T4, None, None, None, None> GetEnumerator() => new(Descriptor);
-}
-
-public sealed class Query<T1, T2, T3, T4, T5> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm where T4 : IQueryTerm where T5 : IQueryTerm
-{
-    private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5));
-    public Query() : base(Cached) { }
-    public new QueryEnumerator<T1, T2, T3, T4, T5, None, None, None> GetEnumerator() => new(Descriptor);
-}
-
-public sealed class Query<T1, T2, T3, T4, T5, T6> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm where T4 : IQueryTerm where T5 : IQueryTerm where T6 : IQueryTerm
-{
-    private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5), typeof(T6));
-    public Query() : base(Cached) { }
-    public new QueryEnumerator<T1, T2, T3, T4, T5, T6, None, None> GetEnumerator() => new(Descriptor);
-}
-
-public sealed class Query<T1, T2, T3, T4, T5, T6, T7> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm where T4 : IQueryTerm where T5 : IQueryTerm where T6 : IQueryTerm where T7 : IQueryTerm
-{
-    private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5), typeof(T6), typeof(T7));
-    public Query() : base(Cached) { }
-    public new QueryEnumerator<T1, T2, T3, T4, T5, T6, T7, None> GetEnumerator() => new(Descriptor);
-}
-
-public sealed class Query<T1, T2, T3, T4, T5, T6, T7, T8> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm where T4 : IQueryTerm where T5 : IQueryTerm where T6 : IQueryTerm where T7 : IQueryTerm where T8 : IQueryTerm
-{
-    private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5), typeof(T6), typeof(T7), typeof(T8));
-    public Query() : base(Cached) { }
-    public new QueryEnumerator<T1, T2, T3, T4, T5, T6, T7, T8> GetEnumerator() => new(Descriptor);
 }

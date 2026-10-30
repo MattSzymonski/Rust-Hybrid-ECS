@@ -418,12 +418,13 @@ namespace PillScriptAnalyzers
         /// Whether a struct looks like a component the host would register.
         /// </summary>
         /// <remarks>
-        /// Layout rules only bind types the manifest describes. Rather than
-        /// reimplement the manifest's discovery, the analyzer keys off the two
-        /// things that make a struct reach it: an explicit shared-component
-        /// attribute, or use as a query term argument somewhere in the
-        /// compilation. Falling back to "any struct with instance fields" would
-        /// report ordinary math helpers.
+        /// Every struct with instance fields in the project assembly is a
+        /// candidate, so a layout rule can reach a struct used only through
+        /// `Commands.With` or `Add`. The manifest builder applies the same
+        /// over-approximation and skips a type it cannot describe; this
+        /// analyzer reports `PILL0403` as an error, so a non-component struct
+        /// with a non-blittable field is refused here. Narrowing the trigger
+        /// to query terms would lose the command-only case.
         /// </remarks>
         private static bool IsComponentCandidate(INamedTypeSymbol type)
         {

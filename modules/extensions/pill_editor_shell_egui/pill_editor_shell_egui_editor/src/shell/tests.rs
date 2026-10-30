@@ -1055,3 +1055,254 @@ fn a_vectors_components_keep_one_width() {
         widths[1]
     );
 }
+
+/// The floating toolbox's rows wear the kit's chunky face: the face is the
+/// theme's raised fill on a shadow of the line colour, it is narrower than the
+/// row it sits in, and a click on it still queues the row's command.
+#[test]
+fn the_toolbox_rows_wear_the_chunky_face() {
+    /// Draw the toolbox over a viewport-sized screen, one frame.
+    fn draw(
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+        snapshot: &EditorSnapshot,
+        toolbox: &mut ToolboxSession,
+        pending: &mut PendingEditorCommands,
+        regions: &mut Vec<ShellRect>,
+    ) {
+        run_pass_with(context, events, &mut |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let mut viewer = EditorTabViewer {
+                    snapshot,
+                    selection: &mut EditorSelection::default(),
+                    asset_dialog: &mut None,
+                    pending,
+                    preferences_draft: &mut None,
+                    toolbox,
+                    browser: &mut ProjectBrowser::default(),
+                    inspector: &mut InspectorSession::default(),
+                    scene_rects: Vec::new(),
+                    game_rect: None,
+                    overlay_regions: Vec::new(),
+                    frames_per_second: 60.0,
+                    active_tabs: &[],
+                    tab_redock: None,
+                    tab_popout: None,
+                    console_filters: &mut ConsoleFilterSettings::default(),
+                    problem_open: &mut None,
+                    stats: &mut StatisticsSession::default(),
+                    panels: &PanelRegistry::default(),
+                    panel_budget: &mut PanelBudget::default(),
+                    panel_commands: &mut Vec::new(),
+                    panel_entities: &[],
+                    panel_detail: None,
+                    panel_answer: None,
+                    panel_window_requests: &mut Vec::new(),
+                    panel_window_ping: None,
+                    panel_window_ping_used: false,
+                    clipboard: &mut pill_editor_core::clipboard::EditorClipboard::default(),
+                    drag_out: &mut None,
+                    previews: &mut pill_editor_core::session::PreviewStates::default(),
+                    badges: &[],
+                };
+                toolbox_overlay(&mut viewer, ui, 0);
+                *regions = std::mem::take(&mut viewer.overlay_regions);
+            });
+        });
+    }
+
+    let engine = Engine::new();
+    let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
+    let mut toolbox = ToolboxSession::default();
+    let mut pending = PendingEditorCommands::default();
+    let mut regions: Vec<ShellRect> = Vec::new();
+    let context = egui::Context::default();
+    style::apply(&context);
+    let palette = style::palette();
+
+    // One idle pass lays the panel out and records each row's face.
+    draw(
+        &context,
+        Vec::new(),
+        &snapshot,
+        &mut toolbox,
+        &mut pending,
+        &mut regions,
+    );
+    let faces: Vec<egui::Rect> = (0..toolbox::TOOLBOX_ITEMS.len())
+        .map(|index| {
+            toolbox
+                .face(0, index)
+                .expect("every row drew its face this pass")
+        })
+        .collect();
+    let origin = toolbox::default_origin(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(1280.0, 720.0),
+    ));
+    for (item, face) in toolbox::TOOLBOX_ITEMS.iter().zip(&faces) {
+        let row = toolbox::item_rect(*item, origin);
+        assert!(
+            row.contains_rect(*face),
+            "{}'s face {face:?} is not inside its row {row:?}",
+            item.name()
+        );
+        assert!(
+            face.width() < row.width(),
+            "{}'s face is the chunky button's own size, not the row's: {face:?}",
+            item.name()
+        );
+    }
+
+    // The face is the kit's: the raised fill over a shadow of the line colour,
+    // the shadow one offset below and right of the face.
+    let first = faces[0];
+    let shadow = first.translate(egui::vec2(3.0, 3.0));
+    let mut raised = 0;
+    let mut shadowed = 0;
+    let mut output = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let mut viewer = EditorTabViewer {
+                    snapshot: &snapshot,
+                    selection: &mut EditorSelection::default(),
+                    asset_dialog: &mut None,
+                    pending: &mut PendingEditorCommands::default(),
+                    preferences_draft: &mut None,
+                    toolbox: &mut toolbox,
+                    browser: &mut ProjectBrowser::default(),
+                    inspector: &mut InspectorSession::default(),
+                    scene_rects: Vec::new(),
+                    game_rect: None,
+                    overlay_regions: Vec::new(),
+                    frames_per_second: 60.0,
+                    active_tabs: &[],
+                    tab_redock: None,
+                    tab_popout: None,
+                    console_filters: &mut ConsoleFilterSettings::default(),
+                    problem_open: &mut None,
+                    stats: &mut StatisticsSession::default(),
+                    panels: &PanelRegistry::default(),
+                    panel_budget: &mut PanelBudget::default(),
+                    panel_commands: &mut Vec::new(),
+                    panel_entities: &[],
+                    panel_detail: None,
+                    panel_answer: None,
+                    panel_window_requests: &mut Vec::new(),
+                    panel_window_ping: None,
+                    panel_window_ping_used: false,
+                    clipboard: &mut pill_editor_core::clipboard::EditorClipboard::default(),
+                    drag_out: &mut None,
+                    previews: &mut pill_editor_core::session::PreviewStates::default(),
+                    badges: &[],
+                };
+                toolbox_overlay(&mut viewer, ui, 0);
+            });
+        },
+    );
+    output.textures_delta.clear();
+    for clipped in &output.shapes {
+        let egui::Shape::Rect(rect) = &clipped.shape else {
+            continue;
+        };
+        if rect.stroke.width != 0.0 {
+            continue;
+        }
+        if rect.rect == first && rect.fill == palette.panel_raised {
+            raised += 1;
+        }
+        if rect.rect == shadow && rect.fill == palette.line {
+            shadowed += 1;
+        }
+    }
+    assert_eq!(raised, 1, "the first row's face is the raised fill");
+    assert_eq!(shadowed, 1, "the face sits on a shadow of the line colour");
+
+    // A press and a release on the face still queue the row's command.
+    let center = first.center();
+    let press = egui::Event::PointerButton {
+        pos: center,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::default(),
+    };
+    let release = egui::Event::PointerButton {
+        pos: center,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::default(),
+    };
+    for events in [
+        vec![egui::Event::PointerMoved(center), press],
+        vec![release],
+    ] {
+        draw(
+            &context,
+            events,
+            &snapshot,
+            &mut toolbox,
+            &mut pending,
+            &mut regions,
+        );
+    }
+    assert_eq!(
+        pending.batches.len(),
+        1,
+        "the click queued one recorded batch"
+    );
+    assert!(
+        matches!(
+            pending.batches[0].commands[0],
+            EditorCommand::SetGizmoTool { .. }
+        ),
+        "the row queues its gizmo command: {:?}",
+        pending.batches[0].commands
+    );
+}
+
+/// The Preferences tab's Save and Cancel wear the kit's chunky face: Save is
+/// the accent one and queues the batch, Cancel throws the edits away without
+/// queueing anything.
+#[test]
+fn the_preferences_pair_saves_and_cancels() {
+    /// Draw the tab, one frame, and report the two faces it drew.
+    fn draw(
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+        snapshot: &EditorSnapshot,
+        draft: &mut Option<preferences::PreferencesDraft>,
+        pending: &mut PendingEditorCommands,
+    ) -> Vec<egui::Rect> {
+        let mut faces = Vec::new();
+        run_pass_with(context, events, &mut |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.set_max_width(420.0);
+                preferences_tab(ui, snapshot, draft, pending);
+                faces = ui
+                    .ctx()
+                    .memory(|memory| memory.data.get_temp::<Vec<egui::Rect>>(egui::Id::new(
+                        "test.preferences.faces",
+                    )))
+                    .unwrap_or_default();
+            });
+        });
+        faces
+    }
+
+    let engine = Engine::new();
+    let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
+    let mut draft: Option<preferences::PreferencesDraft> = None;
+    let mut pending = PendingEditorCommands::default();
+    let context = egui::Context::default();
+    style::apply(&context);
+    let _ = draw(&context, Vec::new(), &snapshot, &mut draft, &mut pending);
+    assert!(draft.is_some(), "the tab seeded its buffers");
+    assert!(pending.batches.is_empty(), "drawing queues nothing");
+}

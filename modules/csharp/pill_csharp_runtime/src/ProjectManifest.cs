@@ -269,7 +269,7 @@ internal static class ProjectManifestBuilder
             var declaredDefault = (EcsFieldDefaultAttribute?)Attribute.GetCustomAttribute(
                 field, typeof(EcsFieldDefaultAttribute), inherit: false);
             // A Handle<T> field is an asset reference: described by the Rust
-            // type path of T, so the host records what it references (W-0048).
+            // type path of T, so the host records what it references.
             string? handleAsset = HandleAssetPath(valueType);
             string primitiveType = handleAsset is not null
                 ? "handle:" + handleAsset

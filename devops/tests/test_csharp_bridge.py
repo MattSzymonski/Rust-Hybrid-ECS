@@ -64,7 +64,7 @@ from pathlib import Path
 from typing import List, Sequence
 
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers. The
-# host's log tokens live in one place (audit opportunity 5.14).
+# host's log tokens live in one place.
 # Standalone-runnable: put `devops/` on `sys.path` before reaching `core`, so
 # the suite works from any working directory without a package import.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -72,8 +72,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers.
 from core.suite_common import *  # noqa: E402,F401,F403
 
-# The shared scenario runner: one definition for every hot-reload suite
-# (audit SA-0057). This suite adds only its C# tokens and scenario table.
+# The shared scenario runner: one definition for every hot-reload suite.
+# This suite adds only its C# tokens and scenario table.
 from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario  # noqa: E402
 
 # =============================================================================
@@ -683,14 +683,14 @@ SESSION_SCENARIOS = [
         restore_after=[PROJECT_CS_PROBE_CS],
     ),
     # The three refusals. C# hot reload is behavior-only by design, and these
-    # pin what "behavior-only" actually means at the boundary - previously the
-    # rejection token appeared in this suite only as something that must NEVER
-    # happen, so nothing checked that it happens when it should.
-    # Adding a field to a C# component used to demand a host restart: the
-    # managed loader refused any manifest change because nothing could migrate a
-    # descriptor column's rows. It can now. The version parks, the host applies
-    # the manifest to the running world, and only then does the swap happen - so
-    # the assertion is a completed reload rather than a refusal.
+    # pin what "behavior-only" actually means at the boundary: each rejection
+    # token must appear when the change it refuses arrives, not only stay
+    # absent otherwise.
+    # Adding a field to a C# component no longer needs a host restart: the
+    # managed loader parks the change while the host migrates the descriptor
+    # column's rows, applies the manifest to the running world, and only then
+    # swaps the assembly - so the assertion is a completed reload rather than a
+    # refusal.
     Scenario(
         name="csharp_migrates_component_layout_change",
         phases=[
@@ -846,11 +846,11 @@ SESSION_SCENARIOS = [
         restore_after=[PROJECT_CS_PROBE_CS],
     ),
     # Renaming a system changes the metadata the scheduler was built from, and
-    # that used to be refused with "restart the host". It is now rebuilt: the
-    # host clears the project's systems and re-registers them from the arriving
-    # assembly. Three things have to hold, and the third is the one a rebuild
-    # can plausibly get wrong - the reload completes, the host says it
-    # re-registered, and the renamed system is still running afterwards.
+    # the host rebuilds it: it clears the project's systems and re-registers
+    # them from the arriving assembly. Three things have to hold, and the third
+    # is the one a rebuild can plausibly get wrong - the reload completes, the
+    # host says it re-registered, and the renamed system is still running
+    # afterwards.
     Scenario(
         name="csharp_reregisters_on_system_signature_change",
         phases=[

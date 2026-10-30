@@ -22,7 +22,7 @@ DESCRIPTION
 
     Asserted:
       1. The project's asset pack was downloaded beside the page and mounted:
-         the module does not carry the project's assets (W-0105).
+         the module does not carry the project's assets.
       2. The renderer presents a first frame with a camera.
       3. Frames keep running (frame statistics are reported).
       4. No engine error, WebGPU uncaptured error or page exception occurs.
@@ -96,7 +96,7 @@ PACK_TOKEN = "mounted the fetched asset pack"
 FIRST_FRAME_TOKEN = "[render] First frame: Presented; camera=true"
 FRAME_TOKEN = "frame statistics"
 # The pack the page fetches, and the window of a `res` file the module must not
-# contain: a browser build keeps its assets out of the wasm (W-0105).
+# contain: a browser build keeps its assets out of the wasm.
 ASSET_PACK_FILE_NAME = "assets.pillpack"
 EMBEDDED_PROBE_BYTES = 512
 MODULE_NAME = "pkg/pill_web_app_bg.wasm"
@@ -366,7 +366,7 @@ def res_files_in_module(module_path: Path, res_directory: Path) -> list:
 
     A window from the middle of each file that is comfortably larger than the
     window, so a coincidental match is not plausible; a browser build fetches
-    its pack and leaves these out (W-0105).
+    its pack and leaves these out.
     """
     if not module_path.is_file() or not res_directory.is_dir():
         return []

@@ -73,9 +73,9 @@ API_ALLOWED_DEPENDENCIES = {
     "pill_core",
     "pill_core_macros",
     "pill_engine",
-    # The UI draw data the frame carries (W-0032: the types live in
-    # `pill_ui_frame`, moved out of the retired UI library, so the contract shares them with
-    # the UI libraries without depending on one).
+    # The UI draw data the frame carries: the types live in `pill_ui_frame`,
+    # so the contract shares them with the UI libraries without depending on
+    # one.
     "pill_ui_frame",
     "serde",
     "thiserror",

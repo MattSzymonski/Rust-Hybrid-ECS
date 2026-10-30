@@ -101,7 +101,9 @@ import struct
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Set
 
 # The analysis report uses box-drawing glyphs and a check mark; Windows
 # defaults stdout to the ANSI codepage (cp1252), which cannot encode them, so
@@ -847,28 +849,46 @@ def analyze_artifact_size(
                 print(f"    {human_readable_size(size):>10}  {truncate_name(name, 92)}")
 
 
-def main() -> int:
-    """Runs the cargo release build with the workspace's RUSTFLAGS cleared."""
-    # Step 0: start the clock - the final report includes total build time.
+class BuildRequestError(RuntimeError):
+    """A release build cannot start; `main` prints the message with `error: `."""
+
+
+@dataclass
+class BuildRequest:
+    """Everything the release phases need, resolved before any build runs."""
+
+    repository_root: Path
+    workspace_directory: Path
+    arguments: List[str]
+    requested_features: Set[str]
+    project_path: str
+    project_root: Optional[Path]
+    shipping: bool
+    managed: bool
+    aot: bool
+    target_directory: Optional[Path]
+    artifacts_directory: Optional[Path]
+    build_binary_name: str
+    project_settings: Dict[str, object]
+    profile_arguments: List[str]
+    managed_manifest: Optional[Path]
+    analyze_size: bool
+    start_time: float
+
+
+def resolve_build_request(argv: List[str]) -> BuildRequest:
+    """Resolves the flags, project, output directories and profile.
+
+    Everything that can refuse a build happens here, before any subprocess
+    runs, so a bad invocation never leaves a half-built tree behind.
+    """
     start_time = time.monotonic()
-
-    # Step 1: locate the repository root, two levels above this script, so the
-    # build works from any working directory.
-    script_directory = Path(__file__).resolve().parent
-    repository_root = script_directory.parent.parent
+    repository_root = Path(__file__).resolve().parent.parent.parent
     workspace_directory = repository_root / "modules"
-
-    # Step 2: fail loudly if the workspace is not where the layout expects it.
     if not (workspace_directory / "Cargo.toml").is_file():
-        print(f"error: no workspace at {workspace_directory}", file=sys.stderr)
-        return 1
+        raise BuildRequestError(f"no workspace at {workspace_directory}")
 
-    # Step 3: resolve the project path from `--project` or `PROJECT_PATH`; it
-    # is only required when the shipping bundle must be regenerated.
-    # `--analyze_size` and `--csharp-aot` are this script's own flags, not
-    # cargo arguments, so they are pulled out before anything is forwarded to
-    # cargo.
-    arguments = sys.argv[1:]
+    arguments = list(argv)
     analyze_size = "--analyze_size" in arguments
     arguments = [argument for argument in arguments if argument != "--analyze_size"]
     aot = "--csharp-aot" in arguments
@@ -876,333 +896,365 @@ def main() -> int:
     try:
         project_path, arguments = extract_project_argument(arguments)
     except ValueError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
+        raise BuildRequestError(str(error)) from error
     if not project_path:
         project_path = os.environ.get("PROJECT_PATH", "")
 
-    # The project root, resolved up front: its manifest says whether the
-    # project is managed, which adds the dotnet steps below.
     project_root = (
         resolve_project_root(repository_root, project_path) if project_path else None
     )
-
-    # Step 4: apply the shipping-host default, so a plain invocation builds the
-    # shipping host and an explicit `-p pill_standalone` can never be hot-reload.
     arguments = apply_shipping_host_default(arguments, project_root)
 
-    # Step 5: validate the effective feature set before any build work starts.
     requested_features = collect_requested_features(arguments)
     shipping = SHIPPING_FEATURE in requested_features
     managed = shipping and project_is_managed(project_root)
     if aot and not managed:
-        print(
-            "error: --csharp-aot requires a managed C# project shipping build; "
-            "point PROJECT_PATH at a directory with a .csproj",
-            file=sys.stderr,
+        raise BuildRequestError(
+            "--csharp-aot requires a managed C# project shipping build; point "
+            "PROJECT_PATH at a directory with a .csproj"
         )
-        return 1
-    # Where a shipping build's output lands: cargo's target dir under the
-    # project's build/build_meta, and dated artifact copies under build/<date>.
+
     target_directory = None
     artifacts_directory = None
-    build_binary_name = ""
     if shipping:
         if "--no-default-features" not in arguments:
-            print(
-                "error: the shipping posture (`shipping`) needs "
-                "`--no-default-features`, otherwise the default `dev` feature "
-                "stays on and the binary ships the development host.",
-                file=sys.stderr,
+            raise BuildRequestError(
+                "the shipping posture (`shipping`) needs `--no-default-features`, "
+                "otherwise the default `dev` feature stays on and the binary "
+                "ships the development host."
             )
-            return 1
         if requested_features & {"dev", "hot_patch"}:
-            print(
-                "error: a shipping build cannot combine `shipping` with "
-                "`dev`/`hot_patch`.",
-                file=sys.stderr,
+            raise BuildRequestError(
+                "a shipping build cannot combine `shipping` with `dev`/`hot_patch`."
             )
-            return 1
         if not project_path:
-            print(
-                "error: no project path: set PROJECT_PATH or pass --project "
-                "(the shipping bundle is generated from the project's "
-                "project_settings.yaml).",
-                file=sys.stderr,
+            raise BuildRequestError(
+                "no project path: set PROJECT_PATH or pass --project (the "
+                "shipping bundle is generated from the project's "
+                "project_settings.yaml)."
             )
-            return 1
-        # `project_root` was already resolved before the shipping default was
-        # applied, so the posture feature and the output directories agree.
         target_directory = project_root / "build" / "build_meta" / "pill_build_data"
         artifacts_directory = (
-            project_root
-            / "build"
-            / datetime.datetime.now().strftime("%d-%m-%Y_%H-%M")
+            project_root / "build" / datetime.datetime.now().strftime("%d-%m-%Y_%H-%M")
         )
-        # Regenerate the shipping bundle from the project's settings file, so
-        # the static build always reflects `project_settings.yaml`. The bundle
-        # is gitignored build output; this pre-step is what makes it exist.
-        generator_script = (
-            repository_root / "devops" / "tools" / "generate_shipping_bundle.py"
-        )
-        # The requested features are forwarded so the bundle can enable the
-        # project's matching features (e.g. `rendering`) in the static build.
-        # The generator receives the project path relative to the repository
-        # root (it resolves against it itself), so a cwd-relative PROJECT_PATH
-        # cannot leak `..` into the generated bundle's paths.
-        generator_project_path = os.path.relpath(project_root, repository_root)
-        generator_command = [sys.executable, str(generator_script), generator_project_path]
-        if aot:
-            generator_command += ["--csharp-aot", "--rid", dotnet_rid()]
-        for feature in sorted(requested_features):
-            generator_command += ["--feature", feature]
-        generated = subprocess.run(generator_command, cwd=str(repository_root))
-        if generated.returncode != 0:
-            return generated.returncode
-        # The generator validated the project `build_binary_name` and recorded
-        # it in the shared build scratch dir; it names the copied artifacts.
-        binary_name_file = (
-            repository_root / "build" / "build_meta" / "build_binary_name.txt"
-        )
-        if not binary_name_file.is_file():
-            print(
-                "error: build/build_meta/build_binary_name.txt missing (the "
-                "generator did not record a build binary name)",
-                file=sys.stderr,
-            )
-            return 1
-        build_binary_name = binary_name_file.read_text(encoding="utf-8").strip()
 
-    # Step 5b: a managed shipping build needs the project assembly (and the C#
-    # runtime it references) produced before the host is linked - the
-    # managed backend loads prebuilt assemblies, it never compiles. The
-    # bundle declared the modules in Rust, so this dotnet build is the whole
-    # managed side of the shipping binary. The output directories are derived
-    # from the manifest exactly as the generated bundle's CSharp config does.
+    managed_manifest = None
     if managed:
         managed_manifests = sorted(project_root.glob("*.csproj"))
         if not managed_manifests:
-            print(
-                f"error: no .csproj in managed project root {project_root}",
-                file=sys.stderr,
+            raise BuildRequestError(
+                f"no .csproj in managed project root {project_root}"
             )
-            return 1
-        # Where the project finds the engine's shared C# build
-        # (`modules/csharp/Pill.CSharp.props`), passed so a project need not
-        # sit at a fixed depth below the repository.
-        engine_root_property = f"-p:PillEngineRoot={(repository_root / 'modules').as_posix()}/"
-        if shutil.which("dotnet") is None:
-            print(
-                "error: a C# shipping build needs the .NET SDK (dotnet) on PATH",
-                file=sys.stderr,
-            )
-            return 1
-        if aot:
-            # NativeAOT posture: publish the project with PublishAot so the
-            # loader, the gameplay code, and the trimmed runtime merge into one
-            # native library. `EnablePillAot` turns on the source generator
-            # (which emits the direct system registry) and the root export
-            # forwarders; the RID selects the platform's publish output dir.
-            print(
-                "Publishing the managed project with NativeAOT "
-                f"(dotnet publish -c Release -r {dotnet_rid()} -p:PublishAot=true)."
-            )
-            managed_build = subprocess.run(
-                [
-                    "dotnet",
-                    "publish",
-                    str(managed_manifests[0]),
-                    "-c",
-                    "Release",
-                    "-r",
-                    dotnet_rid(),
-                    "-p:EnablePillAot=true",
-                    engine_root_property,
-                    "--nologo",
-                ],
-                cwd=str(repository_root),
-            )
-        else:
-            print("Building the managed project assembly (dotnet build -c Release).")
-            managed_build = subprocess.run(
-                [
-                    "dotnet",
-                    "build",
-                    str(managed_manifests[0]),
-                    "-c",
-                    "Release",
-                    engine_root_property,
-                    "--nologo",
-                ],
-                cwd=str(repository_root),
-            )
-        if managed_build.returncode != 0:
-            return managed_build.returncode
+        managed_manifest = managed_manifests[0]
 
-    # The project's settings file drives the build report; read it up front so
-    # the final analysis can name the project, its author and its description.
-    project_settings = load_project_settings(project_root) if project_root else {}
-
-    # Step 6: refuse a release build of the host that escaped the shipping
-    # default (e.g. `--workspace` without the posture).
-    if host_will_build(arguments) and not shipping:
-        print(
-            "error: a release build of `pill_standalone` is always the shipping "
-            "posture - the development host is a development tool and must not ship. "
-            "Scope the build away from the host (e.g. `-p pill_engine` or "
-            "`--exclude pill_standalone`).",
-            file=sys.stderr,
-        )
-        return 1
-
-    # Step 7: `--profile` may already be among the forwarded arguments; adding
-    # `--release` as well would make cargo reject the pair.
     profile_already_chosen = any(
         argument == "--profile" or argument.startswith("--profile=")
         for argument in arguments
     )
     profile_arguments = [] if profile_already_chosen else ["--release"]
 
-    print("Building the release profile with RUSTFLAGS cleared.")
-    print(f"  workspace: {workspace_directory}")
-    if target_directory is not None:
-        print(f"  target: {target_directory}")
-
-    # Step 8: an empty RUSTFLAGS replaces `build.rustflags` outright rather
-    # than merging with it, which is exactly what removing `-C prefer-dynamic`
-    # requires. A shipping build also redirects cargo's target dir into the
-    # project's build/build_meta/pill_build_data.
-    environment = dict(os.environ, RUSTFLAGS="")
-    if target_directory is not None:
-        environment["CARGO_TARGET_DIR"] = str(target_directory)
-    # `--offline`: every dependency is a path dep or already cached, and cargo
-    # then never touches the registry - whose package-cache lock rust-analyzer
-    # can hold for long stretches, which would stall the build with no output.
-    command = ["cargo", "build", "--offline", *profile_arguments, *arguments]
-    completed = subprocess.run(
-        command, cwd=str(workspace_directory), env=environment
+    return BuildRequest(
+        repository_root=repository_root,
+        workspace_directory=workspace_directory,
+        arguments=arguments,
+        requested_features=requested_features,
+        project_path=project_path,
+        project_root=project_root,
+        shipping=shipping,
+        managed=managed,
+        aot=aot,
+        target_directory=target_directory,
+        artifacts_directory=artifacts_directory,
+        build_binary_name="",
+        project_settings={},
+        profile_arguments=profile_arguments,
+        managed_manifest=managed_manifest,
+        analyze_size=analyze_size,
+        start_time=start_time,
     )
 
-    # Step 9: mirror `set -e` from the shell version - a failed build is a
-    # failed script, whatever cargo printed. On success, copy the shipping
-    # artifacts into the dated output directory.
-    copied_artifacts = []
-    if completed.returncode == 0 and target_directory is not None:
-        copied_artifacts = copy_shipping_artifacts(
-            target_directory,
-            artifacts_directory,
-            build_binary_name,
-            extract_profile(arguments),
-        )
-        # The managed side of a C# shipping build: the project assembly and
-        # the C# runtime it references (or, with --csharp-aot, the single
-        # self-contained native library), recorded alongside the shipping
-        # binary.
-        if managed:
-            managed_assembly_name = managed_manifests[0].stem
-            copied_artifacts += copy_managed_artifacts(
-                project_root,
-                workspace_directory,
-                artifacts_directory,
-                managed_assembly_name,
-                aot=aot,
-                rid=dotnet_rid(),
-            )
-        # Drop the debug symbols and linker side products now that every
-        # artifact is in place, so the dated folder holds only what runs
-        # (see REMOVE_MISC_ARTIFACTS above).
-        if REMOVE_MISC_ARTIFACTS:
-            copied_artifacts = remove_misc_artifacts(
-                artifacts_directory, copied_artifacts
-            )
 
-    # Step 10: print the build analysis as a box-drawing tree - the project is
-    # the root, the build facts are its branches, and the artifacts (with
-    # sizes and checksums) close the tree.
-    if completed.returncode == 0:
-        branches = []
-        if project_root is not None:
-            for key in ("author", "version"):
-                value = project_settings.get(key)
-                if value:
-                    branches.append((f"{key}: {value}", None))
-        branches.append((f"platform: {target_platform()}", None))
-        branches.append((f"profile: {extract_profile(arguments)}", None))
-        features = sorted(requested_features)
-        branches.append(
-            (f"features: {', '.join(features) if features else '(none)'}", None)
+def generate_bundle(request: BuildRequest) -> int:
+    """Regenerates the shipping bundle and records the binary name."""
+    if not request.shipping:
+        return 0
+    generator_script = (
+        request.repository_root / "devops" / "tools" / "generate_shipping_bundle.py"
+    )
+    # The generator resolves the path against the repository root, so a
+    # cwd-relative PROJECT_PATH cannot leak `..` into the generated bundle.
+    generator_project_path = os.path.relpath(
+        request.project_root, request.repository_root
+    )
+    command = [sys.executable, str(generator_script), generator_project_path]
+    if request.aot:
+        command += ["--csharp-aot", "--rid", dotnet_rid()]
+    for feature in sorted(request.requested_features):
+        command += ["--feature", feature]
+    generated = subprocess.run(command, cwd=str(request.repository_root))
+    if generated.returncode != 0:
+        return generated.returncode
+    name_file = (
+        request.repository_root / "build" / "build_meta" / "build_binary_name.txt"
+    )
+    if not name_file.is_file():
+        print(
+            "error: build/build_meta/build_binary_name.txt missing (the "
+            "generator did not record a build binary name)",
+            file=sys.stderr,
         )
-        toolchain = toolchain_versions()
-        if toolchain:
-            branches.append((f"toolchain: {toolchain}", None))
-        repository_git = git_info(repository_root)
-        if repository_git:
-            branches.append((f"git: {repository_git}", None))
-        branches.append(
-            (f"duration: {format_duration(time.monotonic() - start_time)}", None)
+        return 1
+    request.build_binary_name = name_file.read_text(encoding="utf-8").strip()
+    return 0
+
+
+def build_managed_side(request: BuildRequest) -> int:
+    """Builds the project assembly, or publishes it with NativeAOT."""
+    if not request.managed:
+        return 0
+    engine_root_property = (
+        f"-p:PillEngineRoot={(request.repository_root / 'modules').as_posix()}/"
+    )
+    if shutil.which("dotnet") is None:
+        print(
+            "error: a C# shipping build needs the .NET SDK (dotnet) on PATH",
+            file=sys.stderr,
         )
-        if project_root is not None:
-            description = project_settings.get("description")
-            if description:
-                branches.append(("description:", [str(description)]))
-            modules = project_settings.get("modules") or []
-            if modules:
-                branches.append(("modules:", [str(name) for name in modules]))
-        if copied_artifacts:
-            artifact_entries = []
-            for name in copied_artifacts:
-                artifact_path = artifacts_directory / name
-                size = (
-                    artifact_path.stat().st_size if artifact_path.is_file() else 0
-                )
-                artifact_entries.append((name, artifact_path, size))
-            total_size = sum(size for _, _, size in artifact_entries)
-            name_width = max(len(name) for name, _, _ in artifact_entries)
-            artifact_lines = [f"path: {artifacts_directory}"]
-            for name, artifact_path, size in artifact_entries:
-                checksum = sha256_checksum(artifact_path)
-                artifact_lines.append(
-                    f"{name:<{name_width}}  {human_readable_size(size)}  "
-                    f"(sha256 {checksum})"
-                )
+        return 1
+    manifest = request.managed_manifest
+    if request.aot:
+        print(
+            "Publishing the managed project with NativeAOT "
+            f"(dotnet publish -c Release -r {dotnet_rid()} -p:PublishAot=true)."
+        )
+        completed = subprocess.run(
+            [
+                "dotnet",
+                "publish",
+                str(manifest),
+                "-c",
+                "Release",
+                "-r",
+                dotnet_rid(),
+                "-p:EnablePillAot=true",
+                engine_root_property,
+                "--nologo",
+            ],
+            cwd=str(request.repository_root),
+        )
+    else:
+        print("Building the managed project assembly (dotnet build -c Release).")
+        completed = subprocess.run(
+            [
+                "dotnet",
+                "build",
+                str(manifest),
+                "-c",
+                "Release",
+                engine_root_property,
+                "--nologo",
+            ],
+            cwd=str(request.repository_root),
+        )
+    return completed.returncode
+
+
+def collect_project_settings(request: BuildRequest) -> None:
+    """Reads the project's settings file into the request for the report."""
+    request.project_settings = (
+        load_project_settings(request.project_root) if request.project_root else {}
+    )
+
+
+def refuse_host_release(request: BuildRequest) -> int:
+    """Refuses a release build of the host that escaped the shipping default."""
+    if host_will_build(request.arguments) and not request.shipping:
+        print(
+            "error: a release build of `pill_standalone` is always the shipping "
+            "posture - the development host is a development tool and must not "
+            "ship. Scope the build away from the host (e.g. `-p pill_engine` or "
+            "`--exclude pill_standalone`).",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def run_cargo(request: BuildRequest) -> subprocess.CompletedProcess:
+    """Runs the release build with `RUSTFLAGS` cleared."""
+    print("Building the release profile with RUSTFLAGS cleared.")
+    print(f"  workspace: {request.workspace_directory}")
+    if request.target_directory is not None:
+        print(f"  target: {request.target_directory}")
+    # An empty RUSTFLAGS replaces `build.rustflags` outright rather than
+    # merging with it, which is what removing `-C prefer-dynamic` requires.
+    environment = dict(os.environ, RUSTFLAGS="")
+    if request.target_directory is not None:
+        environment["CARGO_TARGET_DIR"] = str(request.target_directory)
+    command = [
+        "cargo",
+        "build",
+        "--offline",
+        *request.profile_arguments,
+        *request.arguments,
+    ]
+    return subprocess.run(command, cwd=str(request.workspace_directory), env=environment)
+
+
+def copy_and_prune_artifacts(
+    request: BuildRequest, completed: subprocess.CompletedProcess
+) -> List[str]:
+    """Copies the artifacts into the dated directory and prunes side products."""
+    if completed.returncode != 0 or request.target_directory is None:
+        return []
+    copied_artifacts = copy_shipping_artifacts(
+        request.target_directory,
+        request.artifacts_directory,
+        request.build_binary_name,
+        extract_profile(request.arguments),
+    )
+    if request.managed:
+        copied_artifacts += copy_managed_artifacts(
+            request.project_root,
+            request.workspace_directory,
+            request.artifacts_directory,
+            request.managed_manifest.stem,
+            aot=request.aot,
+            rid=dotnet_rid(),
+        )
+    if REMOVE_MISC_ARTIFACTS:
+        copied_artifacts = remove_misc_artifacts(
+            request.artifacts_directory, copied_artifacts
+        )
+    return copied_artifacts
+
+
+def print_build_report(request: BuildRequest, copied_artifacts: List[str]) -> None:
+    """Prints the build analysis tree for a successful build."""
+    branches = []
+    project_settings = request.project_settings
+    if request.project_root is not None:
+        for key in ("author", "version"):
+            value = project_settings.get(key)
+            if value:
+                branches.append((f"{key}: {value}", None))
+    branches.append((f"platform: {target_platform()}", None))
+    branches.append((f"profile: {extract_profile(request.arguments)}", None))
+    features = sorted(request.requested_features)
+    branches.append(
+        (f"features: {', '.join(features) if features else '(none)'}", None)
+    )
+    toolchain = toolchain_versions()
+    if toolchain:
+        branches.append((f"toolchain: {toolchain}", None))
+    repository_git = git_info(request.repository_root)
+    if repository_git:
+        branches.append((f"git: {repository_git}", None))
+    branches.append(
+        (
+            "duration: "
+            f"{format_duration(time.monotonic() - request.start_time)}",
+            None,
+        )
+    )
+    if request.project_root is not None:
+        description = project_settings.get("description")
+        if description:
+            branches.append(("description:", [str(description)]))
+        modules = project_settings.get("modules") or []
+        if modules:
+            branches.append(("modules:", [str(name) for name in modules]))
+    if copied_artifacts:
+        artifact_entries = []
+        for name in copied_artifacts:
+            artifact_path = request.artifacts_directory / name
+            size = artifact_path.stat().st_size if artifact_path.is_file() else 0
+            artifact_entries.append((name, artifact_path, size))
+        total_size = sum(size for _, _, size in artifact_entries)
+        name_width = max(len(name) for name, _, _ in artifact_entries)
+        artifact_lines = [f"path: {request.artifacts_directory}"]
+        for name, artifact_path, size in artifact_entries:
+            checksum = sha256_checksum(artifact_path)
             artifact_lines.append(
-                f"{'':<{name_width}}  total: {human_readable_size(total_size)}"
+                f"{name:<{name_width}}  {human_readable_size(size)}  "
+                f"(sha256 {checksum})"
             )
-            branches.append(("artifacts:", artifact_lines))
-
-        root_label = (
-            project_settings.get("name") if project_root is not None else "Build"
+        artifact_lines.append(
+            f"{'':<{name_width}}  total: {human_readable_size(total_size)}"
         )
-        print("✓ Build finished successfully")
-        print()
-        for line in render_tree_lines(str(root_label), branches):
-            print(line)
+        branches.append(("artifacts:", artifact_lines))
 
-    # Step 11: optional deep-dive into what makes up the executable.
-    if analyze_size and completed.returncode == 0:
-        if copied_artifacts:
-            executable_names = [
-                name for name in copied_artifacts if name.lower().endswith(".exe")
-            ]
-            if executable_names:
-                analyze_artifact_size(
-                    artifacts_directory / executable_names[0],
-                    workspace_directory,
-                    target_directory,
-                    sorted(requested_features),
-                )
-            else:
-                print(
-                    "--analyze_size: no executable was copied in this build; "
-                    "nothing to analyze.",
-                    file=sys.stderr,
-                )
+    root_label = (
+        project_settings.get("name") if request.project_root is not None else "Build"
+    )
+    print("✓ Build finished successfully")
+    print()
+    for line in render_tree_lines(str(root_label), branches):
+        print(line)
+
+
+def analyze_size(
+    request: BuildRequest,
+    completed: subprocess.CompletedProcess,
+    copied_artifacts: List[str],
+) -> None:
+    """Optionally deep-dives into what makes up the executable."""
+    if not request.analyze_size or completed.returncode != 0:
+        return
+    if copied_artifacts:
+        executable_names = [
+            name for name in copied_artifacts if name.lower().endswith(".exe")
+        ]
+        if executable_names:
+            analyze_artifact_size(
+                request.artifacts_directory / executable_names[0],
+                request.workspace_directory,
+                request.target_directory,
+                sorted(request.requested_features),
+            )
         else:
             print(
-                "--analyze_size skipped: this build produced no shipping "
-                "artifacts (only shipping host builds are analyzed).",
+                "--analyze_size: no executable was copied in this build; "
+                "nothing to analyze.",
                 file=sys.stderr,
             )
+    else:
+        print(
+            "--analyze_size skipped: this build produced no shipping "
+            "artifacts (only shipping host builds are analyzed).",
+            file=sys.stderr,
+        )
+
+
+def main() -> int:
+    """Runs the cargo release build with the workspace's RUSTFLAGS cleared."""
+    try:
+        request = resolve_build_request(sys.argv[1:])
+    except BuildRequestError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    generated = generate_bundle(request)
+    if generated != 0:
+        return generated
+
+    managed_status = build_managed_side(request)
+    if managed_status != 0:
+        return managed_status
+
+    collect_project_settings(request)
+    refused = refuse_host_release(request)
+    if refused != 0:
+        return refused
+
+    completed = run_cargo(request)
+
+    copied_artifacts = copy_and_prune_artifacts(request, completed)
+
+    if completed.returncode == 0:
+        print_build_report(request, copied_artifacts)
+
+    analyze_size(request, completed, copied_artifacts)
     return completed.returncode
 
 

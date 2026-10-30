@@ -593,16 +593,19 @@ public unsafe ref struct MirrorCall
         Unsafe.WriteUnaligned(slot + 8, checked((uint)count));
     }
 
-    private static InvalidOperationException NativeResourceFailure(
-        string name, string csharpName, QueryAccess access, byte status) => status switch
+    internal static InvalidOperationException NativeResourceFailure(
+        string name, string csharpName, QueryAccess access, byte status) =>
+        ((NativeResourceStatus)status) switch
         {
-            1 => new InvalidOperationException($"The world holds no {name} resource."),
-            2 => new InvalidOperationException(
+            NativeResourceStatus.NoValue =>
+                new InvalidOperationException($"The world holds no {name} resource."),
+            NativeResourceStatus.AccessNotDeclared => new InvalidOperationException(
                 $"This system did not declare {access} access to {name}. Add a " +
                 $"{(access == QueryAccess.Write ? "ResMut" : "Res")}<{csharpName}> parameter."),
-            3 => new InvalidOperationException(
+            NativeResourceStatus.NoInvocation => new InvalidOperationException(
                 $"{name} can only be reached from inside an [EcsSystem] or [EcsStartup] call."),
-            _ => new InvalidOperationException($"{name} could not be reached (status {status})."),
+            _ => new InvalidOperationException(
+                $"{name} could not be reached (status {status})."),
         };
 }
 

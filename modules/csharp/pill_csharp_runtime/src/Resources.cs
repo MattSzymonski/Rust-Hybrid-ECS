@@ -197,21 +197,21 @@ internal static unsafe class ResourceAccess
     }
 
     /// <summary>Describe a refused resource request in the caller's terms.</summary>
-    private static InvalidOperationException Failure<T>(byte status, QueryAccess access)
+    internal static InvalidOperationException Failure<T>(byte status, QueryAccess access)
         where T : unmanaged
     {
         string name = ResourceTypeMetadata<T>.Name;
-        return status switch
+        return ((ResourceViewStatus)status) switch
         {
-            1 => new InvalidOperationException(
+            ResourceViewStatus.NotRegistered => new InvalidOperationException(
                 $"Resource {name} is not registered with the engine. Mark it [EcsResource] " +
                 "so the manifest declares it."),
-            2 => new InvalidOperationException(
+            ResourceViewStatus.AccessNotDeclared => new InvalidOperationException(
                 $"This system did not declare {access} access to resource {name}. Add a " +
                 $"{(access == QueryAccess.Write ? "ResMut" : "Res")}<{typeof(T).Name}> parameter."),
-            3 => new InvalidOperationException(
+            ResourceViewStatus.NoInvocation => new InvalidOperationException(
                 $"No ECS system is running on this thread, so resource {name} cannot be reached."),
-            4 => new InvalidOperationException(
+            ResourceViewStatus.NoValue => new InvalidOperationException(
                 $"The world holds no value for resource {name} yet."),
             _ => new InvalidOperationException(
                 $"Resource {name} could not be reached (status {status})."),

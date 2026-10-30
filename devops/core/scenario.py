@@ -14,7 +14,7 @@ DESCRIPTION
     reload token and one from its settle token; the crash sweep, the
     required/forbidden sweep and the restore step were each written three
     times, with the messages disagreeing. One copy makes those choices one
-    decision instead of three (audit SA-0057).
+    decision instead of three.
 
     A suite supplies what is genuinely its own:
 

@@ -704,7 +704,7 @@ def main() -> None:
     print("=" * 70)
     # Report what the scan sees before checking it: the count must include the
     # native-editor suites' patterns, which the editor-session driver collects
-    # with everything else (SA-0051's acceptance evidence).
+    # with everything else.
     declared = collect_declared_tokens()
     driver_tokens = sum(
         1

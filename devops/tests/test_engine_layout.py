@@ -31,19 +31,18 @@ DESCRIPTION
                         loadable artifact; the generated `host_module_*`
                         wrappers replaced it, and a build that turned it back
                         on would duplicate the entry-point symbols.
-      4. shared UI    - each UI-independent shared dylib (`pill_ui_frame`, the in-game
-                        egui UI's `pill_project_ui`, and the egui editor's copy,
-                        `pill_editor_core`) is built as a
-                        `dylib` (one copy per process) and links no UI framework,
-                        window system or GPU crate (`dioxus`, `tao`, `wry`,
-                        `winit`, `wgpu`), followed through every path dependency.
+      4. shared UI    - each crate listed in `SHARED_UI_INDEPENDENT_DYLIBS`
+                        (the plain draw data, the in-game UI, the theme data
+                        and the editor's core) is built as a `dylib` (one
+                        copy per process) and links no UI framework, window
+                        system or GPU crate (`dioxus`, `tao`, `wry`, `winit`,
+                        `wgpu`), followed through every path dependency.
       5. shared core  - the shared `pill_core` dylib names no development-host
                         crate (`notify`, `libloading`, `walkdir`, `filetime`):
                         none is in its library graph, and no source line under
                         `pill_core/src` names one outside a comment. Every
                         posture links the core, so a crate only the development
-                        host and the C# bridge reach must not sit inside it
-                        (W-0114).
+                        host and the C# bridge reach must not sit inside it.
       6. UI kit       - `pill_ui_kit` is an rlib for exactly the two UI
                         dylibs, `pill_editor_core` and `pill_project_ui`: each
                         embeds the translator and re-exports it. Any other
@@ -95,19 +94,19 @@ REGISTRY_PATH_PREFIX = "inventory::"
 # `modules/`, and the crates they must never link (rule 4). A crate not yet
 # present is skipped, so a later stage adds its entry before the crate exists.
 SHARED_UI_INDEPENDENT_DYLIBS = (
-    # The plain draw data the UI libraries and the renderer contract share
-    # (W-0032): one shared dylib, no UI framework inside.
+    # The plain draw data the UI libraries and the renderer contract share:
+    # one shared dylib, no UI framework inside.
     ("pill_ui_frame", "rendering/pill_ui_frame"),
-    # The in-game egui UI (W-0028): one shared dylib over egui alone, so a
+    # The in-game egui UI: one shared dylib over egui alone, so a
     # project links the UI without the windowing or GPU crates the frontends
     # own.
     ("pill_project_ui", "ui/pill_project_ui"),
-    # The theme pipeline's plain data (W-0127): one shared dylib across the
+    # The theme pipeline's plain data: one shared dylib across the
     # project, `pill_project_ui`, the editor shell and `pill_editor_core`, so
     # the `.theme` asset and the `Theme` value have one identity. Egui-free;
     # the token-to-egui translator is an rlib compiled into each UI.
     ("pill_ui_theme", "ui/pill_ui_theme"),
-    # The egui editor's copy (W-0017): one shared dylib, same rule.
+    # The egui editor's copy: one shared dylib, same rule.
     ("pill_editor_core", "editor/pill_editor_core"),
 )
 UI_FRAMEWORK_CRATES = ("dioxus", "tao", "wry", "winit", "wgpu")
@@ -128,7 +127,7 @@ ENGINE_CORE_DYLIBS = ("pill_core", "pill_engine_core")
 # `modules/`, and the development-host crates it must never name (rule 5). The
 # dev host owns the module loader and the file watcher and the C# bridge owns
 # its own host loading; the core names their errors as a boxed
-# `std::error::Error` instead (W-0114). A crate not yet present is skipped.
+# `std::error::Error` instead. A crate not yet present is skipped.
 SHARED_CORE_CRATE = "pill_core"
 SHARED_CORE_DIRECTORY = "engine/pill_core"
 DEV_ONLY_CRATES = ("notify", "libloading", "walkdir", "filetime")

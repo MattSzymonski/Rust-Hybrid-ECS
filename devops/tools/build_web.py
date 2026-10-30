@@ -13,8 +13,8 @@
 #   puts the page (`devops/tools/web/index.html`) beside the generated
 #   `pkg/` in `<project>/build/web/`. Serve that directory over HTTP to play.
 #
-#   The project's assets travel beside the page, not inside the module
-#   (W-0105): the bundle's build script packs them, this script copies
+#   The project's assets travel beside the page, not inside the module:
+#   the bundle's build script packs them, this script copies
 #   `assets.pillpack` next to `index.html`, and `pill_web` fetches and mounts
 #   it before the project initializes.
 #
@@ -35,8 +35,8 @@
 #          --editor        build the editor posture: the shell compiled into
 #                          the wasm, the two-canvas editor page beside it
 #          --editor-frontend
-#                          which editor shell an --editor build links: only
-#                          `egui` (W-0029) exists since W-0030 Stage 2
+#                          which editor shell an --editor build links:
+#                          only `egui` exists
 #          --no-wasm-opt   skip wasm-opt in a release build
 #          [project_path]  workspace-relative project directory; defaults to
 #                          the PROJECT_PATH environment variable
@@ -59,7 +59,7 @@ from pathlib import Path
 # Locations, relative to the repository root.
 GENERATOR = Path("devops") / "tools" / "generate_shipping_bundle.py"
 PAGE_TEMPLATE = Path("devops") / "tools" / "web" / "index.html"
-# The editor posture's page (W-0004 Stage 30, W-0029): two stacked canvases
+# The editor posture's page: two stacked canvases
 # and the scripted channel's page hook.
 EDITOR_PAGE_TEMPLATE = Path("devops") / "tools" / "web" / "editor.html"
 # The editor shells an `--editor` build can link (the generator's list).
@@ -71,7 +71,7 @@ WEB_TARGET_DIRECTORY = Path("build") / "build_meta" / "web_target"
 # The module wasm-pack writes, named after the web app crate.
 WEB_MODULE_NAME = "pill_web_app_bg.wasm"
 # The project's assets, packed by the bundle's build script and fetched by the
-# module at startup (W-0105). It sits beside the page, not inside the module.
+# module at startup. It sits beside the page, not inside the module.
 ASSET_PACK_FILE_NAME = "assets.pillpack"
 BUNDLE_DIRECTORY = Path("build") / "pill_shipping_bundle"
 WEB_PACK_DIRECTORY = "pack"

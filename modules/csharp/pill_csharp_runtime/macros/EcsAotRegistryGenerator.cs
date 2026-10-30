@@ -5,8 +5,8 @@
 // `MethodInfo.Invoke` all require dynamic code or reflection invokers that
 // AOT does not provide. This generator instead emits, at compile time, a
 // direct registration table for every `[EcsSystem]` / `[EcsStartup]` method:
-// method: a static runner per system that constructs each query with `new`
-// and calls the method directly (no reflection), plus the query descriptors
+// a static runner per system that constructs each query with `new` and calls
+// the method directly (no reflection), plus the query descriptors
 // needed for scheduler access derivation and the component manifest.
 //
 // The generated code is compiled into the *project* assembly (the only one
@@ -196,7 +196,7 @@ namespace PillCSharpRuntimeMacros
             {
                 IMethodSymbol method = systems[index];
                 string receiver = method.ContainingType.ToDisplayString(FullyQualified);
-                string entry = EmitSystem(source, method, receiver, index, systemEntries);
+                string? entry = EmitSystem(source, method, receiver, index, systemEntries);
                 if (entry is null)
                     context.ReportDiagnostic(Diagnostic.Create(
                         new DiagnosticDescriptor(
@@ -215,7 +215,19 @@ namespace PillCSharpRuntimeMacros
             {
                 IMethodSymbol method = startups[index];
                 string receiver = method.ContainingType.ToDisplayString(FullyQualified);
-                EmitStartup(source, method, receiver, index, startupEntries);
+                string? refusal = EmitStartup(source, method, receiver, index, startupEntries);
+                if (refusal is not null)
+                    context.ReportDiagnostic(Diagnostic.Create(
+                        new DiagnosticDescriptor(
+                            "PCS0002",
+                            "Unsupported EcsStartup signature",
+                            "Startup {0} has an unsupported signature for the AOT registry: {1}",
+                            "PillCSharpRuntimeMacros",
+                            DiagnosticSeverity.Error,
+                            isEnabledByDefault: true),
+                        method.Locations.FirstOrDefault(),
+                        method.ToDisplayString(FullyQualified),
+                        refusal));
             }
 
             // The registry arrays ProjectHost's AOT branch reads at startup.
@@ -397,14 +409,28 @@ namespace PillCSharpRuntimeMacros
             return name;
         }
 
-        /// <summary>Emit one startup's runner and registry entry.</summary>
-        private static void EmitStartup(
+        /// <summary>
+        /// Emit one startup's runner and registry entry, or say why the
+        /// signature cannot be called directly.
+        /// </summary>
+        /// <remarks>
+        /// The contract is the one `ProjectHost.CreateStartup` enforces on the
+        /// reflection path: a void method, at most `MaxSystemParameters`
+        /// parameters, one `Commands` at most, and every other parameter a
+        /// `Res&lt;T&gt;`/`ResMut&lt;T&gt;`. A signature the runtime would
+        /// refuse must be refused here instead, at generation time, so an AOT
+        /// build never ships a registry that cannot run.
+        /// </remarks>
+        private static string? EmitStartup(
             StringBuilder source,
             IMethodSymbol method,
             string receiver,
             int index,
             List<string> entries)
         {
+            string? refusal = StartupRefusal(method);
+            if (refusal is not null)
+                return refusal;
             string runMethod = $"RunStartup_{index}";
             // Every startup parameter - Commands, Res<T>, ResMut<T> - is
             // stateless, so each is passed as its default, as the reflection
@@ -416,6 +442,32 @@ namespace PillCSharpRuntimeMacros
             entries.Add(
                 $"            new global::TracyLive.Loader.AotStartupRegistration(" +
                 $"\"{name}\", {runMethod})");
+            return null;
+        }
+
+        /// <summary>
+        /// Why the AOT registry cannot call this startup directly, or null.
+        /// </summary>
+        private static string? StartupRefusal(IMethodSymbol method)
+        {
+            if (!method.ReturnsVoid)
+                return "a startup must return void";
+            if (method.Parameters.Length > MaxSystemParameters)
+                return $"a startup takes at most {MaxSystemParameters} parameters";
+            bool usesCommands = false;
+            foreach (IParameterSymbol parameter in method.Parameters)
+            {
+                if (IsCommands(parameter.Type))
+                {
+                    if (usesCommands)
+                        return "Commands is declared more than once";
+                    usesCommands = true;
+                    continue;
+                }
+                if (ResourceMode(parameter.Type) is null)
+                    return $"{parameter.Name} is not a Commands, Res<T> or ResMut<T> parameter";
+            }
+            return null;
         }
     }
 }

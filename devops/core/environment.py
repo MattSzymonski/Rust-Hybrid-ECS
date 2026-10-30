@@ -19,6 +19,7 @@ DESCRIPTION
 
 import os
 import platform
+import shutil
 import socket
 import subprocess
 import sys
@@ -29,6 +30,45 @@ from .paths import REPOSITORY_ROOT, find_executable
 
 # Every external probe is capped so a hung provider cannot stall a run.
 PROBE_TIMEOUT_SECONDS = 8
+
+
+class ProcessToolUnavailable(RuntimeError):
+    """The process query could not run, so its answer means nothing."""
+
+
+def windows_process_commands(name: str) -> List[str]:
+    """Every command line of a running process named `name` (Windows).
+
+    A guard that swallows a failed query as "nothing is running" disables
+    itself silently, so this raises [`ProcessToolUnavailable`] when the shell
+    is missing, the query raises, or it exits non-zero.
+    """
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if not shell:
+        raise ProcessToolUnavailable("neither powershell nor pwsh is on PATH")
+    query = (
+        f"Get-CimInstance Win32_Process -Filter \"Name='{name}'\""
+        " | Select-Object -ExpandProperty CommandLine"
+    )
+    try:
+        completed = subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-Command", query],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ProcessToolUnavailable(
+            f"the process query could not be run: {error}"
+        ) from error
+    if completed.returncode != 0:
+        raise ProcessToolUnavailable(
+            f"the process query failed: {(completed.stderr or '').strip()[:200]}"
+        )
+    return [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
 
 
 def run_text_command(

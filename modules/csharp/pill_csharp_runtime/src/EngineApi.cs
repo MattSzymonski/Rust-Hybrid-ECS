@@ -107,7 +107,7 @@ public unsafe struct EngineApi
 
     /// <summary>
     /// Whether a key, by its <see cref="KeyCode"/> value, is held this frame.
-    /// Returns `1` while held and `0` otherwise. Appended at the end.
+    /// Returns `1` while held and `0` otherwise.
     /// </summary>
     public delegate* unmanaged[Cdecl]<byte, byte> InputKeyHeld;
 
@@ -119,7 +119,7 @@ public unsafe struct EngineApi
 
     /// <summary>
     /// Write the mouse motion since the previous frame, in physical pixels, to
-    /// the two outputs; returns `1` when written. Appended at the end.
+    /// the two outputs; returns `1` when written.
     /// </summary>
     public delegate* unmanaged[Cdecl]<float*, float*, byte> InputMouseDelta;
 

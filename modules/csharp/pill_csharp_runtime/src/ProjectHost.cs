@@ -4,15 +4,18 @@
 // - Loads project assemblies without locking their build output.
 // - Discovers and deterministically orders methods marked with EcsSystem.
 // - Derives scheduler access from every query parameter a method declares.
-// - Reloads behavior while rejecting scheduler-signature changes.
+// - Reloads method bodies, parks a changed component manifest, and lets the
+//   host re-register a changed system set. Only the startup set is refused.
 //
 // Design:
 // - Every project version lives in a collectible AssemblyLoadContext and is read
 //   from bytes so the compiler can replace the source DLL on Windows. Its
 //   portable PDB is read the same way and handed to the context, which is what
 //   gives a managed debugger symbols without either file being held open.
-// - Rust builds its execution graph once. A reload may replace method bodies,
-//   but names and access signatures must remain stable until host restart.
+// - A reload always swaps method bodies. A changed component manifest parks
+//   until the host applies it (`PollStatus.ManifestPending`), a changed system
+//   set is re-registered by the host from the arriving assembly, and only the
+//   startup set is pinned - startup methods do not run again on reload.
 
 using System.Linq.Expressions;
 using System.Reflection;
@@ -152,7 +155,7 @@ internal sealed class ProjectHost
             // thing that holds a retiring context alive. Only the cache goes:
             // the trampoline addresses the host published still belong to the
             // next context, so the unload neither clears the table nor bumps
-            // the generation a live call is resolving against (W-0079).
+            // the generation a live call is resolving against.
             Unloading += _ => MirrorMethods.DropDelegateCache();
         }
 
@@ -559,8 +562,8 @@ internal sealed class ProjectHost
     }
 
     /// <summary>
-    /// Load one assembly version, validate its scheduler signature, then swap
-    /// it atomically with the active collectible context.
+    /// Load one assembly version, validate its startup set, then swap it
+    /// atomically with the active collectible context.
     /// </summary>
     /// <param name="isReload">Whether this is a swap over a running version.</param>
     /// <param name="writeUtc">
