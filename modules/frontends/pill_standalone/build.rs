@@ -3,7 +3,7 @@
 //! # Responsibilities
 //!
 //! - Copy the toolchain's `std` dylib beside the executable.
-//! - Delegate the staging logic to `pill_hot_scan`; this script only wires it up.
+//! - Delegate the staging logic to `pill_std_staging`; this script only wires it up.
 //!
 //! The engine workspace links with `-C prefer-dynamic`, so this executable
 //! imports `std-<hash>.dll` at process load. That dylib lives in the
@@ -11,7 +11,7 @@
 //! search; without it on `PATH` the process fails with
 //! `STATUS_DLL_NOT_FOUND`. This build script copies it beside the executable
 //! so the host runs without any `PATH` adjustment in development. All the
-//! logic lives in the shared `pill_hot_scan` crate; this script only
+//! logic lives in the shared `pill_std_staging` crate; this script only
 //! calls it.
 //!
 //! It also enforces the release posture: a release build of the host is always
@@ -37,5 +37,5 @@ fn main() {
     }
 
     // Copy `std-*.dll` next to the built executable (no-op off Windows).
-    pill_hot_scan::stage_std_dylib();
+    pill_std_staging::stage_std_dylib();
 }

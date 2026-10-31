@@ -82,3 +82,8 @@ pill_editor_core = { path = "../pill_editor_core" }
 pill_ui_theme = { path = "../../ui/pill_ui_theme" }
 # The asset settings documents the Inspector's asset rows edit are JSON.
 serde_json = "1"
+
+[build-dependencies]
+# Copies the toolchain's `std-*.dll` beside `pill_editor.exe`, so the editor
+# starts without relying on another executable's build having staged it.
+pill_std_staging = { path = "../../frontends/pill_std_staging" }

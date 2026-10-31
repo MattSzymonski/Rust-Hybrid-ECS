@@ -598,6 +598,7 @@ ENGINE_LIBRARIES = {
     "pill_engine_macros",
     "pill_core_macros",
     "pill_hot_scan",
+    "pill_std_staging",
     "pill_editor",
     # Under `modules/extensions/`, but engine code rather than an extension:
     #  it is the renderer the host links when built windowed, never
