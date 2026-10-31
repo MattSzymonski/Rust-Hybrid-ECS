@@ -17,7 +17,7 @@ DESCRIPTION
     static event that roots the retiring load context - so a rule that quietly
     stops firing removes a protection nobody would notice was gone.
 
-    Three checks, all driven by `dotnet build` on `examples/project_cs`:
+    Three checks, all driven by `dotnet build` on `examples/local/project_cs`:
 
       1. scenario_clean_project_is_diagnostic_free - the real gameplay project
          builds with no PILL diagnostic at all, which proves the analyzer is
@@ -54,14 +54,13 @@ from pathlib import Path
 # the suite works from any working directory without a package import.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.suite_common import CSHARP_PROJECT_ROOT, WORKSPACE_ROOT  # noqa: E402
+from core.suite_common import PROJECT_CS_CSPROJ, WORKSPACE_ROOT  # noqa: E402
 
 # =============================================================================
 # Constants
 # =============================================================================
 
-PROJECT_CS_CSPROJ = CSHARP_PROJECT_ROOT / "project_cs.csproj"
-ANALYZER_PROBE_CS = CSHARP_PROJECT_ROOT / "src" / "_AnalyzerProbe.cs"
+ANALYZER_PROBE_CS = PROJECT_CS_CSPROJ.parent / "src" / "_AnalyzerProbe.cs"
 
 BUILD_TIMEOUT_SECONDS = 300
 

@@ -151,9 +151,9 @@ public readonly unsafe ref struct QueryRow<T1, T2, T3, T4, T5, T6, T7, T8>
     /// <remarks>
     /// The typed row is the hot path, so this is
     /// <see cref="ConditionalAttribute"/> on DEBUG and the call disappears
-    /// entirely from a release build - the same posture Unity takes with its
-    /// job safety system. In a debug build it turns a read of storage that has
-    /// since moved into a named error.
+    /// entirely from a `Release` configuration - the same posture Unity takes
+    /// with its job safety system. In a `Debug` configuration it turns a read
+    /// of storage that has since moved into a named error.
     /// </remarks>
     [Conditional("DEBUG")]
     private static void ValidateScope(ref QueryColumn column)

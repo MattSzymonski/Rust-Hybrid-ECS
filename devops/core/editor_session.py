@@ -45,6 +45,7 @@ from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
 from core.environment import filesystem_timestamp
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name
+from core.projects import NATIVE_PROJECT_PATH
 from core.suite_common import ensure_host_lock, kill_stale_hosts, release_host_lock
 
 # The editor binary every native-editor suite drives.
@@ -132,7 +133,7 @@ class EditorSession:
         self,
         suite: str,
         session: str = "main",
-        project: str = "../examples/project_rs",
+        project: str = NATIVE_PROJECT_PATH,
         test_seconds: int = 300,
         sandbox: Optional[Path] = None,
         binary: Optional[Path] = None,

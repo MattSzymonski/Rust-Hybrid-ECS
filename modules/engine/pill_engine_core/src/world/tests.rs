@@ -1348,7 +1348,7 @@ impl crate::component::Component for Unregistered {}
 /// The destination archetype is derived from component bits, so an
 /// unregistered type contributes none and the destination resolves to the
 /// entity's current archetype. The migration then short-circuits and the add
-/// reports success while storing nothing - a release build silently loses the
+/// reports success while storing nothing - a release-profile build silently loses the
 /// component.
 #[test]
 fn test_add_component_refuses_unregistered_type() {

@@ -47,9 +47,9 @@
 #          --max-size-kb N      fail (exit 1) when the shipped module is larger
 #
 # EXAMPLE USAGE:
-#   python devops/tools/wasm_size_report.py examples/cube
-#   python devops/tools/wasm_size_report.py --build examples/master_renderer_test
-#   python devops/tools/wasm_size_report.py --max-size-kb 2500 examples/cube
+#   python devops/tools/wasm_size_report.py examples/local/cube
+#   python devops/tools/wasm_size_report.py --build examples/local/master_renderer_test
+#   python devops/tools/wasm_size_report.py --max-size-kb 2500 examples/local/cube
 
 # --- SCRIPT ---
 

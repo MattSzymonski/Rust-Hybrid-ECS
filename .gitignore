@@ -1,79 +1,35 @@
-# Rust build artifacts
+# Rust build output.
 /target
 /devops/tests/project/target
 /modules/target
-/examples/**/target/**
 
-# Cooked shader output.
-#
-# Where a `build.rs` runs the `pill_assets` pipeline over a `shaders/` directory,
-# the `*.wgsl` beside each `*.hlsl` are build products: a tracked copy is stale
-# the moment its source is edited, and the diff it leaves is noise on every
-# shader change.
-#
-# The rule is blanket because the cooked output is read two different ways - the
-# renderer embeds its WGSL through `include_str!`, while a project example loads
-# it from `res/` by path - so the directories holding it are not in one place.
-#
-# The exceptions are files nothing generates. `italian_brainrot` and
-# `italian_brainrot_cs` have no build script and no cooker: their `.wgsl` are
-# committed, loaded from `res/` as they are, and copied out of whichever project
-# cooks them last. Ignoring them would let a shader edit fall out of the
-# repository with nothing to regenerate it.
+# C# build output, wherever a project lives.
+bin/
+obj/
+
+# Cooked shader output: `build.rs` regenerates the `*.wgsl` beside each `*.hlsl`.
 *.wgsl
-!examples/italian_brainrot/res/shaders/*.wgsl
-!examples/italian_brainrot_cs/res/shaders/*.wgsl
-# Hand-written WGSL in the renderer crate itself, with no `.hlsl` beside it to
-# cook: the overlay's three and the preview's one are embedded through
-# `include_str!` and nothing regenerates them.
-!modules/extensions/pill_master_renderer/pill_master_renderer/src/**/*.wgsl
 
-# Hand-written WGSL, with no `.hlsl` beside it to cook. `master_renderer_test`
-# carries its own rule for its cooked output, and the matching exception for
-# this file lives there - a negation here cannot reach past a deeper one.
-!examples/master_renderer_test/res/shaders/unlit_fragment.wgsl
-
-# Hot-reload runtime temp copies
+# Hot-reload runtime temp copies.
 modules/pill_standalone_temp/
 
-# Captured run output. A redirected host run drops these wherever it was
-# started, including the cargo workspace root; one was tracked for a while.
-# A capture worth keeping goes under `local/`, which is ignored below.
+# Captured run output.
 *.log
 
-# Host-generated workspace members (created at runtime): each extension's
-# `host_module_*` wrappers in its own `generated/` folder, and the project's
-# `host_project_*` member. The READMEs anchoring the member globs stay tracked.
+# Host-generated workspace members. The tracked READMEs keep their member
+# globs from matching nothing.
 modules/extensions/*/generated/
-# The C# mirrors the host writes beside a crate that declares mirrored types
-# (one level deeper than the wrapper folders above); regenerated every start.
 modules/extensions/*/*/generated/
 !modules/extensions/_workspace_anchor/generated/
 modules/projects_generated/*
 !modules/projects_generated/README.md
 
-# Generated build scratch (shipping bundle contents, build metadata).
-#
-# Ignore the CONTENTS rather than the directory itself: git never descends
-# into an excluded directory, so a `build/` exclusion would make the
-# negations below unreachable.
+# Generated build scratch, except the shipping-bundle stub. `pill_standalone`
+# declares the stub as a path dependency, and Cargo resolves every manifest
+# before it evaluates features, so the directory must exist even in builds that
+# never enable `shipping`. A shipping build overwrites it; restore it with
+# `git checkout -- build/pill_shipping_bundle`.
 **/build/*
-
-# ...except the shipping bundle crate skeleton, which is COMMITTED as a stub.
-#
-# `pill_standalone` declares `pill_shipping_bundle` as an optional path
-# dependency. Cargo resolves every manifest in the workspace BEFORE it
-# evaluates features, so a missing directory here breaks resolution for the
-# whole workspace - including plain debug builds that never enable
-# `shipping`, and including `cargo run -p editor`. `optional = true`
-# means "do not compile it", not "do not look for it".
-#
-# The committed stub is deliberately project-agnostic and refuses to compile
-# (W-0082): a stub that is a real generation is a bundle the shipping posture
-# would type-check and ship instead of the project's own. A shipping build
-# overwrites both files through the generator's content-based writes, so a
-# stable tree shows no diff; run `git checkout -- build/pill_shipping_bundle`
-# to return to the neutral stub afterwards.
 !build/pill_shipping_bundle/
 build/pill_shipping_bundle/*
 !build/pill_shipping_bundle/Cargo.toml
@@ -81,41 +37,33 @@ build/pill_shipping_bundle/*
 build/pill_shipping_bundle/src/*
 !build/pill_shipping_bundle/src/lib.rs
 
-# Test infrastructure
-devops/tests/__pycache__/
+# Python bytecode.
 __pycache__/
 *.pyc
 *.pyo
 
-# Editor / IDE
+# Editor and IDE state.
 .vscode/settings.json
 .idea/
-# Agent tooling stays local to each checkout: skills and hooks live in
-# `.agents/`, symlinked into `.claude/skills` and `.github/skills`.
-.github/skills/*
-.claude/*
+
+# Local agent tooling and generated Copilot instructions.
 .agents/*
-.claude/skills/*
+.claude/*
+.github/skills/*
 AGENTS.md
-
-/examples/circus_demo_cs
-/examples/circus_recreation
-
-# Profiling and benchmark artifacts
-graphify-out/
-performance_benchmarks/cache/artifacts/
-
-/devops/pill_lab/measurements/
-
-# Local developer notes
-local/
-
-# The construction site's data (its own local-only git repository)
-.construction_site/
-
-# Copilot instructions (generated)
 .github/copilot-instructions.md
 
-bin/
-obj/
+# Example projects are a local checkout the devops suites read from disk; a
+# fresh clone does not carry them.
+/examples/local/
 
+# Measurement and profiling output.
+performance_benchmarks/cache/artifacts/
+/devops/pill_lab/measurements/
+
+# Scratch notes, probes and one-off data.
+/local/
+/modules/local/
+
+# Workflow data, kept in its own repository.
+.construction_site/

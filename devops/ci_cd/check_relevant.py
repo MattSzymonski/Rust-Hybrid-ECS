@@ -56,6 +56,15 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPOSITORY_ROOT / "devops"))
+
+from core.projects import (  # noqa: E402
+    EXAMPLES_RELATIVE_PATH,
+    PROJECT_RS_RES,
+    PROJECT_RS_SRC,
+    repository_relative,
+)
+
 MODULES = "modules"
 SUITES_DIR = REPOSITORY_ROOT / "devops" / "tests"
 
@@ -273,7 +282,10 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 
     # The example's committed render chain: the windowed host runs it and the
     # renderer's chain log must name the project's own pass.
-    if has("examples/project_rs/res/**", "examples/project_rs/src/**"):
+    if has(
+        repository_relative(PROJECT_RS_RES) + "/**",
+        repository_relative(PROJECT_RS_SRC) + "/**",
+    ):
         selected.append(
             suite_check("test_render_chains.py", "the example chain changed")
         )
@@ -306,9 +318,9 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 
     # Examples are projects, not library code: their suites need release
     # builds, so they are suggested rather than run.
-    examples = has("examples/**")
+    examples = has(EXAMPLES_RELATIVE_PATH + "/**")
     if examples:
-        print(f"  note: {len(examples)} file(s) under examples/ changed; "
+        print(f"  note: {len(examples)} file(s) under {EXAMPLES_RELATIVE_PATH}/ changed; "
               "run `python devops/tests/run_all.py --only test_examples.py` when shipping matters")
 
     # A code change outside every rule above still needs a home: fall back to
@@ -352,7 +364,7 @@ RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("manifests", ("**/Cargo.toml", "modules/.cargo/config.toml", "modules/clippy.toml")),
     ("devops-suites", ("devops/tests/**",)),
     ("devops-infrastructure", ("devops/ci_cd/**", "devops/core/**")),
-    ("examples", ("examples/**",)),
+    (EXAMPLES_RELATIVE_PATH, (EXAMPLES_RELATIVE_PATH + "/**",)),
 ]
 
 

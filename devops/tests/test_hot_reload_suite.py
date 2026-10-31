@@ -37,7 +37,7 @@ DESCRIPTION
         7. init_failure_rollback   - an init that returns non-zero keeps the
                                      previous generation and the host alive.
 
-      Session B (project = examples/project_rs, module = pill_spline)
+      Session B (project = examples/local/project_rs, module = pill_spline)
         8. cascade_reload          - editing a module the project links triggers
                                      the module reload AND a project reload, and
                                      the new value reaches the running project
@@ -147,7 +147,7 @@ def last_probe_midpoint(output: str) -> Tuple[float, float]:
 
 # This suite measures the plain reload transaction, so it pins the reload-only
 # posture to keep the patch fast path out of the host it drives. `rendering`
-# stays ON because session B drives `examples/project_rs`, which links
+# stays ON because session B drives `examples/local/project_rs`, which links
 # `pill_master_renderer`: a host without it resolves `pill_core` differently
 # from that project and the project DLL fails to load with "The specified
 # procedure could not be found" (os error 127).
@@ -482,7 +482,7 @@ SESSION_A_SCENARIOS = [
     ),
 ]
 
-# --- Session B scenario (project = examples/project_rs, module = pill_spline) -
+# --- Session B scenario (project = examples/local/project_rs, module = pill_spline) -
 
 # The offset bump the cascade scenario makes, planned against the module source
 # as it is now. Its `delta` is what the probe check below is derived from.
@@ -532,7 +532,7 @@ def session_b_scenarios(monitor: OutputMonitor) -> Optional[Sequence[Scenario]]:
                     # both reloads the probe therefore still sees exactly one.
                     #
                     # The count alone carries that meaning; the surrounding probe
-                    # wording in `examples/project_rs/src/lib.rs` is incidental and
+                    # wording in `examples/local/project_rs/src/lib.rs` is incidental and
                     # edited freely by the demos. Widened from the previous
                     # `xxsees 1 spline(s)` so a probe rewording no longer fails this
                     # scenario. If it regresses, read the analytics lines just above
@@ -744,11 +744,11 @@ def main() -> None:
 
         results.append(
             (
-                "A (devops/tests/project + pill_spline)",
+                "A ({} + pill_spline)".format(FIXTURE_PROJECT_ROOT.name),
                 run_session(
                     "A",
                     FIXTURE_PROJECT_ROOT,
-                    "../devops/tests/project",
+                    FIXTURE_PROJECT_PATH,
                     SESSION_A_SETTINGS,
                     session_a_scenarios,
                 ),
@@ -757,11 +757,11 @@ def main() -> None:
         if results[-1][1]:
             results.append(
                 (
-                    "B (examples/project_rs + pill_spline)",
+                    "B ({} + pill_spline)".format(NATIVE_PROJECT_ROOT.name),
                     run_session(
                         "B",
                         NATIVE_PROJECT_ROOT,
-                        "../examples/project_rs",
+                        NATIVE_PROJECT_PATH,
                         SESSION_B_SETTINGS,
                         session_b_scenarios,
                     ),

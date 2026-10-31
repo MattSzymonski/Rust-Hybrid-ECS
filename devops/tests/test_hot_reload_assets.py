@@ -9,7 +9,7 @@ REQUIREMENTS
   - Rust toolchain (cargo)
 
 DESCRIPTION
-    Drives the headless dev host on `examples/master_renderer_test`, whose
+    Drives the headless dev host on `examples/local/master_renderer_test`, whose
     helmet textures are imported through `.meta` files, and checks that the
     host's asset watcher reimports an asset in place while the game runs:
 
@@ -65,7 +65,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Configuration
 # =============================================================================
 
-PROJECT_ROOT = WORKSPACE_ROOT / "examples" / "master_renderer_test"
+PROJECT_ROOT = MASTER_RENDERER_TEST_ROOT
 ASSET_NAME = "textures/helmet_emissive.jpg"
 SOURCE_FILE = PROJECT_ROOT / "res" / ASSET_NAME
 METADATA_FILE = SOURCE_FILE.with_name(SOURCE_FILE.name + ".meta")
@@ -311,7 +311,7 @@ def main() -> None:
         BACKUP.capture(path)
 
     environment = os.environ.copy()
-    environment["PROJECT_PATH"] = "../examples/master_renderer_test"
+    environment["PROJECT_PATH"] = MASTER_RENDERER_TEST_PATH
     process, monitor = launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
     results = {}
     try:

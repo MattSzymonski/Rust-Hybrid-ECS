@@ -209,7 +209,7 @@ public readonly unsafe ref struct QueryRow
             {
                 // Every typed accessor resolves its column here, so one check
                 // covers Read, Write, OptionalRead and OptionalWrite. Compiled
-                // out of release builds.
+                // out of `Release` configurations.
                 if (column.Present)
                     Engine.ValidateChunkScope(column.ScopeToken, typeof(T).FullName ?? typeof(T).Name);
                 return column;

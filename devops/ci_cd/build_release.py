@@ -35,7 +35,7 @@
 #   release-build the host.
 #
 #   A project whose scripting language is C# (a `*.csproj` in its root, like
-#   `examples/project_cs`) ships the same way, and more: the bundle
+#   `examples/local/project_cs`) ships the same way, and more: the bundle
 #   generator emits the managed backend, `dotnet build -c Release` produces the
 #   project assembly (and the C# runtime it references) before cargo runs, and
 #   the managed sidecars are copied alongside the shipping binary. Pass
@@ -80,9 +80,9 @@
 #          Any other argument is passed straight to cargo.
 
 # EXAMPLE USAGE:
-#   set PROJECT_PATH=examples/project_rs
+#   set PROJECT_PATH=examples/local/project_rs
 #   python devops/ci_cd/build_release.py                        # native shipping host release
-#   set PROJECT_PATH=examples/project_cs
+#   set PROJECT_PATH=examples/local/project_cs
 #   python devops/ci_cd/build_release.py                        # managed (C#) shipping host release
 #   python devops/ci_cd/build_release.py --csharp-aot           # managed (C#) NativeAOT self-contained release
 #   python devops/ci_cd/build_release.py --profile release-fast # shipping host, throughput profile
@@ -270,9 +270,9 @@ def resolve_project_root(repository_root: Path, project_path: str) -> Path:
     """Resolves the project directory, honouring both path conventions.
 
     The host resolves PROJECT_PATH against the working directory (so
-    `../examples/project_rs` works from the workspace dir); the shipping tools
+    `../examples/local/project_rs` works from the workspace dir); the shipping tools
     have historically resolved it against the repository root (so
-    `examples/project_rs` works from anywhere). The working directory is tried
+    `examples/local/project_rs` works from anywhere). The working directory is tried
     first, then the repository root, so both spellings work from either place.
     """
     cwd_candidate = (Path.cwd() / project_path).resolve()

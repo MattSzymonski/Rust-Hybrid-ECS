@@ -83,6 +83,12 @@ from core.editor_session import (  # noqa: E402
 )
 from core.environment import ProcessToolUnavailable, windows_process_commands  # noqa: E402
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name  # noqa: E402
+from core.projects import (  # noqa: E402
+    CIRCUS_DEMO_FONT,
+    ITALIAN_BRAINROT_PATH,
+    ITALIAN_BRAINROT_RES,
+    ITALIAN_BRAINROT_SCENE_RS,
+)
 from core.suite_common import verify_editor_binary  # noqa: E402
 from core import win_clipboard  # noqa: E402
 
@@ -786,7 +792,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--project",
-        default="../examples/italian_brainrot",
+        default=ITALIAN_BRAINROT_PATH,
         help="the project, resolved the way the editor resolves PROJECT_PATH (from modules/)",
     )
     parser.add_argument("--timeout", type=int, default=300)
@@ -854,12 +860,12 @@ def main() -> int:
     tab_systems_source = shell_source.parent / "shell" / "tab_systems.rs"
     with tab_systems_source.open("r", encoding="utf-8", newline="") as file:
         original_systems_source = file.read()
-    project_source = REPOSITORY_ROOT / "examples" / "italian_brainrot" / "src" / "scene.rs"
+    project_source = ITALIAN_BRAINROT_SCENE_RS
     # The Assets step's meta probe: a sourced file with no `.meta` sidecar
     # yet, staged before the editor starts so the res watcher never sees a
     # creation event for it - the write-meta action answers exactly this
     # state.
-    asset_root = REPOSITORY_ROOT / "examples" / "italian_brainrot" / "res"
+    asset_root = ITALIAN_BRAINROT_RES
     stage_file = asset_root / "s16_stage.png"
     samples = sorted((asset_root / "textures").glob("*.png"))
     assert samples, "no texture png to stage the meta probe from"
@@ -3748,7 +3754,7 @@ def _assets_browser_and_pipeline_steps(state: StepState) -> None:
     # writes a valid `.pipeline`: the standard header, a guid and the
     # type's default document (an empty passes list, which is valid - a
     # chain names its passes by guid). The committed chain in
-    # `examples/project_rs` is what exercises a populated file.
+    # `examples/local/project_rs` is what exercises a populated file.
     begin = len(session.read_log())
     session.send("dump standalone-types")
     session.wait(
@@ -4744,14 +4750,7 @@ def _preferences_and_theme_steps(state: StepState) -> None:
     font_directory = theme_root / "fonts"
     font_directory.mkdir(parents=True, exist_ok=True)
     (font_directory / "Silkscreen-Regular.ttf").write_bytes(
-        (
-            REPOSITORY_ROOT
-            / "examples"
-            / "circus_demo"
-            / "res"
-            / "fonts"
-            / "Silkscreen-Regular.ttf"
-        ).read_bytes()
+        CIRCUS_DEMO_FONT.read_bytes()
     )
 
     state.applied_before = applied_before

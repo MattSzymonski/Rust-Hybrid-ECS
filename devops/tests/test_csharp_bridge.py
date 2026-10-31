@@ -14,7 +14,7 @@ REQUIREMENTS
 DESCRIPTION
     End-to-end suite for the managed (C#) project backend and the extension
      -> C# component bridge. Launches the standalone host with
-    `examples/project_cs` and the `pill_spline` module plus a component-less
+    `examples/local/project_cs` and the `pill_spline` module plus a component-less
     dummy module, then verifies from console output and on-disk artifacts:
 
       1. csharp_bridge_startup  - the host starts the C# backend, the host
@@ -80,8 +80,8 @@ from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario 
 # Session configuration
 # =============================================================================
 
-PROJECT_CS_SYSTEMS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Systems.cs"
-PROJECT_CS_COMPONENTS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Components.cs"
+# `PROJECT_CS_SYSTEMS_CS` and `PROJECT_CS_COMPONENTS_CS` come from
+# `core.projects` through the star import above.
 SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "pill_spline" / "src" / "pill_spline.rs"
 SPLINE_GENERATED_FILE = (
     MODULES_ROOT / "extensions" / "pill_spline" / "pill_spline" / "generated" / "pill_spline_Components.g.cs"
@@ -99,7 +99,7 @@ COMMITTED_MIRROR_BYTES = None
 # The suite's own probe file. Written before the host starts and removed in the
 # suite's cleanup, so the example project carries no test-only code and this
 # suite does not depend on demo text a project edit can silently change.
-PROJECT_CS_PROBE_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "BridgeProbe.cs"
+PROJECT_CS_PROBE_CS = PROJECT_CS_BRIDGE_PROBE_CS
 
 # The C# project plus a component-less dummy module: the dummy exercises the
 # codegen paths a module without components takes - a standalone
@@ -977,7 +977,7 @@ def write_bridge_probe() -> None:
 def launch_host():
     """Launches the standalone host exe with PROJECT_PATH pinned to the C# project."""
     environment = os.environ.copy()
-    environment["PROJECT_PATH"] = "../examples/project_cs"
+    environment["PROJECT_PATH"] = CSHARP_PROJECT_PATH
     return launch_process([str(HOST_EXE)], MODULES_ROOT, environment)
 
 

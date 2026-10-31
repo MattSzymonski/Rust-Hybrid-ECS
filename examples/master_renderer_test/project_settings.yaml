@@ -1,7 +1,0 @@
-name: "Master Renderer Test"
-build_binary_name: "MasterRendererTest"
-version: "0.1.0"
-author: "Matt Szymonski"
-description: "PBR helmet test for the master renderer chain."
-
-modules: []

@@ -1093,11 +1093,11 @@ internal static class Program
 #if DEBUG
                 Assert(refused, "a chunk from a finished invocation must be refused");
 #else
-                // Compiled out of release builds on purpose: validating every
+                // Compiled out of `Release` configurations on purpose: validating every
                 // row access would cost the data plane the property that makes
                 // it worth having. Asserting the absence keeps the posture
                 // deliberate rather than accidental.
-                Assert(!refused, "the retention guard must not survive into a release build");
+                Assert(!refused, "the retention guard must not survive into a `Release` configuration");
 #endif
 
                 // The guard must not fire on the ordinary path, which is the

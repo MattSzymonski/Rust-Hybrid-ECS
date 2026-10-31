@@ -19,7 +19,7 @@ DESCRIPTION
     `res/defaults/pill.pbr.material`, the PBR chain's default material.
 
       1. The file is moved aside and the headless dev host is started on
-         `examples/project_rs`.
+         `examples/local/project_rs`.
       2. The host must exit non-zero, and its output must carry
          `module 'pill_master_renderer_data' requires its resource
          'defaults/pill.pbr.material', which is missing at` - the module and the
@@ -63,7 +63,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Configuration
 # =============================================================================
 
-PROJECT_ROOT = WORKSPACE_ROOT / "examples" / "project_rs"
+PROJECT_ROOT = NATIVE_PROJECT_ROOT
 # Headless: the assert fires while the modules load, before any window exists.
 HOST_POSTURE = HOST_DEV_HOT_PATCH
 
@@ -156,7 +156,7 @@ def main() -> int:
     if not park_resource():
         return 1
     environment = os.environ.copy()
-    environment["PROJECT_PATH"] = "../examples/project_rs"
+    environment["PROJECT_PATH"] = NATIVE_PROJECT_PATH
     process, monitor = launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
     passed = False
     try:

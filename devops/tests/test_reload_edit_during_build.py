@@ -78,7 +78,7 @@ MODULE_NAME = "pill_spline"
 # toolchain's `std-*.dll` on the loader path, which `cargo run` sets up.
 #
 # `rendering` is required, not a preference, and this suite ran without it for
-# its whole history. `examples/project_rs` links `pill_master_renderer`
+# its whole history. `examples/local/project_rs` links `pill_master_renderer`
 # directly, which turns on features in crates `pill_core` also depends on. The
 # host binary links its own `pill_core.dll`, so a host built without
 # `rendering` resolves a different variant than the project does - and Windows
@@ -335,7 +335,7 @@ def main() -> None:
         sys.exit(1)
 
     environment = os.environ.copy()
-    environment["PROJECT_PATH"] = "../examples/project_rs"
+    environment["PROJECT_PATH"] = NATIVE_PROJECT_PATH
     process, monitor = launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
     backups = BACKUP
     passed = False

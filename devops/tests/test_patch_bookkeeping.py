@@ -77,7 +77,7 @@ ROLLBACK_REQUEST = MODULES_ROOT / "target" / "hot" / "rollback.request"
 
 # Launched through cargo for the same reason the coverage suite does: the
 # binary needs the toolchain's dynamic runtime on the loader path, and
-# `rendering` is required because examples/project_rs links the renderer.
+# `rendering` is required because examples/local/project_rs links the renderer.
 HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
 
 # Reported by the native project reload when the build produced nothing usable
@@ -183,7 +183,11 @@ def run_bookkeeping_scenario(monitor: OutputMonitor, backups: BackupRegistry) ->
     """Patch, break the build, and roll the patch back through the failure."""
     crate = Crate(NATIVE_PROJECT_ROOT.name, NATIVE_PROJECT_ROOT / "src", "project")
     if not plan_edit(crate):
-        print("  [FAIL] No patchable function body found in examples/project_rs.")
+        print(
+            "  [FAIL] No patchable function body found in {}.".format(
+                repository_relative(NATIVE_PROJECT_ROOT)
+            )
+        )
         return False
 
     backups.capture(crate.edit_file)
@@ -249,7 +253,7 @@ def main() -> None:
         sys.exit(1)
 
     environment = os.environ.copy()
-    environment["PROJECT_PATH"] = "../examples/project_rs"
+    environment["PROJECT_PATH"] = NATIVE_PROJECT_PATH
     process, monitor = launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
     backups = BACKUP
     passed = False

@@ -5,7 +5,7 @@
 #               (`rustup target add wasm32-unknown-unknown`), and `wasm-pack`
 #               on PATH (`cargo install wasm-pack`). On its first run wasm-pack
 #               downloads the `wasm-bindgen` CLI matching the crate version,
-#               and in a release build also `wasm-opt` unless `--no-wasm-opt`.
+#               and in a shipping build also `wasm-opt` unless `--no-wasm-opt`.
 
 # DESCRIPTION: Builds a Rust project for the browser. It regenerates the
 #   shipping bundle and the web app crate (`generate_shipping_bundle.py
@@ -25,7 +25,7 @@
 #   the same dependency versions as the native one. `RUSTC_WRAPPER` is cleared
 #   because sccache cannot spawn `web-sys`'s very long command line on Windows.
 #
-#   Like a release build, this regenerates `build/pill_shipping_bundle`;
+#   Like a shipping build, this regenerates `build/pill_shipping_bundle`;
 #   restore the committed stub afterwards with
 #   `git checkout -- build/pill_shipping_bundle`.
 #
@@ -37,15 +37,15 @@
 #          --editor-frontend
 #                          which editor shell an --editor build links:
 #                          only `egui` exists
-#          --no-wasm-opt   skip wasm-opt in a release build
+#          --no-wasm-opt   skip wasm-opt in a shipping build
 #          [project_path]  workspace-relative project directory; defaults to
 #                          the PROJECT_PATH environment variable
 #
 # EXAMPLE USAGE:
-#   python devops/tools/build_web.py examples/master_renderer_test
-#   python devops/tools/build_web.py --dev examples/master_renderer_test
-#   python devops/tools/build_web.py --dev --editor examples/project_rs
-#   python -m http.server 8000 -d examples/master_renderer_test/build/web
+#   python devops/tools/build_web.py examples/local/master_renderer_test
+#   python devops/tools/build_web.py --dev examples/local/master_renderer_test
+#   python devops/tools/build_web.py --dev --editor examples/local/project_rs
+#   python -m http.server 8000 -d examples/local/master_renderer_test/build/web
 
 # --- SCRIPT ---
 

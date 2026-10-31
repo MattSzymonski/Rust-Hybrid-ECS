@@ -20,8 +20,8 @@ DESCRIPTION
                       complete" (module-only latency, before the cascade)
       cascade_total   same edit -> "[analytics] reload project" (module plus
                       the queued project reload = full user-visible cost)
-      project_reload  edit `examples/project_rs` -> project reload only
-      csharp_reload   edit `examples/project_cs` -> "C# hot reload complete"
+project_reload  edit `examples/local/project_rs` -> project reload only
+  csharp_reload   edit `examples/local/project_cs` -> "C# hot reload complete"
 
     Each native category also carries the host's own phase breakdown, parsed
     from its `[analytics] reload` line: build / stage / load / init / migrate,
@@ -78,11 +78,11 @@ CASE_DESCRIPTIONS = {
         "the project statically embeds."
     ),
     "project_reload": (
-        "Edit a project constant (examples/project_rs) until the project "
+        "Edit a project constant (examples/local/project_rs) until the project "
         "reload analytics line appears. No module cascade involved."
     ),
     "csharp_reload": (
-        "Edit a C# system body (examples/project_cs) until 'C# hot reload "
+        "Edit a C# system body (examples/local/project_cs) until 'C# hot reload "
         "complete'. Covers dotnet build plus the collectible assembly swap; "
         "the managed path emits no phase analytics, so wall time only."
     ),
@@ -220,7 +220,7 @@ def run(
                 "native",
                 "NATIVE (project_rs + pill_spline)",
                 harness.NATIVE_PROJECT_ROOT,
-                "../examples/project_rs",
+                harness.NATIVE_PROJECT_PATH,
                 harness.NATIVE_SETTINGS,
                 [harness.SPLINE_EDIT, harness.CASCADE_EDIT, harness.PROJECT_EDIT],
             )
@@ -231,7 +231,7 @@ def run(
                 "csharp",
                 "CSHARP (project_cs + pill_spline)",
                 harness.CSHARP_PROJECT_ROOT,
-                "../examples/project_cs",
+                harness.CSHARP_PROJECT_PATH,
                 harness.CSHARP_SETTINGS,
                 [harness.CSHARP_EDIT],
             )

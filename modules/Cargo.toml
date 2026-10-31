@@ -104,7 +104,7 @@ undocumented_unsafe_blocks = "warn"
 # outright when targeting Windows. A release binary links everything into one
 # image and needs no shared engine, so it clears the flag; no cargo setting can,
 # because cargo merges config arrays rather than replacing them. Build with
-# `devops/ci_cd/build_release.sh`, which clears `RUSTFLAGS` and forwards its
+# `devops/ci_cd/build_shipping.sh`, which clears `RUSTFLAGS` and forwards its
 # arguments to cargo.
 [profile.release]
 opt-level = "s"

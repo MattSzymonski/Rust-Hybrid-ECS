@@ -13,7 +13,7 @@ REQUIREMENTS
     the executable
 
 DESCRIPTION
-    `devops/tools/build_web.py --dev` builds `examples/master_renderer_test`, a
+    `devops/tools/build_web.py --dev` builds `examples/local/master_renderer_test`, a
     project with a `res` directory, so the asset pack is exercised too. The
     build is served on a free local port and opened in a headless browser with
     WebGPU enabled, driven through the Chrome DevTools Protocol. Before the
@@ -47,7 +47,7 @@ USAGE
 EXAMPLE USAGE
   python devops/tests/test_web_smoke.py
   python devops/tests/test_web_smoke.py --timeout-scale 2 --seconds 20
-  python devops/tests/test_web_smoke.py --project examples/circus_demo --save-capture local/temp/web.png
+  python devops/tests/test_web_smoke.py --project examples/local/circus_demo --save-capture local/temp/web.png
 
 --- SCRIPT ---
 """
@@ -75,6 +75,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import REPOSITORY_ROOT  # noqa: E402
+from core.projects import MASTER_RENDERER_TEST_ROOT, repository_relative  # noqa: E402
 from core.suite_common import (  # noqa: E402
     SHIPPING_BUNDLE_PATHS,
     restore_paths,
@@ -88,7 +89,7 @@ from core.suite_common import (  # noqa: E402
 
 # The project built for the browser by default; its web build lands in the
 # project's `build/web`.
-PROJECT = "examples/master_renderer_test"
+PROJECT = repository_relative(MASTER_RENDERER_TEST_ROOT)
 BUILD_SCRIPT = REPOSITORY_ROOT / "devops" / "tools" / "build_web.py"
 
 # Tokens the page's console must show.
@@ -102,7 +103,7 @@ EMBEDDED_PROBE_BYTES = 512
 MODULE_NAME = "pkg/pill_web_app_bg.wasm"
 
 # Input sent through the DevTools protocol once the first frame is up, and what
-# the project logs when its systems see it (`examples/master_renderer_test/
+# the project logs when its systems see it (`examples/local/master_renderer_test/
 # src/controls.rs`). The key goes first and without a click, so it also checks
 # that the canvas holds keyboard focus from the start. The wheel scrolls down,
 # moving the camera back: closer would put it inside the helmet, and the

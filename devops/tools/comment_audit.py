@@ -159,12 +159,16 @@ EXCLUDED_DIRECTORY_NAMES = {
     "build",
     "generated",
     "projects_generated",
-    "local",
 }
+# The repository-root `local/` is gitignored scratch. Matched at the top level
+# only: `examples/local/` holds the game projects and is scanned like any other
+# source tree.
+ROOT_ONLY_EXCLUDED_DIRECTORY_NAMES = {"local"}
 # The one tracked crate under a `build/` directory that is real source.
 BUILD_SOURCE_CRATES = ("pill_shipping_bundle",)
-# Directories the path-claim check never walks: build output and scratch.
-PATH_CLAIM_SKIP_DIRECTORIES = {".git", "target", "node_modules", "local", "pill_standalone_temp"}
+# Directories the path-claim check never walks: build output and scratch. The
+# root `local/` is pruned separately, by depth.
+PATH_CLAIM_SKIP_DIRECTORIES = {".git", "target", "node_modules", "pill_standalone_temp"}
 
 
 @dataclass
@@ -268,6 +272,8 @@ def should_scan(path: Path) -> bool:
     """Whether the tree-walk fallback treats a path as engine source."""
     parts = repository_relative_parts(path)
     for index, part in enumerate(parts):
+        if part in ROOT_ONLY_EXCLUDED_DIRECTORY_NAMES and index == 0:
+            return False
         if part not in EXCLUDED_DIRECTORY_NAMES:
             continue
         if part == "build" and index + 1 < len(parts) and parts[index + 1] in BUILD_SOURCE_CRATES:
@@ -317,8 +323,12 @@ def load_existing_relative_paths() -> List[str]:
     """
     paths: List[str] = []
     for directory, directory_names, file_names in os.walk(str(REPOSITORY_ROOT)):
+        at_repository_root = Path(directory) == REPOSITORY_ROOT
         directory_names[:] = [
-            name for name in directory_names if name not in PATH_CLAIM_SKIP_DIRECTORIES
+            name
+            for name in directory_names
+            if name not in PATH_CLAIM_SKIP_DIRECTORIES
+            and not (at_repository_root and name in ROOT_ONLY_EXCLUDED_DIRECTORY_NAMES)
         ]
         for file_name in file_names:
             paths.append(display_path(Path(directory) / file_name))

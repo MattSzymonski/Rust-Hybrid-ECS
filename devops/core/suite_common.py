@@ -53,6 +53,51 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name
+from .projects import (
+    CIRCUS_DEMO_ACCENT_THEME,
+    CIRCUS_DEMO_FONT,
+    CIRCUS_DEMO_LIB_RS,
+    CIRCUS_DEMO_PATH,
+    CIRCUS_DEMO_ROOT,
+    CSHARP_PROJECT_PATH,
+    CSHARP_PROJECT_ROOT,
+    EXAMPLES_RELATIVE_PATH,
+    EXAMPLES_ROOT,
+    FIXTURE_PROJECT_PATH,
+    FIXTURE_PROJECT_ROOT,
+    ITALIAN_BRAINROT_CS_ROOT,
+    ITALIAN_BRAINROT_CS_SRC,
+    ITALIAN_BRAINROT_PATH,
+    ITALIAN_BRAINROT_RES,
+    ITALIAN_BRAINROT_ROOT,
+    ITALIAN_BRAINROT_SCENE_RS,
+    MASTER_RENDERER_TEST_PATH,
+    MASTER_RENDERER_TEST_RES,
+    MASTER_RENDERER_TEST_ROOT,
+    NATIVE_PROJECT_PATH,
+    NATIVE_PROJECT_ROOT,
+    PROJECT_CS_BENCH_PATH,
+    PROJECT_CS_BENCH_ROOT,
+    PROJECT_CS_BENCH_SRC,
+    PROJECT_CS_BRIDGE_PROBE_CS,
+    PROJECT_CS_COMPONENTS_CS,
+    PROJECT_CS_CSPROJ,
+    PROJECT_CS_PATH,
+    PROJECT_CS_ROOT,
+    PROJECT_CS_SRC,
+    PROJECT_CS_SYSTEMS_CS,
+    PROJECT_RS_LIB_RS,
+    PROJECT_RS_PATH,
+    PROJECT_RS_RES,
+    PROJECT_RS_ROOT,
+    PROJECT_RS_SETTINGS_RS,
+    PROJECT_RS_SRC,
+    PROJECT_SANDBOX_LIB_RS,
+    PROJECT_SETTINGS_FILENAME,
+    host_project_path,
+    project_settings_yaml,
+    repository_relative,
+)
 
 # The host's output is UTF-8 (its renderer prints a box-drawing frame
 # dashboard), while CPython encodes redirected output with the locale code
@@ -75,22 +120,11 @@ WORKSPACE_ROOT = REPOSITORY_ROOT
 # The standalone host binary the suites drive, per platform.
 HOST_EXE = executable_name("pill_standalone")
 
-# Known project roots. Each declares its own `project_settings.yaml`, the only
-# source of the extension list; the project itself is selected by
-# `PROJECT_PATH` alone (there is no host-level config file anymore).
-NATIVE_PROJECT_ROOT = WORKSPACE_ROOT / "examples" / "project_rs"
-CSHARP_PROJECT_ROOT = WORKSPACE_ROOT / "examples" / "project_cs"
-FIXTURE_PROJECT_ROOT = WORKSPACE_ROOT / "devops" / "tests" / "project"
-
-# The fixture project's entry source: the file the native and migration
-# scenarios edit, and the one whose restore settles with a project reload
-# rather than a module reload.
-PROJECT_SANDBOX_LIB_RS = FIXTURE_PROJECT_ROOT / "src" / "lib.rs"
-
-
-def project_settings_yaml(project_root: Path) -> Path:
-    """Returns a project's settings file path."""
-    return project_root / "project_settings.yaml"
+# Project directories and the files inside them live in `core.projects`, which
+# this module re-exports: the `*_ROOT` Paths, the `*_PATH` values the host
+# receives, `EXAMPLES_ROOT`, `FIXTURE_PROJECT_ROOT` and
+# `project_settings_yaml`. A suite imports them from here with the rest of the
+# harness, so no suite spells a project path of its own.
 
 # =============================================================================
 # Output tokens shared by the suites
@@ -1178,9 +1212,47 @@ __all__ = [
     "MODULES_ROOT",
     "HOST_EXE",
     "NATIVE_PROJECT_ROOT",
+    "NATIVE_PROJECT_PATH",
     "CSHARP_PROJECT_ROOT",
+    "CSHARP_PROJECT_PATH",
     "FIXTURE_PROJECT_ROOT",
+    "FIXTURE_PROJECT_PATH",
     "PROJECT_SANDBOX_LIB_RS",
+    "PROJECT_SETTINGS_FILENAME",
+    "EXAMPLES_ROOT",
+    "EXAMPLES_RELATIVE_PATH",
+    "PROJECT_RS_ROOT",
+    "PROJECT_RS_PATH",
+    "PROJECT_RS_SRC",
+    "PROJECT_RS_LIB_RS",
+    "PROJECT_RS_SETTINGS_RS",
+    "PROJECT_RS_RES",
+    "PROJECT_CS_ROOT",
+    "PROJECT_CS_PATH",
+    "PROJECT_CS_SRC",
+    "PROJECT_CS_CSPROJ",
+    "PROJECT_CS_COMPONENTS_CS",
+    "PROJECT_CS_SYSTEMS_CS",
+    "PROJECT_CS_BRIDGE_PROBE_CS",
+    "PROJECT_CS_BENCH_ROOT",
+    "PROJECT_CS_BENCH_PATH",
+    "PROJECT_CS_BENCH_SRC",
+    "MASTER_RENDERER_TEST_ROOT",
+    "MASTER_RENDERER_TEST_PATH",
+    "MASTER_RENDERER_TEST_RES",
+    "CIRCUS_DEMO_ROOT",
+    "CIRCUS_DEMO_PATH",
+    "CIRCUS_DEMO_LIB_RS",
+    "CIRCUS_DEMO_ACCENT_THEME",
+    "CIRCUS_DEMO_FONT",
+    "ITALIAN_BRAINROT_ROOT",
+    "ITALIAN_BRAINROT_PATH",
+    "ITALIAN_BRAINROT_SCENE_RS",
+    "ITALIAN_BRAINROT_RES",
+    "ITALIAN_BRAINROT_CS_ROOT",
+    "ITALIAN_BRAINROT_CS_SRC",
+    "host_project_path",
+    "repository_relative",
     "project_settings_yaml",
     "write_project_settings",
     "STARTUP_TOKEN",

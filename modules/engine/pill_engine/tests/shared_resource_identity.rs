@@ -590,7 +590,7 @@ fn a_shared_resource_still_conflicts_after_a_rebuild() {
 /// actually handed rather than one a test wrote down. The counter makes an
 /// overlap visible on its own: `ResMut::new` also takes the debug write lock, but
 /// that only exists in debug builds, and it is keyed by the same id this test is
-/// about - so in a release build the sleep either catches a parallel batch or
+/// about - so in a release-profile build the sleep either catches a parallel batch or
 /// nothing does.
 #[test]
 fn two_systems_writing_one_shared_resource_never_overlap() {

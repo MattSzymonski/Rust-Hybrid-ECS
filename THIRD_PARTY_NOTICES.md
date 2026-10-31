@@ -51,8 +51,8 @@ came from.
 
 ## Silkscreen
 
-- Files: `examples/circus_demo/res/fonts/Silkscreen-Regular.ttf` and
-  `examples/circus_demo/res/fonts/Silkscreen-OFL.txt` (the SIL Open Font
+- Files: `examples/local/circus_demo/res/fonts/Silkscreen-Regular.ttf` and
+  `examples/local/circus_demo/res/fonts/Silkscreen-OFL.txt` (the SIL Open Font
   License 1.1 text).
 - Licence: SIL Open Font License 1.1 (Copyright (c) 2001 The Silkscreen
   Project Authors, with Reserved Font Name "Silkscreen").

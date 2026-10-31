@@ -52,7 +52,7 @@ FLAGS:
 
   --project PATH    Project module used for PROJECT_PATH (default: the project
                     `pick` recorded, else $PROJECT_PATH, else
-                    <repo>/examples/project_cs).
+                    <repo>/examples/local/project_cs).
   --session N       Interactive session a windowed host is launched into
                     (default: 1).
   --log PATH        File a windowed host's output is redirected to
@@ -102,14 +102,23 @@ HOST_NAME = "HIST0R-ONE"
 HOST_REPO = r"D:\Programming\Rust-Hybrid-ECS"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "devops"))
+
+from core.projects import (  # noqa: E402
+    EXAMPLES_ROOT,
+    PROJECT_CS_ROOT,
+    PROJECT_SETTINGS_FILENAME,
+)
+
 MODULES_DIRECTORY = REPO_ROOT / "modules"
-DEFAULT_PROJECT = REPO_ROOT / "examples" / "project_cs"
+DEFAULT_PROJECT = PROJECT_CS_ROOT
 DEFAULT_LOG = Path(r"D:\Temp\pill.log")
 
-# A project module is a directory under examples/ with one of these beside its
-# build file. `pick` scans for the marker, so a new project needs no edit here.
-PROJECT_MARKER = "project_settings.yaml"
-PROJECTS_DIRECTORY = REPO_ROOT / "examples"
+# A project module is a directory under the examples root with the marker
+# beside its build file. `pick` scans for the marker, so a new project needs
+# no edit here.
+PROJECT_MARKER = PROJECT_SETTINGS_FILENAME
+PROJECTS_DIRECTORY = EXAMPLES_ROOT
 # Where `pick` records its answer. Outside the repository for the same reason as
 # LAUNCH_SCRIPT, and outside the environment because `setx` only reaches
 # processes started after it runs: without this file, a pick would not be

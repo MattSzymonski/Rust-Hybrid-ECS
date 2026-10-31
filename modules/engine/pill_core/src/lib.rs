@@ -21,7 +21,7 @@
 //!
 //! The crate is both a `dylib` and an `rlib`: every DLL links the one shared
 //! copy, so process-global state has a single instance across the boundary,
-//! while a monolithic release build can still embed it.
+//! while a monolithic release-profile build can still embed it.
 //!
 //! The error system lives in [`error`]: subsystem enums declared with
 //! `#[engine_error]` compose transparently into [`error::HostError`], and the

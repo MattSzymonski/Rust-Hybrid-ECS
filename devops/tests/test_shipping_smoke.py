@@ -66,6 +66,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, find_executable  # noqa: E402
+from core.projects import PROJECT_RS_ROOT, repository_relative  # noqa: E402
 from core.suite_common import (  # noqa: E402
     SHIPPING_BUNDLE_PATHS,
     restore_paths,
@@ -81,7 +82,7 @@ from core.suite_common import (  # noqa: E402
 # project and modules linked in.
 SHIPPING_FEATURES = ["--no-default-features", "--features", "shipping"]
 
-# Where the release build lands.
+# Where the shipping build lands.
 SHIPPING_BINARY = (
     MODULES_ROOT
     / "target"
@@ -182,7 +183,7 @@ def stub_failure() -> str:
 def build_shipping_binary(timeout: int) -> str:
     """Builds the shipping binary, returning an error message or "" on success.
 
-    RUSTFLAGS is cleared for the reason `devops/ci_cd/build_release.sh`
+    RUSTFLAGS is cleared for the reason `devops/ci_cd/build_shipping.sh`
     documents: the workspace sets `-C prefer-dynamic`, which rustc refuses to
     combine with the release profile's `lto = "fat"`.
     """
@@ -191,7 +192,7 @@ def build_shipping_binary(timeout: int) -> str:
     generator = [
         sys.executable,
         str(REPOSITORY_ROOT / "devops" / "tools" / "generate_shipping_bundle.py"),
-        "examples/project_rs",
+        repository_relative(PROJECT_RS_ROOT),
     ]
     completed = subprocess.run(
         generator,

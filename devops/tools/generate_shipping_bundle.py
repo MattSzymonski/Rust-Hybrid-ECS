@@ -22,7 +22,7 @@
 #
 #   Cargo resolves dependencies before build scripts run, so a `build.rs`
 #   cannot pull modules in from a YAML file; this generator runs before cargo
-#   instead (as a pre-step of the release build) and writes the bundle crate
+#   instead (as a pre-step of the shipping build) and writes the bundle crate
 #   under `<repository_root>/build/pill_shipping_bundle/`. The location is
 #   project-agnostic (cargo needs a static path, and only one shipping binary
 #   is built at a time), so `pill_standalone`'s manifest never names a specific
@@ -61,7 +61,7 @@
 #          --feature <name>  project feature to enable on the `project`
 #                            dependency in the bundle (repeatable; names the
 #                            project does not declare are ignored). The
-#                            release build forwards its requested features,
+#                            shipping build forwards its requested features,
 #                            so e.g. `--feature rendering` makes the static
 #                            build link the project's renderer components.
 #          --restore-stub    put the committed stub back instead of generating:
@@ -77,17 +77,17 @@
 #          --web             also write the web app crate for a browser build
 #                            (implies `--feature rendering`; Rust projects only).
 #          [project_path]    workspace-relative path to the project directory
-#                            (e.g. examples/project_rs). When omitted, the
+#                            (e.g. examples/local/project_rs). When omitted, the
 #                            PROJECT_PATH environment variable is used - the
 #                            same resolution the host uses at startup.
 #
 # EXAMPLE USAGE:
-#   python devops/tools/generate_shipping_bundle.py examples/project_rs
-#   python devops/tools/generate_shipping_bundle.py --feature rendering examples/project_rs
-#   python devops/tools/generate_shipping_bundle.py examples/project_cs
-#   python devops/tools/generate_shipping_bundle.py --web examples/master_renderer_test
+#   python devops/tools/generate_shipping_bundle.py examples/local/project_rs
+#   python devops/tools/generate_shipping_bundle.py --feature rendering examples/local/project_rs
+#   python devops/tools/generate_shipping_bundle.py examples/local/project_cs
+#   python devops/tools/generate_shipping_bundle.py --web examples/local/master_renderer_test
 #   python devops/tools/generate_shipping_bundle.py --restore-stub
-#   set PROJECT_PATH=examples/project_rs
+#   set PROJECT_PATH=examples/local/project_rs
 #   python devops/tools/generate_shipping_bundle.py
 
 # --- SCRIPT ---
@@ -1109,16 +1109,16 @@ def main() -> int:
     if not project_path:
         print(
             "error: no project path: pass it as an argument or set PROJECT_PATH "
-            "(e.g. PROJECT_PATH=examples/project_rs).",
+            "(e.g. PROJECT_PATH=examples/local/project_rs).",
             file=sys.stderr,
         )
         return 1
 
     root = repository_root()
     # The host resolves PROJECT_PATH against the working directory, so
-    # `../examples/project_rs` works from the workspace dir; the generator
+    # `../examples/local/project_rs` works from the workspace dir; the generator
     # historically resolved it against the repository root, so
-    # `examples/project_rs` works from anywhere. Try the working directory
+    # `examples/local/project_rs` works from anywhere. Try the working directory
     # first, then the repository root, so both spellings work.
     cwd_candidate = (Path.cwd() / project_path).resolve()
     project_root = (

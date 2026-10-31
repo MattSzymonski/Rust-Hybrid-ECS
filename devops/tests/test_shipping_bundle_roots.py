@@ -19,7 +19,7 @@ DESCRIPTION
     the build script it emits does with them - by importing
     `devops/tools/generate_shipping_bundle.py` and asserting:
 
-      - `examples/project_rs` selects the renderer data crate's `res` and
+      - `examples/local/project_rs` selects the renderer data crate's `res` and
         `shader_sources`, in that order, and a module that ships nothing
         beside its code contributes no root;
       - the emitted build script calls `write_asset_pack_with_roots`, names
@@ -41,8 +41,12 @@ from pathlib import Path
 
 DEVOPS_ROOT = Path(__file__).resolve().parent.parent
 REPOSITORY_ROOT = DEVOPS_ROOT.parent
+sys.path.insert(0, str(DEVOPS_ROOT))
+
+from core.projects import PROJECT_RS_ROOT  # noqa: E402
+
 GENERATOR_PATH = DEVOPS_ROOT / "tools" / "generate_shipping_bundle.py"
-PROJECT_ROOT = REPOSITORY_ROOT / "examples" / "project_rs"
+PROJECT_ROOT = PROJECT_RS_ROOT
 RENDERER = "pill_master_renderer"
 DATA_CRATE_NAME = RENDERER + "_data"
 DATA_CRATE = REPOSITORY_ROOT / "modules" / "extensions" / RENDERER / DATA_CRATE_NAME

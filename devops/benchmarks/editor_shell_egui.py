@@ -66,6 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core.cli import add_json_flag, banner, run_standalone, store_measurement  # noqa: E402
 from core.paths import MODULES_ROOT  # noqa: E402
+from core.projects import CIRCUS_DEMO_PATH  # noqa: E402
 
 CATEGORY = "editor_shell_egui"
 
@@ -84,7 +85,7 @@ HEARTBEAT_FRAME_PATTERN = re.compile(
 EGUI_FRAME_PATTERN = re.compile(r"\[editor\] egui frame\s+frames=(\d+)\s+ui_us=(\d+)")
 PAUSE_TOKEN = re.compile(r"\[editor\] engine commands applied")
 
-DEFAULT_PROJECT = "../examples/circus_demo"
+DEFAULT_PROJECT = CIRCUS_DEMO_PATH
 EDITOR_START_BUDGET_SECONDS = 30
 
 # A first launch after module changes compiles them; it is discarded so the

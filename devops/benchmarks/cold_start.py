@@ -334,7 +334,7 @@ def measure_host_startup(
     # reading a trend across the boundary. The multi-module path those five
     # covered now lives in `devops/tests/project`, which the migration suite
     # runs.
-    environment["PROJECT_PATH"] = "../examples/project_rs"
+    environment["PROJECT_PATH"] = suite_common.NATIVE_PROJECT_PATH
 
     started = time.monotonic()
     process, monitor = suite_common.launch_process(

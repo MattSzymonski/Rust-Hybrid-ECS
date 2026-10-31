@@ -14,9 +14,9 @@
 //! start without the toolchain directory on `PATH`; with neither, it fails
 //! with `STATUS_DLL_NOT_FOUND`. The staging no-ops off Windows.
 //!
-//! A release build links everything into one binary and is always the shipping
-//! posture (the binary itself refuses the other combinations), so a non-debug
-//! profile that enables `dev` - or `hot_patch`, which implies it - is refused.
+//! A build in a release-lineage profile links everything into one binary and is
+//! always the shipping mode, so this script refuses the `dev` feature there; the
+//! binary itself refuses a build with neither mode or with both.
 
 // The std staging every executable's build script includes.
 #[path = "../../build_support/stage_std_dylib.rs"]
@@ -24,15 +24,15 @@ mod stage_std_dylib;
 
 fn main() {
     // Refused here rather than in the binary, which cannot see the profile: a
-    // release build is always the shipping posture, and `hot_patch` enables
-    // `dev`, so checking that one feature covers both. Cargo passes the
-    // profile as `PROFILE` and each enabled feature as `CARGO_FEATURE_*`.
+    // release-lineage build is always the shipping mode, and `hot_patch` enables
+    // `dev`, so checking that one feature covers both. Cargo passes the profile
+    // as `PROFILE` and each enabled feature as `CARGO_FEATURE_*`.
     let profile = std::env::var("PROFILE").unwrap_or_default();
     let development = std::env::var_os("CARGO_FEATURE_DEV").is_some();
     if profile != "debug" && development {
         panic!(
             "pill_standalone cannot be built with `dev` in the `{profile}` profile: \
-             a release build is always the shipping posture. Build it as \
+             a release-lineage build is always the shipping mode. Build it as \
              `--no-default-features --features shipping`."
         );
     }

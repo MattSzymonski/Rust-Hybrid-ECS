@@ -25,13 +25,13 @@
     </Project>
 
   `PillEngineRoot` is only how the project finds this file: the host and the
-  release script pass it as a global property, and the fallback serves an IDE
+  shipping build pass it as a global property, and the fallback serves an IDE
   or a test that builds the project on its own. Once imported, this file
   re-derives the root from its own location, so nothing below depends on where
   the project sits.
 
   The module list is read from `project_settings.yaml` while MSBuild evaluates
-  the project - no file is generated - so the host, the release script, the
+  the project - no file is generated - so the host, the shipping build, the
   IDE and the tests all compile the same mirrors. A module the project does not
   load would otherwise compile fine and fail only when called.
 
@@ -129,12 +129,12 @@
        Full type metadata keeps the GetTypes()-based component-manifest
        discovery working.
 
-       The release build script switches the posture on with
+       The shipping build script switches the posture on with
        `-p:EnablePillAot=true`; `PublishAot` itself is set HERE (not on the
        command line) so the flag does not propagate as a global property onto
        the generator projects, which target netstandard2.0 and must never be
        AOT-compiled. Ordinary JIT builds never set EnablePillAot and pay
-       nothing. The RuntimeIdentifier is supplied by the release script. -->
+       nothing. The RuntimeIdentifier is supplied by the shipping build. -->
   <ItemGroup Condition="'$(EnablePillAot)' == 'true'">
     <ProjectReference Include="$(PillRuntimeDirectory)macros/PillCSharpRuntimeMacros.csproj"
                       OutputItemType="Analyzer"

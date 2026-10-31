@@ -14,7 +14,7 @@ workspace = true
 # dispatcher: a module linking its own copy has no subscriber installed, so
 # every log line it emits is silently dropped.
 #
-# `rlib` is kept so a monolithic release build can link everything statically.
+# `rlib` is kept so a monolithic release-profile build can link everything statically.
 crate-type = ["rlib", "dylib"]
 
 [dependencies]
@@ -136,7 +136,9 @@ ttf-parser = { version = "0.25", features = ["gvar-alloc", "no-std-float"] }
 # one stopped, and the drift check failed. The feature alone costs nothing -
 # it names `kernel32`, which the rest of this tree already links - while the
 # whole version would cost the 68 import libraries above.
-windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_SystemInformation",
+] }
 
 # The platform layer (`src/platform`) on native: the rolling log file and
 # blocking on a future.

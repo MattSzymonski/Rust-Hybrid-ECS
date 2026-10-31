@@ -1,7 +1,7 @@
 """
 Asset metadata consistency check for Rust-Hybrid-ECS.
 
-PROTECTS: Every .meta under examples/*/res has its asset, and no two assets share a guid.
+PROTECTS: Every .meta under each project's res directory has its asset, and no two assets share a guid.
 TIER: static
 
 REQUIREMENTS
@@ -17,7 +17,8 @@ DESCRIPTION
       * two `.meta` files with one guid - a source copied together with its
         `.meta`, which the engine refuses to import (`DuplicateGuid`).
 
-    This check scans `examples/*/res` and fails on either, naming the files.
+    This check scans every project's `res` directory under the configured
+    examples root and fails on either, naming the files.
     Standalone assets (`*.material`, `*.render_pass`, ...) hold their guid in
     their own header and have no `.meta`; their guids are checked for
     duplicates too, against each other and against the sidecars.
@@ -29,7 +30,7 @@ USAGE
   python devops/tests/test_asset_metadata.py [--self-test] [--root <dir> ...]
 
   --self-test   run the checker against generated broken and clean trees
-  --root DIR    check DIR (a `res` directory) instead of `examples/*/res`
+  --root DIR    check DIR (a `res` directory) instead of every project's
 
 EXAMPLE USAGE
   python devops/tests/test_asset_metadata.py
@@ -46,6 +47,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPOSITORY_ROOT / "devops"))
+
+from core.projects import EXAMPLES_ROOT  # noqa: E402
+
 METADATA_SUFFIX = ".meta"
 
 
@@ -105,7 +110,7 @@ def check_root(root: Path) -> List[str]:
 
 def default_roots() -> List[Path]:
     """Every example project's `res` directory."""
-    return sorted(path for path in (REPOSITORY_ROOT / "examples").glob("*/res") if path.is_dir())
+    return sorted(path for path in EXAMPLES_ROOT.glob("*/res") if path.is_dir())
 
 
 def check(roots: Sequence[Path]) -> int:

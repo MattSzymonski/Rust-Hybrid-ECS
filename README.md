@@ -14,8 +14,8 @@ project identity is compiled into the host.
 
 Rust project (headless):
 
-- `set PROJECT_PATH=../examples/project_rs` then `cargo run --package pill_standalone`
-- or, in PowerShell: `$env:PROJECT_PATH = "../examples/project_rs"; cargo run --package pill_standalone`
+- `set PROJECT_PATH=../examples/local/project_rs` then `cargo run --package pill_standalone`
+- or, in PowerShell: `$env:PROJECT_PATH = "../examples/local/project_rs"; cargo run --package pill_standalone`
 
 Rust project (windowed): the same, with `--features rendering`.
 
@@ -40,11 +40,11 @@ machinery - e.g. when measuring reload performance - build the host with
 `--no-default-features --features dev` instead.
 
 C# project: point `PROJECT_PATH` at the directory containing the `.csproj`,  
-e.g. `../examples/project_cs`.
+e.g. `../examples/local/project_cs`.
 
 ## Shipping builds
 
-`devops/ci_cd/build_release.py` builds the shipping host release: `pill_standalone`  
+`devops/ci_cd/build_shipping.py` builds the shipping build: `pill_standalone`  
 with the `shipping` feature, which runs the project through `pill_player` and  
 does not compile the development host (`pill_development_host`) at all. It reads the  
 project's scripting language from its manifest: the generated bundle carries  
@@ -63,16 +63,16 @@ no .NET install, and no JIT.
 ```bat
 cd D:\Programming\Rust-Hybrid-ECS
 
-set PROJECT_PATH=examples/project_rs
+set PROJECT_PATH=examples/local/project_rs
 python devops\ci_cd\build_release.py --features rendering   :: native shipping build
 
-set PROJECT_PATH=examples/project_cs
-python devops\ci_cd\build_release.py --features rendering   :: managed (C#), framework-dependent
-python devops\ci_cd\build_release.py --csharp-aot           :: managed (C#), NativeAOT self-contained
+set PROJECT_PATH=examples/local/project_cs
+python devops\ci_cd\build_shipping.py --features rendering   :: managed (C#), framework-dependent
+python devops\ci_cd\build_shipping.py --csharp-aot           :: managed (C#), NativeAOT self-contained
 ```
 
 `PROJECT_PATH` is resolved against the working directory first (the dev  
-convention: from `modules`, `../examples/project_cs`), falling back to the  
+convention: from `modules`, `../examples/local/project_cs`), falling back to the  
 repository root, so both spellings work from either place.
 
 Build output lands under the project's `build/<timestamp>/` directory.
@@ -89,13 +89,13 @@ directory, not just `pkg/`.
 
 ```bat
 :: once: rustup target add wasm32-unknown-unknown  and  cargo install wasm-pack
-python devops\tools\build_web.py examples/master_renderer_test        :: release (wasm-opt)
-python devops\tools\build_web.py --dev examples/master_renderer_test  :: faster, unoptimized
-python -m http.server 8000 -d examples/master_renderer_test/build/web
+python devops\tools\build_web.py examples/local/master_renderer_test        :: release (wasm-opt)
+python devops\tools\build_web.py --dev examples/local/master_renderer_test  :: faster, unoptimized
+python -m http.server 8000 -d examples/local/master_renderer_test/build/web
 ```
 
 Then open http://localhost:8000/ in Chrome or Edge 113+, Safari 18+ or Firefox  
-141+. Like a release build, this regenerates `build/pill_shipping_bundle`;  
+141+. Like a shipping build, this regenerates `build/pill_shipping_bundle`;  
 put the committed stub back with  
 `python devops/tools/generate_shipping_bundle.py --restore-stub`.
 
@@ -159,7 +159,7 @@ If the staged dylib is missing (for example the toolchain was updated and the
 binary was not rebuilt), the build script re-copies it on the next `cargo build`.
 
 - `cargo run --package editor` — Run the Rust project in the editor.
-- `dotnet build examples/project_cs/project_cs.csproj -c Release --nologo` — Build the C# project and its `csharp_runtime` dependency.
+- `dotnet build examples/local/project_cs/project_cs.csproj -c Release --nologo` — Build the C# project and its `csharp_runtime` dependency.
 - `dotnet run --project modules/csharp/pill_csharp_runtime/tests/csharp_runtime_tests.csproj -c Release` — Run the C# system discovery and scheduler-access tests.
 - `cargo test --workspace` — Run all Rust workspace tests.
 - `cargo check --workspace` — Type-check the complete Rust workspace without producing release binaries.

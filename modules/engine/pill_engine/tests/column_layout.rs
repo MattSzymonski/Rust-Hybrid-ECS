@@ -36,7 +36,7 @@ fn degenerate_layouts_are_typed_errors() {
 
     // The fields are public, so a column can be handed a layout the
     // constructor would have refused. It validates again in every build
-    // profile, so a release build cannot accept these either.
+    // profile, so a release-profile build cannot accept these either.
     let zero_sized = ColumnLayout {
         size: 0,
         align: 4,

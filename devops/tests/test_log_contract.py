@@ -129,12 +129,12 @@ STRING_ESCAPES: Dict[str, str] = {
 EXTERNALLY_PRODUCED: Dict[str, str] = {
     "STATUS_ACCESS_VIOLATION": "Windows prints this exit status, not the host.",
     "panicked at": "Emitted by the Rust panic runtime, not by our code.",
-    "counter tick": "Printed by the example project in examples/project_rs.",
-    "[project]": "Printed by the example project in examples/project_rs, which "
+    "counter tick": "Printed by the example project in examples/local/project_rs.",
+    "[project]": "Printed by the example project in examples/local/project_rs, which "
     "is outside the `modules/` tree this test scans.",
     "warning CS": "Emitted by the C# compiler.",
     "[csharp_bench] done":
-        "Printed by the C# benchmark scene in examples/project_cs_bench, "
+        "Printed by the C# benchmark scene in examples/local/project_cs_bench, "
         "whose source is C# rather than Rust.",
     "[csharp_runtime] reloaded project_cs.dll":
         "Emitted by the .NET bridge, whose source is C# rather than Rust.",
@@ -163,16 +163,16 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
         "pill_spline's registration line, and its value is a count.",
     "[project_cs] sample extra=7.5":
         "Printed by C# that test_csharp_bridge.py injects into "
-        "examples/project_cs during the run, to witness a field default.",
+        "examples/local/project_cs during the run, to witness a field default.",
     "cs spline bridge: sees 1 spline(s), first P0.X=0, count=4":
         "Printed by the C# BridgeProbe fixture test_csharp_bridge.py injects "
-        "into examples/project_cs during the run.",
+        "into examples/local/project_cs during the run.",
     "cs spline bridge: sees 2 spline(s)":
         "Printed by the C# BridgeProbe fixture test_csharp_bridge.py injects "
-        "into examples/project_cs during the run.",
+        "into examples/local/project_cs during the run.",
     "probe retirement markers seeded":
         "Printed by C# that test_csharp_bridge.py injects into "
-        "examples/project_cs during the run, to witness declaration "
+        "examples/local/project_cs during the run, to witness declaration "
         "retirement.",
     "SHARED RESOURCE PROBE":
         "Printed by Rust that test_shared_component_identity.py injects into "

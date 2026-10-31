@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Build every example project in release mode and report artifact sizes.
+Build every example project with the release profile and report artifact sizes.
 
-PROTECTS: Every example project builds in release.
+PROTECTS: Every example project builds in the release profile.
 TIER: build
 
 REQUIREMENTS: Python 3.8+, Rust toolchain (cargo) on PATH, .NET SDK for any
               C# example (a missing SDK skips those rather than failing).
 
 DESCRIPTION
-    Builds each example in release, reports a per-file artifact size
+    Builds each example in the release profile, reports a per-file artifact size
     breakdown, and finishes with a pass/fail/skip summary whose exit code is
     non-zero when anything failed.
 
     DISCOVERY, NOT A HARDCODED LIST. The shell version enumerated eight
     example paths (`examples/cube`, `examples/city`, ...) that no longer exist
     in this repository, so it had nothing left to build. This script finds
-    examples by convention instead - any immediate subdirectory of
-    `examples/` carrying a build manifest - so adding an example needs no
+    examples by convention instead - any immediate subdirectory of the
+    configured examples root carrying a build manifest - so adding an example needs no
     edit here:
 
       * `Cargo.toml`  -> built with `cargo build --release`
@@ -31,7 +31,7 @@ USAGE
 
 EXAMPLE USAGE
   python devops/tests/test_examples.py
-  python devops/tests/test_examples.py examples/project_rs
+  python devops/tests/test_examples.py examples/local/project_rs
   python devops/tests/test_examples.py --list
 
   Exit status: 0 when every example built, 1 when any failed, 2 on a usage
@@ -52,6 +52,7 @@ from typing import List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import REPOSITORY_ROOT, find_executable  # noqa: E402
+from core.projects import EXAMPLES_ROOT  # noqa: E402
 from core.suite_common import run_suite_with_timing  # noqa: E402
 from core.test_report import (  # noqa: E402
     ANSI_BOLD,
@@ -62,9 +63,7 @@ from core.test_report import (  # noqa: E402
     section,
 )
 
-EXAMPLES_ROOT = REPOSITORY_ROOT / "examples"
-
-# A release build of a cold example pulls in the whole engine graph.
+# A release-profile build of a cold example pulls in the whole engine graph.
 BUILD_TIMEOUT_SECONDS = 3600
 
 
@@ -83,7 +82,7 @@ class Example:
 
     @property
     def artifact_directory(self) -> Path:
-        """Where the release build drops its artifacts."""
+        """Where the release-profile build drops its artifacts."""
         if self.kind == "rust":
             return self.path / "target" / "release"
         return self.path / "bin" / "Release"
@@ -107,7 +106,7 @@ class Example:
 
 
 def discover_examples() -> List[Tuple[Path, Optional[Example]]]:
-    """Finds every example project under `examples/`.
+    """Finds every example project under the configured examples root.
 
     Returns `(directory, Example or None)` pairs so a directory without a
     recognised manifest can be reported as skipped rather than dropped.
@@ -139,7 +138,7 @@ def classify_example(directory: Path) -> Optional[Example]:
 
 
 def build_rust_example(example: Example, tally: ResultTally) -> None:
-    """Builds a Cargo example in release mode and reports its artifact sizes."""
+    """Builds a Cargo example in the release profile and reports its artifact sizes."""
     command = [
         find_executable("cargo"),
         "build",
@@ -155,7 +154,7 @@ def build_rust_example(example: Example, tally: ResultTally) -> None:
 
 
 def build_csharp_example(example: Example, tally: ResultTally) -> None:
-    """Builds a .NET example in release mode, skipping when no SDK is present."""
+    """Builds a .NET example in the `Release` configuration, skipping when no SDK is present."""
     if shutil.which("dotnet") is None:
         tally.report_skip(example.display, "dotnet SDK not found on PATH")
         return
@@ -176,7 +175,7 @@ def build_csharp_example(example: Example, tally: ResultTally) -> None:
 def run_build(command: List[str], example: Example, tally: ResultTally) -> bool:
     """Runs one build command, reporting a failure against the example.
 
-    Output is inherited rather than captured: a release build runs for
+    Output is inherited rather than captured: a release-profile build runs for
     minutes, and a silent terminal looks like a hang.
     """
     print(f"  $ {' '.join(command)}")
@@ -255,14 +254,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="test_examples.py",
         description=(
-            "Builds every example project in release mode and reports artifact "
+            "Builds every example project with the release profile and reports artifact "
             "sizes. Exit 0 when all built, 1 on any failure, 2 on a usage error."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
             "  test_examples.py\n"
-            "  test_examples.py examples/project_rs\n"
+            "  test_examples.py examples/local/project_rs\n"
             "  test_examples.py --list\n"
         ),
     )

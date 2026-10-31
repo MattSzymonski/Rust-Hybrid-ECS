@@ -70,6 +70,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPOSITORY_ROOT / "devops"))
+
+from core.projects import PROJECT_RS_ROOT, repository_relative  # noqa: E402
+
 # Set by GitHub Actions; switches on log groups and the job summary.
 RUNNING_IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 MODULES_ROOT = REPOSITORY_ROOT / "modules"
@@ -201,7 +205,7 @@ STEPS: List[Step] = [
         [
             # The generator is named by absolute path: the step runs from
             # `modules/`, where the cargo command below has to run.
-            [PYTHON, str(REPOSITORY_ROOT / "devops" / "tools" / "generate_shipping_bundle.py"), "examples/project_rs"],
+            [PYTHON, str(REPOSITORY_ROOT / "devops" / "tools" / "generate_shipping_bundle.py"), repository_relative(PROJECT_RS_ROOT)],
             [
                 "cargo", "clippy", "-p", "pill_standalone",
                 "--no-default-features", "--features", "shipping",
@@ -359,7 +363,7 @@ STEPS: List[Step] = [
         working_directory=REPOSITORY_ROOT,
     ),
     # The example's committed render chain: the windowed host runs
-    # `examples/project_rs`, whose `init` loads `res/pipelines/main.pipeline`
+    # `examples/local/project_rs`, whose `init` loads `res/pipelines/main.pipeline`
     # by path, and the renderer's `Pass chain:` line must name the project's
     # own pass with draws. A host-tier suite, so it runs before the editor
     # lane's build.

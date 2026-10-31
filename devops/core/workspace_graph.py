@@ -35,6 +35,8 @@ import tomllib
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
+from .projects import EXAMPLES_RELATIVE_PATH
+
 
 class ManifestError(Exception):
     """A manifest that could not be read or parsed."""
@@ -134,7 +136,13 @@ def workspace_members(modules: Path) -> List[Crate]:
     return members
 
 
-# The example projects: every `examples/*/Cargo.toml`. A project without a
-# manifest is a managed-language one and has no cargo tree to measure.
+# The example projects: every `<examples>/*/Cargo.toml`, where the directory
+# name comes from `projects`. A project without a manifest is a
+# managed-language one and has no cargo tree to measure.
 def example_projects(repository: Path) -> List[Crate]:
-    return [Crate(manifest) for manifest in sorted((repository / "examples").glob("*/Cargo.toml"))]
+    return [
+        Crate(manifest)
+        for manifest in sorted(
+            (repository / EXAMPLES_RELATIVE_PATH).glob("*/Cargo.toml")
+        )
+    ]

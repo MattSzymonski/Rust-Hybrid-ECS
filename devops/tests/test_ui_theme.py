@@ -10,7 +10,7 @@ REQUIREMENTS
   - Rust toolchain (cargo)
 
 DESCRIPTION
-    Drives the headless dev host on `examples/circus_demo` - whose code default
+    Drives the headless dev host on `examples/local/circus_demo` - whose code default
     is the brutalist recipe, whose `res/ui/accent.theme` overrides the accent
     and the heading size, and whose body font is `res/fonts/Silkscreen`
  - and checks the game half of the theme pipeline end to end:
@@ -66,9 +66,9 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Configuration
 # =============================================================================
 
-PROJECT_ROOT = WORKSPACE_ROOT / "examples" / "circus_demo"
-THEME_FILE = PROJECT_ROOT / "res" / "ui" / "accent.theme"
-PROJECT_SOURCE = PROJECT_ROOT / "src" / "lib.rs"
+PROJECT_ROOT = CIRCUS_DEMO_ROOT
+THEME_FILE = CIRCUS_DEMO_ACCENT_THEME
+PROJECT_SOURCE = CIRCUS_DEMO_LIB_RS
 
 # Headless dev host: this suite reads log lines, and the UI runs in every
 # posture (the game UI's own pass does not need a window).
@@ -331,7 +331,7 @@ def main() -> None:
         BACKUP.capture(path)
 
     environment = os.environ.copy()
-    environment["PROJECT_PATH"] = "../examples/circus_demo"
+    environment["PROJECT_PATH"] = CIRCUS_DEMO_PATH
     process, monitor = launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
     results = {}
     state = {"generation": 0}

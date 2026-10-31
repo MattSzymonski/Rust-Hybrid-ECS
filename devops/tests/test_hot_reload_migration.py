@@ -520,7 +520,7 @@ def validate_witness_tokens(
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the standalone host and returns process + monitor."""
     process_environment = os.environ.copy()
-    process_environment["PROJECT_PATH"] = "../devops/tests/project"
+    process_environment["PROJECT_PATH"] = FIXTURE_PROJECT_PATH
     return launch_process(host_command(HOST_POSTURE), WORKSPACE_ROOT / "modules", process_environment)
 
 

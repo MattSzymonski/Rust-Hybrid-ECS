@@ -11,7 +11,7 @@ REQUIREMENTS
     surface, so this drives the windowed development host.
 
 DESCRIPTION
-    `examples/project_rs` ships `res/pipelines/main.pipeline`, which names the
+    `examples/local/project_rs` ships `res/pipelines/main.pipeline`, which names the
     project's own `dwdw.render_pass` by guid, and its `init` imports both and
     hands the chain to `RenderingManager`. A chain is only built when a surface
     exists, so the suite launches the windowed development host on that project
@@ -46,10 +46,10 @@ from pathlib import Path
 # Standalone-runnable: `devops/` holds `core`, and the suites sit beside it.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core.projects import PROJECT_RS_PATH, PROJECT_RS_ROOT  # noqa: E402
 from core.suite_common import (  # noqa: E402
     HOST_DEV_RENDERING,
     MODULES_ROOT,
-    WORKSPACE_ROOT,
     add_common_suite_arguments,
     ensure_host_lock,
     host_command,
@@ -63,8 +63,7 @@ from core.suite_common import (  # noqa: E402
 # Constants
 # =============================================================================
 
-PROJECT_DIRECTORY = "examples/project_rs"
-PROJECT_ROOT = WORKSPACE_ROOT / PROJECT_DIRECTORY
+PROJECT_ROOT = PROJECT_RS_ROOT
 
 # The pass the committed chain names, as the artist named the file. The
 # renderer labels a pass with its asset name, which is the path it was
@@ -165,7 +164,7 @@ def main() -> int:
     if not prepare_host(HOST_DEV_RENDERING, arguments):
         return 1
 
-    environment = dict(os.environ, PROJECT_PATH="../" + PROJECT_DIRECTORY)
+    environment = dict(os.environ, PROJECT_PATH=PROJECT_RS_PATH)
     process, monitor = launch_process(
         host_command(HOST_DEV_RENDERING), MODULES_ROOT, environment
     )

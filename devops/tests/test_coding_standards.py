@@ -38,7 +38,7 @@ EXAMPLE USAGE
   python devops/tests/test_coding_standards.py --root modules/engine/pill_engine/src
   python devops/tests/test_coding_standards.py modules/engine/pill_core/src/lib.rs
   python devops/tests/test_coding_standards.py modules/engine/pill_core/src/lib.rs \
-      examples/project_rs/src/lib.rs --report local/lint.json
+      examples/local/project_rs/src/lib.rs --report local/lint.json
   python devops/tests/test_coding_standards.py --root modules \
       --exclude modules/extensions/pill_master_renderer
 
@@ -65,6 +65,13 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import REPOSITORY_ROOT  # noqa: E402
+from core.projects import (  # noqa: E402
+    EXAMPLES_RELATIVE_PATH,
+    ITALIAN_BRAINROT_CS_SRC,
+    PROJECT_CS_BENCH_SRC,
+    PROJECT_CS_SRC,
+    repository_relative,
+)
 from core.suite_common import run_suite_with_timing  # noqa: E402
 from core.test_report import (  # noqa: E402
     ANSI_BOLD,
@@ -101,20 +108,39 @@ EXCLUDED_DIRECTORY_NAMES = {
     # them in CI would gate on files nobody can fix there.
     "generated",
     "projects_generated",
-    # `local/` is gitignored scratch - experiment labs, notes, one-off probes.
-    # It is not engine source and is not tracked, so holding it to the engine's
-    # comment and layout rules only ever produced noise. Excluding it here
-    # rather than in one caller is what makes a bare run and a `--root modules`
-    # run agree, which is the disagreement that made `run_all.py` red while the
-    # documented gate was green.
-    "local",
 }
+
+# The repository-root `local/` is gitignored scratch - experiment labs, notes,
+# one-off probes - and not engine source. It is matched at the top level only:
+# `examples/local/` holds the game projects, and their sources are linted like
+# any other project's. Excluding the root here rather than in one caller is
+# what keeps a bare run and a `--root modules` run in agreement.
+ROOT_ONLY_EXCLUDED_DIRECTORY_NAMES = {"local"}
 
 # The repository's own `build/` holds generated scratch - and one tracked
 # crate whose `.gitignore` negations keep its source in the tree: the shipping
 # bundle stub the generator overwrites. A `.rs` in there is source and is
 # linted; everything else under a `build/`, everywhere, is not.
 BUILD_SOURCE_CRATES = ("pill_shipping_bundle",)
+
+
+def repository_relative_parts(path: Path) -> Tuple[str, ...]:
+    """The path's parts below the repository root, or all parts if outside."""
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(REPOSITORY_ROOT).parts
+    except ValueError:
+        return resolved.parts
+
+
+def is_in_excluded_directory(parts: Tuple[str, ...]) -> bool:
+    """Whether repository-relative parts name a directory the lint skips."""
+    for index, part in enumerate(parts):
+        if part in EXCLUDED_DIRECTORY_NAMES:
+            return True
+        if index == 0 and part in ROOT_ONLY_EXCLUDED_DIRECTORY_NAMES:
+            return True
+    return False
 
 # =============================================================================
 # Patterns
@@ -194,9 +220,9 @@ COMMENT_CONTENT_SCOPE = (
 )
 CSHARP_COMMENT_CONTENT_ROOTS = (
     "modules/csharp",
-    "examples/project_cs/src",
-    "examples/italian_brainrot_cs/src",
-    "examples/project_cs_bench/src",
+    repository_relative(PROJECT_CS_SRC),
+    repository_relative(ITALIAN_BRAINROT_CS_SRC),
+    repository_relative(PROJECT_CS_BENCH_SRC),
 )
 # Build output inside a C# tree, never source.
 CSHARP_EXCLUDED_DIRECTORY_NAMES = {"bin", "obj"}
@@ -206,7 +232,6 @@ DEVOPS_COMMENT_CONTENT_SCOPE = "devops/"
 PYTHON_EXCLUDED_DIRECTORY_NAMES = {
     "__pycache__",
     ".git",
-    "local",
     "node_modules",
     "target",
 }
@@ -456,12 +481,12 @@ tree and outside git's ignored set.
         return False
     if path.resolve() in ignored_rust_files():
         return False
-    try:
-        relative = path.relative_to(REPOSITORY_ROOT)
-    except ValueError:
-        relative = path
-    for index, part in enumerate(relative.parts):
-        if part not in EXCLUDED_DIRECTORY_NAMES:
+    relative_parts = repository_relative_parts(path)
+    for index, part in enumerate(relative_parts):
+        excluded = part in EXCLUDED_DIRECTORY_NAMES or (
+            index == 0 and part in ROOT_ONLY_EXCLUDED_DIRECTORY_NAMES
+        )
+        if not excluded:
             continue
         # The repository's own `build/` keeps one tracked crate's sources: the
         # shipping bundle stub's `src/`. Everything else under a `build/` -
@@ -469,9 +494,9 @@ tree and outside git's ignored set.
         if (
             part == "build"
             and index == 0
-            and relative.parts[1:2]
-            and relative.parts[1] in BUILD_SOURCE_CRATES
-            and relative.parts[2:3] == ("src",)
+            and relative_parts[1:2]
+            and relative_parts[1] in BUILD_SOURCE_CRATES
+            and relative_parts[2:3] == ("src",)
         ):
             continue
         return False
@@ -521,7 +546,7 @@ def find_shader_files(root: Path, excludes: Optional[List[Path]] = None) -> List
     discovered: List[Path] = []
     for suffix in SHADER_SUFFIXES:
         for path in root.rglob(f"*{suffix}"):
-            if any(part in EXCLUDED_DIRECTORY_NAMES for part in path.parts):
+            if is_in_excluded_directory(repository_relative_parts(path)):
                 continue
             resolved = path.resolve()
             if any(
@@ -539,10 +564,10 @@ def find_csharp_files(root: Path) -> List[Path]:
         return [root] if root.suffix == ".cs" else []
     discovered: List[Path] = []
     for path in root.rglob("*.cs"):
-        if any(
-            part in CSHARP_EXCLUDED_DIRECTORY_NAMES or part in EXCLUDED_DIRECTORY_NAMES
-            for part in path.parts
-        ):
+        parts = repository_relative_parts(path)
+        if any(part in CSHARP_EXCLUDED_DIRECTORY_NAMES for part in parts):
+            continue
+        if is_in_excluded_directory(parts):
             continue
         discovered.append(path)
     return sorted(discovered, key=lambda path: path.as_posix())
@@ -554,7 +579,10 @@ def find_python_files(root: Path) -> List[Path]:
         return [root] if root.suffix == ".py" else []
     discovered: List[Path] = []
     for path in root.rglob("*.py"):
-        if any(part in PYTHON_EXCLUDED_DIRECTORY_NAMES for part in path.parts):
+        parts = repository_relative_parts(path)
+        if any(part in PYTHON_EXCLUDED_DIRECTORY_NAMES for part in parts):
+            continue
+        if is_in_excluded_directory(parts):
             continue
         discovered.append(path)
     return sorted(discovered, key=lambda path: path.as_posix())
@@ -960,10 +988,15 @@ def check_shell_reexport_blocks(
 # Whether a display path belongs to a crate that reloads while it runs:
 # extension crates and example projects do; the engine, the hosts and the
 # editor frontends do not.
+RELOADABLE_PATH_PARTS = ("extensions",)
+
+
 def is_reloadable_source(display_path: str) -> bool:
     """Whether the egui-storage rule applies to this path."""
     parts = display_path.split("/")
-    return "extensions" in parts or "examples" in parts
+    if any(part in RELOADABLE_PATH_PARTS for part in parts):
+        return True
+    return display_path.startswith(EXAMPLES_RELATIVE_PATH + "/")
 
 
 # Flags the egui context-storage APIs; see `EGUI_CONTEXT_STORAGE_PATTERNS`.
@@ -1376,6 +1409,12 @@ def classify_use_group(path: str) -> str:
 # Self test
 # =============================================================================
 
+# A synthetic example path for the self-tests: built from the configured root
+# so a move of the examples directory keeps it pointing at a reloadable
+# project rather than silently leaving the scope.
+SYNTHETIC_EXAMPLE_LIB_RS = EXAMPLES_RELATIVE_PATH + "/acme/src/lib.rs"
+
+
 class SilentCollector(ViolationCollector):
     """A collector for the self test: counts violations without printing."""
 
@@ -1410,7 +1449,7 @@ def self_test() -> int:
         ),
         (
             "a paint callback in an example fails",
-            "examples/acme/src/lib.rs",
+            SYNTHETIC_EXAMPLE_LIB_RS,
             "let shape = egui::Shape::Callback(PaintCallback { .. });\n",
             1,
         ),

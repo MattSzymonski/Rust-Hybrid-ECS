@@ -71,7 +71,7 @@ pill_engine           ECS: World, resources, systems, AssetManager, Time
 pill_master_renderer  ── this crate
 pill_development_host             the host that drives the engine and owns the window
 pill_standalone       the generic launcher that picks a project
-examples/*            gameplay projects
+examples/local/*            gameplay projects
 ```
 
 Three facts about that position:
@@ -119,12 +119,12 @@ accepts everything and reports `FrameOutcome::Skipped`.
 Nearly every file here belongs to one of four layers. Mixing them up is the  
 main source of confusion on a first read.
 
-| Layer                                       | Lives in           | Owned by                    | Contents                                                                                                                      |
-| ------------------------------------------- | ------------------ | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| **Assets** — plain data a game authors      | `src/assets/`      | the world's `AssetManager`  | `Mesh`, `Texture`, `Shader`, `Material`, `RenderPass`, `RenderingPipeline`                                                    |
+| Layer                                       | Lives in          | Owned by                    | Contents                                                                                                                      |
+| ------------------------------------------- | ----------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| **Assets** — plain data a game authors      | `src/assets/`     | the world's `AssetManager`  | `Mesh`, `Texture`, `Shader`, `Material`, `RenderPass`, `RenderingPipeline`                                                    |
 | **Components** — what is where in the scene | `src/components/` | the ECS `World`, per entity | `TransformComponent`, `CameraComponent`, `MeshRendererComponent`, `DirectionalLightComponent`                                 |
-| **GPU resources** — the uploaded mirror     | `src/resources/`   | the `Renderer`              | `RendererMesh`, `RendererTexture`, `RendererShader`, `RendererMaterial`, `RendererPass`, `RendererCamera`, `EngineParameters` |
-| **The frame** — one update's renderer input | `src/frame.rs`     | extracted from the ECS      | `RenderFrame` and its parts                                                                                                   |
+| **GPU resources** — the uploaded mirror     | `src/resources/`  | the `Renderer`              | `RendererMesh`, `RendererTexture`, `RendererShader`, `RendererMaterial`, `RendererPass`, `RendererCamera`, `EngineParameters` |
+| **The frame** — one update's renderer input | `src/frame.rs`    | extracted from the ECS      | `RenderFrame` and its parts                                                                                                   |
 
 Read down the table and the rule appears: **the `Renderer*` prefix means "this**  
 **is the GPU side"**. `Mesh` is bytes a game holds; `RendererMesh` is a vertex and  
@@ -178,25 +178,25 @@ ECS exists.
 
 `src/`
 
-| File                     | Role                                                                                 | Approx. |
-| ------------------------ | ------------------------------------------------------------------------------------ | ------- |
-| `lib.rs`                 | re-exports and `register()`                                                          | 120     |
-| `api.rs`                 | the `PillRenderer` trait, `FrameOutcome`, metrics, the headless stub                 | 150     |
-| `renderer.rs`            | `Renderer` (the frame skeleton) and `State` (device, targets, frame state)           | 575     |
-| `rendering_resources_manager.rs` | `RenderingResourcesManager`: the GPU object per asset, and the queue a frame draws from | 560 |
-| `pipeline.rs`            | `ScriptableRenderingPipeline`: the chain's pass objects, and its per-frame plan        | 690     |
-| `surface.rs`             | the window surface, its swapchain, and the GPU bootstrap                             | 370     |
-| `frame.rs`               | `RenderInstance`, `ResolvedPass`, `RenderFrame`, `rendering_system`                  | 580     |
-| `components/`            | the scene contract, one file per component, and `register_components`                | 485     |
-| `assets/`                | the six asset types and their builders                                               | 1010    |
-| `resources/`             | one module per GPU resource kind, each with the handle that names it                 | 2395    |
-| `drawers/mesh_drawer.rs` | batching and draw recording                                                          | 510     |
-| `render_queue.rs`        | the packed `u64` sort key                                                            | 160     |
-| `instance.rs`            | one instance's transform, in the shader's layout                                     | 210     |
-| `config/`                | bind-group indices, batch size, and the shipped pipelines, each with its shaders (`common_shaders/`, `simple_pipeline/`, `pbr_pipeline/`, `post_processing/`) | 672 |
-| `error.rs`               | `RendererError`, `capturing_validation`                                              | 140     |
-| `profiler.rs`            | GPU timing queries                                                                   | 670     |
-| `build.rs`               | cooks `*.hlsl` → `*.wgsl` before the crate compiles                                  | 94      |
+| File                             | Role                                                                                                                                                          | Approx. |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `lib.rs`                         | re-exports and `register()`                                                                                                                                   | 120     |
+| `api.rs`                         | the `PillRenderer` trait, `FrameOutcome`, metrics, the headless stub                                                                                          | 150     |
+| `renderer.rs`                    | `Renderer` (the frame skeleton) and `State` (device, targets, frame state)                                                                                    | 575     |
+| `rendering_resources_manager.rs` | `RenderingResourcesManager`: the GPU object per asset, and the queue a frame draws from                                                                       | 560     |
+| `pipeline.rs`                    | `ScriptableRenderingPipeline`: the chain's pass objects, and its per-frame plan                                                                               | 690     |
+| `surface.rs`                     | the window surface, its swapchain, and the GPU bootstrap                                                                                                      | 370     |
+| `frame.rs`                       | `RenderInstance`, `ResolvedPass`, `RenderFrame`, `rendering_system`                                                                                           | 580     |
+| `components/`                    | the scene contract, one file per component, and `register_components`                                                                                         | 485     |
+| `assets/`                        | the six asset types and their builders                                                                                                                        | 1010    |
+| `resources/`                     | one module per GPU resource kind, each with the handle that names it                                                                                          | 2395    |
+| `drawers/mesh_drawer.rs`         | batching and draw recording                                                                                                                                   | 510     |
+| `render_queue.rs`                | the packed `u64` sort key                                                                                                                                     | 160     |
+| `instance.rs`                    | one instance's transform, in the shader's layout                                                                                                              | 210     |
+| `config/`                        | bind-group indices, batch size, and the shipped pipelines, each with its shaders (`common_shaders/`, `simple_pipeline/`, `pbr_pipeline/`, `post_processing/`) | 672     |
+| `error.rs`                       | `RendererError`, `capturing_validation`                                                                                                                       | 140     |
+| `profiler.rs`                    | GPU timing queries                                                                                                                                            | 670     |
+| `build.rs`                       | cooks `*.hlsl` → `*.wgsl` before the crate compiles                                                                                                           | 94      |
 
 `managed/RendererComponents.cs` is the generated C# mirror of the components, so  
 a C# project binds the same field layouts.
@@ -392,15 +392,15 @@ is presented.
 touches. The split exists so surface lifecycle (new / resize / reconfigure) has a  
 home independent of the caches.
 
-| Field                              | What it is                                                      |
-| ---------------------------------- | --------------------------------------------------------------- |
-| `surface`                          | the window's swapchain — see `Surface` below                    |
-| `device`, `queue`                  | every GPU object in the crate is created from these             |
-| `depth_format`, `depth_texture`    | `Depth32Float`, shared by the geometry passes                   |
-| `offscreen`                        | `HashMap<String, RendererTexture>` — the chain's colour targets |
-| `mesh_drawer`                      | the instance buffer and its batching state                      |
-| `camera_bind_group_layout`         | layout every camera bind group is built from                    |
-| `renderer_resource_storage`        | the five slot maps plus the engine parameters                   |
+| Field                           | What it is                                                      |
+| ------------------------------- | --------------------------------------------------------------- |
+| `surface`                       | the window's swapchain — see `Surface` below                    |
+| `device`, `queue`               | every GPU object in the crate is created from these             |
+| `depth_format`, `depth_texture` | `Depth32Float`, shared by the geometry passes                   |
+| `offscreen`                     | `HashMap<String, RendererTexture>` — the chain's colour targets |
+| `mesh_drawer`                   | the instance buffer and its batching state                      |
+| `camera_bind_group_layout`      | layout every camera bind group is built from                    |
+| `renderer_resource_storage`     | the five slot maps plus the engine parameters                   |
 
 **Why `State` owns the offscreen targets** rather than the passes: two passes  
 name the same target — one writes it, the next reads it — and a texture owned by  
@@ -427,13 +427,13 @@ and the colour format chosen from the surface's capabilities — and takes
 `&wgpu::Device` as an argument wherever it needs one. It is deliberately not the  
 device's owner; `State` is.
 
-| Method           | What it does                                                         |
-| ---------------- | -------------------------------------------------------------------- |
-| `create`         | instance → surface → adapter → device → queue → configure            |
-| `acquire`        | gets a frame; `Lost` / `Outdated` reconfigures and retries once      |
-| `resize`         | reconfigures the swapchain to a new pixel size                       |
-| `format`, `size` | the colour format, and the current pixel size                        |
-| `configuration`  | the `SurfaceConfiguration`, for creating surface-sized resources     |
+| Method           | What it does                                                     |
+| ---------------- | ---------------------------------------------------------------- |
+| `create`         | instance → surface → adapter → device → queue → configure        |
+| `acquire`        | gets a frame; `Lost` / `Outdated` reconfigures and retries once  |
+| `resize`         | reconfigures the swapchain to a new pixel size                   |
+| `format`, `size` | the colour format, and the current pixel size                    |
+| `configuration`  | the `SurfaceConfiguration`, for creating surface-sized resources |
 
 **Why the alpha mode has a fallback.** `Surface::configure` returns nothing, and  
 a refused configuration is reported through the device's uncaptured-error path,  
@@ -454,14 +454,14 @@ the shader it draws with and the values it reads. It is written through
 is the other side of that declaration — what the chain becomes once the device  
 has seen it.
 
-| Field             | What it is                                                                  |
-| ----------------- | --------------------------------------------------------------------------- |
-| `passes`          | one `PassSlot` per pass of the chain, in chain order                        |
-| `signature`       | the chain content those passes were built from                              |
-| `inputs`          | `(chain_generation, resource_epoch, width, height)` — the per-frame gate   |
-| `offscreen_key`   | the offscreen layout the current targets were built for                     |
-| `skipped_passes`  | passes already reported as undrawable, so each is named once                |
-| `chain_log`       | the chain last printed, so an unchanged one prints nothing                  |
+| Field            | What it is                                                               |
+| ---------------- | ------------------------------------------------------------------------ |
+| `passes`         | one `PassSlot` per pass of the chain, in chain order                     |
+| `signature`      | the chain content those passes were built from                           |
+| `inputs`         | `(chain_generation, resource_epoch, width, height)` — the per-frame gate |
+| `offscreen_key`  | the offscreen layout the current targets were built for                  |
+| `skipped_passes` | passes already reported as undrawable, so each is named once             |
+| `chain_log`      | the chain last printed, so an unchanged one prints nothing               |
 
 It is deliberately narrow: no window, no frame loop, no asset cache. What it  
 needs of those arrives in a `ChainContext` — the device state by reference, the  
@@ -480,12 +480,12 @@ size that moved — every offscreen target is built at the surface size.
 `src/config/`. A `RenderingPipeline` is an asset, so the renderer hands a project  
 one as easily as a project hands the renderer one:
 
-| Module                   | The frame                                                                                 |
-| ------------------------ | ----------------------------------------------------------------------------------------- |
-| `config/simple_pipeline/` | one lit geometry pass, through the built-in lit shader, to the surface                    |
-| `config/pbr_pipeline/`   | the geometry half: the lit pass, its shader, a neutral material, and the skybox pass (off until `set_skybox`) |
-| `config/post_processing/` | the four fullscreen passes that end the frame                                            |
-| `config/skybox/`         | the equirect and cubemap skybox shaders (fixed guids) and the skybox pass builder         |
+| Module                    | The frame                                                                                                     |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `config/simple_pipeline/` | one lit geometry pass, through the built-in lit shader, to the surface                                        |
+| `config/pbr_pipeline/`    | the geometry half: the lit pass, its shader, a neutral material, and the skybox pass (off until `set_skybox`) |
+| `config/post_processing/` | the four fullscreen passes that end the frame                                                                 |
+| `config/skybox/`          | the equirect and cubemap skybox shaders (fixed guids) and the skybox pass builder                             |
 
 `pbr_pipeline`'s `mod.rs` is what composes the two halves into one pipeline asset,  
 and every module here keeps its shaders in a `shaders/` beside itself — the lit  
@@ -515,13 +515,13 @@ built-in chain.
 `src/rendering_resources_manager.rs`. One GPU object per live asset, and the content version it  
 was built from:
 
-| Field            | What it is                                                         |
-| ---------------- | ------------------------------------------------------------------ |
-| four `*_handles` | key → the GPU object, one map per asset type                       |
-| four `*_versions` | key → the version that object was built from                      |
-| `synced_revision` | the store revision these are level with, so a frame can skip out  |
-| `resource_epoch`  | bumped when a shader or texture object is created or dropped      |
-| the two defaults  | the built-in lit shader, and a material built from it             |
+| Field             | What it is                                                       |
+| ----------------- | ---------------------------------------------------------------- |
+| four `*_handles`  | key → the GPU object, one map per asset type                     |
+| four `*_versions` | key → the version that object was built from                     |
+| `synced_revision` | the store revision these are level with, so a frame can skip out |
+| `resource_epoch`  | bumped when a shader or texture object is created or dropped     |
+| the two defaults  | the built-in lit shader, and a material built from it            |
 
 `build_queue` lives here for the same reason the syncs do: an instance names its  
 mesh and material by *asset* key, the queue needs the *GPU* handles, and these  
@@ -627,11 +627,11 @@ draw through material pipelines.
 **`RendererTexture`** — always a `texture` + `texture_view` + `sampler` triple,  
 because every consumer needs all three. One type covers three different things:
 
-| Constructor         | Used for                | Format                                                  |
-| ------------------- | ----------------------- | ------------------------------------------------------- |
+| Constructor         | Used for                | Format                                                                                                                      |
+| ------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `new_texture`       | uploaded image assets   | `Rgba8UnormSrgb` for `Color`, `Rgba8Unorm` for `Normal`, `Rgba16Float` for `Equirect` and `Cubemap` (six layers, cube view) |
-| `new_render_target` | offscreen chain targets | `Rgba16Float`                                           |
-| `new_depth_texture` | the shared depth buffer | `Depth32Float`                                          |
+| `new_render_target` | offscreen chain targets | `Rgba16Float`                                                                                                               |
+| `new_depth_texture` | the shared depth buffer | `Depth32Float`                                                                                                              |
 
 The type decides the format because **the bytes alone don't say how to read**  
 **them**. Colour is uploaded as sRGB so the hardware linearises it; a normal map is  
@@ -895,13 +895,13 @@ pipeline over four roots. The rule matches one level below the directory it is
 given — `<root>/shaders/*.hlsl`, or `*.hlsl` where the root is itself the  
 shaders directory — never a search, so each tree takes a call of its own:
 
-| Root                              | What it holds                                        |
-| --------------------------------- | ---------------------------------------------------- |
-| `src/config/common_shaders/`      | the vertex stage every lit pass starts from          |
-| `src/config/simple_pipeline/`     | the built-in lit fragment stage                      |
-| `src/config/pbr_pipeline/`        | the geometry fragment stage                          |
-| `src/config/post_processing/`     | the fullscreen vertex stage and the four fragment stages |
-| `shaders/skybox/`                 | the far-plane vertex stage, the equirect and cubemap fragment stages, and their shared header |
+| Root                          | What it holds                                                                                 |
+| ----------------------------- | --------------------------------------------------------------------------------------------- |
+| `src/config/common_shaders/`  | the vertex stage every lit pass starts from                                                   |
+| `src/config/simple_pipeline/` | the built-in lit fragment stage                                                               |
+| `src/config/pbr_pipeline/`    | the geometry fragment stage                                                                   |
+| `src/config/post_processing/` | the fullscreen vertex stage and the four fragment stages                                      |
+| `shaders/skybox/`             | the far-plane vertex stage, the equirect and cubemap fragment stages, and their shared header |
 
 Nothing compiles a shader at runtime — wgpu parses the cooked WGSL through naga  
 like any other `ShaderSource::Wgsl`.
@@ -991,11 +991,11 @@ actions are one-click entries in the "Power Glove" command palette.
 
 Related material elsewhere in the repo:
 
-- `examples/master_renderer_test/` — the PBR test project, and the fullest  
+- `examples/local/master_renderer_test/` — the PBR test project, and the fullest  
 example of a project driving this renderer end to end. Its chain is five  
 passes over four named offscreen targets (`hdr`, `bloom`, `lit`, `ldr`):  
 opaque → bloom prefilter → bloom composite → tonemap → lens.
-- `examples/project_rs/` — the minimal scene setup.
+- `examples/local/project_rs/` — the minimal scene setup.
 - `devops/tests/test_pbr_native.py`, `devops/tests/test_renderer_assets.py` —  
 the renderer-specific suites.
 - `pill_2d_renderer/`, `pill_embedded_renderer/` — the sibling backends, for  
@@ -1008,7 +1008,7 @@ contrast.
 | **asset key**       | a `u64` packing a handle's index and generation: how the renderer names an asset without holding a handle     |
 | **content version** | per-asset counter; the diff basis for re-uploading GPU objects                                                |
 | **revision**        | the `AssetManager`'s global counter; gates the renderer's per-frame asset sync                                |
-| **store**           | the world's `AssetManager`; the renderer reads it directly rather than a copy riding in the frame              |
+| **store**           | the world's `AssetManager`; the renderer reads it directly rather than a copy riding in the frame             |
 | **chain**           | the resolved list of passes a frame runs, from the pipeline the game set                                      |
 | **built-in pass**   | the fallback chain: one geometry pass over the surface, no shader of its own                                  |
 | **unshaded**        | a geometry pass with no shader: instances draw through their own material's pipeline                          |

@@ -15,7 +15,7 @@ DESCRIPTION
       tests/       standalone pass/fail suites plus their fixture crate
       core/        this package: shared code every script imports
       pill_lab/    the web app and the CLI that drives the scripts
-      ci_cd/       the CI gate, the release builds and the container
+      ci_cd/       the CI gate, the shipping builds and the container
       docs/        the rustdoc -> Markdown documentation pipeline
       tools/       builders, probes and one-off repository tools
 

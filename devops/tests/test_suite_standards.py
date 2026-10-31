@@ -4,7 +4,8 @@ Suite lint for `devops/tests`: the header `run_all.py` reads, and the rules
 that keep the shared helpers from being forked again.
 
 PROTECTS: Suites keep their run_all header, stop re-forking the core helpers, say
-          why they sleep, and anchor their output before they write.
+          why they sleep, anchor their output before they write, and name project
+          directories through `core.projects`.
 TIER: static
 
 REQUIREMENTS: Python 3.8+ (standard library only).
@@ -13,7 +14,7 @@ DESCRIPTION
     The end-to-end suites are the sharpest tools in the repository and the
     easiest to fork by accident: a private `read_log` in one file, a bare
     settle in another, and the shared helpers quietly stop being the only way
-    to drive a host. This lint holds every `devops/tests/test_*.py` to four
+    to drive a host. This lint holds every `devops/tests/test_*.py` to five
     rules:
 
       1. header   - the docstring declares the `PROTECTS:` line and a valid
@@ -34,6 +35,10 @@ DESCRIPTION
                     counted into the anchor never appears in
                     `output_since(start_index)` - the crate then reads as
                     `TIMED OUT` while its fast path is healthy.
+      5. project  - a suite names a project directory through `core.projects`,
+                    never as a literal. A literal is how one project move
+                    turned into a list of files to edit, and a stale literal
+                    fails as "no such project" only when that suite runs.
 
     Each rule ships with a planted-violation self-test (`--self-test`), so a
     rule that stopped matching fails here, where it is cheap to see, instead
@@ -83,6 +88,13 @@ SLEEP_CALL_PATTERN = re.compile(r"time\.sleep\s*\(")
 ANCHOR_ASSIGNMENT_PATTERN = re.compile(r"^\s*\w+\s*=\s*\w+\.line_count\b")
 SOURCE_WRITE_PATTERN = re.compile(
     r"\b(atomic_write|restore_one|write_bytes|write_text)\s*\("
+)
+
+# Rule 5's shape: a quoted project directory, complete in one segment. A path
+# into a file or a synthetic layout carries another slash and is left alone;
+# so is prose, which is not a bare literal.
+PROJECT_PATH_LITERAL_PATTERN = re.compile(
+    r'"(?:\.\./)?examples/[A-Za-z0-9_.-]+"|"\.\./devops/tests/[A-Za-z0-9_.-]+"'
 )
 
 
@@ -155,6 +167,22 @@ def anchor_findings(path: Path, text: str) -> List[str]:
     return found
 
 
+# Rule 5: a project directory is named through `core.projects`.
+#
+# Only a bare literal is reported: a quoted one-segment directory under the
+# examples root or the suite fixture. A path into a file carries another
+# slash and prose carries spaces, so neither is flagged.
+def project_findings(path: Path, text: str) -> List[str]:
+    found = []
+    for match in PROJECT_PATH_LITERAL_PATTERN.finditer(text):
+        line = text.count("\n", 0, match.start()) + 1
+        found.append(
+            f"{path.name}:{line}: names {match.group(0)}; import the path from "
+            "devops/core/projects.py"
+        )
+    return found
+
+
 # Every rule's findings, in report order.
 def collect() -> List[Tuple[str, List[str]]]:
     sources = [(path, path.read_text(encoding="utf-8")) for path in discover_files()]
@@ -172,6 +200,10 @@ def collect() -> List[Tuple[str, List[str]]]:
             "rule 4: every output anchor is taken before the write it anchors",
             [finding for path, text in sources for finding in anchor_findings(path, text)],
         ),
+        (
+            "rule 5: every project path comes from core.projects",
+            [finding for path, text in sources for finding in project_findings(path, text)],
+        ),
     ]
 
 
@@ -183,6 +215,7 @@ BARE_SLEEP = "time" + ".sleep(0.5)"
 COMMENTED_SLEEP = "# Let the watcher see the write before the next edit.\n" + BARE_SLEEP
 WRITE_FIXTURE = "atomic" + "_write(path, text)"
 ANCHOR_FIXTURE = "start_" + "index = monitor.line_count"
+PROJECT_LITERAL_FIXTURE = '"../examples/' + 'project_rs"'
 
 
 # Every rule accepts its compliant fixture and fails its planted violation.
@@ -237,6 +270,18 @@ def self_test() -> int:
             "    " + WRITE_FIXTURE + "\n    check_reimported(monitor, 0)\n    " + ANCHOR_FIXTURE + "\n",
         )
         == [],
+    )
+    expect(
+        "a literal project path is caught",
+        len(project_findings(fixture, "PROJECT_ROOT = " + PROJECT_LITERAL_FIXTURE + "\n")) == 1,
+    )
+    expect(
+        "a catalog name passes",
+        project_findings(fixture, "PROJECT_ROOT = PROJECT_RS_ROOT\n") == [],
+    )
+    expect(
+        "a path into a project file passes",
+        project_findings(fixture, 'source = "examples/local/project_rs/src/lib.rs"\n') == [],
     )
     expect(
         "a missing PROTECTS line is caught",

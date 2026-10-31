@@ -20,9 +20,9 @@ DESCRIPTION
                            reload is followed by a queued project reload.
       * cascade_total    - same edit -> the cascaded project reload line
                            (module + project = the full user-visible cost).
-      * project_reload   - editing `examples/project_rs/src/settings.rs` directly
+      * project_reload   - editing `examples/local/project_rs/src/settings.rs` directly
                            (project-only, no module cascade).
-      * csharp_reload    - editing `examples/project_cs/src/Systems.cs` ->
+      * csharp_reload    - editing `examples/local/project_cs/src/Systems.cs` ->
                            `C# hot reload complete` (dotnet build + collectible
                            assembly swap).
 
@@ -103,8 +103,6 @@ from core.scenario import settle_restored_source  # noqa: E402
 # =============================================================================
 
 SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "pill_spline" / "src" / "pill_spline.rs"
-PROJECT_RS_SETTINGS_RS = WORKSPACE_ROOT / "examples" / "project_rs" / "src" / "settings.rs"
-PROJECT_CS_SYSTEMS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Systems.cs"
 
 NATIVE_SETTINGS = """\
 name: "Harness Native"
@@ -439,7 +437,7 @@ def build_host() -> bool:
     """Builds the standalone host once before the script runs.
 
     `rendering` is required, not a preference. The native session drives
-    `examples/project_rs`, which links `pill_master_renderer` directly, and
+    `examples/local/project_rs`, which links `pill_master_renderer` directly, and
     that turns on features in crates `pill_core` also depends on. The host
     binary links its own `pill_core.dll`, so a host built without `rendering`
     resolves a different variant than the project does. Windows keeps one
@@ -960,7 +958,7 @@ def main() -> None:
             if not run_session(
                 "NATIVE (project_rs + pill_spline)",
                 NATIVE_PROJECT_ROOT,
-                "../examples/project_rs",
+                NATIVE_PROJECT_PATH,
                 NATIVE_SETTINGS,
                 native_categories,
                 args.iterations,
@@ -974,7 +972,7 @@ def main() -> None:
             if not run_session(
                 "CSHARP (project_cs + pill_spline)",
                 CSHARP_PROJECT_ROOT,
-                "../examples/project_cs",
+                CSHARP_PROJECT_PATH,
                 CSHARP_SETTINGS,
                 [CSHARP_EDIT],
                 args.iterations,

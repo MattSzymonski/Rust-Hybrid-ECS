@@ -200,12 +200,12 @@ It imports `devops/core/suite_common.py` for the host process plumbing (log
 tokens, the output monitor, backup/restore) - the same module the functional
 suites in `devops/tests/` use.
 
-| Case | Edit | Measured to |
-| --- | --- | --- |
-| `module_reload` | `pill_spline` constant | `extension hot reload complete` |
-| `cascade_total` | same edit | the cascaded `[analytics] reload project` |
-| `project_reload` | `examples/project_rs` constant | project reload analytics |
-| `csharp_reload` | `examples/project_cs` probe | `C# hot reload complete` |
+| Case             | Edit                                 | Measured to                               |
+| ---------------- | ------------------------------------ | ----------------------------------------- |
+| `module_reload`  | `pill_spline` constant               | `extension hot reload complete`           |
+| `cascade_total`  | same edit                            | the cascaded `[analytics] reload project` |
+| `project_reload` | `examples/local/project_rs` constant | project reload analytics                  |
+| `csharp_reload`  | `examples/local/project_cs` probe    | `C# hot reload complete`                  |
 
 Native cases also carry the host's own phase split (build / stage / load / init
 / migrate) and the crates cargo rebuilt. The C# path emits no analytics line,
@@ -220,12 +220,12 @@ python devops/pill_lab/pill_lab.py hot-reload --native-only   # no .NET SDK need
 
 Four separate concepts, never conflated:
 
-| Case | What it is |
-| --- | --- |
-| `clean_check` / `clean_build` | after a targeted clean of the workspace's own packages |
-| `incremental_check` / `incremental_build` | after an mtime bump of `pill_engine_core/src/lib.rs` |
-| `startup_cold` / `startup_warm` | host launch to "Entering project loop", with modules to build and on the up-to-date fast path |
-| `engine_init` | the `pill_engine` smoke binary end to end (spawn + `Engine::new` + print) |
+| Case                                      | What it is                                                                                    |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `clean_check` / `clean_build`             | after a targeted clean of the workspace's own packages                                        |
+| `incremental_check` / `incremental_build` | after an mtime bump of `pill_engine_core/src/lib.rs`                                          |
+| `startup_cold` / `startup_warm`           | host launch to "Entering project loop", with modules to build and on the up-to-date fast path |
+| `engine_init`                             | the `pill_engine` smoke binary end to end (spawn + `Engine::new` + print)                     |
 
 Build cases attach Cargo's own `--timings` data - per-unit compile times parsed
 from the report Cargo writes to `target/cargo-timings/`. Cargo's HTML is not

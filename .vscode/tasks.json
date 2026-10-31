@@ -69,7 +69,7 @@
             "options": {
                 "cwd": "${workspaceFolder}/modules",
                 "env": {
-                    "PROJECT_PATH": "../examples/project_cs",
+                    "PROJECT_PATH": "../examples/local/project_cs",
                     "PILL_CSHARP_CONFIGURATION": "Debug",
                     "PILL_WAIT_FOR_MANAGED_DEBUGGER": "1"
                 }

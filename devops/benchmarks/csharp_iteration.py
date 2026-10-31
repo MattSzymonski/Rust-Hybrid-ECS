@@ -15,7 +15,7 @@ DESCRIPTION
         iter_mutable          Query<Write<T>>           query_iter_mutable
         iter_multi_component  Query<Read<A>, Read<B>>   query_multi_component
 
-    `examples/project_cs_bench` does the timing; this script only drives the
+    `examples/local/project_cs_bench` does the timing; this script only drives the
     host once per entity count and collects what that project prints.
 
     The unit reported is nanoseconds per entity, which is what makes the two
@@ -51,12 +51,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.cli import add_json_flag, banner, run_standalone, store_measurement  # noqa: E402
 from core.paths import MODULES_ROOT, find_executable  # noqa: E402
+from core.projects import PROJECT_CS_BENCH_PATH  # noqa: E402
 
 CATEGORY = "csharp_iteration"
 
 # The project that does the timing. It declares no extensions and draws
 # nothing, so a frame contains managed iteration and little else.
-PROJECT_PATH = "../examples/project_cs_bench"
+PROJECT_PATH = PROJECT_CS_BENCH_PATH
 
 # Entity counts, matching the decades the Rust target sweeps so the two tables
 # line up row for row.

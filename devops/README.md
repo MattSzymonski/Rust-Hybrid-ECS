@@ -8,7 +8,7 @@ devops/
 ├── tests/        things that assert    - each runs standalone
 ├── core/         shared code both import
 ├── pill_lab/     the web app and the CLI that drives the scripts
-├── ci_cd/        the CI gate (verify.py), release builds and shell entry points
+├── ci_cd/        the CI gate (verify.py), shipping builds and shell entry points
 └── docs/         the rustdoc -> Markdown documentation pipeline
 ```
 
@@ -72,8 +72,8 @@ default material, `pill_master_renderer_data`'s
 show.
 
 `test_coding_standards.py` lints every `.rs` file against the Pill comment and
-layout rules, and `test_examples.py` builds each example in release and reports
-artifact sizes. The lint's eighth check refuses work-item ids, stage numbers,
+layout rules, and `test_examples.py` builds each example with the release
+profile and reports artifact sizes. The lint's eighth check refuses work-item ids, stage numbers,
 plan decisions, audit-finding ids, audit opportunity numbers, plan sections and
 construction-site paths in `modules/` comments, with no allowance: a
 reintroduced reference fails the check. The same check covers the managed
@@ -144,6 +144,7 @@ or asserts anything.
 | Module             | Role                                                                 |
 | ------------------ | -------------------------------------------------------------------- |
 | `paths.py`         | devops/repository layout, plus `ensure_devops_on_path()`             |
+| `projects.py`      | the project catalogue: each suite's `PROJECT_PATH` and edited files  |
 | `environment.py`   | git / OS / CPU / toolchain metadata                                  |
 | `storage.py`       | measurement files and the `index.json` manifest                      |
 | `compare.py`       | baseline comparison behind `pill_lab.py compare`                     |
@@ -174,13 +175,13 @@ python devops/pill_lab/pill_lab.py serve     # browse the history
 
 ## ci_cd/
 
-The CI gate, the release build and the shell entry points.
+The CI gate, the shipping build and the shell entry points.
 
 | File                        | What it is                                                                       |
 | --------------------------- | -------------------------------------------------------------------------------- |
 | `verify.py`                 | the CI gate: every check CI runs, as named steps (`--list`, `--only`, `--quick`) |
 | `check_relevant.py`         | runs only the checks a change set needs, by repository area                      |
-| `build_release.py` / `.sh`  | release builds (they clear `RUSTFLAGS`; a plain `cargo build --release` fails)   |
+| `build_shipping.py` / `.sh` | shipping builds (they clear `RUSTFLAGS`; a plain `cargo build --release` fails)  |
 | `run_hot_reload_tests.sh`   | the hot-reload regression net: a fixed set of suites in `tests/`                 |
 | `generate_documentation.sh` | `docs/generate_documentation_markdown.py`                                        |
 

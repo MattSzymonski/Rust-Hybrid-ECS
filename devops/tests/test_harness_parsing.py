@@ -67,6 +67,7 @@ DEVOPS_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(DEVOPS_ROOT))
 
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT  # noqa: E402
+from core.projects import EXAMPLES_RELATIVE_PATH, PROJECT_RS_LIB_RS  # noqa: E402
 from core.suite_common import (  # noqa: E402
     apply_replacements,
     restore_paths,
@@ -657,9 +658,9 @@ def check_example_projects_come_from_manifests() -> None:
     directories = {crate.directory.name for crate in projects}
     for directory in ("project_rs", "master_renderer_test"):
         if directory not in directories:
-            fail(f"examples/{directory} is missing from the example projects")
+            fail(f"{EXAMPLES_RELATIVE_PATH}/{directory} is missing from the example projects")
     if "project" not in {crate.name for crate in projects}:
-        fail("examples/project_rs must read as package `project`")
+        fail(f"{EXAMPLES_RELATIVE_PATH}/project_rs must read as package `project`")
     if any(not crate.manifest_path.is_file() for crate in projects):
         fail("an example project was constructed without a manifest")
 
@@ -725,7 +726,7 @@ def check_hook_and_ci_lint_the_same_files() -> None:
     probes = [REPOSITORY_ROOT / name for name in tracked[:3] + tracked[-3:] + ignored]
     probes += [
         REPOSITORY_ROOT / "local" / "temp" / "probe.rs",
-        REPOSITORY_ROOT / "examples" / "project_rs" / "src" / "lib.rs",
+        PROJECT_RS_LIB_RS,
     ]
     for probe in probes:
         if lint.is_linted(probe) != hook_lint.is_linted(probe):

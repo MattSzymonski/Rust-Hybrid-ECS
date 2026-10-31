@@ -16,7 +16,7 @@ DESCRIPTION
     proves a real module edit moves it.
 
     The scenario mirrors `test_hot_reload_suite.py`'s cascade: load `pill_spline`
-    into `examples/project_rs`, edit the module's sample-offset constant, and
+    into `examples/local/project_rs`, edit the module's sample-offset constant, and
     wait for the reload transaction. The assertion is the host's own log line
     `editor revision bumped`, which the editor surfaces to integration suites
     without a GUI.
@@ -112,7 +112,7 @@ def plan_value_edit(content: str) -> Tuple[str, str, str]:
 # Process helpers
 # =============================================================================
 
-# `rendering` is required rather than optional: examples/project_rs links
+# `rendering` is required rather than optional: examples/local/project_rs links
 # `pill_master_renderer`, so a host without it resolves `pill_core` differently
 # from the project and the project DLL fails to load with "The specified
 # procedure could not be found" (os error 127), the same reason the cascade
@@ -123,7 +123,7 @@ HOST_POSTURE = HOST_DEV_RENDERING
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the host and returns process + monitor."""
     process_environment = os.environ.copy()
-    process_environment["PROJECT_PATH"] = "../examples/project_rs"
+    process_environment["PROJECT_PATH"] = NATIVE_PROJECT_PATH
     return launch_process(host_command(HOST_POSTURE), MODULES_ROOT, process_environment)
 
 

@@ -21,11 +21,11 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "pill_csharp_compiler", "mod
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "examples", "examples", "{20323623-E7F0-4A9E-BEBB-8C23D1F00C96}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "project_cs", "examples\project_cs\project_cs.csproj", "{C0B237FD-ED61-421C-B01B-06787C7C5B41}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "project_cs", "examples\\local\\project_cs\\project_cs.csproj", "{C0B237FD-ED61-421C-B01B-06787C7C5B41}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "italian_brainrot_cs", "examples\italian_brainrot_cs\italian_brainrot_cs.csproj", "{188E0DEC-8CD2-4AF2-9F2F-7B2E0B424613}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "italian_brainrot_cs", "examples\\local\\italian_brainrot_cs\\italian_brainrot_cs.csproj", "{188E0DEC-8CD2-4AF2-9F2F-7B2E0B424613}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "project_cs_bench", "examples\project_cs_bench\project_cs_bench.csproj", "{A811F2E7-7C8A-4BA7-AD0F-8FA09430F826}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "project_cs_bench", "examples\\local\\project_cs_bench\\project_cs_bench.csproj", "{A811F2E7-7C8A-4BA7-AD0F-8FA09430F826}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
