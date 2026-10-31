@@ -205,55 +205,97 @@ def discover_crates() -> List[Crate]:
     return crates
 
 
-def find_function_bodies(source: str) -> List[Tuple[str, int, int]]:
-    """Every `fn name(...) { ... }` in the file, as (name, body start, body end).
+def matching_brace(source: str, opening: int) -> Optional[int]:
+    """The offset of the `}` that closes the `{` at `opening`, or None.
+
+    Strings and comments are skipped so a brace inside either cannot unbalance
+    the count.
+    """
+    depth, index, length = 0, opening, len(source)
+    in_string = in_line_comment = in_block_comment = False
+    while index < length:
+        character = source[index]
+        pair = source[index : index + 2]
+        if in_line_comment:
+            if character == "\n":
+                in_line_comment = False
+        elif in_block_comment:
+            if pair == "*/":
+                in_block_comment = False
+                index += 1
+        elif in_string:
+            if character == "\\":
+                index += 1
+            elif character == '"':
+                in_string = False
+        elif pair == "//":
+            in_line_comment = True
+            index += 1
+        elif pair == "/*":
+            in_block_comment = True
+            index += 1
+        elif character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def find_function_bodies(source: str) -> List[Tuple[str, int, int, int]]:
+    """Every `fn name(...) { ... }` in the file, as (name, keyword, body start, body end).
 
     A brace scanner rather than a parser: it only has to find a literal inside a
-    body, and being approximate costs nothing here - a mis-scan yields no
-    candidate literal and the crate reports SKIPPED rather than a false failure.
-    Strings and comments are skipped so a brace inside either cannot unbalance
-    the scan.
+    body and the declaration a candidate belongs to, and being approximate costs
+    nothing here - a mis-scan yields no candidate literal and the crate reports
+    SKIPPED rather than a false failure.
     """
-    bodies: List[Tuple[str, int, int]] = []
+    bodies: List[Tuple[str, int, int, int]] = []
     for match in re.finditer(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]", source):
-        name = match.group(1)
         opening = source.find("{", match.end())
         if opening < 0:
             continue
-        depth, index, length = 0, opening, len(source)
-        in_string = in_line_comment = in_block_comment = False
-        while index < length:
-            character = source[index]
-            pair = source[index : index + 2]
-            if in_line_comment:
-                if character == "\n":
-                    in_line_comment = False
-            elif in_block_comment:
-                if pair == "*/":
-                    in_block_comment = False
-                    index += 1
-            elif in_string:
-                if character == "\\":
-                    index += 1
-                elif character == '"':
-                    in_string = False
-            elif pair == "//":
-                in_line_comment = True
-                index += 1
-            elif pair == "/*":
-                in_block_comment = True
-                index += 1
-            elif character == '"':
-                in_string = True
-            elif character == "{":
-                depth += 1
-            elif character == "}":
-                depth -= 1
-                if depth == 0:
-                    bodies.append((name, opening, index))
-                    break
-            index += 1
+        closing = matching_brace(source, opening)
+        if closing is not None:
+            bodies.append((match.group(1), match.start(), opening, closing))
     return bodies
+
+
+def impl_block_ranges(source: str) -> List[Tuple[int, int]]:
+    """Every `impl` body in the file, as (open brace, close brace) offsets.
+
+    Approximate like the body scan: a `impl` inside a comment or a string can
+    add a range that contains nothing, which only ever costs a candidate.
+    """
+    ranges: List[Tuple[int, int]] = []
+    for match in re.finditer(r"\bimpl\b", source):
+        opening = source.find("{", match.end())
+        if opening < 0:
+            continue
+        closing = matching_brace(source, opening)
+        if closing is not None:
+            ranges.append((opening, closing))
+    return ranges
+
+
+def is_associated_without_receiver(
+    source: str, keyword_start: int, body_start: int, impl_ranges: List[Tuple[int, int]]
+) -> bool:
+    """Whether this function is an associated one with no `Self` to bind.
+
+    The host refuses those by construction: a patch compiles a replacement body
+    against `Self`, and an associated function inside an `impl` has none, so the
+    refusal reads `associated-without-receiver`. Offering one as a candidate
+    reports a healthy crate as broken, which is exactly the false failure this
+    test exists to avoid.
+    """
+    if not any(start <= keyword_start <= end for start, end in impl_ranges):
+        return False
+    return "self" not in source[keyword_start:body_start]
 
 
 def declaration_is_annotated(source: str, body_start: int) -> bool:
@@ -332,11 +374,14 @@ def plan_edit(crate: Crate) -> bool:
     for path in sorted(crate.source_root.rglob("*.rs")):
         source = read_source(path)
         runtime_end = runtime_code_end(source)
-        for name, body_start, body_end in find_function_bodies(source):
+        impl_ranges = impl_block_ranges(source)
+        for name, keyword_start, body_start, body_end in find_function_bodies(source):
             if name in UNEDITABLE_FUNCTIONS:
                 continue
             # Only code the running artifact actually contains.
             if body_start >= runtime_end or declaration_is_a_test(source, body_start):
+                continue
+            if is_associated_without_receiver(source, keyword_start, body_start, impl_ranges):
                 continue
             annotated = declaration_is_annotated(source, body_start)
             if annotated:

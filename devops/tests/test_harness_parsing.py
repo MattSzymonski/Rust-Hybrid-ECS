@@ -325,18 +325,38 @@ def check_function_body_scan_handles_braces_in_strings_and_comments() -> None:
     scan, which would silently mis-locate every function after it.
     """
     bodies = coverage.find_function_bodies(REAL_RUST_SOURCE)
-    names = [name for name, _, _ in bodies]
+    names = [name for name, _, _, _ in bodies]
     for expected in ("get_color_a", "default", "helper"):
         if expected not in names:
             fail(f"missed {expected}: {names}")
 
     # The body of `helper` must end at its own closing brace, not run on.
-    _, start, end = next(body for body in bodies if body[0] == "helper")
+    _, _, start, end = next(body for body in bodies if body[0] == "helper")
     body = REAL_RUST_SOURCE[start:end]
     if "0.5" not in body:
         fail("helper's body must contain its literal")
     if "mod tests" in body:
         fail("helper's body ran past its closing brace")
+
+
+def check_associated_functions_are_not_offered_as_candidates() -> None:
+    """An associated function has no `Self`, so the host refuses it by construction.
+
+    Offering one as a candidate made the coverage suite report a healthy crate
+    as broken (`associated-without-receiver`), so the picker must skip it while
+    still accepting a method and a free function from the same file.
+    """
+    ranges = coverage.impl_block_ranges(REAL_RUST_SOURCE)
+    verdicts = {
+        name: coverage.is_associated_without_receiver(REAL_RUST_SOURCE, keyword, start, ranges)
+        for name, keyword, start, _ in coverage.find_function_bodies(REAL_RUST_SOURCE)
+    }
+    if not verdicts.get("default"):
+        fail(f"`default` is an associated function and must be skipped: {verdicts}")
+    if verdicts.get("get_color_a"):
+        fail(f"`get_color_a(&self)` has a receiver and must stay a candidate: {verdicts}")
+    if verdicts.get("helper"):
+        fail(f"`helper` is a free function and must stay a candidate: {verdicts}")
 
 
 def check_test_module_is_excluded_from_runtime_code() -> None:
@@ -749,6 +769,8 @@ CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("cargo test totals are summed", check_cargo_test_totals_are_summed),
     ("brace scan survives strings and comments",
      check_function_body_scan_handles_braces_in_strings_and_comments),
+    ("associated functions are not candidates",
+     check_associated_functions_are_not_offered_as_candidates),
     ("cfg(test) code is excluded", check_test_module_is_excluded_from_runtime_code),
     ("edit anchors are unique", check_unique_snippet_anchors_to_one_place),
     ("shared-slot rule matches the engine", check_shared_slot_detection_matches_cargo_naming),
