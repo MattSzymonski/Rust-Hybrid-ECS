@@ -2,35 +2,31 @@
 //!
 //! # Responsibilities
 //!
-//! - Copy the toolchain's `std` dylib beside the executable.
-//! - Include the shared staging code from `modules/build_support`; this script
-//!   only wires it up.
+//! - Stage the std dylib through the shared `build_support` staging code.
+//! - Refuse a non-debug build that enables `dev`.
 //!
-//! The engine workspace links with `-C prefer-dynamic`, so this executable
-//! imports `std-<hash>.dll` at process load. That dylib lives in the
+//! # Design
+//!
+//! A development build links with `-C prefer-dynamic`, so this executable
+//! imports `std-<hash>.dll` at process load. That dylib sits in the
 //! toolchain's `lib/rustlib/<host>/lib` directory, which Windows does not
-//! search; without it on `PATH` the process fails with
-//! `STATUS_DLL_NOT_FOUND`. This build script copies it beside the executable
-//! so the host runs without any `PATH` adjustment in development. All the
-//! logic lives in the shared `build_support/stage_std_dylib.rs` file; this
-//! script only calls it.
+//! search, so the copy staged beside the executable is what lets the binary
+//! start without the toolchain directory on `PATH`; with neither, it fails
+//! with `STATUS_DLL_NOT_FOUND`. The staging no-ops off Windows.
 //!
-//! It also enforces the release posture: a release build of the host is always
-//! the shipping build, so `dev` (and its `hot_patch` superset) are refused in
-//! any non-debug profile.
+//! A release build links everything into one binary and is always the shipping
+//! posture (the binary itself refuses the other combinations), so a non-debug
+//! profile that enables `dev` - or `hot_patch`, which implies it - is refused.
 
-// The staging code shared by every executable's build script.
+// The std staging every executable's build script includes.
 #[path = "../../build_support/stage_std_dylib.rs"]
 mod stage_std_dylib;
 
 fn main() {
-    // A release build of the host is always the shipping posture: the reloading
-    // machinery is a development tool and must not ship. cargo exposes the
-    // active profile to build scripts as `PROFILE` and each enabled feature as
-    // `CARGO_FEATURE_*`, so the combination is refused here - before any crate
-    // in the dependency graph is compiled - for every invocation path (script,
-    // CI, or a bare `cargo build --release`). `dev` is what every development
-    // feature (`hot_patch` included) turns on, so it is the one to check.
+    // Refused here rather than in the binary, which cannot see the profile: a
+    // release build is always the shipping posture, and `hot_patch` enables
+    // `dev`, so checking that one feature covers both. Cargo passes the
+    // profile as `PROFILE` and each enabled feature as `CARGO_FEATURE_*`.
     let profile = std::env::var("PROFILE").unwrap_or_default();
     let development = std::env::var_os("CARGO_FEATURE_DEV").is_some();
     if profile != "debug" && development {

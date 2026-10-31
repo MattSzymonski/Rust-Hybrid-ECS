@@ -5,17 +5,18 @@
 //! - Install the engine report handler and the shared telemetry stack.
 //! - Select what to run - the development host (`dev`) or the linked game
 //!   (`shipping`) - and run it through the loops in [`runner`].
-//! - Convert the final error into one styled miette report at the single
+//! - Convert the run's failure into one styled miette report at the single
 //!   reporting boundary.
 //!
 //! # Design
 //!
-//! This binary owns its event loop and its window; what runs inside it is
-//! either `pill_development_host`'s development host or `pill_player` with the generated
-//! shipping bundle, both driven through `pill_player::FrameDriver`. A shipping
-//! build does not depend on `pill_development_host` at all, so development code cannot
-//! reach a shipped binary. There is no GPU code here: the renderer attach lives
-//! in the runtime, and the renderer itself in its own crate.
+//! This binary owns its event loop, and in a windowed build its window; what
+//! runs inside it is either `pill_development_host`'s development host or
+//! `pill_player` with the generated shipping bundle, both driven through
+//! `pill_player::FrameDriver`. A shipping build does not depend on
+//! `pill_development_host` at all, so development code cannot reach a shipped
+//! binary. There is no GPU code here: the renderer attach lives in the runtime,
+//! and the renderer itself in its own crate.
 
 // Standard library
 use std::path::PathBuf;
@@ -27,6 +28,10 @@ use pill_core::error::{engine_report, install_engine_report_handler};
 // Current crate
 use crate::frontend::RunError;
 
+// =============================================================================
+// Modules
+// =============================================================================
+
 /// The standalone frontend's errors.
 mod frontend;
 /// What this binary runs: the development host, or a shipped game.
@@ -34,11 +39,15 @@ mod posture;
 /// The headless and windowed run loops.
 mod runner;
 
+// =============================================================================
+// Posture
+// =============================================================================
+
 // Exactly one posture: without one there is nothing to run, and with both the
 // development host would sit beside a linked project it never uses. Feature
 // unification makes the second easy to trigger by accident - a `--workspace`
-// build where another package asks for `pill_development_host` - so it is refused at
-// compile time rather than discovered in a shipped binary.
+// build where another package asks for `pill_development_host` - so it is
+// refused at compile time rather than discovered in a shipped binary.
 #[cfg(not(any(feature = "dev", feature = "shipping")))]
 compile_error!(
     "pill_standalone needs a posture: `dev` (the default) or `shipping` - build a shipped game as `--no-default-features --features shipping`."
@@ -49,18 +58,23 @@ compile_error!(
 );
 
 // =============================================================================
-// Project
+// Constants
 // =============================================================================
 
-/// Environment variable that runs the development host in the editor posture,
-/// loading extension editor crates (`<extension>_editor`).
+/// Environment variable that runs the development host in the editor posture.
 ///
-/// A development and test switch: it gives this binary the editor host's
-/// extension set. Unset, the binary never builds or loads an editor crate.
+/// A development and test switch: set, it gives this binary the editor host's
+/// extension set, `<extension>_editor` crates included; unset, this binary
+/// never builds or loads an editor crate.
 #[cfg(feature = "dev")]
 const EDITOR_POSTURE_ENVIRONMENT_VARIABLE: &str = "PILL_EDITOR_POSTURE";
 
-/// The project to run: resolved from `PROJECT_PATH` and its settings.
+// =============================================================================
+// Project
+// =============================================================================
+
+/// The project to run: resolved from `PROJECT_PATH` and the project's
+/// `project_settings.yaml`.
 ///
 /// # Errors
 ///
@@ -90,7 +104,7 @@ fn project() -> miette::Result<pill_player::StaticProject> {
 // Telemetry
 // =============================================================================
 
-/// Install the shared telemetry stack before the run loop starts.
+/// Installs the shared telemetry stack before the run loop starts.
 ///
 /// Terminal logging is always active. A file lane is added when `ECS_LOG_DIR`
 /// is set. When the `profiling` feature is enabled, `profile::*` spans are
@@ -113,16 +127,17 @@ fn init_telemetry() {
 // Reporting Boundary
 // =============================================================================
 
-/// Install the report handler once and report the final error once.
+/// Installs the report handler, then runs the project and reports its failure.
 ///
 /// The telemetry stack is brought up before the run loop starts so that any
 /// failure is captured on every active lane.
 ///
 /// # Errors
 ///
-/// Returns the styled [`engine_report`] when the run terminates with an error,
-/// after also recording the failure on the tracing lane for correlation with
-/// active spans and log files.
+/// Returns the project's configuration report when it cannot be resolved, or
+/// the styled [`engine_report`] of the failure the run terminated with, after
+/// recording that failure on the tracing lane for correlation with active
+/// spans and log files.
 fn main() -> miette::Result<()> {
     // Step 1: install the miette report handler before anything can fail.
     install_engine_report_handler();

@@ -1,4 +1,5 @@
-//! The standalone frontend's errors.
+//! Errors of the standalone frontend: its `winit` failures, and what a run
+//! can end with.
 //!
 //! # Responsibilities
 //!
@@ -8,11 +9,13 @@
 //!
 //! # Design
 //!
-//! Both live in the crate that owns the event loop. `pill_core` is the shared
-//! dylib every module and hot patch imports, so a `winit` type there would make
-//! all of them link the windowing library for an error only this binary
-//! constructs. The runtime composes setup and renderer failures without the
-//! frontend arm (`pill_player::RenderingError`); [`RunError`] adds it.
+//! Both types live in the crate that owns the event loop. `pill_core` is the
+//! shared dylib every module, project and hot patch imports, so a `winit` type
+//! there would put the windowing library in every one of their graphs for an
+//! error only this binary constructs. `pill_player::RenderingError` composes
+//! the windowed runtime's setup and renderer failures; [`RunError`] adds the
+//! frontend arm, and a build without `rendering` has neither it nor the
+//! renderer arm.
 
 // Standard library
 use std::convert::Infallible;
@@ -64,7 +67,8 @@ pub enum RunError {
     #[transparent]
     Frontend(#[from] FrontendError),
 
-    /// The GPU surface, device, or a frame could not be obtained.
+    /// The renderer failed: no GPU surface or device, a resource it needs
+    /// missing, or a frame it could not draw.
     #[cfg(feature = "rendering")]
     #[transparent]
     Renderer(#[from] pill_player::RendererError),
@@ -83,7 +87,8 @@ impl From<pill_player::RenderingError> for RunError {
 }
 
 impl From<Infallible> for RunError {
-    /// A headless frame cannot fail; this lets one loop take any driver.
+    /// A headless driver's frame cannot fail, so this is what satisfies the
+    /// `RunError: From<D::Error>` bound the headless loop takes.
     fn from(never: Infallible) -> Self {
         match never {}
     }
@@ -99,8 +104,8 @@ mod tests {
     // `code()` comes from the diagnostic trait `#[engine_error]` implements.
     use miette::Diagnostic as _;
 
-    /// Every arm is transparent, so a composed error reports the code of the
-    /// error it carries rather than one of its own.
+    /// The transparent `Host` arm reports the code of the error it carries
+    /// rather than one of its own.
     #[test]
     fn a_composed_arm_reports_the_leaf_code() {
         let host = RunError::from(pill_core::error::HostError::from(

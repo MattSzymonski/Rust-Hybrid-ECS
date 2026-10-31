@@ -74,7 +74,7 @@ with the editor suites immediately after (see the ordering rule below).
 ```powershell
 python devops/ci_cd/check_relevant.py --dry-run     # select and print, run nothing
 python devops/ci_cd/check_relevant.py               # run the selection
-python devops/ci_cd/check_relevant.py --paths modules/frontends/editor/pill_editor_core/src/icons.rs
+python devops/ci_cd/check_relevant.py --paths modules/editor/pill_editor_core/src/icons.rs
 python devops/ci_cd/check_relevant.py --list-rules  # the area table
 ```
 
@@ -422,15 +422,15 @@ iteration, `check_relevant.py` runs the subset the change actually needs (see
 these from `modules/`. The counts were measured on 2026-09-17; record what you
 actually measure and update a row in the same commit that changes it.
 
-| Gate                      | Command                                                         | Expected         |
-| ------------------------- | --------------------------------------------------------------- | ---------------- |
-| Engine unit tests         | `cargo test -p pill_engine --lib --offline`                     | 322 passed       |
-| Engine, all targets       | `cargo test -p pill_engine --offline`                           | all targets pass |
+| Gate                      | Command                                                                     | Expected         |
+| ------------------------- | --------------------------------------------------------------------------- | ---------------- |
+| Engine unit tests         | `cargo test -p pill_engine --lib --offline`                                 | 322 passed       |
+| Engine, all targets       | `cargo test -p pill_engine --offline`                                       | all targets pass |
 | Host, default posture     | `cargo test -p pill_development_host --lib --offline`                       | 98 passed        |
 | Host, rendering           | `cargo test -p pill_development_host --features rendering --lib --offline`  | 152 passed       |
 | Host, shipping posture    | `cargo test -p pill_development_host --no-default-features --lib --offline` | 25 passed        |
-| Clippy, formatting, lints | `python devops/ci_cd/verify.py --quick`                         | clean            |
-| End-to-end suites         | `python devops/tests/run_all.py`                                | all pass         |
+| Clippy, formatting, lints | `python devops/ci_cd/verify.py --quick`                                     | clean            |
+| End-to-end suites         | `python devops/tests/run_all.py`                                            | all pass         |
 
 ## Generated C# mirrors
 

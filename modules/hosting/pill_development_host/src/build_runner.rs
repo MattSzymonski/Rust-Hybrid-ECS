@@ -598,7 +598,7 @@ pub(crate) fn declared_features(workspace_root: &Path, package: &str) -> Option<
 }
 
 /// How many directory levels below the workspace root a member manifest can
-/// sit: three, for the deepest member layout (`frontends/editor/pill_editor`).
+/// sit: two, for the deepest member layout (`editor/pill_editor`).
 const MEMBER_SEARCH_DEPTH: usize = 3;
 
 /// Uncached [`declared_features`]: reads the extension crate's manifest

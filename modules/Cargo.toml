@@ -23,11 +23,11 @@ members = [
     "hosting/*",
     # The frontends - `pill_standalone`, `pill_web` - and the `pill_input`
     # gamepad glue they and the editor share. Every crate here is named
-    # `pill_*`, the same convention as the extensions: `frontends/` also holds
-    # the `editor/` folder, which is not a crate itself.
+    # `pill_*`, the same convention as the extensions.
     "frontends/pill_*",
-    # The egui editor frontend: its executable and its shared core dylib.
-    "frontends/editor/*",
+    # The egui editor: its executable and its shared core dylib, in their own
+    # folder beside the other layers.
+    "editor/*",
     # The C# half of the engine: the bridge crate, plus the managed runtime and
     # compiler that live beside it. This one is named explicitly rather than
     # globbed, because `csharp/` is not all crates - the other two are MSBuild

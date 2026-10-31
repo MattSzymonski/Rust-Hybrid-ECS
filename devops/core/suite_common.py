@@ -884,7 +884,7 @@ HOST_BUILD_RECORD = MODULES_ROOT / "target" / "pill_suite_host_build.json"
 # project sources are absent for the host's reason: the editor loads those as
 # DLLs, and this suite edits them.
 EDITOR_SOURCE_ROOTS = HOST_SOURCE_ROOTS + (
-    MODULES_ROOT / "frontends" / "editor",
+    MODULES_ROOT / "editor",
     MODULES_ROOT / "csharp" / "pill_csharp_bridge",
 )
 

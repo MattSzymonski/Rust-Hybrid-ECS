@@ -13,7 +13,7 @@
 //! shared target directory.
 
 // The staging code shared by every executable's build script.
-#[path = "../../../build_support/stage_std_dylib.rs"]
+#[path = "../../build_support/stage_std_dylib.rs"]
 mod stage_std_dylib;
 
 fn main() {

@@ -107,7 +107,7 @@ SHARED_UI_INDEPENDENT_DYLIBS = (
     # the token-to-egui translator is an rlib compiled into each UI.
     ("pill_ui_theme", "ui/pill_ui_theme"),
     # The egui editor's copy: one shared dylib, same rule.
-    ("pill_editor_core", "frontends/editor/pill_editor_core"),
+    ("pill_editor_core", "editor/pill_editor_core"),
 )
 UI_FRAMEWORK_CRATES = ("dioxus", "tao", "wry", "winit", "wgpu")
 
@@ -453,7 +453,7 @@ def self_test():
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             write_crate(root, "pill_engine_core", [])
-            directory = root / "modules" / "frontends" / "editor" / "pill_editor_core"
+            directory = root / "modules" / "editor" / "pill_editor_core"
             (directory / "src").mkdir(parents=True, exist_ok=True)
             lines = [
                 '[package]\nname = "pill_editor_core"\nversion = "0.1.0"\n',
@@ -484,7 +484,7 @@ def self_test():
     ):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            directory = root / "modules" / "frontends" / "editor" / "pill_editor_core"
+            directory = root / "modules" / "editor" / "pill_editor_core"
             (directory / "src").mkdir(parents=True, exist_ok=True)
             (directory / "Cargo.toml").write_text(
                 '[package]\nname = "pill_editor_core"\nversion = "0.1.0"\n',
