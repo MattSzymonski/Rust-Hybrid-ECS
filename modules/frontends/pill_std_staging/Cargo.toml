@@ -1,0 +1,11 @@
+[package]
+name = "pill_std_staging"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+# No dependencies by design: every executable's build script compiles this
+# crate before anything else, in every posture.
+[dependencies]

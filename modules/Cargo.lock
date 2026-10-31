@@ -2722,6 +2722,7 @@ dependencies = [
  "pill_host",
  "pill_input",
  "pill_runtime",
+ "pill_std_staging",
  "pill_ui_theme",
  "serde_json",
  "thiserror 2.0.20",
@@ -2959,14 +2960,18 @@ dependencies = [
  "pill_core",
  "pill_core_macros",
  "pill_host",
- "pill_hot_scan",
  "pill_input",
  "pill_runtime",
  "pill_shipping_bundle",
+ "pill_std_staging",
  "thiserror 2.0.20",
  "tracing",
  "winit",
 ]
+
+[[package]]
+name = "pill_std_staging"
+version = "0.1.0"
 
 [[package]]
 name = "pill_test"

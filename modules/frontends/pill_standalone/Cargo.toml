@@ -58,7 +58,7 @@ pill_input = { path = "../pill_input", features = [
 pill_shipping_bundle = { path = "../../../build/pill_shipping_bundle", optional = true }
 
 [build-dependencies]
-pill_hot_scan = { path = "../../hosting/pill_hot_scan" }
+pill_std_staging = { path = "../pill_std_staging" }
 
 [features]
 # Exactly one of `dev` and `shipping` is selected; `main.rs` refuses anything
