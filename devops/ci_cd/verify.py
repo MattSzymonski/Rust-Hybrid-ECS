@@ -76,7 +76,7 @@ MODULES_ROOT = REPOSITORY_ROOT / "modules"
 PYTHON = sys.executable
 
 # The two hot_patch feature switches, shared by the check and test steps.
-HOT_PATCH_FEATURES = "pill_host/hot_patch,pill_engine/hot_patch"
+HOT_PATCH_FEATURES = "pill_development_host/hot_patch,pill_engine/hot_patch"
 # The default test lane must compile without hot_patch, so the plain-reload
 # code paths (`cfg(not(feature = "hot_patch"))`) are built and tested. Cargo
 # unifies features across one invocation, and `pill_standalone` turns
@@ -87,7 +87,7 @@ DEFAULT_LANE = [
     "--workspace",
     "--exclude",
     "pill_standalone",
-    # The egui editor frontend links `pill_host` with its default features, so
+    # The egui editor frontend links `pill_development_host` with its default features, so
     # leaving it in the default lane turns `pill_engine_core/hot_patch` on for
     # every crate in it - the lane exists to test the plain path, and the
     # hot_patch lane below covers the other one.
@@ -192,7 +192,7 @@ STEPS: List[Step] = [
         "check-shipping",
         "Clippy (shipping posture)",
         # `-p pill_standalone` alone: with `--workspace`, `pill_editor` would
-        # bring `pill_host` and the dev posture back (see the crate's manifest).
+        # bring `pill_development_host` and the dev posture back (see the crate's manifest).
         #
         # The bundle is generated first: the committed stub is deliberately
         # project-agnostic and refuses to compile, so without this step the
@@ -340,7 +340,7 @@ STEPS: List[Step] = [
         [
             [
                 "cargo", "clippy", "--target", "wasm32-unknown-unknown",
-                "-p", "pill_runtime", "--features", "rendering",
+                "-p", "pill_player", "--features", "rendering",
                 "-p", "pill_web", "-p", "pill_master_renderer",
                 "--", "-D", "warnings",
             ]

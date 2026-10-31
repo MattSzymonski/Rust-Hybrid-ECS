@@ -19,7 +19,7 @@
 //! conflicts with every other system keeps that read out of a parallel batch.
 //! Its owner, [`SystemOwner::ENGINE`](crate::SystemOwner::ENGINE), is one no
 //! reload path clears, so the report survives project and module reloads. It
-//! cannot report `pill_host`'s reload graveyard - retired images kept mapped
+//! cannot report `pill_development_host`'s reload graveyard - retired images kept mapped
 //! while their rows migrate - so recycled entity IDs and empty archetypes
 //! stand in for it.
 

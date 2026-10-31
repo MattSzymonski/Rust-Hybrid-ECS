@@ -512,7 +512,7 @@ def install_failing_reload_with_resource() -> None:
 # `pill_master_renderer` directly, so the project build resolves the wgpu
 # graph, and the host's engine dylibs must match the resolution every spawned
 # build gets (`apply_cargo_host_overrides` in
-# `pill_host/src/build_runner.rs` mirrors the host's engine features).
+# `pill_development_host/src/build_runner.rs` mirrors the host's engine features).
 HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
 
 

@@ -8,26 +8,26 @@
 //! # Design
 //!
 //! The loops in [`crate::runner`] are written once, against
-//! [`pill_runtime::FrameDriver`]; only setting a driver up differs, and that
+//! [`pill_player::FrameDriver`]; only setting a driver up differs, and that
 //! difference lives here, in two sibling modules selected by the `dev` and
 //! `shipping` features. A shipping build compiles only the second, which
-//! names nothing from `pill_host`.
+//! names nothing from `pill_development_host`.
 
-/// The development posture: `pill_host` builds, loads and reloads the project.
+/// The development posture: `pill_development_host` builds, loads and reloads the project.
 #[cfg(feature = "dev")]
 mod selected {
     // External crates
     use pill_core::error::HostError;
     #[cfg(feature = "rendering")]
-    use pill_runtime::{RendererWindow, RenderingError};
+    use pill_player::{RendererWindow, RenderingError};
 
     /// What says which project to run: its settings.
-    pub type Project = pill_host::HostConfig;
+    pub type Project = pill_development_host::HostConfig;
     /// The headless driver.
-    pub type Headless = pill_host::DevHost;
+    pub type Headless = pill_development_host::DevHost;
     /// The windowed driver.
     #[cfg(feature = "rendering")]
-    pub type Windowed = pill_host::RenderingHost;
+    pub type Windowed = pill_development_host::RenderingHost;
 
     /// Build, load and start watching the project and its extensions.
     ///
@@ -35,7 +35,7 @@ mod selected {
     ///
     /// Returns the host's setup failure.
     pub fn setup(project: Project) -> Result<Headless, HostError> {
-        pill_host::setup(project)
+        pill_development_host::setup(project)
     }
 
     /// Load the renderer module and attach it to `window`.
@@ -50,25 +50,25 @@ mod selected {
         width: u32,
         height: u32,
     ) -> Result<Windowed, RenderingError> {
-        pill_host::attach_renderer(host, window, width, height)
+        pill_development_host::attach_renderer(host, window, width, height)
     }
 }
 
-/// The shipping posture: `pill_runtime` runs the project the bundle links in.
+/// The shipping posture: `pill_player` runs the project the bundle links in.
 #[cfg(feature = "shipping")]
 mod selected {
     // External crates
     use pill_core::error::HostError;
     #[cfg(feature = "rendering")]
-    use pill_runtime::{RendererWindow, RenderingError};
+    use pill_player::{RendererWindow, RenderingError};
 
     /// What says which project to run: the linked project.
-    pub type Project = pill_runtime::StaticProject;
+    pub type Project = pill_player::StaticProject;
     /// The headless driver.
-    pub type Headless = pill_runtime::Runtime;
+    pub type Headless = pill_player::Runtime;
     /// The windowed driver.
     #[cfg(feature = "rendering")]
-    pub type Windowed = pill_runtime::RenderingRuntime;
+    pub type Windowed = pill_player::RenderingRuntime;
 
     /// Register the linked extensions and project.
     ///
@@ -76,7 +76,7 @@ mod selected {
     ///
     /// Returns the first entry point's failure.
     pub fn setup(project: Project) -> Result<Headless, HostError> {
-        pill_runtime::setup(project)
+        pill_player::setup(project)
     }
 
     /// Register the linked renderer and attach it to `window`.
@@ -94,7 +94,7 @@ mod selected {
         width: u32,
         height: u32,
     ) -> Result<Windowed, RenderingError> {
-        pill_core::platform::futures::block_on(pill_runtime::attach_renderer(
+        pill_core::platform::futures::block_on(pill_player::attach_renderer(
             runtime, window, width, height,
         ))
     }

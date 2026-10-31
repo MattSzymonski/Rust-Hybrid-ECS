@@ -30,7 +30,7 @@
 #   `PROJECT_PATH` (or `--project`), the shipping bundle is regenerated from
 #   its `project_settings.yaml`, and `pill_standalone` is built with
 #   `--no-default-features --features shipping`, which runs the project
-#   through `pill_runtime` and does not compile the development host. Hot
+#   through `pill_player` and does not compile the development host. Hot
 #   reload is a development tool and must not ship, so there is no other way to
 #   release-build the host.
 #
@@ -591,14 +591,13 @@ ENGINE_LIBRARIES = {
     "pill_engine",
     "pill_engine_core",
     "pill_core",
-    "pill_host",
-    "pill_runtime",
+    "pill_development_host",
+    "pill_player",
     "pill_csharp_bridge",
     "pill_standalone",
     "pill_engine_macros",
     "pill_core_macros",
     "pill_hot_scan",
-    "pill_std_staging",
     "pill_editor",
     # Under `modules/extensions/`, but engine code rather than an extension:
     #  it is the renderer the host links when built windowed, never

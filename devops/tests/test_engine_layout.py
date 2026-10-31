@@ -107,7 +107,7 @@ SHARED_UI_INDEPENDENT_DYLIBS = (
     # the token-to-egui translator is an rlib compiled into each UI.
     ("pill_ui_theme", "ui/pill_ui_theme"),
     # The egui editor's copy: one shared dylib, same rule.
-    ("pill_editor_core", "editor/pill_editor_core"),
+    ("pill_editor_core", "frontends/editor/pill_editor_core"),
 )
 UI_FRAMEWORK_CRATES = ("dioxus", "tao", "wry", "winit", "wgpu")
 
@@ -117,7 +117,7 @@ KIT_DEPENDENTS = {"pill_editor_core", "pill_project_ui"}
 
 # The development host's list of the shared dylibs it stages beside a module it
 # isolates (rule 7), and the two the engine core owns rather than a UI crate.
-HOST_NATIVE_LIBRARY = Path("hosting") / "pill_host" / "src" / "native_library.rs"
+HOST_NATIVE_LIBRARY = Path("hosting") / "pill_development_host" / "src" / "native_library.rs"
 ENGINE_DYLIB_STEMS_PATTERN = re.compile(
     r"ENGINE_DYLIB_STEMS: \[&str; \d+\] = \[(.*?)\];", re.DOTALL
 )
@@ -453,7 +453,7 @@ def self_test():
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             write_crate(root, "pill_engine_core", [])
-            directory = root / "modules" / "editor" / "pill_editor_core"
+            directory = root / "modules" / "frontends" / "editor" / "pill_editor_core"
             (directory / "src").mkdir(parents=True, exist_ok=True)
             lines = [
                 '[package]\nname = "pill_editor_core"\nversion = "0.1.0"\n',
@@ -484,7 +484,7 @@ def self_test():
     ):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            directory = root / "modules" / "editor" / "pill_editor_core"
+            directory = root / "modules" / "frontends" / "editor" / "pill_editor_core"
             (directory / "src").mkdir(parents=True, exist_ok=True)
             (directory / "Cargo.toml").write_text(
                 '[package]\nname = "pill_editor_core"\nversion = "0.1.0"\n',

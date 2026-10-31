@@ -56,7 +56,7 @@
 #
 # EXAMPLE USAGE:
 #   python devops/tools/comment_audit.py
-#   python devops/tools/comment_audit.py --root modules/editor/pill_editor_core
+#   python devops/tools/comment_audit.py --root modules/frontends/editor/pill_editor_core
 #   python devops/tools/comment_audit.py --sort density --top 40
 #   python devops/tools/comment_audit.py --json local/temp/comment-audit.json
 #   python devops/tools/comment_audit.py --markdown local/temp/comment-audit.md

@@ -105,7 +105,7 @@ def project_settings_yaml(project_root: Path) -> Path:
 # that text - and the fix is either to reword the token or to find out why the
 # host went quiet.
 #
-# THE TRAP. Most tokens below are printed by `pill_host`, which nobody edits
+# THE TRAP. Most tokens below are printed by `pill_development_host`, which nobody edits
 # casually. Two are not: MODULE_REGISTERED_MESSAGE and PROJECT_PROBE_PREFIX
 # come from the example project and the example module - the two files the
 # whole hot-reload demo invites you to type into. Editing the probe string
@@ -832,9 +832,9 @@ class HostPosture:
 
 
 # The postures in use. `--features rendering` on the defaults is the same graph
-# as the `--features pill_host/hot_patch,rendering` the hot-patch suites used to
+# as the `--features pill_development_host/hot_patch,rendering` the hot-patch suites used to
 # spell out: `hot_patch` is a default feature and it is what forwards
-# `pill_host/hot_patch`.
+# `pill_development_host/hot_patch`.
 HOST_DEV_HOT_PATCH = HostPosture("dev+hot_patch")
 HOST_DEV = HostPosture("dev", ("--no-default-features", "--features", "dev"))
 HOST_DEV_HOT_PATCH_RENDERING = HostPosture("dev+hot_patch+rendering", ("--features", "rendering"))
@@ -844,7 +844,7 @@ HOST_DEV_RENDERING = HostPosture(
     ("--offline",),
 )
 
-# The roots of every crate `pill_host` compiles, for `verify_host_build`'s
+# The roots of every crate `pill_development_host` compiles, for `verify_host_build`'s
 # staleness check. A path dependency added to its manifest belongs here too.
 # Extension and project sources are deliberately absent: the host loads those as
 # DLLs, so editing `pill_spline` - which several suites do, leaving the file
@@ -868,7 +868,7 @@ HOST_SOURCE_ROOTS = (
     MODULES_ROOT / "ui",
     MODULES_ROOT / "hosting",
     MODULES_ROOT / "frontends" / "pill_standalone",
-    # `pill_host` links the C# bridge by path; the managed runtime beside it
+    # `pill_development_host` links the C# bridge by path; the managed runtime beside it
     # is not a cargo crate and does not rebuild the host.
     MODULES_ROOT / "csharp" / "pill_csharp_bridge",
 )
@@ -884,7 +884,7 @@ HOST_BUILD_RECORD = MODULES_ROOT / "target" / "pill_suite_host_build.json"
 # project sources are absent for the host's reason: the editor loads those as
 # DLLs, and this suite edits them.
 EDITOR_SOURCE_ROOTS = HOST_SOURCE_ROOTS + (
-    MODULES_ROOT / "editor",
+    MODULES_ROOT / "frontends" / "editor",
     MODULES_ROOT / "csharp" / "pill_csharp_bridge",
 )
 

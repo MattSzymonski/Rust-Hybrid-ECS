@@ -6,9 +6,9 @@ came from.
 
 ## Phosphor Icons (web fonts, regular and duotone weights)
 
-- Files: `modules/editor/pill_editor_core/assets/Phosphor.ttf`,
-  `modules/editor/pill_editor_core/assets/Phosphor-Duotone.ttf` and
-  `modules/editor/pill_editor_core/assets/Phosphor-LICENSE.txt` (the MIT text).
+- Files: `modules/frontends/editor/pill_editor_core/assets/Phosphor.ttf`,
+  `modules/frontends/editor/pill_editor_core/assets/Phosphor-Duotone.ttf` and
+  `modules/frontends/editor/pill_editor_core/assets/Phosphor-LICENSE.txt` (the MIT text).
 - Licence: MIT (Copyright (c) 2023 Phosphor Icons).
 - Source: the `@phosphor-icons/web` package, version 2.1.1, from
   `https://unpkg.com/@phosphor-icons/web@2.1.1/src/{regular/Phosphor.ttf,
@@ -21,8 +21,8 @@ came from.
 
 ## Inter (variable font, optical size and weight axes)
 
-- Files: `modules/editor/pill_editor_core/assets/Inter-Variable.ttf` and
-  `modules/editor/pill_editor_core/assets/Inter-OFL.txt` (the SIL Open Font
+- Files: `modules/frontends/editor/pill_editor_core/assets/Inter-Variable.ttf` and
+  `modules/frontends/editor/pill_editor_core/assets/Inter-OFL.txt` (the SIL Open Font
   License 1.1 text).
 - Licence: SIL Open Font License 1.1 (Copyright (c) 2016 The Inter Project
   Authors).
@@ -36,8 +36,8 @@ came from.
 
 ## JetBrains Mono (variable font, weight axis)
 
-- Files: `modules/editor/pill_editor_core/assets/JetBrainsMono-Variable.ttf`
-  and `modules/editor/pill_editor_core/assets/JetBrainsMono-OFL.txt` (the SIL
+- Files: `modules/frontends/editor/pill_editor_core/assets/JetBrainsMono-Variable.ttf`
+  and `modules/frontends/editor/pill_editor_core/assets/JetBrainsMono-OFL.txt` (the SIL
   Open Font License 1.1 text).
 - Licence: SIL Open Font License 1.1 (Copyright (c) 2020 The JetBrains Mono
   Project Authors).

@@ -11,7 +11,7 @@
 //!
 //! # Design
 //!
-//! The executable folds `pill_host::HostNotice`s into
+//! The executable folds `pill_development_host::HostNotice`s into
 //! [`EditorNotices`-shaped plain data][EditorNotices] each frame; this module
 //! only reads it and turns it into pixels. A toast is keyed by its notice
 //! sequence number, so a redrawn frame neither re-queues a line nor repeats

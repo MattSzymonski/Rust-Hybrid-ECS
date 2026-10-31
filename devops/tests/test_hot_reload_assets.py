@@ -79,7 +79,7 @@ DATA_CRATE_ROOT = (
 # test is the same with or without a window.
 HOST_POSTURE = HOST_DEV_HOT_PATCH
 
-# Host log lines this suite asserts on (printed by `pill_host/src/runtime.rs`).
+# Host log lines this suite asserts on (printed by `pill_development_host/src/runtime.rs`).
 ASSET_WATCH_TOKEN = "[assets] watching the project's assets for edits"
 REIMPORTED_TOKEN = "[assets] reimported"
 REIMPORT_FAILED_TOKEN = "[assets] reimport failed; keeping the loaded value"

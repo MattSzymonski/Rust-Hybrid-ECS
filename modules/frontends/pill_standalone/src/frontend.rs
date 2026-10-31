@@ -12,7 +12,7 @@
 //! dylib every module and hot patch imports, so a `winit` type there would make
 //! all of them link the windowing library for an error only this binary
 //! constructs. The runtime composes setup and renderer failures without the
-//! frontend arm (`pill_runtime::RenderingError`); [`RunError`] adds it.
+//! frontend arm (`pill_player::RenderingError`); [`RunError`] adds it.
 
 // Standard library
 use std::convert::Infallible;
@@ -67,17 +67,17 @@ pub enum RunError {
     /// The GPU surface, device, or a frame could not be obtained.
     #[cfg(feature = "rendering")]
     #[transparent]
-    Renderer(#[from] pill_runtime::RendererError),
+    Renderer(#[from] pill_player::RendererError),
 }
 
 #[cfg(feature = "rendering")]
-impl From<pill_runtime::RenderingError> for RunError {
+impl From<pill_player::RenderingError> for RunError {
     /// The runtime's composition is this one without the frontend arm, so
     /// each of its arms maps onto the matching arm here.
-    fn from(error: pill_runtime::RenderingError) -> Self {
+    fn from(error: pill_player::RenderingError) -> Self {
         match error {
-            pill_runtime::RenderingError::Host(error) => Self::Host(error),
-            pill_runtime::RenderingError::Renderer(error) => Self::Renderer(error),
+            pill_player::RenderingError::Host(error) => Self::Host(error),
+            pill_player::RenderingError::Renderer(error) => Self::Renderer(error),
         }
     }
 }

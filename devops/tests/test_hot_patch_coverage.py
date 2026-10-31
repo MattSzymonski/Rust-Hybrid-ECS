@@ -8,7 +8,7 @@ SETS: hot-reload
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain (cargo)
-  - `pill_standalone` built with the `pill_host/hot_patch` feature (this script
+  - `pill_standalone` built with the `pill_development_host/hot_patch` feature (this script
     builds it unless --skip-build is given)
 
 DESCRIPTION

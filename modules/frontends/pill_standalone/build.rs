@@ -3,7 +3,8 @@
 //! # Responsibilities
 //!
 //! - Copy the toolchain's `std` dylib beside the executable.
-//! - Delegate the staging logic to `pill_std_staging`; this script only wires it up.
+//! - Include the shared staging code from `modules/build_support`; this script
+//!   only wires it up.
 //!
 //! The engine workspace links with `-C prefer-dynamic`, so this executable
 //! imports `std-<hash>.dll` at process load. That dylib lives in the
@@ -11,12 +12,16 @@
 //! search; without it on `PATH` the process fails with
 //! `STATUS_DLL_NOT_FOUND`. This build script copies it beside the executable
 //! so the host runs without any `PATH` adjustment in development. All the
-//! logic lives in the shared `pill_std_staging` crate; this script only
-//! calls it.
+//! logic lives in the shared `build_support/stage_std_dylib.rs` file; this
+//! script only calls it.
 //!
 //! It also enforces the release posture: a release build of the host is always
 //! the shipping build, so `dev` (and its `hot_patch` superset) are refused in
 //! any non-debug profile.
+
+// The staging code shared by every executable's build script.
+#[path = "../../build_support/stage_std_dylib.rs"]
+mod stage_std_dylib;
 
 fn main() {
     // A release build of the host is always the shipping posture: the reloading
@@ -37,5 +42,5 @@ fn main() {
     }
 
     // Copy `std-*.dll` next to the built executable (no-op off Windows).
-    pill_std_staging::stage_std_dylib();
+    stage_std_dylib::stage_std_dylib();
 }

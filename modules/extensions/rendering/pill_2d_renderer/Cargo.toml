@@ -33,6 +33,6 @@ thiserror = "2"
 miette = { version = "7", features = ["derive"] }
 
 [features]
-# Deliberately empty. This crate is reached only through `pill_host`'s
+# Deliberately empty. This crate is reached only through `pill_development_host`'s
 # `rendering` feature, so it has nothing of its own to gate.
 default = []

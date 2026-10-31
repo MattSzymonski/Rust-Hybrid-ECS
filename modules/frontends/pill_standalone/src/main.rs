@@ -11,9 +11,9 @@
 //! # Design
 //!
 //! This binary owns its event loop and its window; what runs inside it is
-//! either `pill_host`'s development host or `pill_runtime` with the generated
-//! shipping bundle, both driven through `pill_runtime::FrameDriver`. A shipping
-//! build does not depend on `pill_host` at all, so development code cannot
+//! either `pill_development_host`'s development host or `pill_player` with the generated
+//! shipping bundle, both driven through `pill_player::FrameDriver`. A shipping
+//! build does not depend on `pill_development_host` at all, so development code cannot
 //! reach a shipped binary. There is no GPU code here: the renderer attach lives
 //! in the runtime, and the renderer itself in its own crate.
 
@@ -37,7 +37,7 @@ mod runner;
 // Exactly one posture: without one there is nothing to run, and with both the
 // development host would sit beside a linked project it never uses. Feature
 // unification makes the second easy to trigger by accident - a `--workspace`
-// build where another package asks for `pill_host` - so it is refused at
+// build where another package asks for `pill_development_host` - so it is refused at
 // compile time rather than discovered in a shipped binary.
 #[cfg(not(any(feature = "dev", feature = "shipping")))]
 compile_error!(
@@ -66,13 +66,13 @@ const EDITOR_POSTURE_ENVIRONMENT_VARIABLE: &str = "PILL_EDITOR_POSTURE";
 ///
 /// Returns the configuration error when the project cannot be resolved.
 #[cfg(feature = "dev")]
-fn project() -> miette::Result<pill_host::HostConfig> {
+fn project() -> miette::Result<pill_development_host::HostConfig> {
     // The editor posture only on an explicit `1`, so a stray value never
     // loads editor code into an ordinary run.
     if std::env::var(EDITOR_POSTURE_ENVIRONMENT_VARIABLE).as_deref() == Ok("1") {
-        return Ok(pill_host::HostConfig::from_environment_for_editor()?);
+        return Ok(pill_development_host::HostConfig::from_environment_for_editor()?);
     }
-    Ok(pill_host::HostConfig::from_environment()?)
+    Ok(pill_development_host::HostConfig::from_environment()?)
 }
 
 /// The project to run: the one the generated shipping bundle links in.
@@ -82,7 +82,7 @@ fn project() -> miette::Result<pill_host::HostConfig> {
 /// binary never names a project or module itself. The bundle also encodes the
 /// backend - native Rust or managed C#.
 #[cfg(feature = "shipping")]
-fn project() -> miette::Result<pill_runtime::StaticProject> {
+fn project() -> miette::Result<pill_player::StaticProject> {
     Ok(pill_shipping_bundle::static_project())
 }
 
@@ -102,7 +102,7 @@ fn init_telemetry() {
     // Step 1: resolve the optional log directory from the environment.
     let file_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
     // Step 2: install the stack, reporting setup failures to stderr.
-    if let Err(error) = pill_runtime::init_telemetry(file_directory) {
+    if let Err(error) = pill_player::init_telemetry(file_directory) {
         // The one message that cannot go through the logger: it reports that
         // the logger itself did not install.
         eprintln!("[standalone] telemetry setup failed: {error}");

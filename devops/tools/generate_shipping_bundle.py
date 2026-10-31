@@ -123,10 +123,10 @@ EDITOR_UI_CANVAS_ID = "pill-editor-ui"
 # The crates a bundle names: the runtime always (the static-link types), and the
 # C# bridge for a managed project (its external project backend). Never the
 # development host - a shipping build does not compile it at all.
-RUNTIME_CRATE_DIRECTORY = Path("modules") / "hosting" / "pill_runtime"
+RUNTIME_CRATE_DIRECTORY = Path("modules") / "hosting" / "pill_player"
 CSHARP_BRIDGE_CRATE_DIRECTORY = Path("modules") / "csharp" / "pill_csharp_bridge"
 # The renderer, chosen by the project's `renderer:` setting exactly as the host
-# chooses it (`pill_host::config`): absent means the master renderer, `none`
+# chooses it (`pill_development_host::config`): absent means the master renderer, `none`
 # means no renderer. Its data crate, `<renderer>_data`, is linked as the first
 # static module in every shipping build, headless included; a windowed build
 # also links the GPU crate `<renderer>` and hands the host its entry points as
@@ -158,7 +158,7 @@ WEB_APP_DIRECTORY = Path("build") / WEB_APP_CRATE_NAME
 WEB_CRATE_DIRECTORY = Path("modules") / "frontends" / "pill_web"
 WEB_CANVAS_ID = "pill-canvas"
 
-# Managed (C#) project constants, mirroring `pill_host::config` so a generated
+# Managed (C#) project constants, mirroring `pill_development_host::config` so a generated
 # bundle resolves assemblies exactly where `dotnet build` produced them. The
 # host derives the same four values in `csharp_from_manifest`; a shipping build
 # has no project path to read, so the generator states them instead.
@@ -222,7 +222,7 @@ def load_renderer(project_root: Path):
     return None if name == NO_RENDERER else name
 
 
-# The log levels the `logging:` section accepts, as `pill_runtime::LoggingSettings`
+# The log levels the `logging:` section accepts, as `pill_player::LoggingSettings`
 # reads them.
 LOG_LEVELS = {"off", "error", "warn", "info", "debug", "trace"}
 
@@ -523,7 +523,7 @@ def build_cargo_manifest(
         "",
         "[dependencies]",
         # The runtime, so the table can name StaticModule / StaticProjectBackend.
-        "pill_runtime = { path = "
+        "pill_player = { path = "
         f'"{manifest_relative_path(bundle_directory, root / RUNTIME_CRATE_DIRECTORY)}" }}',
     ]
     if managed:
@@ -722,7 +722,7 @@ def build_library_source(
     lines += assets_responsibility
     lines += [
         "",
-        "use pill_runtime::{",
+        "use pill_player::{",
         "    StaticLogging, StaticModule, StaticProject, StaticProjectBackend, StaticRenderer,",
         "};",
         "",

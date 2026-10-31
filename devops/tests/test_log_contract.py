@@ -191,14 +191,14 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
 # Tokens whose text another language prints and whose shape a Rust format string
 # fits by coincidence. `{} reload {} {}` fits any `[subject] reload detail`
 # token, so the managed loader's `[csharp_runtime] reload failed:` line reads as
-# printable by `pill_host`'s analytics line although no Rust literal really
+# printable by `pill_development_host`'s analytics line although no Rust literal really
 # prints it. An entry here is checked for still being declared and for really
 # being such a coincidence; nothing can require its presence, because the fit it
 # describes is indistinguishable from coverage.
 SHAPE_ONLY_FITS: Dict[str, str] = {
     "[csharp_runtime] reload failed:":
         "Printed by the managed loader (pill_csharp_runtime, C#); the "
-        "`[analytics] reload {} {}` line in pill_host fits its shape by "
+        "`[analytics] reload {} {}` line in pill_development_host fits its shape by "
         "coincidence.",
 }
 

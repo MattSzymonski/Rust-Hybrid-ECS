@@ -180,12 +180,12 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # drives the real executable - a frontend build plus a full scripted
     # session - so only the code that session exercises, the shell module and
     # the frontend, selects it; a model-only change keeps its unit tests.
-    if has("modules/editor/pill_editor_core/**", "modules/extensions/pill_editor_shell_egui/**"):
+    if has("modules/frontends/editor/pill_editor_core/**", "modules/extensions/pill_editor_shell_egui/**"):
         selected.append(cargo_check("test egui editor crates",
                                     ("test", "-p", "pill_editor_core",
                                      "-p", "pill_editor_shell_egui_editor", "--offline"),
                                     "egui editor crates changed"))
-    if has("modules/editor/pill_editor/**", "modules/extensions/pill_editor_shell_egui/**"):
+    if has("modules/frontends/editor/pill_editor/**", "modules/extensions/pill_editor_shell_egui/**"):
         selected.append(suite_check("test_editor_egui.py", "editor shell or frontend changed"))
 
     # pill_project_ui: the in-game egui UI. Its own unit tests cover the
@@ -207,8 +207,8 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # editor's own rule below already selects its crate tests when the style
     # module moves.
     if has("modules/ui/pill_ui_theme/**", "modules/ui/pill_ui_kit/**",
-           "modules/editor/pill_editor_core/src/style.rs",
-           "modules/hosting/pill_host/src/config.rs"):
+           "modules/frontends/editor/pill_editor_core/src/style.rs",
+           "modules/hosting/pill_development_host/src/config.rs"):
         selected.append(cargo_check("test theme crates",
                                     ("test", "-p", "pill_ui_theme", "-p", "pill_ui_kit",
                                      "-p", "pill_project_ui", "--offline"),
@@ -238,13 +238,13 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 
     # The host: its unit tests and the reload suites that exercise the
     # development postures end to end.
-    if has("modules/hosting/pill_host/**", "modules/hosting/pill_hot_scan/**"):
-        selected.append(cargo_check("test pill_host",
-                                    ("test", "-p", "pill_host", "--features", "hot_patch", "--offline"),
+    if has("modules/hosting/pill_development_host/**", "modules/hosting/pill_hot_scan/**"):
+        selected.append(cargo_check("test pill_development_host",
+                                    ("test", "-p", "pill_development_host", "--features", "hot_patch", "--offline"),
                                     "host changed"))
         selected.append(suite_check("test_hot_reload_suite.py", "host reload path changed"))
         selected.append(suite_check("test_hot_patch_coverage.py", "host patch path changed"))
-    if has("modules/hosting/pill_runtime/**", "modules/rendering/pill_renderer_api/**"):
+    if has("modules/hosting/pill_player/**", "modules/rendering/pill_renderer_api/**"):
         selected.append(cargo_check("check shipping", ("check", "-p", "pill_standalone",
                                                        "--no-default-features", "--features", "shipping",
                                                        "--offline"), "runtime changed"))
@@ -336,15 +336,15 @@ RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("pill-ui-frame", ("modules/rendering/pill_ui_frame/**",)),
     ("pill-project-ui", ("modules/ui/pill_project_ui/**",)),
     ("theme-pipeline", ("modules/ui/pill_ui_theme/**", "modules/ui/pill_ui_kit/**",
-                        "modules/editor/pill_editor_core/src/style.rs",
-                        "modules/hosting/pill_host/src/config.rs")),
-    ("editor-crates", ("modules/editor/pill_editor_core/**", "modules/extensions/pill_editor_shell_egui/**")),
-    ("editor-frontend", ("modules/editor/pill_editor/**", "modules/extensions/pill_editor_shell_egui/**")),
+                        "modules/frontends/editor/pill_editor_core/src/style.rs",
+                        "modules/hosting/pill_development_host/src/config.rs")),
+    ("editor-crates", ("modules/frontends/editor/pill_editor_core/**", "modules/extensions/pill_editor_shell_egui/**")),
+    ("editor-frontend", ("modules/frontends/editor/pill_editor/**", "modules/extensions/pill_editor_shell_egui/**")),
     ("web-frontend", ("modules/frontends/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**")),
     ("engine-core", ("modules/engine/pill_engine_core/**", "modules/engine/pill_engine/**", "modules/engine/pill_engine_macros/**")),
     ("pill-core", ("modules/engine/pill_core/**",)),
-    ("host", ("modules/hosting/pill_host/**", "modules/hosting/pill_hot_scan/**")),
-    ("runtime", ("modules/hosting/pill_runtime/**", "modules/rendering/pill_renderer_api/**")),
+    ("host", ("modules/hosting/pill_development_host/**", "modules/hosting/pill_hot_scan/**")),
+    ("runtime", ("modules/hosting/pill_player/**", "modules/rendering/pill_renderer_api/**")),
     ("shipping-bundle", ("build/pill_shipping_bundle/**",)),
     ("extensions", ("modules/extensions/**",)),
     ("csharp", ("modules/csharp/**", "modules/pill_csharp_compiler/**", "modules/pill_csharp_runtime/**",

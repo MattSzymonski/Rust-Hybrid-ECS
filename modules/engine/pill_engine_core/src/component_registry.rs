@@ -85,7 +85,7 @@ pub struct ComponentFieldDescriptor {
     /// Type tag from a closed vocabulary — `f32`, `u32`, `bool`, ...
     /// `array:<inner>`, `struct:<path>`, `vec:<element>`, `dynbuf:<element>`,
     /// `string` — that the C# codegen maps to a concrete C# type. See
-    /// `pill_host/src/csharp/codegen.rs`.
+    /// `pill_development_host/src/csharp/codegen.rs`.
     ///
     /// `vec:<element>` and `string` describe Rust-owned heap fields, which
     /// carry no C# field of their own: managed code reaches them through the

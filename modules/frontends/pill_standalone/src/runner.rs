@@ -38,7 +38,7 @@ use pill_core::{error, info};
 use pill_input::gamepads::Gamepads;
 #[cfg(feature = "rendering")]
 use pill_input::winit_events::{translate_device_event, translate_window_event};
-use pill_runtime::{FrameDriver, FrameReport};
+use pill_player::{FrameDriver, FrameReport};
 #[cfg(feature = "rendering")]
 use winit::application::ApplicationHandler;
 #[cfg(feature = "rendering")]
@@ -105,7 +105,7 @@ struct SecondView {
 
 /// The second view's surface id.
 #[cfg(all(feature = "rendering", feature = "dev"))]
-const SECOND_VIEW_SURFACE: pill_runtime::SurfaceId = pill_runtime::SurfaceId(1);
+const SECOND_VIEW_SURFACE: pill_player::SurfaceId = pill_player::SurfaceId(1);
 
 /// Environment variable that runs the picking test.
 #[cfg(all(feature = "rendering", feature = "dev"))]
@@ -126,8 +126,8 @@ struct PickTest {
     /// The center and corner request ids, once asked.
     requests: Option<(u64, u64)>,
     /// The answers that arrived, by request.
-    center: Option<pill_runtime::PickHit>,
-    corner: Option<pill_runtime::PickHit>,
+    center: Option<pill_player::PickHit>,
+    corner: Option<pill_player::PickHit>,
     /// Whether both answers were logged.
     finished: bool,
 }
@@ -145,12 +145,12 @@ impl PickTest {
             if self.frames < PICK_TEST_SETTLE_FRAMES {
                 return;
             }
-            let Some(requests) = world.get_resource_mut::<pill_runtime::PickRequests>() else {
+            let Some(requests) = world.get_resource_mut::<pill_player::PickRequests>() else {
                 error!(target: telemetry_target::ENGINE, "[pick test] the world has no PickRequests");
                 self.finished = true;
                 return;
             };
-            let surface = pill_runtime::SurfaceId::PRIMARY;
+            let surface = pill_player::SurfaceId::PRIMARY;
             let center = requests.request(surface, width / 2, height / 2);
             let corner = requests.request(surface, 1, 1);
             self.requests = Some((center, corner));
@@ -162,7 +162,7 @@ impl PickTest {
             );
             return;
         };
-        if let Some(results) = world.get_resource_mut::<pill_runtime::PickResults>() {
+        if let Some(results) = world.get_resource_mut::<pill_player::PickResults>() {
             for result in results.take() {
                 if result.request.id == center_id {
                     self.center = Some(result.hit);
@@ -177,8 +177,8 @@ impl PickTest {
         self.finished = true;
         info!(target: telemetry_target::ENGINE, "[pick test] center: {center:?}");
         info!(target: telemetry_target::ENGINE, "[pick test] corner: {corner:?}");
-        if let pill_runtime::PickHit::Entity(entity) = center {
-            if let Some(outlines) = world.get_resource_mut::<pill_runtime::SelectionOutlines>() {
+        if let pill_player::PickHit::Entity(entity) = center {
+            if let Some(outlines) = world.get_resource_mut::<pill_player::SelectionOutlines>() {
                 outlines.entities = vec![entity];
                 info!(target: telemetry_target::ENGINE, "[pick test] outlined {entity:?}");
             }
@@ -293,7 +293,7 @@ impl ApplicationHandler for WindowedApplication {
                 if let Some(host) = &mut self.host {
                     FrameDriver::resize_surface(
                         host,
-                        pill_runtime::SurfaceId::PRIMARY,
+                        pill_player::SurfaceId::PRIMARY,
                         size.width,
                         size.height,
                     );
@@ -345,7 +345,7 @@ impl WindowedApplication {
             Arc::clone(&window),
             size.width,
             size.height,
-            pill_runtime::SurfaceOptions::default(),
+            pill_player::SurfaceOptions::default(),
         ) {
             report_failure("second view surface", &error);
             return;
@@ -353,9 +353,9 @@ impl WindowedApplication {
         // The same scene from higher up and further back.
         host.set_surface_camera(
             SECOND_VIEW_SURFACE,
-            Some(pill_runtime::CameraBinding::View {
-                camera: pill_runtime::CameraComponent::default(),
-                transform: pill_runtime::TransformComponent {
+            Some(pill_player::CameraBinding::View {
+                camera: pill_player::CameraComponent::default(),
+                transform: pill_player::TransformComponent {
                     translation: [0.0, 3.0, 16.0],
                     ..Default::default()
                 },

@@ -7,7 +7,7 @@ edition = "2021"
 workspace = true
 
 # Input glue shared by the frontends: turns a platform's events into the
-# engine's `InputEvent`s, and owns the gamepads. The engine and `pill_runtime`
+# engine's `InputEvent`s, and owns the gamepads. The engine and `pill_player`
 # never link a windowing or gamepad library; this crate is where those meet
 # the engine's input vocabulary. Linked only by frontends (`pill_standalone`,
 # `pill_web`, `pill_editor`), each picking the half it needs.

@@ -16,7 +16,7 @@ pill_core = { path = "../../engine/pill_core" }
 pill_engine = { path = "../../engine/pill_engine" }
 # The runtime's `ProjectBackend`, which a C# project is started through in a
 # shipping build. The runtime never depends back on the bridge.
-pill_runtime = { path = "../../hosting/pill_runtime" }
+pill_player = { path = "../../hosting/pill_player" }
 libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,5 +30,5 @@ renderer_data_dependency_graph = { package = "pill_master_renderer_data", path =
 [features]
 # The reloading posture: polling the collectible loader, applying a changed
 # component manifest, re-registering systems, republishing the asset exports.
-# Enabled by `pill_host`'s `hot_reload`; a shipping bundle leaves it off.
+# Enabled by `pill_development_host`'s `hot_reload`; a shipping bundle leaves it off.
 hot_reload = []
