@@ -6,8 +6,9 @@
 //!   stale outputs, and report what was discovered, rebuilt and skipped.
 //! - Stamp an output a rule left untouched with its newest input's time, so an
 //!   unchanged rewrite still counts as fresh.
-//! - Write a project's `res` as one asset pack ([`write_asset_pack`]), which a
-//!   shipping build embeds and the engine's asset store reads.
+//! - Write a project's `res` and the roots its modules ship as one asset pack
+//!   ([`write_asset_pack`]), which a shipping build embeds and the engine's
+//!   asset store reads.
 //! - Move a source asset together with its `.meta` file ([`move_asset`]).
 //!
 //! # Design
@@ -27,6 +28,7 @@
 // it does not depend on `pill_core` (whose platform clock the ban points to).
 #![allow(clippy::disallowed_types)]
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -376,40 +378,69 @@ pub fn walk_files(directory: &Path) -> Result<Vec<PathBuf>, CookError> {
 /// Write every file below `source` into one asset pack at `output`, returning
 /// the packed files for a build script to report to cargo.
 ///
+/// Shorthand for [`write_asset_pack_with_roots`] with no module roots: a
+/// project with no module resources beside it packs only its own `res`.
+///
+/// # Errors
+///
+/// As [`write_asset_pack_with_roots`].
+pub fn write_asset_pack(source: &Path, output: &Path) -> Result<Vec<PathBuf>, CookError> {
+    write_asset_pack_with_roots(source, &[], output)
+}
+
+/// Write every file below `source` and below each of `module_roots` into one
+/// asset pack at `output`, returning the packed files for a build script to
+/// report to cargo.
+///
 /// The format is `pill_engine::asset_store`'s, and the two change together:
 /// `PILLPACK`, a `u32` version and entry count, then per entry a `u32` path
-/// length, the `/`-separated path below `source`, and a `u64` offset and
+/// length, the `/`-separated path below its root, and a `u64` offset and
 /// length from the pack's start, all little-endian; the bytes follow the
-/// index, sorted by path. A missing `source` gives an empty pack.
+/// index, sorted by path. A missing `source` or root contributes no files.
+///
+/// A module's resources are named relative to its own root, so they pack under
+/// that same name: a shipped build mounts the pack and reads them where a
+/// development build finds them beside the module, with no directory to
+/// declare. Names resolve the way `pill_engine::asset_store::read` resolves
+/// them - the project's files first, then each root in order - because the
+/// index is flat and a duplicate would replace the earlier entry silently.
+/// `res/editor/` is the editor's own content and stays out of the project's
+/// part; a module root is read-only content and keeps everything it ships.
 ///
 /// # Errors
 ///
 /// [`CookError::Io`] when a file cannot be read or the pack written, and
 /// [`CookError::Rule`] for a path that is not UTF-8.
-pub fn write_asset_pack(source: &Path, output: &Path) -> Result<Vec<PathBuf>, CookError> {
-    // Name every file by its `/`-separated path below `source`.
+pub fn write_asset_pack_with_roots(
+    source: &Path,
+    module_roots: &[PathBuf],
+    output: &Path,
+) -> Result<Vec<PathBuf>, CookError> {
+    // Name every file by its `/`-separated path below its root.
     let mut files = Vec::new();
     for file in walk_files(source)? {
-        let relative = file.strip_prefix(source).unwrap_or(&file);
-        let parts: Option<Vec<&str>> = relative.iter().map(|part| part.to_str()).collect();
-        let key = parts.ok_or_else(|| CookError::Rule {
-            rule: "asset_pack",
-            input: file.clone(),
-            detail: "the path is not UTF-8".to_owned(),
-        })?;
-        // A dot-file is never an asset: `write_beside` writes a metadata update
-        // as `.<file>.meta.<pid>-<seq>.tmp` and a crash can leave one behind,
-        // and the runtime's own walk of `res` skips dot-files. Packing one
-        // would let it stand in for the asset it was written for.
-        if key.iter().any(|part| part.starts_with('.')) {
+        let Some(key) = pack_key(source, &file)? else {
             continue;
-        }
+        };
         // `res/editor/` is the editor's own content - its theme layers and the
         // fonts they name. A game never loads it, so it never ships.
-        if key.first() == Some(&"editor") {
+        if key.split('/').next() == Some("editor") {
             continue;
         }
-        files.push((key.join("/"), file));
+        files.push((key, file));
+    }
+    // A project file of a module resource's name is the project's, exactly as
+    // the store orders the two, so a key it claimed is not offered to a root.
+    let mut claimed: BTreeSet<String> = files.iter().map(|(key, _)| key.clone()).collect();
+    for root in module_roots {
+        for file in walk_files(root)? {
+            let Some(key) = pack_key(root, &file)? else {
+                continue;
+            };
+            if claimed.insert(key.clone()) {
+                files.push((key, file));
+            }
+        }
     }
     files.sort();
 
@@ -453,6 +484,31 @@ pub fn write_asset_pack(source: &Path, output: &Path) -> Result<Vec<PathBuf>, Co
         })?;
     }
     Ok(files.into_iter().map(|(_, file)| file).collect())
+}
+
+/// The `/`-separated key `file` packs under below `root`, or `None` for a
+/// dot-file.
+///
+/// A dot-file is never an asset: `write_beside` writes a metadata update as
+/// `.<file>.meta.<pid>-<seq>.tmp` and a crash can leave one behind, and the
+/// runtime's own walk of `res` skips dot-files. Packing one would let it stand
+/// in for the asset it was written for.
+///
+/// # Errors
+///
+/// [`CookError::Rule`] when the path is not UTF-8.
+fn pack_key(root: &Path, file: &Path) -> Result<Option<String>, CookError> {
+    let relative = file.strip_prefix(root).unwrap_or(file);
+    let parts: Option<Vec<&str>> = relative.iter().map(|part| part.to_str()).collect();
+    let key = parts.ok_or_else(|| CookError::Rule {
+        rule: "asset_pack",
+        input: file.to_owned(),
+        detail: "the path is not UTF-8".to_owned(),
+    })?;
+    if key.iter().any(|part| part.starts_with('.')) {
+        return Ok(None);
+    }
+    Ok(Some(key.join("/")))
 }
 
 /// Files matching one `directory/*.extension` pattern below `root`.
@@ -635,6 +691,121 @@ mod tests {
             .collect();
         assert_eq!(keys, ["editorial.txt", "ui/accent.theme"]);
         assert!(!pack.windows(12).any(|window| window == b"editor.theme"));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A module ships its resources beside its code, not in the project's
+    /// `res`: a packed build has no module directory left to resolve them
+    /// from, so the pack carries them under their own root's relative names.
+    #[test]
+    fn a_module_roots_files_are_packed_beside_the_projects() {
+        let directory = scratch("module_roots");
+        let source = directory.join("res");
+        fs::create_dir_all(&source).expect("scratch directory");
+        fs::write(source.join("project.txt"), b"project").expect("input");
+        let resources = directory.join("module").join("res");
+        fs::create_dir_all(resources.join("defaults")).expect("scratch directory");
+        fs::write(
+            resources.join("defaults").join("pill.pbr.material"),
+            b"material",
+        )
+        .expect("input");
+        let shaders = directory.join("module").join("shader_sources");
+        fs::create_dir_all(shaders.join("pbr").join("shaders")).expect("scratch directory");
+        fs::write(shaders.join("pbr").join("shaders").join("x.wgsl"), b"stage").expect("input");
+        let output = directory.join("assets.pillpack");
+
+        let packed =
+            write_asset_pack_with_roots(&source, &[resources.clone(), shaders.clone()], &output)
+                .expect("pack");
+        let pack = fs::read(&output).expect("written");
+
+        assert_eq!(packed.len(), 3);
+        assert_eq!(&pack[12..16], &3u32.to_le_bytes());
+        for key in [
+            "project.txt",
+            "defaults/pill.pbr.material",
+            "pbr/shaders/x.wgsl",
+        ] {
+            assert!(
+                pack.windows(key.len())
+                    .any(|window| window == key.as_bytes()),
+                "{key} is indexed"
+            );
+        }
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A project file of a module resource's name is the project's - the store
+    /// tries the project's directory before a module root - and the flat index
+    /// cannot hold both.
+    #[test]
+    fn a_project_file_shadows_a_module_resource_of_the_same_name() {
+        let directory = scratch("shadowed_module_resource");
+        let source = directory.join("res");
+        fs::create_dir_all(source.join("defaults")).expect("scratch directory");
+        fs::write(source.join("defaults").join("x.material"), b"project").expect("input");
+        let resources = directory.join("module").join("res");
+        fs::create_dir_all(resources.join("defaults")).expect("scratch directory");
+        fs::write(resources.join("defaults").join("x.material"), b"module").expect("input");
+        let output = directory.join("assets.pillpack");
+
+        let packed = write_asset_pack_with_roots(&source, &[resources], &output).expect("pack");
+        let pack = fs::read(&output).expect("written");
+
+        assert_eq!(packed, [source.join("defaults").join("x.material")]);
+        assert!(pack.windows(7).any(|window| window == b"project"));
+        assert!(!pack.windows(6).any(|window| window == b"module"));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Two roots shipping one name resolve like their module's registration
+    /// order: the first root keeps it, as the first declared root answers a
+    /// lookup first.
+    #[test]
+    fn the_first_module_root_wins_a_name_two_roots_ship() {
+        let directory = scratch("overlapping_module_roots");
+        let first = directory.join("first");
+        let second = directory.join("second");
+        fs::create_dir_all(&first).expect("scratch directory");
+        fs::create_dir_all(&second).expect("scratch directory");
+        fs::write(first.join("shared.txt"), b"first").expect("input");
+        fs::write(second.join("shared.txt"), b"second").expect("input");
+        let output = directory.join("assets.pillpack");
+
+        let packed = write_asset_pack_with_roots(
+            &directory.join("missing_res"),
+            &[first.clone(), second],
+            &output,
+        )
+        .expect("pack");
+        let pack = fs::read(&output).expect("written");
+
+        assert_eq!(packed, [first.join("shared.txt")]);
+        assert!(pack.windows(5).any(|window| window == b"first"));
+        assert!(!pack.windows(6).any(|window| window == b"second"));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A project with no `res` still ships what its modules declare.
+    #[test]
+    fn a_missing_project_directory_still_packs_module_roots() {
+        let directory = scratch("module_only_pack");
+        let resources = directory.join("module").join("res");
+        fs::create_dir_all(&resources).expect("scratch directory");
+        fs::write(resources.join("defaults.material"), b"material").expect("input");
+        let output = directory.join("assets.pillpack");
+
+        let packed = write_asset_pack_with_roots(
+            &directory.join("res"),
+            std::slice::from_ref(&resources),
+            &output,
+        )
+        .expect("pack");
+        let pack = fs::read(&output).expect("written");
+
+        assert_eq!(packed, [resources.join("defaults.material")]);
+        assert_eq!(&pack[12..16], &1u32.to_le_bytes());
         let _ = fs::remove_dir_all(&directory);
     }
 

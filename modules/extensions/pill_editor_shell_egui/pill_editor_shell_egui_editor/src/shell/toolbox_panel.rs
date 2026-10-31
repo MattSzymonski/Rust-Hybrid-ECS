@@ -86,15 +86,12 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
         let rect = toolbox::item_rect(item, origin);
         let button = ui
             .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                ui.with_layout(
-                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                    |ui| {
-                        ui.add(
-                            kit::ChunkyButton::new(item.label(&state), &theme)
-                                .selected(item.active(&state)),
-                        )
-                    },
-                )
+                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                    ui.add(
+                        kit::ChunkyButton::new(item.label(&state), &theme)
+                            .selected(item.active(&state)),
+                    )
+                })
                 .inner
             })
             .inner;

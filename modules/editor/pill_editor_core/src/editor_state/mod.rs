@@ -278,10 +278,10 @@ pub const FOLDER_KIND: &str = "folder";
 /// What a listing row is: the one kind the browser treats differently, or the
 /// type the host's listing reported for the file.
 ///
-/// The kind used to be a bare `String` compared against `"folder"` at nine
-/// sites, so a misspelt label silently reclassified a row - a directory that
-/// Rename and Delete would queue a move against. The enum is parsed once, where
-/// the snapshot is built, and every branch that cares now asks the type.
+/// The kind is an enum parsed once, where the snapshot is built, and every
+/// branch that cares asks the type: a misspelt label cannot silently
+/// reclassify a row, which would let Rename and Delete queue a move against a
+/// directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AssetKind {
     /// A directory: the tree expands it, the grid opens it, and no toolbar

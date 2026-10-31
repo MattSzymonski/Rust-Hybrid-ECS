@@ -96,7 +96,8 @@ python -m http.server 8000 -d examples/master_renderer_test/build/web
 
 Then open http://localhost:8000/ in Chrome or Edge 113+, Safari 18+ or Firefox  
 141+. Like a release build, this regenerates `build/pill_shipping_bundle`;  
-restore it with `git checkout -- build/pill_shipping_bundle`.
+put the committed stub back with  
+`python devops/tools/generate_shipping_bundle.py --restore-stub`.
 
 ## Extensions
 

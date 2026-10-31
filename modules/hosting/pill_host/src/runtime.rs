@@ -747,10 +747,12 @@ impl RenderingHost {
             ..
         } = self;
         let mut detached = false;
+        let peers = peer_component_names(&host.extensions, None, &host.loaded_project);
         let outcome = renderer_module.reload_if_changed(
             host.runtime.engine_mut(),
             &host.engine_api,
             &host.workspace_root,
+            &peers,
             &mut || {
                 // Dropping the module's backend runs its detach export inside
                 // the image that is about to retire, while it is still mapped.
@@ -2458,6 +2460,31 @@ fn note_managed_swap(host: &mut DevHost) {
     host.bump_editor_revision();
 }
 
+/// Every component type name the live subjects other than `exclude` declare.
+///
+/// Gathered from each slot's current generation rather than from the world's
+/// registration log, which is append-only: a name a module has stopped
+/// registering is still in that log, so it cannot answer whether any subject
+/// declares the name now. The project counts as a subject too - a shared
+/// identity is registered by every artifact linking the crate, and dropping it
+/// on a module reload would delete the project's rows.
+fn peer_component_names(
+    extensions: &[ExtensionSlot],
+    exclude: Option<usize>,
+    project: &LoadedProject,
+) -> Vec<String> {
+    let mut names: Vec<String> = extensions
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != exclude)
+        .flat_map(|(_, slot)| slot.exposed_component_names().iter().cloned())
+        .collect();
+    names.extend(project.component_names().iter().cloned());
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Runs in two parts around a background patch build: with nothing in flight
 /// it prepares one and starts it, and while one is running every step here is
 /// deferred - the frame keeps rendering and the build is collected and
@@ -2536,6 +2563,7 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
         workspace_root,
         queued_reload_generation,
         module_config,
+        loaded_project,
         ..
     } = &mut *host;
     let engine = runtime.engine_mut();
@@ -2544,7 +2572,15 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     // only the sessions whose sources were rebuilt need a new baseline.
     let mut reloaded_modules: Vec<usize> = Vec::new();
     for index in 0..extensions.len() {
-        let outcome = extensions[index].reload_if_changed(engine, engine_api, workspace_root);
+        if !extensions[index].has_pending_reload() {
+            continue;
+        }
+        // The other live subjects' declarations, gathered before the mutable
+        // borrow of the slot being reloaded: a type only one of them names is
+        // not this module's to retire.
+        let peers = peer_component_names(extensions, Some(index), loaded_project);
+        let outcome =
+            extensions[index].reload_if_changed(engine, engine_api, workspace_root, &peers);
         // A runtime crate that reloads leaves its folder's editor crate running
         // an old embedded copy of it, so queue that crate's rebuild. Editor
         // crates load after every runtime crate, so this pass reaches it later.
@@ -2752,10 +2788,11 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
             // A native project has no assembly to build: its reload owns the
             // DLL transaction on this thread.
             ManagedReloadStart::NotManaged => {
-                // The project image about to be replaced unmaps two generations later,
+                // A project image about to be replaced unmaps two generations later,
                 // so every recorded prologue address inside it goes stale the moment
                 // the swap commits - the same clear a module reload performs, gated
                 // the same way.
+                let peers = peer_component_names(&host.extensions, None, &host.loaded_project);
                 let replaced = host.loaded_project.reload(
                     host.runtime.engine_mut(),
                     &host.engine_api,
@@ -2765,6 +2802,7 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
                     // baseline, which cancels the in-flight compilation; the next
                     // frame observes the newer generation and rebuilds.
                     Some((&host.source_edit_generation, source_edits)),
+                    &peers,
                 );
                 // A failed or refused reload keeps the current image, whose patches
                 // are still installed and whose recorded prologues are still their

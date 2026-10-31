@@ -546,9 +546,8 @@ mod tests {
         assert!(rows[1].1);
         assert!(rows[5].1);
         // An entity selected on a snapshot that has not captured it yet has
-        // nothing to carry, so the clipboard rows stay grey: they used to be
-        // enabled here and the copy then carried the asset the selection
-        // replaced - or nothing at all.
+        // nothing to carry, so the clipboard rows stay grey: enabling Copy or
+        // Cut there would carry the asset the selection replaced, or nothing.
         assert_eq!((rows[2].1, rows[3].1), (false, false));
         snapshot.detail = Some(crate::editor_state::EntityDetail {
             entity,

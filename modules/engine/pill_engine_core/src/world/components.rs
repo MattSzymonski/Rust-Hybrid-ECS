@@ -31,8 +31,7 @@ use super::*;
 ///
 /// Every chunk accessor returns this type, so a caller reads `len` as a row
 /// count and `element_size` as the row stride by name instead of by position -
-/// the two are adjacent in the signatures they used to be carried in, and the
-/// descriptor lane returned only one of them.
+/// the two are adjacent in the signatures, and every lane returns both.
 pub struct ColumnChunk<'a> {
     /// The archetype the rows belong to.
     pub archetype: ArchetypeId,

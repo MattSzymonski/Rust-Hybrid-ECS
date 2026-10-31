@@ -49,8 +49,9 @@ pub const TOOLBOX_HANDLE_HEIGHT: f32 = 16.0;
 /// The gap between the handle and the first row, and between two rows.
 pub const TOOLBOX_ITEM_GAP: f32 = 4.0;
 
-/// One row's height.
-pub const TOOLBOX_ITEM_HEIGHT: f32 = 24.0;
+/// One row's height: tall enough for the kit's chunky face (32 points) with a
+/// little air above and below it, since the panel's rows wear that face.
+pub const TOOLBOX_ITEM_HEIGHT: f32 = 44.0;
 /// The inset between a row and the panel's sides, and below the last row.
 pub const TOOLBOX_PADDING: f32 = 6.0;
 

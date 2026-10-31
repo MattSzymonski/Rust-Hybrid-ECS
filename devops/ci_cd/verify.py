@@ -118,6 +118,11 @@ class Step:
     environment: Dict[str, str] = field(default_factory=dict)
     # Printed above the step when its commands had to adapt to this machine.
     note: str = ""
+    # Commands run after the step's own, whether they passed or not: a step
+    # that rewrites tracked files this way leaves the tree as it found it, so a
+    # failing step cannot leave a build artifact behind for a later commit to
+    # pick up.
+    cleanup: List[List[str]] = field(default_factory=list)
 
 
 def unit_test_step(name: str, title: str, lane: List[str]) -> Step:
@@ -172,6 +177,18 @@ STEPS: List[Step] = [
         [["cargo", "clippy", "--workspace", "--features", HOT_PATCH_FEATURES, "--", "-D", "warnings"]],
     ),
     Step(
+        "bundle-stub",
+        "Shipping bundle stub (a generation is never committed)",
+        # The tracked bundle files are build scratch: a generation names one
+        # project and compiles, so a committed one would let the shipping
+        # posture type-check - and ship - against whichever project happened
+        # to be generated last. This runs before any step generates, and
+        # builds nothing.
+        [[PYTHON, "devops/tests/test_shipping_smoke.py", "--stub-only"]],
+        working_directory=REPOSITORY_ROOT,
+        quick=True,
+    ),
+    Step(
         "check-shipping",
         "Clippy (shipping posture)",
         # `-p pill_standalone` alone: with `--workspace`, `pill_editor` would
@@ -190,6 +207,12 @@ STEPS: List[Step] = [
                 "--no-default-features", "--features", "shipping",
                 "--", "-D", "warnings",
             ],
+        ],
+        # The generation is this step's own input, not the tree's state: put
+        # the stub back, even when clippy fails, so no gate run leaves a
+        # generated bundle for a later commit to sweep in.
+        cleanup=[
+            [PYTHON, str(REPOSITORY_ROOT / "devops" / "tools" / "generate_shipping_bundle.py"), "--restore-stub"],
         ],
     ),
     Step(
@@ -335,6 +358,17 @@ STEPS: List[Step] = [
         [[PYTHON, "devops/tests/run_all.py", "--only", "test_ui_theme.py"]],
         working_directory=REPOSITORY_ROOT,
     ),
+    # The example's committed render chain: the windowed host runs
+    # `examples/project_rs`, whose `init` loads `res/pipelines/main.pipeline`
+    # by path, and the renderer's `Pass chain:` line must name the project's
+    # own pass with draws. A host-tier suite, so it runs before the editor
+    # lane's build.
+    Step(
+        "renderer-chains",
+        "Render chain suite (a committed .pipeline runs the frame)",
+        [[PYTHON, "devops/tests/run_all.py", "--only", "test_render_chains.py"]],
+        working_directory=REPOSITORY_ROOT,
+    ),
     # The end-to-end editor lane: the real executable, driven through its
     # scripted channel. Order is the whole point. The host-tier revision suite
     # builds its own narrowed `pill_standalone`, which re-splits the shared
@@ -425,17 +459,36 @@ def run_step(step: Step) -> bool:
     environment = dict(os.environ, **step.environment)
     if step.note:
         print(f"note: {step.note}", flush=True)
-    for command in step.commands:
-        print(f"$ {format_command(command)}", flush=True)
-        # A missing tool (no cargo on PATH) is a failed step, not a crash.
-        try:
-            result = subprocess.run(command, cwd=step.working_directory, env=environment)
-        except FileNotFoundError as error:
-            print(f"ERROR: {error}", file=sys.stderr)
-            return False
-        if result.returncode != 0:
-            return False
-    return True
+    passed = True
+    try:
+        for command in step.commands:
+            print(f"$ {format_command(command)}", flush=True)
+            # A missing tool (no cargo on PATH) is a failed step, not a crash.
+            try:
+                result = subprocess.run(command, cwd=step.working_directory, env=environment)
+            except FileNotFoundError as error:
+                print(f"ERROR: {error}", file=sys.stderr)
+                passed = False
+                break
+            if result.returncode != 0:
+                passed = False
+                break
+        return passed
+    finally:
+        # The cleanup commands undo what the step wrote, so they run even after
+        # a failure: a red step must not leave a generated file in the tree.
+        for command in step.cleanup:
+            print(f"$ {format_command(command)}", flush=True)
+            try:
+                result = subprocess.run(command, cwd=step.working_directory, env=environment)
+                if result.returncode != 0:
+                    print(
+                        f"warning: cleanup command exited {result.returncode}: "
+                        f"{format_command(command)}",
+                        file=sys.stderr,
+                    )
+            except FileNotFoundError as error:
+                print(f"warning: cleanup command not run: {error}", file=sys.stderr)
 
 
 def main() -> int:
@@ -453,6 +506,8 @@ def main() -> int:
             print(f"{step.name}{marker}: {step.title}")
             for command in step.commands:
                 print(f"    {format_command(command)}")
+            for command in step.cleanup:
+                print(f"    (always) {format_command(command)}")
         return 0
 
     # Each result is "PASS", "FAIL" or "SKIP" (not run after a failure).

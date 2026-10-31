@@ -250,6 +250,13 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                                        "--offline"), "runtime changed"))
         selected.append(suite_check("test_shipping_smoke.py", "runtime changed"))
 
+    # The bundle's tracked files are the stub a fresh clone needs: a change
+    # there may be a generation about to be committed, which the stub check
+    # refuses before the posture is even type-checked.
+    if has("build/pill_shipping_bundle/**"):
+        selected.append(verify_check("bundle-stub", "the shipping bundle changed"))
+        selected.append(verify_check("check-shipping", "the shipping bundle changed"))
+
     # Extensions: reload through the host, so the reload suite is the net. The
     # editor shell is an extension only in its build shape - no reload suite
     # starts an editor host - and the editor lane below patches and reloads it.
@@ -263,6 +270,13 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     if has("modules/extensions/pill_master_renderer/**"):
         selected.append(verify_check("renderer-boundaries", "renderer changed"))
         selected.append(suite_check("test_hot_reload_assets.py", "renderer or shader data changed"))
+
+    # The example's committed render chain: the windowed host runs it and the
+    # renderer's chain log must name the project's own pass.
+    if has("examples/project_rs/res/**", "examples/project_rs/src/**"):
+        selected.append(
+            suite_check("test_render_chains.py", "the example chain changed")
+        )
 
     # The C# half of the ABI.
     if has("modules/csharp/**", "modules/pill_csharp_compiler/**", "modules/pill_csharp_runtime/**",
@@ -331,6 +345,7 @@ RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("pill-core", ("modules/engine/pill_core/**",)),
     ("host", ("modules/hosting/pill_host/**", "modules/hosting/pill_hot_scan/**")),
     ("runtime", ("modules/hosting/pill_runtime/**", "modules/rendering/pill_renderer_api/**")),
+    ("shipping-bundle", ("build/pill_shipping_bundle/**",)),
     ("extensions", ("modules/extensions/**",)),
     ("csharp", ("modules/csharp/**", "modules/pill_csharp_compiler/**", "modules/pill_csharp_runtime/**",
                 "**/*.cs", "**/*.csproj")),

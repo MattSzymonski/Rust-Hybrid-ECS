@@ -1,22 +1,23 @@
-//! Decodes the bundled OBJ and PNG into the current renderer asset types.
+//! Loads the bundled model and texture by path and builds the materials.
 //!
 //! # Responsibilities
 //!
-//! - Ensure the bundled mesh, texture, shaders and materials exist in the
-//!   world's asset manager, loading each only when it is absent.
-//! - Hand the three ready materials back as handles, so the scene never
-//!   looks an asset up by name.
+//! - Mount the project's `res` and ask the world for the model and the colour
+//!   texture by path, so their guids come from the `.meta` files beside them.
+//! - Build the shaders and the three materials in code, since a shader is a
+//!   pair of source files rather than one imported asset.
+//! - Hand the handles back, so the scene never looks an asset up by name.
 //!
 //! # Design
 //!
 //! A hot reload of the project calls `init` again on the same world, keeping
-//! the asset manager, so add-or-reuse is what makes the reload idempotent;
-//! a second `add_named` of the same name is an error by design.
+//! the asset manager; `World::load_asset` hands back the existing handle for a
+//! path that is already loaded, which is what makes the reload idempotent.
 
 use pill_engine::{AssetManager, Handle, World};
 use pill_master_renderer_data::{
     AssetLoader, Material, Mesh, Shader, ShaderParameterSlot, ShaderParameterType,
-    ShaderTextureKind, ShaderTextureSlot, Texture, TextureType,
+    ShaderTextureKind, ShaderTextureSlot, Texture,
 };
 use std::path::PathBuf;
 
@@ -29,46 +30,32 @@ pub(crate) struct SceneAssets {
     pub cartoon: Handle<Material>,
 }
 
-/// Ensures the bundled mesh, texture, shaders and materials exist in the
-/// manager, building each one only when its name is absent.
+/// Mounts the bundled `res` and loads the model and texture by path, then
+/// builds the shaders and materials around those handles.
 ///
 /// # Errors
 ///
-/// Returns an error when the manager is missing or when a bundled asset fails
-/// to decode. An asset already present under its name is reused, so a project
-/// reload - which calls `init` again on the same world - keeps its handles.
+/// Returns an error when a bundled asset fails to load or the manager is
+/// missing. Both loads return the handle a previous run already holds, so a
+/// project reload keeps its assets.
 pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error::Error>> {
+    /// The bundled model and colour texture, relative to `res`.
+    const MODEL_PATH: &str = "models/chimpanzini_bananini.obj";
+    const TEXTURE_PATH: &str = "textures/chimpanzini_bananini_color.png";
+
+    // Mounting the directory is what the path-based load resolves through; the
+    // shader builders below read their sources through the same mount.
     AssetLoader::set_root(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("res"));
+
+    // The mesh's `.meta` states `flip_v: false`: the bundled file is the
+    // original demo's, whose UVs are authored top-down against a sampler whose
+    // V starts at the image's top edge.
+    let mesh = world.load_asset::<Mesh>(MODEL_PATH)?;
+    let color = world.load_asset::<Texture>(TEXTURE_PATH)?;
+
     let assets = world
         .get_resource_mut::<AssetManager>()
         .ok_or_else(|| "the engine AssetManager resource is missing".to_owned())?;
-
-    // The OBJ decode lives in the renderer; the loader supplies only the bytes.
-    let mesh = match assets.handle_by_name::<Mesh>("italian_brainrot.mesh") {
-        Some(handle) => handle,
-        None => {
-            let obj = AssetLoader::Path("models/chimpanzini_bananini.obj".into()).load()?;
-            assets.add_named(
-                "italian_brainrot.mesh",
-                // The bundled file is the original demo's: its UVs are
-                // authored top-down, against a sampler whose V starts at the
-                // image's top edge, so the default bottom-up flip would
-                // scatter every island over the texture.
-                Mesh::from_obj_bytes_top_down("chimpanzini_bananini", &obj)?,
-            )?
-        }
-    };
-    let color = match assets.handle_by_name::<Texture>("italian_brainrot.color") {
-        Some(handle) => handle,
-        None => assets.add_named(
-            "italian_brainrot.color",
-            Texture::new(
-                "chimpanzini_bananini",
-                TextureType::Color,
-                AssetLoader::Path("textures/chimpanzini_bananini_color.png".into()),
-            )?,
-        )?,
-    };
     let unlit_shader = match assets.handle_by_name::<Shader>("italian_brainrot.shader.unlit") {
         Some(handle) => handle,
         None => assets.add_named(
@@ -158,15 +145,35 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pill_engine::ImportedAsset;
+    use pill_master_renderer_data::{MeshImportSettings, TextureImportSettings};
+
+    /// Reads a bundled file through the same mount the game uses.
+    fn bundled(path: &str) -> Vec<u8> {
+        AssetLoader::set_root(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("res"));
+        AssetLoader::Path(path.into())
+            .load()
+            .expect("the bundled file is readable")
+    }
 
     #[test]
-    fn bundled_model_decodes_to_indexed_triangles() {
-        AssetLoader::set_root(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("res"));
-        let obj = AssetLoader::Path("models/chimpanzini_bananini.obj".into())
-            .load()
-            .expect("the bundled OBJ is readable");
-        let mesh =
-            Mesh::from_obj_bytes_top_down("chimpanzini_bananini", &obj).expect("a valid OBJ");
+    fn the_mesh_metadata_keeps_the_bundled_uvs_top_down() {
+        let metadata = bundled("models/chimpanzini_bananini.obj.meta");
+        let text = String::from_utf8(metadata).expect("the sidecar is UTF-8");
+        assert!(
+            text.contains("\"flip_v\": false"),
+            "the model is authored top-down, so its sidecar must not flip V: {text}"
+        );
+    }
+
+    #[test]
+    fn the_bundled_model_imports_to_indexed_triangles() {
+        let obj = bundled("models/chimpanzini_bananini.obj");
+        let settings = MeshImportSettings {
+            flip_v: false,
+            calculate_tangents: true,
+        };
+        let mesh = Mesh::import("chimpanzini_bananini", &obj, &settings).expect("a valid OBJ");
 
         assert!(!mesh.vertices.is_empty());
         assert!(!mesh.indices.is_empty());
@@ -174,14 +181,14 @@ mod tests {
     }
 
     #[test]
-    fn bundled_texture_decodes_to_rgba() {
-        AssetLoader::set_root(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("res"));
-        let texture = Texture::new(
+    fn the_bundled_texture_imports_as_a_colour_image() {
+        let png = bundled("textures/chimpanzini_bananini_color.png");
+        let texture = Texture::import(
             "chimpanzini_bananini",
-            TextureType::Color,
-            AssetLoader::Path("textures/chimpanzini_bananini_color.png".into()),
+            &png,
+            &TextureImportSettings::default(),
         )
-        .expect("bundled PNG");
+        .expect("a valid PNG");
         assert!(texture.width > 0 && texture.height > 0);
         assert_eq!(
             texture.rgba.len(),

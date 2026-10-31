@@ -28,15 +28,17 @@
 #   is built at a time), so `pill_standalone`'s manifest never names a specific
 #   project.
 #
-#   A project with a `res` directory also gets a `build.rs` in the bundle: it
-#   packs that directory with `pill_assets::write_asset_pack` at build time, and
-#   the bundle embeds the pack as `StaticProject::asset_pack`, which the
-#   runtime mounts in the engine's asset store. A shipped game then reads its
-#   assets from its own binary, wherever it runs. A browser build cannot: a
-#   wasm module is downloaded whole, so `--web` packs the directory beside the
-#   crate instead and the bundle names it in `StaticProject::asset_pack_url`
-#   for `pill_web` to fetch. `devops/tools/build_web.py` copies the
-#   file next to the page.
+#   A project with a `res` directory, and any linked module with asset roots,
+#   gets a `build.rs` in the bundle: it packs the project's `res` and every
+#   module's `res` and `shader_sources` with
+#   `pill_assets::write_asset_pack_with_roots` at build time, and the bundle
+#   embeds the pack as `StaticProject::asset_pack`, which the runtime mounts in
+#   the engine's asset store. A shipped game then reads its assets - its own
+#   and its modules' - from its own binary, wherever it runs. A browser build
+#   cannot: a wasm module is downloaded whole, so `--web` packs the directories
+#   beside the crate instead and the bundle names the file in
+#   `StaticProject::asset_pack_url` for `pill_web` to fetch.
+#   `devops/tools/build_web.py` copies the file next to the page.
 #
 #   With `--web` it also writes the web app crate, `build/pill_web_app`: a
 #   `cdylib` whose `#[wasm_bindgen(start)]` shim runs the bundle's project
@@ -47,14 +49,24 @@
 #   content-based: unchanged output is not rewritten, so a stable tree shows
 #   no diff.
 #
+#   The generated bundle is one project's build artifact, never the tree's
+#   state: the committed files are a project-agnostic stub that refuses to
+#   compile. `--restore-stub` writes that stub back, which is what the gate
+#   runs after its shipping clippy step, and
+#   `devops/tests/test_shipping_smoke.py` refuses a committed generation.
+#
 # USAGE: python devops/tools/generate_shipping_bundle.py [--feature <name>...]
 #                                                     [project_path]
+#        python devops/tools/generate_shipping_bundle.py --restore-stub
 #          --feature <name>  project feature to enable on the `project`
 #                            dependency in the bundle (repeatable; names the
 #                            project does not declare are ignored). The
 #                            release build forwards its requested features,
 #                            so e.g. `--feature rendering` makes the static
 #                            build link the project's renderer components.
+#          --restore-stub    put the committed stub back instead of generating:
+#                            the manifest, `src/lib.rs`, and removing the
+#                            generated `build.rs`. Takes no project path.
 #          --csharp-aot      emit the NativeAOT backend (`native_aot`) instead
 #                            of the hostfxr one, for a managed project whose
 #                            assembly was published with `dotnet publish
@@ -74,6 +86,7 @@
 #   python devops/tools/generate_shipping_bundle.py --feature rendering examples/project_rs
 #   python devops/tools/generate_shipping_bundle.py examples/project_cs
 #   python devops/tools/generate_shipping_bundle.py --web examples/master_renderer_test
+#   python devops/tools/generate_shipping_bundle.py --restore-stub
 #   set PROJECT_PATH=examples/project_rs
 #   python devops/tools/generate_shipping_bundle.py
 
@@ -126,6 +139,12 @@ RENDERING_FEATURE = "rendering"
 # The project's asset directory, packed into the binary when it exists, and the
 # crate whose build-time writer packs it.
 ASSETS_DIRECTORY_NAME = "res"
+# The directories a module ships beside its code and declares as its asset
+# roots at runtime (`declare_module_root`): its `res` and the shader tree its
+# build script cooks. A packed build has no module directory to declare, so the
+# pack carries both under the same root-relative names.
+SHADER_SOURCES_DIRECTORY_NAME = "shader_sources"
+MODULE_ROOT_DIRECTORY_NAMES = (ASSETS_DIRECTORY_NAME, SHADER_SOURCES_DIRECTORY_NAME)
 ASSETS_CRATE_DIRECTORY = Path("modules") / "assets" / "pill_assets"
 ASSET_PACK_FILE_NAME = "assets.pillpack"
 # Where a web bundle's build script packs it: beside the crate, because a
@@ -325,6 +344,23 @@ def modules_with_renderer_data(renderer, modules: list) -> list:
         return list(modules)
     data = renderer + RENDERER_DATA_SUFFIX
     return [data] + [name for name in modules if name.strip() != data]
+
+
+def module_asset_roots(root: Path, modules: list) -> list:
+    """Returns the asset roots every linked module ships, in load order.
+
+    `modules` is the final static module list (the renderer's data crate first)
+    plus any other linked module. Only directories that exist are roots: a
+    module that ships nothing beside its code contributes none.
+    """
+    roots = []
+    for name in modules:
+        crate_directory = extension_crate_directory(root, name)
+        for directory_name in MODULE_ROOT_DIRECTORY_NAMES:
+            candidate = crate_directory / directory_name
+            if candidate.is_dir():
+                roots.append(candidate)
+    return roots
 
 
 def load_project_name(project_root: Path) -> str:
@@ -541,18 +577,31 @@ def build_cargo_manifest(
     return "\n".join(lines) + "\n"
 
 
-def build_build_script(bundle_directory: Path, assets_directory: Path, web: bool = False) -> str:
-    """Builds the bundle's build.rs, which packs `assets_directory`.
+def build_build_script(
+    bundle_directory: Path,
+    assets_directory: Path,
+    module_roots: list,
+    web: bool = False,
+) -> str:
+    """Builds the bundle's build.rs, which packs the project's `res` and the
+    asset roots every linked module ships.
 
     A native bundle packs into `OUT_DIR`, where `src/lib.rs` embeds it. A web
     bundle cannot embed it - the whole point of the split is that the
     module stays small - so it packs beside the crate instead, where
     `build_web.py` picks the file up and puts it next to the page.
 
-    The directory is named relative to the bundle, like every dependency path,
-    so the generated file does not change with the checkout's location.
+    Every directory is named relative to the bundle, like every dependency
+    path, so the generated file does not change with the checkout's location.
+    A shader tree among the roots is cooked here before packing: the module's
+    own build script cooks the same tree, and cargo does not order two crates'
+    build scripts, so a clean build cannot assume the stage files are on disk.
     """
     relative_assets = manifest_relative_path(bundle_directory, assets_directory)
+    root_lines = [
+        f'        manifest_directory.join("{manifest_relative_path(bundle_directory, root)}"),'
+        for root in module_roots
+    ]
     if web:
         output_lines = [
             "    // Beside the crate, not in OUT_DIR: the browser fetches it, so it",
@@ -563,9 +612,9 @@ def build_build_script(bundle_directory: Path, assets_directory: Path, web: bool
             '        .unwrap_or_else(|error| panic!("cannot create {}: {error}", output.display()));',
         ]
         responsibilities = [
-            "//! - Pack the project's `res` directory beside this crate, where",
-            "//!   `build_web.py` copies it next to the page: a browser build",
-            "//!   fetches its assets instead of embedding them.",
+            "//! - Pack the project's `res` and the modules' roots beside this crate,",
+            "//!   where `build_web.py` copies them next to the page: a browser build",
+            "//!   fetches them instead of embedding them.",
         ]
     else:
         output_lines = [
@@ -573,8 +622,8 @@ def build_build_script(bundle_directory: Path, assets_directory: Path, web: bool
             f'        .join("{ASSET_PACK_FILE_NAME}");',
         ]
         responsibilities = [
-            "//! - Pack the project's `res` directory into `OUT_DIR`, where `src/lib.rs`",
-            "//!   embeds it as the project's asset pack.",
+            "//! - Pack the project's `res` and the modules' roots into `OUT_DIR`,",
+            "//!   where `src/lib.rs` embeds them as the project's asset pack.",
         ]
     lines = [
         "//! Generated shipping bundle build script - do not edit. Regenerated by",
@@ -589,13 +638,34 @@ def build_build_script(bundle_directory: Path, assets_directory: Path, web: bool
         "fn main() {",
         "    let manifest_directory = std::path::PathBuf::from(env!(\"CARGO_MANIFEST_DIR\"));",
         f'    let source = manifest_directory.join("{relative_assets}");',
+        "    // The directories a linked module ships beside its code: its `res` and",
+        "    // its shader tree. A packed build has no module directory left to",
+        "    // declare, so the pack carries them under the same relative names.",
+        "    let module_roots: Vec<std::path::PathBuf> = vec![",
+    ]
+    lines += root_lines
+    lines += [
+        "    ];",
     ]
     lines += output_lines
     lines += [
-        "    let packed = pill_assets::write_asset_pack(&source, &output)",
+        "    // The module's build script cooks the same tree; cargo does not order",
+        "    // two crates' build scripts, so a clean build cooks here before packing",
+        "    // rather than pack a stage file that is not on disk yet.",
+        "    for root in &module_roots {",
+        f'        if root.file_name().is_some_and(|name| name == "{SHADER_SOURCES_DIRECTORY_NAME}") {{',
+        "            pill_assets::cook_shader_tree(root).unwrap_or_else(|error| {",
+        '                panic!("cannot cook shaders at {}: {error}", root.display())',
+        "            });",
+        "        }",
+        "    }",
+        "    let packed = pill_assets::write_asset_pack_with_roots(&source, &module_roots, &output)",
         "        .unwrap_or_else(|error| panic!(\"cannot pack {}: {error}\", source.display()));",
-        "    // The directory itself too, so an added or removed file repacks.",
+        "    // The directories themselves too, so an added or removed file repacks.",
         "    println!(\"cargo:rerun-if-changed={}\", source.display());",
+        "    for root in &module_roots {",
+        "        println!(\"cargo:rerun-if-changed={}\", root.display());",
+        "    }",
         "    for file in packed {",
         "        println!(\"cargo:rerun-if-changed={}\", file.display());",
         "    }",
@@ -866,6 +936,88 @@ def write_if_changed(path: Path, content: str) -> bool:
     return True
 
 
+# The tracked bundle files between generations: a crate with no project, no
+# module table and no dependencies, whose only job is to keep
+# `pill_standalone`'s optional path dependency resolvable on a fresh clone, and
+# to refuse to compile so nothing type-checks against it by accident.
+#
+# A generation is one project's build artifact, so it is never committed:
+# `--restore-stub` puts these bytes back, the gate runs it after its shipping
+# clippy step, and `devops/tests/test_shipping_smoke.py` refuses a committed
+# generation before it builds anything.
+STUB_MANIFEST = """\
+# The committed face of the shipping bundle: a crate with no dependencies that
+# exists so `pill_standalone`'s optional path dependency resolves on a fresh
+# clone. `devops/tools/generate_shipping_bundle.py` rewrites this manifest and
+# `src/lib.rs` for the project being shipped; a real generation is never
+# committed, because it would let a shipping build compile against another
+# project. `build = false` ignores a `build.rs` that an earlier generation left
+# behind (that file is gitignored, so restoring the stub does not remove it).
+[package]
+name = "pill_shipping_bundle"
+version = "0.0.0"
+edition = "2021"
+build = false
+"""
+
+STUB_LIBRARY_SOURCE = """\
+//! The shipping bundle's committed stub: no project, no modules, no renderer.
+//!
+//! # Responsibilities
+//!
+//! - Keep `pill_standalone`'s optional path dependency resolvable on a fresh
+//!   clone, which is the only reason this crate is committed at all.
+//! - Refuse to compile, so nothing can be type-checked or shipped against the
+//!   stub in place of a real bundle.
+//!
+//! # Design
+//!
+//! `devops/tools/generate_shipping_bundle.py` rewrites this file and the
+//! manifest beside it for the project named on its command line: the generated
+//! source exports the module table, the renderer choice and the project
+//! accessor the `shipping` posture of `pill_standalone` calls, and the
+//! manifest gains the dependencies those names need. The stub exports none of
+//! them. `--restore-stub` writes these bytes back once a generation is done.
+//!
+//! A committed generation would be worse than this refusal: it compiles, so
+//! `cargo clippy -p pill_standalone --features shipping` and a shipped binary
+//! would both type-check against whichever project happened to be generated
+//! last. The generator's output is a build artifact of one project, never the
+//! tree's state; `devops/tests/test_shipping_smoke.py` asserts the committed
+//! files are this stub, and the gate runs that assertion before anything
+//! generates a bundle.
+
+compile_error!(
+    "this is the project-agnostic shipping bundle stub; run \\
+     `python devops/tools/generate_shipping_bundle.py <project>` before building the \\
+     shipping posture"
+);
+"""
+
+
+def restore_stub(bundle_directory: Path) -> int:
+    """Restores the tracked bundle files to the project-agnostic stub.
+
+    The build script belongs to a generation (it packs that project's assets),
+    so it goes too; the stub's `build = false` would ignore it, but leaving
+    another project's packer in the tree is exactly the state this undoes.
+    """
+    wrote_manifest = write_if_changed(
+        bundle_directory / PROJECT_MANIFEST_FILE_NAME, STUB_MANIFEST
+    )
+    wrote_source = write_if_changed(
+        bundle_directory / "src" / "lib.rs", STUB_LIBRARY_SOURCE
+    )
+    build_script_path = bundle_directory / BUILD_SCRIPT_FILE_NAME
+    removed_build_script = build_script_path.is_file()
+    if removed_build_script:
+        build_script_path.unlink()
+    changed = wrote_manifest or wrote_source or removed_build_script
+    print(f"shipping bundle stub: {bundle_directory}")
+    print("  restored (changed)" if changed else "  already the stub (unchanged)")
+    return 0
+
+
 def main() -> int:
     """Generates the shipping bundle crate for the given project path.
 
@@ -881,6 +1033,7 @@ def main() -> int:
     aot = False
     web = False
     editor = False
+    restore = False
     editor_frontend = DEFAULT_EDITOR_FRONTEND
     rid = "win-x64"
     positional = []
@@ -895,6 +1048,11 @@ def main() -> int:
             requested_features.append(arguments[index])
         elif argument.startswith("--feature="):
             requested_features.append(argument[len("--feature=") :])
+        elif argument == "--restore-stub":
+            # Undo a generation: the tracked files go back to the stub the gate
+            # and a fresh clone expect. It names no project, so everything else
+            # on the line is refused rather than silently ignored.
+            restore = True
         elif argument == "--csharp-aot":
             aot = True
         elif argument == "--web":
@@ -936,6 +1094,17 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    # Restoring names no project, so it refuses a project path: a line that
+    # looks like a generation must not quietly restore the stub instead.
+    if restore:
+        if positional:
+            print(
+                "error: --restore-stub takes no project path; it puts the "
+                "committed stub back",
+                file=sys.stderr,
+            )
+            return 2
+        return restore_stub(repository_root() / BUNDLE_DIRECTORY)
     project_path = positional[0] if positional else os.environ.get("PROJECT_PATH", "")
     if not project_path:
         print(
@@ -1074,9 +1243,14 @@ def main() -> int:
     # binary-name record land in the shared `<repo>/build/` scratch location,
     # not under the project, so `pill_standalone`'s manifest path stays static.
     bundle_directory = root / BUNDLE_DIRECTORY
-    # A project with a `res` directory ships it packed inside the binary.
+    # A project with a `res` ships it packed inside the binary, and every
+    # linked module's roots ride the same pack: a shipped build has no module
+    # directory to read them from. The pack exists when either side has files.
     assets_directory = project_root / ASSETS_DIRECTORY_NAME
-    packs_assets = assets_directory.is_dir()
+    module_roots = module_asset_roots(
+        root, modules + ([linked_renderer] if linked_renderer else [])
+    )
+    packs_assets = assets_directory.is_dir() or bool(module_roots)
     cargo_manifest = build_cargo_manifest(
         bundle_directory,
         project_root,
@@ -1115,7 +1289,7 @@ def main() -> int:
     if packs_assets:
         wrote_source |= write_if_changed(
             build_script_path,
-            build_build_script(bundle_directory, assets_directory, web=web),
+            build_build_script(bundle_directory, assets_directory, module_roots, web=web),
         )
     elif build_script_path.is_file():
         build_script_path.unlink()

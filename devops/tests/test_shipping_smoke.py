@@ -16,9 +16,8 @@ DESCRIPTION
     Five things are asserted:
 
       0. The committed bundle stub is project-agnostic, so no shipping binary
-         can be type-checked against a stale generation of another project
-. This runs before the bundle is generated, over the
-         committed files.
+         can be type-checked against a stale generation of another project.
+         This runs before the bundle is generated, over the committed files.
       1. The binary contains none of the strings only the reloading path
          produces, which shows that machinery was gated out rather than merely
          unused (the same technique `test_log_contract.py` uses in the other
@@ -39,11 +38,16 @@ DESCRIPTION
     it was left.
 
 USAGE
-  python devops/tests/test_shipping_smoke.py [--timeout-scale N]
+  python devops/tests/test_shipping_smoke.py [--timeout-scale N] [--stub-only]
+
+  --timeout-scale N  multiply every timeout, for slower machines
+  --stub-only        run check 0 alone, without building anything (the gate
+                     uses it, so a committed generation never reaches a build)
 
 EXAMPLE USAGE
   python devops/tests/test_shipping_smoke.py
   python devops/tests/test_shipping_smoke.py --timeout-scale 2
+  python devops/tests/test_shipping_smoke.py --stub-only
 
 --- SCRIPT ---
 """
@@ -142,8 +146,8 @@ def stub_failure() -> str:
 
     A tree that holds a generated bundle (an earlier build's output) is asked
     to restore the stub rather than skipped: the file it leaves behind is
-    exactly the one that must not be committed, and `git checkout --
-    build/pill_shipping_bundle` puts the stub back.
+    exactly the one that must not be committed, and
+    `generate_shipping_bundle.py --restore-stub` puts the stub back.
     """
     bundle = REPOSITORY_ROOT / "build" / "pill_shipping_bundle"
     try:
@@ -152,8 +156,8 @@ def stub_failure() -> str:
         return f"cannot read the bundle stub: {error}"
     if "Generated shipping bundle" in source:
         return (
-            "the tree holds a generated bundle where the stub belongs; restore "
-            "it with `git checkout -- build/pill_shipping_bundle`"
+            "the tree holds a generated bundle where the stub belongs; restore it "
+            "with `python devops/tools/generate_shipping_bundle.py --restore-stub`"
         )
     for relative, required, forbidden in (
         ("Cargo.toml", ('name = "pill_shipping_bundle"',), ("[dependencies]",)),
@@ -452,7 +456,23 @@ def main() -> None:
         default=1.0,
         help="multiply every timeout, for slower machines (default 1.0)",
     )
+    parser.add_argument(
+        "--stub-only",
+        action="store_true",
+        help="only check that the committed bundle stub is project-agnostic",
+    )
     arguments = parser.parse_args()
+
+    # The stub check alone needs no cargo run, so the gate can reject a
+    # committed generation before anything builds against it.
+    if arguments.stub_only:
+        failure = stub_failure()
+        if failure:
+            print(f"  [FAIL] {failure}")
+            sys.exit(1)
+        print("  [OK] the stub refuses to compile and names no project")
+        sys.exit(0)
+
     sys.exit(run_and_observe(arguments.timeout_scale))
 
 

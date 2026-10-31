@@ -858,6 +858,27 @@ public static class AssetManagerExtensions
     }
 
     /// <summary>
+    /// Load the asset at <paramref name="path"/> (below <c>res</c>) and return
+    /// its handle - the managed face of Rust's <c>World::load_asset</c>.
+    /// </summary>
+    /// <param name="assets">The store.</param>
+    /// <param name="path">The source file, below the project's <c>res</c>.</param>
+    /// <remarks>
+    /// The path names a file, not a type: the caller's <typeparamref name="T"/>
+    /// decides how the store files it, and the <c>.meta</c> beside the file
+    /// decides how it is read. The guid that file holds - or the one written
+    /// when it has none - is what lets the handle be saved as a reference, and a
+    /// path that is already loaded hands back the handle it was loaded under
+    /// instead of decoding again. This is <see cref="Import{T}"/> with the two
+    /// things a plain load does not need dropped: the policy is always
+    /// <see cref="MetadataPolicy.CreateIfMissing"/> and the flags are not
+    /// returned.
+    /// </remarks>
+    /// <exception cref="EngineException">The file cannot be read, does not decode as <typeparamref name="T"/>, or names an asset of another type.</exception>
+    public static Handle<T> Load<T>(this ResMut<AssetManager> assets, string path)
+        where T : RustObject, IRustImportedAsset<T> => assets.Import<T>(path).Handle;
+
+    /// <summary>
     /// Import the standalone file at <paramref name="path"/> (below <c>res</c>),
     /// whose header holds its guid, as Rust's <c>AssetManager::import_standalone</c> does.
     /// </summary>

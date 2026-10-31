@@ -173,6 +173,13 @@ pub use rows::ROW_LABEL_GAP;
 pub use rows::ROW_LABEL_WIDTH;
 pub use rows::WIDE_ROW_LABEL_WIDTH;
 
+/// The [`settle`] module: the stage after a shell pass - the requests the
+/// pass deferred and the frame it produced.
+pub mod settle;
+
+pub use settle::settle_pass;
+pub use settle::FrameRequests;
+
 /// The [`tab_entities`] module: the entities tab: the entity rows and their menu.
 pub mod tab_entities;
 
@@ -465,7 +472,7 @@ pub fn run_frame(
         panel_commands,
         panel_entities: panel_feed.entities.as_slice(),
         panel_detail: panel_feed.detail.as_ref(),
-        panel_answer: panel_answer.as_ref(),
+        panel_answer,
         panel_window_requests: &mut panel_window_requests,
         panel_window_ping: panel_window_ping
             .as_ref()
@@ -566,85 +573,31 @@ pub fn run_frame(
     shell_frame.game_rect = viewer.game_rect.take();
     shell_frame.overlay_regions = std::mem::take(&mut viewer.overlay_regions);
     shell_frame.quit_requested = std::mem::take(&mut menubar.quit_requested);
-    // One more pass per popped-out tab: each runs its own context, so its
-    // window has its own widget state, its own input record and its own frame.
-    // These tabs are not in the dock tree, so nothing draws them twice.
-    // A tab that came back to the dock takes its context with it: a context
-    // nothing draws into would be cleared on every generation's first frame
-    // and kept for the life of the session otherwise.
-    popout_contexts.retain(|tab, _| dock.is_popped_out(*tab));
-    shell_frame.popout_frames =
-        run_popout_passes(dock, popout_contexts, popout_inputs, &mut viewer);
-    // A tab menu's pop-out request lands here for the same reason a re-dock
-    // does: the dock is borrowed while it draws.
-    if let Some(tab) = viewer.tab_popout.take() {
-        if dock.pop_out(tab) {
-            pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
-                tab = tab.name().as_str(),
-                "[editor] popout moved"
-            );
-        }
-    }
-    // A tab menu's re-dock runs after the dock finished drawing: changing
-    // the tree mid-draw would edit it under the widget that asked.
-    if let Some(surface) = viewer.tab_redock.take() {
-        pill_editor_shell_egui_editor::shell::apply_tab_redock(dock.state_mut(), surface);
-    }
-    // The Window menu's "New Scene View", docked here for the same reason and
-    // activated through the executable's own path, so the new tab is at the
-    // front of its group the moment it appears.
-    if std::mem::take(&mut menubar.new_scene_view) {
-        let tab = dock.next_scene_view();
-        if dock.contains(tab) {
-            // Already docked: the command brought it back rather than adding.
-            menubar.pending_tab = Some(tab);
-        } else if dock.can_open_scene_view() {
-            dock.state_mut().push_to_focused_leaf(tab);
-            pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
-                tab = tab.name().as_str(),
-                view = tab.scene_view().unwrap_or_default(),
-                "[editor] scene view added"
-            );
-            menubar.pending_tab = Some(tab);
-        } else {
-            pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
-                limit = pill_editor_core::boundary::SCENE_VIEWS_MAX,
-                "[editor] scene view refused: the view limit is reached"
-            );
-        }
-    }
-    // The answer has been read by the pass that needed it; the next one must
-    // not act on it again.
-    if panel_answer.is_some() {
-        windows.answer = None;
-    }
-    // The pinged panel drew this pass, so its window request is spent.
-    if viewer.panel_window_ping_used {
-        *window_ping = None;
-    }
-    // A panel that crossed its budget this frame gets its toast once, named
-    // after the tab so the user can find the panel it belongs to. After the
-    // viewer's last use: the viewer holds the budget mutably while it draws.
-    for entry in &mut panel_budget.entries {
-        if !entry.warned || entry.toasted {
-            continue;
-        }
-        entry.toasted = true;
-        let title = panels.tab_title(entry.slot);
-        let text = format!(
-            "Panel {} is over its frame budget ({:.1} ms)",
-            title,
-            entry.micros / 1000.0
-        );
-        toasts.push_local(NoticeLevel::Warning, text, frame_index);
-    }
-    *frame = shell_frame;
-    // The tile drag's path travels in the frame the executable drains: the
-    // shell cannot start an OLE drag itself.
-    frame.drag_out = drag_out;
+    // What the pass could not act on while the dock and its tabs were borrowed,
+    // in one value: the settle stage applies it in the order the pass requires
+    // (its module docs say why each request sits where it does).
+    let requests = pill_editor_shell_egui_editor::shell::FrameRequests {
+        drag_out: viewer.drag_out.take(),
+        tab_popout: viewer.tab_popout.take(),
+        tab_redock: viewer.tab_redock.take(),
+        new_scene_view: std::mem::take(&mut menubar.new_scene_view),
+        answer_taken: viewer.panel_answer.is_some(),
+        ping_used: viewer.panel_window_ping_used,
+    };
+    *frame = pill_editor_shell_egui_editor::shell::settle_pass(
+        dock,
+        popout_contexts,
+        popout_inputs,
+        menubar,
+        windows,
+        window_ping,
+        toasts,
+        panels,
+        frame_index,
+        &mut viewer,
+        shell_frame,
+        requests,
+    );
     let ui_micros = ui_started.elapsed().as_micros() as u64;
     // The Statistics tab's top row: the pass this frame actually took,
     // recorded before the frame's own logging so the tab and the log line
@@ -868,8 +821,9 @@ pub struct EditorTabViewer<'a> {
     pub panel_entities: &'a [PanelEntityRow],
     /// The selected entity's components, as module panels see them.
     pub panel_detail: Option<&'a PanelEntityDetail>,
-    /// The answer a modal window took, for the pass that follows it.
-    pub panel_answer: Option<&'a pill_editor_core::panels::PanelAnswer>,
+    /// The answer a modal window took, for the pass that follows it; owned so
+    /// the viewer never borrows the panel-window state the settle stage clears.
+    pub panel_answer: Option<pill_editor_core::panels::PanelAnswer>,
     /// The windows the panels asked to open or close this pass, with the slot
     /// that asked: applied after the dock, before the windows draw.
     pub panel_window_requests: &'a mut Vec<(u16, PanelCommand)>,
@@ -1071,7 +1025,7 @@ pub fn draw_module_panel(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, sl
         detail: viewer.panel_detail,
         window: None,
         requested_window,
-        answer: viewer.panel_answer,
+        answer: viewer.panel_answer.as_ref(),
         commands: viewer.panel_commands,
     };
     // Timed here rather than reusing `tab_body`'s clock: the panel budget is a

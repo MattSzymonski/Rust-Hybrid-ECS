@@ -32,8 +32,10 @@ use egui::{
 // Current crate
 use pill_ui_theme::{Rgba, Theme};
 
-/// How far the shadow sits from the face, in points.
-const SHADOW_OFFSET: f32 = 3.0;
+/// How far the shadow sits from the face, in points: the face is the button's
+/// allocated rectangle shrunk by this much, and the shadow is that rectangle
+/// translated back onto the allocation.
+pub const SHADOW_OFFSET: f32 = 3.0;
 
 /// The outline's width, in points.
 const OUTLINE_WIDTH: f32 = 2.0;

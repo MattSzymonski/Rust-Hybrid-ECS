@@ -1,9 +1,9 @@
 // Managed port of examples/italian_brainrot/src/{lib,scene,systems}.rs.
 //
 // Responsibilities
-// - Loads the bundled OBJ mesh, PNG texture and two custom WGSL shaders from
-//   res/, and builds the lit/unlit/cartoon materials from them - the managed
-//   twin of the Rust `asset_loading::load`.
+// - Loads the bundled OBJ mesh and PNG texture by path, and the two custom WGSL
+//   shaders, and builds the lit/unlit/cartoon materials around them - the
+//   managed twin of the Rust `asset_loading::load`.
 // - Creates a camera and the three tagged entities once, the managed twin of
 //   `scene::create`.
 // - Rotates every tagged entity around its local Y axis at 90 degrees per
@@ -117,20 +117,12 @@ public static class SceneStartup
         // styles need.
         rendering.Clear();
 
-        // The OBJ decode lives in the renderer; the loader supplies only the
-        // bytes. The bundled file's UVs are authored top-down, against a
-        // sampler whose V starts at the image's top edge, so the default
-        // bottom-up flip would scatter every island over the texture.
-        byte[] obj = AssetLoader.Path("models/chimpanzini_bananini.obj").Load();
-        Handle<Mesh> mesh = assets.AddNamed(
-            "italian_brainrot.mesh",
-            Mesh.FromObjBytesTopDown("chimpanzini_bananini", obj));
-        Handle<Texture> color = assets.AddNamed(
-            "italian_brainrot.color",
-            Texture.New(
-                "chimpanzini_bananini",
-                TextureType.Color,
-                AssetLoader.Path("textures/chimpanzini_bananini_color.png")));
+        // The model and its colour map are loaded by path. The `.meta` files
+        // beside them hold the guids that make the handles referenceable, and
+        // the model's says `flip_v: false`: the bundled file's UVs are authored
+        // top-down, against a sampler whose V starts at the image's top edge.
+        Handle<Mesh> mesh = assets.Load<Mesh>("models/chimpanzini_bananini.obj");
+        Handle<Texture> color = assets.Load<Texture>("textures/chimpanzini_bananini_color.png");
         Handle<Shader> unlitShader = assets.AddNamed(
             "italian_brainrot.shader.unlit",
             Shader.New("italian_brainrot_unlit")

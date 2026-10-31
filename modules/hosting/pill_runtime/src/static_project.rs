@@ -361,9 +361,9 @@ fn initialize_linked(
     scope: Option<SystemOwner>,
     startup_scene: Option<&'static str>,
 ) -> Result<(), u32> {
-    // The same transaction the generated wrappers run, ordering included: this
-    // used to be a hand-maintained copy that had to stay identical to
-    // `run_artifact_init` by comment.
+    // The same transaction the generated wrappers run, ordering included: both
+    // sides call `run_artifact_init`, so the caller owns the order and no
+    // comment has to keep two copies identical.
     let status = pill_engine::component_registry::run_artifact_entry(
         engine,
         |engine| {

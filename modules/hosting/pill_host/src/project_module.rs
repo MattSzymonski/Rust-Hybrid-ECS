@@ -98,6 +98,13 @@ mod loaded {
             /// Resource ids the last `pill_module_init` registered, so a type the
             /// project stops owning can be dropped while its image is mapped.
             registered_resource_ids: Vec<pill_engine::ResourceId>,
+            /// Every component type name the last `pill_module_init`
+            /// registered, plain and persistable alike.
+            ///
+            /// A module reload treats the project as a peer: a shared type the
+            /// project also declares is not the module's to retire, so the
+            /// drop of a forgotten type asks this set before it runs.
+            registered_component_names: Vec<String>,
         },
         /// A collectible managed runtime hosting the C# project assembly,
         /// with the in-process compiler that rebuilds it.
@@ -127,6 +134,22 @@ mod loaded {
                     registered_schemas, ..
                 } => crate::reload::stale_components(world, registered_schemas),
                 Self::CSharp(_) => Vec::new(),
+            }
+        }
+
+        /// Every component type name the loaded project's generation
+        /// registered, plain and persistable alike.
+        ///
+        /// Read by a module reload to decide whether a type that module
+        /// forgot is still declared by the project; empty for the C# backend,
+        /// whose components are its own descriptor-defined set.
+        pub(crate) fn component_names(&self) -> &[String] {
+            match self {
+                Self::Native {
+                    registered_component_names,
+                    ..
+                } => registered_component_names,
+                Self::CSharp(_) => &[],
             }
         }
 
@@ -184,6 +207,7 @@ mod loaded {
                         registered_type_names: init.registered_type_names,
                         registered_schemas: init.registered_schemas,
                         registered_resource_ids: init.registered_resource_ids,
+                        registered_component_names: init.component_names,
                     })
                 }
                 // The managed runtime performs assembly discovery, component
@@ -217,6 +241,7 @@ mod loaded {
             workspace_root: &Path,
             config: &ProjectModuleConfig,
             cancel_flag: Option<(&AtomicU64, u64)>,
+            peer_component_names: &[String],
         ) -> bool {
             match self {
                 // Native reload owns schema migration and DLL lifetime handling, so
@@ -227,12 +252,15 @@ mod loaded {
                     registered_type_names,
                     registered_schemas,
                     registered_resource_ids,
+                    registered_component_names,
                 } => reload_native(
                     current,
                     old_libraries,
                     registered_type_names,
                     registered_schemas,
                     registered_resource_ids,
+                    registered_component_names,
+                    peer_component_names,
                     engine,
                     engine_api,
                     workspace_root,
@@ -524,11 +552,12 @@ mod loaded {
 
     /// Reload one native generation and migrate components whose persisted schema
     /// changed across the module boundary.
-    // Ten parameters, and they are ten distinct collaborators rather than
-    // fields of an implicit struct: the five pieces of generation state this
-    // mutates, the engine and its API table, where to build, what to build, and the
-    // cancellation signal. Grouping them would name a type that exists only to
-    // satisfy the lint, and would hide which of them this function mutates.
+    // Twelve parameters, and they are twelve distinct collaborators rather than
+    // fields of an implicit struct: the six pieces of generation state this
+    // mutates, the engine and its API table, where to build, what to build, the
+    // cancellation signal, and the set of names the live modules declare.
+    // Grouping them would name a type that exists only to satisfy the lint, and
+    // would hide which of them this function mutates.
     #[allow(clippy::too_many_arguments)]
     fn reload_native(
         current: &mut NativeLibrary,
@@ -536,6 +565,8 @@ mod loaded {
         registered_type_names: &mut Vec<String>,
         registered_schemas: &mut Vec<(String, u64)>,
         registered_resource_ids: &mut Vec<pill_engine::ResourceId>,
+        registered_component_names: &mut Vec<String>,
+        peer_component_names: &[String],
         engine: &mut Engine,
         engine_api: &EngineApi,
         workspace_root: &Path,
@@ -556,9 +587,10 @@ mod loaded {
             registered_type_names,
             registered_schemas,
             registered_resource_ids,
+            peer_component_names,
             graveyard_policy: crate::reload::GraveyardPolicy::Bounded,
         };
-        crate::reload::build_load_and_commit(
+        let Some(commit) = crate::reload::build_load_and_commit(
             engine,
             engine_api,
             workspace_root,
@@ -567,7 +599,12 @@ mod loaded {
             crate::reload::LoadValidation::None,
             &mut || {},
             transaction,
-        )
-        .is_some()
+        ) else {
+            return false;
+        };
+        // The swapped generation's declarations replace the previous set, so a
+        // later module reload asks about the project as it stands now.
+        *registered_component_names = commit.exposed_component_names;
+        true
     }
 }
