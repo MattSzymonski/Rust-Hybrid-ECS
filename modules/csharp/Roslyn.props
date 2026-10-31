@@ -15,10 +15,12 @@
     so there is one, here.
 
   USAGE: <Import Project="path/to/Roslyn.props" /> then reference
-         $(PillRoslynVersion) in the PackageReference.
+         $(PillRoslynVersion) in the PackageReference. The runtime's three
+         components do not import it directly: their shared posture,
+         `pill_csharp_runtime/RoslynComponent.props`, imports it for them.
 
   EXAMPLE USAGE:
-    <Import Project="../../Roslyn.props" />
+    <Import Project="../Roslyn.props" />
     <ItemGroup>
       <PackageReference Include="Microsoft.CodeAnalysis.CSharp"
                         Version="$(PillRoslynVersion)" />

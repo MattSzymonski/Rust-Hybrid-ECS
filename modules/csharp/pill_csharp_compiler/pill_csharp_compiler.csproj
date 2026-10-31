@@ -2,7 +2,7 @@
 
   <!-- The Roslyn version, shared with the three components this process loads
        into its own load context. -->
-  <Import Project="../../Roslyn.props" />
+  <Import Project="../Roslyn.props" />
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>

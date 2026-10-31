@@ -2,7 +2,7 @@
 
   <!-- The one Roslyn version every project in this workspace shares, read by
        the generator test's in-memory compilation. -->
-  <Import Project="../../../Roslyn.props" />
+  <Import Project="../../Roslyn.props" />
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
