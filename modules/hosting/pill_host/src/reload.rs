@@ -199,6 +199,17 @@ pub(crate) struct ReloadTransaction<'a> {
     /// the subject has stopped owning can be dropped while the image holding
     /// its drop function is still mapped.
     pub(crate) registered_resource_ids: &'a mut Vec<pill_engine::ResourceId>,
+    /// Every component type name - plain or persistable - the OTHER live
+    /// subjects declare, gathered by the caller from their current
+    /// generations.
+    ///
+    /// A type another artifact still declares is not this subject's to
+    /// retire: a shared identity is registered by every artifact that links
+    /// the crate, so dropping its columns here would erase the peer's rows
+    /// along with the peer's registration. The world's registration log is
+    /// append-only and cannot answer "who declares this now", which is why
+    /// the set is passed in rather than queried.
+    pub(crate) peer_component_names: &'a [String],
     /// Whether retired generations may be unmapped.
     pub(crate) graveyard_policy: GraveyardPolicy,
 }
@@ -903,12 +914,13 @@ impl ReloadTransaction<'_> {
         let newly_registered = engine
             .world()
             .persist_type_names_registered_since(registration_sequence);
-        // The world's *current* registrations, not this generation's: a shared
-        // component another loaded artifact registered is not this subject's to
-        // retire, and it is still registered. Asking only what this reload
-        // declared made every peer's shared type look orphaned, so dropping its
-        // columns erased the peer's data and registration along with them.
-        let all_registered = engine.world().registered_component_names_since(0);
+        // Every component name this generation registered, plain or
+        // persistable. Its window starts at the sequence taken before init, so
+        // unlike a `since(0)` query it counts this generation's declarations
+        // rather than every artifact's history.
+        let registered_now = engine
+            .world()
+            .registered_component_names_since(component_registration_sequence);
         let forgotten_type_names: Vec<String> = self
             .registered_type_names
             .iter()
@@ -923,16 +935,17 @@ impl ReloadTransaction<'_> {
                 "{}", self.kind.forgotten_types_warning()
             );
 
-            // Drop the orphaned columns only for types the new generation does
-            // not register at all (not even as a plain component). A type merely
-            // downgraded from persistable to plain keeps live data, so its
-            // columns must survive. This runs while the generation that last
-            // registered the type is still mapped, so the drop is safe.
-            let truly_forgotten: Vec<String> = forgotten_type_names
-                .iter()
-                .filter(|name| !all_registered.iter().any(|current| current == *name))
-                .cloned()
-                .collect();
+            // Drop the orphaned columns only for types nothing declares any
+            // more: not this generation (a type downgraded from persistable
+            // to a plain component keeps live data) and not another artifact
+            // (a shared type a peer registers is the peer's to keep). This
+            // runs while the generation that last registered the type is still
+            // mapped, so the drop is safe.
+            let truly_forgotten = unclaimed_type_names(
+                &forgotten_type_names,
+                &registered_now,
+                self.peer_component_names,
+            );
             if !truly_forgotten.is_empty() {
                 let dropped_entities = engine
                     .world_mut()
@@ -1125,9 +1138,30 @@ impl ReloadTransaction<'_> {
         );
 
         Some(ReloadCommit {
-            exposed_component_names: all_registered,
+            exposed_component_names: registered_now,
         })
     }
+}
+
+/// The names among `forgotten` that nothing declares any more.
+///
+/// `forgotten` holds persistable names the previous generation registered and
+/// the new one did not re-register. A name in `registered_now` was
+/// re-registered as a plain component, so its data is live and its columns must
+/// survive. A name in `peers` belongs to another artifact that still declares
+/// it - usually a shared identity the project registers as well as a module -
+/// and dropping it here would erase that peer's rows.
+fn unclaimed_type_names(
+    forgotten: &[String],
+    registered_now: &[String],
+    peers: &[String],
+) -> Vec<String> {
+    forgotten
+        .iter()
+        .filter(|name| !registered_now.iter().any(|current| current == *name))
+        .filter(|name| !peers.iter().any(|peer| peer == *name))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -1136,7 +1170,7 @@ mod tests {
     use pill_engine::World;
 
     // Current crate
-    use super::{registered_schemas, stale_components};
+    use super::{registered_schemas, stale_components, unclaimed_type_names};
 
     /// A subject is stale exactly while the hash it registered differs from
     /// the one recorded now, and a name the world no longer records is not
@@ -1159,5 +1193,26 @@ mod tests {
 
         let forgotten = vec![("no::such::Component".to_owned(), 7)];
         assert!(stale_components(&world, &forgotten).is_empty());
+    }
+
+    /// A forgotten name is claimed when the new generation registered it as
+    /// anything, and when any other subject still declares it; only a name
+    /// nothing claims is returned.
+    #[test]
+    fn a_forgotten_type_is_unclaimed_only_when_nothing_declares_it() {
+        let forgotten = vec![
+            "dropped::Nowhere".to_owned(),
+            "downgraded::Plain".to_owned(),
+            "shared::WithPeer".to_owned(),
+        ];
+        let registered_now = vec!["downgraded::Plain".to_owned()];
+        let peers = vec!["shared::WithPeer".to_owned()];
+
+        assert_eq!(
+            unclaimed_type_names(&forgotten, &registered_now, &peers),
+            vec!["dropped::Nowhere".to_owned()]
+        );
+        assert!(unclaimed_type_names(&forgotten, &[], &[]).len() == 3);
+        assert!(unclaimed_type_names(&[], &registered_now, &peers).is_empty());
     }
 }

@@ -2411,9 +2411,8 @@ mod tests {
 
     /// The tag table, both codecs and the diagnostic names all agree.
     ///
-    /// They used to be hand-copied matches, so a scalar could be sized but not
-    /// decoded - or decoded but reported by a name nothing else knew. A tag is
-    /// a vocabulary entry only if every one of them accepts it.
+    /// A tag is a vocabulary entry only if every one of them accepts it, so a
+    /// scalar cannot be sized but not decoded, or decoded but named by nothing.
     #[test]
     fn every_scalar_tag_sizes_encodes_decodes_and_names_itself() {
         let values = [

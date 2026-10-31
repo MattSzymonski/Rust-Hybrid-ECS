@@ -7,11 +7,14 @@
 //!   does not declare one.
 //! - Resolve the compiler to an explicit path, from `PILL_SLANGC` or `PATH`,
 //!   and refuse one that resolves inside the working directory.
+//! - Kill a compiler that outlives the cook's bound, so one hung `slangc`
+//!   cannot block every crate built behind it.
 //! - Surface `slangc`'s own diagnostics when a compile fails.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::{walk_files, CookError, Rule};
 
@@ -24,6 +27,15 @@ const SLANGC_EXECUTABLE: &str = if cfg!(windows) {
 } else {
     "slangc"
 };
+
+/// How long one `slangc` run may take before the cook kills it.
+///
+/// A shader tree is cooked from the build script of every crate that names it,
+/// so a compiler that never exits would stall the whole build, not one file.
+const SLANGC_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often a running `slangc` is checked for having finished.
+const SLANGC_POLL: Duration = Duration::from_millis(25);
 
 /// Compiles `shaders/*.hlsl` to WGSL beside the source through `slangc`.
 ///
@@ -129,18 +141,14 @@ impl Rule for HlslToWgsl {
         }
         // `-O0 -g` keep the intermediate variable names, so the emitted WGSL
         // still reads like the HLSL it came from.
-        let cooked = slangc.args(["-O0", "-g", "-o"]).arg(output).output();
+        slangc.args(["-O0", "-g", "-o"]).arg(output);
+        let cooked =
+            run_bounded(slangc, &compiler, SLANGC_TIMEOUT).map_err(|detail| CookError::Rule {
+                rule: self.name(),
+                input: input.to_owned(),
+                detail,
+            })?;
 
-        let cooked = match cooked {
-            Ok(cooked) => cooked,
-            Err(error) => {
-                return Err(CookError::Rule {
-                    rule: self.name(),
-                    input: input.to_owned(),
-                    detail: format!("{}: {error}", compiler.display()),
-                })
-            }
-        };
         if !cooked.status.success() {
             return Err(CookError::Rule {
                 rule: self.name(),
@@ -155,6 +163,40 @@ impl Rule for HlslToWgsl {
         }
         Ok(())
     }
+}
+
+/// Run `command` to completion, killing it once `timeout` has passed.
+///
+/// Output is captured the way [`Command::output`] captures it, so a failed
+/// compile still reports the compiler's own diagnostics. A run that outlives
+/// the bound is killed and reported; a compiler that ignores the kill is still
+/// waited for, so no child outlives the cook.
+fn run_bounded(mut command: Command, compiler: &Path, timeout: Duration) -> Result<Output, String> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("{}: {error}", compiler.display()))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(error) => return Err(format!("{}: {error}", compiler.display())),
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "{} did not finish within {timeout:?} and was killed",
+                compiler.display()
+            ));
+        }
+        std::thread::sleep(SLANGC_POLL);
+    }
+    child
+        .wait_with_output()
+        .map_err(|error| format!("{}: {error}", compiler.display()))
 }
 
 /// The `slangc` a cook may run.
@@ -419,5 +461,34 @@ mod tests {
 
         let detail = refused.expect_err("an empty PATH has no compiler");
         assert!(detail.contains(SLANGC_ENV), "{detail}");
+    }
+
+    /// A compiler that never exits is killed at the bound: one wedged process
+    /// must not hold every crate built after it.
+    #[test]
+    fn a_compiler_that_never_finishes_is_killed() {
+        let detail = run_bounded(
+            slow_command(),
+            Path::new(SLANGC_EXECUTABLE),
+            Duration::from_millis(100),
+        )
+        .expect_err("the command outlives the bound");
+
+        assert!(detail.contains("did not finish within"), "{detail}");
+        assert!(detail.contains(SLANGC_EXECUTABLE), "{detail}");
+    }
+
+    /// A command that stays alive far longer than any test's bound, without
+    /// writing enough to fill a pipe.
+    fn slow_command() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            command
+        }
     }
 }

@@ -30,3 +30,4 @@ pub use style::{
     build_style, font_definitions, install, FontSignature, ThemeFonts, DISPLAY_FAMILY,
 };
 pub use widgets::ChunkyButton;
+pub use widgets::SHADOW_OFFSET;

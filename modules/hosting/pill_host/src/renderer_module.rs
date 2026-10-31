@@ -182,12 +182,15 @@ impl RendererModule {
     ///
     /// `before_commit` is the reload's hook (see
     /// [`ExtensionSlot::reload_if_changed_with`]); a first load has no backend
-    /// to detach and does not run it.
+    /// to detach and does not run it. `peer_component_names` is what the other
+    /// live subjects declare, so a type only this module dropped is dropped and
+    /// a shared one is kept.
     pub(crate) fn reload_if_changed(
         &mut self,
         engine: &mut Engine,
         engine_api: &EngineApi,
         workspace_root: &Path,
+        peer_component_names: &[String],
         before_commit: &mut dyn FnMut(),
     ) -> RendererModuleChange {
         if let Some(slot) = &mut self.slot {
@@ -195,6 +198,7 @@ impl RendererModule {
                 engine,
                 engine_api,
                 workspace_root,
+                peer_component_names,
                 before_commit,
             ));
         }

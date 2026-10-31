@@ -284,6 +284,17 @@ mod slot {
             self.graveyard_policy = crate::reload::GraveyardPolicy::KeepAll;
         }
 
+        /// Whether a watcher signal is waiting to be turned into a reload.
+        ///
+        /// The caller asks before gathering the peer declaration set, so the
+        /// per-frame reload pass allocates nothing for modules with no
+        /// pending change.
+        pub(crate) fn has_pending_reload(&self) -> bool {
+            self.queued_cascade_reload
+                || self.source_edit_generation.load(Ordering::Acquire)
+                    != self.last_processed_source_edit
+        }
+
         /// Reload this module when its watcher signalled a source change.
         ///
         /// Returns [`ReloadOutcome::Reloaded`] when a new generation replaced
@@ -299,8 +310,15 @@ mod slot {
             engine: &mut Engine,
             engine_api: &EngineApi,
             workspace_root: &Path,
+            peer_component_names: &[String],
         ) -> ReloadOutcome {
-            self.reload_if_changed_with(engine, engine_api, workspace_root, &mut || {})
+            self.reload_if_changed_with(
+                engine,
+                engine_api,
+                workspace_root,
+                peer_component_names,
+                &mut || {},
+            )
         }
 
         /// [`Self::reload_if_changed`], running `before_commit` once the
@@ -311,11 +329,16 @@ mod slot {
         /// For a module whose caller holds state built on the current image
         /// that has to be released while that image is still mapped: the
         /// renderer module's GPU backend.
+        ///
+        /// `peer_component_names` is every component name the other live
+        /// subjects declare; a type only they name is not this module's to
+        /// drop when its new generation forgets it.
         pub(crate) fn reload_if_changed_with(
             &mut self,
             engine: &mut Engine,
             engine_api: &EngineApi,
             workspace_root: &Path,
+            peer_component_names: &[String],
             before_commit: &mut dyn FnMut(),
         ) -> ReloadOutcome {
             let generation = self.source_edit_generation.load(Ordering::Acquire);
@@ -335,6 +358,7 @@ mod slot {
                 engine_api,
                 workspace_root,
                 generation,
+                peer_component_names,
                 before_commit,
             );
 
@@ -516,6 +540,7 @@ mod slot {
             engine_api: &EngineApi,
             workspace_root: &Path,
             generation: u64,
+            peer_component_names: &[String],
             before_commit: &mut dyn FnMut(),
         ) -> ReloadOutcome {
             // Steps 1 to 3 are shared with the project path and live in
@@ -532,6 +557,7 @@ mod slot {
                 registered_type_names: &mut self.registered_type_names,
                 registered_schemas: &mut self.registered_schemas,
                 registered_resource_ids: &mut self.registered_resource_ids,
+                peer_component_names,
                 graveyard_policy: self.graveyard_policy,
             };
             let Some(commit) = crate::reload::build_load_and_commit(

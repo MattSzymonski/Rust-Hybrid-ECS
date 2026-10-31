@@ -2938,14 +2938,6 @@ dependencies = [
 [[package]]
 name = "pill_shipping_bundle"
 version = "0.0.0"
-dependencies = [
- "pill_assets",
- "pill_audio",
- "pill_master_renderer_data",
- "pill_runtime",
- "pill_spline",
- "project",
-]
 
 [[package]]
 name = "pill_spline"
@@ -3212,19 +3204,6 @@ name = "profiling"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
-
-[[package]]
-name = "project"
-version = "0.1.0"
-dependencies = [
- "pill_audio",
- "pill_core",
- "pill_engine",
- "pill_master_renderer_data",
- "pill_spline",
- "serde",
- "tracing",
-]
 
 [[package]]
 name = "pxfm"

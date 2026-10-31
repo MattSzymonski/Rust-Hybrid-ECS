@@ -2945,10 +2945,9 @@ mod decorator_vocabulary_tests {
     /// Every decorator the vocabulary lists is one the parser accepts, and the
     /// refusal text names every listed one.
     ///
-    /// The parser and its refusal used to be two hand-copied lists, and the
-    /// refusal had already fallen behind (`color` and `vector` were accepted but
-    /// never offered). This is the check that keeps the next decorator from
-    /// repeating it.
+    /// The vocabulary is the single source for both lists, so a decorator
+    /// cannot be accepted without being offered, and a listed one cannot be
+    /// refused.
     #[test]
     fn the_refusal_text_lists_exactly_the_accepted_decorators() {
         for (key, usage) in FIELD_DECORATOR_USAGE {

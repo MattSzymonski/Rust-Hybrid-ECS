@@ -3,7 +3,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Import the helmet's mesh and maps through their metadata files.
+//! - Ask the world for the helmet's mesh and its four maps by path, so each
+//!   file's guid and how to read it come from the metadata file beside it.
 //! - Load the helmet's material from its own file, after the maps it names.
 //! - Hand the scene the handles it draws with ([`SceneAssets`]).
 //!
@@ -15,18 +16,17 @@
 //! registers. This file supplies only the geometry, the maps that feed that
 //! chain, and the material that binds them to the chain's shader.
 //!
-//! The mesh and the maps are imported through their metadata files
-//! (`res/models/helmet.obj.meta`, `res/textures/*.jpg.meta`): each file holds
-//! the asset's guid and how to read it, and is written on the first run when it
-//! is missing. The material is a file of its own (`res/materials/helmet.material`)
-//! that names the chain's shader and the four maps by guid. Every import is
-//! idempotent, so a reload that runs this again gets the assets already loaded
-//! rather than a second copy.
+//! The mesh and the maps are loaded by path (`World::load_asset`): the file's
+//! extension picks the importer, and the metadata file beside it
+//! (`res/models/helmet.obj.meta`, `res/textures/*.jpg.meta`) holds the asset's
+//! guid and how to read it - written on the first run when it is missing. The
+//! material is a file of its own (`res/materials/helmet.material`) that names
+//! the chain's shader and the four maps by guid, so the maps have to be loaded
+//! before it is. Every import is idempotent, so a reload that runs this again
+//! gets the assets already loaded rather than a second copy.
 
-use pill_engine::{AssetImport, AssetImportError, AssetManager, Handle, MetadataPolicy, World};
-use pill_master_renderer_data::{
-    config::pbr_pipeline, AssetLoader, Material, Mesh, Texture, TextureImportSettings, TextureType,
-};
+use pill_engine::{AssetManager, Handle, World};
+use pill_master_renderer_data::{config::pbr_pipeline, AssetLoader, Material, Mesh, Texture};
 use std::path::{Path, PathBuf};
 
 /// Source files, relative to `res`. Each path is also the asset's name in the
@@ -74,43 +74,26 @@ pub(crate) fn res_directory() -> PathBuf {
 /// install.
 pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error::Error>> {
     AssetLoader::set_root(res_directory());
-    let assets = world
-        .get_resource_mut::<AssetManager>()
-        .ok_or_else(|| "the engine AssetManager resource is missing".to_owned())?;
 
-    let mesh = assets
-        .import(AssetImport::<Mesh>::new(
-            HELMET_MESH,
-            MetadataPolicy::CreateIfMissing,
-        ))?
-        .handle;
+    let mesh = world.load_asset::<Mesh>(HELMET_MESH)?;
 
-    // The texture types here only seed a missing metadata file; once it
-    // exists, its `texture_type` is what the map is read as.
-    import_texture(assets, BASE_COLOR, TextureType::Color)?;
-    import_texture(assets, NORMAL, TextureType::Normal)?;
-    import_texture(assets, METALLIC_ROUGHNESS, TextureType::Color)?;
-    import_texture(assets, EMISSIVE, TextureType::Color)?;
+    // The maps are loaded for their guids alone: the material names them, and
+    // the renderer reads them through it. Their metadata files say which one is
+    // the normal map, so nothing here has to.
+    for map in [BASE_COLOR, NORMAL, METALLIC_ROUGHNESS, EMISSIVE] {
+        world.load_asset::<Texture>(map)?;
+    }
 
     // The material names the chain's shader and the four maps by guid, so
     // both have to be loaded before it is: `install` is idempotent and returns
     // the chain the module already put in the store.
+    let assets = world
+        .get_resource_mut::<AssetManager>()
+        .ok_or_else(|| "the engine AssetManager resource is missing".to_owned())?;
     pbr_pipeline::install(assets)?;
     let material = assets
         .import_standalone::<Material>(Path::new(HELMET_MATERIAL))?
         .handle;
 
     Ok(SceneAssets { mesh, material })
-}
-
-/// Imports the map at `path`, read as `texture_type` when it has no metadata
-/// file yet.
-fn import_texture(
-    assets: &mut AssetManager,
-    path: &str,
-    texture_type: TextureType,
-) -> Result<Handle<Texture>, AssetImportError> {
-    let request = AssetImport::<Texture>::new(path, MetadataPolicy::CreateIfMissing)
-        .with_initial_settings(TextureImportSettings { texture_type });
-    Ok(assets.import(request)?.handle)
 }

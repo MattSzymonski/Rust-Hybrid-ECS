@@ -11,13 +11,14 @@
 # crate that shares this workspace's `Cargo.lock`. Shared dynamic linkage
 # requires the exact same dependency resolution on both sides, because a Rust
 # dylib exports symbols mangled with a metadata hash derived from the resolved
-# graph. Project modules live in their own workspaces with their own lockfiles,
-# so they are built with static linkage instead; see `ProjectModuleConfig`.
+# graph. Projects live outside `modules/`, but the host builds each one through
+# a generated `projects_generated/host_project_*` member of this workspace, so
+# a project shares this lockfile and links the engine dylibs like an extension.
 #
 # Release builds link everything into one binary, need no shared library, and
 # cannot combine `-C prefer-dynamic` with the release profile's `lto = "fat"` -
-# rustc refuses that pairing outright on Windows. Use the `release-build` alias
-# below, which clears the flag, rather than remembering to do it by hand.
+# rustc refuses that pairing outright on Windows. Build them through
+# `devops/ci_cd/build_release.py` (or `.sh`), which clears the flag; see below.
 [build]
 rustflags = ["-C", "prefer-dynamic"]
 

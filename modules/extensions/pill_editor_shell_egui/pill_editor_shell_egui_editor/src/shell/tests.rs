@@ -1,4 +1,4 @@
-//! The shell's unit tests.
+﻿//! The shell's unit tests.
 //!
 //! # Responsibilities
 //!
@@ -1154,10 +1154,20 @@ fn the_toolbox_rows_wear_the_chunky_face() {
         );
     }
 
-    // The face is the kit's: the raised fill over a shadow of the line colour,
-    // the shadow one offset below and right of the face.
+    // The face is the kit's: the active row (the default tool) wears the
+    // accent fill, a neutral row the raised one. A face is its allocated
+    // rectangle shrunk by the shadow offset, and the shadow is that rectangle
+    // translated back onto the allocation, so the shadow sits below and right
+    // of the fill.
     let first = faces[0];
-    let shadow = first.translate(egui::vec2(3.0, 3.0));
+    let neutral = faces[1];
+    let active_face = first.shrink(pill_editor_core::kit::SHADOW_OFFSET);
+    let neutral_face = neutral.shrink(pill_editor_core::kit::SHADOW_OFFSET);
+    let neutral_shadow = neutral_face.translate(egui::vec2(
+        pill_editor_core::kit::SHADOW_OFFSET,
+        pill_editor_core::kit::SHADOW_OFFSET,
+    ));
+    let mut accented = 0;
     let mut raised = 0;
     let mut shadowed = 0;
     let mut output = context.run_ui(
@@ -1215,14 +1225,18 @@ fn the_toolbox_rows_wear_the_chunky_face() {
         if rect.stroke.width != 0.0 {
             continue;
         }
-        if rect.rect == first && rect.fill == palette.panel_raised {
+        if rect.rect == active_face && rect.fill == palette.accent {
+            accented += 1;
+        }
+        if rect.rect == neutral_face && rect.fill == palette.panel_raised {
             raised += 1;
         }
-        if rect.rect == shadow && rect.fill == palette.line {
+        if rect.rect == neutral_shadow && rect.fill == palette.line {
             shadowed += 1;
         }
     }
-    assert_eq!(raised, 1, "the first row's face is the raised fill");
+    assert_eq!(accented, 1, "the active row's face is the accent fill");
+    assert_eq!(raised, 1, "a neutral row's face is the raised fill");
     assert_eq!(shadowed, 1, "the face sits on a shadow of the line colour");
 
     // A press and a release on the face still queue the row's command.
@@ -1272,28 +1286,21 @@ fn the_toolbox_rows_wear_the_chunky_face() {
 /// queueing anything.
 #[test]
 fn the_preferences_pair_saves_and_cancels() {
-    /// Draw the tab, one frame, and report the two faces it drew.
+    /// Draw the tab for one frame: the tab seeds its draft buffers on the
+    /// first draw and must queue nothing until an answer is pressed.
     fn draw(
         context: &egui::Context,
         events: Vec<egui::Event>,
         snapshot: &EditorSnapshot,
         draft: &mut Option<preferences::PreferencesDraft>,
         pending: &mut PendingEditorCommands,
-    ) -> Vec<egui::Rect> {
-        let mut faces = Vec::new();
+    ) {
         run_pass_with(context, events, &mut |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.set_max_width(420.0);
                 preferences_tab(ui, snapshot, draft, pending);
-                faces = ui
-                    .ctx()
-                    .memory(|memory| memory.data.get_temp::<Vec<egui::Rect>>(egui::Id::new(
-                        "test.preferences.faces",
-                    )))
-                    .unwrap_or_default();
             });
         });
-        faces
     }
 
     let engine = Engine::new();
@@ -1302,7 +1309,7 @@ fn the_preferences_pair_saves_and_cancels() {
     let mut pending = PendingEditorCommands::default();
     let context = egui::Context::default();
     style::apply(&context);
-    let _ = draw(&context, Vec::new(), &snapshot, &mut draft, &mut pending);
+    draw(&context, Vec::new(), &snapshot, &mut draft, &mut pending);
     assert!(draft.is_some(), "the tab seeded its buffers");
     assert!(pending.batches.is_empty(), "drawing queues nothing");
 }

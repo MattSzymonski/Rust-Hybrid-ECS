@@ -368,8 +368,8 @@ mod tests {
             Some(CameraNavigation::Dolly)
         );
         // Alt means "left-button navigation" in the presets that use it, so a
-        // middle-button drag with Alt held navigates nothing - the guard that
-        // used to be spelled as a rebinding of `modifiers`.
+        // middle-button drag with Alt held navigates nothing - the guard is a
+        // condition on `modifiers`, not a rebinding of them.
         assert_eq!(
             navigation_binding(
                 KeymapPreset::Blender,

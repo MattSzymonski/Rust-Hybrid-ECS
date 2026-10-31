@@ -51,6 +51,7 @@ python devops/tests/test_hot_reload_suite.py
 python devops/tests/test_hot_reload_migration.py --cycles 2
 python devops/tests/test_csharp_bridge.py
 python devops/tests/test_ui_theme.py            # the UI theme pipeline, `circus_demo`
+python devops/tests/test_render_chains.py       # a committed .pipeline runs the frame, `project_rs`
 python devops/tests/test_module_resource_assert.py  # a module's declared resource is missing
 python devops/tests/test_shipping_smoke.py
 python devops/tests/test_web_smoke.py          # browser build in headless Chrome/Edge
@@ -76,13 +77,13 @@ artifact sizes. The lint's eighth check refuses work-item ids, stage numbers,
 plan decisions, audit-finding ids, audit opportunity numbers, plan sections and
 construction-site paths in `modules/` comments, with no allowance: a
 reintroduced reference fails the check. The same check covers the managed
-sources under `modules/csharp/` and the three example projects' `src/`
-folders, where the existing debt is held in
-`devops/tests/comment_content_baseline.json`: a file's recorded count is its
-allowance, a missing entry allows zero, and `--write-comment-baseline`
-rewrites the file after a sweep. The `devops/` Python tree is covered the same
-way - full-line `#` comments and module, class and function docstrings, one
-allowance per file - while `TIER:` and `PROTECTS:` docstring lines stay
+sources under `modules/csharp/`, the three example projects' `src/` folders and
+the `devops/` Python tree, and it is strict there too - there is no baseline
+file, so every scope holds zero allowance and any reference fails. The
+`--write-comment-baseline` flag still exists for a future sweep that needs to
+record debt before paying it down; a missing baseline allows zero. The `devops/`
+tree is covered the same way - full-line `#` comments and module, class and
+function docstrings - while `TIER:` and `PROTECTS:` docstring lines stay
 untouched. Formatting, clippy and the
 cargo test lanes are `verify.py`
 steps; those two lanes run through `cargo-nextest` (`modules/.config/nextest.toml`)
@@ -191,6 +192,13 @@ the few `verify.py` steps that guard the area. An editor suite gets the
 editor build (the uplift) prepended; a file no rule recognizes falls back to
 `verify.py --quick`, so nothing passes unchecked by accident. The full gate
 and the tier runs stay for stage boundaries and milestones.
+
+A step whose commands rewrite tracked files declares `cleanup` commands, which
+run even when the step fails, so a red step cannot leave a build artifact where
+a later commit could pick it up. `check-shipping` is the one step that needs
+it: it generates `build/pill_shipping_bundle` for the shipping clippy run and
+puts the committed stub back afterwards, and the quick `bundle-stub` step
+refuses a tree that holds a generation.
 
 The gate itself carries the editor end to end: its `editor` step runs the
 host-tier revision suite, builds `pill_editor` (the uplift), and then

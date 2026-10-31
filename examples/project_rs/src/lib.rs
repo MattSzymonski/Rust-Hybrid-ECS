@@ -24,6 +24,7 @@
 //! serializable data. xx
 
 // Standard library
+use std::path::Path;
 
 // External crates
 use pill_core::error;
@@ -34,8 +35,8 @@ use pill_engine::*;
 // data crate this project depends on; `MeshRendererComponent` is that
 // renderer's own idea of a thing to draw.
 use pill_master_renderer_data::{
-    CameraComponent, DirectionalLightComponent, Material, Mesh, MeshRendererComponent,
-    TransformComponent,
+    CameraComponent, DirectionalLightComponent, Material, Mesh, MeshRendererComponent, RenderPass,
+    RenderingManager, RenderingPipeline, TransformComponent,
 };
 use pill_spline::Spline;
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,13 @@ use settings::*;
 use simulation_time::update_time_system;
 use spline_path::spline_path_system;
 use spline_probe::{spline_probe_system, SplineProbeState};
+
+/// The pass the project's own frame draws with, as a file in `res`.
+const PASS_PATH: &str = "dwdw.render_pass";
+
+/// The frame this project runs, authored as a file: it names [`PASS_PATH`] by
+/// guid in the order the pass runs.
+const CHAIN_PATH: &str = "pipelines/main.pipeline";
 
 /// Wall-clock delta between frames, shared by every system that steps on time.
 ///
@@ -132,6 +140,27 @@ pub fn init(engine: &mut Engine) -> u32 {
     // resource, so the host-side GPU backend reads the extracted data through
     // the engine's stable cross-artifact resource identity.
     pill_master_renderer_data::register(engine);
+    // The frame this project runs is authored as files in `res`, not composed
+    // here: `pipelines/main.pipeline` names `dwdw.render_pass` in the order it
+    // runs, and the manager hands that chain to the renderer.
+    let chain = {
+        let assets = engine
+            .world_mut()
+            .get_resource_mut::<AssetManager>()
+            .expect("Engine always owns an AssetManager");
+        match load_chain(assets) {
+            Ok(chain) => chain,
+            Err(message) => {
+                pill_engine::tracing::error!("render chain failed to load: {message}");
+                return 1;
+            }
+        }
+    };
+    engine
+        .world_mut()
+        .get_resource_mut::<RenderingManager>()
+        .expect("the renderer data crate registers its manager")
+        .set_pipeline(chain);
     // The entity-reference test subject: its layout is what gives the
     // Inspector a reference row to draw (W-0048 Stage 6).
     follow_target::register(engine.world_mut());
@@ -420,4 +449,89 @@ pub fn init(engine: &mut Engine) -> u32 {
 
     // Report successful registration so the host keeps this generation.
     0
+}
+
+/// Import the frame this project runs: its pass first, then the chain that
+/// names it.
+///
+/// A chain's file names its passes by guid, so the pass has to be in the store
+/// before the chain resolves it. Importing a file that is already loaded hands
+/// back the same asset, which is what keeps a hot reload's second `init` from
+/// failing on a name that is taken.
+///
+/// # Errors
+///
+/// A message naming the file when the pass or the chain will not load.
+fn load_chain(assets: &mut AssetManager) -> Result<Handle<RenderingPipeline>, String> {
+    assets
+        .import_standalone::<RenderPass>(Path::new(PASS_PATH))
+        .map_err(|error| format!("`{PASS_PATH}` did not load: {error}"))?;
+    assets
+        .import_standalone::<RenderingPipeline>(Path::new(CHAIN_PATH))
+        .map_err(|error| format!("`{CHAIN_PATH}` did not load: {error}"))
+        .map(|loaded| loaded.handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh world runs the chain the project's own files declare: `init`
+    /// imports `pipelines/main.pipeline`, hands it to the renderer's manager
+    /// instead of the installed default chain, and the chain holds the
+    /// project's `dwdw.render_pass`.
+    #[test]
+    fn init_hands_the_manager_the_chain_from_the_project_files() {
+        // A host mounts this project's `res` and registers the modules the
+        // project lists before its `init`; the test mounts the directory and
+        // registers what the scene needs itself. `init` registers the renderer
+        // data again, which a reload does too.
+        AssetLoader::set_root(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("res"));
+        let mut engine = Engine::new();
+        assert_eq!(pill_master_renderer_data::register(&mut engine), 0);
+        engine
+            .world_mut()
+            .register_component::<pill_spline::Spline>();
+        // The artifact-wide loop the host and the runtime run before `init`
+        // registers the project's own components; a direct call does it here.
+        // `init` must not repeat it: a second live registration of one type
+        // name fails the generation, which is what a reload would hit.
+        __pill_register_PhysicsState(engine.world_mut());
+        __pill_register_SplineSample(engine.world_mut());
+
+        // The chain loads straight from the project's files, so a broken file
+        // fails here with its own message rather than as a status code.
+        let imported = {
+            let assets = engine
+                .world_mut()
+                .get_resource_mut::<AssetManager>()
+                .expect("the engine owns an asset manager");
+            load_chain(assets).expect("the project's chain loads")
+        };
+
+        assert_eq!(init(&mut engine), 0);
+
+        let manager = engine
+            .world()
+            .get_resource::<RenderingManager>()
+            .expect("the renderer data registers its manager");
+        let pipeline = manager.pipeline().expect("init set the chain");
+        let assets = engine
+            .world()
+            .get_resource::<AssetManager>()
+            .expect("the engine owns an asset manager");
+        let chain = assets
+            .handle_by_name::<RenderingPipeline>(CHAIN_PATH)
+            .expect("the chain is imported under its path");
+        let pass = assets
+            .handle_by_name::<RenderPass>(PASS_PATH)
+            .expect("the pass is imported under its path");
+
+        assert_eq!(pipeline, imported);
+        assert_eq!(imported, chain);
+        assert_eq!(
+            assets.get(chain).expect("the chain is loaded").passes,
+            vec![pass]
+        );
+    }
 }
