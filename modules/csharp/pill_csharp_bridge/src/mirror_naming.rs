@@ -27,7 +27,7 @@ use pill_engine::component_registry::ComponentFieldDescriptor;
 /// This is what lets a managed mirror be checked field by field against the
 /// native component it binds to, without a schema hash both sides would have
 /// to agree on: the names and offsets are exactly the ones the generator in
-/// `pill_host` (`emit_typed_struct`) writes - PascalCase, one numbered field
+/// `pill_development_host` (`emit_typed_struct`) writes - PascalCase, one numbered field
 /// per array element. A component with no field layout, or with a heap-owned
 /// field (which emits private handle words rather than a public field), has no
 /// signature and is checked by size and alignment only.

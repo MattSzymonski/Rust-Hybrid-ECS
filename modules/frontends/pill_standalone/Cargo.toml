@@ -16,11 +16,11 @@ miette = { version = "7", features = ["derive"] }
 tracing = "0.1"
 # What runs the game, in both postures: the frame driver the loops are written
 # against, telemetry, and - shipping - the engine and the linked project.
-pill_runtime = { path = "../../hosting/pill_runtime" }
+pill_player = { path = "../../hosting/pill_player" }
 # The development host, linked only by `dev`. A shipping build does not
 # compile it at all: the dependency structure, not a feature flag, is what keeps
 # development code out of a shipped binary.
-pill_host = { package = "pill_host", path = "../../hosting/pill_host", default-features = false, optional = true }
+pill_development_host = { package = "pill_development_host", path = "../../hosting/pill_development_host", default-features = false, optional = true }
 # The window and event loop of a windowed run. Only the frontend links winit.
 winit = { version = "0.30", optional = true }
 # A windowed run's input: winit's keyboard and mouse events as engine input
@@ -57,8 +57,6 @@ pill_input = { path = "../pill_input", features = [
 # `git checkout -- build/pill_shipping_bundle`.
 pill_shipping_bundle = { path = "../../../build/pill_shipping_bundle", optional = true }
 
-[build-dependencies]
-pill_std_staging = { path = "../pill_std_staging" }
 
 [features]
 # Exactly one of `dev` and `shipping` is selected; `main.rs` refuses anything
@@ -73,30 +71,30 @@ pill_std_staging = { path = "../pill_std_staging" }
 default = ["dev", "hot_patch"]
 # The development posture: the development host builds, loads, watches and
 # reloads the project and every extension.
-dev = ["dep:pill_host", "pill_host/hot_reload"]
+dev = ["dep:pill_development_host", "pill_development_host/hot_reload"]
 # The shipping posture: the runtime runs the project and extensions the
 # generated bundle links in. Nothing is watched, built or loaded at runtime, and
-# `pill_host` is not compiled. Build it with `--package pill_standalone`, not
+# `pill_development_host` is not compiled. Build it with `--package pill_standalone`, not
 # `--workspace`: cargo unions the features requested for a package across one
-# invocation, and `pill_editor` asks for `pill_host`, which would bring `dev`
+# invocation, and `pill_editor` asks for `pill_development_host`, which would bring `dev`
 # back.
 shipping = ["dep:pill_shipping_bundle"]
 # Per-function hot patching, forwarded to the host. Implies `dev`.
-hot_patch = ["dev", "pill_host/hot_patch"]
+hot_patch = ["dev", "pill_development_host/hot_patch"]
 # Windowed mode: the winit event loop and its input here, the renderer attach in
 # the runtime (and the renderer module in the development host). The binary
 # itself contains no GPU code. A headless run has no window, so no input.
 rendering = [
     "dep:winit",
     "dep:pill_input",
-    "pill_runtime/rendering",
-    "pill_host?/rendering",
+    "pill_player/rendering",
+    "pill_development_host?/rendering",
 ]
 # Enable Tracy profiling through the shared telemetry stack.
-profiling = ["pill_runtime/profiling", "pill_host?/profiling"]
+profiling = ["pill_player/profiling", "pill_development_host?/profiling"]
 # Investigative fine-grained profiling zones.
-profiling-fine = ["pill_runtime/profiling-fine", "pill_host?/profiling-fine"]
+profiling-fine = ["pill_player/profiling-fine", "pill_development_host?/profiling-fine"]
 # Repeated numerical measurements through the shared metrics recorder.
-metrics = ["pill_runtime/metrics", "pill_host?/metrics"]
+metrics = ["pill_player/metrics", "pill_development_host?/metrics"]
 # Compile the simple developer log macros (`log!`, `dev_warn!`, `dev_error!`).
 dev-logs = ["pill_core/dev-logs"]

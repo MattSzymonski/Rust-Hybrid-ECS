@@ -297,8 +297,8 @@ EGUI_STATE_MARKER_PATTERN = re.compile(r"egui-state-ok")
 # maths - listed below with the reason each needs one.
 COLOUR_LITERAL_PATTERN = re.compile(r"Color32::(from_[a-z_]+|[A-Z][A-Z_]+)")
 COLOUR_LITERAL_AREAS = (
-    "modules/editor/pill_editor_core/src",
-    "modules/editor/pill_editor/src",
+    "modules/frontends/editor/pill_editor_core/src",
+    "modules/frontends/editor/pill_editor/src",
     "modules/extensions/pill_editor_shell_egui/",
     "modules/frontends/pill_web/src",
     # The kit translates and draws from the same tokens: a literal here would
@@ -1398,7 +1398,7 @@ def self_test() -> int:
         ),
         (
             "the same plant outside a reloadable crate passes",
-            "modules/editor/pill_editor/src/runner.rs",
+            "modules/frontends/editor/pill_editor/src/runner.rs",
             "let stored = context.data_mut::<Widget>();\n",
             0,
         ),
@@ -1477,13 +1477,13 @@ def self_test() -> int:
         ),
         (
             "a named colour in the editor core fails",
-            "modules/editor/pill_editor_core/src/session.rs",
+            "modules/frontends/editor/pill_editor_core/src/session.rs",
             "let clear = Color32::TRANSPARENT;\n",
             1,
         ),
         (
             "an allowlisted colour-maths line passes",
-            "modules/editor/pill_editor_core/src/inspector.rs",
+            "modules/frontends/editor/pill_editor_core/src/inspector.rs",
             "0 => Color32::from_rgb(214, 96, 96),\n",
             0,
         ),
@@ -1495,7 +1495,7 @@ def self_test() -> int:
         ),
         (
             "a comment naming a colour passes",
-            "modules/editor/pill_editor_core/src/style.rs",
+            "modules/frontends/editor/pill_editor_core/src/style.rs",
             "// Color32::from_rgb is only for the conversion helpers\n",
             0,
         ),
@@ -1797,7 +1797,7 @@ def self_test() -> int:
         ),
         (
             "the same wall in another crate's root is outside the guard",
-            "modules/editor/pill_editor_core/src/editor_state.rs",
+            "modules/frontends/editor/pill_editor_core/src/editor_state.rs",
             "pub mod bar;\n"
             "\n"
             "pub mod palette;\n"

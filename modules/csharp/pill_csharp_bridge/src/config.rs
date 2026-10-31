@@ -36,7 +36,7 @@ pub struct CSharpModuleConfig {
 impl CSharpModuleConfig {
     /// Describe a managed project by its assembly names and output directories.
     ///
-    /// A reloading build gets this from `pill_host`'s
+    /// A reloading build gets this from `pill_development_host`'s
     /// `ProjectModuleConfig::from_environment`, which reads the project's
     /// `.csproj`; a shipping build has no project path to read, so its frontend
     /// states the same four values directly. The constructor exists because the

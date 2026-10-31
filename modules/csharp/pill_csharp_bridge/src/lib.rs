@@ -19,9 +19,9 @@
 //! entry point.
 //!
 //! Development tooling - mirror generation and the in-process Roslyn
-//! compiler - lives in `pill_host`. This crate reads no project settings,
+//! compiler - lives in `pill_development_host`. This crate reads no project settings,
 //! builds nothing and watches nothing. A shipped C# project reaches the
-//! runtime as a [`CSharpBackend`] implementing `pill_runtime::ProjectBackend`:
+//! runtime as a [`CSharpBackend`] implementing `pill_player::ProjectBackend`:
 //! the bridge depends on the runtime, never the other way round.
 
 /// C-compatible data structures and callback table shared with the managed runtime.
@@ -78,11 +78,11 @@ pub use csharp_runtime::DotnetRuntimeContext;
 /// The two-call protocol every managed payload crosses the boundary through.
 pub use managed_buffer::{fetch_managed_buffer, ManagedBufferError};
 /// The naming rules a generated mirror follows, shared by the generator in
-/// `pill_host` and the binding check here.
+/// `pill_development_host` and the binding check here.
 pub use mirror_naming::{
     is_heap_owned_tag, is_opaque_container_tag, snake_to_pascal, split_array_tag,
 };
-/// A shipped C# project, started through `pill_runtime`'s external backend.
+/// A shipped C# project, started through `pill_player`'s external backend.
 pub use project_backend::CSharpBackend;
 
 /// Resolve registered component names into the layouts managed code binds.

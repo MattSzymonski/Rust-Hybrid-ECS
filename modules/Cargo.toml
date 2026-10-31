@@ -18,14 +18,16 @@ members = [
     # outlives a project reload and its frame is neutral data the renderer
     # draws.
     "ui/*",
-    # Hosting and running a project: the runtime, the development host and the
+    # Hosting and running a project: the player, the development host and the
     # source scanner the host patches through.
     "hosting/*",
-    # The game frontends - `pill_standalone`, `pill_web` - and the `pill_input`
-    # gamepad glue they and the editor share.
-    "frontends/*",
-    # The egui editor: its executable and its shared core dylib.
-    "editor/*",
+    # The frontends - `pill_standalone`, `pill_web` - and the `pill_input`
+    # gamepad glue they and the editor share. Every crate here is named
+    # `pill_*`, the same convention as the extensions: `frontends/` also holds
+    # the `editor/` folder, which is not a crate itself.
+    "frontends/pill_*",
+    # The egui editor frontend: its executable and its shared core dylib.
+    "frontends/editor/*",
     # The C# half of the engine: the bridge crate, plus the managed runtime and
     # compiler that live beside it. This one is named explicitly rather than
     # globbed, because `csharp/` is not all crates - the other two are MSBuild

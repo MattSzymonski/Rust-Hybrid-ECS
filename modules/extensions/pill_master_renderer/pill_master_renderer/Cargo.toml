@@ -11,7 +11,7 @@ workspace = true
 [lib]
 # `rlib` only: the artifact the host loads is built by the generated
 # `host_module_pill_master_renderer` wrapper, which links this crate as a
-# library; `pill_host` reaches the same hashed build through
+# library; `pill_development_host` reaches the same hashed build through
 # `renderer_dependency_graph`.
 crate-type = ["rlib"]
 

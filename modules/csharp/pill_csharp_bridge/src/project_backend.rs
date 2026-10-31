@@ -2,7 +2,7 @@
 //!
 //! # Responsibilities
 //!
-//! - Implement `pill_runtime::ProjectBackend` for a shipped C# project, in
+//! - Implement `pill_player::ProjectBackend` for a shipped C# project, in
 //!   either posture: CoreCLR through hostfxr, or a NativeAOT library.
 //!
 //! # Design
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 // External crates
 use pill_core::error::HostError;
 use pill_engine::Engine;
-use pill_runtime::ProjectBackend;
+use pill_player::ProjectBackend;
 
 // Current crate
 use crate::mirror_calls::static_mirror_methods;

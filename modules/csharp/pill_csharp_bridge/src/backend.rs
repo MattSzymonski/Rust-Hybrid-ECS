@@ -267,7 +267,7 @@ pub struct CSharpRuntime {
     bindings: Arc<BindingStore>,
     /// Clears the loader's poll interval after an in-process compile.
     ///
-    /// Only useful together with `pill_host`'s in-process compiler: the
+    /// Only useful together with `pill_development_host`'s in-process compiler: the
     /// certainty it reports is exactly the certainty an in-process compile
     /// produces. `None` in the AOT posture, which never reloads - and which
     /// would otherwise oblige every shipped project to re-export a symbol it
@@ -767,7 +767,7 @@ impl CSharpRuntime {
     ///
     /// `on_runtime_booted` sees the .NET runtime once it is up and before the
     /// project starts. Development tooling loads its own assemblies into it
-    /// there: `pill_host` starts its in-process compiler's warmup, so it
+    /// there: `pill_development_host` starts its in-process compiler's warmup, so it
     /// overlaps component registration, the startup methods and system
     /// registration instead of landing on the developer's first edit. A
     /// shipping build passes a no-op.

@@ -65,7 +65,7 @@ use super::queries::{
 use super::resources::resource_target;
 use pill_engine::common_components::TransformComponent;
 // The host depends on the renderer data crate for its dependency graph only
-// (see `pill_host/Cargo.toml`); these tests are the one place that names it,
+// (see `pill_development_host/Cargo.toml`); these tests are the one place that names it,
 // to bind the real renderer components and call its asset functions.
 use renderer_data_dependency_graph as pill_master_renderer_data;
 use renderer_data_dependency_graph::MeshRendererComponent;

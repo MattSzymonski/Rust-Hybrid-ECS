@@ -4,7 +4,7 @@
 //!
 //! - Start a shipped project ([`run`]): readable panics, console logging, the
 //!   project's asset pack downloaded beside the page, and the
-//!   project's modules registered through `pill_runtime`.
+//!   project's modules registered through `pill_player`.
 //! - Put a `winit` window on the page's canvas, attach the renderer to it
 //!   asynchronously, and run one frame per browser animation frame.
 //! - Feed the canvas's keyboard and mouse events to the engine. The canvas is
@@ -13,7 +13,7 @@
 //! # Design
 //!
 //! The web counterpart of `pill_standalone`'s shipping posture, over the same
-//! `pill_runtime` and [`FrameDriver`]. Three things differ, all because a
+//! `pill_player` and [`FrameDriver`]. Three things differ, all because a
 //! browser only makes progress once control returns to it: the event loop is
 //! handed over with `spawn_app` rather than run, the renderer attach - a
 //! future - is spawned onto that loop instead of blocked on, and the asset
@@ -35,7 +35,7 @@ use pill_core::telemetry::telemetry_target;
 use pill_core::utils::format_error_chain;
 use pill_core::{error, info, warn};
 use pill_input::winit_events::{translate_device_event, translate_window_event};
-use pill_runtime::{FrameDriver, RenderingRuntime, Runtime, StaticProject, SurfaceId};
+use pill_player::{FrameDriver, RenderingRuntime, Runtime, StaticProject, SurfaceId};
 use wasm_bindgen::JsCast;
 use web_sys::HtmlCanvasElement;
 use winit::application::ApplicationHandler;
@@ -90,13 +90,13 @@ where
 {
     // Step 1: Readable panics and console logging, before anything can fail.
     console_error_panic_hook::set_once();
-    if let Err(error) = pill_runtime::init_telemetry(None) {
+    if let Err(error) = pill_player::init_telemetry(None) {
         web_sys::console::error_1(&format!("[web] telemetry failed to start: {error}").into());
     }
 
     // Step 2: A project without a pack URL carries its assets in the module.
     let Some(url) = project.asset_pack_url else {
-        match pill_runtime::setup(project) {
+        match pill_player::setup(project) {
             Ok(runtime) => launch(runtime),
             Err(error) => report_failure("project setup", &error),
         }
@@ -113,15 +113,15 @@ where
                 return;
             }
         };
-        let database = match pill_runtime::mount_asset_pack(
+        let database = match pill_player::mount_asset_pack(
             project.name,
-            pill_runtime::PackSource::Fetched,
+            pill_player::PackSource::Fetched,
             bytes,
         ) {
             Ok(database) => database,
             Err(error) => return report_failure("asset pack mount", &error),
         };
-        match pill_runtime::setup_with_asset_database(project, Some(database)) {
+        match pill_player::setup_with_asset_database(project, Some(database)) {
             Ok(runtime) => launch(runtime),
             Err(error) => report_failure("project setup", &error),
         }
@@ -221,7 +221,7 @@ impl ApplicationHandler for WebApplication {
         };
         let driver = Rc::clone(&self.driver);
         pill_core::platform::futures::spawn(async move {
-            let attach = pill_runtime::attach_renderer(runtime, Arc::clone(&window), width, height);
+            let attach = pill_player::attach_renderer(runtime, Arc::clone(&window), width, height);
             match attach.await {
                 Ok(mut attached) => {
                     // A resize that arrived during the attach went nowhere;

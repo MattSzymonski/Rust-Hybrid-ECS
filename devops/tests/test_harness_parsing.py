@@ -42,7 +42,7 @@ DESCRIPTION
     was reimplemented in the test and then asserted against itself. Neither
     could fail when the engine changed - the failure mode this whole file
     exists to catch. Both now read the rule out of the engine's own source
-    (`pill_host/src/analytics.rs`, `pill_host/src/build_runner.rs`) and compare
+    (`pill_development_host/src/analytics.rs`, `pill_development_host/src/build_runner.rs`) and compare
     it with what the harness and this file believe, so a route relabelled or
     reclassified in Rust fails here.
 
@@ -101,7 +101,7 @@ coverage = load_module("tests/test_hot_patch_coverage.py", "test_hot_patch_cover
 
 # The engine sources the two rules under test are defined in. Read as text: a
 # rule that moves, is renamed or is reworded fails the check that reads it.
-PILL_HOST_SOURCE = MODULES_ROOT / "hosting" / "pill_host" / "src"
+PILL_HOST_SOURCE = MODULES_ROOT / "hosting" / "pill_development_host" / "src"
 ANALYTICS_SOURCE = PILL_HOST_SOURCE / "analytics.rs"
 BUILD_RUNNER_SOURCE = PILL_HOST_SOURCE / "build_runner.rs"
 
@@ -146,7 +146,7 @@ REAL_CARGO_TEST_OUTPUT = """\
 test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
      Running unittests src\\lib.rs (target\\debug\\deps\\pill_engine-3f3e.exe)
 test result: ok. 160 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 14.69s
-     Running unittests src\\lib.rs (target\\debug\\deps\\pill_host-082c.exe)
+     Running unittests src\\lib.rs (target\\debug\\deps\\pill_development_host-082c.exe)
 test result: FAILED. 70 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s
 """
 
@@ -270,7 +270,7 @@ def check_route_is_read_only_when_present() -> None:
 def check_provable_routes_match_the_engine() -> None:
     """The harness's idea of a provable route must match the engine's.
 
-    `PatchRoute::is_provable` in `pill_host/src/analytics.rs` is the definition;
+    `PatchRoute::is_provable` in `pill_development_host/src/analytics.rs` is the definition;
     the harness's `PROVABLE_ROUTES` mirrors it. If they drift, the benchmark
     silently reclassifies a best-effort patch as a guaranteed one - so both
     sides are read here, and the labels the engine actually prints are the ones
@@ -388,7 +388,7 @@ def check_unique_snippet_anchors_to_one_place() -> None:
 def check_shared_slot_detection_matches_cargo_naming() -> None:
     """Which artifacts another build can overwrite in place.
 
-    The rule lives in `is_shared_slot_rlib` (`pill_host/src/build_runner.rs`):
+    The rule lives in `is_shared_slot_rlib` (`pill_development_host/src/build_runner.rs`):
     a `.rlib` whose stem carries no `-<16 hex digits>` suffix is the shared
     per-crate slot, and the only kind another build silently replaces. The patch
     linker and the dependency staging both call it, so a change there has to be

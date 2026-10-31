@@ -41,7 +41,7 @@ use pill_editor_core::scripted::{Dump, ScriptedCommand};
 use pill_editor_core::{entities, systems};
 use pill_engine_core::input::InputEvent;
 use pill_input::winit_events::translate_window_event;
-use pill_runtime::{FrameDriver, RenderingRuntime, Runtime, StaticProject, SurfaceId};
+use pill_player::{FrameDriver, RenderingRuntime, Runtime, StaticProject, SurfaceId};
 use web_sys::HtmlCanvasElement;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
@@ -210,7 +210,7 @@ impl ApplicationHandler for WebEditorApplication {
         let driver = Rc::clone(&self.driver);
         pill_core::platform::futures::spawn(async move {
             let attach =
-                pill_runtime::attach_renderer(runtime, Arc::clone(&scene_window), width, height);
+                pill_player::attach_renderer(runtime, Arc::clone(&scene_window), width, height);
             match attach.await {
                 Ok(mut attached) => {
                     // A resize that arrived during the attach went nowhere;

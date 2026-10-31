@@ -45,8 +45,8 @@ e.g. `../examples/project_cs`.
 ## Shipping builds
 
 `devops/ci_cd/build_release.py` builds the shipping host release: `pill_standalone`  
-with the `shipping` feature, which runs the project through `pill_runtime` and  
-does not compile the development host (`pill_host`) at all. It reads the  
+with the `shipping` feature, which runs the project through `pill_player` and  
+does not compile the development host (`pill_development_host`) at all. It reads the  
 project's scripting language from its manifest: the generated bundle carries  
 the backend, and a managed C# project (`*.csproj`) also gets its assemblies  
 built and copied. A project's `res` directory is packed into the binary at  

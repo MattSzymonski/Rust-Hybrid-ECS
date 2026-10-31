@@ -23,7 +23,7 @@ DESCRIPTION
                          crates: pill_core, pill_core_macros, pill_engine,
                          pill_ui_frame, serde, thiserror, miette, raw-window-handle;
                          and has no build dependencies.
-      3. host          - `pill_runtime`, `pill_csharp_bridge`, `pill_host` and
+      3. host          - `pill_player`, `pill_csharp_bridge`, `pill_development_host` and
                          `pill_standalone` name no data crate
                          or GPU module in code. A dependency on one is allowed
                          only as a graph-only dependency (a key ending in
@@ -84,7 +84,7 @@ API_ALLOWED_DEPENDENCIES = {
 }
 
 # Crates that must not name renderer data or GPU code (rule 3).
-HOST_CRATES = ("pill_runtime", "pill_csharp_bridge", "pill_host", "pill_standalone")
+HOST_CRATES = ("pill_player", "pill_csharp_bridge", "pill_development_host", "pill_standalone")
 
 # Suffix that marks a data crate, and one that marks a graph-only dependency.
 DATA_SUFFIX = "_data"
@@ -203,16 +203,16 @@ def report(repository: Path) -> int:
 # A minimal repository that satisfies every rule: a renderer `r` with its data
 # crate, the contract crate, a host with graph-only dependencies, a project.
 VALID_TREE = {
-    "modules/Cargo.toml": '[workspace]\nmembers = ["pill_renderer_api", "pill_host", "pill_standalone", "pill_editor", '
+    "modules/Cargo.toml": '[workspace]\nmembers = ["pill_renderer_api", "pill_development_host", "pill_standalone", "pill_editor", '
                           '"extensions/*/*", "extensions/*/generated/*", "projects_generated/*"]\n'
                           'exclude = ["extensions/rendering"]\n',
     "modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\n'
                                            'pill_engine = { path = "x" }\npill_ui_frame = { path = "x" }\nserde = "1"\n',
-    "modules/pill_host/Cargo.toml": '[package]\nname = "pill_host"\n[dependencies]\n'
+    "modules/pill_development_host/Cargo.toml": '[package]\nname = "pill_development_host"\n[dependencies]\n'
                                    'renderer_data_dependency_graph = { package = "r_data", path = "x" }\n'
                                    'renderer_dependency_graph = { package = "r", path = "x" }\n',
-    "modules/pill_host/src/lib.rs": "//! Host.\n",
-    "modules/pill_host/src/tests.rs": "use renderer_data_dependency_graph as r_data;\n",
+    "modules/pill_development_host/src/lib.rs": "//! Host.\n",
+    "modules/pill_development_host/src/tests.rs": "use renderer_data_dependency_graph as r_data;\n",
     "modules/pill_standalone/Cargo.toml": '[package]\nname = "pill_standalone"\n[dependencies]\npill_host = { path = "x" }\n',
     "modules/pill_editor/Cargo.toml": '[package]\nname = "pill_editor"\n[dependencies]\nwgpu = "25"\n',
     "modules/extensions/r/r/Cargo.toml": '[package]\nname = "r"\n[dependencies]\nwgpu = "25"\nr_data = { path = "x" }\n',
@@ -231,7 +231,7 @@ BROKEN_VARIANTS = [
     (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\nrand = "0.8"\n'}),
     (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[build-dependencies]\npill_assets = "1"\n'}),
     (3, {"modules/pill_standalone/Cargo.toml": '[package]\nname = "pill_standalone"\n[dependencies]\nr_data = { path = "x" }\n'}),
-    (3, {"modules/pill_host/src/lib.rs": "//! Host.\nuse renderer_data_dependency_graph::Mesh;\n"}),
+    (3, {"modules/pill_development_host/src/lib.rs": "//! Host.\nuse renderer_data_dependency_graph::Mesh;\n"}),
     (4, {"examples/p/Cargo.toml": '[package]\nname = "p"\n[dependencies]\nr = { path = "x" }\n'}),
     (4, {"modules/extensions/o/generated/host_module_o/Cargo.toml": '[package]\nname = "host_module_o"\n[dependencies]\nr = { path = "x" }\n'}),
     (5, {"modules/extensions/r/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\nr = { path = "x" }\n'}),

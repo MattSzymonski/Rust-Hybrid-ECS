@@ -98,7 +98,7 @@ ALL_DYLIBS = ENGINE_DYLIBS + EGUI_EDITOR_DYLIBS
 
 # The host postures module and project builds run under: the host's own cargo
 # selection, and the engine features `build_runner::host_engine_features`
-# mirrors from that host (the engine-affecting features `pill_host` declares:
+# mirrors from that host (the engine-affecting features `pill_development_host` declares:
 # `hot_patch`, the profiling levels, `metrics`, `dev-logs`). No native
 # frontend keeps a cargo anchor since the dioxus editor retired; the anchor
 # slot stays in the shape so a posture that ever needs one is measured with

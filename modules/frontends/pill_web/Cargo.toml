@@ -13,11 +13,11 @@ workspace = true
 pill_core = { path = "../../engine/pill_core" }
 # What runs the game: the engine, the linked project and the renderer attached
 # to the canvas.
-pill_runtime = { path = "../../hosting/pill_runtime", features = ["rendering"] }
+pill_player = { path = "../../hosting/pill_player", features = ["rendering"] }
 pill_engine_core = { path = "../../engine/pill_engine_core" }
 # The egui editor posture (W-0029): the boundary types and the shared model
 # the egui shell writes its frame with, plus egui's own wgpu renderer.
-pill_editor_core = { path = "../../editor/pill_editor_core" }
+pill_editor_core = { path = "../editor/pill_editor_core" }
 egui-wgpu = "0.36.2"
 # The device both UI canvases are drawn through.
 wgpu = "30.0.0"

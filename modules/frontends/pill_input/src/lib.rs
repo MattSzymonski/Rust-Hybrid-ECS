@@ -11,7 +11,7 @@
 //! # Design
 //!
 //! The engine defines what input is (`pill_engine::input`) and knows no
-//! platform library; `pill_runtime` must not link winit either. Each frontend
+//! platform library; `pill_player` must not link winit either. Each frontend
 //! gets its platform's events in its own loop, so translation belongs to the
 //! frontends - and every winit frontend (`pill_standalone`, `pill_editor`,
 //! `pill_web`) names this crate instead of repeating it. Only

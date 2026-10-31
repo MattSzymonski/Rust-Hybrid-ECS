@@ -152,7 +152,7 @@
        ===================================================================== -->
 
   <!-- The modules the project loads, read from `project_settings.yaml` the way
-       the host reads it (`pill_host::config`): the renderer's data crate
+       the host reads it (`pill_development_host::config`): the renderer's data crate
        `<renderer>_data` first - `renderer:` absent means the master renderer,
        `none` means no renderer - then every name under `modules:`, in either
        YAML list style. Property functions return escaped text, which is why

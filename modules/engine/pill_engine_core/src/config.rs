@@ -18,7 +18,7 @@
 //! the file lane, or silenced like any other engine output. It is one
 //! multi-line event (`log_block`), which the terminal formatter prints as a
 //! block below its time, level and target. The system hardware report lives in
-//! `pill_runtime` (its `system_specs` module), so `sysinfo` stays out of the
+//! `pill_player` (its `system_specs` module), so `sysinfo` stays out of the
 //! shared engine dylib.
 
 // External crates
