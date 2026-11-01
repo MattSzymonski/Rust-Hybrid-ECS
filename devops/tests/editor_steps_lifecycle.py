@@ -95,6 +95,13 @@ def step_11_layout_survives_restart(
             leftover, win_clipboard.read_text()
         )
     )
+    # The bytes the first editor wrote, kept for the paste below: the clipboard
+    # is machine-global, and the restart takes long enough (three sessions'
+    # worth of startup) that another program can replace the payload in
+    # between. Restoring the copy the first editor wrote keeps the step about
+    # the payload crossing a process boundary rather than about the machine
+    # staying quiet.
+    entity_payload = leftover
     restart = EditorSession(
         "egui",
         "restart",
@@ -161,6 +168,17 @@ def step_11_layout_survives_restart(
             )
         )
         begin = len(restart.read_log())
+        # The payload is put back when something else took the clipboard while
+        # the restart was starting; without this the paste reports a decode
+        # failure from a program the suite never asked, one step from the end.
+        current = win_clipboard.read_payload()
+        if current != entity_payload:
+            win_clipboard.write_payload(entity_payload)
+            print(
+                "  [OK] the clipboard was restored for the restart: {!r}".format(
+                    (current or "")[:80]
+                )
+            )
         restart.send("command editor.paste")
         restart.wait(
             re.escape(CLIPBOARD_PASTED_TOKEN) + r'\s+kind="entity"',

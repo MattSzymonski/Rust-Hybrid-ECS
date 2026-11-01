@@ -192,6 +192,26 @@ mod tests {
         assert_eq!(rotating_count, 3);
         assert_eq!(camera_count, 1);
 
+        // The two models past the first carry the reference row, both naming
+        // the first one, and the first carries none so its own rows keep the
+        // Inspector's body.
+        let carriers: Vec<Entity> = Query::<(&ShowcaseReferenceComponent, Entity)>::new(world)
+            .iter_mut()
+            .map(|(_, entity)| entity)
+            .collect();
+        assert_eq!(carriers.len(), 2);
+        let first_target = Query::<(&TagAlphaComponent, Entity)>::new(world)
+            .iter_mut()
+            .map(|(_, entity)| entity)
+            .next()
+            .expect("the first model");
+        assert!(!carriers.contains(&first_target));
+        let followed: Vec<Entity> = Query::<&ShowcaseReferenceComponent>::new(world)
+            .iter_mut()
+            .map(|reference| reference.follow)
+            .collect();
+        assert!(followed.iter().all(|target| *target == first_target));
+
         // A second pass is what a project reload runs: the builder returns early
         // on the tag the first one left, so nothing is duplicated or replaced.
         scene::create(world, assets).expect("the second pass builds nothing");

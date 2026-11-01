@@ -185,7 +185,7 @@ DRAG_OUT_NO_BUTTON_TOKEN = "[editor] drag out skipped: no button held"
 RECOVERED_STATE_TOKEN = "[editor] recovered editor state after an unclean exit"
 # The registered name the showcase component's payload carries: the
 # paste's registry check compares full type names.
-SHOWCASE_TYPE_NAME = "italian_brainrot::ShowcaseComponent"
+SHOWCASE_TYPE_NAME = "scene::ShowcaseComponent"
 WINDOWS_DUMP_TOKEN = "[test] windows"
 WINDOW_ROW_TOKEN = "[test] window"
 SAFE_MODE_TOKEN = "[editor] safe mode"
@@ -950,7 +950,7 @@ def main() -> int:
             },
             "gizmo": {
                 "projects": {
-                    "italian_brainrot": {
+                    "scene": {
                         "mode": "translate",
                         "space": "world",
                         "snap": False,
@@ -1582,8 +1582,21 @@ def _tiles_inspector_and_input_steps(state: StepState) -> None:
     # scripted drags on each tool's own handle move, turn and scale the
     # entity through the real pick; the world is checked directly with
     # `dump field`.
+    #
+    # What the suite drags first is a translate handle, so the tool is set
+    # rather than assumed: the steps above click the toolbox's own rows, which
+    # switch the gizmo to another tool and leave it there. No token is waited
+    # for on the switch itself - the editor logs a tool change only when the
+    # mode actually moves, and a run that arrives already on translate prints
+    # nothing - so the anchor wait below is what proves it took. The point is
+    # the scene view's centre, from the rect the splitter drag left rather than
+    # a fixed pixel: the dock laid the view out again when it took that drag,
+    # so a hardcoded point only holds for one window size and one layout.
     begin = len(session.read_log())
-    session.send("click 640 317")
+    session.send("gizmo translate")
+    gizmo_point_x = moved[0] + moved[2] * 0.5
+    gizmo_point_y = moved[1] + moved[3] * 0.5
+    session.send(f"click {gizmo_point_x:.0f} {gizmo_point_y:.0f}")
     found, _ = session.wait_either(
         [PICK_ENTITY_PATTERN, PICK_NOTHING_PATTERN], 120, begin
     )
@@ -4390,7 +4403,7 @@ def _preferences_and_theme_steps(state: StepState) -> None:
     dump = session.read_log()[begin:]
     assert re.search(r'snapping_translation="0\.25"', dump), dump[-600:]
     assert re.search(r'history_step_cap="400"', dump), dump[-600:]
-    assert re.search(r'project="italian_brainrot"', dump), dump[-600:]
+    assert re.search(r'project="scene"', dump), dump[-600:]
     print("  [OK] the seeded preferences reached the tab's view")
 
     # One row through the scripted save: the file, the tab's view and
@@ -4423,13 +4436,13 @@ def _preferences_and_theme_steps(state: StepState) -> None:
     begin = len(session.read_log())
     session.send("command editor.tool_translate")
     session.wait(
-        re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN) + r'\s+project="italian_brainrot"',
+        re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN) + r'\s+project="scene"',
         30,
         "the tool choice persisted",
         begin,
     )
     wait_preference_value(
-        "gizmo.projects.italian_brainrot.mode",
+        "gizmo.projects.scene.mode",
         "translate",
         "the project entry carries the tool choice",
     )
@@ -4512,13 +4525,13 @@ def _preferences_and_theme_steps(state: StepState) -> None:
     begin = len(session.read_log())
     session.send("command editor.tool_rotate")
     session.wait(
-        re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN) + r'\s+project="italian_brainrot"',
+        re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN) + r'\s+project="scene"',
         30,
         "the second tool choice persisted",
         begin,
     )
     wait_preference_value(
-        "gizmo.projects.italian_brainrot.mode", "rotate", "the project entry followed"
+        "gizmo.projects.scene.mode", "rotate", "the project entry followed"
     )
     wait_preference_value("gizmo.mode", "rotate", "the last-used mode followed")
     begin = len(session.read_log())

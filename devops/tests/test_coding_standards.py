@@ -67,8 +67,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.paths import REPOSITORY_ROOT  # noqa: E402
 from core.projects import (  # noqa: E402
     EXAMPLES_RELATIVE_PATH,
-    ITALIAN_BRAINROT_CS_SRC,
-    MANAGED_PROJECT_SRC,
     MANAGED_PROJECT_SRC,
     repository_relative,
 )
@@ -221,8 +219,6 @@ COMMENT_CONTENT_SCOPE = (
 )
 CSHARP_COMMENT_CONTENT_ROOTS = (
     "modules/csharp",
-    repository_relative(MANAGED_PROJECT_SRC),
-    repository_relative(ITALIAN_BRAINROT_CS_SRC),
     repository_relative(MANAGED_PROJECT_SRC),
 )
 # Build output inside a C# tree, never source.

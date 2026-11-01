@@ -231,10 +231,6 @@ THEMED_PROJECT_THEME = SCENE_PROJECT_RES / "ui" / "accent.theme"
 # The face the editor's project theme layer installs.
 THEMED_PROJECT_FONT = SCENE_PROJECT_RES / "fonts" / "Silkscreen-Regular.ttf"
 
-# The managed port of the same scene: comment-lint scope only.
-ITALIAN_BRAINROT_CS_ROOT = TEST_PROJECTS_ROOT / "italian_brainrot_cs"
-ITALIAN_BRAINROT_CS_SRC = ITALIAN_BRAINROT_CS_ROOT / "src"
-
 
 # =============================================================================
 # The migration fixture: the components the schema scenarios rewrite

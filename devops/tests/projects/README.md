@@ -19,6 +19,19 @@ Together the three weigh 2.3 MB in 96 files - `native` 110 KB, `scene` 1.1 MB,
 `managed` 1.0 MB - against the 37.4 MB the seven projects they replaced held.
 Build output (`target/`, `build/`) is not counted and is gitignored.
 
+The `scene` fixture's models are sized for the editor's default orbit view,
+which looks at the origin from sixteen units away: at that distance the row
+fills enough of a scene viewport that a click at its centre reaches a mesh
+rather than the entity badge drawn over it. Change the scale and the editor
+suite's pick probe has to change with it.
+
+Both models past the first carry the entity reference (`scene::
+ShowcaseReferenceComponent`), each following the first one. Two carriers rather
+than one because the editor suite's reference step needs a model it has not
+selected yet to open the row, and which model a scene pick answers depends on
+the view; the first model carries none, so the reference section does not push
+its own mesh rows out of the Inspector's body.
+
 ## Conventions
 
 - A fixture is named after its directory (`native`, `scene`, `managed`), because

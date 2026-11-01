@@ -123,17 +123,19 @@ pub(crate) fn create(world: &mut World, assets: SceneAssets) -> Result<(), Strin
         }
     }
 
-    // The last model points at the first one, set from code so the Inspector's
-    // reference row names a target the moment the project loads. One model
-    // carries it rather than all of them: a single reference shows the row, and
-    // the reference section is drawn above the others, so putting it on every
-    // model would push the first model's mesh rows out of the Inspector's body.
+    // Every model but the first points at the first one, set from code so the
+    // Inspector's reference row names a target the moment the project loads.
+    // The first model carries none: the reference section is drawn above the
+    // others, and putting it on that model too would push its own mesh rows out
+    // of the Inspector's body. Two carriers rather than one because the row's
+    // steps need a model the editor has not selected yet, and which model a
+    // scene pick answers depends on the view.
     if let Some(target) = follow_target {
         let tagged: Vec<Entity> = {
             let mut query = Query::<(&TagAlphaComponent, Entity)>::new(world);
             query.iter_mut().map(|(_, entity)| entity).collect()
         };
-        if let Some(follower) = tagged.iter().copied().find(|entity| *entity != target) {
+        for follower in tagged.iter().copied().filter(|entity| *entity != target) {
             if world
                 .get_component::<ShowcaseReferenceComponent>(follower)
                 .is_none()
