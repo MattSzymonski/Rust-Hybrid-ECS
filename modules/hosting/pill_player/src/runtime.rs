@@ -253,7 +253,6 @@ impl Runtime {
             // keeps no copy, so the console report stays the printed record.
             #[cfg(feature = "metrics")]
             record_frame_metrics(
-                self.engine.world().entity_count(),
                 frame_start.elapsed().as_secs_f64() * 1000.0,
                 self.last_measured_fps,
             );
@@ -267,11 +266,7 @@ impl Runtime {
         self.last_report = Instant::now();
 
         #[cfg(feature = "metrics")]
-        record_frame_metrics(
-            entity_count,
-            frame_start.elapsed().as_secs_f64() * 1000.0,
-            fps,
-        );
+        record_frame_metrics(frame_start.elapsed().as_secs_f64() * 1000.0, fps);
 
         // The frame-statistics line the devops suites wait for. It is logged
         // from here so every build reports it the same way, under the target
@@ -565,9 +560,15 @@ pub fn run_one_frame(runtime: &mut Runtime) {
 }
 
 /// Record one frame's numerical state into the shared metrics recorder.
+///
+/// The span measured here is the caller's: `frame_start` is when the frontend
+/// began the frame, so it covers whatever it drew after the systems ran. The
+/// engine's own pass records its span as `ecs.frame_time_ms` from inside
+/// `Engine::process_frame` - one name per span, so neither histogram mixes two
+/// meanings. The entity count is the engine's to report, for the same reason:
+/// it describes the world that pass produced, and the value is the same.
 #[cfg(feature = "metrics")]
-fn record_frame_metrics(entity_count: usize, frame_time_ms: f64, fps: f64) {
-    metrics::gauge!("ecs.entities").set(entity_count as f64);
+fn record_frame_metrics(frame_time_ms: f64, fps: f64) {
     metrics::histogram!("engine.frame_time_ms").record(frame_time_ms);
     metrics::gauge!("engine.fps").set(fps);
 }
@@ -579,8 +580,171 @@ fn record_frame_metrics(entity_count: usize, frame_time_ms: f64, fps: f64) {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
     use super::*;
+
+    #[cfg(feature = "metrics")]
+    use std::collections::HashMap;
+    #[cfg(feature = "metrics")]
+    use std::sync::{Arc, OnceLock};
+
+    /// Held by every test that runs a frame.
+    ///
+    /// The metrics recorder is process-wide, so a test that counts what one
+    /// frame records needs the other frame-running tests to be between frames
+    /// while it does.
+    static FRAME_LOCK: Mutex<()> = Mutex::new(());
+
+    /// How often each metric was updated, keyed by its name.
+    #[cfg(feature = "metrics")]
+    type MetricSamples = Arc<Mutex<HashMap<String, usize>>>;
+
+    /// A `metrics` recorder that counts updates per name.
+    ///
+    /// The engine's recorder keeps nothing, so a test that asks how many
+    /// samples one frame records - and under which names - has to install a
+    /// recorder of its own. `metrics` allows one per process, which is why it
+    /// is installed once behind a `OnceLock` and shared by this binary.
+    #[cfg(feature = "metrics")]
+    struct CountingRecorder {
+        samples: MetricSamples,
+    }
+
+    /// The handle one metric name gets: every update lands in the shared map.
+    #[cfg(feature = "metrics")]
+    struct CountingHandle {
+        name: String,
+        samples: MetricSamples,
+    }
+
+    #[cfg(feature = "metrics")]
+    impl CountingHandle {
+        fn count(&self) {
+            *self
+                .samples
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(self.name.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    impl metrics::CounterFn for CountingHandle {
+        fn increment(&self, _value: u64) {
+            self.count();
+        }
+
+        fn absolute(&self, _value: u64) {
+            self.count();
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    impl metrics::GaugeFn for CountingHandle {
+        fn increment(&self, _value: f64) {
+            self.count();
+        }
+
+        fn decrement(&self, _value: f64) {
+            self.count();
+        }
+
+        fn set(&self, _value: f64) {
+            self.count();
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    impl metrics::HistogramFn for CountingHandle {
+        fn record(&self, _value: f64) {
+            self.count();
+        }
+
+        fn record_many(&self, _value: f64, _count: usize) {
+            self.count();
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    impl metrics::Recorder for CountingRecorder {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::from_arc(Arc::new(CountingHandle {
+                name: key.name().to_owned(),
+                samples: self.samples.clone(),
+            }))
+        }
+
+        fn register_gauge(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            metrics::Gauge::from_arc(Arc::new(CountingHandle {
+                name: key.name().to_owned(),
+                samples: self.samples.clone(),
+            }))
+        }
+
+        fn register_histogram(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::from_arc(Arc::new(CountingHandle {
+                name: key.name().to_owned(),
+                samples: self.samples.clone(),
+            }))
+        }
+    }
+
+    /// The installed counting recorder's map, installed on first use.
+    #[cfg(feature = "metrics")]
+    fn metric_samples() -> MetricSamples {
+        static SAMPLES: OnceLock<MetricSamples> = OnceLock::new();
+        SAMPLES
+            .get_or_init(|| {
+                let samples: MetricSamples = Arc::new(Mutex::new(HashMap::new()));
+                let installed = metrics::set_global_recorder(CountingRecorder {
+                    samples: samples.clone(),
+                });
+                assert!(
+                    installed.is_ok(),
+                    "a recorder was installed before this binary's first metrics test"
+                );
+                samples
+            })
+            .clone()
+    }
 
     /// A project that registers nothing.
     fn no_op(_engine: &mut Engine) -> u32 {
@@ -629,6 +793,9 @@ mod tests {
     /// A statically linked project starts and runs frames.
     #[test]
     fn a_static_project_starts_and_runs_frames() {
+        let _frame = FRAME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut runtime = setup(StaticProject {
             name: "project",
             backend: crate::StaticProjectBackend::Native { init: no_op },
@@ -684,11 +851,57 @@ mod tests {
     /// The hook a host passes runs once per frame, after the systems.
     #[test]
     fn the_after_systems_hook_runs_once_per_frame() {
+        let _frame = FRAME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut runtime = Runtime::new();
         let mut calls = 0;
         runtime.run_frame_with(Instant::now(), |_| calls += 1);
         runtime.run_frame_with(Instant::now(), |_| calls += 1);
         assert_eq!(calls, 2);
+    }
+
+    /// One frame records one sample per metric, each under a name that says
+    /// which span it measured.
+    ///
+    /// Two spans exist and they are not the same number: the engine's own pass,
+    /// measured inside `Engine::process_frame`, and the frame the frontend owns,
+    /// which also covers whatever it draws before the next one. One histogram
+    /// carrying both mixes two meanings into one series.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn a_frame_records_one_sample_per_metric() {
+        let _frame = FRAME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let samples = metric_samples();
+        samples
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+
+        let mut runtime = Runtime::new();
+        runtime.run_frame_with(Instant::now(), |_| {});
+
+        let counts = samples
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            counts.get("engine.frame_time_ms").copied().unwrap_or(0),
+            1,
+            "the frontend's frame is recorded once: {counts:?}"
+        );
+        assert_eq!(
+            counts.get("ecs.frame_time_ms").copied().unwrap_or(0),
+            1,
+            "the engine's pass is recorded once, under its own name: {counts:?}"
+        );
+        assert_eq!(
+            counts.get("ecs.entities").copied().unwrap_or(0),
+            1,
+            "the entity count is reported once: {counts:?}"
+        );
     }
 
     /// Input pushed through the frame driver is what the next frame's systems
@@ -712,6 +925,9 @@ mod tests {
             .engine_mut()
             .register_system("rumble_on_space", rumble_on_space);
 
+        let _frame = FRAME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         FrameDriver::push_input(
             &mut runtime,
             InputEvent::Key {

@@ -233,6 +233,22 @@ STEPS: List[Step] = [
     unit_test_step("test", "Unit tests (default lane, no hot_patch)", DEFAULT_LANE),
     unit_test_step("test-hot-patch", "Unit tests (hot_patch lane)", ["--workspace", "--features", HOT_PATCH_FEATURES]),
     Step(
+        "test-metrics",
+        "Unit tests (metrics posture)",
+        # The metrics feature is off everywhere by default, so the per-frame
+        # measurements - and the recorder tests that count them - are compiled
+        # by no other step. The two crates that record are enough: the engine
+        # emits from its own pass, the runtime records the frontend's frame.
+        [
+            [
+                "cargo", "test",
+                "-p", "pill_engine_core",
+                "-p", "pill_player",
+                "--features", "metrics",
+            ],
+        ],
+    ),
+    Step(
         "coding-standards",
         "Coding standards lint",
         # Repository-root scope, through the lint's own `is_linted`: the

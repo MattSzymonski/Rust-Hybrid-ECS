@@ -1273,13 +1273,18 @@ impl Engine {
         // which forwards them to Tracy's plot API when a profiler is attached.
         // It keeps no copy of its own: a reader that wants these values reads
         // Tracy or logs them.
+        //
+        // The time here is this pass's own span, so it is named for the world
+        // state beside it rather than for the frame: `engine.frame_time_ms` is
+        // the frontend's frame, which also covers whatever it draws between two
+        // of these and is a different number.
         #[cfg(feature = "metrics")]
         {
             metrics::gauge!("ecs.entities").set(self.world.entity_count() as f64);
             metrics::gauge!("ecs.archetypes").set(self.world.archetypes.len() as f64);
             metrics::gauge!("ecs.systems").set(self.systems.len() as f64);
             metrics::gauge!("ecs.components").set(self.world.component_registry.len() as f64);
-            metrics::histogram!("engine.frame_time_ms")
+            metrics::histogram!("ecs.frame_time_ms")
                 .record(frame_start.elapsed().as_secs_f64() * 1000.0);
         }
     }

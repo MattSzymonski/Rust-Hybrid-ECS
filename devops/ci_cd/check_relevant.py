@@ -258,9 +258,12 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
         selected.append(suite_check("test_hot_reload_suite.py", "host reload path changed"))
         selected.append(suite_check("test_hot_patch_coverage.py", "host patch path changed"))
     if has("modules/hosting/pill_player/**", "modules/rendering/pill_renderer_api/**"):
-        selected.append(cargo_check("check shipping", ("check", "-p", "pill_standalone",
-                                                       "--no-default-features", "--features", "shipping",
-                                                       "--offline"), "runtime changed"))
+        # The shipping posture type-checks against a *generated* bundle, and the
+        # tracked one is the project-agnostic stub that deliberately refuses to
+        # compile, so a bare `cargo check` here fails on any clean tree. The
+        # gate's own step generates the bundle from the fixture and puts the
+        # stub back afterwards, which is the only way this check means anything.
+        selected.append(verify_check("check-shipping", "runtime changed"))
         selected.append(suite_check("test_shipping_smoke.py", "runtime changed"))
 
     # The bundle's tracked files are the stub a fresh clone needs: a change
