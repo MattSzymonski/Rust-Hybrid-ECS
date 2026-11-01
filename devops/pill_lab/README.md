@@ -204,8 +204,8 @@ suites in `devops/tests/` use.
 | ---------------- | ------------------------------------ | ----------------------------------------- |
 | `module_reload`  | `pill_spline` constant               | `extension hot reload complete`           |
 | `cascade_total`  | same edit                            | the cascaded `[analytics] reload project` |
-| `project_reload` | `examples/local/project_rs` constant | project reload analytics                  |
-| `csharp_reload`  | `examples/local/project_cs` probe    | `C# hot reload complete`                  |
+| `project_reload` | `devops/tests/projects/project_rs` constant | project reload analytics                  |
+| `csharp_reload`  | `devops/tests/projects/managed` probe    | `C# hot reload complete`                  |
 
 Native cases also carry the host's own phase split (build / stage / load / init
 / migrate) and the crates cargo rebuilt. The C# path emits no analytics line,

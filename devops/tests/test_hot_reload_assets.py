@@ -9,11 +9,11 @@ REQUIREMENTS
   - Rust toolchain (cargo)
 
 DESCRIPTION
-    Drives the headless dev host on `examples/local/master_renderer_test`, whose
-    helmet textures are imported through `.meta` files, and checks that the
-    host's asset watcher reimports an asset in place while the game runs:
+    Drives the headless dev host on `devops/tests/projects/scene`, whose sample
+    map is imported through a `.meta` file, and checks that the host's asset
+    watcher reimports an asset in place while the game runs:
 
-      1. metadata edit - `helmet_emissive.jpg.meta` changes `texture_type`
+      1. metadata edit - `reimport_sample.png.meta` changes `texture_type`
          from `Color` to `Normal`. The host must log `[assets] reimported` for
          that asset, with the guid in the file and a content version that
          moved. The line is only printed when the loaded value was replaced in
@@ -30,9 +30,9 @@ DESCRIPTION
          and back. Each time the host must log `[assets] followed a move`,
          keeping the asset's handle and guid: no new import, and no warning
          that the old source was deleted.
-      5. material edit - `materials/helmet.material`, a standalone asset with
+      5. material edit - `materials/teapot.material`, a standalone asset with
          no `.meta`, changes a parameter. The host must reimport the material
-         in its slot, re-resolving the shader and maps it names by guid.
+         in its slot, re-resolving the shader it names by guid.
 
     Every file the suite touches is restored byte for byte afterwards.
 
@@ -65,11 +65,11 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Configuration
 # =============================================================================
 
-PROJECT_ROOT = MASTER_RENDERER_TEST_ROOT
-ASSET_NAME = "textures/helmet_emissive.jpg"
+PROJECT_ROOT = SCENE_PROJECT_ROOT
+ASSET_NAME = "textures/reimport_sample.png"
 SOURCE_FILE = PROJECT_ROOT / "res" / ASSET_NAME
 METADATA_FILE = SOURCE_FILE.with_name(SOURCE_FILE.name + ".meta")
-MATERIAL_NAME = "materials/helmet.material"
+MATERIAL_NAME = "materials/teapot.material"
 MATERIAL_FILE = PROJECT_ROOT / "res" / MATERIAL_NAME
 DATA_CRATE_ROOT = (
     MODULES_ROOT / "extensions" / "pill_master_renderer" / "pill_master_renderer_data" / "src" / "pill_master_renderer_data.rs"
@@ -311,7 +311,7 @@ def main() -> None:
         BACKUP.capture(path)
 
     environment = os.environ.copy()
-    environment["PROJECT_PATH"] = MASTER_RENDERER_TEST_PATH
+    environment["PROJECT_PATH"] = SCENE_PROJECT_PATH
     process, monitor = launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
     results = {}
     try:

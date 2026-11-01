@@ -16,7 +16,8 @@
 //! window live in `pill_player`, which a shipping build runs directly; this
 //! module adds what developing needs around them. [`DevHost`] wraps the
 //! runtime for the headless path, [`RenderingHost`] adds the renderer module
-//! and its window, and backend-specific loading stays behind [`LoadedProject`].
+//! and the surfaces it draws on, and backend-specific loading stays behind
+//! [`LoadedProject`].
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -43,12 +44,13 @@ use pill_engine::{AssetGuid, InputEvent, RumbleRequest};
 use pill_player::registration::extension_owner;
 #[cfg(feature = "rendering")]
 use pill_player::{AttachedRenderer, RendererWindow};
-use pill_player::{FrameDriver, FrameReport, Runtime};
+use pill_player::{FrameDriver, Runtime};
 #[cfg(feature = "rendering")]
 use pill_renderer_api::{PillRenderer, RenderViewport, RendererError};
 
 // Current crate
 use crate::analytics;
+use crate::asset_watcher::AssetChange;
 use crate::config::project_depends_on_crate;
 use crate::csharp::{BuildCollection, BuildOutcome, BuildReport, ModuleExposedComponent};
 use crate::extension::{ExtensionSlot, ReloadOutcome};
@@ -61,23 +63,70 @@ use crate::watcher::spawn_source_watcher;
 use crate::{HostConfig, ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// The renderer data crate's development shader reload export; see
+/// `pill_master_renderer_data::shader_hot_reload`.
+#[cfg(feature = "rendering")]
+const SHADER_CHANGED_EXPORT: &str = "pill_render_data_shader_changed";
+
+/// What [`SHADER_CHANGED_EXPORT`] returns when it could not look at the assets
+/// at all.
+#[cfg(feature = "rendering")]
+const SHADER_CHANGE_REFUSED: u32 = u32::MAX;
+
+/// Signature of [`SHADER_CHANGED_EXPORT`]: the world, the re-cooked file's
+/// path relative to the crate's `shader_sources/`, and its WGSL; returns how
+/// many shader assets changed.
+#[cfg(feature = "rendering")]
+type ShaderChangedFunction = unsafe extern "C" fn(
+    world: *mut pill_engine::World,
+    path: *const u8,
+    path_len: usize,
+    wgsl: *const u8,
+    wgsl_len: usize,
+) -> u32;
+
+/// File a developer or a script drops to drive live patching, relative to the
+/// workspace root.
+///
+/// A file rather than an environment variable because the request has to reach a
+/// process that is already running, and rather than a console command because
+/// the standalone host has no input loop and its stdout is routinely redirected.
+///
+/// One line, either `list` (print every generation this session installed),
+/// `<function>@<generation>` (reinstall that generation), `<function>@previous`
+/// (step back one from whatever is running), or `<function>@0` (the code the
+/// artifact was built with). It is deleted as soon as it is read, so a request
+/// is honoured exactly once.
+#[cfg(feature = "hot_patch")]
+const ROLLBACK_REQUEST_FILE: &str = "target/hot/rollback.request";
+
+// =============================================================================
 // Types + Impls
 // =============================================================================
 
-/// Everything the frame-step loop needs, assembled once during startup.
+/// An editor-only module whose tolerated first load failed.
 ///
-/// An editor-only module whose tolerated first load failed: kept with the
-/// owner tag and watcher counter its first load would have had, so
-/// [`DevHost::retry_extension`] can build and load it later without
+/// Kept with the owner tag and watcher counter its first load would have had,
+/// so [`DevHost::retry_extension`] can build and load it later without
 /// restarting the host.
 struct PendingModule {
+    /// The module's configuration, reused verbatim by the retry.
     config: crate::config::ExtensionConfig,
+    /// The owner tag the module's systems register under once it loads.
     owner: pill_engine::SystemOwner,
+    /// The counter the module's source watcher bumps once one runs.
     source_edit_generation: Arc<AtomicU64>,
 }
 
-/// Bundling this state lets headless, windowed, and editor frontends share the
-/// same engine lifetime and hot-reload behavior through [`run_one_frame`].
+/// The headless development host.
+///
+/// It owns the runtime (the engine and its frame), the loaded project image and
+/// every extension slot, and reloads them at each frame boundary
+/// ([`run_one_frame`]). Bundling this state lets headless, windowed, and editor
+/// frontends share the same engine lifetime and hot-reload behavior.
 pub struct DevHost {
     /// The directory every spawned cargo build runs in and every artifact path
     /// is resolved against.
@@ -114,10 +163,10 @@ pub struct DevHost {
     /// rebuild: a reloaded module the project links directly, or a module swap
     /// that changed the C# mirror surface.
     ///
-    /// Separate from [`Self::source_edit_generation`] on purpose. The two mean
-    /// different things - "a source save arrived" versus "a rebuilt module
-    /// crate must be re-embedded" - and while one counter carried both, a
-    /// fast-path patch of the project's own edit consumed the cascade's bump
+    /// Separate from [`Self::source_edit_generation`] on purpose: "a source
+    /// save arrived" and "a rebuilt module crate must be re-embedded" are
+    /// different reasons to rebuild, and one counter carrying both lets a
+    /// fast-path patch of the project's own edit consume the cascade's bump
     /// along with the edit, silently skipping the rebuild. No fast path
     /// consumes this counter, so the rebuild stays owed until
     /// `loaded_project.reload` runs. Written and read by the frame thread
@@ -401,12 +450,6 @@ impl DevHost {
         }
     }
 
-    /// Snapshot the current frame rate and entity count without resetting the
-    /// three-second reporting window used by console frontends.
-    pub fn current_frame_report(&self) -> FrameReport {
-        self.runtime.current_frame_report()
-    }
-
     /// The project's `res` directory, when the host knows it.
     pub fn asset_directory(&self) -> Option<&Path> {
         self.asset_directory.as_deref()
@@ -561,8 +604,9 @@ impl DevHost {
 impl FrameDriver for DevHost {
     type Error = std::convert::Infallible;
 
-    fn run_frame(&mut self) -> Result<Option<FrameReport>, Self::Error> {
-        Ok(run_one_frame(self))
+    fn run_frame(&mut self) -> Result<(), Self::Error> {
+        run_one_frame(self);
+        Ok(())
     }
 
     // The bare dev host draws no surface; its renderer lives in
@@ -585,7 +629,7 @@ impl FrameDriver for DevHost {
     }
 }
 
-/// The development host with the engine renderer attached to one native window.
+/// The development host with the engine renderer drawing on native surfaces.
 ///
 /// Keeping the renderer beside [`DevHost`] makes its creation and lifetime part
 /// of host setup. Executable crates never construct or retain GPU resources.
@@ -613,9 +657,9 @@ pub struct RenderingHost {
     /// Whether the last frame drew the surfaces; the frontend clears its
     /// scene-changed flag on the frames this is true.
     scene_drawn: bool,
-    /// Watches the renderer data crate's `shaders/` and queues what it
-    /// re-cooks; `None` without a renderer, or when its data crate has no
-    /// shaders or the watch could not start.
+    /// Watches the renderer data crate's `shader_sources/` tree and queues
+    /// what it re-cooks; `None` without a renderer, or when its data crate has
+    /// no shaders or the watch could not start.
     shader_watcher: Option<crate::shader_watcher::ShaderWatcher>,
     /// Set whenever a renderer backend attaches; the next frame then reports
     /// the render data the renderer ignores, once per renderer generation.
@@ -646,59 +690,6 @@ enum RendererStep {
     Failed,
 }
 
-/// Whether rendering should be paused after one frame boundary.
-///
-/// `paused` is the state before it; `data_layout_changed` says whether the
-/// renderer's data crate reloaded this boundary with a different component
-/// layout; `step` is what the renderer step did. A renderer that attached
-/// successfully always resumes; a layout change without one pauses; anything
-/// else keeps the current state.
-#[cfg(feature = "rendering")]
-fn pause_after_boundary(
-    paused: Option<PauseReason>,
-    data_layout_changed: bool,
-    step: RendererStep,
-) -> Option<PauseReason> {
-    match step {
-        RendererStep::Attached => None,
-        RendererStep::Failed | RendererStep::Unchanged if data_layout_changed => {
-            Some(PauseReason::StaleRendererAfterDataLayoutChange)
-        }
-        RendererStep::Failed | RendererStep::Unchanged => paused,
-    }
-}
-
-/// The structural hash of every component the named extension registered,
-/// by component name, or empty when no such extension is loaded.
-///
-/// Taken before and after a reload of the renderer's data crate, to tell a
-/// layout change (the renderer must not read the rows until it is rebuilt)
-/// from a body-only one (it may).
-#[cfg(feature = "rendering")]
-fn component_schemas_of(host: &DevHost, extension: &str) -> Vec<(String, Option<u64>)> {
-    let Some(slot) = host.extensions.iter().find(|slot| slot.name() == extension) else {
-        return Vec::new();
-    };
-    let world = host.runtime.engine().world();
-    let mut schemas: Vec<(String, Option<u64>)> = slot
-        .exposed_component_names()
-        .iter()
-        .map(|name| {
-            let schema = world
-                .resolve_component_id_by_name_any(name)
-                .ok()
-                .flatten()
-                .and_then(|component| world.component_field_layout(component))
-                .filter(|fields| !fields.is_empty())
-                .map(pill_engine::component::component_schema_hash);
-            (name.clone(), schema)
-        })
-        .collect();
-    schemas.sort();
-    schemas.dedup();
-    schemas
-}
-
 #[cfg(feature = "rendering")]
 impl RenderingHost {
     /// Move rendering to a newly created native window surface.
@@ -706,6 +697,11 @@ impl RenderingHost {
     /// The existing ECS host and project module remain alive. A replacement is
     /// constructed before the old renderer is dropped, so initialization
     /// failure leaves the current surface untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RendererError`] when the replacement window's surface cannot
+    /// be created or the renderer cannot attach to it.
     pub fn retarget_render_window<W>(
         &mut self,
         window: W,
@@ -961,12 +957,12 @@ impl RenderingHost {
     /// The candidates are the shared components the renderer's data crate
     /// registered and at least one entity carries. Shared, because render data
     /// has to be to reach the renderer module at all - its own copy of a type
-    /// only finds the world's column through the shared identity - while the
-    /// plain components the data crate registers along the way (the engine's
-    /// `Position` and `Color`) are not render data. A candidate missing from the
-    /// renderer's `RenderCapabilities::consumed_components` draws nothing, and
-    /// a project should hear so rather than wonder why its fog volume or light
-    /// has no effect.
+    /// only finds the world's column through the shared identity - while a
+    /// plain component the data crate registers along the way is not render
+    /// data. A candidate missing from the renderer's
+    /// `RenderCapabilities::consumed_components` draws nothing, and a project
+    /// should hear so rather than wonder why its directional light has no
+    /// effect.
     fn report_unsupported_render_data(&self, data_extension: Option<&str>) {
         let Some(slot) = data_extension
             .and_then(|data| self.host.extensions.iter().find(|slot| slot.name() == data))
@@ -1018,7 +1014,11 @@ impl RenderingHost {
     }
 
     /// Execute one ECS frame and present its resulting world to the surface.
-    pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RendererError`] when the renderer cannot draw the frame.
+    pub fn run_one_frame(&mut self) -> Result<(), RendererError> {
         let frame_start = Instant::now();
 
         // Step 1: The data crate's schemas before any reload, when it has an
@@ -1052,14 +1052,14 @@ impl RenderingHost {
         let shaders_delivered = self.deliver_shader_changes(data_extension.as_deref());
 
         // Step 3: The frame's systems.
-        let report = run_frame_phase(&mut self.host, frame_start);
+        run_frame_phase(&mut self.host, frame_start);
 
         // Step 4: While paused the live renderer must not read the world.
         if self.paused.is_some() {
             self.scene_drawn = false;
-            return Ok(report);
+            return Ok(());
         }
-        // Step 5: an idle editor draws nothing. When the frontend reports its
+        // Step 5: An idle editor draws nothing. When the frontend reports its
         // scene quiet, the project's systems are paused and nothing this
         // boundary touched the renderer, the surfaces keep their last presented
         // image: with the world not advancing, the image cannot be stale.
@@ -1073,7 +1073,7 @@ impl RenderingHost {
             && !shaders_delivered
         {
             self.scene_drawn = false;
-            return Ok(report);
+            return Ok(());
         }
         // After the frame's systems, so entities a startup system spawns are
         // counted too; while paused the check waits for the renderer that
@@ -1090,7 +1090,7 @@ impl RenderingHost {
         self.display
             .deliver_preview_results(self.host.runtime.engine_mut().world_mut());
         self.scene_drawn = true;
-        Ok(report)
+        Ok(())
     }
 
     /// The wrapped development host.
@@ -1116,7 +1116,7 @@ impl RenderingHost {
 impl FrameDriver for RenderingHost {
     type Error = RendererError;
 
-    fn run_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
+    fn run_frame(&mut self) -> Result<(), RendererError> {
         self.run_one_frame()
     }
 
@@ -1256,8 +1256,7 @@ fn index_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path
 /// what it owns is loaded module images: dropping one unmaps code the engine
 /// may still be running, and a fault in that unmap would destroy the only copy
 /// of this error. Reporting first is what keeps the failure legible when the
-/// unload then crashes, which is how the first windowed-startup failure went
-/// missing.
+/// unload then crashes.
 fn report_setup_failure(error: HostError) -> HostError {
     let cause_chain = format_error_chain(&error);
     // "Host setup failed" is what the suites wait for when a start must fail.
@@ -1298,7 +1297,8 @@ fn optional_failure_output(error: &HostError) -> String {
     }
 }
 
-/// Build/load the project module, create the engine, and start its source watcher.
+/// Builds and loads every module, creates the engine, and starts the source
+/// watchers.
 ///
 /// # Errors
 ///
@@ -1321,14 +1321,17 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         module.validate()?;
     }
 
-    // Step 2: Resolve the workspace root and print the selected configuration.
+    // Step 2: Prepare the workspace: its root, the sweep of whatever an
+    // earlier run left behind, the engine, and the build of every native
+    // module.
+    //
     // The engine owns this root (see [`crate::config::engine_workspace_root`]),
     // so it does not depend on the directory the process was launched from.
     let workspace_root = crate::config::engine_workspace_root()?;
 
     print_startup_configuration(&workspace_root, &module_config);
 
-    // Step 2a: Sweep the staging an earlier run left, whatever backend this is.
+    // Sweep the staging an earlier run left, whatever backend this is.
     //
     // The staging directory holds loaded module copies, the engine dylibs
     // staged beside them, and the hot-patch scratch images - none of it any
@@ -1336,7 +1339,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     // so the sweep cannot depend on the project's backend.
     cleanup_temporary_files(&workspace_root);
 
-    // Step 3: Construct the engine and its stable API table.
+    // Construct the engine and its stable API table.
     // EngineApi stores a raw pointer into the runtime's boxed engine, whose
     // address does not change when the runtime moves.
     let mut runtime = Runtime::new();
@@ -1353,7 +1356,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     pill_player::insert_debug_resources(runtime.engine_mut().world_mut(), true);
     let engine_api = EngineApi::new(runtime.engine_mut());
 
-    // Step 3b: Announce every module this start builds, in build order: the
+    // Announce every module this start builds, in build order: the
     // extensions, the project, and - in a windowed host - the renderer's GPU
     // module, which is built once the window opens.
     let mut planned_builds: Vec<crate::build_progress::PlannedBuild> = host_config
@@ -1378,14 +1381,14 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     }
     crate::build_progress::announce_plan(&host_config.name, planned_builds);
 
-    // Step 3b: Build every native module in ONE cargo invocation: the
-    // extensions, the project's member and - in a windowed host - the
-    // renderer's wrapper, which is an ordinary wrapper build whose load waits
-    // for the window. Each module build otherwise pays cargo's fixed
-    // process-and-resolve cost again, which is what made a start scale
-    // linearly in cargo invocations; the batch shares it. Modules whose
-    // artifacts the batch validated skip their own build when they load below
-    // (Step 4) - an edit later still rebuilds a module on its own.
+    // Build every native module in ONE cargo invocation: the extensions, the
+    // project's member and - in a windowed host - the renderer's wrapper,
+    // which is an ordinary wrapper build whose load waits for the window.
+    // Each module built on its own otherwise pays cargo's fixed
+    // process-and-resolve cost again, so a start would scale linearly in cargo
+    // invocations; the batch shares it. Modules whose artifacts the batch
+    // validated skip their own build when they load below (Step 3) - an edit
+    // later still rebuilds a module on its own.
     crate::build_runner::build_extension_batch(
         &workspace_root,
         &host_config.extensions,
@@ -1397,13 +1400,14 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         },
     );
 
-    // Step 4: Build, load and watch the extensions before the project.
+    // Step 3: Build, load and watch the extensions before the project.
     // Modules are infrastructure: loading them first means the project can rely
     // on whatever they register. The renderer's data crate, when the project
     // selects a renderer, is the first of them (see `HostConfig::renderer`), so
     // extensions and the project find its components registered and the C#
-    // bridge binds them like any extension's, headless included. Each gets its own owner tag and its own
-    // generation counter, so later reloads stay isolated from each other.
+    // bridge binds them like any extension's, headless included. Each gets its
+    // own owner tag and its own generation counter, so later reloads stay
+    // isolated from each other.
     let mut extensions = Vec::with_capacity(host_config.extensions.len());
     let mut pending_modules: Vec<PendingModule> = Vec::new();
     // One patch session per LOADED extension, index-aligned with
@@ -1478,8 +1482,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     // missing stops the host with the module and the path in the message
     // instead of leaving a scene that quietly draws nothing.
     pill_engine::asset_store::verify_module_roots();
-    // Step 5: Build and load the project module, then start its source watcher.
-    // Extensions load first, so the C# backend can be handed every
+    // Step 4: Build and load the project module, then start its source
+    // watcher. Extensions load first, so the C# backend can be handed every
     // native component the modules exposed to managed code: each module's
     // registered type names resolve to its native components, and the
     // C#-facing name is the Rust path with `::` replaced by `.` so a
@@ -1536,22 +1540,22 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         return Err(fail_setup(runtime, error.into()));
     }
 
-    // Step 5b: Import the project's source assets when its settings ask for
-    // it, once every module has registered its imported asset types.
+    // Import the project's source assets when its settings ask for it, once
+    // every module has registered its imported asset types.
     if host_config.assets.scan_on_start {
         if let Some(asset_directory) = &host_config.asset_directory {
             scan_project_assets(runtime.engine_mut(), asset_directory);
         }
     }
 
-    // Step 5c: Index every asset of the project by guid and by path, loaded
-    // or not, so a reference can find and load one. After the module
-    // and project registrations, which say which extensions are standalone.
+    // Index every asset of the project by guid and by path, loaded or not, so
+    // a reference can find and load one. After the module and project
+    // registrations, which say which extensions are standalone.
     if let Some(asset_directory) = &host_config.asset_directory {
         index_project_assets(runtime.engine_mut(), asset_directory);
     }
 
-    // Step 6: Snapshot host memory and print the startup analytics report.
+    // Step 5: Snapshot host memory and print the startup analytics report.
     // Every module has been built, staged, loaded and initialized by now, so
     // the table carries the complete startup picture.
     analytics::record_host_memory();
@@ -1628,7 +1632,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
 
     Ok(host)
 }
-/// Set up the engine, project module, hot reload, and renderer together.
+
+/// Sets up the engine, project module, hot reload, and renderer together.
 ///
 /// A frontend owns its platform event loop and supplies its cloneable window
 /// handle. The engine creates exactly one surface for that window, while the
@@ -1651,6 +1656,59 @@ where
 {
     let host = setup(project.into())?;
     attach_renderer(host, window, width, height)
+}
+
+/// Whether rendering should be paused after one frame boundary.
+///
+/// `paused` is the state before it; `data_layout_changed` says whether the
+/// renderer's data crate reloaded this boundary with a different component
+/// layout; `step` is what the renderer step did. A renderer that attached
+/// successfully always resumes; a layout change without one pauses; anything
+/// else keeps the current state.
+#[cfg(feature = "rendering")]
+fn pause_after_boundary(
+    paused: Option<PauseReason>,
+    data_layout_changed: bool,
+    step: RendererStep,
+) -> Option<PauseReason> {
+    match step {
+        RendererStep::Attached => None,
+        RendererStep::Failed | RendererStep::Unchanged if data_layout_changed => {
+            Some(PauseReason::StaleRendererAfterDataLayoutChange)
+        }
+        RendererStep::Failed | RendererStep::Unchanged => paused,
+    }
+}
+
+/// The structural hash of every component the named extension registered,
+/// by component name, or empty when no such extension is loaded.
+///
+/// Taken before and after a reload of the renderer's data crate, to tell a
+/// layout change (the renderer must not read the rows until it is rebuilt)
+/// from a body-only one (it may).
+#[cfg(feature = "rendering")]
+fn component_schemas_of(host: &DevHost, extension: &str) -> Vec<(String, Option<u64>)> {
+    let Some(slot) = host.extensions.iter().find(|slot| slot.name() == extension) else {
+        return Vec::new();
+    };
+    let world = host.runtime.engine().world();
+    let mut schemas: Vec<(String, Option<u64>)> = slot
+        .exposed_component_names()
+        .iter()
+        .map(|name| {
+            let schema = world
+                .resolve_component_id_by_name_any(name)
+                .ok()
+                .flatten()
+                .and_then(|component| world.component_field_layout(component))
+                .filter(|fields| !fields.is_empty())
+                .map(pill_engine::component::component_schema_hash);
+            (name.clone(), schema)
+        })
+        .collect();
+    schemas.sort();
+    schemas.dedup();
+    schemas
 }
 
 /// The shared components among `registered` that at least one entity in
@@ -1684,27 +1742,6 @@ fn unsupported_render_components(
         })
         .collect()
 }
-
-/// The renderer data crate's development shader reload export; see
-/// `pill_master_renderer_data::shader_hot_reload`.
-#[cfg(feature = "rendering")]
-const SHADER_CHANGED_EXPORT: &str = "pill_render_data_shader_changed";
-
-/// What that export returns when it could not look at the assets at all.
-#[cfg(feature = "rendering")]
-const SHADER_CHANGE_REFUSED: u32 = u32::MAX;
-
-/// Signature of [`SHADER_CHANGED_EXPORT`]: the world, the re-cooked file's
-/// path relative to `shaders/`, and its WGSL; returns how many shader assets
-/// changed.
-#[cfg(feature = "rendering")]
-type ShaderChangedFunction = unsafe extern "C" fn(
-    world: *mut pill_engine::World,
-    path: *const u8,
-    path_len: usize,
-    wgsl: *const u8,
-    wgsl_len: usize,
-) -> u32;
 
 /// Start watching the renderer data crate's shader sources, when the host has
 /// a renderer and its data crate has a `shader_sources/` directory.
@@ -2282,6 +2319,11 @@ type RegeneratedMirror = (
 /// managed method table), and whether the mirror file on disk actually
 /// changed. The change flag lets the reload path queue a C# project rebuild
 /// only when the C# surface moved.
+///
+/// # Errors
+///
+/// Returns a [`CSharpError::CodegenFailed`] when the mirror file cannot be
+/// written.
 fn regenerate_module_csharp_mirror(
     workspace_root: &Path,
     slot: &ExtensionSlot,
@@ -2329,9 +2371,6 @@ fn module_mirror_ownership(
         .collect()
 }
 
-/// Run every reload step of one frame: module reloads, the per-function fast
-/// paths, a pending project reload, and the analytics drain that reports them.
-///
 /// Collect a finished C# assembly build and complete its reload at this frame
 /// boundary.
 ///
@@ -2485,13 +2524,14 @@ fn peer_component_names(
     names
 }
 
-/// Runs in two parts around a background patch build: with nothing in flight
-/// it prepares one and starts it, and while one is running every step here is
-/// deferred - the frame keeps rendering and the build is collected and
-/// activated at the first boundary after it finishes.
+/// Run every reload step of one frame: the extensions' own reloads, the
+/// per-function fast paths, a pending project reload, the suspension of a
+/// subject left on a replaced component layout, and the analytics line that
+/// reports them.
 ///
-/// Separated from [`run_one_frame`] so the reload work reads as one sequence,
-/// apart from the frame the runtime runs after it.
+/// Returns the names of the extensions that reloaded, in load order, for a
+/// windowed host's renderer step. A step that owes a background build leaves
+/// the rest to a later frame instead of blocking this one.
 fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     // Step 1: Reload any extension whose sources changed. Each module
     // owns an independent generation counter and clears only its own systems,
@@ -2926,13 +2966,12 @@ fn suspend_stale_subjects(host: &mut DevHost) {
     }
 }
 
-/// Process hot reloads, execute one scheduler frame, and update FPS tracking.
+/// Process hot reloads, execute one scheduler frame, and log the frame
+/// statistics when the reporting window elapses.
 ///
-/// Returns a report roughly every three seconds for a frontend to print or
-/// display; all other frames return `None`. The two phases back to back: a
-/// windowed host runs them itself, with its renderer step between them (see
-/// [`RenderingHost::run_one_frame`]).
-pub fn run_one_frame(host: &mut DevHost) -> Option<FrameReport> {
+/// The two phases back to back: a windowed host runs them itself, with its
+/// renderer step between them (see [`RenderingHost::run_one_frame`]).
+pub fn run_one_frame(host: &mut DevHost) {
     let frame_start = Instant::now();
     run_reload_phase(host);
     run_frame_phase(host, frame_start)
@@ -2945,11 +2984,11 @@ pub fn run_one_frame(host: &mut DevHost) -> Option<FrameReport> {
 /// [`run_frame_phase`] so a windowed host can reload its renderer between the
 /// two - after the data it draws reloaded, before any system reads it.
 pub(crate) fn run_reload_phase(host: &mut DevHost) -> Vec<String> {
-    // Steps 1 to 5: everything reloading does, in one call so this loop is
+    // Steps 1 to 6: everything reloading does, in one call so this loop is
     // identical whether or not the machinery is compiled in.
     let reloaded_extensions = run_reload_steps(host);
 
-    // Step 6: Poll the managed loader for an assembly swap.
+    // Step 7: Poll the managed loader for an assembly swap.
     // The managed loader watches the built assembly instead of source files.
     // Only a reloading build has a managed loader to poll; this is the
     // fallback half of the deliberate two-mechanism design described on the
@@ -2965,7 +3004,7 @@ pub(crate) fn run_reload_phase(host: &mut DevHost) -> Vec<String> {
         note_managed_swap(host);
     }
 
-    // Step 7: Apply asset edits, after every reload of this boundary, so they
+    // Step 8: Apply asset edits, after every reload of this boundary, so they
     // go through the registrations current now.
     apply_asset_changes(host);
     reloaded_extensions
@@ -3024,8 +3063,6 @@ fn guid_text(guid: Option<AssetGuid>) -> String {
 /// loaded value in place, and a deleted source stays loaded until the next
 /// run, because components may still hold its handle.
 fn apply_asset_changes(host: &mut DevHost) {
-    use crate::asset_watcher::AssetChange;
-
     let Some(watcher) = &host.asset_watcher else {
         return;
     };
@@ -3134,8 +3171,8 @@ fn apply_asset_changes(host: &mut DevHost) {
                     && registry.is_loaded(assets, Path::new(&source)) =>
             {
                 warn!(
-                target: telemetry_target::HOT_RELOAD,
-                asset = source.as_str(),
+                    target: telemetry_target::HOT_RELOAD,
+                    asset = source.as_str(),
                     "[assets] source deleted; the asset stays loaded until the next run"
                 )
             }
@@ -3164,8 +3201,8 @@ fn apply_asset_changes(host: &mut DevHost) {
                     && registry.is_loaded(assets, Path::new(&source)) =>
             {
                 info!(
-                target: telemetry_target::HOT_RELOAD,
-                asset = source.as_str(),
+                    target: telemetry_target::HOT_RELOAD,
+                    asset = source.as_str(),
                     "[assets] metadata file deleted; the loaded asset keeps its guid and settings until the next run"
                 )
             }
@@ -3203,7 +3240,7 @@ fn apply_asset_changes(host: &mut DevHost) {
 }
 
 /// One scheduler frame and its reporting, run by the wrapped runtime.
-pub(crate) fn run_frame_phase(host: &mut DevHost, frame_start: Instant) -> Option<FrameReport> {
+pub(crate) fn run_frame_phase(host: &mut DevHost, frame_start: Instant) {
     let DevHost { runtime, .. } = host;
     runtime.run_frame_with(frame_start, |_| {
         // No per-frame native hook exists: a project and every extension run
@@ -3212,21 +3249,6 @@ pub(crate) fn run_frame_phase(host: &mut DevHost, frame_start: Instant) -> Optio
         // per-frame hook would use.
     })
 }
-
-/// File a developer or a script drops to drive live patching, relative to the
-/// workspace root.
-///
-/// A file rather than an environment variable because the request has to reach a
-/// process that is already running, and rather than a console command because
-/// the standalone host has no input loop and its stdout is routinely redirected.
-///
-/// One line, either `list` (print every generation this session installed),
-/// `<function>@<generation>` (reinstall that generation), `<function>@previous`
-/// (step back one from whatever is running), or `<function>@0` (the code the
-/// artifact was built with). It is deleted as soon as it is read, so a request
-/// is honoured exactly once.
-#[cfg(feature = "hot_patch")]
-const ROLLBACK_REQUEST_FILE: &str = "target/hot/rollback.request";
 
 /// Honour a pending request, if one was dropped.
 ///
@@ -3432,9 +3454,9 @@ fn print_patch_generations(host: &DevHost) {
 /// Every loaded artifact a plain-function patch must be offered to.
 ///
 /// One entry per currently loaded library: the project and each extension.
-///  A crate linked into several of them is compiled into each, so each
-/// holds an independent redirect slot for the same function and all of them
-/// have to be told about the replacement.
+/// A crate linked into several of them is compiled into each, so each holds
+/// an independent redirect slot for the same function and all of them have to
+/// be told about the replacement.
 ///
 /// Retired generations are deliberately left out. They stay mapped only so
 /// outstanding pointers into their code remain valid, and their systems have

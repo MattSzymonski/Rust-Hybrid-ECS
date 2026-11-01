@@ -11,7 +11,7 @@ REQUIREMENTS
 
 DESCRIPTION
     Verifies that one renderer draws one scene into two windows through two
-    cameras, on `examples/local/master_renderer_test`, through the standalone dev
+    cameras, on `devops/tests/projects/scene`, through the standalone dev
     host's test frontend (`PILL_SECOND_VIEW=1` opens a second window as
     surface 1 with a camera of its own):
 
@@ -52,7 +52,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Configuration
 # =============================================================================
 
-PROJECT_PATH = MASTER_RENDERER_TEST_PATH
+PROJECT_PATH = SCENE_PROJECT_PATH
 GPU_MODULE_SOURCE = (
     MODULES_ROOT / "extensions" / "pill_master_renderer" / "pill_master_renderer" / "src" / "lib.rs"
 )

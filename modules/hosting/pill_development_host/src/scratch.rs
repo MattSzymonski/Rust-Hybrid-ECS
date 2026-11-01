@@ -16,10 +16,15 @@
 //! rather than in a trailing call, so a failing test - which never reaches the
 //! end of its body - still removes its directory.
 
+// Standard library
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// Distinguishes directories made by the same test in one process.
 static NEXT_SCRATCH: AtomicUsize = AtomicUsize::new(0);
@@ -39,8 +44,8 @@ impl ScratchDirectory {
         let counter = NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("pill_host_{name}_{}_{counter}", std::process::id()));
-        // A same-named directory can only be one of ours from an earlier run
-        // of the same process id, so it is safe to clear.
+        // Only this helper creates these names, so a same-named directory is a
+        // leftover this process can clear.
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create the scratch directory");
         Self { path }
@@ -88,12 +93,17 @@ impl Drop for ScratchDirectory {
     }
 }
 
-/// Set a file's modification time, so a later write is provably newer.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Set a file's modification time, so a test can order files without waiting
+/// out the clock.
 ///
 /// Dating one side explicitly makes a "this file is newer than that one"
-/// comparison true by construction, with no wall-clock distance to wait out.
-/// Files only: Windows cannot open a directory to set its time, so a fixture
-/// whose walk compares directory times must stay flat.
+/// comparison true by construction. Files only: Windows cannot open a
+/// directory to set its time, so a fixture whose walk compares directory
+/// times must stay flat.
 pub(crate) fn date_file(path: &Path, modified: SystemTime) {
     let file = std::fs::File::options()
         .write(true)
@@ -102,6 +112,10 @@ pub(crate) fn date_file(path: &Path, modified: SystemTime) {
     file.set_modified(modified)
         .unwrap_or_else(|error| panic!("set the modification time of {}: {error}", path.display()));
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

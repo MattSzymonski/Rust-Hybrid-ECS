@@ -8,7 +8,7 @@
 
 # DESCRIPTION: Prepares a fresh Linux machine to build and run this workspace
 #   with:
-#       export PROJECT_PATH=../examples/local/project_cs
+#       export PROJECT_PATH=../devops/tests/projects/managed
 #       cd modules
 #       cargo run --package pill_standalone --features rendering
 #
@@ -76,7 +76,7 @@
 
 # EXAMPLE USAGE:
 #   bash devops/setup/setup_linux_environment.sh
-#   export PROJECT_PATH=../examples/local/project_cs
+#   export PROJECT_PATH=../devops/tests/projects/managed
 #   cd modules && cargo run --package pill_standalone --features rendering
 
 # --- SCRIPT ---
@@ -525,7 +525,7 @@ main() {
     printf '\n%sSetup complete.%s Run the project with:\n' "$GREEN" "$NC"
     printf '  export DOTNET_ROOT="%s"\n' "$DOTNET_ROOT"
     printf '  export PATH="$DOTNET_ROOT:$PATH"\n'
-    printf '  export PROJECT_PATH=../examples/local/project_cs\n'
+    printf '  export PROJECT_PATH=../devops/tests/projects/managed\n'
     printf '  cd modules\n'
     printf '  cargo run --package pill_standalone --features rendering\n'
     printf '\n'

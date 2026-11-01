@@ -26,7 +26,7 @@ USAGE
 
 EXAMPLE USAGE
   python devops/tests/test_engine_exports.py
-  python devops/tests/test_engine_exports.py --profile dev-optimized
+  python devops/tests/test_engine_exports.py --profile development-optimized
 
   Exit status: 0 when every dylib is under the threshold, 1 when one is over,
   2 when a dylib is missing or unreadable.

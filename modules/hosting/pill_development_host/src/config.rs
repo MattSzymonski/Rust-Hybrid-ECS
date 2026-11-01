@@ -1,23 +1,28 @@
-//! Project-module configuration shared by every host frontend.
+//! Project and extension configuration shared by every host frontend.
 //!
 //! # Responsibilities
 //!
-//! - Describes how a project module is built, watched, and loaded.
-//! - Infers the complete configuration from a single project directory.
-//! - Validates the assembled configuration before any build work starts.
+//! - Describes how the project module and each extension are built, watched
+//!   and loaded.
+//! - Infers the configuration from `PROJECT_PATH` and the project's own
+//!   `project_settings.yaml`: backend, extensions, renderer, assets, logging
+//!   and startup scene.
+//! - Resolves the renderer's two crates and an editor host's editor crates,
+//!   and generates the workspace members that build the project and each
+//!   extension crate.
+//! - Reads the editor-only `editor_settings.yaml`.
+//! - Mirrors the host's cargo profile, target triple and dioxus-CLI wrapper
+//!   onto every build the host spawns.
 //!
 //! # Design
 //!
-//! [`ProjectModuleConfig`] owns every configured value and is built by
-//! [`ProjectModuleConfig::from_environment`] from one variable, `PROJECT_PATH`,
-//! which names the project directory relative to the workspace root. The
-//! backend (native Rust or managed C#) is detected from the manifest files in
-//! that directory (`Cargo.toml` or `*.csproj`), and every path, command, and
-//! assembly name is derived from the manifest, so no project identity is
-//! compiled into the host binary. A missing or unreadable project fails fast
-//! with a [`ConfigError`] naming the offending path, and
-//! [`ProjectModuleConfig::validate`] reports the first invalid field so
-//! callers can correct it directly.
+//! [`ProjectModuleConfig`] holds the project module's values; [`HostConfig`]
+//! adds the extension list and the posture switches. The backend (native Rust
+//! or managed C#) comes from the manifest in the project directory
+//! (`Cargo.toml` or `*.csproj`), and every path, command and assembly name is
+//! derived from it, so no project identity is compiled into the host binary.
+//! A missing or unreadable project fails fast with a [`ConfigError`] naming
+//! the offending path.
 
 // Standard library
 use std::collections::{BTreeMap, HashSet};
@@ -121,9 +126,12 @@ const GENERATED_DIRECTORY: &str = "generated";
 /// loads (after the folder's runtime crates) and no other build ever sees.
 pub(crate) const EDITOR_CRATE_SUFFIX: &str = "_editor";
 
-/// The editor frontend the `pill_editor` host and the standalone's editor
-/// posture report as. An editor crate tagged with another name (see
-/// `declared_editor_frontend`) loads only under that other frontend.
+/// The editor frontend name a configuration carries when its caller names
+/// none.
+///
+/// `pill_editor` names `egui` explicitly through
+/// [`HostConfig::from_environment_for_editor_frontend`]; a crate tagged with
+/// another frontend loads only under that one.
 pub(crate) const DEFAULT_EDITOR_FRONTEND: &str = "egui";
 
 /// The editor frontend tag no host accepts: a crate that declares it is
@@ -161,21 +169,6 @@ pub(crate) const HOST_MODULE_MEMBER_PREFIX: &str = "host_module_";
 /// `release-with-debug`).
 const HOST_PROFILE_DIRECTORY: &str = env!("PILL_HOST_PROFILE_DIRECTORY");
 
-/// Cargo profile *name* matching [`HOST_PROFILE_DIRECTORY`].
-///
-/// Cargo names the default profile `dev` but writes it into `target/debug`;
-/// every other profile's directory is its own name. This is the only place the
-/// two vocabularies are reconciled.
-///
-/// Module builds must use the host's profile. A host and a module compiled
-/// into different profiles resolve different crate-metadata hashes, so the
-/// module's exports do not match what the host looks up and `LoadLibrary`
-/// fails with "The specified procedure could not be found", naming nothing
-/// useful.
-pub(crate) fn host_profile_name() -> &'static str {
-    profile_name_for_directory(HOST_PROFILE_DIRECTORY)
-}
-
 /// Target triple the host was compiled for, recorded by `build.rs`.
 ///
 /// Empty when the host was built natively (an ordinary `cargo build`/`cargo
@@ -187,48 +180,6 @@ pub(crate) fn host_profile_name() -> &'static str {
 /// dies with "The specified procedure could not be found" (os error 127).
 /// Host-spawned module builds mirror this triple so both sides agree.
 const HOST_TARGET_TRIPLE: &str = env!("PILL_HOST_TARGET_TRIPLE");
-
-/// The `--target` triple host-spawned builds must pass, when the host itself
-/// was built with one.
-pub(crate) fn host_target_triple() -> Option<&'static str> {
-    if HOST_TARGET_TRIPLE.is_empty() {
-        None
-    } else {
-        Some(HOST_TARGET_TRIPLE)
-    }
-}
-
-/// Map a cargo profile *directory* to the profile *name* that produces it.
-///
-/// Split out from [`host_profile_name`] so the mapping is testable without
-/// rebuilding the host under every profile.
-fn profile_name_for_directory(directory: &str) -> &str {
-    // The one profile whose directory and name differ. `test` and `bench` also
-    // build into `debug`, but the host is never compiled under those - they
-    // apply to test and benchmark targets, not to a dependency being built.
-    if directory == "debug" {
-        "dev"
-    } else {
-        directory
-    }
-}
-
-/// Whether a cargo profile enables link-time optimization, the one case where
-/// a host-spawned build must drop the workspace's `-C prefer-dynamic` rustflag.
-///
-/// rustc refuses `prefer-dynamic` combined with `lto = "fat"` outright
-/// ("cannot prefer dynamic linking when performing LTO"), so a host running
-/// under an LTO profile has to clear the flag for every build it spawns.
-/// Every other profile - `dev`, and launcher-injected dev-like profiles such
-/// as the dioxus CLI's `desktop-dev` - keeps `prefer-dynamic`, which is what
-/// makes modules dynamic (importing the one shared `pill_core.dll` instead of
-/// embedding a private engine copy).
-fn profile_uses_lto(profile: &str) -> bool {
-    // The workspace manifest sets `lto = "fat"` on `release` and everything
-    // that inherits from it. Custom profiles that inherit `dev` (for example
-    // the dioxus CLI's `desktop-dev`) deliberately stay out of this list.
-    matches!(profile, "release" | "release-fast" | "release-with-debug")
-}
 
 /// Environment variable the dioxus CLI sets on every app it launches.
 ///
@@ -254,130 +205,6 @@ const RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT: &str = "RUSTC_WORKSPACE_WRAPPER";
 /// mirror dx's workspace wrapper must set both variables together.
 const DX_RUSTC_WRAPPER_ENVIRONMENT: &str = "DX_RUSTC";
 
-/// Whether this host binary is running as an app launched by the dioxus CLI.
-///
-/// `dx serve`/`dx run` set `DIOXUS_CLI_ENABLED` (plus `DIOXUS_BUILD_ID` and
-/// friends) on the environment of every app it builds and launches
-/// (dioxus-cli `build/builder.rs` `child_environment_variables`); a plain
-/// `cargo run` never sets it. That is what separates the dx-built editor -
-/// whose engine dylibs carry dx's workspace-wrapper hash - from every other
-/// host. Also read by [`crate::build_runner::apply_cargo_host_overrides`],
-/// which keeps the cargo anchor for editor hosts and dx-launched hosts: the
-/// editor's renderer graph must be present when project modules are built, and
-/// its macro graph under dx unions features onto proc-macro units the engine
-/// manifests cannot enumerate.
-pub(crate) fn running_under_dioxus_cli() -> bool {
-    env::var_os(DIOXUS_CLI_ENABLED_ENVIRONMENT).is_some()
-}
-
-/// Canonicalize a path without the Windows `\\?\` verbatim prefix.
-///
-/// `std::fs::canonicalize` returns `\\?\C:\...` on Windows; dx canonicalizes
-/// its own executable with `dunce` (which strips the prefix), and the two
-/// strings must be byte-identical or cargo's metadata hash will not agree.
-fn canonicalize_plain(path: &Path) -> Option<PathBuf> {
-    let canonical = std::fs::canonicalize(path).ok()?;
-    let text = canonical.to_string_lossy();
-    let plain = text.strip_prefix(r"\\?\").unwrap_or(&text);
-    Some(PathBuf::from(plain))
-}
-
-/// Canonical path of the `dx` executable that launched this host, if any.
-///
-/// dx builds by setting `RUSTC_WORKSPACE_WRAPPER` to its own canonical
-/// executable path (dioxus-cli `build/request.rs` `cargo_build_command`), and
-/// cargo folds that exact path into the `-C metadata` hash of workspace
-/// member crates (cargo `compiler/build_runner/compilation_files.rs`
-/// `compute_metadata`). Host-spawned builds must mirror the SAME path string
-/// for their member crates to hash identically to the editor's, so this
-/// resolves dx the same way dx resolves itself: prefer an already-recorded
-/// wrapper value from the environment, otherwise look `dx` up on `PATH` and
-/// canonicalize. Cached because it is read for every spawned build.
-fn dioxus_executable_path() -> Option<&'static Path> {
-    static DIOXUS_EXECUTABLE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-    DIOXUS_EXECUTABLE_PATH
-        .get_or_init(|| {
-            // A launcher may already have set the wrapper (or dx may have left
-            // it in the environment); reuse it rather than guessing on PATH.
-            if let Some(recorded) = env::var_os(RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT) {
-                let recorded_path = PathBuf::from(recorded);
-                return canonicalize_plain(&recorded_path).or(Some(recorded_path));
-            }
-            let executable_name = if cfg!(windows) { "dx.exe" } else { "dx" };
-            for directory in env::split_paths(&env::var_os("PATH")?) {
-                let candidate = directory.join(executable_name);
-                if candidate.is_file() {
-                    return canonicalize_plain(&candidate);
-                }
-            }
-            None
-        })
-        .as_deref()
-}
-
-/// Directory dx's wrapper writes captured member rustc invocations into.
-///
-/// dx only acts as a rustc wrapper when `DX_RUSTC` names a directory; it
-/// records one JSON file per member crate there (never read back by this
-/// host) and then proxies the real `rustc`. A private temp directory keeps
-/// these host-driven captures out of dx's own `target/dx/.captured-args`
-/// scope, which dx serve reads for its own thin-rebuild replay.
-fn dioxus_wrapper_args_directory() -> PathBuf {
-    std::env::temp_dir().join("pill-host-dx-rustc-args")
-}
-
-/// Environment every host-spawned cargo build needs, on top of the host's own.
-///
-/// Both entries keep the spawned build's crate-metadata universe byte-identical
-/// to the running host binary. `RUSTFLAGS` is cleared only for LTO profiles,
-/// where the workspace's `-C prefer-dynamic` cannot survive (rustc rejects the
-/// pairing); it is the only lever, because cargo MERGES `build.rustflags`
-/// arrays, so an explicit empty `RUSTFLAGS` wins. Under the dioxus CLI the
-/// build also mirrors dx's `RUSTC_WORKSPACE_WRAPPER`: dx wraps every member's
-/// rustc invocation through its own binary, cargo folds that path into the
-/// member crates' `-C metadata`, and registry crates are unaffected. dx
-/// intercepts linker-driver invocations only, and host builds link through
-/// `link.exe`, so member compiles are proxied to the real `rustc`.
-///
-/// Fail-safe: under dx with an unresolvable wrapper path, `prefer-dynamic` is
-/// dropped too and modules stay static, which load regardless of the wrapper
-/// hash where dynamic ones fail with os error 127.
-pub(crate) fn spawned_build_environment() -> Vec<(String, String)> {
-    let mut environment = Vec::new();
-    let under_dioxus = running_under_dioxus_cli();
-    let wrapper_mirrored = under_dioxus && dioxus_executable_path().is_some();
-    if profile_uses_lto(host_profile_name()) || (under_dioxus && !wrapper_mirrored) {
-        environment.push(("RUSTFLAGS".to_string(), String::new()));
-    }
-    if wrapper_mirrored {
-        if let Some(executable) = dioxus_executable_path() {
-            environment.push((
-                RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT.to_string(),
-                executable.display().to_string(),
-            ));
-            environment.push((
-                DX_RUSTC_WRAPPER_ENVIRONMENT.to_string(),
-                dioxus_wrapper_args_directory().display().to_string(),
-            ));
-        }
-    }
-    environment
-}
-
-/// Workspace-relative directory cargo wrote this host's profile into.
-///
-/// Used as the host's own artifact location, so the host looks for the engine
-/// dylibs it maps where its own profile put them rather than always in
-/// `target/debug`. A host built with `--target` (the dioxus CLI) lives under
-/// `target/<triple>/<profile>`; a native one under `target/<profile>`.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-pub(crate) fn host_target_directory() -> String {
-    match host_target_triple() {
-        Some(triple) => format!("target/{triple}/{HOST_PROFILE_DIRECTORY}"),
-        None => format!("target/{HOST_PROFILE_DIRECTORY}"),
-    }
-}
-
 /// Private build tree for every cargo build the host spawns.
 ///
 /// The running host binary maps the engine dylibs out of the regular target
@@ -392,19 +219,6 @@ pub(crate) fn host_target_directory() -> String {
 /// With a `--target` host ([`HOST_TARGET_TRIPLE`]) the builds pass the same
 /// triple, so the subtree lands under `target/hot/build/<triple>/<profile>`.
 pub(crate) const MODULE_BUILD_TARGET_DIRECTORY: &str = "target/hot/build";
-
-/// Profile subdirectory inside [`MODULE_BUILD_TARGET_DIRECTORY`] where cargo
-/// writes a host-spawned build's artifacts (`target/hot/build/debug` for a
-/// native dev host, `target/hot/build/x86_64-pc-windows-msvc/desktop-dev`
-/// under the dioxus CLI, which builds with an explicit `--target`).
-pub(crate) fn module_build_artifact_directory() -> String {
-    match host_target_triple() {
-        Some(triple) => {
-            format!("{MODULE_BUILD_TARGET_DIRECTORY}/{triple}/{HOST_PROFILE_DIRECTORY}")
-        }
-        None => format!("{MODULE_BUILD_TARGET_DIRECTORY}/{HOST_PROFILE_DIRECTORY}"),
-    }
-}
 
 /// Project configuration file name, resolved in the project root. A project
 /// that ships one declares its own extension list; the project itself is
@@ -438,6 +252,13 @@ pub(crate) const RENDERER_DATA_SUFFIX: &str = "_data";
 /// The same name the crate's build script and the shader reload export use, so
 /// an edit lands where the watcher looks.
 pub(crate) const RENDERER_SHADER_SOURCES_DIRECTORY: &str = "shader_sources";
+
+/// Dependency tables whose entries link code into the build.
+///
+/// The workspace-wide `[workspace.dependencies]` table is deliberately absent:
+/// it is shared infrastructure rather than a dependency of this project.
+const LINKING_DEPENDENCY_TABLES: [&str; 3] =
+    ["dependencies", "dev-dependencies", "build-dependencies"];
 
 // =============================================================================
 // Types
@@ -636,16 +457,17 @@ pub struct HostConfig {
     /// Whether this host loads extension editor crates: the editor posture.
     ///
     /// Only editor frontends set it, through
-    /// [`Self::from_environment_for_editor`]; every other build never builds or
-    /// loads an editor crate. When set, [`Self::extensions`] ends with the
-    /// editor crates of the loaded extensions' folders and of every
+    /// [`Self::from_environment_for_editor_frontend`]; every other build never
+    /// builds or loads an editor crate. When set, [`Self::extensions`] ends with
+    /// the editor crates of the loaded extensions' folders and of every
     /// editor-only folder.
     pub load_editor_crates: bool,
 
     /// Editor-only modules (a folder holding only its `<folder>_editor`
     /// crate) whose first load may fail without aborting setup; the embedder
     /// handles their absence - the editor's safe mode covers the shell. Filled
-    /// by [`Self::from_environment_for_editor`], empty in every other posture.
+    /// by [`Self::from_environment_for_editor_frontend`], empty in every other
+    /// posture.
     pub first_load_optional: Vec<String>,
 
     /// The renderer's GPU module, from the settings' `renderer:` key
@@ -775,18 +597,10 @@ impl HostConfig {
         Self::from_environment_in_posture(false, DEFAULT_EDITOR_FRONTEND)
     }
 
-    /// [`Self::from_environment`] for an editor host: the extensions'
-    /// editor crates load too (see [`Self::load_editor_crates`]).
+    /// The editor host's configuration: [`Self::from_environment`] plus the
+    /// extensions' editor crates, for a named editor frontend.
     ///
-    /// # Errors
-    ///
-    /// As [`Self::from_environment`].
-    pub fn from_environment_for_editor() -> Result<Self, ConfigError> {
-        Self::from_environment_in_posture(true, DEFAULT_EDITOR_FRONTEND)
-    }
-
-    /// [`Self::from_environment_for_editor`] for a named editor frontend:
-    /// editor crates load, and one whose manifest declares
+    /// Editor crates load, and one whose manifest declares
     /// `[package.metadata.pill] editor_frontend = "<name>"` loads only when
     /// that name is this host's. Untagged editor crates
     /// load under every editor frontend.
@@ -1168,9 +982,10 @@ impl HostConfig {
 }
 
 impl From<ProjectModuleConfig> for HostConfig {
-    /// Run one project with no extensions.
+    /// Runs one project with no extensions.
     ///
-    /// Keeps embedders that already build a `ProjectModuleConfig` compiling.
+    /// Lets an embedder that holds a [`ProjectModuleConfig`] wrap it without
+    /// naming every host field.
     fn from(project: ProjectModuleConfig) -> Self {
         Self {
             name: project.name.clone(),
@@ -1388,6 +1203,263 @@ impl ProjectModuleConfig {
     }
 }
 
+/// What `editor_settings.yaml` selected for the editor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EditorSettings {
+    /// The `editor_theme:` value, as the file spells it: a path below the
+    /// project's `res`.
+    pub editor_theme: Option<String>,
+}
+
+/// Values declared by the project's own `editor_settings.yaml`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct EditorSettingsFile {
+    /// The editor theme the project's editor layer uses, below `res`.
+    editor_theme: Option<String>,
+}
+
+/// Values declared by the project's own `project_settings.yaml`.
+///
+/// `name` and `build_binary_name` are required (the display/window title and
+/// the artifact file base respectively); the rest is optional classic package
+/// metadata.
+///
+/// Unknown keys are refused rather than dropped, so `module:` instead of
+/// `modules:` is an error rather than a silently empty extension list.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ProjectSettingsFile {
+    /// Project display name; required, used as the window title.
+    name: Option<String>,
+    /// Artifact file base; required, letters/digits/underscores only.
+    build_binary_name: Option<String>,
+    /// Optional package version.
+    version: Option<String>,
+    /// Optional package author.
+    author: Option<String>,
+    /// Optional one-line package description.
+    description: Option<String>,
+    /// Extension crate names, in load order. The only source for this
+    /// list: there is no environment-variable override, so the file is always
+    /// the complete answer to "which modules load" - apart from the selected
+    /// renderer's data crate, which loads first by convention.
+    modules: Vec<String>,
+    /// The renderer the project draws with: the name of its GPU module under
+    /// `extensions/` (`pill_master_renderer` when absent), or `none`. Its data
+    /// crate, `<renderer>_data`, loads in every build.
+    renderer: Option<String>,
+    /// What the development host does with the project's source assets.
+    assets: ProjectAssetSettings,
+    /// Log levels over the engine's defaults.
+    logging: ProjectLoggingSettings,
+    /// Whether a shipping or web build starts with debug drawing on; the
+    /// development host always draws.
+    debug_draw: Option<bool>,
+    /// The `.scene` the project starts with, as a path below `res`; loaded
+    /// after every component is registered and before the project's `init`
+    /// seeds anything.
+    startup_scene: Option<String>,
+}
+
+// =============================================================================
+// Free functions
+// =============================================================================
+
+/// Cargo profile *name* matching [`HOST_PROFILE_DIRECTORY`].
+///
+/// Cargo names the default profile `dev` but writes it into `target/debug`;
+/// every other profile's directory is its own name. This is the only place the
+/// two vocabularies are reconciled.
+///
+/// Module builds must use the host's profile. A host and a module compiled
+/// into different profiles resolve different crate-metadata hashes, so the
+/// module's exports do not match what the host looks up and `LoadLibrary`
+/// fails with "The specified procedure could not be found", naming nothing
+/// useful.
+pub(crate) fn host_profile_name() -> &'static str {
+    profile_name_for_directory(HOST_PROFILE_DIRECTORY)
+}
+
+/// The `--target` triple host-spawned builds must pass, when the host itself
+/// was built with one.
+pub(crate) fn host_target_triple() -> Option<&'static str> {
+    if HOST_TARGET_TRIPLE.is_empty() {
+        None
+    } else {
+        Some(HOST_TARGET_TRIPLE)
+    }
+}
+
+/// Map a cargo profile *directory* to the profile *name* that produces it.
+///
+/// Split out from [`host_profile_name`] so the mapping is testable without
+/// rebuilding the host under every profile.
+fn profile_name_for_directory(directory: &str) -> &str {
+    // The one profile whose directory and name differ. `test` and `bench` also
+    // build into `debug`, but the host is never compiled under those - they
+    // apply to test and benchmark targets, not to a dependency being built.
+    if directory == "debug" {
+        "dev"
+    } else {
+        directory
+    }
+}
+
+/// Whether a cargo profile enables link-time optimization, the one case where
+/// a host-spawned build must drop the workspace's `-C prefer-dynamic` rustflag.
+///
+/// rustc refuses `prefer-dynamic` combined with `lto = "fat"` outright
+/// ("cannot prefer dynamic linking when performing LTO"), so a host running
+/// under an LTO profile has to clear the flag for every build it spawns.
+/// Every other profile - `dev`, and launcher-injected dev-like profiles such
+/// as the dioxus CLI's `desktop-dev` - keeps `prefer-dynamic`, which is what
+/// makes modules dynamic (importing the one shared `pill_core.dll` instead of
+/// embedding a private engine copy).
+fn profile_uses_lto(profile: &str) -> bool {
+    // The workspace manifest sets `lto = "fat"` on `release` and everything
+    // that inherits from it. Custom profiles that inherit `dev` (for example
+    // the dioxus CLI's `desktop-dev`) deliberately stay out of this list.
+    matches!(profile, "release" | "release-fast" | "release-with-debug")
+}
+
+/// Whether this host binary is running as an app launched by the dioxus CLI.
+///
+/// `dx serve`/`dx run` set `DIOXUS_CLI_ENABLED` (plus `DIOXUS_BUILD_ID` and
+/// friends) on the environment of every app it builds and launches
+/// (dioxus-cli `build/builder.rs` `child_environment_variables`); a plain
+/// `cargo run` never sets it. That is what separates the dx-built editor -
+/// whose engine dylibs carry dx's workspace-wrapper hash - from every other
+/// host. Also read by [`crate::build_runner::apply_cargo_host_overrides`],
+/// which keeps the cargo anchor for editor hosts and dx-launched hosts: the
+/// editor's renderer graph must be present when project modules are built, and
+/// its macro graph under dx unions features onto proc-macro units the engine
+/// manifests cannot enumerate.
+pub(crate) fn running_under_dioxus_cli() -> bool {
+    env::var_os(DIOXUS_CLI_ENABLED_ENVIRONMENT).is_some()
+}
+
+/// Canonicalize a path without the Windows `\\?\` verbatim prefix.
+///
+/// `std::fs::canonicalize` returns `\\?\C:\...` on Windows; dx canonicalizes
+/// its own executable with `dunce` (which strips the prefix), and the two
+/// strings must be byte-identical or cargo's metadata hash will not agree.
+fn canonicalize_plain(path: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let text = canonical.to_string_lossy();
+    let plain = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    Some(PathBuf::from(plain))
+}
+
+/// Canonical path of the `dx` executable that launched this host, if any.
+///
+/// dx builds by setting `RUSTC_WORKSPACE_WRAPPER` to its own canonical
+/// executable path (dioxus-cli `build/request.rs` `cargo_build_command`), and
+/// cargo folds that exact path into the `-C metadata` hash of workspace
+/// member crates (cargo `compiler/build_runner/compilation_files.rs`
+/// `compute_metadata`). Host-spawned builds must mirror the SAME path string
+/// for their member crates to hash identically to the editor's, so this
+/// resolves dx the same way dx resolves itself: prefer an already-recorded
+/// wrapper value from the environment, otherwise look `dx` up on `PATH` and
+/// canonicalize. Cached because it is read for every spawned build.
+fn dioxus_executable_path() -> Option<&'static Path> {
+    static DIOXUS_EXECUTABLE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIOXUS_EXECUTABLE_PATH
+        .get_or_init(|| {
+            // A launcher may already have set the wrapper (or dx may have left
+            // it in the environment); reuse it rather than guessing on PATH.
+            if let Some(recorded) = env::var_os(RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT) {
+                let recorded_path = PathBuf::from(recorded);
+                return canonicalize_plain(&recorded_path).or(Some(recorded_path));
+            }
+            let executable_name = if cfg!(windows) { "dx.exe" } else { "dx" };
+            for directory in env::split_paths(&env::var_os("PATH")?) {
+                let candidate = directory.join(executable_name);
+                if candidate.is_file() {
+                    return canonicalize_plain(&candidate);
+                }
+            }
+            None
+        })
+        .as_deref()
+}
+
+/// Directory dx's wrapper writes captured member rustc invocations into.
+///
+/// dx only acts as a rustc wrapper when `DX_RUSTC` names a directory; it
+/// records one JSON file per member crate there (never read back by this
+/// host) and then proxies the real `rustc`. A private temp directory keeps
+/// these host-driven captures out of dx's own `target/dx/.captured-args`
+/// scope, which dx serve reads for its own thin-rebuild replay.
+fn dioxus_wrapper_args_directory() -> PathBuf {
+    std::env::temp_dir().join("pill-host-dx-rustc-args")
+}
+
+/// Environment every host-spawned cargo build needs, on top of the host's own.
+///
+/// Both entries keep the spawned build's crate-metadata universe byte-identical
+/// to the running host binary. `RUSTFLAGS` is cleared only for LTO profiles,
+/// where the workspace's `-C prefer-dynamic` cannot survive (rustc rejects the
+/// pairing); it is the only lever, because cargo MERGES `build.rustflags`
+/// arrays, so an explicit empty `RUSTFLAGS` wins. Under the dioxus CLI the
+/// build also mirrors dx's `RUSTC_WORKSPACE_WRAPPER`: dx wraps every member's
+/// rustc invocation through its own binary, cargo folds that path into the
+/// member crates' `-C metadata`, and registry crates are unaffected. dx
+/// intercepts linker-driver invocations only, and host builds link through
+/// `link.exe`, so member compiles are proxied to the real `rustc`.
+///
+/// Fail-safe: under dx with an unresolvable wrapper path, `prefer-dynamic` is
+/// dropped too and modules stay static, which load regardless of the wrapper
+/// hash where dynamic ones fail with os error 127.
+pub(crate) fn spawned_build_environment() -> Vec<(String, String)> {
+    let mut environment = Vec::new();
+    let under_dioxus = running_under_dioxus_cli();
+    let wrapper_mirrored = under_dioxus && dioxus_executable_path().is_some();
+    if profile_uses_lto(host_profile_name()) || (under_dioxus && !wrapper_mirrored) {
+        environment.push(("RUSTFLAGS".to_string(), String::new()));
+    }
+    if wrapper_mirrored {
+        if let Some(executable) = dioxus_executable_path() {
+            environment.push((
+                RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT.to_string(),
+                executable.display().to_string(),
+            ));
+            environment.push((
+                DX_RUSTC_WRAPPER_ENVIRONMENT.to_string(),
+                dioxus_wrapper_args_directory().display().to_string(),
+            ));
+        }
+    }
+    environment
+}
+
+/// Workspace-relative directory cargo wrote this host's profile into.
+///
+/// Used as the host's own artifact location, so the host looks for the engine
+/// dylibs it maps where its own profile put them rather than always in
+/// `target/debug`. A host built with `--target` (the dioxus CLI) lives under
+/// `target/<triple>/<profile>`; a native one under `target/<profile>`.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+pub(crate) fn host_target_directory() -> String {
+    match host_target_triple() {
+        Some(triple) => format!("target/{triple}/{HOST_PROFILE_DIRECTORY}"),
+        None => format!("target/{HOST_PROFILE_DIRECTORY}"),
+    }
+}
+
+/// Profile subdirectory inside [`MODULE_BUILD_TARGET_DIRECTORY`] where cargo
+/// writes a host-spawned build's artifacts (`target/hot/build/debug` for a
+/// native dev host, `target/hot/build/x86_64-pc-windows-msvc/desktop-dev`
+/// under the dioxus CLI, which builds with an explicit `--target`).
+pub(crate) fn module_build_artifact_directory() -> String {
+    match host_target_triple() {
+        Some(triple) => {
+            format!("{MODULE_BUILD_TARGET_DIRECTORY}/{triple}/{HOST_PROFILE_DIRECTORY}")
+        }
+        None => format!("{MODULE_BUILD_TARGET_DIRECTORY}/{HOST_PROFILE_DIRECTORY}"),
+    }
+}
+
 /// Read a required configuration variable or report it as missing.
 ///
 /// # Errors
@@ -1400,8 +1472,8 @@ fn required_environment(variable: &'static str) -> Result<String, ConfigError> {
 
 /// Whether host-driven cargo builds should emit a timing report.
 ///
-/// Read by both the build-command builders below and the analytics collector,
-/// so the flag cannot be set on one side and silently unread on the other.
+/// Read by [`host_cargo_command`] and by the analytics collector, so the flag
+/// cannot be set on one side and silently unread on the other.
 pub(crate) fn cargo_timings_enabled() -> bool {
     std::env::var_os(CARGO_TIMINGS_ENVIRONMENT_VARIABLE).is_some()
 }
@@ -1532,12 +1604,12 @@ fn manifest_string_value(manifest: &str, section: &str, key: &str) -> Option<Str
         .map(str::to_string)
 }
 
+#[cfg(feature = "hot_reload")]
 /// Whether the project manifest declares a direct dependency on `crate_name`.
 ///
 /// Reads the project's manifest again at runtime because the decision depends
 /// on the module that just changed, which is only known during the frame loop.
 /// A missing or unreadable manifest counts as "no dependency", so a transient
-#[cfg(feature = "hot_reload")]
 /// filesystem state can never force the project through an extra reload.
 pub(crate) fn project_depends_on_crate(
     workspace_root: &Path,
@@ -1557,13 +1629,6 @@ pub(crate) fn project_depends_on_crate(
     };
     manifest_depends_on_crate(&manifest, crate_name)
 }
-
-/// Dependency tables whose entries link code into the build.
-///
-/// The workspace-wide `[workspace.dependencies]` table is deliberately absent:
-/// it is shared infrastructure rather than a dependency of this project.
-const LINKING_DEPENDENCY_TABLES: [&str; 3] =
-    ["dependencies", "dev-dependencies", "build-dependencies"];
 
 /// Whether a `Cargo.toml` declares a dependency on `crate_name`.
 ///
@@ -1625,18 +1690,6 @@ fn declares_dependency(table: &Table, crate_name: &str) -> bool {
     })
 }
 
-// =============================================================================
-// The editor's settings file
-// =============================================================================
-
-/// What `editor_settings.yaml` selected for the editor.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct EditorSettings {
-    /// The `editor_theme:` value, as the file spells it: a path below the
-    /// project's `res`.
-    pub editor_theme: Option<String>,
-}
-
 /// Read the editor's settings file from the project root.
 ///
 /// A project without the file is the normal case and an empty settings
@@ -1666,8 +1719,8 @@ pub fn read_editor_settings(project_directory: &Path) -> Result<EditorSettings, 
 /// file, otherwise none.
 ///
 /// The path is below the project's `res` and is checked against the editor
-/// scope when it loads, not here, so a file naming `ui/x.theme` is refused
-/// with the rule the game's own loader states.
+/// theme scope when it loads, not here, so a file naming `ui/x.theme` is
+/// refused at load rather than resolved.
 pub fn resolve_editor_theme(project_directory: &Path, settings: &EditorSettings) -> Option<String> {
     if let Some(path) = settings.editor_theme.clone() {
         return Some(path);
@@ -1678,57 +1731,6 @@ pub fn resolve_editor_theme(project_directory: &Path, settings: &EditorSettings)
         .join("editor.theme")
         .is_file()
         .then(|| DEFAULT_EDITOR_THEME.to_string())
-}
-
-/// Values declared by the project's own `editor_settings.yaml`.
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct EditorSettingsFile {
-    /// The editor theme the project's editor layer uses, below `res`.
-    editor_theme: Option<String>,
-}
-
-/// Values declared by the project's own `project_settings.yaml`.
-///
-/// `name` and `build_binary_name` are required (the display/window title and
-/// the artifact file base respectively); the rest is optional classic package
-/// metadata.
-///
-/// Unknown keys are refused rather than dropped, so `module:` instead of
-/// `modules:` is an error rather than a silently empty extension list.
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ProjectSettingsFile {
-    /// Project display name; required, used as the window title.
-    name: Option<String>,
-    /// Artifact file base; required, letters/digits/underscores only.
-    build_binary_name: Option<String>,
-    /// Optional package version.
-    version: Option<String>,
-    /// Optional package author.
-    author: Option<String>,
-    /// Optional one-line package description.
-    description: Option<String>,
-    /// Extension crate names, in load order. The only source for this
-    /// list: there is no environment-variable override, so the file is always
-    /// the complete answer to "which modules load" - apart from the selected
-    /// renderer's data crate, which loads first by convention.
-    modules: Vec<String>,
-    /// The renderer the project draws with: the name of its GPU module under
-    /// `extensions/` (`pill_master_renderer` when absent), or `none`. Its data
-    /// crate, `<renderer>_data`, loads in every build.
-    renderer: Option<String>,
-    /// What the development host does with the project's source assets.
-    assets: ProjectAssetSettings,
-    /// Log levels over the engine's defaults.
-    logging: ProjectLoggingSettings,
-    /// Whether a shipping or web build starts with debug drawing on; the
-    /// development host always draws.
-    debug_draw: Option<bool>,
-    /// The `.scene` the project starts with, as a path below `res`; loaded
-    /// after every component is registered and before the project's `init`
-    /// seeds anything.
-    startup_scene: Option<String>,
 }
 
 /// Whether a value is a safe artifact file base: letters, digits, underscores.
@@ -2067,7 +2069,7 @@ fn for_each_dependency_table_mut(root: &mut Table, visit: &mut impl FnMut(&mut T
 /// Removes host-generated workspace members left behind by earlier runs.
 ///
 /// Every directory under `projects_generated/` whose name carries
-/// [`HOST_PROJECT_MEMBER_PREFIX`] was written by this function, so any one that
+/// [`HOST_PROJECT_MEMBER_PREFIX`] was written by the host, so any one that
 /// is not the member being materialized now belongs to a project the host is no
 /// longer running. Leaving it is not harmless: the workspace glob still picks
 /// it up as a member, and its dependency paths point into the previous

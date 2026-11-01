@@ -35,7 +35,13 @@ import tomllib
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
-from .projects import EXAMPLES_RELATIVE_PATH
+from .paths import REPOSITORY_ROOT
+from .projects import (
+    EXAMPLES_RELATIVE_PATH,
+    OFFICIAL_EXAMPLE_PROJECTS,
+    TEST_PROJECT_NAMES,
+    TEST_PROJECTS_ROOT,
+)
 
 
 class ManifestError(Exception):
@@ -136,13 +142,31 @@ def workspace_members(modules: Path) -> List[Crate]:
     return members
 
 
-# The example projects: every `<examples>/*/Cargo.toml`, where the directory
-# name comes from `projects`. A project without a manifest is a
-# managed-language one and has no cargo tree to measure.
+# The example and fixture projects: every `<examples>/*/Cargo.toml` in the local
+# checkout, every official project the catalog names, and every fixture under
+# `devops/tests/projects`. A project without a manifest is a managed-language
+# one and has no cargo tree to measure.
+#
+# The local checkout uses both layouts: a project directory, and a group
+# directory holding one Rust and one C# project (as `pills_awakens` does), so
+# the manifest glob reaches one level deeper than the folder itself.
 def example_projects(repository: Path) -> List[Crate]:
-    return [
-        Crate(manifest)
-        for manifest in sorted(
-            (repository / EXAMPLES_RELATIVE_PATH).glob("*/Cargo.toml")
+    examples = repository / EXAMPLES_RELATIVE_PATH
+    manifests = sorted(
+        set(examples.glob("*/Cargo.toml")) | set(examples.glob("*/*/Cargo.toml"))
+    )
+    manifests.extend(
+        sorted(
+            repository / path.relative_to(REPOSITORY_ROOT) / "Cargo.toml"
+            for path in OFFICIAL_EXAMPLE_PROJECTS.values()
+            if (path / "Cargo.toml").is_file()
         )
-    ]
+    )
+    manifests.extend(
+        sorted(
+            repository / TEST_PROJECTS_ROOT.relative_to(REPOSITORY_ROOT) / name / "Cargo.toml"
+            for name in TEST_PROJECT_NAMES
+            if (TEST_PROJECTS_ROOT / name / "Cargo.toml").is_file()
+        )
+    )
+    return [Crate(manifest) for manifest in manifests]

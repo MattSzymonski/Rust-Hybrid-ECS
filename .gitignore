@@ -2,6 +2,10 @@
 /target
 /devops/tests/project/target
 /modules/target
+# An official example or fixture project builds into its own folder when
+# cargo is run there rather than through the host.
+/examples/*/*/target/
+/devops/tests/projects/*/target/
 
 # C# build output, wherever a project lives.
 bin/

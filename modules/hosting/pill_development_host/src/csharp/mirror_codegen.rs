@@ -4,13 +4,13 @@
 //! # Responsibilities
 //!
 //! - Resolve the type names a mirror tag carries (`val:Mesh`, `mut:AssetManager`)
-//!   to C# types: an object class, an enum, a resource marker, a value-type
-//!   struct, or one of the runtime's own types.
-//! - Emit one C# member per mirrored function, whatever owns it: a value type,
-//!   an object class, a resource (as extension methods on `Res<T>` /
-//!   `ResMut<T>`), or a module (as a static class).
+//!   through [`MirrorScope`]: an object class, an enum, a resource marker, a
+//!   value-type struct, or one of the runtime's own types.
+//! - Emit one C# member per mirrored function with [`emit_member`], whatever
+//!   owns it: a value type, an object class, a resource (as extension methods
+//!   on `Res<T>` / `ResMut<T>`), or a module (as a static class).
 //! - Emit the object classes, enums and resource markers the type rows
-//!   declare.
+//!   declare, through [`emit_declared_type`].
 //!
 //! # Design
 //!
@@ -18,10 +18,10 @@
 //! for the function's trampoline, push the receiver and each argument the way
 //! its tag says, invoke, and read the result the way the result's tag says.
 //! The runtime owns every pointer, so the generated code is safe C# and the
-//! reloadable project assembly still needs no `AllowUnsafeBlocks`; one
-//! function-pointer type covers every trampoline, so NativeAOT needs nothing
-//! generated per signature either. The encodings each `Push*`/`Result*` call
-//! writes are the contract with `pill_engine::mirror` on the Rust side.
+//! reloadable project assembly needs no `AllowUnsafeBlocks`; one function
+//! pointer type covers every trampoline, so NativeAOT needs nothing generated
+//! per signature. The encodings each `Push*`/`Result*` call writes are the
+//! contract with `pill_engine::mirror` on the Rust side.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -29,6 +29,13 @@ use std::collections::BTreeMap;
 // External crates
 use pill_csharp_bridge::{snake_to_pascal, ResolvedMirrorMethod};
 use pill_engine::component_registry::{PillValueTypeDescriptor, MIRROR_TYPE_ROW};
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The runtime's own resource marker for the engine's asset store.
+const ASSET_MANAGER: &str = "global::TracyLive.AssetManager";
 
 // =============================================================================
 // Types
@@ -43,7 +50,7 @@ pub(super) enum MirrorKind {
     Enum,
     /// A `#[pill_mirror_resource]` marker (or the runtime's `AssetManager`).
     Resource,
-    /// A `#[derive(PillMirror)]` value type or a component row.
+    /// A `#[derive(PillMirror)]` value type.
     Value,
 }
 
@@ -52,7 +59,8 @@ pub(super) enum MirrorKind {
 pub(super) struct MirrorType {
     /// What it is.
     pub(super) kind: MirrorKind,
-    /// The fully qualified C# name (`global::ns.Name`).
+    /// The C# name to spell: `global::ns.Name`, or the bare simple name when
+    /// the value type carries no namespace.
     pub(super) csharp: String,
 }
 
@@ -80,33 +88,23 @@ pub(super) struct MirrorScope {
     pub(super) declared: Vec<DeclaredType>,
 }
 
-/// The runtime's own resource marker for the engine's asset store.
-const ASSET_MANAGER: &str = "global::TracyLive.AssetManager";
-
-/// The namespace a declared type is emitted in: its crate's root, so one
-/// `using` reaches every object, enum and resource a module mirrors.
-fn crate_namespace(type_name: &str) -> String {
-    type_name
-        .split("::")
-        .next()
-        .unwrap_or(type_name)
-        .to_string()
-}
-
-/// The last `::` segment of a Rust path.
-fn last_segment(type_name: &str) -> &str {
-    type_name.rsplit("::").next().unwrap_or(type_name)
-}
-
 impl MirrorScope {
     /// Build the scope from a module's descriptors and value types.
     ///
-    /// `value_namespace` gives the namespace a value type is emitted in.
+    /// `value_namespace` returns the namespace a value type is emitted in, or
+    /// `None` to spell its name unqualified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a type row names an owner kind this file does not
+    /// know, or when two declared types share a C# simple name.
     pub(super) fn new(
         methods: &[ResolvedMirrorMethod],
         value_types: &[PillValueTypeDescriptor],
         value_namespace: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
+        // Step 1: seed the runtime's own types. `AssetManager` is a resource
+        // marker the runtime defines, so every module may name it.
         let mut by_name = BTreeMap::new();
         by_name.insert(
             "AssetManager".to_string(),
@@ -115,6 +113,8 @@ impl MirrorScope {
                 csharp: ASSET_MANAGER.to_string(),
             },
         );
+
+        // Step 2: resolve the type rows the module declares.
         let mut declared = Vec::new();
         for row in methods
             .iter()
@@ -133,6 +133,8 @@ impl MirrorScope {
             };
             let name = last_segment(&row.type_name).to_string();
             let namespace = crate_namespace(&row.type_name);
+            // Tags carry a simple name, so two Rust types ending in the same
+            // segment cannot both be resolved.
             if let Some(existing) = declared
                 .iter()
                 .find(|existing: &&DeclaredType| existing.name == name)
@@ -157,12 +159,18 @@ impl MirrorScope {
                 row: row.clone(),
             });
         }
+
+        // Step 3: order the declared types so the generated file is stable.
         declared.sort_by(|left, right| left.type_name.cmp(&right.type_name));
+
+        // Step 4: add the value types, which declare no type row of their own.
+        // A declared type wins over a value type with the same simple name.
         for value_type in value_types {
             let name = last_segment(value_type.type_name).to_string();
             if by_name.contains_key(&name) {
                 continue;
             }
+            // Without a namespace the type is named by its simple name alone.
             let csharp = match value_namespace(value_type.type_name) {
                 Some(namespace) => format!("global::{namespace}.{name}"),
                 None => name.clone(),
@@ -179,6 +187,11 @@ impl MirrorScope {
     }
 
     /// The type a tag's name resolves to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the tag when the name is not one this module
+    /// mirrors.
     pub(super) fn resolve(&self, name: &str) -> Result<&MirrorType, String> {
         self.by_name.get(name).ok_or_else(|| {
             format!(
@@ -204,6 +217,65 @@ impl MirrorScope {
             .filter(|resolved| resolved.kind == MirrorKind::Object)
             .map(|resolved| format!("global::TracyLive.Handle<{}>", resolved.csharp))
     }
+}
+
+/// One argument, lowered to C#.
+struct CsArgument {
+    /// The parameter declaration (`ReadOnlySpan<byte> bytes`).
+    declaration: String,
+    /// The statements pushing it onto the call.
+    push: String,
+    /// How a call forwards the parameter to another member (`in value`).
+    forward: String,
+}
+
+/// One result, lowered to C#.
+struct CsResult {
+    /// The C# return type.
+    csharp: String,
+    /// The bytes the return buffer must hold, as a C# expression; empty for
+    /// the default buffer.
+    size: String,
+    /// The statement returning it, after the call.
+    read: String,
+}
+
+/// What a member is emitted on.
+pub(super) enum MemberHost<'a> {
+    /// An instance or static member of a value-type struct.
+    ValueStruct,
+    /// An instance or static member of an object class.
+    Object {
+        /// The class's simple name: an associated `new` returning it also
+        /// becomes a constructor.
+        name: &'a str,
+    },
+    /// An extension method on `Res<T>` / `ResMut<T>` of a resource marker.
+    Resource {
+        /// The marker's fully qualified C# name.
+        marker: &'a str,
+    },
+    /// A static member of a module's static class.
+    Module,
+}
+
+// =============================================================================
+// Path Helpers
+// =============================================================================
+
+/// The namespace a declared type is emitted in: its crate's root, so one
+/// `using` reaches every object, enum and resource a module mirrors.
+fn crate_namespace(type_name: &str) -> String {
+    type_name
+        .split("::")
+        .next()
+        .unwrap_or(type_name)
+        .to_string()
+}
+
+/// The last `::` segment of a Rust path.
+fn last_segment(type_name: &str) -> &str {
+    type_name.rsplit("::").next().unwrap_or(type_name)
 }
 
 // =============================================================================
@@ -232,6 +304,10 @@ fn primitive(tag: &str) -> Option<(&'static str, usize)> {
 
 /// The offsets of a tuple of primitives packed with natural alignment - the
 /// layout `pill_engine_macros`'s `tuple_layout` computes.
+///
+/// # Errors
+///
+/// Returns an error for a tuple element that is not a primitive tag.
 fn tuple_layout(elements: &[&str]) -> Result<Vec<(usize, &'static str)>, String> {
     let mut cursor = 0usize;
     let mut layout = Vec::new();
@@ -246,6 +322,11 @@ fn tuple_layout(elements: &[&str]) -> Result<Vec<(usize, &'static str)>, String>
 }
 
 /// The C# type of an `array:<element>:<length>` tag.
+///
+/// # Errors
+///
+/// Returns an error for any array the runtime has no vector type for; only
+/// `[f32; 2..=4]` maps to one.
 fn array_type(tag: &str) -> Result<String, String> {
     let mut parts = tag.splitn(2, ':');
     let element = parts.next().unwrap_or_default();
@@ -264,18 +345,16 @@ fn array_type(tag: &str) -> Result<String, String> {
 // Arguments
 // =============================================================================
 
-/// One argument, lowered to C#.
-struct CsArgument {
-    /// The parameter declaration (`ReadOnlySpan<byte> bytes`).
-    declaration: String,
-    /// The statements pushing it onto the call.
-    push: String,
-    /// How a call forwards the parameter to another member (`in value`).
-    forward: String,
-}
-
 /// Lower one argument tag to its C# parameter and push.
+///
+/// # Errors
+///
+/// Returns an error for a tag this file cannot lower: an unsupported tag or
+/// slice element, a type name the module does not mirror, or a resource taken
+/// by value, as a slice element or as an option.
 fn lower_argument(tag: &str, name: &str, scope: &MirrorScope) -> Result<CsArgument, String> {
+    // A parameter declared `in`/`ref` is forwarded with the same modifier, so
+    // delegating code hands it on unchanged.
     let simple = |declaration: String, push: String| {
         let forward = if declaration.starts_with("in ") {
             format!("in {name}")
@@ -476,20 +555,18 @@ fn lower_argument(tag: &str, name: &str, scope: &MirrorScope) -> Result<CsArgume
 // Results
 // =============================================================================
 
-/// One result, lowered to C#.
-struct CsResult {
-    /// The C# return type.
-    csharp: String,
-    /// The bytes the return buffer must hold, as a C# expression; empty for
-    /// the default buffer.
-    size: String,
-    /// The statement returning it, after the call.
-    read: String,
-}
-
 /// Lower one result tag to its C# type and read.
+///
+/// # Errors
+///
+/// Returns an error for a tag this file cannot lower: an unsupported tag or
+/// optional payload, a type name the module does not mirror, or a resource
+/// returned by value.
 fn lower_result(tag: &str, scope: &MirrorScope) -> Result<CsResult, String> {
+    // A return tag may or may not carry the `result:` prefix; what follows it
+    // is the value tag.
     let tag = tag.strip_prefix("result:").unwrap_or(tag);
+    // A plain result reads from the default return buffer, so it names no size.
     let plain = |csharp: String, read: String| {
         Ok(CsResult {
             csharp,
@@ -551,6 +628,8 @@ fn lower_result(tag: &str, scope: &MirrorScope) -> Result<CsResult, String> {
         };
     }
     if let Some(inner) = tag.strip_prefix("option:") {
+        // An optional result keeps its payload in the second 16-byte slot,
+        // behind the presence flag in the first.
         if let Some((csharp, _)) = primitive(inner) {
             return plain(
                 format!("{csharp}?"),
@@ -597,37 +676,25 @@ fn lower_result(tag: &str, scope: &MirrorScope) -> Result<CsResult, String> {
 // Members
 // =============================================================================
 
-/// What a member is emitted on.
-pub(super) enum MemberHost<'a> {
-    /// An instance or static member of a value-type struct.
-    ValueStruct,
-    /// An instance or static member of an object class.
-    Object {
-        /// The class's simple name: an associated `new` returning it also
-        /// becomes a constructor.
-        name: &'a str,
-    },
-    /// An extension method on `Res<T>` / `ResMut<T>` of a resource marker.
-    Resource {
-        /// The marker's fully qualified C# name.
-        marker: &'a str,
-    },
-    /// A static member of a module's static class.
-    Module,
-}
-
 /// The C# parameter name for one argument: the Rust name, unless it is blank
-/// or a C# keyword.
+/// or a C# keyword, in which case it is the positional `arg<index>`.
 fn parameter_name(index: usize, rust_name: &str) -> String {
     super::codegen::csharp_parameter_name(index, rust_name)
 }
 
 /// Emit the C# member (or members) for one mirrored function.
+///
+/// # Errors
+///
+/// Returns an error naming the function when one of its argument or result
+/// tags cannot be lowered, or when its receiver cannot be emitted on its host.
 pub(super) fn emit_member(
     method: &ResolvedMirrorMethod,
     host: &MemberHost<'_>,
     scope: &MirrorScope,
 ) -> Result<String, String> {
+    // Step 1: lower the arguments and the result to C# declarations, pushes
+    // and a read.
     let context = || {
         format!(
             "mirrored function `{}::{}`",
@@ -648,6 +715,8 @@ pub(super) fn emit_member(
     }
     let result = lower_result(&method.return_tag, scope)
         .map_err(|error| format!("{}: {error}", context()))?;
+    // Only a value result needs an explicit return-buffer size; every other
+    // result reads the default one.
     let begin = if result.size.is_empty() {
         format!(
             "var __call = global::TracyLive.MirrorCall.Begin(\"{}\", \"{}\");",
@@ -664,7 +733,8 @@ pub(super) fn emit_member(
         method.type_name, method.method_name
     );
 
-    // Each member variant: (signature prefix, receiver parameter, receiver push).
+    // Step 2: resolve the variants the host and receiver produce: a signature
+    // prefix, an optional receiver parameter and the push of that receiver.
     let variants: Vec<(String, Option<String>, Option<String>)> = match (host, method.receiver.as_str()) {
         (MemberHost::Module, "") => vec![("public static".to_string(), None, None)],
         (MemberHost::Module, other) => {
@@ -725,6 +795,7 @@ pub(super) fn emit_member(
         }
     };
 
+    // Step 3: emit one member per variant.
     let mut output = String::new();
     for (prefix, receiver_parameter, receiver_push) in variants {
         let mut parameters: Vec<String> = Vec::new();
@@ -751,10 +822,10 @@ pub(super) fn emit_member(
         ));
     }
 
-    // An associated `new` that returns the object itself is also its
-    // constructor, so C# reads `new ShaderParameterSlot("tint", kind)` the way
-    // Rust reads `ShaderParameterSlot::new("tint", kind)`. The static `New`
-    // stays beside it for code that prefers the Rust spelling.
+    // Step 4: an associated `new` that returns the object itself is also its
+    // constructor, so C# reads `new ShaderParameterSlot("tint", parameter_type)`
+    // the way Rust reads `ShaderParameterSlot::new("tint", parameter_type)`. The
+    // static `New` stays beside it for code that prefers the Rust spelling.
     if let MemberHost::Object { name } = host {
         let returns_self = method
             .return_tag
@@ -772,7 +843,8 @@ pub(super) fn emit_member(
     Ok(output)
 }
 
-/// The functions mirrored onto one owner, skipping type and runtime-only rows.
+/// The functions mirrored onto one owner, skipping the `__`-named rows: the
+/// `__type` type row and the runtime's own `__asset_*` operations.
 pub(super) fn members_of<'a>(
     methods: &'a [ResolvedMirrorMethod],
     type_name: &'a str,
@@ -788,11 +860,19 @@ pub(super) fn members_of<'a>(
 
 /// Emit one declared type - an object class, an enum, or a resource marker
 /// and its extension class - wrapped in its namespace.
+///
+/// # Errors
+///
+/// Returns an error when the type row cannot be emitted: an enum whose
+/// representation is not a primitive, an enum with mirrored methods, a
+/// resource with no shared name, a value type that should carry no type row,
+/// or a member that cannot be lowered.
 pub(super) fn emit_declared_type(
     declared: &DeclaredType,
     methods: &[ResolvedMirrorMethod],
     scope: &MirrorScope,
 ) -> Result<String, String> {
+    // Step 1: emit the body for the kind the type row declares.
     let name = &declared.name;
     let body = match declared.kind {
         MirrorKind::Object => {
@@ -889,6 +969,7 @@ pub(super) fn emit_declared_type(
             ))
         }
     };
+    // Step 2: wrap the body in the namespace its crate root gives it.
     Ok(format!(
         "namespace {} {{\n\n{body}\n}}\n\n",
         declared.namespace
@@ -901,20 +982,28 @@ pub(super) fn emit_declared_type(
 /// its last segment, PascalCased, and declared in the namespace of the
 /// preceding segments, so `pill_dummy_color::get_color_a` reaches C# as
 /// `pill_dummy_color.PillDummyColor.GetColorA()`.
+///
+/// # Errors
+///
+/// Returns an error when one of the functions' argument or result tags cannot
+/// be lowered.
 pub(super) fn emit_free_function_class(
     module_path: &str,
     functions: &[&ResolvedMirrorMethod],
     scope: &MirrorScope,
 ) -> Result<String, String> {
+    // Step 1: derive the class name and namespace from the module path.
     let class_name = snake_to_pascal(last_segment(module_path));
     let namespace = module_path
         .rfind("::")
         .map(|separator| module_path[..separator].replace("::", "."))
         .unwrap_or_else(|| module_path.to_string());
+    // Step 2: emit one static member per function.
     let mut body = String::new();
     for function in functions {
         body.push_str(&emit_member(function, &MemberHost::Module, scope)?);
     }
+    // Step 3: wrap the members in the class and its namespace.
     Ok(format!(
         "\nnamespace {namespace} {{\n\n\
          /// Static mirror of the free functions the Rust module `{module_path}` declares;\n\
@@ -931,7 +1020,8 @@ pub(super) fn emit_free_function_class(
 mod tests {
     use super::*;
 
-    /// A resolved row, as the loader produces it.
+    /// A resolved row in the loader's shape, with a stand-in trampoline
+    /// address.
     fn row(
         type_name: &str,
         name: &str,
@@ -1023,6 +1113,7 @@ mod tests {
         ]
     }
 
+    /// The scope a fixture resolves to, with no value types.
     fn scope(methods: &[ResolvedMirrorMethod]) -> MirrorScope {
         MirrorScope::new(methods, &[], &|_| None).expect("the fixture resolves")
     }

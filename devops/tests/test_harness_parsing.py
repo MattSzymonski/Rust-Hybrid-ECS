@@ -67,7 +67,7 @@ DEVOPS_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(DEVOPS_ROOT))
 
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT  # noqa: E402
-from core.projects import EXAMPLES_RELATIVE_PATH, PROJECT_RS_LIB_RS  # noqa: E402
+from core.projects import PROJECT_RS_LIB_RS  # noqa: E402
 from core.suite_common import (  # noqa: E402
     apply_replacements,
     restore_paths,
@@ -652,15 +652,15 @@ def check_dependency_records_carry_kind_and_directory() -> None:
 
 
 def check_example_projects_come_from_manifests() -> None:
-    """The example projects are the manifests under `examples/`, with their
-    package names read from them - one directory, one crate."""
+    """The shipped projects are read from their own manifests: one directory,
+    one crate, and the name read from the manifest rather than the folder."""
     projects = example_projects(REPOSITORY_ROOT)
     directories = {crate.directory.name for crate in projects}
-    for directory in ("project_rs", "master_renderer_test"):
+    for directory in ("native", "pills_rust"):
         if directory not in directories:
-            fail(f"{EXAMPLES_RELATIVE_PATH}/{directory} is missing from the example projects")
-    if "project" not in {crate.name for crate in projects}:
-        fail(f"{EXAMPLES_RELATIVE_PATH}/project_rs must read as package `project`")
+            fail(f"{directory} is missing from the shipped projects")
+    if "native" not in {crate.name for crate in projects}:
+        fail("the native fixture must read as package `native`")
     if any(not crate.manifest_path.is_file() for crate in projects):
         fail("an example project was constructed without a manifest")
 

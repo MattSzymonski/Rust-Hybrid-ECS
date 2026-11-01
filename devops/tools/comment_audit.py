@@ -161,7 +161,8 @@ EXCLUDED_DIRECTORY_NAMES = {
     "projects_generated",
 }
 # The repository-root `local/` is gitignored scratch. Matched at the top level
-# only: `examples/local/` holds the game projects and is scanned like any other
+# only: `examples/` holds the game projects and `devops/tests/projects/` the
+# suites' fixtures; both are scanned like any other
 # source tree.
 ROOT_ONLY_EXCLUDED_DIRECTORY_NAMES = {"local"}
 # The one tracked crate under a `build/` directory that is real source.

@@ -9,9 +9,12 @@ DESCRIPTION
     path of its own, so relocating, adding or renaming a project is an edit here
     and nowhere else under `devops/`.
 
-    `EXAMPLES_ROOT` is the single knob for the repository's game projects: every
-    example path below derives from it. The fixture crate the functional suites
-    drive lives under `devops/tests/` and derives from `TESTS_ROOT`.
+    `EXAMPLES_ROOT` and `OFFICIAL_EXAMPLE_PROJECTS` name the projects a
+    developer runs: the local checkout and the tracked official examples. The
+    projects the suites drive live under `devops/tests/projects/` and are named
+    by `TEST_PROJECTS_ROOT` / `TEST_PROJECT_NAMES`, so a clean checkout can run
+    the gate without an examples checkout. The functional fixture crate derives
+    from `TESTS_ROOT` as well.
 
     Each project is exported in two forms, because the callers need different
     ones:
@@ -47,6 +50,35 @@ from .paths import MODULES_ROOT, REPOSITORY_ROOT, TESTS_ROOT
 EXAMPLES_RELATIVE_PATH = "examples/local"
 EXAMPLES_ROOT = REPOSITORY_ROOT / EXAMPLES_RELATIVE_PATH
 
+# The fixture projects the devops suites drive. They are test-owned rather than
+# examples: a suite edits their sources, asserts their log lines and reverts
+# them, and each one carries the anchors its suite needs. They live beside the
+# suites so a clean checkout can run the gate without a developer's examples
+# checkout.
+TEST_PROJECTS_ROOT = TESTS_ROOT / "projects"
+TEST_PROJECT_NAMES = (
+    "native",
+    "scene",
+    "managed",
+)
+
+# The official examples, the tracked counterpart of the local checkout above:
+# each group holds one Rust project and one C# project running the same demo,
+# and both are read from disk the same way. ONE ENTRY PER GROUP: a suite that
+# needs a project by role imports its name below, and a new example is an edit
+# here rather than a path spelled inside a suite.
+OFFICIAL_EXAMPLES_ROOT = REPOSITORY_ROOT / "examples"
+OFFICIAL_EXAMPLE_PROJECTS = {
+    "cube_rust": OFFICIAL_EXAMPLES_ROOT / "cube" / "cube_rust",
+    "cube_csharp": OFFICIAL_EXAMPLES_ROOT / "cube" / "cube_csharp",
+    "cube_no_editor_rust": OFFICIAL_EXAMPLES_ROOT / "cube_no_editor" / "cube_no_editor_rust",
+    "cube_no_editor_csharp": OFFICIAL_EXAMPLES_ROOT / "cube_no_editor" / "cube_no_editor_csharp",
+    "pills_rust": OFFICIAL_EXAMPLES_ROOT / "pills" / "pills_rust",
+    "pills_csharp": OFFICIAL_EXAMPLES_ROOT / "pills" / "pills_csharp",
+    "headless_rust": OFFICIAL_EXAMPLES_ROOT / "headless" / "headless_rust",
+    "headless_csharp": OFFICIAL_EXAMPLES_ROOT / "headless" / "headless_csharp",
+}
+
 # Every project directory is named by its manifest, so this is the file a
 # discovery walk looks for.
 PROJECT_SETTINGS_FILENAME = "project_settings.yaml"
@@ -71,95 +103,152 @@ def project_settings_yaml(project_root: Path) -> Path:
     return project_root / PROJECT_SETTINGS_FILENAME
 
 
+def example_project_roots() -> list[Path]:
+    """Returns every example project directory, local and official.
+
+    The local checkout is walked, because its projects are a developer's own
+    and nothing names them here; the official examples come from the catalog
+    above, so a suite and the build sweep agree on what the official set is.
+
+    The local checkout uses the same two layouts the official examples do: a
+    project directory (its `project_settings.yaml`) or a group directory
+    holding one Rust and one C# project. A directory with no manifest of its
+    own is read as a group.
+    """
+    roots: list[Path] = []
+    if EXAMPLES_ROOT.is_dir():
+        for path in sorted(EXAMPLES_ROOT.iterdir()):
+            if not path.is_dir():
+                continue
+            if project_settings_yaml(path).is_file():
+                roots.append(path)
+                continue
+            roots.extend(
+                sorted(
+                    child
+                    for child in path.iterdir()
+                    if child.is_dir() and project_settings_yaml(child).is_file()
+                )
+            )
+    roots.extend(sorted(OFFICIAL_EXAMPLE_PROJECTS.values()))
+    return roots
+
+
+def test_project_roots() -> list[Path]:
+    """Returns the fixture projects the suites drive, in name order."""
+    return [TEST_PROJECTS_ROOT / name for name in TEST_PROJECT_NAMES]
+
+
+def project_roots() -> list[Path]:
+    """Returns every project the repository ships: examples plus fixtures."""
+    return example_project_roots() + test_project_roots()
+
+
 # =============================================================================
-# The native example: the minimal scene the native scenarios drive
+# The native fixture: the reload, patch, migration, module and shipping anchors
 # =============================================================================
 
-PROJECT_RS_ROOT = EXAMPLES_ROOT / "project_rs"
-PROJECT_RS_PATH = host_project_path(PROJECT_RS_ROOT)
-PROJECT_RS_SRC = PROJECT_RS_ROOT / "src"
+# One project carries every anchor the mutation-heavy native suites need: the
+# ball/spline scene, the module list, the render chain, the embedded sound and
+# the migration witnesses (`src/lib.rs`).
+NATIVE_PROJECT_ROOT = TEST_PROJECTS_ROOT / "native"
+NATIVE_PROJECT_PATH = host_project_path(NATIVE_PROJECT_ROOT)
+PROJECT_RS_SRC = NATIVE_PROJECT_ROOT / "src"
 PROJECT_RS_LIB_RS = PROJECT_RS_SRC / "lib.rs"
 # The constant the hot-reload harness edits to force a project reload.
 PROJECT_RS_SETTINGS_RS = PROJECT_RS_SRC / "settings.rs"
-PROJECT_RS_RES = PROJECT_RS_ROOT / "res"
+# The components the migration scenarios rewrite live in the crate root, next
+# to the seeds and the witness systems they are read by.
+PROJECT_RS_RES = NATIVE_PROJECT_ROOT / "res"
 
-# The name the native suites and benchmarks use: the project is `project_rs`,
-# and its role in a scenario is "the native one".
-NATIVE_PROJECT_ROOT = PROJECT_RS_ROOT
-NATIVE_PROJECT_PATH = PROJECT_RS_PATH
+# The older spelling of the same role: the suites that predate the rename still
+# import these names, so they stay as aliases of the native fixture.
+PROJECT_RS_ROOT = NATIVE_PROJECT_ROOT
+PROJECT_RS_PATH = NATIVE_PROJECT_PATH
 
 
 # =============================================================================
-# The managed example: the C# bridge, analyzer and mirror suites
+# The managed fixture: the C# bridge, analyzer and mirror suites
 # =============================================================================
 
-PROJECT_CS_ROOT = EXAMPLES_ROOT / "project_cs"
-PROJECT_CS_PATH = host_project_path(PROJECT_CS_ROOT)
-PROJECT_CS_SRC = PROJECT_CS_ROOT / "src"
-PROJECT_CS_CSPROJ = PROJECT_CS_ROOT / "project_cs.csproj"
-PROJECT_CS_COMPONENTS_CS = PROJECT_CS_SRC / "Components.cs"
-PROJECT_CS_SYSTEMS_CS = PROJECT_CS_SRC / "Systems.cs"
+MANAGED_PROJECT_ROOT = TEST_PROJECTS_ROOT / "managed"
+MANAGED_PROJECT_PATH = host_project_path(MANAGED_PROJECT_ROOT)
+MANAGED_PROJECT_SRC = MANAGED_PROJECT_ROOT / "src"
+MANAGED_PROJECT_CSPROJ = MANAGED_PROJECT_ROOT / "managed.csproj"
+MANAGED_PROJECT_COMPONENTS_CS = MANAGED_PROJECT_SRC / "Components.cs"
+MANAGED_PROJECT_SYSTEMS_CS = MANAGED_PROJECT_SRC / "Systems.cs"
 # The probe file the bridge suite writes and deletes.
-PROJECT_CS_BRIDGE_PROBE_CS = PROJECT_CS_SRC / "BridgeProbe.cs"
+MANAGED_PROJECT_BRIDGE_PROBE_CS = MANAGED_PROJECT_SRC / "BridgeProbe.cs"
 
 # The managed counterpart's role name, matching `NATIVE_PROJECT_ROOT`.
-CSHARP_PROJECT_ROOT = PROJECT_CS_ROOT
-CSHARP_PROJECT_PATH = PROJECT_CS_PATH
+CSHARP_PROJECT_ROOT = MANAGED_PROJECT_ROOT
+CSHARP_PROJECT_PATH = MANAGED_PROJECT_PATH
 
 
 # =============================================================================
 # The managed benchmark scene: iteration timing only, no renderer
 # =============================================================================
 
-PROJECT_CS_BENCH_ROOT = EXAMPLES_ROOT / "project_cs_bench"
-PROJECT_CS_BENCH_PATH = host_project_path(PROJECT_CS_BENCH_ROOT)
-PROJECT_CS_BENCH_SRC = PROJECT_CS_BENCH_ROOT / "src"
+MANAGED_PROJECT_ROOT = TEST_PROJECTS_ROOT / "managed"
+MANAGED_PROJECT_PATH = host_project_path(MANAGED_PROJECT_ROOT)
+MANAGED_PROJECT_SRC = MANAGED_PROJECT_ROOT / "src"
 
 
 # =============================================================================
-# The renderer's test project: the fullest asset and material set
+# The scene fixture: the editor, picking, surface, web, asset and theme target
 # =============================================================================
 
-MASTER_RENDERER_TEST_ROOT = EXAMPLES_ROOT / "master_renderer_test"
-MASTER_RENDERER_TEST_PATH = host_project_path(MASTER_RENDERER_TEST_ROOT)
-MASTER_RENDERER_TEST_RES = MASTER_RENDERER_TEST_ROOT / "res"
+# One small, deterministic scene carries every read-mostly anchor: one mesh
+# drawn three times, three rotating models with the middle one on the camera's
+# axis for a scripted click to reach, a committed material, a sample map the
+# asset watcher reimports, a themed UI layer, a committed render pass and an
+# editor project layer. Nothing in it is reload- or patch-specific; that is the
+# native fixture's job.
+SCENE_PROJECT_ROOT = TEST_PROJECTS_ROOT / "scene"
+SCENE_PROJECT_PATH = host_project_path(SCENE_PROJECT_ROOT)
+SCENE_PROJECT_SRC = SCENE_PROJECT_ROOT / "src"
+SCENE_PROJECT_LIB_RS = SCENE_PROJECT_SRC / "lib.rs"
+# The file the editor suite's scene edits land in.
+SCENE_PROJECT_SCENE_RS = SCENE_PROJECT_SRC / "scene.rs"
+SCENE_PROJECT_RES = SCENE_PROJECT_ROOT / "res"
 
 
 # =============================================================================
-# The themed example: the UI theme, game UI and editor suites
+# The themed fixture: the UI theme, game UI and editor suites
 # =============================================================================
 
-CIRCUS_DEMO_ROOT = EXAMPLES_ROOT / "circus_demo"
-CIRCUS_DEMO_PATH = host_project_path(CIRCUS_DEMO_ROOT)
-CIRCUS_DEMO_SRC = CIRCUS_DEMO_ROOT / "src"
-CIRCUS_DEMO_LIB_RS = CIRCUS_DEMO_SRC / "lib.rs"
+# The scene fixture ships the theme chain the suites assert: the code default is
+# `Theme::brutalist()`, `res/ui/accent.theme` overrides the accent to `#33d17a`
+# and the heading size, and the body font is the Silkscreen face - the same
+# three-layer setup the old example drove, now inside the fixture tree so the
+# gate does not read `examples/`.
+THEMED_PROJECT_ROOT = SCENE_PROJECT_ROOT
+THEMED_PROJECT_PATH = SCENE_PROJECT_PATH
+THEMED_PROJECT_SRC = SCENE_PROJECT_SRC
+THEMED_PROJECT_LIB_RS = SCENE_PROJECT_LIB_RS
 # The override the theme suite edits, twice, to prove a live re-apply.
-CIRCUS_DEMO_ACCENT_THEME = CIRCUS_DEMO_ROOT / "res" / "ui" / "accent.theme"
+THEMED_PROJECT_THEME = SCENE_PROJECT_RES / "ui" / "accent.theme"
 # The face the editor's project theme layer installs.
-CIRCUS_DEMO_FONT = CIRCUS_DEMO_ROOT / "res" / "fonts" / "Silkscreen-Regular.ttf"
-
-
-# =============================================================================
-# The editor suite's project: a scene large enough to exercise navigation
-# =============================================================================
-
-ITALIAN_BRAINROT_ROOT = EXAMPLES_ROOT / "italian_brainrot"
-ITALIAN_BRAINROT_PATH = host_project_path(ITALIAN_BRAINROT_ROOT)
-ITALIAN_BRAINROT_SCENE_RS = ITALIAN_BRAINROT_ROOT / "src" / "scene.rs"
-ITALIAN_BRAINROT_RES = ITALIAN_BRAINROT_ROOT / "res"
+THEMED_PROJECT_FONT = SCENE_PROJECT_RES / "fonts" / "Silkscreen-Regular.ttf"
 
 # The managed port of the same scene: comment-lint scope only.
-ITALIAN_BRAINROT_CS_ROOT = EXAMPLES_ROOT / "italian_brainrot_cs"
+ITALIAN_BRAINROT_CS_ROOT = TEST_PROJECTS_ROOT / "italian_brainrot_cs"
 ITALIAN_BRAINROT_CS_SRC = ITALIAN_BRAINROT_CS_ROOT / "src"
 
 
 # =============================================================================
-# The suite fixture: the Rust crate the functional scenarios hot-reload
+# The migration fixture: the components the schema scenarios rewrite
 # =============================================================================
 
-FIXTURE_PROJECT_ROOT = TESTS_ROOT / "project"
-FIXTURE_PROJECT_PATH = host_project_path(FIXTURE_PROJECT_ROOT)
-# The fixture's entry source: the file the native and migration scenarios edit,
-# and the one whose restore settles with a project reload rather than a module
-# reload.
+# The migration scenarios used to drive a separate crate; their components and
+# witness systems now live in the native fixture's crate root, so both families
+# of scenarios run the same build and there is no second project to keep in
+# step.
+FIXTURE_PROJECT_ROOT = NATIVE_PROJECT_ROOT
+FIXTURE_PROJECT_PATH = NATIVE_PROJECT_PATH
+# The fixture's entry source: the file the native scenarios edit, and the one
+# whose restore settles with a project reload rather than a module reload.
 PROJECT_SANDBOX_LIB_RS = FIXTURE_PROJECT_ROOT / "src" / "lib.rs"
+# The migration scenarios edit the crate root itself, where the witness
+# components and their seeds live.
+FIXTURE_PROJECT_COMPONENTS_RS = PROJECT_RS_LIB_RS

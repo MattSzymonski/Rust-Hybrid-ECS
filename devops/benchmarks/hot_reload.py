@@ -20,8 +20,8 @@ DESCRIPTION
                       complete" (module-only latency, before the cascade)
       cascade_total   same edit -> "[analytics] reload project" (module plus
                       the queued project reload = full user-visible cost)
-project_reload  edit `examples/local/project_rs` -> project reload only
-  csharp_reload   edit `examples/local/project_cs` -> "C# hot reload complete"
+project_reload  edit `devops/tests/projects/project_rs` -> project reload only
+  csharp_reload   edit `devops/tests/projects/managed` -> "C# hot reload complete"
 
     Each native category also carries the host's own phase breakdown, parsed
     from its `[analytics] reload` line: build / stage / load / init / migrate,
@@ -78,11 +78,11 @@ CASE_DESCRIPTIONS = {
         "the project statically embeds."
     ),
     "project_reload": (
-        "Edit a project constant (examples/local/project_rs) until the project "
+        "Edit a project constant (devops/tests/projects/project_rs) until the project "
         "reload analytics line appears. No module cascade involved."
     ),
     "csharp_reload": (
-        "Edit a C# system body (examples/local/project_cs) until 'C# hot reload "
+        "Edit a C# system body (devops/tests/projects/managed) until 'C# hot reload "
         "complete'. Covers dotnet build plus the collectible assembly swap; "
         "the managed path emits no phase analytics, so wall time only."
     ),
@@ -208,7 +208,7 @@ def run(
         harness.project_settings_yaml(harness.CSHARP_PROJECT_ROOT),
         harness.SPLINE_LIB_RS,
         harness.PROJECT_RS_SETTINGS_RS,
-        harness.PROJECT_CS_SYSTEMS_CS,
+        harness.MANAGED_PROJECT_SYSTEMS_CS,
     ):
         harness.BACKUP.capture(path)
     harness.kill_stale_hosts()
@@ -229,7 +229,7 @@ def run(
         session_definitions.append(
             (
                 "csharp",
-                "CSHARP (project_cs + pill_spline)",
+                "CSHARP (managed + pill_spline)",
                 harness.CSHARP_PROJECT_ROOT,
                 harness.CSHARP_PROJECT_PATH,
                 harness.CSHARP_SETTINGS,

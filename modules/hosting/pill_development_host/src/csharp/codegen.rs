@@ -3,41 +3,146 @@
 //! # Responsibilities
 //!
 //! - Generate `generated/<module>_Components.g.cs` inside each extension that
-//!   exposes a managed surface - its components, its mirrored value types and
-//!   its mirrored free functions - from that surface's real registered
-//!   descriptors (name, size, alignment, field layout).
-//! - Keep the declaration with the module: nothing is hand-written in the
-//!   C# project, and the generated file's content derives entirely from what
-//!   the Rust module itself registered.
+//!   exposes a managed surface - its components, its mirrored value types, the
+//!   object classes, enums and resource markers its type rows declare, and its
+//!   mirrored free functions - from that surface's real registered descriptors
+//!   (name, size, alignment, field layout).
+//! - Keep the declaration with the module: nothing is hand-written in the C#
+//!   project, so the generated file derives entirely from what the Rust module
+//!   itself registered.
 //!
 //! # Design
 //!
-//! Each component is mirrored by a struct over its registered layout: an
-//! opaque `[StructLayout(LayoutKind.Sequential, Size = N)]` blob with an
-//! alignment-driving pad field when no field layout is known, and an explicit
-//! `LayoutKind.Explicit` struct with one field per descriptor when it is (C#
-//! struct alignment is driven by fields, so the pad makes the managed
-//! alignment match the module's). The `Raw` span property exposes the live
-//! bytes in safe code. The host validates the generated struct's size and
+//! A component with a registered field layout becomes a `LayoutKind.Explicit`
+//! struct with one field per descriptor; one with no field metadata becomes an
+//! opaque `[StructLayout(LayoutKind.Sequential, Size = N)]` blob whose sole
+//! field is an alignment pad. Both expose the live bytes as a `Raw` span in
+//! safe code, and the explicit struct also pads where its fields alone would
+//! not give it the module's alignment. The host compares the mirror's size and
 //! alignment against the module binding when the managed manifest is
 //! registered, so a generator bug cannot silently produce a mismatched mirror.
 //!
-//! The file is regenerated on every host startup. A committed copy serves as a
-//! bootstrap so standalone C# builds (IDE, `dotnet build`, the C# runtime
-//! regression tests) compile without a prior host run; identical content is
-//! left untouched, so a matching module keeps the tree clean.
+//! The file is regenerated on every startup and module reload of a C# project.
+//! A committed copy serves as a bootstrap so standalone C# builds (IDE,
+//! `dotnet build`, the C# runtime regression tests) compile without a prior
+//! host run; identical content is left untouched, so a matching module keeps
+//! the tree clean.
 
 // Standard library
 use std::path::Path;
 
 // External crates
-use pill_engine::component_registry::{ComponentFieldDescriptor, PillValueTypeDescriptor};
-
-use super::mirror_codegen;
 use pill_csharp_bridge::{
     is_heap_owned_tag, is_opaque_container_tag, snake_to_pascal, split_array_tag,
     ModuleExposedComponent, ResolvedFieldAccessor, ResolvedMirrorMethod,
 };
+use pill_engine::component_registry::{ComponentFieldDescriptor, PillValueTypeDescriptor};
+
+// Current crate
+use super::mirror_codegen;
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// C# reserved keywords that cannot name a parameter.
+///
+/// A Rust argument may legally be named like any of these (`event`, `string`,
+/// `ref`, ...) because Rust reserves a different set of words. Emitting it
+/// verbatim would make the generated project fail to compile, so such an
+/// argument falls back to a positional `argN` name (clearer in generated code
+/// than `@`-escaping, and immune to future keyword additions).
+const CSHARP_RESERVED_KEYWORDS: &[&str] = &[
+    "abstract",
+    "as",
+    "base",
+    "bool",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "checked",
+    "class",
+    "const",
+    "continue",
+    "decimal",
+    "default",
+    "delegate",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "event",
+    "explicit",
+    "extern",
+    "false",
+    "finally",
+    "fixed",
+    "float",
+    "for",
+    "foreach",
+    "goto",
+    "if",
+    "implicit",
+    "in",
+    "int",
+    "interface",
+    "internal",
+    "is",
+    "lock",
+    "long",
+    "namespace",
+    "new",
+    "null",
+    "object",
+    "operator",
+    "out",
+    "override",
+    "params",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "ref",
+    "return",
+    "sbyte",
+    "sealed",
+    "short",
+    "sizeof",
+    "stackalloc",
+    "static",
+    "string",
+    "struct",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "uint",
+    "ulong",
+    "unchecked",
+    "unsafe",
+    "ushort",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "while",
+];
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/// One nested C# struct definition to emit, deduplicated by Rust path.
+struct EmittedStruct {
+    /// Rust qualified path the definition was generated from.
+    qualified: String,
+    /// Full C# struct text (without the namespace wrapper).
+    definition: String,
+}
 
 // =============================================================================
 // Free Functions
@@ -47,8 +152,8 @@ use pill_csharp_bridge::{
 ///
 /// A struct with no fields defaults to 1-byte alignment in C# regardless of
 /// `Size`, so a single private pad field of a matching-alignment primitive is
-/// emitted to make `Marshal.OffsetOf`-style alignment probes agree with the
-/// module's registered layout.
+/// emitted to make the runtime's field-walk layout measurement report the
+/// alignment the module registered.
 fn alignment_primitive(align: usize) -> Option<&'static str> {
     match align {
         1 => Some("byte"),
@@ -77,8 +182,8 @@ fn path_namespace(qualified: &str) -> Option<String> {
 
 /// Generate `<module>_Components.g.cs` inside the extension's `generated`
 /// directory for the surface the module exposes to managed code: its exposed
-/// components, its `#[derive(PillMirror)]` value types, and its
-/// `#[pill_mirror_fn]` free functions.
+/// components, its `#[derive(PillMirror)]` value types, the types its type rows
+/// declare, and its `#[pill_mirror_fn]` free functions.
 ///
 /// Returns `Ok(true)` when the mirror file was written or removed, and
 /// `Ok(false)` when the existing file already matched what this call would
@@ -87,8 +192,13 @@ fn path_namespace(qualified: &str) -> Option<String> {
 ///
 /// # Errors
 ///
-/// Returns a message when an exposed component has an unsupported alignment or
-/// the generated file cannot be written.
+/// Returns a message when an exposed component's derived name has no
+/// namespace, a field layout cannot be expressed in C# (an alignment above 8,
+/// a field outside the type, overlapping siblings, an array whose count does
+/// not divide its size, an unsupported type tag), a container field has no
+/// published accessor or trampoline, two mirrored types collide on one C# name,
+/// a declared value type disagrees with the field using it, a declared type or
+/// mirrored member cannot be emitted, or a file operation fails.
 pub(crate) fn generate_module_components_csharp(
     workspace_root: &Path,
     module_name: &str,
@@ -109,8 +219,8 @@ pub(crate) fn generate_module_components_csharp(
 
 /// Generate `generated/<module_name>_Components.g.cs` inside `crate_root`.
 ///
-/// The engine of [`generate_module_components_csharp`], taking the directory
-/// that holds the module's `generated/` folder directly.
+/// The implementation behind [`generate_module_components_csharp`], taking the
+/// directory that holds the module's `generated/` folder directly.
 ///
 /// # Errors
 ///
@@ -126,11 +236,11 @@ pub(crate) fn generate_components_csharp(
     let generated_dir = crate_root.join("generated");
     let output_path = generated_dir.join(format!("{module_name}_Components.g.cs"));
 
-    // A module with no managed surface at all needs no mirror file: no exposed
-    // components, no mirrored value types, no mirrored free functions. Remove
-    // a stale file from an earlier generation so a surface that stopped being
-    // exposed cannot linger in the C# project (it would otherwise compile in a
-    // struct or class whose binding no longer exists).
+    // Step 1: drop the mirror file when the module has no managed surface at
+    // all - no exposed components, no mirrored value types, no mirrored free
+    // functions and no declared types. A surface that stopped being exposed
+    // must not linger in the C# project, where it would compile against a
+    // binding that no longer exists.
     let has_free_functions = methods.iter().any(|method| method.is_free_function);
     let has_declared_types = methods
         .iter()
@@ -148,12 +258,16 @@ pub(crate) fn generate_components_csharp(
     std::fs::create_dir_all(&generated_dir)
         .map_err(|error| format!("cannot create {}: {error}", generated_dir.display()))?;
 
+    // Step 2: render the whole file into `content` - the usings, the declared
+    // types, the nested value-type and component namespaces, then the free
+    // functions.
     let mut content = String::new();
     content.push_str(
         "// AUTO-GENERATED by the Rust host from this extension's registered metadata.\n\
-         // Do not edit: derived from the components, mirrored value types and mirrored\n\
-         // free functions the module itself declares.\n\
-         // Regenerated on every host startup into generated/<module>_Components.g.cs.\n\
+         // Do not edit: derived from the components, mirrored value types, declared\n\
+         // types and mirrored free functions the module itself declares.\n\
+         // Written into generated/<module>_Components.g.cs when a C# project\n\
+         // starts and whenever one of its modules reloads.\n\
          // Components registered with compile-time field layouts are emitted as\n\
          // typed structs; everything else is an opaque ABI blob with a `Raw` span.\n\
          // Heap-owning fields become accessor members: `Vec`/`String` reach the\n\
@@ -326,17 +440,12 @@ pub(crate) fn generate_components_csharp(
         }
     }
 
-    // Write only when the file is missing or its content differs from what
-    // this startup would generate. The generated file depends on the module's
-    // registered layout (name/size/align/fields), so "up to date" is a content
-    // comparison, not a timestamp comparison: a module rebuild that does not
-    // change the layout leaves the file and its mtime untouched (keeping the
-    // committed bootstrap clean), while a layout change (or a missing file)
-    // triggers a rewrite.
+    // Step 3: write only when the file is missing or its content differs. "Up
+    // to date" is a content comparison, not a timestamp one: a module rebuild
+    // that leaves the registered layout alone keeps the file and its mtime, so
+    // the committed bootstrap stays clean.
     match std::fs::read(&output_path) {
-        // Up to date: identical content leaves the file and its mtime alone.
         Ok(existing) if existing == content.as_bytes() => return Ok(false),
-        // Missing or different: fall through to rewrite.
         _ => {}
     }
 
@@ -345,15 +454,11 @@ pub(crate) fn generate_components_csharp(
     Ok(true)
 }
 
-/// One nested C# struct definition to emit, deduplicated by Rust path.
-struct EmittedStruct {
-    /// Rust qualified path the definition was generated from.
-    qualified: String,
-    /// Full C# struct text (without the namespace wrapper).
-    definition: String,
-}
-
 /// Emit the opaque ABI-blob mirror for a component with no field metadata.
+///
+/// # Errors
+///
+/// Returns a message when `align` has no C# primitive with that alignment.
 fn emit_blob_component(name: &str, size: usize, align: usize) -> Result<String, String> {
     let align_primitive = alignment_primitive(align)
         .ok_or_else(|| format!("unsupported alignment {align} for exposed component {name}"))?;
@@ -386,12 +491,22 @@ fn emit_blob_component(name: &str, size: usize, align: usize) -> Result<String, 
 /// `owner_type_name` is the component's Rust type name when this struct
 /// mirrors a component row — which is what enables the heap-field accessor
 /// members — and empty for a `PillMirror` value type. The many parameters
-/// mirror the descriptor fields plus the recursion context; clippy's
-/// threshold is below the (internal) signature's size.
+/// mirror the descriptor fields plus the recursion context; clippy's argument
+/// threshold sits below this signature's count.
 ///
 /// `qualified` is the Rust path mirrored methods resolve against: a component
 /// row passes its own name, so `#[pill_mirror_impl]` methods attach to it the
 /// same way they attach to a `PillMirror` value type.
+///
+/// # Errors
+///
+/// Returns a message when a field has no size or runs past the type's bytes,
+/// an array reports zero elements or a size its count does not divide, two
+/// emitted fields overlap, a type tag or element alignment has no C# mirror, a
+/// container field has no published accessor or trampoline, a nested value
+/// type collides on its C# name or disagrees with the field using it, a
+/// mirrored member cannot be lowered, or no free range is left for the
+/// alignment pad.
 #[allow(clippy::too_many_arguments)]
 fn emit_typed_struct(
     name: &str,
@@ -644,6 +759,12 @@ fn emit_typed_struct(
 /// `PillMirror`, a foreign type), an opaque blob of the field's element
 /// size/alignment is emitted so the mirror still compiles and stays
 /// size-correct.
+///
+/// # Errors
+///
+/// Returns a message when two nested types map to one C# name, when a declared
+/// value type's size or alignment disagrees with the field using it, or when a
+/// recursive definition or the opaque fallback cannot be emitted.
 fn emit_nested_struct(
     qualified: &str,
     size: usize,
@@ -702,6 +823,10 @@ fn emit_nested_struct(
 }
 
 /// Emit an opaque blob struct for a nested type with no `PillMirror` descriptor.
+///
+/// # Errors
+///
+/// Returns a message when `align` has no C# primitive with that alignment.
 fn emit_opaque_struct(name: &str, size: usize, align: usize) -> Result<String, String> {
     let align_primitive = alignment_primitive(align)
         .ok_or_else(|| format!("unsupported alignment {align} for nested value type `{name}`"))?;
@@ -720,93 +845,6 @@ fn emit_opaque_struct(name: &str, size: usize, align: usize) -> Result<String, S
         align_primitive = align_primitive,
     ))
 }
-
-/// C# reserved keywords that cannot name a parameter.
-///
-/// A Rust argument may legally be named like any of these (`event`, `string`,
-/// `ref`, ...) because Rust reserves a different set of words. Emitting it
-/// verbatim would make the generated project fail to compile, so such an
-/// argument falls back to a positional `argN` name (clearer in generated code
-/// than `@`-escaping, and immune to future keyword additions).
-const CSHARP_RESERVED_KEYWORDS: &[&str] = &[
-    "abstract",
-    "as",
-    "base",
-    "bool",
-    "break",
-    "byte",
-    "case",
-    "catch",
-    "char",
-    "checked",
-    "class",
-    "const",
-    "continue",
-    "decimal",
-    "default",
-    "delegate",
-    "do",
-    "double",
-    "else",
-    "enum",
-    "event",
-    "explicit",
-    "extern",
-    "false",
-    "finally",
-    "fixed",
-    "float",
-    "for",
-    "foreach",
-    "goto",
-    "if",
-    "implicit",
-    "in",
-    "int",
-    "interface",
-    "internal",
-    "is",
-    "lock",
-    "long",
-    "namespace",
-    "new",
-    "null",
-    "object",
-    "operator",
-    "out",
-    "override",
-    "params",
-    "private",
-    "protected",
-    "public",
-    "readonly",
-    "ref",
-    "return",
-    "sbyte",
-    "sealed",
-    "short",
-    "sizeof",
-    "stackalloc",
-    "static",
-    "string",
-    "struct",
-    "switch",
-    "this",
-    "throw",
-    "true",
-    "try",
-    "typeof",
-    "uint",
-    "ulong",
-    "unchecked",
-    "unsafe",
-    "ushort",
-    "using",
-    "virtual",
-    "void",
-    "volatile",
-    "while",
-];
 
 /// The parameter name the generated C# uses for one mirrored-method argument.
 ///
@@ -831,6 +869,10 @@ pub(super) fn csharp_parameter_name(argument_index: usize, rust_name: &str) -> S
 /// so the generated body compiles without `AllowUnsafeBlocks`.
 ///
 /// Returns an empty string when the value type has no mirrored functions.
+///
+/// # Errors
+///
+/// Returns a message when one of the type's members cannot be lowered to C#.
 fn emit_value_type_methods(
     qualified: &str,
     methods: &[ResolvedMirrorMethod],
@@ -852,9 +894,9 @@ fn emit_value_type_methods(
     Ok(output)
 }
 
-/// The namespace a value type no component references is emitted in: the
-/// first exposed component's, or - when the module exposes none - the type's
-/// own module path.
+/// The namespace a value type no component references is emitted in: the first
+/// exposed component's namespace, or - when the module exposes no components -
+/// `pill_<module_name>`.
 fn default_value_namespace(module_name: &str, exposed: &[ModuleExposedComponent]) -> String {
     exposed
         .first()
@@ -988,6 +1030,13 @@ fn value_type_namespaces(
 /// The parameters are the descriptor fields plus the recursion context, as
 /// for [`emit_typed_struct`]; clippy's threshold is below the (internal)
 /// signature's size.
+///
+/// # Errors
+///
+/// Returns a message when a container field has no published accessor, when
+/// the accessor's kind or element tag disagrees with the field, when a
+/// trampoline the generated members call was not published, or when a span's
+/// element type cannot be resolved.
 #[allow(clippy::too_many_arguments)]
 fn emit_heap_field_accessors(
     cs_name: &str,
@@ -1472,6 +1521,12 @@ fn emit_heap_field_accessors(
 /// A primitive maps straight across; a `struct:<path>` element must be
 /// declared with `#[derive(PillMirror)]`, because that descriptor is where the
 /// span's C# struct and its size both come from.
+///
+/// # Errors
+///
+/// Returns a message when a `struct:` element carries no `PillMirror`
+/// descriptor, when the tag is neither a primitive nor a struct, or when the
+/// element's own definition cannot be emitted.
 fn resolve_span_element_type(
     element_tag: &str,
     cs_name: &str,
@@ -1704,6 +1759,8 @@ mod tests {
         }
     }
 
+    /// Path of a module's mirror file inside a temp workspace shaped like the
+    /// real repo: `<root>/extensions/<module>/<module>/generated/`.
     fn generated_path(workspace: &Path, module_name: &str) -> PathBuf {
         workspace
             .join("extensions")
@@ -1735,6 +1792,7 @@ mod tests {
         },
     ];
 
+    /// Text of a module's generated mirror file, read back for assertions.
     fn read_generated(workspace: &Path, module_name: &str) -> String {
         std::fs::read_to_string(generated_path(workspace, module_name))
             .expect("generated file is readable")

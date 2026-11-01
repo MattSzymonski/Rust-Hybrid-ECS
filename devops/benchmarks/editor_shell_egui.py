@@ -5,8 +5,8 @@ frame rate, idle CPU and its per-update UI time, with the D32 comparison
 ratios: the targets the native editor missed, measured on its replacement.
 
 REQUIREMENTS: Python 3.8+, a built `pill_editor` and `pill_standalone`
-(prefers the `dev-optimized` profile: `cargo build -p pill_editor
---profile dev-optimized` and the same for `pill_standalone` in modules/),
+(prefers the `development-optimized` profile: `cargo build -p pill_editor
+--profile development-optimized` and the same for `pill_standalone` in modules/),
 and a GPU the windowed editor can render with.
 
 DESCRIPTION
@@ -66,7 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core.cli import add_json_flag, banner, run_standalone, store_measurement  # noqa: E402
 from core.paths import MODULES_ROOT  # noqa: E402
-from core.projects import CIRCUS_DEMO_PATH  # noqa: E402
+from core.projects import THEMED_PROJECT_PATH  # noqa: E402
 
 CATEGORY = "editor_shell_egui"
 
@@ -85,7 +85,7 @@ HEARTBEAT_FRAME_PATTERN = re.compile(
 EGUI_FRAME_PATTERN = re.compile(r"\[editor\] egui frame\s+frames=(\d+)\s+ui_us=(\d+)")
 PAUSE_TOKEN = re.compile(r"\[editor\] engine commands applied")
 
-DEFAULT_PROJECT = CIRCUS_DEMO_PATH
+DEFAULT_PROJECT = THEMED_PROJECT_PATH
 EDITOR_START_BUDGET_SECONDS = 30
 
 # A first launch after module changes compiles them; it is discarded so the
@@ -109,7 +109,7 @@ STANDALONE_LOOP_TOKEN = re.compile(r"Entering project loop")
 STANDALONE_FPS_PATTERN = re.compile(r"(\d+(?:\.\d+)?) FPS \|")
 
 # The profile `--profile` selected; `None` keeps `profile_binary`'s preference
-# order (dev-optimized, release, debug).
+# order (development-optimized, release, debug).
 SELECTED_PROFILE: Optional[str] = None
 
 
@@ -149,16 +149,16 @@ def kill_editors() -> None:
 
 
 def profile_binary(name: str) -> Path:
-    """A built binary: the dev-optimized profile first (hot reload works at
+    """A built binary: the development-optimized profile first (hot reload works at
     opt-level 3), then release, then the dev build."""
     suffix = ".exe" if os.name == "nt" else ""
-    for profile in ("dev-optimized", "release", "debug"):
+    for profile in ("development-optimized", "release", "debug"):
         candidate = MODULES_ROOT / "target" / profile / f"{name}{suffix}"
         if candidate.is_file():
             return candidate
     raise SystemExit(
         f"{name} binary not found; build it first (in modules/): "
-        f"cargo build -p {name} --profile dev-optimized"
+        f"cargo build -p {name} --profile development-optimized"
     )
 
 
@@ -743,10 +743,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--profile",
-        choices=("auto", "dev-optimized", "release", "debug"),
+        choices=("auto", "development-optimized", "release", "debug"),
         default="auto",
         help=(
-            "which built profile to measure; `auto` prefers dev-optimized, "
+            "which built profile to measure; `auto` prefers development-optimized, "
             "then release, then debug (default: auto)"
         ),
     )

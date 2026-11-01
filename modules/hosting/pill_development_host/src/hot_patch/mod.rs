@@ -5,8 +5,8 @@
 //! - Decide whether a source change is a body-only edit of a function the host
 //!   can address, and refuse loudly when it is anything else.
 //! - Generate, compile and load a small patch library for that one function.
-//! - Install the replacement into the engine's dispatch slot at a frame
-//!   boundary.
+//! - Install the replacement at a frame boundary: the engine's registry, an
+//!   artifact's dispatch slot, or the function's prologue.
 //!
 //! # Design
 //!
@@ -54,29 +54,6 @@ pub(crate) mod compile;
 pub(crate) mod generations;
 /// Patch routes: where a body is installed and how calls reach it.
 pub(crate) mod routes;
-/// Patch builds: compiling and loading a patch away from the frame thread.
-mod worker;
-
-// A function's patch history and the routes back through it.
-pub(crate) use generations::Generation;
-pub use generations::PatchGeneration;
-
-// The captured compiler line and its cache, re-exported for the build runner:
-// a module build harvests the same line this pipeline would otherwise pay a
-// second `cargo build -v` to discover.
-pub(crate) use compile::{flags_cache_path, parse_rustc_line};
-
-// One background build's pieces, re-exported for the frame loop that starts a
-// build and installs its product at a later frame boundary.
-pub(crate) use worker::{build_attempt, BodyOutcome, PatchAttempt};
-
-// The three install routes and the patch-image plumbing they share, re-exported
-// rather than referenced through `routes::` at every call site.
-use routes::{
-    install_everywhere, prologue_patch_everywhere, reset_everywhere, resolve_in,
-    resolve_patch_address, resolve_plain_in,
-};
-pub(crate) use routes::{LoadedPatch, PrologueRestore};
 /// The source scanner, shared with every crate's build script.
 ///
 /// The implementation lives in `pill_hot_scan` because the host and the build
@@ -90,10 +67,34 @@ pub(crate) use routes::{LoadedPatch, PrologueRestore};
 pub(crate) mod source {
     pub use pill_hot_scan::*;
 }
+/// Patch builds: compiling and loading a patch away from the frame thread.
+mod worker;
+
+pub(crate) use compile::CargoRustcLine;
+
+// The captured compiler line and its cache, re-exported for the build runner:
+// a module build harvests the same line this pipeline would otherwise pay a
+// second `cargo build -v` to discover.
+pub(crate) use compile::{flags_cache_path, parse_rustc_line};
+
+// A function's patch history and the routes back through it.
+pub(crate) use generations::Generation;
+pub use generations::PatchGeneration;
+
+pub(crate) use routes::{LoadedPatch, PrologueRestore};
+
+// One background build's pieces, re-exported for the frame loop that starts a
+// build and installs its product at a later frame boundary.
+pub(crate) use worker::{build_attempt, BodyOutcome, PatchAttempt};
 
 use crate::native_library::NativeLibrary;
 
-pub(crate) use compile::CargoRustcLine;
+// The three install routes and the patch-image plumbing they share, in scope so
+// the install code below does not spell `routes::` at every call site.
+use routes::{
+    install_everywhere, prologue_patch_everywhere, reset_everywhere, resolve_in,
+    resolve_patch_address, resolve_plain_in,
+};
 
 // =============================================================================
 // Constants
@@ -106,6 +107,12 @@ pub(crate) use compile::CargoRustcLine;
 /// `#[no_mangle]` definitions of one name in a single artifact is a link error.
 pub(super) const PATCH_RESOLVER_EXPORT: &[u8] = b"pill_patch_resolve";
 
+/// Export that reports where a patched plain function lives.
+///
+/// Named from `PATCH_RESOLVER_EXPORT` by the same macro that generates it, and
+/// distinct from the crate's own `pill_hot_resolve_plain` for the same reason.
+pub(super) const PATCH_PLAIN_EXPORT: &[u8] = b"pill_patch_resolve_plain";
+
 /// Prefix that namespaces a patch's registry entry.
 ///
 /// Also not optional. Linking the project's rlib pulls in that crate's
@@ -115,12 +122,6 @@ pub(super) const PATCH_RESOLVER_EXPORT: &[u8] = b"pill_patch_resolve";
 /// matching signature hash - a patch that installs silently and changes
 /// nothing.
 const PATCH_NAME_PREFIX: &str = "pill_patch::";
-
-/// Export that reports where a patched plain function lives.
-///
-/// Named from `PATCH_RESOLVER_EXPORT` by the same macro that generates it, and
-/// distinct from the crate's own `pill_hot_resolve_plain` for the same reason.
-pub(super) const PATCH_PLAIN_EXPORT: &[u8] = b"pill_patch_resolve_plain";
 
 // =============================================================================
 // Outcome
@@ -134,9 +135,9 @@ pub(super) const PATCH_PLAIN_EXPORT: &[u8] = b"pill_patch_resolve_plain";
 /// per-reason cases in `devops/tests/` meaningful rather than brittle.
 #[derive(Debug, Clone)]
 pub(crate) struct PatchRefusal {
-    /// Stable tag, printed in parentheses after the headline.
+    /// Stable tag, logged as the `code` field beside the reason.
     pub code: &'static str,
-    /// Human explanation, printed on its own line.
+    /// Human explanation, logged as the `detail` field.
     pub detail: String,
 }
 
@@ -154,7 +155,7 @@ impl PatchRefusal {
 pub(crate) mod refusal_code {
     /// A source file appeared that was not in the baseline snapshot.
     pub const NEW_SOURCE_FILE: &str = "new-source-file";
-    /// The changed file marks no function as hot-patchable.
+    /// The changed file declares no function the host can address.
     pub const NO_HOT_FUNCTION: &str = "no-hot-function";
     /// Something outside a hot body moved: a signature, type, constant, import
     /// or another function.
@@ -174,9 +175,10 @@ pub(crate) mod refusal_code {
 
 /// The change was in scope, but the attempt to deliver it did not complete.
 pub(crate) mod failure_code {
-    /// The edited function could not be located in the changed source.
+    /// The patch source for the edited function could not be produced.
     pub const GENERATE: &str = "generate";
-    /// Writing the generated source, or capturing the compiler flags, failed.
+    /// The scratch directory, the generated source, the staged rlib or the
+    /// compiler flags could not be prepared.
     pub const PREPARE: &str = "prepare";
     /// `rustc` rejected the generated patch.
     pub const COMPILE: &str = "compile";
@@ -194,7 +196,8 @@ pub(crate) mod failure_code {
 pub(crate) enum PatchOutcome {
     /// A function's implementation was replaced; no reload is needed.
     Patched {
-        /// Qualified name of the patched function.
+        /// Qualified names of the patched functions, comma-separated when one
+        /// save changed several.
         function: String,
         /// Which generation this became; generation zero is the original code
         /// the running artifact was built with.
@@ -204,7 +207,7 @@ pub(crate) enum PatchOutcome {
         /// Per-stage breakdown, so the dominant cost is visible rather than
         /// guessed at. Without this a slow patch is just a number.
         stages: PatchStages,
-        /// Size of the compiled patch, for the analytics line.
+        /// Size of the last body's compiled artifact, for the analytics line.
         artifact_bytes: u64,
         /// Which mechanisms delivered this edit. More than one when a single
         /// save changed both an annotated and an un-annotated body.
@@ -268,8 +271,8 @@ pub(crate) struct PatchStages {
     pub classify: f64,
     /// Producing the patch source.
     pub generate: f64,
-    /// Asking cargo for the compiler flags. Zero once this session has cached
-    /// the answer.
+    /// Asking cargo for the compiler flags. Near zero once this session has
+    /// cached the answer.
     pub flags: f64,
     /// `rustc` compiling and linking the patch library.
     pub compile: f64,
@@ -279,6 +282,7 @@ pub(crate) struct PatchStages {
     pub activate: f64,
 }
 
+/// Renders the per-stage timings as one line for the console.
 impl std::fmt::Display for PatchStages {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -343,11 +347,11 @@ struct Snapshot {
     /// `None` means "always re-read", which is the safe direction: a redundant
     /// read costs microseconds, a missed edit costs a reload.
     ///
-    /// Compared against the file's *current* modification time, never against
-    /// `SystemTime::now()`. Both sides are filesystem timestamps, which matters:
-    /// on Windows file times come from the coarse system clock and can lag
-    /// `now()` by a scheduler tick, so a file written after a snapshot can
-    /// report an earlier time and the edit is then missed.
+    /// Compared against the file's *current* modification time, never against a
+    /// clock read at check time. Both sides are filesystem timestamps, which
+    /// matters: on Windows file times come from the coarse system clock and can
+    /// lag `now()` by a scheduler tick, so a file written just after a snapshot
+    /// can report an earlier time and the edit is then missed.
     modified: Option<SystemTime>,
 }
 
@@ -393,7 +397,10 @@ struct ClassifiedEdit {
     modified: Option<SystemTime>,
 }
 
-/// Drives the fast path for one project.
+/// Drives the fast path for one loaded module: the project or one extension.
+///
+/// A session owns that module's snapshots, compiler line and generation
+/// history, keyed to the package, build command and staged rlib it patches.
 pub(crate) struct HotPatchSession {
     workspace_root: PathBuf,
     package: String,
@@ -433,11 +440,12 @@ pub(crate) struct HotPatchSession {
 }
 
 impl HotPatchSession {
-    /// Prepare a session and take the baseline snapshot of the project sources.
+    /// Prepare a session for one module and take the baseline snapshot of its
+    /// sources.
     ///
-    /// Returns `None` when the project has no function the host could address,
-    /// so a project with no such function pays nothing, and when the crate's
-    /// own rlib was not built - a patch could not link it.
+    /// Returns `None` when the module has no function the host could address,
+    /// so a module without one pays nothing, and when the crate's own rlib was
+    /// not built - a patch could not link it.
     pub(crate) fn new(
         workspace_root: &Path,
         package: &str,
@@ -581,9 +589,9 @@ impl HotPatchSession {
         let mut bodies = Vec::with_capacity(edit.declarations.len());
         for declaration in edit.declarations {
             // The path the running artifact recorded for this function, which
-            // is what both the engine registry and a slot are keyed by.
-            // Derived from the file's position under the source root, so a
-            // function in a submodule resolves as `crate::module::function`.
+            // is what the engine registry is keyed by. Derived from the file's
+            // position under the source root, so a function in a submodule
+            // resolves as `crate::module::function`.
             let qualified = self.qualified_name(&path, &declaration);
             // The slot route asks under a different name; see
             // `slot_lookup_name`.
@@ -625,16 +633,23 @@ impl HotPatchSession {
 
     /// Identify body-only edits in exactly one source file.
     ///
-    /// `Ok(None)` means nothing changed. `Err` carries the reason the change is
-    /// out of scope, phrased for the console. A match carries the file's
+    /// `Ok(None)` means nothing changed. `Ok(Some(..))` carries the file's
     /// contents and the modification time read together, so the snapshot the
     /// caller writes describes one observation rather than two.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the change is out of scope, phrased for the console:
+    /// a new source file, a file declaring no function the host can address, a
+    /// change outside the hot bodies, a second changed file, an unresolvable
+    /// receiver type, a receiver-less associated function, a duplicate bare
+    /// name, or an edit that landed before the baseline was taken.
     fn classify(&mut self) -> Result<Option<ClassifiedEdit>, PatchRefusal> {
         let mut result: Option<ClassifiedEdit> = None;
 
-        // One directory walk, reused below. Reading every file in the crate on
-        // every attempt made classification proportional to crate size rather
-        // than to the edit - measured at 53 ms and 72 ms on small crates.
+        // One directory walk, reused below: re-reading every file in the crate
+        // on every attempt would make classification proportional to crate size
+        // rather than to the edit.
         let sources = rust_sources(&self.source_root);
         let mut any_newer_than_snapshot = false;
 
@@ -731,12 +746,10 @@ impl HotPatchSession {
                 ));
             }
 
-            // Exactly one changed body keeps the first version simple and the
-            // diagnostics precise. Both revisions are scanned once for every
-            // body at a time rather than once per function: asking about each
-            // function separately rebuilt the file's code mask on every
-            // question, which made classification of a 500-line file cost tens
-            // of milliseconds on every save.
+            // Both revisions are scanned once for every body at a time rather
+            // than once per function: asking about each function separately
+            // rebuilds the file's code mask on every question, which costs tens
+            // of milliseconds on a large file at every save.
             let old_bodies = source::function_bodies(old_contents, &hot_names);
             let new_bodies = source::function_bodies(&new_contents, &hot_names);
             let mut changed: Vec<String> = Vec::new();
@@ -1024,6 +1037,12 @@ impl HotPatchSession {
     /// The compile, the load and the artifact inspection already happened on a
     /// worker thread; what runs here is exactly the part that must happen at
     /// the frame boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns `resolve` when the patch does not report the replacement this
+    /// route asked for, and `install` when a running artifact refuses it -
+    /// typically because the function's signature no longer matches.
     fn install_body(
         &mut self,
         engine: &mut Engine,
@@ -1112,6 +1131,7 @@ impl HotPatchSession {
             // other module linking it, so the same replacement is offered to all
             // of them - which is exactly what makes the cascading project reload
             // this edit would otherwise trigger unnecessary.
+            //
             // No attribute, so no slot exists to install into: the running
             // copies are redirected by overwriting their first bytes.
             source::HotFunctionKind::PlainFunction if !declaration.annotated => {
@@ -1200,6 +1220,12 @@ impl HotPatchSession {
     /// written. Everything it names comes from the SAME artifacts the running
     /// module linked, which is what keeps type layout and `TypeId` identical
     /// across the boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the source cannot be produced: the function is not in
+    /// the changed source, a receiver-taking body has no known receiver type,
+    /// or its signature text cannot be read.
     fn generate(
         &self,
         new_contents: &str,
@@ -1457,6 +1483,11 @@ impl HotPatchSession {
     /// still what the host *loads*, so a wrong-featured rlib copied here can
     /// only make this one patch fail to compile, and the next real build
     /// restages it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error text when a freshly built rlib is there but cannot be
+    /// copied over the staged copy.
     fn refresh_staged_rlib(&self) -> Result<(), String> {
         // A wrapper build compiles the extension as a dependency, so the
         // newest rlib under the build's `deps` directory is the one that
@@ -1497,30 +1528,31 @@ impl HotPatchSession {
     }
 
     /// The captured compiler flags, asking cargo on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error text when the line has to be captured and cargo cannot
+    /// run, the build fails, or it prints no invocation for this package.
     fn rustc_line(&mut self) -> Result<&CargoRustcLine, String> {
         if self.rustc_line.is_none() {
             let cache = compile::flags_cache_path(&self.workspace_root, &self.package);
-            // Deliberately NOT the crate root. The flags describe the dependency
-            // graph and feature set, which a source edit cannot change - and the
-            // crate root is precisely the file being edited, so including it
-            // would invalidate the cache on every single patch and re-run a full
-            // `cargo build -v` to re-derive flags that were already correct.
+            // Deliberately NOT the crate root: the flags describe the dependency
+            // graph and feature set, and the crate root is the very file being
+            // edited, so including it would invalidate the cache on every patch
+            // and re-run a full `cargo build -v` for flags that were correct.
             //
-            // The crate's own freshly built rlib IS included: the flags
-            // describe the dependency closure this crate links, and that
-            // closure changes exactly when the crate is rebuilt - at startup, on
-            // a module reload, or when the engine feature set the build resolves
-            // with changes. A cache captured against one feature set goes
+            // The crate's own staged rlib IS included: the flags describe the
+            // closure this crate links, which changes exactly when the crate is
+            // rebuilt - at startup, on a module reload, or when the engine's
+            // feature set changes. A cache captured against one feature set goes
             // silently stale against another, and rustc then reports
-            // `error[E0463]` when the patch links the freshly staged rlib
-            // against the old externs. The rlib's mtime moves exactly when that
-            // happens, so keying on it re-captures precisely when the world
-            // changed and stays hot across plain source edits and patches.
+            // `error[E0463]` when the patch links the fresh rlib against the old
+            // externs.
             //
-            // The staged copy, not a build-tree path: a wrapper build leaves
-            // the extension's rlib under a hashed name the session cannot
-            // know, and the staged file is refreshed from it right before this
-            // runs - it is also what the patch actually links.
+            // The staged copy, not a build-tree path: a wrapper build leaves the
+            // extension's rlib under a hashed name the session cannot know, and
+            // the staged file is refreshed from it right before this runs - it
+            // is also what the patch actually links.
             let mut freshness = vec![
                 self.workspace_root.join("Cargo.toml"),
                 self.workspace_root.join("Cargo.lock"),

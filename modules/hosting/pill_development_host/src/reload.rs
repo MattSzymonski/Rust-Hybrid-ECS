@@ -2,30 +2,30 @@
 //!
 //! # Responsibilities
 //!
-//! - Capture the retiring generation's persistable metadata.
-//! - Clear its systems and initialize the new generation, rolling back on
-//!   failure.
-//! - Drop columns for types the new generation no longer registers.
-//! - Re-home every native column onto a still-mapped generation.
+//! - Capture the retiring generation's persistable metadata and initialize the
+//!   new one, rolling back on failure.
+//! - Drop what the new generation stopped registering, and re-home every
+//!   surviving native column, resource and asset table.
 //! - Migrate persistable schemas that changed across the swap.
-//! - Retire the previous image into the bounded graveyard.
+//! - Retire the previous image into the graveyard.
 //!
 //! # Design
 //!
 //! The project and every extension run one sequence, and differ in three ways:
 //! an extension tags its registrations with its [`SystemOwner`] while the
 //! project owns the scheduler and tags nothing; their log wording differs, and
-//! not decoratively, because the suites in `devops/tests` tell a project reload
-//! from a module reload by matching those exact phrases; and only a module's
-//! component names are reported onward, for the C# backend to expose.
+//! not decoratively, because the suites in `devops/tests` match those exact
+//! phrases and the two wordings have to stay tellable apart; and both record
+//! the component names their generation registered, but only a module's are
+//! exposed onward to the C# mirror.
 //!
 //! **The order of the steps is load-bearing and must not be rearranged.**
 //! `drop_forgotten_components` calls into the retiring image's drop glue, so it
 //! has to run while that image is still mapped. `rehome_native_columns` then
 //! re-points every column's function table at a generation that is still
-//! mapped. Both must happen before the graveyard evicts anything, which is the
-//! only reason a bound of two generations is sound. Reordering them is a
-//! use-after-unmap that surfaces two reloads later, not immediately.
+//! mapped. Both must happen before the graveyard evicts anything, and that
+//! ordering is what makes a bound of two generations sound. Reordering them is
+//! a use-after-unmap that surfaces two reloads later, not immediately.
 
 // Standard library
 use std::collections::{HashMap, HashSet};
@@ -43,6 +43,18 @@ use crate::analytics;
 use crate::native_library::NativeLibrary;
 use crate::notices::{self, HostNotice};
 
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Maximum number of retired generations kept mapped per subject.
+///
+/// The immediately previous generation must stay mapped because engine-owned
+/// pointers may still refer to its code; anything older can be evicted once the
+/// forgotten-type drop and the column re-home have re-pointed everything that
+/// could reach it.
+pub(crate) const MAX_GRAVEYARD_GENERATIONS: usize = 2;
+
 /// Consecutive deferred evictions tolerated before the warning becomes an
 /// error.
 ///
@@ -53,23 +65,15 @@ use crate::notices::{self, HostNotice};
 /// deferral into noise.
 const MAX_DEFERRED_EVICTIONS: u32 = 3;
 
-/// Maximum number of retired generations kept mapped per subject.
-///
-/// The immediately previous generation must stay mapped because engine-owned
-/// pointers may still refer to its code; anything older can be evicted, because
-/// the two passes above have re-pointed everything that could reach it.
-pub(crate) const MAX_GRAVEYARD_GENERATIONS: usize = 2;
-
 /// Completion line for a project reload.
 ///
-/// The four constants below are an interface, not prose. `devops/core/
-/// suite_common.py` and the Python suites in `devops/tests` tell a project
-/// reload from a module reload by grepping host output for these exact
-/// phrases, and `devops/tests/test_log_contract.py` fails if either member of
-/// a pair stops appearing verbatim in Rust source. That is why the project and
-/// module wordings are spelled out separately instead of sharing one message
-/// with an interpolated noun: an interpolated message is not greppable, so
-/// nothing would catch it being reworded.
+/// This constant and its three neighbours below are an interface, not prose:
+/// `devops/core/suite_common.py` and the suites in `devops/tests` match these
+/// phrases in host output, and `devops/tests/test_log_contract.py` fails if
+/// either member of a pair stops appearing verbatim in Rust source. The project
+/// and module wordings stay spelled out separately for that reason: one shared
+/// message with an interpolated noun would print the same text for both
+/// subjects, which no suite could tell apart.
 const PROJECT_RELOAD_COMPLETE: &str = "hot reload complete";
 
 /// Completion line for an extension reload.
@@ -80,6 +84,10 @@ const PROJECT_FORGOTTEN_TYPES: &str = "component type(s) no longer registered by
 
 /// Forgotten-type warning for an extension reload.
 const MODULE_FORGOTTEN_TYPES: &str = "component type(s) no longer registered by this module; their data stays in the world but is orphaned (the new generation cannot read it)";
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// Which kind of subject a reload is running for.
 ///
@@ -92,8 +100,8 @@ pub(crate) enum ReloadSubjectKind {
     /// The game project: owns the scheduler outright, and is the only subject
     /// whose completion line the migration and auto-reload suites match on.
     Project,
-    /// An extension: contributes systems alongside the project
-    /// and every other module, so its registrations are tagged with its owner.
+    /// An extension: contributes systems alongside the project and every other
+    /// module, so its registrations are tagged with its owner.
     Extension,
 }
 
@@ -199,16 +207,16 @@ pub(crate) struct ReloadTransaction<'a> {
     /// the subject has stopped owning can be dropped while the image holding
     /// its drop function is still mapped.
     pub(crate) registered_resource_ids: &'a mut Vec<pill_engine::ResourceId>,
-    /// Every component type name - plain or persistable - the OTHER live
+    /// Every component type name - plain or persistable - the other live
     /// subjects declare, gathered by the caller from their current
     /// generations.
     ///
-    /// A type another artifact still declares is not this subject's to
-    /// retire: a shared identity is registered by every artifact that links
-    /// the crate, so dropping its columns here would erase the peer's rows
-    /// along with the peer's registration. The world's registration log is
-    /// append-only and cannot answer "who declares this now", which is why
-    /// the set is passed in rather than queried.
+    /// A type another artifact still declares is not this subject's to retire:
+    /// a shared identity is registered by every artifact that links the crate,
+    /// so dropping its columns here would erase the peer's rows and its
+    /// registration. The world's registration log is append-only and cannot
+    /// answer "who declares this now", which is why the set is passed in rather
+    /// than queried.
     pub(crate) peer_component_names: &'a [String],
     /// Whether retired generations may be unmapped.
     pub(crate) graveyard_policy: GraveyardPolicy,
@@ -217,8 +225,11 @@ pub(crate) struct ReloadTransaction<'a> {
 /// What a committed reload registered, for the caller to record.
 pub(crate) struct ReloadCommit {
     /// Every component type name the new generation registered, plain or
-    /// persistable. The C# backend needs this to expose a module's native
-    /// components; the project has no use for it.
+    /// persistable.
+    ///
+    /// A module's set is exposed onward so the C# mirror can bind its native
+    /// components; a project's set replaces its own record, which peer-name
+    /// gathering reads on the next module reload.
     pub(crate) exposed_component_names: Vec<String>,
 }
 
@@ -237,175 +248,6 @@ pub(crate) struct GenerationInit {
     /// Every component type name registered - plain and persistable alike -
     /// for the C# backend's bindings.
     pub(crate) component_names: Vec<String>,
-}
-
-/// Capture, initialize and record one native generation.
-///
-/// The shared half of a subject's `start`. The project and an extension run
-/// exactly the same sequence around their entry point: take the registration
-/// sequences first, scope the registration when the subject uses a scope,
-/// invoke the entry point under a timer, then either record what the
-/// generation registered or - on a non-zero status - release everything the
-/// failed image owns while it is still mapped.
-///
-/// `scope` is the owner registrations are tagged with, or `None` for a subject
-/// that owns the scheduler outright. `clearing_owner` names the systems a
-/// failed init removes, which is the subject's own owner either way.
-pub(crate) fn initialize_generation(
-    engine: &mut Engine,
-    engine_api: &EngineApi,
-    subject: &str,
-    scope: Option<SystemOwner>,
-    clearing_owner: SystemOwner,
-    library: &NativeLibrary,
-    first_load_failure: FirstLoadFailure,
-) -> GenerationInit {
-    // Step 1: Sequences before the call, so `since` compares this generation
-    // against the state just before it ran and not against zero - the log
-    // accumulates across every artifact, and `since(0)` would claim the
-    // engine's own resources for this subject.
-    let persist_sequence = engine.world().persist_registration_sequence();
-    let component_sequence = engine.world().component_registration_sequence();
-    let resource_sequence = engine.world().resource_registration_sequence();
-    // What the world already held before this generation ran, taken only for
-    // the policy that has to tell this generation's registrations from a name
-    // another subject had already registered.
-    let registered_before = (first_load_failure == FirstLoadFailure::ClearGenerationData)
-        .then(|| engine.world().registered_component_names_since(0));
-
-    // Step 2: The entry point, under the subject's registration scope when it
-    // has one.
-    let status = {
-        let started = Instant::now();
-        // The same scoped call a statically linked build makes; only the
-        // entry point differs (a DLL export here, a linked function there).
-        let status = pill_player::registration::register_scoped(engine, scope, |_| {
-            library.call_init(engine_api)
-        });
-        analytics::record_init(subject, started.elapsed().as_secs_f64() * 1000.0);
-        status
-    };
-
-    if status != 0 {
-        match first_load_failure {
-            FirstLoadFailure::ClearWorld => {
-                clear_failed_generation(engine, subject, clearing_owner)
-            }
-            FirstLoadFailure::ClearSystemsOnly => {
-                let removed = engine.clear_systems_owned_by(clearing_owner);
-                info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    module = subject,
-                    removed_systems = removed,
-                    "cleared the failed generation's systems and kept the world"
-                );
-            }
-            FirstLoadFailure::ClearGenerationData => {
-                // Systems first, then the registrations this generation made -
-                // all of it while its image is still mapped, because a
-                // resource's drop function and a column's drop glue belong to
-                // the image that wrote them.
-                let removed_systems = engine.clear_systems_owned_by(clearing_owner);
-                let registered = engine
-                    .world()
-                    .registered_component_names_since(component_sequence);
-                let owned_components: Vec<String> = match &registered_before {
-                    // A name another subject already registered is not this
-                    // generation's to retire: dropping it would erase the
-                    // peer's data along with its registration.
-                    Some(before) => registered
-                        .into_iter()
-                        .filter(|name| !before.contains(name))
-                        .collect(),
-                    None => registered,
-                };
-                let owned_resources = engine
-                    .world()
-                    .resource_ids_registered_since(resource_sequence);
-                let dropped_resources = engine.world_mut().drop_resources(&owned_resources);
-                let dropped_rows = engine
-                    .world_mut()
-                    .drop_forgotten_components(&owned_components);
-                info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    module = subject,
-                    removed_systems,
-                    dropped_resources,
-                    dropped_components = owned_components.len(),
-                    dropped_rows,
-                    "cleared the failed generation's own data and kept the world"
-                );
-            }
-        }
-        return GenerationInit {
-            status,
-            registered_type_names: Vec::new(),
-            registered_schemas: Vec::new(),
-            registered_resource_ids: Vec::new(),
-            component_names: Vec::new(),
-        };
-    }
-
-    // Step 3: What this generation owns, claimed in the world too so one
-    // subject's retirement cannot take a value another subject shares.
-    let registered_resource_ids = engine
-        .world()
-        .resource_ids_registered_since(resource_sequence);
-    engine
-        .world_mut()
-        .retain_resource_claims(&registered_resource_ids);
-    let registered_type_names = engine
-        .world()
-        .persist_type_names_registered_since(persist_sequence);
-    GenerationInit {
-        status,
-        registered_schemas: registered_schemas(engine.world(), &registered_type_names),
-        registered_type_names,
-        registered_resource_ids,
-        component_names: engine
-            .world()
-            .registered_component_names_since(component_sequence),
-    }
-}
-
-/// The schema hash recorded now for each of `type_names`, captured right
-/// after the `init` that registered them, while they are still the hashes
-/// that generation declared.
-fn registered_schemas(world: &World, type_names: &[String]) -> Vec<(String, u64)> {
-    // A generation can register one type twice (the component inventory and
-    // an explicit `register` call both do), which the log records twice.
-    let mut schemas: Vec<(String, u64)> = Vec::new();
-    for name in type_names {
-        if schemas.iter().any(|(known, _)| known == name) {
-            continue;
-        }
-        if let Some(hash) = world.persist_schema_hash(name) {
-            schemas.push((name.clone(), hash));
-        }
-    }
-    schemas
-}
-
-/// The persistable components a subject registered whose layout has been
-/// replaced since, by another subject's reload.
-///
-/// A shared component is registered by every binary that links it, and a
-/// reload of one of them may re-lay it out (the registry accepts the new
-/// layout from a superseding registration, and the reload migrates the rows).
-/// Every other binary that registered it is still built against the old
-/// layout: its queries are refused by the declared schema check, and whatever
-/// else its systems do with the type, such as spawning a value, would write
-/// rows in the old layout. An empty result means the subject is current.
-pub(crate) fn stale_components(world: &World, registered_schemas: &[(String, u64)]) -> Vec<String> {
-    registered_schemas
-        .iter()
-        .filter(|(name, declared)| {
-            world
-                .persist_schema_hash(name)
-                .is_some_and(|current| current != *declared)
-        })
-        .map(|(name, _)| name.clone())
-        .collect()
 }
 
 /// What a failed first load of an artifact costs the world.
@@ -444,26 +286,6 @@ pub(crate) enum FirstLoadFailure {
     ClearGenerationData,
 }
 
-/// Release everything one failed generation owns, while its image is mapped.
-///
-/// The failed image's systems are `Box<dyn System>` trait objects, and its
-/// data - resources it inserted, columns its entities live in - carries drop
-/// glue from the same image. Systems first, then the world by replacement: the
-/// replacement's drop is what runs every one of those functions, and both
-/// have to run before the image can be unmapped.
-fn clear_failed_generation(engine: &mut Engine, subject: &str, owner: SystemOwner) {
-    engine.clear_systems_owned_by(owner);
-    let abandoned = std::mem::replace(engine.world_mut(), World::new());
-    let resources = abandoned.resource_count();
-    drop(abandoned);
-    info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        module = subject,
-        resources,
-        "cleared the world before unmapping the generation that failed to initialize"
-    );
-}
-
 /// What to verify about a freshly loaded replacement before it is committed.
 pub(crate) enum LoadValidation {
     /// Nothing: this host built the subject from the workspace it owns, so the
@@ -473,99 +295,6 @@ pub(crate) enum LoadValidation {
     /// members any `cargo build` can refresh, so the revision is checked
     /// rather than assumed.
     ModuleAbi,
-}
-
-/// Build, load and commit one native generation, for either subject.
-///
-/// Both subjects run the same three steps in the same order, and a failure
-/// anywhere leaves the current generation running: compile (`build`), load a
-/// private copy, then swap through [`ReloadTransaction`]. Their differences -
-/// which build function to call, whether the ABI check applies, the refusal
-/// wording the suites match - are parameters, not a second lifecycle.
-///
-/// `before_commit` runs once the replacement has built, loaded and passed
-/// validation, immediately before the swap, and not at all when an earlier step
-/// refused it. It is where a subject releases state that must be dropped while
-/// the retiring image is still mapped: the renderer module detaches its GPU
-/// backend there.
-///
-/// Returns the commit when the swap happened, `None` when anything was
-/// refused.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_load_and_commit(
-    engine: &mut Engine,
-    engine_api: &EngineApi,
-    workspace_root: &Path,
-    build: impl FnOnce(Option<(&AtomicU64, u64)>) -> Result<PathBuf, BuildError>,
-    cancel_flag: Option<(&AtomicU64, u64)>,
-    validation: LoadValidation,
-    before_commit: &mut dyn FnMut(),
-    transaction: ReloadTransaction<'_>,
-) -> Option<ReloadCommit> {
-    let subject = transaction.subject;
-    let kind = &transaction.kind;
-
-    // Step 1: Compile before touching engine state, so a compiler error can
-    // never remove the systems of the working generation. A newer save during
-    // the build cancels it and the next frame retries.
-    let output_path = match build(cancel_flag) {
-        Ok(path) => path,
-        Err(error) => {
-            error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                module = subject,
-                error = %error,
-                "{}", kind.build_failed_message()
-            );
-            // The editor shows the compiler's own words: whatever the build
-            // runner captured for this failure.
-            notices::push(HostNotice::ModuleFailed {
-                module: subject.to_string(),
-                output: crate::build_runner::recent_build_output(),
-            });
-            return None;
-        }
-    };
-
-    // Step 2: Load and validate the replacement transactionally, leaving the
-    // active generation untouched until it is ready to initialize.
-    let new_library = match NativeLibrary::load_copy(&output_path, workspace_root, subject) {
-        Ok(library) => library,
-        Err(error) => {
-            error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                module = subject,
-                error = %error,
-                "{}", kind.load_failed_message()
-            );
-            // No compiler text belongs here: the build this failure follows
-            // succeeded, so the ring holds its (successful) tail.
-            notices::push(HostNotice::ModuleFailed {
-                module: subject.to_string(),
-                output: format!("{}: {error}", kind.load_failed_message()),
-            });
-            return None;
-        }
-    };
-    if let LoadValidation::ModuleAbi = validation {
-        if let Err(error) = new_library.check_module_abi(subject) {
-            error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                module = subject,
-                error = %error,
-                "{}", kind.rejected_message()
-            );
-            notices::push(HostNotice::ModuleFailed {
-                module: subject.to_string(),
-                output: format!("{}: {error}", kind.rejected_message()),
-            });
-            return None;
-        }
-    }
-
-    // Step 3: The shared transaction, whose own step order is load-bearing.
-    before_commit();
-    transaction.commit(engine, engine_api, new_library)
 }
 
 impl ReloadTransaction<'_> {
@@ -693,7 +422,7 @@ impl ReloadTransaction<'_> {
         // its registrations are replaced. The new init below re-registers the
         // same type names, so without this capture the old serializer pointers
         // would be lost before migration could use them. The previous DLL stays
-        // mapped (Step 6), which keeps those function pointers valid.
+        // mapped (Step 12), which keeps those function pointers valid.
         let previous_metadata_by_name = engine.world().capture_persist_type_metadata();
         let previous_manifest = engine.world().persist_type_manifest();
         // The resource half of the same capture, and needed for the same
@@ -734,7 +463,7 @@ impl ReloadTransaction<'_> {
             .into_iter()
             .filter(|id| matches!(id, ComponentId::Shared(_)))
             .collect();
-        // Step 5: announce the retiring generation's persistable names. A
+        // Step 5: Announce the retiring generation's persistable names. A
         // rebuilt image has a fresh `TypeId` for every type name it declares,
         // which at the registration site looks exactly like another binary
         // claiming the same name - and the world's collision guard refuses that
@@ -907,10 +636,10 @@ impl ReloadTransaction<'_> {
         }
 
         // Detect persistable component types the new generation stopped
-        // registering. Such data is NOT wiped by migration — the type is
-        // absent from the changed-name set, so its column and metadata linger
-        // while the new generation cannot read them. Surface it instead of
-        // letting the type silently orphan.
+        // registering. Such data is not wiped by migration: the type is absent
+        // from the changed-name set, so its column and metadata linger while
+        // the new generation cannot read them. Surface it instead of letting
+        // the type silently orphan.
         let newly_registered = engine
             .world()
             .persist_type_names_registered_since(registration_sequence);
@@ -998,10 +727,6 @@ impl ReloadTransaction<'_> {
             );
         }
         *self.registered_resource_ids = claimed_now;
-        // Refresh the C#-exposed component set to the new generation's
-        // registrations (plain and persistable alike).
-        // Returned to the caller rather than stored: only a module
-        // reports its component names onward to the C# backend.
 
         // Step 6: Re-home every native storage column to the freshly loaded
         // generation's function table. Columns created by older generations
@@ -1025,10 +750,11 @@ impl ReloadTransaction<'_> {
         engine.world_mut().rehome_assets();
 
         // Step 9: Migrate persistable schemas that changed across the swap.
-        // Types are matched by stable name rather than runtime ComponentId,
-        // which can differ between generations, so data follows a renamed or
-        // reshaped component. Unchanged columns keep their allocations and
-        // change-detection ticks, making the common reload path cheap.
+        // Types are matched by stable name rather than runtime `ComponentId`,
+        // which differs between generations, so a reshaped type keeps its rows
+        // and its data follows the new layout. Unchanged columns keep their
+        // allocations and change-detection ticks, making the common reload
+        // path cheap.
         let migrate_started = Instant::now();
         let current_schema_by_name: HashMap<String, u64> = engine
             .world()
@@ -1143,6 +869,295 @@ impl ReloadTransaction<'_> {
     }
 }
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Capture, initialize and record one native generation.
+///
+/// The shared half of a subject's `start`. The project and an extension run
+/// exactly the same sequence around their entry point: take the registration
+/// sequences first, scope the registration when the subject uses a scope,
+/// invoke the entry point under a timer, then either record what the
+/// generation registered or - on a non-zero status - release what the failed
+/// image owns while it is still mapped, as `first_load_failure` prescribes.
+///
+/// `scope` is the owner registrations are tagged with, or `None` for a subject
+/// that owns the scheduler outright. `clearing_owner` names the systems a
+/// failed init removes, which is the subject's own owner either way.
+pub(crate) fn initialize_generation(
+    engine: &mut Engine,
+    engine_api: &EngineApi,
+    subject: &str,
+    scope: Option<SystemOwner>,
+    clearing_owner: SystemOwner,
+    library: &NativeLibrary,
+    first_load_failure: FirstLoadFailure,
+) -> GenerationInit {
+    // Step 1: Sequences before the call, so `since` compares this generation
+    // against the state just before it ran and not against zero - the log
+    // accumulates across every artifact, and `since(0)` would claim the
+    // engine's own resources for this subject.
+    let persist_sequence = engine.world().persist_registration_sequence();
+    let component_sequence = engine.world().component_registration_sequence();
+    let resource_sequence = engine.world().resource_registration_sequence();
+    // What the world already held before this generation ran, taken only for
+    // the policy that has to tell this generation's registrations from a name
+    // another subject had already registered.
+    let registered_before = (first_load_failure == FirstLoadFailure::ClearGenerationData)
+        .then(|| engine.world().registered_component_names_since(0));
+
+    // Step 2: The entry point, under the subject's registration scope when it
+    // has one.
+    let status = {
+        let started = Instant::now();
+        // The same scoped call a statically linked build makes; only the
+        // entry point differs (a DLL export here, a linked function there).
+        let status = pill_player::registration::register_module(engine, scope, |_| {
+            library.call_init(engine_api)
+        });
+        analytics::record_init(subject, started.elapsed().as_secs_f64() * 1000.0);
+        status
+    };
+
+    if status != 0 {
+        match first_load_failure {
+            FirstLoadFailure::ClearWorld => {
+                clear_failed_generation(engine, subject, clearing_owner)
+            }
+            FirstLoadFailure::ClearSystemsOnly => {
+                let removed = engine.clear_systems_owned_by(clearing_owner);
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = subject,
+                    removed_systems = removed,
+                    "cleared the failed generation's systems and kept the world"
+                );
+            }
+            FirstLoadFailure::ClearGenerationData => {
+                // Systems first, then the registrations this generation made -
+                // all of it while its image is still mapped, because a
+                // resource's drop function and a column's drop glue belong to
+                // the image that wrote them.
+                let removed_systems = engine.clear_systems_owned_by(clearing_owner);
+                let registered = engine
+                    .world()
+                    .registered_component_names_since(component_sequence);
+                let owned_components: Vec<String> = match &registered_before {
+                    // A name another subject already registered is not this
+                    // generation's to retire: dropping it would erase the
+                    // peer's data along with its registration.
+                    Some(before) => registered
+                        .into_iter()
+                        .filter(|name| !before.contains(name))
+                        .collect(),
+                    None => registered,
+                };
+                let owned_resources = engine
+                    .world()
+                    .resource_ids_registered_since(resource_sequence);
+                let dropped_resources = engine.world_mut().drop_resources(&owned_resources);
+                let dropped_rows = engine
+                    .world_mut()
+                    .drop_forgotten_components(&owned_components);
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = subject,
+                    removed_systems,
+                    dropped_resources,
+                    dropped_components = owned_components.len(),
+                    dropped_rows,
+                    "cleared the failed generation's own data and kept the world"
+                );
+            }
+        }
+        return GenerationInit {
+            status,
+            registered_type_names: Vec::new(),
+            registered_schemas: Vec::new(),
+            registered_resource_ids: Vec::new(),
+            component_names: Vec::new(),
+        };
+    }
+
+    // Step 3: What this generation owns, claimed in the world too so one
+    // subject's retirement cannot take a value another subject shares.
+    let registered_resource_ids = engine
+        .world()
+        .resource_ids_registered_since(resource_sequence);
+    engine
+        .world_mut()
+        .retain_resource_claims(&registered_resource_ids);
+    let registered_type_names = engine
+        .world()
+        .persist_type_names_registered_since(persist_sequence);
+    GenerationInit {
+        status,
+        registered_schemas: registered_schemas(engine.world(), &registered_type_names),
+        registered_type_names,
+        registered_resource_ids,
+        component_names: engine
+            .world()
+            .registered_component_names_since(component_sequence),
+    }
+}
+
+/// The schema hash the world records for each of `type_names`.
+///
+/// Captured in the same transaction as the `init` that registered them, so a
+/// hash that differs later means another subject's reload has re-laid that
+/// type out since.
+fn registered_schemas(world: &World, type_names: &[String]) -> Vec<(String, u64)> {
+    // A generation can register one type twice (the component inventory and
+    // an explicit `register` call both do), which the log records twice.
+    let mut schemas: Vec<(String, u64)> = Vec::new();
+    for name in type_names {
+        if schemas.iter().any(|(known, _)| known == name) {
+            continue;
+        }
+        if let Some(hash) = world.persist_schema_hash(name) {
+            schemas.push((name.clone(), hash));
+        }
+    }
+    schemas
+}
+
+/// The persistable components a subject registered whose layout has been
+/// replaced since, by another subject's reload.
+///
+/// A shared component is registered by every binary that links it, and a
+/// reload of one of them may re-lay it out (the registry accepts the new
+/// layout from a superseding registration, and the reload migrates the rows).
+/// Every other binary that registered it is still built against the old
+/// layout: its queries are refused by the declared schema check, and whatever
+/// else its systems do with the type, such as spawning a value, would write
+/// rows in the old layout. An empty result means the subject is current.
+pub(crate) fn stale_components(world: &World, registered_schemas: &[(String, u64)]) -> Vec<String> {
+    registered_schemas
+        .iter()
+        .filter(|(name, declared)| {
+            world
+                .persist_schema_hash(name)
+                .is_some_and(|current| current != *declared)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Release everything one failed generation owns, while its image is mapped.
+///
+/// The failed image's systems are `Box<dyn System>` trait objects, and its
+/// data - resources it inserted, columns its entities live in - carries drop
+/// glue from the same image. Systems first, then the world by replacement: the
+/// replacement's drop is what runs every one of those functions, and both
+/// have to run before the image can be unmapped.
+fn clear_failed_generation(engine: &mut Engine, subject: &str, owner: SystemOwner) {
+    engine.clear_systems_owned_by(owner);
+    let abandoned = std::mem::replace(engine.world_mut(), World::new());
+    let resources = abandoned.resource_count();
+    drop(abandoned);
+    info!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        module = subject,
+        resources,
+        "cleared the world before unmapping the generation that failed to initialize"
+    );
+}
+
+/// Build, load and commit one native generation, for either subject.
+///
+/// Both subjects run the same three steps in the same order, and a failure
+/// anywhere leaves the current generation running: compile (`build`), load a
+/// private copy, then swap through [`ReloadTransaction`]. Their differences -
+/// which build function to call, whether the ABI check applies, the refusal
+/// wording the suites match - are parameters, not a second lifecycle.
+///
+/// `before_commit` runs once the replacement has built, loaded and passed
+/// validation, immediately before the swap, and not at all when an earlier step
+/// refused it. It is where a subject releases state that must be dropped while
+/// the retiring image is still mapped: the renderer module detaches its GPU
+/// backend there.
+///
+/// Returns the commit when the swap happened, `None` when anything was
+/// refused.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_load_and_commit(
+    engine: &mut Engine,
+    engine_api: &EngineApi,
+    workspace_root: &Path,
+    build: impl FnOnce(Option<(&AtomicU64, u64)>) -> Result<PathBuf, BuildError>,
+    cancel_flag: Option<(&AtomicU64, u64)>,
+    validation: LoadValidation,
+    before_commit: &mut dyn FnMut(),
+    transaction: ReloadTransaction<'_>,
+) -> Option<ReloadCommit> {
+    let subject = transaction.subject;
+    let kind = &transaction.kind;
+
+    // Step 1: Compile before touching engine state, so a compiler error can
+    // never remove the systems of the working generation. A newer save during
+    // the build cancels it and the next frame retries.
+    let output_path = match build(cancel_flag) {
+        Ok(path) => path,
+        Err(error) => {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = subject,
+                error = %error,
+                "{}", kind.build_failed_message()
+            );
+            // The editor shows the compiler's own words: whatever the build
+            // runner captured for this failure.
+            notices::push(HostNotice::ModuleFailed {
+                module: subject.to_string(),
+                output: crate::build_runner::recent_build_output(),
+            });
+            return None;
+        }
+    };
+
+    // Step 2: Load and validate the replacement transactionally, leaving the
+    // active generation untouched until it is ready to initialize.
+    let new_library = match NativeLibrary::load_copy(&output_path, workspace_root, subject) {
+        Ok(library) => library,
+        Err(error) => {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = subject,
+                error = %error,
+                "{}", kind.load_failed_message()
+            );
+            // No compiler text belongs here: the build this failure follows
+            // succeeded, so the ring holds its (successful) tail.
+            notices::push(HostNotice::ModuleFailed {
+                module: subject.to_string(),
+                output: format!("{}: {error}", kind.load_failed_message()),
+            });
+            return None;
+        }
+    };
+    if let LoadValidation::ModuleAbi = validation {
+        if let Err(error) = new_library.check_module_abi(subject) {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = subject,
+                error = %error,
+                "{}", kind.rejected_message()
+            );
+            notices::push(HostNotice::ModuleFailed {
+                module: subject.to_string(),
+                output: format!("{}: {error}", kind.rejected_message()),
+            });
+            return None;
+        }
+    }
+
+    // Step 3: Hand off to the shared transaction, whose own labels pick up at
+    // Step 3 and whose order is load-bearing.
+    before_commit();
+    transaction.commit(engine, engine_api, new_library)
+}
+
 /// The names among `forgotten` that nothing declares any more.
 ///
 /// `forgotten` holds persistable names the previous generation registered and
@@ -1163,6 +1178,10 @@ fn unclaimed_type_names(
         .cloned()
         .collect()
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

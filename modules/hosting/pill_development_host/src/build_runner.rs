@@ -1,4 +1,4 @@
-//! Project-module build execution and output-path resolution.
+//! Build execution, artifact staging and output-path resolution.
 //!
 //! Build processes inherit the host's standard streams so compiler progress
 //! and diagnostics remain visible in the terminal that launched the host.
@@ -7,16 +7,20 @@
 //!
 //! - Execute backend-specific build commands from the workspace root.
 //! - Resolve each backend's expected output artifact path.
+//! - Stage built artifacts into a private hot-load directory and stamp them,
+//!   so a later process can tell them from another build's output.
 //! - Validate that build artifacts exist before loading is attempted.
 //!
 //! # Design
 //!
-//! [`build_project_module`] is the host's single entry point for compiling a
-//! project module. It treats the build as an opaque process: it never inspects
-//! compiler output, and instead decides success from the child's exit status
-//! plus a backend-specific output-path resolution step. Cancellation is
-//! cooperative: the caller advances a generation counter on newer source
-//! saves, and the watchdog loop aborts the build when it observes the change.
+//! [`run_build_command`] treats a build as an opaque process: it never inspects
+//! compiler output, and decides success from the child's exit status alone.
+//! Cancellation is cooperative: the caller advances a generation counter on
+//! newer source saves, and the watchdog loop stops the child - together with
+//! the [`BuildProcessTree`] it started - when it observes the change. The
+//! startup batch ([`build_extension_batch`]) compiles every module in one cargo
+//! invocation, and each module consumes its share through
+//! [`take_batch_validation`].
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -24,6 +28,7 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
+
 // External crates
 #[cfg(feature = "hot_patch")]
 use pill_core::debug;
@@ -43,9 +48,10 @@ use crate::{ExtensionConfig, ProjectModuleBackend, ProjectModuleConfig};
 /// The tail of the most recent build's stderr, for the editor's Problems
 /// panel.
 ///
-/// Process-global: `pill_development_host.dll` has exactly one copy per process. Builds
-/// are serialized (a patch attempt in flight defers reloads and managed
-/// builds), so the ring holds one build's output when a failure reads it.
+/// Process-global, because `pill_development_host.dll` has exactly one copy
+/// per process. Builds are serialized - a patch attempt in flight defers
+/// reloads and managed builds - so the ring holds one build's output when a
+/// failure reads it.
 static BUILD_OUTPUT: std::sync::Mutex<std::collections::VecDeque<String>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
@@ -74,8 +80,8 @@ fn push_build_output(line: &str) {
 
 /// The ring's current contents, oldest first: what the last build printed.
 ///
-/// The editor parses this into the Problems panel's entries after a failure;
-/// an ordinary host never reads it.
+/// A failed build's notice carries this text, and the editor parses it into
+/// the Problems panel's entries.
 pub(crate) fn recent_build_output() -> String {
     let ring = BUILD_OUTPUT
         .lock()
@@ -123,8 +129,8 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 /// The batch compiles every module, the project and the renderer in one cargo
 /// invocation, and on a fresh checkout it does so with nothing in the private
 /// build tree - the one case where a single command legitimately takes
-/// minutes. Killing it at the single-module cap made a first start fall back
-/// to per-module builds and need a second run.
+/// minutes. The single-module cap would kill that build, and the modules it
+/// had not finished would then be rebuilt one at a time.
 const STARTUP_BATCH_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How often the build watchdog checks for completion and cancellation.
@@ -137,22 +143,8 @@ const STARTUP_BATCH_TIMEOUT: Duration = Duration::from_secs(600);
 /// sooner during a reload.
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Subdirectory, relative to the workspace root, where a host-spawned build
-/// writes its freshly compiled artifacts.
-///
-/// Every cargo build the host spawns runs with `CARGO_TARGET_DIR` pointing at
-/// the private module build tree ([`crate::config::MODULE_BUILD_TARGET_DIRECTORY`]),
-/// never the shared `target/<profile>` the running binary maps its engine
-/// dylibs from - a GUI frontend's module build needs a different engine
-/// variant than the host runs, and rewriting the shared slot would make cargo
-/// delete a DLL the host has loaded. The produced artifacts are staged into
-/// the module's private hot-load directory.
-fn cargo_module_output_subdirectory() -> String {
-    crate::config::module_build_artifact_directory()
-}
-
 /// Private directory the host stages the project's loadable artifacts into,
-/// and the default an extension's configuration also names.
+/// and the output directory an extension's configuration defaults to.
 ///
 /// The same protection an extension's output has: cargo writes `project.dll`
 /// to a shared per-crate slot that any other `cargo build` of the same package
@@ -194,6 +186,21 @@ const HOST_PROFILING_FEATURE_SET: &str = if cfg!(feature = "profiling-fine") {
     "no-profiling"
 };
 
+/// Subdirectory, relative to the workspace root, where a host-spawned build
+/// writes its freshly compiled artifacts.
+///
+/// Every cargo build the host spawns runs with `CARGO_TARGET_DIR` pointing
+/// into the private module build tree
+/// ([`crate::config::MODULE_BUILD_TARGET_DIRECTORY`]), never the shared
+/// `target/<profile>` the running binary maps its engine dylibs from: a GUI
+/// frontend's module build needs a different engine variant than the host
+/// runs, and rewriting the shared slot would make cargo delete a DLL the host
+/// has loaded. The produced artifacts are staged into the module's private
+/// hot-load directory.
+fn cargo_module_output_subdirectory() -> String {
+    crate::config::module_build_artifact_directory()
+}
+
 /// Host build identity: toolchain, feature set, cargo profile, target, and the
 /// environment every spawned build runs with.
 ///
@@ -230,9 +237,9 @@ fn host_build_identity() -> String {
 /// their exported names hash the features their dependency trees resolved, so
 /// a module or project compiled with a different engine feature set imports
 /// names the loaded instances do not export and fails to load with
-/// "The specified procedure could not be found" (os error 127). The names are
-/// all declared as `pill_development_host` features, so `cfg!` sees exactly the posture
-/// the running binary was built with.
+/// "The specified procedure could not be found" (os error 127). Every `cfg!`
+/// name checked here is a declared `pill_development_host` feature, so each
+/// one reports exactly the posture the running binary was built with.
 fn host_engine_features() -> Vec<&'static str> {
     let mut features = Vec::new();
     if cfg!(feature = "hot_patch") {
@@ -258,7 +265,8 @@ fn host_engine_features() -> Vec<&'static str> {
 // Build Identity and Artifact Stamps
 // =============================================================================
 
-/// The toolchain version line and host feature set of the running host.
+/// The toolchain version line plus [`host_build_identity`] of the running
+/// host.
 ///
 /// Resolved once per process: spawning `rustc` for every stamp write would
 /// cost more than the stamps themselves save.
@@ -294,8 +302,8 @@ fn artifact_stamp_path(workspace_root: &Path, module_name: &str) -> PathBuf {
 /// Describe the artifacts a build produced, together with the host identity,
 /// the sources and the command that produced them.
 ///
-/// `build_info` is [`current_build_info`], and `source_identity` the watch
-/// directory. Both stay in the stamp because a stamp either of two host
+/// `build_info` is [`current_build_info`] and `source_identity` the watch
+/// directory. Both stay in the stamp because a stamp that either of two host
 /// processes - or two projects sharing a package name, output path and stamp
 /// file - could satisfy would let one load the other's artifact, which fails
 /// inside `LoadLibrary` naming nothing.
@@ -334,9 +342,8 @@ fn artifact_stamp(
 
 /// Record that the host itself produced these artifacts with this command.
 ///
-/// Best-effort by design, like the toolchain marker: a failed write leaves the
-/// stamp missing, which makes the next run rebuild rather than trust an
-/// artifact it cannot identify.
+/// Best-effort by design: a failed write leaves the stamp missing, which makes
+/// the next run rebuild rather than trust an artifact it cannot identify.
 fn record_artifact_stamp(
     workspace_root: &Path,
     module_name: &str,
@@ -427,6 +434,11 @@ fn confirm_staged_artifacts(
 // Free Functions
 // =============================================================================
 
+/// How many directory levels below the workspace root a member manifest can
+/// sit: three, the depth of `extensions/<extension>/<crate>`, which is the
+/// deepest member layout this search has to reach.
+const MEMBER_SEARCH_DEPTH: usize = 3;
+
 /// Apply the environment and argument overrides every host-spawned cargo build
 /// needs, regardless of which path spawns it.
 ///
@@ -437,10 +449,11 @@ fn confirm_staged_artifacts(
 /// - `CARGO_TARGET_DIR` redirects into the private module build tree so cargo
 ///   never has to delete a DLL the host has mapped (see
 ///   [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`]).
-/// - The host's engine features ([`host_engine_features`]) are passed
-///   explicitly: the shared dylibs' exported names hash their dependency
-///   trees' features, so a differently featured module cannot resolve its
-///   imports against them (`test_engine_feature_drift.py` checks every posture).
+/// - The engine features ([`host_engine_features`]) are passed explicitly, or
+///   for an editor host reproduced by anchoring the build to the editor's own
+///   package: the shared dylibs' exported names hash their dependency trees'
+///   features, so a differently featured module cannot resolve its imports
+///   against them.
 /// - A launcher-injected profile (the dioxus CLI's `desktop-dev`) is not
 ///   declared in the module workspaces, so the spawned build defines it as an
 ///   inheritor of `dev`; the profile name is part of cargo's metadata hash.
@@ -455,28 +468,24 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
     let anchor = host_anchor_package();
     let editor_host = anchor.as_deref().is_some_and(is_editor_anchor);
     if crate::config::running_under_dioxus_cli() || editor_host {
-        // An editor keeps the cargo anchor. Its dependency graph must be
-        // part of the module build too: its renderer dependencies affect the
-        // shared engine dylibs even though the project itself only depends on
-        // renderer data. A reload builds one module on its own, while the
-        // startup batch builds every module together - without the anchor the
-        // two resolve different feature unions onto `pill_core.dll` and the
-        // reloaded artifact cannot import against the running host. The same
-        // anchor also reproduces the Dioxus editor's macro graph
-        // (dioxus' procedural macros) unions features onto the HOST units of
-        // `proc-macro2`/`quote`/`syn` - a resolution cargo keeps separate
-        // from the target side - and those unions change the metadata of the
-        // derive-macro crates (`serde_derive`, `thiserror_impl`, ...), which
-        // cascades into `pill_core`'s and `pill_engine_core`'s exported
-        // symbol hashes. Only selecting the editor package reproduces the
-        // exact graph; enumerating its unions is not possible.
+        // An editor keeps the cargo anchor. Its renderer dependencies affect
+        // the shared engine dylibs even though the project itself only depends
+        // on renderer data, and a reload builds one module where the startup
+        // batch builds them all - without the anchor the two resolve different
+        // feature unions onto `pill_core.dll`, and the reloaded artifact
+        // cannot import against the running host. The anchor also reproduces
+        // the editor's macro graph, whose proc-macro feature unions on
+        // `proc-macro2`, `quote`, `syn` and the derive crates reach
+        // `pill_core`'s and `pill_engine_core`'s exported symbol hashes. Only
+        // selecting the editor package reproduces the exact graph; enumerating
+        // its unions is not possible.
         if let Some(anchor) = anchor {
             command.arg("--package").arg(&anchor);
             // Select the anchor with the SAME features the running host was
-            // built with, not merely the same package. The anchor's default
-            // features are dropped first, because cargo would otherwise
-            // resolve `pill_standalone`'s defaults (`hot_patch`) onto a host
-            // built without them.
+            // built with, not merely the same package. The anchor's own
+            // defaults are dropped first: resolved onto a host built without
+            // them, they change the metadata hash of every crate the two
+            // share.
             if let Some(declared) = declared_features(workspace_root, &anchor) {
                 command.arg("--no-default-features");
                 for feature in host_posture_features() {
@@ -597,10 +606,6 @@ pub(crate) fn declared_features(workspace_root: &Path, package: &str) -> Option<
         .clone()
 }
 
-/// How many directory levels below the workspace root a member manifest can
-/// sit: two, for the deepest member layout (`editor/pill_editor`).
-const MEMBER_SEARCH_DEPTH: usize = 3;
-
 /// Uncached [`declared_features`]: reads the extension crate's manifest
 /// (`extensions/<folder>/<package>/Cargo.toml`) when an extension folder
 /// holds the package, otherwise scans every `Cargo.toml` up to
@@ -659,26 +664,23 @@ fn collect_member_manifests(directory: &Path, depth: usize, manifests: &mut Vec<
 // Piggybacked flag capture
 // =============================================================================
 
-/// Harvests the module crate's `rustc` invocation out of a build already running.
-///
-/// # Why
+/// Harvests the module crate's `rustc` invocation out of a build already
+/// running.
 ///
 /// A fast patch replays the exact compiler line cargo uses for the module, so
 /// the patch links the identical dependency closure. Discovering that line
 /// costs a `cargo build -v`, and cargo only prints the invocation when it
-/// actually compiles - so a fresh crate has to be touched to force a rebuild,
-/// on the first patch after every module reload, because a reload is what makes
-/// the cached line stale. The build the host just ran compiled that crate for
-/// real, so asking it for `-v` makes the discovery free.
-///
-/// # How
+/// actually compiles - so an on-demand probe has to touch the crate to force a
+/// rebuild, once per reload, because a reload is what makes the cached line
+/// stale. Harvesting it from the build the host just ran makes the discovery
+/// free.
 ///
 /// `-v` is appended at spawn time only, never to the configured build command:
-/// that command is part of the cache key and of the artifact stamp. Cargo's
-/// stderr is piped rather than inherited so it can be scanned, and every line
-/// is written straight back out so the console still streams - minus the
-/// `Running` and `Fresh` lines `-v` adds. Colour is requested explicitly when
-/// the host's own stderr is a terminal, because cargo turns it off for a pipe.
+/// that command is part of the cache key and of the artifact stamp. Stderr is
+/// piped so it can be scanned, and every line is written straight back out so
+/// the console still streams - minus the `Running`, `Fresh` and `Dirty` lines
+/// `-v` adds. Colour is requested explicitly when the host's own stderr is a
+/// terminal, because cargo turns it off for a pipe.
 #[cfg(feature = "hot_patch")]
 struct VerboseCapture {
     /// Crate names to look for: the modules one invocation builds.
@@ -803,7 +805,7 @@ impl VerboseCapture {
     /// Join the reader without caching anything.
     ///
     /// A failed build's stderr still has to finish draining before the ring
-    /// (`recent_build_output`) is read for the Problems panel; the harvested
+    /// ([`recent_build_output`]) is read for the failure notice; the harvested
     /// rustc lines are discarded because no artifact appeared to describe.
     fn abandon(self) {
         if let Some(reader) = self.reader {
@@ -871,6 +873,21 @@ fn without_ansi(line: &str) -> String {
 /// dying compiler from holding cargo's package lock across the handover.
 const TREE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: closing the last handle to the job
+/// kills every process still in it.
+#[cfg(windows)]
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+/// `JobObjectExtendedLimitInformation`, the information class through which
+/// the kill-on-close limit is set.
+#[cfg(windows)]
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+
+/// `JobObjectBasicAccountingInformation`, the information class that reports
+/// how many processes a job currently holds.
+#[cfg(windows)]
+const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION: u32 = 1;
+
 /// A build's whole process tree, on platforms that can name one.
 ///
 /// Killing the direct child reaches cargo alone: the rustc and linker
@@ -893,21 +910,6 @@ pub(crate) struct BuildProcessTree {
 /// here; the type exists so the call sites need no platform `cfg` of their own.
 #[cfg(not(windows))]
 pub(crate) struct BuildProcessTree;
-
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: closing the last handle to the job
-/// kills every process still in it.
-#[cfg(windows)]
-const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
-
-/// `JobObjectExtendedLimitInformation`, the information class through which
-/// the kill-on-close limit is set.
-#[cfg(windows)]
-const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
-
-/// `JobObjectBasicAccountingInformation`, the information class that reports
-/// how many processes a job currently holds.
-#[cfg(windows)]
-const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION: u32 = 1;
 
 // The `kernel32` entry points that make a job object the unit of build
 // cancellation. Declared here rather than pulled from a crate with
@@ -1236,12 +1238,13 @@ pub(crate) fn run_build_command(
 
     // Step 2: Spawn the child process from the workspace root.
     //
-    // Run from the workspace root because configured paths and Cargo package
-    // selection are workspace-relative. The child inherits the host's stdout
-    // and stderr instead of capturing them, which keeps compiler progress,
-    // warnings, and errors visible during startup and hot reload. Configured
-    // environment overrides are applied last so they win over anything the
-    // host itself inherited.
+    // The workspace root is the working directory because configured paths and
+    // Cargo package selection are workspace-relative. A child that needs no
+    // reader inherits the host's stdout and stderr, which keeps compiler
+    // progress, warnings and errors visible during startup and hot reload; a
+    // cargo build whose stderr has to be scanned gets a pipe instead (below).
+    // Configured environment overrides win over anything the host itself
+    // inherited.
     let mut command = Command::new(program);
     command
         .args(arguments)
@@ -1266,8 +1269,8 @@ pub(crate) fn run_build_command(
     #[cfg(not(feature = "hot_patch"))]
     let _ = capture_entries;
     // A cargo build without the capture still tees its stderr into the ring:
-    // a failed build's Problems entry is parsed from it. A child that inherits
-    // the stream outright loses the text once the terminal scrolls.
+    // a failed build's notice is built from it. A child that inherits the
+    // stream outright loses the text once the terminal scrolls.
     #[cfg(feature = "hot_patch")]
     let tee_needed = capture.is_none() && program == "cargo";
     #[cfg(not(feature = "hot_patch"))]
@@ -1678,14 +1681,14 @@ fn stage_artifact(build_output: &Path, hot_output: &Path) -> Result<(), BuildErr
 
 /// Stage the module-world engine dylibs beside the hot-load copies.
 ///
-/// Every native module and project imports `pill_core.dll` and
-/// `pill_engine_core.dll`. The engine dylibs a host-spawned build produces (in
-/// the private module build tree) can differ from the ones the host binary
-/// itself maps from the regular target directory, since a GUI frontend unions
-/// extra features onto shared crates; the loader then gives modules their
-/// matching copies. When they are byte-identical (a plain CLI host) these
-/// staged copies simply stay unused and the loader keeps the host's single
-/// instances.
+/// Every native module, project and patch imports the engine dylibs
+/// ([`crate::native_library::ENGINE_DYLIB_STEMS`]). The ones a host-spawned
+/// build produces, in the private module build tree, can differ from the ones
+/// the host binary itself maps from the regular target directory, since a GUI
+/// frontend unions extra features onto shared crates; the loader then gives
+/// modules their matching copies. When they are byte-identical (a plain CLI
+/// host) these staged copies stay unused and the loader keeps the host's
+/// single instances.
 fn stage_engine_dylib(workspace_root: &Path) {
     for stem in crate::native_library::ENGINE_DYLIB_STEMS {
         let file_name = format!("{stem}.dll");
@@ -1731,6 +1734,12 @@ fn stage_engine_dylib(workspace_root: &Path) {
 /// `cdylib` legitimately has none and simply leaves the fast path idle.
 ///
 /// Returns the staged paths, in the order a stamp should record them.
+///
+/// # Errors
+///
+/// Returns [`BuildError::OutputMissing`] when the build produced no library to
+/// stage, and [`BuildError::HotArtifactCopyFailed`] when a copy into the
+/// hot-load directory fails.
 fn stage_build_outputs(
     workspace_root: &Path,
     library: (&Path, &Path),
@@ -1808,8 +1817,8 @@ pub(crate) fn newest_extension_rlib(build_directory: &Path, package: &str) -> Op
 
 /// Where the shared per-crate dependency rlibs are staged for patch linking.
 ///
-/// A sibling of the artifacts already staged in `target/hot`, and private to the
-/// host for the same reason they are.
+/// A subdirectory of the hot-load directory, private to the host for the same
+/// reason the artifacts staged there are.
 #[cfg(feature = "hot_patch")]
 pub(crate) const STAGED_DEPENDENCY_SUBDIRECTORY: &str = "target/hot/deps";
 
@@ -1883,9 +1892,9 @@ pub(crate) fn stage_shared_dependency_rlibs(workspace_root: &Path) -> usize {
 /// specific to one resolved configuration. A name without that suffix is the
 /// shared slot every build of that crate name writes to, and is the only kind
 /// another build can silently replace. The patch linker (`hot_patch::compile`)
-/// and the dependency staging below must agree about which files are shared,
-/// or a file is staged and never linked, or linked and never staged - so this
-/// is the single implementation both call.
+/// and [`stage_shared_dependency_rlibs`] must agree about which files are
+/// shared, or a file is staged and never linked, or linked and never staged,
+/// so this is the single implementation both call.
 #[cfg(feature = "hot_patch")]
 pub(crate) fn is_shared_slot_rlib(file_name: &str) -> bool {
     let Some(stem) = file_name.strip_suffix(".rlib") else {
@@ -2373,13 +2382,9 @@ mod tests {
         );
     }
 
-    /// Build a throwaway workspace containing one module, a path dependency,
-    /// and a freshly produced artifact, and return the workspace root plus the
-    /// module's manifest path.
+    /// An artifact another build wrote after the host's own must not be taken
+    /// for host-built, however fresh its timestamp looks.
     ///
-    /// The artifact is written after a short pause so its modification time is
-    /// strictly newer than every input, matching the invariant a real build
-    /// leaves behind.
     /// The scenario that produced an access violation in the field: the host
     /// builds an artifact, an unrelated `cargo build` overwrites it moments
     /// later with a different feature set, and every timestamp still looks
@@ -2433,13 +2438,12 @@ mod tests {
     }
 
     /// The same artifact built under a different host identity is a different
-    /// artifact, which is what makes the check feature-aware PER MODULE.
+    /// artifact, which is what makes the check feature-aware per module.
     ///
-    /// The workspace-wide build-info marker cannot answer this. It is rewritten
-    /// by the first module that rebuilds after a host feature change, so every
-    /// module checked after that one compares equal and skips its build while
-    /// still holding an artifact built against the engine variant that rebuild
-    /// just replaced - which loads as os error 127 and names nothing.
+    /// The identity lives in each module's own stamp rather than in one shared
+    /// marker: a host feature change must leave every module's stamp different,
+    /// or a module keeps an artifact built against the engine variant the
+    /// change just replaced, and loads it as os error 127 naming nothing.
     #[test]
     fn a_different_host_identity_is_a_different_stamp() {
         let (root, _) = test_workspace();

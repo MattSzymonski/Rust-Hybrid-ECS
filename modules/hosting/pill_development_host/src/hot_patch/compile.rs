@@ -4,7 +4,8 @@
 //!
 //! - Ask cargo once, in verbose mode, for the command it builds a crate with.
 //! - Replay that command with a different input file and output path.
-//! - Cache the result, invalidated by manifest and source modification times.
+//! - Cache the result, invalidated by the build command and the inputs'
+//!   modification times.
 //!
 //! # Design
 //!
@@ -23,13 +24,14 @@
 //!     .output()?;
 //! ```
 
+// Standard library
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 // =============================================================================
-// Flag classification
+// Constants
 // =============================================================================
 
 /// Identifies how a cached compiler line was tokenized.
@@ -93,6 +95,14 @@ const DROPPED_FLAGS: &[&str] = &[
     "--crate-type",
 ];
 
+/// The linker [`patch_linker_value`] substitutes for a recorded non-LLD one.
+///
+/// `rust-lld` is resolved by rustc out of the active toolchain's sysroot
+/// (`lib/rustlib/<target>/bin`), so it needs nothing installed and follows a
+/// toolchain switch. It is the same linker `modules/.cargo/config.toml` already
+/// asks every non-dx build in this repository to use.
+const PATCH_LINKER: &str = "rust-lld";
+
 // =============================================================================
 // CargoRustcLine
 // =============================================================================
@@ -105,54 +115,6 @@ pub struct CargoRustcLine {
     pub program: String,
     /// Every argument except the input source path, which is substituted.
     pub args: Vec<String>,
-}
-
-/// Where a package's captured flags are cached between processes.
-///
-/// Inside the workspace's private build tree, not the system temporary
-/// directory: checkouts of this repository share `/tmp`, and a cache at a
-/// shared path would be replayed by the wrong dependency graph - the metadata
-/// and `TypeId` drift the rest of this subsystem prevents. Keying on the
-/// workspace root makes a foreign cache unreachable rather than merely
-/// detectable.
-///
-/// Shared by the two writers: the fast-patch pipeline, which captures on
-/// demand, and [`crate::build_runner::run_build_command`], which harvests the
-/// same line out of a build it runs anyway.
-pub(crate) fn flags_cache_path(workspace_root: &Path, package: &str) -> PathBuf {
-    workspace_root
-        .join(crate::config::MODULE_BUILD_TARGET_DIRECTORY)
-        .join("hotpatch-flags")
-        .join(format!("{package}.flags"))
-}
-
-/// Pull the invocation for `crate_name` out of one line of cargo's `-v` output.
-///
-/// Returns `None` for every line that is not a `Running \`rustc ...\`` naming
-/// that crate, so a caller can feed it cargo's whole stderr stream a line at a
-/// time. Any rustc wrapper cargo ran (sccache) is unwrapped, exactly as the
-/// on-demand capture does - the patch replays the compiler directly and the
-/// wrapper's own CLI would reject rustc's arguments.
-pub(crate) fn parse_rustc_line(line: &str, crate_name: &str) -> Option<CargoRustcLine> {
-    let invocation = extract_backticked(line)?;
-    if !invocation.contains("rustc") {
-        return None;
-    }
-    let tokens = tokenize(&invocation);
-    if tokens.len() < 2 {
-        return None;
-    }
-    let names_this_crate = tokens
-        .windows(2)
-        .any(|pair| pair[0] == "--crate-name" && pair[1] == crate_name);
-    if !names_this_crate {
-        return None;
-    }
-    let compiler_index = compiler_token_index(&tokens);
-    Some(CargoRustcLine {
-        program: tokens[compiler_index].clone(),
-        args: tokens[compiler_index + 1..].to_vec(),
-    })
 }
 
 impl CargoRustcLine {
@@ -170,20 +132,23 @@ impl CargoRustcLine {
     ///
     /// # Errors
     ///
-    /// Returns a message when cargo cannot run, the build fails, or no
-    /// invocation for `package` appears after forcing a rebuild.
+    /// Returns a message when cargo cannot run, the build fails, the crate root
+    /// cannot be touched, or no invocation for `package` appears after forcing
+    /// a rebuild.
     pub fn capture(
         workspace_dir: &Path,
         package: &str,
         crate_root: &Path,
         build_command: &[String],
     ) -> Result<Self, String> {
+        // Step 1: Ask cargo for an invocation without changing anything.
         if let Some(line) = Self::try_capture(workspace_dir, package, build_command)? {
             return Ok(line);
         }
 
-        // The crate was fresh, so cargo stayed silent. Touch the root source to
-        // force exactly one rebuild of this crate and ask again.
+        // Step 2: Cargo stayed silent because the crate was fresh. Touch the
+        // root source to force exactly one rebuild of this crate, then ask
+        // again.
         touch(crate_root)?;
         Self::try_capture(workspace_dir, package, build_command)?.ok_or_else(|| {
             format!(
@@ -211,6 +176,7 @@ impl CargoRustcLine {
         build_command: &[String],
         timeout: Duration,
     ) -> Result<Option<Self>, String> {
+        // Step 1: Reconstruct the host's own command, environment included.
         let (program, arguments) = build_command
             .split_first()
             .ok_or_else(|| "the build command is empty".to_string())?;
@@ -236,6 +202,8 @@ impl CargoRustcLine {
             command.envs(crate::config::spawned_build_environment());
             crate::build_runner::apply_cargo_host_overrides(&mut command, workspace_dir);
         }
+        // Step 2: Spawn the child and drain its stderr while the poll runs.
+        //
         // This runs on the frame thread, so the child is supervised rather than
         // waited on: a cargo blocked behind another build's package lock must
         // not freeze the editor for as long as that build takes. Stderr is
@@ -259,6 +227,7 @@ impl CargoRustcLine {
             text
         });
 
+        // Step 3: Poll until the child exits or the deadline expires.
         let deadline = pill_core::platform::Instant::now() + timeout;
         let status = loop {
             if let Some(status) = child.try_wait().map_err(|error| {
@@ -286,6 +255,8 @@ impl CargoRustcLine {
             .join()
             .map_err(|_| "the cargo stderr reader panicked".to_string())?;
 
+        // Step 4: Pick this package's invocation out of cargo's stderr.
+        //
         // Cargo writes the `Running` lines to stderr.
         let stderr = String::from_utf8_lossy(&stderr);
         if !status.success() {
@@ -355,6 +326,8 @@ impl CargoRustcLine {
         let mut arguments = Vec::with_capacity(self.args.len() + 8);
         let mut index = 0;
 
+        // Step 1: Search the staged dependency directory before cargo's own.
+        //
         // Ahead of everything cargo recorded, so rustc finds the staged copies
         // first. This is not the same job as redirecting `--extern` below, and
         // both are needed: `--extern` only maps crates the patch source names
@@ -369,6 +342,7 @@ impl CargoRustcLine {
             arguments.push(format!("dependency={}", directory.display()));
         }
 
+        // Step 2: Replay the recorded tokens, dropping what is replaced below.
         while index < self.args.len() {
             let token = &self.args[index];
             let has_separate_value =
@@ -416,13 +390,15 @@ impl CargoRustcLine {
             index += if has_separate_value { 2 } else { 1 };
         }
 
-        // Anything the patch needs beyond what the original crate linked -
-        // principally that crate's own rlib.
+        // Step 3: Append anything the patch needs beyond what the original
+        // crate linked - principally that crate's own rlib.
         for extern_entry in extra_externs {
             arguments.push("--extern".to_string());
             arguments.push(extern_entry.clone());
         }
 
+        // Step 4: Append the patch's own build settings and output.
+        //
         // No PDB for the patch.
         //
         // Linking dominates a patch's wall time because the linker reads the
@@ -462,8 +438,14 @@ impl CargoRustcLine {
 
     /// Persist the captured line so a later host process skips the cargo probe.
     ///
-    /// One token per line, program first. Tokens never contain newlines (they
+    /// The file holds the format version, then the build command, then the
+    /// program, then one argument per line. No token contains a newline (they
     /// are paths and flags), so no escaping is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error when the cache directory cannot be created or the
+    /// file cannot be written.
     pub fn save(&self, path: &Path, build_command: &[String]) -> std::io::Result<()> {
         let mut text = String::with_capacity(4096);
         // How the tokens in this file were produced. A cache written by an older
@@ -491,7 +473,8 @@ impl CargoRustcLine {
     /// Reload a line saved by [`Self::save`].
     ///
     /// Returns `None` when the cache is absent, when any input that could change
-    /// the flags is newer than it, or when `build_command` differs from the one
+    /// the flags is newer than it or cannot be read, when the file was written
+    /// by a different tokenizer, or when `build_command` differs from the one
     /// the cache was captured with.
     ///
     /// The build command is part of the key because feature flags live there and
@@ -535,6 +518,54 @@ impl CargoRustcLine {
 // Free functions
 // =============================================================================
 
+/// Where a package's captured flags are cached between processes.
+///
+/// Inside the workspace's private build tree, not the system temporary
+/// directory: checkouts of this repository on one machine share that directory,
+/// and a cache at a shared path would be replayed by the wrong dependency graph,
+/// which is the metadata and `TypeId` drift the rest of this subsystem prevents.
+/// Keying on the workspace root makes a foreign cache unreachable rather than
+/// merely detectable.
+///
+/// Shared by the two writers: the fast-patch pipeline, which captures on
+/// demand, and [`crate::build_runner::run_build_command`], which harvests the
+/// same line out of a build it runs anyway.
+pub(crate) fn flags_cache_path(workspace_root: &Path, package: &str) -> PathBuf {
+    workspace_root
+        .join(crate::config::MODULE_BUILD_TARGET_DIRECTORY)
+        .join("hotpatch-flags")
+        .join(format!("{package}.flags"))
+}
+
+/// Pull the invocation for `crate_name` out of one line of cargo's `-v` output.
+///
+/// Returns `None` for every line that is not a `Running \`rustc ...\`` naming
+/// that crate, so a caller can feed it cargo's whole stderr stream a line at a
+/// time. Any rustc wrapper cargo ran (sccache) is unwrapped, exactly as the
+/// on-demand capture does - the patch replays the compiler directly and the
+/// wrapper's own CLI would reject rustc's arguments.
+pub(crate) fn parse_rustc_line(line: &str, crate_name: &str) -> Option<CargoRustcLine> {
+    let invocation = extract_backticked(line)?;
+    if !invocation.contains("rustc") {
+        return None;
+    }
+    let tokens = tokenize(&invocation);
+    if tokens.len() < 2 {
+        return None;
+    }
+    let names_this_crate = tokens
+        .windows(2)
+        .any(|pair| pair[0] == "--crate-name" && pair[1] == crate_name);
+    if !names_this_crate {
+        return None;
+    }
+    let compiler_index = compiler_token_index(&tokens);
+    Some(CargoRustcLine {
+        program: tokens[compiler_index].clone(),
+        args: tokens[compiler_index + 1..].to_vec(),
+    })
+}
+
 /// Linker the patch is built with, given the one cargo recorded. Returns the
 /// value unchanged for every `-C` other than `linker=`, and for a `linker=`
 /// that already names an LLD.
@@ -561,14 +592,6 @@ fn patch_linker_value(value: &str) -> String {
     }
     format!("linker={PATCH_LINKER}")
 }
-
-/// The linker [`patch_linker_value`] substitutes.
-///
-/// `rust-lld` is resolved by rustc out of the active toolchain's sysroot
-/// (`lib/rustlib/<target>/bin`), so it needs nothing installed and follows a
-/// toolchain switch. It is the same linker `modules/.cargo/config.toml` already
-/// asks every non-dx build in this repository to use.
-const PATCH_LINKER: &str = "rust-lld";
 
 /// Point one `--extern name=path` at the artifact a patch can actually use.
 ///

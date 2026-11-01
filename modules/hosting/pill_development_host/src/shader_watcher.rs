@@ -1,13 +1,14 @@
 //! Development shader reload, host half: watch the renderer data crate's
-//! shaders, re-cook edits on a worker thread, and queue the results.
+//! `shader_sources/` tree, re-cook edits, and queue the results.
 //!
 //! # Responsibilities
 //!
-//! - Watch the data crate's `shaders/` for HLSL edits, debounced like source
-//!   edits, and cook the whole tree with [`pill_assets::cook_shader_tree`] -
-//!   the routine the crate's build script runs, so both agree on outputs.
-//! - Queue each re-cooked file as a [`CookedShader`] for the main thread, which
-//!   hands it to the data crate's `pill_render_data_shader_changed` export.
+//! - Watch that tree for HLSL edits, debounced like source edits, and cook the
+//!   whole tree with [`pill_assets::cook_shader_tree`] - the routine the data
+//!   crate's build script runs, so both agree on outputs.
+//! - Queue every output whose text changed as a [`CookedShader`] for the main
+//!   thread, which hands it to the data crate's
+//!   `pill_render_data_shader_changed` export.
 //!
 //! # Design
 //!
@@ -39,19 +40,29 @@ use pill_core::{info, warn};
 // Current crate
 use crate::watcher::{is_relevant_event, spawn_settled_watcher};
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// Extension of the sources whose edits start a cook.
 const SOURCE_EXTENSION: &str = "hlsl";
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// One re-cooked WGSL file, waiting for the main thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CookedShader {
-    /// The file relative to the watched `shaders/`, with `/` separators.
+    /// The file relative to the watched `shader_sources/` tree, with `/`
+    /// separators.
     pub(crate) relative_path: String,
     /// The file's new text.
     pub(crate) wgsl: String,
 }
 
-/// A running shader watcher; dropping it lets the worker thread wind down.
+/// A running shader watcher; dropping it stops the worker at its next settled
+/// burst.
 pub(crate) struct ShaderWatcher {
     /// Re-cooked files, in the order the worker produced them.
     cooked: Receiver<CookedShader>,
@@ -75,8 +86,9 @@ impl ShaderWatcher {
             return Ok(None);
         }
 
-        // Spawn the shared watcher worker with the shader acceptance (`.hlsl`
-        // sources only) and the cook step.
+        // Step 1: Open the queue for the main thread, seeded with the outputs
+        // as they are now - what the running data module embedded - so only
+        // text that moved reaches it.
         let (cooked_sender, cooked) = channel::<CookedShader>();
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -84,9 +96,10 @@ impl ShaderWatcher {
             directory = %shaders_directory.display(),
             "watching renderer shader sources for edits"
         );
-        // The worker starts from the outputs as they are now, which is what
-        // the running data module embedded.
         let mut known_outputs = read_outputs(&shaders_directory);
+
+        // Step 2: Register the shared watcher worker with the shader
+        // acceptance (`.hlsl` sources only) and the cook step.
         spawn_settled_watcher(
             shaders_directory,
             "pill shader watcher",
@@ -116,8 +129,12 @@ impl ShaderWatcher {
     }
 }
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// The text of every cooked output in the tree, by path; an output that cannot
-/// be read is left out, so the next cook reports it.
+/// be read is left out, so the next cook queues it as changed.
 fn read_outputs(shaders_directory: &Path) -> HashMap<PathBuf, String> {
     let Ok(layout) = pill_assets::shader_tree_layout(shaders_directory) else {
         return HashMap::new();
@@ -145,12 +162,19 @@ fn read_outputs(shaders_directory: &Path) -> HashMap<PathBuf, String> {
 /// Cook the tree after `edited` settled, and return every output whose text
 /// differs from `known_outputs`, which it then records.
 ///
+/// Every discovered source is compared, not only the outputs this cook
+/// rebuilt: the data crate's build script cooks the same tree, and when it
+/// reaches an edited source first, the edit still has to reach the running
+/// world.
+///
 /// A failed cook is logged and yields nothing, so the assets keep their text.
 fn cook(
     shaders_directory: &Path,
     edited: &[PathBuf],
     known_outputs: &mut HashMap<PathBuf, String>,
 ) -> Vec<CookedShader> {
+    // Step 1: Cook the tree. A failure keeps every previous output in place,
+    // so the shaders that are already loaded keep drawing.
     let started = Instant::now();
     let report = match pill_assets::cook_shader_tree(shaders_directory) {
         Ok(report) => report,
@@ -163,6 +187,7 @@ fn cook(
         }
     };
 
+    // Step 2: Queue every output whose text moved, in discovery order.
     let mut changed = Vec::new();
     for source in &report.discovered_sources {
         let output = source.with_extension("wgsl");
@@ -210,6 +235,10 @@ fn relative_to(root: &Path, path: &Path) -> Option<String> {
         .collect();
     Some(parts.join("/"))
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

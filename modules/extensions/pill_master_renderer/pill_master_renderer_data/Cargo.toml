@@ -39,10 +39,10 @@ bytemuck = { version = "1.4", features = ["derive"] }
 # The shaders' slot tables: name-keyed like a map, with the declaration order
 # the uniform buffer packs in. `indexmap` is `ordermap`'s current name.
 indexmap = "2"
-# `jpeg` alongside `png`: the committed helmet asset in `master_renderer_test`
-# ships its PBR maps as JPEG, and re-encoding them to PNG would multiply the
-# committed size for no gain in fidelity. `hdr` reads Radiance environment maps
-# for skyboxes, whose values run past what an 8-bit image can hold.
+# `jpeg` alongside `png`: a project may ship its PBR maps as JPEG, and
+# re-encoding them to PNG would multiply their size for no gain in fidelity.
+# `hdr` reads Radiance environment maps for skyboxes, whose values run past
+# what an 8-bit image can hold.
 image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",

@@ -1,18 +1,15 @@
 //! The project's assets as a tool sees them: the `res` tree, each file's
-//! asset type, load state and guid, and the operations an editor performs on
-//! them.
+//! asset type, load state and guid, and what an editor does with them.
 //!
 //! # Responsibilities
 //!
-//! - List the project's `res` as a tree ([`list_assets`]): folders and files,
-//!   `.meta` sidecars hidden, each file with its asset type, load state and
-//!   guid - then the read-only `res` of every loaded module, naming its root.
+//! - List the project's `res` and every module root as a tree ([`list_assets`]),
+//!   `.meta` sidecars hidden, with each file's type, load state and guid.
 //! - Read and save an asset's import settings, or a standalone asset's own
 //!   document, as JSON ([`asset_settings`], [`save_asset_settings`]), and move
 //!   an asset together with its `.meta` ([`move_asset`]).
-//! - Create a standalone asset from its type's default document
-//!   ([`create_standalone_asset`]), with every check on the name and folder
-//!   done here rather than in a UI.
+//! - Create a standalone asset from its type's default document, checking the
+//!   name and folder here rather than in a UI ([`create_standalone_asset`]).
 //! - Refuse every path outside `res`; a module's resources are listed
 //!   read-only, and the write functions reach only the project's own `res`.
 //!
@@ -21,13 +18,11 @@
 //! Everything goes through the world's
 //! [`ImportRegistry`](pill_engine::ImportRegistry), so no asset type is named
 //! here: a type a module registers later shows up and edits with no change to
-//! this file or to the editor.
-//!
-//! Nothing here reimports anything. Saving rewrites the file atomically and a
-//! move renames files; the dev host's asset watcher sees the change and
-//! reimports (or follows the move) at the next frame boundary, exactly as it
-//! does for an edit made in any other program. One path for every edit keeps
-//! the editor from being a special case of the live-reload rules.
+//! this file or to the editor. A call imports once and never reimports - saving
+//! writes the file (importing a sourced asset whose `.meta` is still missing)
+//! and a move renames files - and the dev host's asset watcher sees either
+//! change and reimports it, or follows the move, at the next frame boundary, as
+//! for an edit made in another program.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -36,13 +31,24 @@ use std::path::{Path, PathBuf};
 use pill_engine::asset_metadata::METADATA_FORMAT_VERSION;
 use pill_engine::{AssetGuid, AssetManager, ImportRegistry, MetadataPolicy, World};
 
-// Re-exported from the engine's metadata module: the naming and path rules
-// are the asset format's, shared with every other writer (the editor core's
-// asset commands ride the same ones).
+// =============================================================================
+// Re-exports
+// =============================================================================
+
+// The naming and path rules are the asset format's, shared with every other
+// writer (the editor core's asset commands validate through the same two).
 pub use pill_engine::asset_metadata::{checked_relative, standalone_file_name};
+
+// =============================================================================
+// Constants
+// =============================================================================
 
 /// The suffix of a metadata sidecar.
 const METADATA_SUFFIX: &str = ".meta";
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// One row of an asset tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +78,21 @@ pub struct AssetEntry {
     pub guid: Option<String>,
 }
 
+/// A standalone asset type a new file can be created for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandaloneType {
+    /// The registered type name, written to the file's `asset_type`.
+    pub type_name: String,
+    /// The last `::` segment of the type name, for a dropdown.
+    pub display_name: String,
+    /// The file extension, without the dot (`render_pass`).
+    pub extension: String,
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Every folder and file under `asset_directory`, depth first, folders before
 /// files and each level sorted by name; `.meta` files and dot-files left out.
 ///
@@ -79,8 +100,11 @@ pub struct AssetEntry {
 /// resources ([`pill_engine::asset_store::module_roots`]), each entry naming
 /// its root so a UI can tell them apart.
 pub fn list_assets(world: &World, asset_directory: &Path) -> Vec<AssetEntry> {
+    // Step 1: The project's own tree, the only one a tool may write.
     let mut entries = Vec::new();
     append_root(world, "", asset_directory, false, &[], &mut entries);
+    // Step 2: One read-only tree per module root, each entry labelled with its
+    // module so a UI can group the roots one module declared.
     for root in pill_engine::asset_store::module_roots() {
         append_root(
             world,
@@ -150,8 +174,10 @@ fn append_root(
                     entry.loaded =
                         assets.is_some_and(|assets| registry.is_loaded(assets, relative));
                 }
-                // The asset database knows every indexed guid; reading the header
-                // covers a host without one and a file indexed late.
+                // The asset database knows every indexed guid; reading the file
+                // that carries it - a standalone's own header, a source's
+                // `.meta` - covers a host without a database and a file
+                // indexed late.
                 entry.guid = database
                     .and_then(|database| database.by_path(&entry.path))
                     .map(|record| record.guid.to_string())
@@ -169,17 +195,22 @@ fn append_root(
     );
 }
 
-/// Walk `root/relative` recursively, calling `visit(relative, is_directory,
-/// depth)` for each folder and file in the order [`list_assets`] promises.
+/// Walk `root/relative` recursively, calling `visit_entry(relative,
+/// is_directory, depth)` for each folder and file in the order [`list_assets`]
+/// promises.
 fn visit(
     root: &Path,
     relative: &Path,
     depth: usize,
     visit_entry: &mut dyn FnMut(&Path, bool, usize),
 ) {
+    // A directory that cannot be read has nothing to list, so the caller's
+    // tree simply omits it.
     let Ok(read) = std::fs::read_dir(root.join(relative)) else {
         return;
     };
+    // Step 1: Split this level into folders and files, dropping the sidecars
+    // and dot-files a tree never shows.
     let mut folders = Vec::new();
     let mut files = Vec::new();
     for entry in read.flatten() {
@@ -194,6 +225,8 @@ fn visit(
             _ => {}
         }
     }
+    // Step 2: Report and descend each folder, then report the files, so every
+    // level lists its folders before its files and both sorted by name.
     folders.sort();
     files.sort();
     for folder in folders {
@@ -222,8 +255,8 @@ fn slash_path(path: &Path) -> String {
 ///
 /// # Errors
 ///
-/// A message when no registered type imports the path or its file cannot be
-/// read.
+/// A message when the path leaves `res`, no asset types are registered, no
+/// registered type imports it, or its file cannot be read.
 pub fn asset_settings(world: &World, path: &str) -> Result<serde_json::Value, String> {
     let relative = checked_relative(path)?;
     let registry = world
@@ -246,14 +279,16 @@ pub fn asset_settings(world: &World, path: &str) -> Result<serde_json::Value, St
 ///
 /// # Errors
 ///
-/// A message when the path leaves `res`, no type imports it, the settings do
-/// not fit the type, or the file cannot be read or written.
+/// A message when the path leaves `res`, no asset types are registered, no
+/// type imports it, the settings do not fit the type, the `.meta` cannot be
+/// created, or the file cannot be read, parsed or written.
 pub fn save_asset_settings(
     world: &mut World,
     asset_directory: &Path,
     path: &str,
     settings: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    // Step 1: Refuse a path outside `res` and resolve the type that imports it.
     let relative = checked_relative(path)?;
     let registry = world
         .get_resource::<ImportRegistry>()
@@ -268,10 +303,15 @@ pub fn save_asset_settings(
         .type_for_extension(&extension)
         .ok_or_else(|| format!("no asset type imports `.{extension}` files"))?
         .to_owned();
+    // Step 2: Normalize against the type, so a malformed edit is refused
+    // before anything is written.
     let normalized = registry
         .normalize_settings_json(&type_name, settings)
         .map_err(|error| error.to_string())?;
 
+    // Step 3: Name the body the settings go into - a standalone file's own
+    // document, or the `.meta` beside its source - and create a missing
+    // `.meta` by importing the source once.
     let standalone = registry.is_standalone_extension(&extension);
     let (file, body_field) = if standalone {
         (asset_directory.join(&relative), "asset")
@@ -292,6 +332,8 @@ pub fn save_asset_settings(
             .map_err(|error| error.to_string())?;
     }
 
+    // Step 4: Replace only the body field, keeping the header the file already
+    // has, and put the result in place atomically.
     let text = std::fs::read_to_string(&file)
         .map_err(|error| format!("cannot read `{}`: {error}", file.display()))?;
     let mut document: serde_json::Value = serde_json::from_str(&text)
@@ -308,6 +350,11 @@ pub fn save_asset_settings(
 
 /// Write `bytes` to a temporary sibling of `file`, then rename it over `file`,
 /// so a reader never sees a half-written file.
+///
+/// # Errors
+///
+/// A message when `file` has no name, the temporary sibling cannot be written,
+/// or the rename fails.
 fn replace_atomically(file: &Path, bytes: &[u8]) -> Result<(), String> {
     let file_name = file
         .file_name()
@@ -331,28 +378,13 @@ fn replace_atomically(file: &Path, bytes: &[u8]) -> Result<(), String> {
 ///
 /// # Errors
 ///
-/// A message when either path leaves `res`, or the move is refused (missing
-/// source, existing target).
+/// A message when either path leaves `res`, the move is refused (the source is
+/// missing or a `.meta`, the target exists), or a rename fails.
 pub fn move_asset(asset_directory: &Path, from: &str, to: &str) -> Result<(), String> {
     let from = checked_relative(from)?;
     let to = checked_relative(to)?;
     pill_assets::move_asset(&asset_directory.join(from), &asset_directory.join(to))
         .map_err(|error| error.to_string())
-}
-
-// =============================================================================
-// Creating standalone assets
-// =============================================================================
-
-/// A standalone asset type a new file can be created for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StandaloneType {
-    /// The registered type name, written to the file's `asset_type`.
-    pub type_name: String,
-    /// The last `::` segment of the type name, for a dropdown.
-    pub display_name: String,
-    /// The file extension, without the dot (`render_pass`).
-    pub extension: String,
 }
 
 /// The live standalone types, sorted by display name: what a "create asset"
@@ -388,13 +420,16 @@ pub fn standalone_types(world: &World) -> Vec<StandaloneType> {
 /// its own. It is written with [`pill_engine::asset_store::write_new`], so an
 /// existing file is never replaced, then imported through the registry, so
 /// the caller gets a loaded asset at once. When the asset watcher sees the new
-/// file afterwards, the import finds it already loaded.
+/// file afterwards, it finds the asset already loaded and reimports it in
+/// place.
 ///
 /// # Errors
 ///
-/// A message when the type is not a live standalone type, the folder leaves
-/// `res` or does not exist, the name is refused (see [`standalone_file_name`]),
-/// the file already exists, or it cannot be written or loaded.
+/// A message when no asset types are registered, the type is not a live
+/// standalone type, the folder leaves `res` or does not exist, the name is
+/// refused (see [`standalone_file_name`]), the file already exists, the type's
+/// default document cannot be built, no random source exists for the new guid,
+/// or the file cannot be written or loaded.
 pub fn create_standalone_asset(
     world: &mut World,
     asset_directory: &Path,
@@ -402,6 +437,8 @@ pub fn create_standalone_asset(
     folder: &str,
     name: &str,
 ) -> Result<String, String> {
+    // Step 1: Resolve the extension of the type being created; only a live
+    // standalone type has one.
     let registry = world
         .get_resource::<ImportRegistry>()
         .cloned()
@@ -412,6 +449,8 @@ pub fn create_standalone_asset(
         .find(|(registered, _)| registered == type_name)
         .ok_or_else(|| format!("`{type_name}` is not a standalone asset type"))?;
 
+    // Step 2: Check the folder, the name and the target before anything is
+    // written: each refusal leaves `res` untouched.
     let folder = folder.trim().trim_matches('/');
     let relative_folder = if folder.is_empty() {
         PathBuf::new()
@@ -432,6 +471,8 @@ pub fn create_standalone_asset(
         return Err(format!("`res/{}` already exists", slash_path(&relative)));
     }
 
+    // Step 3: Write the standard header and the type's default document;
+    // `write_new` links the file into place and never replaces one.
     let document = registry
         .default_document(type_name)
         .map_err(|error| error.to_string())?;
@@ -447,6 +488,8 @@ pub fn create_standalone_asset(
     bytes.push(b'\n');
     pill_engine::asset_store::write_new(&destination, &bytes).map_err(|error| error.to_string())?;
 
+    // Step 4: Import the finished file, so the caller holds a loaded asset
+    // instead of waiting for the watcher to notice it.
     let assets = world
         .get_resource_mut::<AssetManager>()
         .ok_or("the engine has no AssetManager")?;
@@ -460,6 +503,10 @@ pub fn create_standalone_asset(
         })?;
     Ok(slash_path(&relative))
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -481,6 +528,7 @@ mod tests {
     impl pill_engine::Asset for Note {}
     trait_type_map::impl_trait_accessible!(dyn pill_engine::Asset; Note);
 
+    /// `Note`'s document: the text a new note starts with.
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     #[serde(default)]
     struct NoteDocument {
@@ -666,6 +714,8 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// A created file holds the header and the type's default document, gets
+    /// its own guid, and is loaded before the call returns.
     #[test]
     fn a_created_asset_has_a_header_a_fresh_guid_and_is_loaded() {
         let _mounted = mount_lock();
@@ -719,6 +769,8 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Every refused create names its reason, and an existing file keeps its
+    /// bytes.
     #[test]
     fn creation_refuses_bad_input_and_never_overwrites() {
         let _mounted = mount_lock();
@@ -764,6 +816,7 @@ mod tests {
     impl pill_engine::Asset for Swatch {}
     trait_type_map::impl_trait_accessible!(dyn pill_engine::Asset; Swatch);
 
+    /// `Swatch`'s import settings: one switch a save has to round-trip.
     #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     #[serde(default)]
     struct SwatchSettings {
@@ -848,6 +901,8 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Every path that would leave `res` is refused, and Windows separators are
+    /// normalized to `/`.
     #[test]
     fn paths_outside_res_are_refused() {
         assert!(checked_relative("../secret.png").is_err());
@@ -860,6 +915,8 @@ mod tests {
         );
     }
 
+    /// The tree lists folders before files, depth first, and leaves out the
+    /// `.meta` sidecars and dot-files.
     #[test]
     fn the_tree_lists_folders_first_and_hides_metadata() {
         let root = std::env::temp_dir().join(format!("pill-asset-browser-{}", std::process::id()));

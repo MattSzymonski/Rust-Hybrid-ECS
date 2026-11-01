@@ -1,0 +1,10 @@
+name: "Scene Fixture"
+build_binary_name: "SceneFixture"
+version: "0.1.0"
+author: "Matt Szymonski"
+description: "Four meshes, a themed UI layer and a fixed scene for the editor suites."
+
+# No extension modules: this fixture is the editor, picking, surface, web and
+# asset target, and a module list would only add build time to every suite that
+# drives it. The reload and patch anchors live in the `native` fixture.
+modules: []

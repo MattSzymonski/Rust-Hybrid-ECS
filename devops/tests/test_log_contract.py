@@ -129,22 +129,22 @@ STRING_ESCAPES: Dict[str, str] = {
 EXTERNALLY_PRODUCED: Dict[str, str] = {
     "STATUS_ACCESS_VIOLATION": "Windows prints this exit status, not the host.",
     "panicked at": "Emitted by the Rust panic runtime, not by our code.",
-    "counter tick": "Printed by the example project in examples/local/project_rs.",
-    "[project]": "Printed by the example project in examples/local/project_rs, which "
+    "counter tick": "Printed by the example project in devops/tests/projects/project_rs.",
+    "[project]": "Printed by the example project in devops/tests/projects/project_rs, which "
     "is outside the `modules/` tree this test scans.",
     "warning CS": "Emitted by the C# compiler.",
     "[csharp_bench] done":
-        "Printed by the C# benchmark scene in examples/local/project_cs_bench, "
+        "Printed by the C# benchmark scene in devops/tests/projects/managed, "
         "whose source is C# rather than Rust.",
-    "[csharp_runtime] reloaded project_cs.dll":
+    "[csharp_runtime] reloaded managed.dll":
         "Emitted by the .NET bridge, whose source is C# rather than Rust.",
-    "'project::FrameCounter' -> migrating":
+    "'native::FrameCounter' -> migrating":
         "Composed at runtime from the component's type name and its verdict.",
-    "'project::SpatialPosition' -> migrating":
+    "'native::SpatialPosition' -> migrating":
         "Composed at runtime from the component's type name and its verdict.",
-    "'project::LinearVelocity' -> migrating":
+    "'native::LinearVelocity' -> migrating":
         "Composed at runtime from the component's type name and its verdict.",
-    "'project::MarkerTrail' -> migrating":
+    "'native::MarkerTrail' -> migrating":
         "Composed at runtime from the component's type name and its verdict.",
     "are still loaded after":
         "Emitted by the .NET bridge (ProjectHost.cs), whose source is C# "
@@ -161,18 +161,18 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
     "existing=1":
         "Composed at runtime: `existing` is a structured field on "
         "pill_spline's registration line, and its value is a count.",
-    "[project_cs] sample extra=7.5":
+    "[managed] sample extra=7.5":
         "Printed by C# that test_csharp_bridge.py injects into "
-        "examples/local/project_cs during the run, to witness a field default.",
+        "devops/tests/projects/managed during the run, to witness a field default.",
     "cs spline bridge: sees 1 spline(s), first P0.X=0, count=4":
         "Printed by the C# BridgeProbe fixture test_csharp_bridge.py injects "
-        "into examples/local/project_cs during the run.",
+        "into devops/tests/projects/managed during the run.",
     "cs spline bridge: sees 2 spline(s)":
         "Printed by the C# BridgeProbe fixture test_csharp_bridge.py injects "
-        "into examples/local/project_cs during the run.",
+        "into devops/tests/projects/managed during the run.",
     "probe retirement markers seeded":
         "Printed by C# that test_csharp_bridge.py injects into "
-        "examples/local/project_cs during the run, to witness declaration "
+        "devops/tests/projects/managed during the run, to witness declaration "
         "retirement.",
     "SHARED RESOURCE PROBE":
         "Printed by Rust that test_shared_component_identity.py injects into "

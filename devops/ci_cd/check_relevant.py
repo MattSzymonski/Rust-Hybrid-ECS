@@ -59,7 +59,6 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "devops"))
 
 from core.projects import (  # noqa: E402
-    EXAMPLES_RELATIVE_PATH,
     PROJECT_RS_RES,
     PROJECT_RS_SRC,
     repository_relative,
@@ -227,11 +226,16 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # The browser frontend: the crate only compiles for wasm, so its check is
     # the wasm target, and the page smoke suite builds a project and draws it
     # in a headless browser.
-    if has("modules/frontends/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**"):
+    if has("modules/frontends/pill_web/**", "modules/editor/pill_web_editor/**",
+           "devops/tools/build_web.py", "devops/tools/web/**"):
         selected.append(cargo_check("check pill_web (wasm)",
                                     ("check", "-p", "pill_web", "--target", "wasm32-unknown-unknown",
                                      "--offline"),
                                     "browser frontend changed"))
+        selected.append(cargo_check("check pill_web_editor (wasm)",
+                                    ("check", "-p", "pill_web_editor",
+                                     "--target", "wasm32-unknown-unknown", "--offline"),
+                                    "browser editor changed"))
         selected.append(suite_check("test_web_smoke.py", "browser frontend changed"))
 
     # Engine core and the shared crates below it: unit tests plus the
@@ -318,9 +322,9 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 
     # Examples are projects, not library code: their suites need release
     # builds, so they are suggested rather than run.
-    examples = has(EXAMPLES_RELATIVE_PATH + "/**")
+    examples = has("examples/**")
     if examples:
-        print(f"  note: {len(examples)} file(s) under {EXAMPLES_RELATIVE_PATH}/ changed; "
+        print(f"  note: {len(examples)} file(s) under examples/ changed; "
               "run `python devops/tests/run_all.py --only test_examples.py` when shipping matters")
 
     # A code change outside every rule above still needs a home: fall back to
@@ -364,7 +368,7 @@ RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("manifests", ("**/Cargo.toml", "modules/.cargo/config.toml", "modules/clippy.toml")),
     ("devops-suites", ("devops/tests/**",)),
     ("devops-infrastructure", ("devops/ci_cd/**", "devops/core/**")),
-    (EXAMPLES_RELATIVE_PATH, (EXAMPLES_RELATIVE_PATH + "/**",)),
+    ("examples", ("examples/**",)),
 ]
 
 

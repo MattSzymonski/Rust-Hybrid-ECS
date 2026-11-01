@@ -37,8 +37,16 @@ use pill_core::info;
 // Current crate
 use crate::watcher::{is_relevant_event, spawn_settled_watcher};
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// The extension of a metadata file, appended to its source's name.
 const METADATA_SUFFIX: &str = ".meta";
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// What happened to one source asset, as far as the files say.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +71,8 @@ pub(crate) enum AssetChange {
     },
 }
 
-/// A running asset watcher; dropping it lets the worker thread wind down.
+/// A running asset watcher; dropping it stops the worker at its next settled
+/// burst.
 pub(crate) struct AssetWatcher {
     /// Changes, oldest first, one per source per debounce window.
     changes: Receiver<AssetChange>,
@@ -77,23 +86,26 @@ impl AssetWatcher {
     ///
     /// # Errors
     ///
-    /// Returns a [`WatcherError`] when the watcher cannot be created or the
-    /// directory cannot be registered.
+    /// Returns a [`WatcherError`] when the watcher or its worker thread cannot
+    /// be created, or the directory cannot be registered for watching.
     pub(crate) fn spawn(asset_directory: PathBuf) -> Result<Option<Self>, WatcherError> {
         if !asset_directory.is_dir() {
             return Ok(None);
         }
 
-        // Queue the receiver and spawn the shared watcher worker with the
-        // asset acceptance: every relevant event, rename sides included (a
-        // rename arrives as a remove of the old name and a create of the new
-        // one, and the classification below reads both).
+        // Step 1: Open the queue the worker fills and the main thread drains.
         let (change_sender, changes) = channel::<AssetChange>();
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             directory = %asset_directory.display(),
             "[assets] watching the project's assets for edits"
         );
+
+        // Step 2: Register the shared watcher worker with the asset
+        // acceptance: every relevant event plus any rename side, which a
+        // backend may report as a name modification rather than as a create
+        // and a remove. Paths pass unfiltered: which of them are assets is the
+        // main thread's decision.
         spawn_settled_watcher(
             asset_directory,
             "pill asset watcher",
@@ -119,6 +131,10 @@ impl AssetWatcher {
         self.changes.try_iter().collect()
     }
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Whether the event is one side of a rename, which some backends report as
 /// neither a create nor a remove.
@@ -187,12 +203,17 @@ fn classify(asset_directory: &Path, touched: &[PathBuf]) -> Vec<AssetChange> {
     by_source.into_values().collect()
 }
 
-/// `path` relative to `root`, with `/` separators, or `None` outside it.
+/// `path` relative to `root` with `/` separators, or `None` when it lies
+/// outside `root`, equals it, or is not UTF-8.
 fn relative_to(root: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
     let text = relative.to_str()?.replace('\\', "/");
     (!text.is_empty()).then_some(text)
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

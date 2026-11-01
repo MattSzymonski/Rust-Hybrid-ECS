@@ -12,7 +12,7 @@ REQUIREMENTS
 
 DESCRIPTION
     This script launches the standalone host and executes a table-driven migration
-    suite by editing devops/tests/project/src/lib.rs. Every scenario waits for
+    suite by editing the native fixture's src/lib.rs. Every scenario waits for
     hot-reload, checks crash signals, verifies expected migration logs, optionally
     validates migration entity counts and the fixture's value witnesses (component
     values printed once per generation), and that the counter system still ticks.
@@ -59,17 +59,30 @@ from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario 
 # Configuration
 # =============================================================================
 
-TEST_PROJECT_ROOT = WORKSPACE_ROOT / "devops" / "tests" / "project"
-PROJECT_LIB_RS = TEST_PROJECT_ROOT / "src" / "lib.rs"
+# The migration scenarios drive the native fixture: its components live in
+# `src/migration.rs`, apart from the reload scenarios' anchors in `lib.rs`.
+TEST_PROJECT_ROOT = FIXTURE_PROJECT_ROOT
+PROJECT_LIB_RS = FIXTURE_PROJECT_COMPONENTS_RS
+
+# The scenarios rewrite a persistable component's shape. A schema migration
+# while extension modules are loaded overflows the host's stack - the module
+# artifacts bring their own component registries into the same reload - so this
+# suite runs the fixture module-free and restores its settings afterwards. The
+# reload suites, which never change a schema, keep the usual module list.
+MODULE_FREE_SETTINGS = """name: "Native Fixture"
+build_binary_name: "NativeFixture"
+modules: []
+"""
+PROJECT_SETTINGS_PATH = TEST_PROJECT_ROOT / "project_settings.yaml"
 
 RELOAD_COMPLETE_TOKEN = "hot reload complete"
 FAST_PATH_TOKEN = "schema unchanged for all persistable component types"
 SELECTIVE_START_TOKEN = MIGRATION_START_TOKEN
 SELECTIVE_FINISHED_TOKEN = MIGRATION_FINISHED_TOKEN
-FRAMECOUNTER_MIGRATE_LOG_TOKEN = "'project::FrameCounter' -> migrating"
-SPATIAL_POSITION_MIGRATE_LOG_TOKEN = "'project::SpatialPosition' -> migrating"
-LINEAR_VELOCITY_MIGRATE_LOG_TOKEN = "'project::LinearVelocity' -> migrating"
-MARKER_TRAIL_MIGRATE_LOG_TOKEN = "'project::MarkerTrail' -> migrating"
+FRAMECOUNTER_MIGRATE_LOG_TOKEN = "'native::FrameCounter' -> migrating"
+SPATIAL_POSITION_MIGRATE_LOG_TOKEN = "'native::SpatialPosition' -> migrating"
+LINEAR_VELOCITY_MIGRATE_LOG_TOKEN = "'native::LinearVelocity' -> migrating"
+MARKER_TRAIL_MIGRATE_LOG_TOKEN = "'native::MarkerTrail' -> migrating"
 DESERIALIZE_FAILED_TOKEN = "[persistence] Failed to deserialize"
 
 # Value witnesses: the fixture prints its components once per module generation
@@ -564,7 +577,7 @@ def build_scenarios() -> List[Scenario]:
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("project::FrameCounter", 6)],
+            expected_migration_entity_counts=[("native::FrameCounter", 6)],
             expected_witness_tokens=[WITNESS_POSITION_2, WITNESS_TRAIL_ALPHA],
         ),
         migration_scenario(
@@ -584,7 +597,7 @@ def build_scenarios() -> List[Scenario]:
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("project::FrameCounter", 9)],
+            expected_migration_entity_counts=[("native::FrameCounter", 9)],
             expected_witness_tokens=[WITNESS_POSITION_2, WITNESS_TRAIL_ALPHA],
         ),
         migration_scenario(
@@ -605,7 +618,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("project::SpatialPosition", 12)],
+            expected_migration_entity_counts=[("native::SpatialPosition", 12)],
             # The added field defaults to zero on migrated entities while every
             # pre-existing value survives: the witness pins exactly that.
             expected_witness_tokens=[
@@ -630,7 +643,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("project::LinearVelocity", 10)],
+            expected_migration_entity_counts=[("native::LinearVelocity", 10)],
             expected_witness_tokens=[
                 WITNESS_POSITION_3_A,
                 WITNESS_POSITION_3_B,
@@ -667,7 +680,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("project::SpatialPosition", 21)],
+            expected_migration_entity_counts=[("native::SpatialPosition", 21)],
             expected_witness_tokens=[
                 WITNESS_POSITION_3_A,
                 WITNESS_POSITION_3_B,
@@ -691,7 +704,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("project::MarkerTrail", 16)],
+            expected_migration_entity_counts=[("native::MarkerTrail", 16)],
             # Heap payloads must survive the schema change; the new vector must
             # arrive empty on migrated rows (stamps=0) and seeded on new ones.
             expected_witness_tokens=[
@@ -722,7 +735,7 @@ def build_scenarios() -> List[Scenario]:
                 "MarkerTrail(points=3,sum=1.88",
                 "MarkerTrail(points=2,sum=2.25",
             ],
-            expected_migration_entity_counts=[("project::MarkerTrail", 20)],
+            expected_migration_entity_counts=[("native::MarkerTrail", 20)],
             expected_witness_tokens=[
                 '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50,stamps=0)',
                 '[project] witness MarkerTrail(points=2,sum=9.00,label="beta",samples=1,last=2.50,stamps=1)',
@@ -748,7 +761,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("project::MarkerTrail", 20)],
+            expected_migration_entity_counts=[("native::MarkerTrail", 20)],
             expected_witness_tokens=[
                 # A renamed field has no source value: it resets to Default
                 # while its neighbours keep their data.
@@ -774,7 +787,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("project::MarkerTrail", 24)],
+            expected_migration_entity_counts=[("native::MarkerTrail", 24)],
             # The stored floats cannot become u32, so the snapshot fails to
             # parse and the fallback resets the WHOLE component on migrated
             # rows (name reverts too, visible as the empty string) while the
@@ -875,33 +888,38 @@ def run_suite(cycles: int) -> bool:
 
 
 def build_fixture_project() -> bool:
-    """Builds the `devops/tests/project` fixture this suite drives.
+    """Builds the native fixture crate this suite drives.
 
     The host itself comes from the shared `prepare_host`; this is the one
     build that is not a host posture, so it stays local.
     """
-    print("  [PREP] Building devops/tests/project crate...")
+    print("  [PREP] Building the native fixture crate...")
     try:
         tests_project_result = subprocess.run(
-            ["cargo", "build", "--manifest-path", "devops/tests/project/Cargo.toml"],
+            [
+                "cargo",
+                "build",
+                "--manifest-path",
+                str(FIXTURE_PROJECT_ROOT / "Cargo.toml"),
+            ],
             cwd=str(WORKSPACE_ROOT),
             capture_output=True,
             text=True,
             timeout=BUILD_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        print(f"  [FAIL] devops/tests/project build timed out after {BUILD_TIMEOUT} seconds.")
+        print(f"  [FAIL] native fixture build timed out after {BUILD_TIMEOUT} seconds.")
         return False
     except FileNotFoundError:
         print("  [FAIL] 'cargo' not found. Is Rust installed and on PATH?")
         return False
 
     if tests_project_result.returncode != 0:
-        print("  [FAIL] devops/tests/project build failed:")
+        print("  [FAIL] native fixture build failed:")
         print(tests_project_result.stderr[-2000:])
         return False
 
-    print("  [OK] devops/tests/project built.")
+    print("  [OK] native fixture built.")
     return True
 
 
@@ -948,6 +966,8 @@ def main() -> None:
 
     apply_timeout_scale(args.timeout_scale)
     ORIGINAL_CONTENT = read_source(PROJECT_LIB_RS)
+    original_settings = PROJECT_SETTINGS_PATH.read_text(encoding="utf-8")
+    PROJECT_SETTINGS_PATH.write_text(MODULE_FREE_SETTINGS, encoding="utf-8", newline="")
 
     print("=" * 60)
     print("  Hot-Reload Migration Integration Suite")
@@ -966,6 +986,7 @@ def main() -> None:
     finally:
         print("\n  [CLEANUP] Restoring original project source...")
         restore_original()
+        PROJECT_SETTINGS_PATH.write_text(original_settings, encoding="utf-8", newline="")
         print("  [OK] Source restored.")
 
     print("\n" + "=" * 60)

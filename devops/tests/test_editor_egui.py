@@ -7,7 +7,7 @@ SETS: editor
 Builds against an already-built `pill_editor` binary - verified before use, so
 a binary older than the sources it was compiled from is refused rather than
 trusted - and starts it on
-`italian_brainrot` - three models and a camera, so the frames are fast and
+`scene` - three models and a camera, so the frames are fast and
 the heartbeat waits are short - with the scripted input channel
 (`PILL_EDITOR_TEST_COMMANDS`), and asserts on its log tokens: startup and the
 two scene surfaces (the Scene and Scene 2 viewports), the egui shell module
@@ -84,10 +84,10 @@ from core.editor_session import (  # noqa: E402
 from core.environment import ProcessToolUnavailable, windows_process_commands  # noqa: E402
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name  # noqa: E402
 from core.projects import (  # noqa: E402
-    CIRCUS_DEMO_FONT,
-    ITALIAN_BRAINROT_PATH,
-    ITALIAN_BRAINROT_RES,
-    ITALIAN_BRAINROT_SCENE_RS,
+    SCENE_PROJECT_PATH,
+    SCENE_PROJECT_RES,
+    SCENE_PROJECT_SCENE_RS,
+    THEMED_PROJECT_FONT,
 )
 from core.suite_common import verify_editor_binary  # noqa: E402
 from core import win_clipboard  # noqa: E402
@@ -792,7 +792,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--project",
-        default=ITALIAN_BRAINROT_PATH,
+        default=SCENE_PROJECT_PATH,
         help="the project, resolved the way the editor resolves PROJECT_PATH (from modules/)",
     )
     parser.add_argument("--timeout", type=int, default=300)
@@ -860,12 +860,12 @@ def main() -> int:
     tab_systems_source = shell_source.parent / "shell" / "tab_systems.rs"
     with tab_systems_source.open("r", encoding="utf-8", newline="") as file:
         original_systems_source = file.read()
-    project_source = ITALIAN_BRAINROT_SCENE_RS
+    project_source = SCENE_PROJECT_SCENE_RS
     # The Assets step's meta probe: a sourced file with no `.meta` sidecar
     # yet, staged before the editor starts so the res watcher never sees a
     # creation event for it - the write-meta action answers exactly this
     # state.
-    asset_root = ITALIAN_BRAINROT_RES
+    asset_root = SCENE_PROJECT_RES
     stage_file = asset_root / "s16_stage.png"
     samples = sorted((asset_root / "textures").glob("*.png"))
     assert samples, "no texture png to stage the meta probe from"
@@ -908,7 +908,7 @@ def main() -> int:
     # finally block, the way the sources are.
     inspector_metas = [
         asset_root / "models" / "cube.obj.meta",
-        asset_root / "textures" / "chimpanzini_bananini_color.png.meta",
+        asset_root / "textures" / "reimport_sample.png.meta",
     ]
     original_metas = {}
     for meta_path in inspector_metas:
@@ -3420,7 +3420,7 @@ def _assets_browser_and_pipeline_steps(state: StepState) -> None:
     grid = session.read_log()[begin:]
     assert re.search(
         re.escape(BROWSER_ITEM_TOKEN)
-        + r'\s+path="?textures/chimpanzini_bananini_color\.png',
+        + r'\s+path="?textures/reimport_sample\.png',
         grid,
     ), "the grid misses the textures folder's texture: " + grid[-800:]
     for outside in ("config.ini", "s16_stage.png"):
@@ -3754,7 +3754,7 @@ def _assets_browser_and_pipeline_steps(state: StepState) -> None:
     # writes a valid `.pipeline`: the standard header, a guid and the
     # type's default document (an empty passes list, which is valid - a
     # chain names its passes by guid). The committed chain in
-    # `examples/local/project_rs` is what exercises a populated file.
+    # `devops/tests/projects/project_rs` is what exercises a populated file.
     begin = len(session.read_log())
     session.send("dump standalone-types")
     session.wait(
@@ -3938,8 +3938,8 @@ def _systems_components_and_entities_steps(state: StepState) -> None:
     wait_applied(applied_before, "settings undo applied")
     wait_meta_value(cube_meta, "flip_v", flip_before, 30, "the undo restored the sidecar")
 
-    texture_asset = "textures/chimpanzini_bananini_color.png"
-    texture_meta = asset_root / "textures" / "chimpanzini_bananini_color.png.meta"
+    texture_asset = "textures/reimport_sample.png"
+    texture_meta = asset_root / "textures" / "reimport_sample.png.meta"
     begin = len(session.read_log())
     session.send(f"select asset {texture_asset}")
     session.wait(
@@ -4750,7 +4750,7 @@ def _preferences_and_theme_steps(state: StepState) -> None:
     font_directory = theme_root / "fonts"
     font_directory.mkdir(parents=True, exist_ok=True)
     (font_directory / "Silkscreen-Regular.ttf").write_bytes(
-        CIRCUS_DEMO_FONT.read_bytes()
+        THEMED_PROJECT_FONT.read_bytes()
     )
 
     state.applied_before = applied_before
@@ -5504,7 +5504,7 @@ def _menus_and_dock_steps(state: StepState) -> None:
     # declare [Header]/[Space]/[Tooltip]/[Range]/[Min]/[HideInInspector]
     # draws the rows the model chose: a separator line, a gap, a slider
     # carrying its tooltip, a clamped drag value, and no row at all for
-    # the hidden field. `italian_brainrot`'s models carry the decorated
+    # the hidden field. `scene`'s models carry the decorated
     # `ShowcaseComponent`, so the step picks one the way the scene
     # selection step does.
     begin = len(session.read_log())

@@ -16,12 +16,12 @@
 //! # Design
 //!
 //! A process-wide collector is used because the build pipeline spans several
-//! modules (`build_runner`, `native_library`, `extension`,
-//! `project_module`) and no single one owns the whole transaction. Records are
-//! keyed by module name, which is unique across the project and extensions.
-//! The collector is deliberately best-effort: a missing DLL, a PE image that
-//! cannot be parsed, or an absent cargo-timings report degrades the report to
-//! `-` instead of failing the build.
+//! modules (`build_runner`, `native_library`, `reload`, `runtime`) and no
+//! single one owns the whole transaction. Records are keyed by module name,
+//! which is unique across the project and extensions. The collector is
+//! deliberately best-effort: a missing DLL, a PE image that cannot be parsed,
+//! or an absent cargo-timings report degrades the report to `-` instead of
+//! failing the build.
 
 // Standard library
 use std::collections::HashMap;
@@ -37,6 +37,23 @@ use serde_json::Value;
 
 // =============================================================================
 // Constants
+// =============================================================================
+
+/// How many distinct fallback reasons the tally remembers.
+///
+/// A cap rather than a growing list: the tally's counters still total every
+/// refusal and failure, so a long session loses only the listing of a ninth
+/// distinct cause, never the count.
+#[cfg(feature = "hot_patch")]
+const MAX_TRACKED_FALLBACK_REASONS: usize = 8;
+
+/// How much of one explanation is kept. Compiler errors can run long, and this
+/// line sits inside a reload report that has to stay readable.
+#[cfg(feature = "hot_patch")]
+const MAX_FALLBACK_DETAIL_CHARS: usize = 160;
+
+// =============================================================================
+// Build Tree Locations
 // =============================================================================
 
 /// Subdirectory, relative to the workspace root, where cargo writes its
@@ -83,6 +100,7 @@ pub(crate) enum ModuleKind {
 }
 
 impl ModuleKind {
+    /// The value printed in the report's `kind` column.
     fn label(self) -> &'static str {
         match self {
             ModuleKind::Extension => "extension",
@@ -123,6 +141,8 @@ pub(crate) struct PeInspection {
 /// The parse degrades rather than fails: a truncated or malformed table
 /// yields what was readable up to that point.
 pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
+    // Step 1: The DOS stub and the PE signature, which is all that separates a
+    // PE image from any other file.
     let data = std::fs::read(path).ok()?;
     if data.len() < 0x40 || &data[0..2] != b"MZ" {
         return None;
@@ -174,7 +194,7 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
             .ok()?,
     );
 
-    // Map an RVA to a file offset through the section table.
+    // Step 2: Map an RVA to a file offset through the section table.
     let sections = coff + 20 + size_of_optional;
     let rva_to_offset = |rva: u32| -> Option<usize> {
         if rva == 0 {
@@ -201,8 +221,8 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
         None
     };
 
-    // Import directory: a null-terminated list of image import descriptors,
-    // each naming one imported DLL and the symbols taken from it.
+    // Step 3: The import directory - a null-terminated list of image import
+    // descriptors, each naming one imported DLL and the symbols taken from it.
     let mut import_dlls = Vec::new();
     let mut imports = Vec::new();
     if import_rva != 0 && import_size != 0 {
@@ -292,7 +312,8 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
         }
     }
 
-    // Export directory: the name-pointer table lists every exported name.
+    // Step 4: The export directory's name-pointer table lists every exported
+    // name.
     let mut exports = Vec::new();
     if export_rva != 0 && export_size != 0 {
         if let Some(directory) = rva_to_offset(export_rva) {
@@ -475,7 +496,8 @@ pub(crate) struct CargoTiming {
     pub total_seconds: f64,
 }
 
-/// Parse the newest `target/cargo-timings/cargo-timing-*.html` report.
+/// Parse the newest `.html` report under the build tree's `cargo-timings`
+/// directory.
 ///
 /// Cargo embeds a JSON `UNIT_DATA` array at the end of the HTML: one entry per
 /// unit with `name`, `mode`, `start`, `duration` (seconds) and `sections`.
@@ -542,10 +564,11 @@ pub(crate) fn parse_latest_cargo_timings(workspace_root: &Path) -> Option<CargoT
 
 /// Read a crate's direct dependencies from its fingerprint JSON.
 ///
-/// Cargo writes `<target>/debug/.fingerprint/<crate>-<hash>/lib-<crate>.json`
-/// for every compiled library, whose `deps` array names each direct
-/// dependency. Returns an empty vector when the fingerprint is missing (for
-/// example before the first build of a fresh workspace).
+/// Cargo writes
+/// `<artifact directory>/.fingerprint/<crate>-<hash>/lib-<crate>.json` for
+/// every compiled library, whose `deps` array names each direct dependency.
+/// Returns an empty vector when the fingerprint is missing (for example before
+/// the first build of a fresh workspace).
 pub(crate) fn read_cargo_deps(workspace_root: &Path, crate_name: &str) -> Vec<String> {
     let fingerprint_directory = workspace_root.join(cargo_fingerprint_directory());
     let Ok(entries) = std::fs::read_dir(&fingerprint_directory) else {
@@ -604,18 +627,25 @@ pub(crate) fn read_cargo_deps(workspace_root: &Path, crate_name: &str) -> Vec<St
 struct ModuleAnalytics {
     name: String,
     kind: ModuleKind,
+    /// The last cargo build's wall time; `0` until a build records one.
     build_wall_ms: u64,
-    /// Sub-second phase timings carry fractional milliseconds so fast
-    /// operations (load, init) do not round to zero.
+    /// The phase timings carry fractional milliseconds so fast operations
+    /// (stage, load, init) do not round to zero.
     stage_ms: f64,
     load_ms: f64,
     init_ms: f64,
     migrate_ms: f64,
+    /// The staged DLL's size on disk.
     artifact_bytes: u64,
+    /// `SizeOfImage` from the DLL's PE header, in bytes.
     image_size: u64,
     import_dlls: Vec<String>,
+    /// Direct cargo dependencies, read from the crate's fingerprint.
     cargo_deps: Vec<String>,
+    /// This module's own unit in the newest cargo `--timings` report, when the
+    /// build ran in that invocation.
     cargo_unit_ms: Option<u64>,
+    /// Completed reloads of this module.
     reloads: u32,
 }
 
@@ -707,7 +737,8 @@ impl PatchRoute {
     }
 }
 
-/// A snapshot of one completed hot reload, printed on the next frame.
+/// A snapshot of one completed hot reload, printed once the frame's reloads
+/// have all finished.
 struct ReloadEvent {
     /// Whether this was a whole-artifact reload or an in-place patch.
     kind: EventKind,
@@ -715,6 +746,7 @@ struct ReloadEvent {
     /// total. `None` for a reload, which has no route: it replaces the whole
     /// artifact rather than redirecting anything.
     route: Option<(Vec<PatchRoute>, usize)>,
+    /// The module's name, or the names of the patched functions.
     name: String,
     build_ms: u64,
     stage_ms: f64,
@@ -722,6 +754,8 @@ struct ReloadEvent {
     init_ms: f64,
     migrate_ms: f64,
     artifact_bytes: u64,
+    /// The module's completed-reload count, or a patched function's
+    /// generation.
     reload_count: u32,
     /// Crates that actually compiled or linked in this reload's cargo
     /// invocation(s), with their wall times, sorted by time descending. This
@@ -729,19 +763,6 @@ struct ReloadEvent {
     /// `pill_dummy_color` also relinks `pill_spline`).
     cargo_crates: Vec<(String, u64)>,
 }
-
-/// How many distinct fallback reasons the tally remembers.
-///
-/// A cap rather than a growing list: the counters below still total every
-/// refusal and failure, so a long session loses only the listing of a ninth
-/// distinct cause, never the count.
-#[cfg(feature = "hot_patch")]
-const MAX_TRACKED_FALLBACK_REASONS: usize = 8;
-
-/// How much of one explanation is kept. Compiler errors can run long, and this
-/// line sits inside a reload report that has to stay readable.
-#[cfg(feature = "hot_patch")]
-const MAX_FALLBACK_DETAIL_CHARS: usize = 160;
 
 /// Why one change fell back to a full reload instead of patching.
 ///
@@ -943,7 +964,7 @@ pub(crate) fn record_migrate(name: &str, migrate_ms: f64) {
     collector.modules[index].migrate_ms = migrate_ms;
 }
 
-/// Record a completed hot reload and queue its console line.
+/// Record a completed hot reload and queue its report entry.
 pub(crate) fn record_reload(name: &str) {
     let mut collector = analytics()
         .lock()
@@ -1131,6 +1152,7 @@ fn patch_tally_lines() -> Vec<String> {
     }
     lines
 }
+
 /// Record the host process's current and peak memory (called at setup end).
 pub(crate) fn record_host_memory() {
     let mut collector = analytics()
@@ -1517,8 +1539,8 @@ fn wrap_list(items: &[&str], width: usize) -> Vec<String> {
 /// shows the rebuild → stage → load → init → migrate breakdown as it happens.
 /// `reload_started` is the moment the reload transaction began (before the
 /// first build), so the total spans the whole cascade - the edited module
-/// plus the queued project reload - rather than one transaction. Returns the
-/// number of reload events reported.
+/// plus the queued project reload - not only the last one. Returns the number
+/// of reload events reported.
 ///
 /// The `[analytics] reload ...` and `crates rebuilt by cargo:` lines keep the
 /// exact text the suites and `devops/benchmarks/hot_reload_harness.py` parse;
@@ -1529,6 +1551,7 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
     if count == 0 {
         return 0;
     }
+    // Step 1: One line per recorded event, plus its cargo breakdown.
     let mut lines = Vec::new();
     for event in &events {
         lines.push(format!(
@@ -1595,10 +1618,10 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
             ));
         }
     }
-    // One aggregate number for the whole transaction (module + project for a
-    // cascade, or a single reload otherwise), reconciled against the visible
-    // phase sums so the unaccounted remainder - the gap between the two
-    // reloads plus scheduling - is shown explicitly instead of silently
+    // Step 2: One aggregate number for the whole transaction (module + project
+    // for a cascade, or a single reload otherwise), reconciled against the
+    // visible phase sums so the unaccounted remainder - the gap between the
+    // two reloads plus scheduling - is shown explicitly instead of silently
     // missing. Integer milliseconds, so the parts add up exactly to the total.
     let total_ms = reload_started.elapsed().as_millis() as u64;
     let segment_ms: Vec<u64> = events
@@ -1610,8 +1633,8 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
         .collect();
     let phases_ms: u64 = segment_ms.iter().sum();
     let gap_ms = total_ms.saturating_sub(phases_ms);
-    // The running fast-path tally, reported alongside the transaction it
-    // belongs to rather than in the startup report, where these are always
+    // Step 3: The running fast-path tally, reported alongside the transaction
+    // it belongs to rather than in the startup report, where these are always
     // zero. Left out entirely until the fast path has done something, so a
     // project that has not opted in sees no extra noise.
     lines.extend(patch_tally_lines());
@@ -1646,6 +1669,7 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
     );
     count
 }
+
 /// Take and clear the pending reload events for the current frame.
 fn drain_reload_events() -> Vec<ReloadEvent> {
     let mut collector = analytics()
@@ -1661,6 +1685,7 @@ fn drain_reload_events() -> Vec<ReloadEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     /// The startup report keeps the line the benchmark harness parses, drops
     /// columns that are empty for every module, lines its rows up, and names
@@ -1745,7 +1770,6 @@ mod tests {
             "{report}"
         );
     }
-    use std::time::SystemTime;
 
     /// A synthetic cargo `--timings` HTML matching the format this parser
     /// targets: `DURATION = N;`, a `UNIT_DATA` JSON array whose executed units
@@ -1820,9 +1844,10 @@ const CONCURRENCY_DATA = [
     }
 
     /// The labels are the harness's vocabulary, so they are pinned rather than
-    /// left free to drift. `PROVABLE_ROUTES` in
-    /// `devops/benchmarks/hot_reload_harness.py` names these exact strings, and
-    /// its `route=([\w+-]+)` group accepts them joined by `+`.
+    /// left free to drift. `RELOAD_LINE_RE` in
+    /// `devops/benchmarks/hot_reload_harness.py` matches `route=([\w+-]+)` and
+    /// accepts these joined by `+`; its `PROVABLE_ROUTES` names the two slot
+    /// routes among them.
     #[test]
     fn route_labels_match_what_the_harness_parses() {
         assert_eq!(PatchRoute::EngineSlot.label(), "engine-slot");
@@ -1867,7 +1892,7 @@ const CONCURRENCY_DATA = [
         assert_eq!(event.kind.label(), "reload");
     }
 
-    /// Build a throwaway workspace whose `target/cargo-timings` holds the
+    /// Build a throwaway workspace whose `cargo-timings` directory holds the
     /// fixture, and return the workspace root.
     fn fixture_workspace() -> PathBuf {
         let unique = SystemTime::now()
@@ -1903,7 +1928,8 @@ const CONCURRENCY_DATA = [
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// An empty timings directory yields `None` instead of failing.
+    /// A workspace with no `cargo-timings` directory yields `None` instead of
+    /// failing.
     #[test]
     fn missing_timings_directory_returns_none() {
         let unique = SystemTime::now()

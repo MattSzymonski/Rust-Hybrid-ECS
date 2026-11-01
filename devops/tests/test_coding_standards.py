@@ -38,7 +38,7 @@ EXAMPLE USAGE
   python devops/tests/test_coding_standards.py --root modules/engine/pill_engine/src
   python devops/tests/test_coding_standards.py modules/engine/pill_core/src/lib.rs
   python devops/tests/test_coding_standards.py modules/engine/pill_core/src/lib.rs \
-      examples/local/project_rs/src/lib.rs --report local/lint.json
+      devops/tests/projects/project_rs/src/lib.rs --report local/lint.json
   python devops/tests/test_coding_standards.py --root modules \
       --exclude modules/extensions/pill_master_renderer
 
@@ -68,8 +68,8 @@ from core.paths import REPOSITORY_ROOT  # noqa: E402
 from core.projects import (  # noqa: E402
     EXAMPLES_RELATIVE_PATH,
     ITALIAN_BRAINROT_CS_SRC,
-    PROJECT_CS_BENCH_SRC,
-    PROJECT_CS_SRC,
+    MANAGED_PROJECT_SRC,
+    MANAGED_PROJECT_SRC,
     repository_relative,
 )
 from core.suite_common import run_suite_with_timing  # noqa: E402
@@ -112,9 +112,10 @@ EXCLUDED_DIRECTORY_NAMES = {
 
 # The repository-root `local/` is gitignored scratch - experiment labs, notes,
 # one-off probes - and not engine source. It is matched at the top level only:
-# `examples/local/` holds the game projects, and their sources are linted like
-# any other project's. Excluding the root here rather than in one caller is
-# what keeps a bare run and a `--root modules` run in agreement.
+# the game projects under `examples/` and the suites' own fixtures under
+# `devops/tests/projects/` are linted like any other project's. Excluding the
+# root here rather than in one caller is what keeps a bare run and a
+# `--root modules` run in agreement.
 ROOT_ONLY_EXCLUDED_DIRECTORY_NAMES = {"local"}
 
 # The repository's own `build/` holds generated scratch - and one tracked
@@ -220,9 +221,9 @@ COMMENT_CONTENT_SCOPE = (
 )
 CSHARP_COMMENT_CONTENT_ROOTS = (
     "modules/csharp",
-    repository_relative(PROJECT_CS_SRC),
+    repository_relative(MANAGED_PROJECT_SRC),
     repository_relative(ITALIAN_BRAINROT_CS_SRC),
-    repository_relative(PROJECT_CS_BENCH_SRC),
+    repository_relative(MANAGED_PROJECT_SRC),
 )
 # Build output inside a C# tree, never source.
 CSHARP_EXCLUDED_DIRECTORY_NAMES = {"bin", "obj"}
@@ -996,7 +997,12 @@ def is_reloadable_source(display_path: str) -> bool:
     parts = display_path.split("/")
     if any(part in RELOADABLE_PATH_PARTS for part in parts):
         return True
-    return display_path.startswith(EXAMPLES_RELATIVE_PATH + "/")
+    # Every example and fixture project reloads, whichever root a checkout keeps
+    # it under: the official groups, the local-only checkout, and the suites'
+    # own projects under `devops/tests/projects`.
+    if parts and parts[0] == "examples":
+        return True
+    return display_path.startswith("devops/tests/projects/")
 
 
 # Flags the egui context-storage APIs; see `EGUI_CONTEXT_STORAGE_PATTERNS`.

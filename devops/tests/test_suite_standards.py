@@ -281,7 +281,7 @@ def self_test() -> int:
     )
     expect(
         "a path into a project file passes",
-        project_findings(fixture, 'source = "examples/local/project_rs/src/lib.rs"\n') == [],
+        project_findings(fixture, 'source = "devops/tests/projects/project_rs/src/lib.rs"\n') == [],
     )
     expect(
         "a missing PROTECTS line is caught",

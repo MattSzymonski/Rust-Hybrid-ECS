@@ -2,26 +2,28 @@
 //!
 //! # Responsibilities
 //!
-//! - Install the shared [`pill_core::telemetry`] subscriber stack (terminal,
-//!   optional file, optional Tracy) with the default engine filter.
+//! - Install the shared [`pill_core::telemetry`] subscriber stack - terminal,
+//!   optional rolling file, optional console capture, optional Tracy - with
+//!   the default engine filter.
 //! - Apply a project's logging settings - the `logging:` section of its
 //!   `project_settings.yaml` - over those defaults once the project is known
 //!   ([`apply_logging_settings`]).
 //! - Install the shared metrics recorder when the `metrics` feature is on.
+//! - Report a frontend failure with its whole cause chain ([`report_failure`]).
 //!
 //! # Design
 //!
-//! The runtime owns the executable-facing telemetry entry point so every
-//! frontend shares one consistent setup. Logging verbosity (terminal +
-//! file) is independent of Tracy profiling: Tracy spans (`profile::*`) are
-//! only routed when the `profiling` feature is active, and their filter is
-//! never affected by terminal log levels.
+//! This crate is the runtime every executable links, so it owns the
+//! executable-facing telemetry entry point and every frontend shares one
+//! setup. Logging verbosity (terminal and file) is independent of Tracy:
+//! `profile::*` spans are routed only when the `profiling` feature is active,
+//! and their filter never sees a terminal log level.
 //!
 //! Telemetry starts before the project's settings are read, so nothing logged
-//! while finding the project is lost; the settings arrive afterwards and reload
-//! the filters in place. They come as [`LoggingSettings`], already validated:
-//! this crate reads no YAML, so the development host parses the settings file
-//! and a shipping build has them baked into its bundle.
+//! while finding the project is lost; the settings arrive afterwards and
+//! reload the filters in place. They arrive as [`LoggingSettings`], already
+//! validated: this crate reads no YAML, so the development host parses the
+//! settings file and a shipping bundle carries them as text.
 
 // Standard library
 use std::path::PathBuf;
@@ -35,6 +37,15 @@ use pill_core::telemetry::{
     set_show_source_location, set_timestamp_format, telemetry_target, LoggingConfig,
     TelemetryBuilder, TelemetryError, TelemetryHandles, TimestampFormat, DEV_LOG_TARGET,
 };
+use pill_core::utils::format_error_chain;
+
+// =============================================================================
+// Shared State
+// =============================================================================
+
+/// The handles of the installed stack, kept so the project's settings can
+/// reload its filters after [`init_telemetry`] returned.
+static TELEMETRY_HANDLES: OnceLock<TelemetryHandles> = OnceLock::new();
 
 // =============================================================================
 // LoggingSettings
@@ -94,8 +105,8 @@ impl LoggingSettings {
         }
     }
 
-    /// Check one target name: letters, digits, `_`, `-`, `.` and `::`
-    /// separators, which is what a `tracing` target is made of.
+    /// Check one target name: letters, digits and the `_`, `-`, `.`, `:`
+    /// characters a `tracing` target is made of.
     ///
     /// # Errors
     ///
@@ -120,9 +131,9 @@ impl LoggingSettings {
     ///
     /// # Errors
     ///
-    /// Returns the first level, timestamp format or target that does not read;
-    /// the bundle generator validates all three, so this only fails on a
-    /// hand-edited bundle.
+    /// Returns the message of the first level, timestamp format or target that
+    /// does not read; the bundle generator validates all three, so this only
+    /// fails on a hand-edited bundle.
     pub fn from_text(
         level: Option<&str>,
         timestamp: Option<&str>,
@@ -195,18 +206,17 @@ fn file_defaults() -> LoggingConfig {
 // Free Functions
 // =============================================================================
 
-/// The handles of the installed stack, kept so the project's settings can
-/// reload its filters after [`init_telemetry`] returned.
-static TELEMETRY_HANDLES: OnceLock<TelemetryHandles> = OnceLock::new();
-
 /// Install the engine telemetry stack and return its reload handles.
 ///
-/// The terminal lane uses the default engine filter. When `directory` is
-/// supplied, a rolling file lane is added with the engine's filter minus the
-/// developer scratch logs (`engine::dev`) and with the rendering target at
-/// `debug`; both lanes are live-reloadable through the returned handles. When
-/// the `profiling` feature is active, `profile::*` spans are routed to Tracy
-/// through an independent filter.
+/// The terminal lane uses the default engine filter. When
+/// `file_log_directory` is supplied, a rolling file lane is added with the
+/// engine's filter minus the developer scratch logs (`engine::dev`) and with
+/// the rendering target at `debug`; both lanes are live-reloadable through the
+/// returned handles. When the `profiling` feature is active, `profile::*`
+/// spans are routed to Tracy through an independent filter.
+///
+/// The stack installs once per process: a later call returns the first
+/// install's handles rather than installing a second subscriber.
 ///
 /// # Errors
 ///
@@ -232,17 +242,15 @@ pub fn init_telemetry_with_capture(
 ) -> Result<TelemetryHandles, TelemetryError> {
     let mut builder = TelemetryBuilder::new().with_logging_config(terminal_defaults());
 
-    // Step 1: install the console's capture lane when one was supplied.
+    // Step 1: choose the lane set - the console's capture ring when one was
+    // supplied, a rolling file lane when a log directory was, and Tracy when
+    // the `profiling` feature is active.
     if let Some(buffer) = capture {
         builder = builder.with_capture(buffer);
     }
-
-    // Step 2: Add a rolling file lane when a log directory is supplied.
     if let Some(directory) = file_log_directory {
         builder = builder.with_file_output(file_defaults(), directory);
     }
-
-    // Step 3: Route profiling spans to Tracy when the feature is active.
     #[cfg(feature = "profiling")]
     {
         builder = builder.with_tracy(true);
@@ -252,11 +260,12 @@ pub fn init_telemetry_with_capture(
         }
     }
 
-    // Step 4: Build and initialize the subscriber stack.
+    // Step 2: install the stack and keep the handles the project's settings
+    // reload through.
     let handles = builder.init()?;
     let _ = TELEMETRY_HANDLES.set(handles.clone());
 
-    // Step 5: Install the shared metrics recorder when the feature is on.
+    // Step 3: install the shared metrics recorder when the feature is on.
     #[cfg(feature = "metrics")]
     {
         // The recorder is process-wide, so the engine and host share one
@@ -270,23 +279,26 @@ pub fn init_telemetry_with_capture(
 
 /// Apply a project's logging settings to the installed stack, both lanes.
 ///
-/// Called once the project is known, after [`init_telemetry`]. Settings with
-/// nothing in them leave the defaults as they are; without an installed stack
-/// there is nothing to reload, which is not an error.
+/// Called once the project is known, after [`init_telemetry`]. Settings that
+/// name no level and no target leave the filters as they are; without an
+/// installed stack there is nothing to reload, which is not an error.
 ///
 /// # Errors
 ///
 /// Returns [`TelemetryError`] when a filter does not build or does not reload;
 /// the previous filter stays active.
 pub fn apply_logging_settings(settings: &LoggingSettings) -> Result<(), TelemetryError> {
-    // The timestamp format is a process-wide value in `pill_core`, not part of
-    // a filter, so it applies even when no stack is installed.
+    // Step 1: apply the process-wide switches. They live in `pill_core` rather
+    // than in a filter, so they take effect even without an installed stack.
     if let Some(timestamp) = settings.timestamp {
         set_timestamp_format(timestamp);
     }
     if let Some(show) = settings.source_location {
         set_show_source_location(show);
     }
+
+    // Step 2: reload both lanes, when there is a filter to change and a stack
+    // to change it on.
     if settings.level.is_none() && settings.targets.is_empty() {
         return Ok(());
     }
@@ -296,6 +308,27 @@ pub fn apply_logging_settings(settings: &LoggingSettings) -> Result<(), Telemetr
     handles.reload_logging_config(&settings.terminal_config())?;
     handles.reload_file_config(&settings.file_config())
 }
+
+/// Report a frontend failure to the engine's log, with its whole cause chain.
+///
+/// A frontend reports a failure where it happens rather than only returning
+/// it: dropping a development run unmaps module images, so a report made
+/// afterwards may never reach the console. `context` names the operation that
+/// failed; the cause chain names the reason, since the outer message names
+/// only the operation.
+pub fn report_failure(context: &str, error: &(dyn std::error::Error + 'static)) {
+    let cause_chain = format_error_chain(error);
+    pill_core::error!(
+        target: telemetry_target::ENGINE,
+        error = %cause_chain,
+        "{} failed",
+        context
+    );
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

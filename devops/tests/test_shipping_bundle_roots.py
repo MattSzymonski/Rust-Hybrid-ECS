@@ -19,7 +19,7 @@ DESCRIPTION
     the build script it emits does with them - by importing
     `devops/tools/generate_shipping_bundle.py` and asserting:
 
-      - `examples/local/project_rs` selects the renderer data crate's `res` and
+      - `devops/tests/projects/project_rs` selects the renderer data crate's `res` and
         `shader_sources`, in that order, and a module that ships nothing
         beside its code contributes no root;
       - the emitted build script calls `write_asset_pack_with_roots`, names

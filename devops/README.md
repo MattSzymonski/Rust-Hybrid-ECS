@@ -50,7 +50,7 @@ Pass/fail suites for the hot-reload and persistence architecture, plus the
 python devops/tests/test_hot_reload_suite.py
 python devops/tests/test_hot_reload_migration.py --cycles 2
 python devops/tests/test_csharp_bridge.py
-python devops/tests/test_ui_theme.py            # the UI theme pipeline, `circus_demo`
+python devops/tests/test_ui_theme.py            # the UI theme pipeline, `pills_rust`
 python devops/tests/test_render_chains.py       # a committed .pipeline runs the frame, `project_rs`
 python devops/tests/test_module_resource_assert.py  # a module's declared resource is missing
 python devops/tests/test_shipping_smoke.py

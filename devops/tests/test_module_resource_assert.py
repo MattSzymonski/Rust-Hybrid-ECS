@@ -19,7 +19,7 @@ DESCRIPTION
     `res/defaults/pill.pbr.material`, the PBR chain's default material.
 
       1. The file is moved aside and the headless dev host is started on
-         `examples/local/project_rs`.
+         `devops/tests/projects/project_rs`.
       2. The host must exit non-zero, and its output must carry
          `module 'pill_master_renderer_data' requires its resource
          'defaults/pill.pbr.material', which is missing at` - the module and the

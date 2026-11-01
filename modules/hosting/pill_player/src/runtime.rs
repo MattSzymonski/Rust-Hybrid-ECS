@@ -4,6 +4,7 @@
 //!
 //! - Own the [`Engine`] at a stable address, and whatever must outlive it.
 //! - Start a statically linked project ([`setup`]).
+//! - Mount a project's asset pack and index it ([`mount_asset_pack`]).
 //! - Run one frame: systems, deferred commands, failure reporting, frame
 //!   statistics ([`Runtime::run_frame_with`]).
 //! - Define [`FrameDriver`], what a frontend's loop needs from whatever runs
@@ -44,17 +45,8 @@ const FRAME_ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const FRAME_REPORT_INTERVAL_SECONDS: f64 = 3.0;
 
 // =============================================================================
-// Types
+// FrameDriver
 // =============================================================================
-
-/// Result of one frame when the reporting interval elapses.
-#[derive(Debug, Clone, Copy)]
-pub struct FrameReport {
-    /// Frames per second measured over the reporting window.
-    pub fps: f64,
-    /// Number of live entities at report time.
-    pub entity_count: usize,
-}
 
 /// What a frontend's loop needs from whatever runs the game.
 ///
@@ -65,13 +57,16 @@ pub trait FrameDriver {
     /// What a frame can fail with; a headless runtime cannot fail at all.
     type Error: std::error::Error + 'static;
 
-    /// Run one frame; `Some` when the reporting interval elapsed.
+    /// Run one frame.
+    ///
+    /// The frame statistics are logged by the runtime itself, once per
+    /// reporting window, so no frontend has to carry them.
     ///
     /// # Errors
     ///
     /// Returns the driver's error when the frame could not be completed (a
     /// windowed driver: the renderer failed).
-    fn run_frame(&mut self) -> Result<Option<FrameReport>, Self::Error>;
+    fn run_frame(&mut self) -> Result<(), Self::Error>;
 
     /// Queue an input event for the next frame.
     ///
@@ -83,7 +78,6 @@ pub trait FrameDriver {
     /// frontend that owns the gamepads to play.
     fn take_rumble_requests(&mut self) -> Vec<RumbleRequest>;
 
-    #[cfg(feature = "rendering")]
     /// Draw into another window as surface `id`; see
     /// [`crate::AttachedRenderer::attach_surface`]. A driver without a
     /// renderer refuses.
@@ -92,6 +86,7 @@ pub trait FrameDriver {
     ///
     /// Returns a [`RendererError`] when the driver draws no window, the window
     /// cannot give its handles, or the renderer refuses the surface.
+    #[cfg(feature = "rendering")]
     fn attach_surface<W: crate::RendererWindow>(
         &mut self,
         id: SurfaceId,
@@ -131,40 +126,9 @@ pub trait FrameDriver {
     fn set_surface_camera(&mut self, _id: SurfaceId, _binding: Option<CameraBinding>) {}
 }
 
-/// Write `binding` for surface `id` into the world's
-/// [`pill_renderer_api::SurfaceCameras`], creating the resource on first use.
-///
-/// Shared by every driver with a renderer, so the binding lives where the
-/// rendering system reads it.
-pub fn set_surface_camera(world: &mut World, id: SurfaceId, binding: Option<CameraBinding>) {
-    if world.get_resource::<SurfaceCameras>().is_none() {
-        world.insert_resource(SurfaceCameras::default());
-    }
-    if let Some(cameras) = world.get_resource_mut::<SurfaceCameras>() {
-        cameras.set(id, binding);
-    }
-}
-
-/// Insert the debug-drawing and picking resources into `world`, each only
-/// where it is missing.
-///
-/// Every build has them: debug drawing on in the development host, and in a
-/// shipping or web build as its project settings say. A system toggles it at
-/// runtime through [`pill_engine::DebugDraw::set_enabled`].
-pub fn insert_debug_resources(world: &mut World, debug_draw_enabled: bool) {
-    if !world.has_resource::<pill_engine::DebugDraw>() {
-        world.insert_resource(pill_engine::DebugDraw::new(debug_draw_enabled));
-    }
-    if !world.has_resource::<pill_renderer_api::SelectionOutlines>() {
-        world.insert_resource(pill_renderer_api::SelectionOutlines::default());
-    }
-    if !world.has_resource::<pill_renderer_api::PickRequests>() {
-        world.insert_resource(pill_renderer_api::PickRequests::default());
-    }
-    if !world.has_resource::<pill_renderer_api::PickResults>() {
-        world.insert_resource(pill_renderer_api::PickResults::default());
-    }
-}
+// =============================================================================
+// Runtime
+// =============================================================================
 
 /// The engine and the frame state every build needs.
 pub struct Runtime {
@@ -192,10 +156,6 @@ pub struct Runtime {
     /// The rate the last completed window measured.
     last_measured_fps: f64,
 }
-
-// =============================================================================
-// Impls
-// =============================================================================
 
 impl Default for Runtime {
     fn default() -> Self {
@@ -243,24 +203,25 @@ impl Runtime {
     }
 
     /// Run one frame: see [`Self::run_frame_with`].
-    pub fn run_frame(&mut self) -> Option<FrameReport> {
+    pub fn run_frame(&mut self) {
         self.run_frame_with(Instant::now(), |_| {})
     }
 
     /// Run one scheduler frame and its reporting: systems, deferred commands,
     /// `after_systems`, then the frame statistics.
     ///
-    /// `after_systems` runs once the systems have: the development host calls
-    /// its modules' per-frame export there. `frame_start` is when the caller's
-    /// frame began, for the frame-time metric. Returns a report roughly every
-    /// three seconds for a frontend to print or display; all other frames
-    /// return `None`.
+    /// `after_systems` runs once the systems have executed and their failures
+    /// have been reported, before the frame statistics are taken. `frame_start`
+    /// is when the caller's frame began, for the frame-time metric. The
+    /// statistics are logged here, roughly every three seconds, so every
+    /// frontend reports them the same way; the line is `N FPS | M entities`,
+    /// which the devops suites wait for.
     #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
     pub fn run_frame_with(
         &mut self,
         frame_start: Instant,
         after_systems: impl FnOnce(&mut Engine),
-    ) -> Option<FrameReport> {
+    ) {
         // Step 1: Execute one scheduler frame and report its failures.
         if let Err(errors) = self.engine.process_frame() {
             // Deferred command failures arrive as a batch; flatten them into one
@@ -296,41 +257,43 @@ impl Runtime {
                 frame_start.elapsed().as_secs_f64() * 1000.0,
                 self.last_measured_fps,
             );
-            return None;
+            return;
         }
 
         let fps = self.frame_count as f64 / elapsed;
-        let report = FrameReport {
-            fps,
-            entity_count: self.engine.world().entity_count(),
-        };
+        let entity_count = self.engine.world().entity_count();
         self.last_measured_fps = fps;
         self.frame_count = 0;
         self.last_report = Instant::now();
 
         #[cfg(feature = "metrics")]
         record_frame_metrics(
-            report.entity_count,
+            entity_count,
             frame_start.elapsed().as_secs_f64() * 1000.0,
             fps,
         );
 
-        Some(report)
+        // The frame-statistics line the devops suites wait for. It is logged
+        // from here so every build reports it the same way, under the target
+        // and level the project's `logging:` settings control.
+        info!(
+            target: telemetry_target::ENGINE,
+            "{:.0} FPS | {} entities",
+            fps,
+            entity_count
+        );
     }
 
-    /// Snapshot the current frame rate and entity count without resetting the
-    /// reporting window used by console frontends.
-    pub fn current_frame_report(&self) -> FrameReport {
+    /// The rate the current reporting window measures.
+    ///
+    /// For a frontend that displays a live rate - the browser's editor canvas;
+    /// the console line is logged by [`Self::run_frame_with`] itself.
+    pub fn frames_per_second(&self) -> f64 {
         let elapsed = self.last_report.elapsed().as_secs_f64();
-        let fps = if self.frame_count == 0 || elapsed <= f64::EPSILON {
+        if self.frame_count == 0 || elapsed <= f64::EPSILON {
             self.last_measured_fps
         } else {
             self.frame_count as f64 / elapsed
-        };
-
-        FrameReport {
-            fps,
-            entity_count: self.engine.world().entity_count(),
         }
     }
 
@@ -364,8 +327,9 @@ impl Runtime {
 impl FrameDriver for Runtime {
     type Error = std::convert::Infallible;
 
-    fn run_frame(&mut self) -> Result<Option<FrameReport>, Self::Error> {
-        Ok(Runtime::run_frame(self))
+    fn run_frame(&mut self) -> Result<(), Self::Error> {
+        Runtime::run_frame(self);
+        Ok(())
     }
 
     // A headless runtime draws no surface, so a resize and a viewport have
@@ -384,7 +348,7 @@ impl FrameDriver for Runtime {
 }
 
 // =============================================================================
-// Free Functions
+// PackSource
 // =============================================================================
 
 /// Where a project's asset pack came from, which the mount logs.
@@ -397,8 +361,8 @@ pub enum PackSource {
 }
 
 impl PackSource {
-    /// The mount line for this source. Two literals rather than one format
-    /// string, so the log contract can look for either in the source.
+    /// The mount line for this source. Each source has its own literal rather
+    /// than one format string, so the line is a fixed log token.
     fn mounted_message(self) -> &'static str {
         match self {
             Self::Embedded => "mounted the embedded asset pack",
@@ -406,12 +370,51 @@ impl PackSource {
         }
     }
 
-    /// The database line for this source, for the same reason.
+    /// The database-indexed line for this source, likewise a fixed token.
     fn indexed_message(self) -> &'static str {
         match self {
             Self::Embedded => "[assets] database indexed from the embedded pack",
             Self::Fetched => "[assets] database indexed from the fetched pack",
         }
+    }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Write `binding` for surface `id` into the world's
+/// [`pill_renderer_api::SurfaceCameras`], creating the resource on first use.
+///
+/// Shared by every driver with a renderer, so the binding lives where the
+/// rendering system reads it.
+pub fn set_surface_camera(world: &mut World, id: SurfaceId, binding: Option<CameraBinding>) {
+    if world.get_resource::<SurfaceCameras>().is_none() {
+        world.insert_resource(SurfaceCameras::default());
+    }
+    if let Some(cameras) = world.get_resource_mut::<SurfaceCameras>() {
+        cameras.set(id, binding);
+    }
+}
+
+/// Insert the debug-drawing and picking resources into `world`, each only
+/// where it is missing.
+///
+/// Every build has them: debug drawing on in the development host, and in a
+/// shipping or web build as its project settings say. A system toggles it at
+/// runtime through [`pill_engine::DebugDraw::set_enabled`].
+pub fn insert_debug_resources(world: &mut World, debug_draw_enabled: bool) {
+    if !world.has_resource::<pill_engine::DebugDraw>() {
+        world.insert_resource(pill_engine::DebugDraw::new(debug_draw_enabled));
+    }
+    if !world.has_resource::<pill_renderer_api::SelectionOutlines>() {
+        world.insert_resource(pill_renderer_api::SelectionOutlines::default());
+    }
+    if !world.has_resource::<pill_renderer_api::PickRequests>() {
+        world.insert_resource(pill_renderer_api::PickRequests::default());
+    }
+    if !world.has_resource::<pill_renderer_api::PickResults>() {
+        world.insert_resource(pill_renderer_api::PickResults::default());
     }
 }
 
@@ -430,6 +433,7 @@ pub fn mount_asset_pack(
     source: PackSource,
     bytes: impl Into<std::borrow::Cow<'static, [u8]>>,
 ) -> Result<pill_engine::AssetDatabase, HostError> {
+    // Step 1: Parse the pack and report where it came from.
     let pack = pill_engine::asset_store::AssetPack::parse(bytes).map_err(|error| {
         ConfigError::AssetPackInvalid {
             project: project_name.to_owned(),
@@ -442,6 +446,9 @@ pub fn mount_asset_pack(
         "{}",
         source.mounted_message()
     );
+
+    // Step 2: Index every entry, so a reference can find and load an asset
+    // that is not loaded yet.
     let database = pill_engine::AssetDatabase::from_pack(&pack);
     info!(
         target: telemetry_target::ENGINE,
@@ -449,10 +456,11 @@ pub fn mount_asset_pack(
         "{}",
         source.indexed_message()
     );
-    pill_engine::asset_store::mount_pack(pack);
-    // From here on the store reads what the pack holds and nothing else: a
+
+    // Step 3: Mount the pack, then close the store to everything else: a
     // shipped build must not fall back to a file on the player's machine when
     // an asset is missing from the bundle.
+    pill_engine::asset_store::mount_pack(pack);
     pill_engine::asset_store::restrict_to_packs();
     Ok(database)
 }
@@ -500,11 +508,12 @@ pub fn setup_with_asset_database(
     project: StaticProject,
     database: Option<pill_engine::AssetDatabase>,
 ) -> Result<Runtime, HostError> {
+    // Step 1: Create the engine with its debug and picking resources, then
+    // apply the log levels the bundle was built with, before anything logs on
+    // the project's behalf.
     let mut runtime = Runtime::new();
     insert_debug_resources(runtime.engine_mut().world_mut(), project.debug_draw);
 
-    // The project's log levels, baked into the bundle from its settings file,
-    // before anything is logged on its behalf.
     let logging = project
         .logging
         .settings()
@@ -519,6 +528,9 @@ pub fn setup_with_asset_database(
         );
     }
 
+    // Step 2: Announce the host and insert the database the caller already
+    // mounted, because mounting has to precede every module's and the
+    // project's init.
     info!(
         target: telemetry_target::ENGINE,
         module = project.name,
@@ -526,14 +538,12 @@ pub fn setup_with_asset_database(
         "ECS host starting (statically linked)"
     );
 
-    // The database arrives already mounted, because mounting has to precede
-    // every module's and the project's init.
     if let Some(database) = database {
         runtime.engine_mut().world_mut().insert_resource(database);
     }
 
-    // Register every module, then the project, in the order and under the
-    // owners the reloading host uses.
+    // Step 3: Register every module, then the project, in the order and under
+    // the owners the reloading host uses.
     runtime._project_guard = project.initialize(runtime.engine_mut())?;
     // The renderer is registered when a window attaches it, like the loaded
     // module; it takes the next owner after the modules, as that module does.
@@ -550,7 +560,7 @@ pub fn setup_with_asset_database(
 }
 
 /// Run one frame of `runtime`; see [`Runtime::run_frame`].
-pub fn run_one_frame(runtime: &mut Runtime) -> Option<FrameReport> {
+pub fn run_one_frame(runtime: &mut Runtime) {
     runtime.run_frame()
 }
 
@@ -616,8 +626,7 @@ mod tests {
         pack
     }
 
-    /// A statically linked project starts and runs frames; the first ones
-    /// report nothing until the reporting window has elapsed.
+    /// A statically linked project starts and runs frames.
     #[test]
     fn a_static_project_starts_and_runs_frames() {
         let mut runtime = setup(StaticProject {
@@ -632,8 +641,8 @@ mod tests {
             startup_scene: None,
         })
         .expect("it starts");
-        assert!(run_one_frame(&mut runtime).is_none());
-        assert_eq!(runtime.current_frame_report().entity_count, 0);
+        run_one_frame(&mut runtime);
+        assert_eq!(runtime.engine().world().entity_count(), 0);
     }
 
     /// A project whose pack was fetched gets the database the fetch mounted
@@ -645,7 +654,7 @@ mod tests {
         let database =
             mount_asset_pack("project", PackSource::Fetched, bytes).expect("the pack is valid");
 
-        let runtime = setup_with_asset_database(
+        let _runtime = setup_with_asset_database(
             StaticProject {
                 name: "project",
                 backend: crate::StaticProjectBackend::Native {
@@ -670,7 +679,6 @@ mod tests {
         let bytes = pill_engine::asset_store::read(std::path::Path::new("fetched/pack-probe.txt"))
             .expect("the packed entry reads back");
         assert_eq!(bytes, b"from the pack");
-        assert!(runtime.current_frame_report().entity_count == 0);
     }
 
     /// The hook a host passes runs once per frame, after the systems.

@@ -345,17 +345,23 @@ STEPS: List[Step] = [
             [
                 "cargo", "clippy", "--target", "wasm32-unknown-unknown",
                 "-p", "pill_player", "--features", "rendering",
-                "-p", "pill_web", "-p", "pill_master_renderer",
+                "-p", "pill_master_renderer",
                 "--", "-D", "warnings",
-            ]
+            ],
+            # The browser frontends, game and editor, so both stay wasm-clean.
+            [
+                "cargo", "clippy", "--target", "wasm32-unknown-unknown",
+                "-p", "pill_web", "-p", "pill_web_editor",
+                "--", "-D", "warnings",
+            ],
         ],
         environment={"RUSTFLAGS": "", "RUSTC_WRAPPER": ""},
     ),
-    # The theme pipeline's game half: the headless host on
-    # `circus_demo`, the `.theme` override re-applying live, a refusal keeping
-    # the applied theme, a project reload keeping it too, and the pack writer
-    # keeping editor content out. A host-tier suite, so it runs before the
-    # editor lane - that lane's build must stay the last one.
+    # The theme pipeline's game half: the headless host on `pills_rust`, the
+    # `.theme` override re-applying live, a refusal
+    # keeping the applied theme, a project reload keeping it too, and the pack
+    # writer keeping editor content out. A host-tier suite, so it runs before
+    # the editor lane - that lane's build must stay the last one.
     Step(
         "theme",
         "Theme pipeline suite (the game UI's theme, end to end)",
@@ -363,7 +369,7 @@ STEPS: List[Step] = [
         working_directory=REPOSITORY_ROOT,
     ),
     # The example's committed render chain: the windowed host runs
-    # `examples/local/project_rs`, whose `init` loads `res/pipelines/main.pipeline`
+    # `devops/tests/projects/project_rs`, whose `init` loads `res/pipelines/main.pipeline`
     # by path, and the renderer's `Pass chain:` line must name the project's
     # own pass with draws. A host-tier suite, so it runs before the editor
     # lane's build.

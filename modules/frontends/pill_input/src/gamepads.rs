@@ -1,30 +1,32 @@
-//! Gamepads through gilrs: polled into input events, rumbled on request.
+//! Gamepads: polled into input events, rumbled on request.
 //!
 //! # Responsibilities
 //!
-//! - Own the process's [`Gilrs`] context and assign each gamepad a
+//! - Own the process's [`GamepadContext`] and assign each gamepad a
 //!   [`PlayerId`] slot as it connects ([`Gamepads::poll`]).
-//! - Translate gilrs buttons and axes into the engine's.
+//! - Translate the library's buttons and axes into the engine's.
 //! - Play the rumble systems request, keeping each effect alive while it runs
 //!   ([`Gamepads::play_rumble`]).
 //!
 //! # Design
 //!
-//! Gamepads are not window events: gilrs reads them from the operating system
-//! on its own, so a frontend polls once per frame, before running it, and pushes
-//! what it gets like any other input. Slots go to gamepads in connection order,
-//! the lowest free one first; a fifth gamepad is ignored until a slot frees.
+//! Gamepads are not window events: the gilrs library reads them from the
+//! operating system on its own, so a frontend polls once per frame, before
+//! running it, and pushes what it gets like any other input. Slots go to
+//! gamepads in connection order, the lowest free one first; a fifth gamepad is
+//! ignored until a slot frees.
 //!
-//! Dropping a gilrs `Effect` stops it, so playing rumble means keeping the
-//! effect until its duration has passed; a gamepad that never reports
-//! completion (some XInput pads) is covered by that deadline.
+//! Dropping an `Effect` stops it, so playing rumble means keeping the effect
+//! until its duration has passed; a gamepad that never reports completion
+//! (some XInput pads) is covered by that deadline.
 
 // Standard library
 use std::time::Duration;
 
 // External crates
-use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Replay, Ticks};
-use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
+use gamepad_library::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Replay, Ticks};
+use gamepad_library::Gilrs as GamepadContext;
+use gamepad_library::{Axis, Button, EventType, GamepadId};
 use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
@@ -49,8 +51,9 @@ struct ActiveRumble {
 
 /// The gamepads, their player slots and the rumble playing on them.
 pub struct Gamepads {
-    /// The gilrs context, or `None` when the platform has no gamepad support.
-    gilrs: Option<Gilrs>,
+    /// The platform's gamepad context, or `None` when it has no gamepad
+    /// support.
+    context: Option<GamepadContext>,
     /// The gamepad holding each [`PlayerId`] slot.
     slots: [Option<GamepadId>; GAMEPAD_SLOT_COUNT],
     /// Gamepads connected before the first poll, announced by it.
@@ -71,33 +74,33 @@ impl Gamepads {
     /// Never fails: without gamepad support the result reports no gamepads,
     /// and the reason is logged once.
     pub fn new() -> Self {
-        let gilrs = match Gilrs::new() {
-            Ok(gilrs) => Some(gilrs),
+        let context = match GamepadContext::new() {
+            Ok(context) => Some(context),
             // A working context that will never see a gamepad.
-            Err(gilrs::Error::NotImplemented(gilrs)) => {
+            Err(gamepad_library::Error::NotImplemented(context)) => {
                 warn!(
                     target: telemetry_target::ENGINE,
                     "gamepads are not supported on this platform"
                 );
-                Some(gilrs)
+                Some(context)
             }
             Err(error) => {
                 warn!(
                     target: telemetry_target::ENGINE,
                     error = %error,
-                    "gamepads unavailable: gilrs failed to start"
+                    "gamepads unavailable: the gamepad library failed to start"
                 );
                 None
             }
         };
-        // gilrs reports a gamepad that was already plugged in through
+        // The library reports a gamepad that was already plugged in through
         // `gamepads()`, not as a connection event.
-        let connected_at_start = gilrs
+        let connected_at_start = context
             .as_ref()
-            .map(|gilrs| gilrs.gamepads().map(|(id, _)| id).collect())
+            .map(|context| context.gamepads().map(|(id, _)| id).collect())
             .unwrap_or_default();
         Self {
-            gilrs,
+            context,
             slots: [None; GAMEPAD_SLOT_COUNT],
             connected_at_start,
             active_rumble: Vec::new(),
@@ -114,7 +117,7 @@ impl Gamepads {
         }
 
         // Step 2: Translate what happened since the last poll.
-        while let Some(event) = self.gilrs.as_mut().and_then(Gilrs::next_event) {
+        while let Some(event) = self.context.as_mut().and_then(GamepadContext::next_event) {
             let gamepad = event.id;
             match event.event {
                 EventType::Connected => self.connect(gamepad, &mut push),
@@ -157,17 +160,17 @@ impl Gamepads {
     /// Call after a frame, with what its systems requested. A request for an
     /// empty slot or a gamepad without force feedback is dropped.
     pub fn play_rumble(&mut self, requests: Vec<RumbleRequest>) {
-        let Some(gilrs) = self.gilrs.as_mut() else {
+        let Some(context) = self.context.as_mut() else {
             return;
         };
         for request in requests {
             let Some(gamepad) = self.slots[request.player.index()] else {
                 continue;
             };
-            if !gilrs.gamepad(gamepad).is_ff_supported() {
+            if !context.gamepad(gamepad).is_ff_supported() {
                 continue;
             }
-            match rumble_effect(gilrs, gamepad, &request).and_then(|effect| {
+            match rumble_effect(context, gamepad, &request).and_then(|effect| {
                 effect.play()?;
                 Ok(effect)
             }) {
@@ -202,11 +205,11 @@ impl Gamepads {
         };
         self.slots[index] = Some(gamepad);
         let player = PlayerId::ALL[index];
-        if let Some(gilrs) = &self.gilrs {
+        if let Some(context) = &self.context {
             info!(
                 target: telemetry_target::ENGINE,
                 player = ?player,
-                name = gilrs.gamepad(gamepad).name(),
+                name = context.gamepad(gamepad).name(),
                 "gamepad connected"
             );
         }
@@ -276,12 +279,12 @@ impl Gamepads {
 ///
 /// # Errors
 ///
-/// Returns gilrs's error when the gamepad refuses the effect.
+/// Returns the gamepad library's error when the gamepad refuses the effect.
 fn rumble_effect(
-    gilrs: &mut Gilrs,
+    context: &mut GamepadContext,
     gamepad: GamepadId,
     request: &RumbleRequest,
-) -> Result<Effect, gilrs::ff::Error> {
+) -> Result<Effect, gamepad_library::ff::Error> {
     let duration_milliseconds = u32::try_from(request.duration.as_millis()).unwrap_or(u32::MAX);
     let scheduling = Replay {
         play_for: Ticks::from_ms(duration_milliseconds),
@@ -305,13 +308,13 @@ fn rumble_effect(
             ..Default::default()
         })
         .gamepads(&[gamepad])
-        .finish(gilrs)
+        .finish(context)
 }
 
-/// The engine's button for gilrs's, or `None` for one the engine does not
+/// The engine's button for the library's, or `None` for one the engine does not
 /// track (the extra `C`/`Z` buttons, unknown ones).
 ///
-/// gilrs names face buttons by position; the engine names them after the Xbox
+/// The library names face buttons by position; the engine names them after the Xbox
 /// layout, where X is on the left and Y on top.
 fn gamepad_button(button: Button) -> Option<GamepadButton> {
     match button {
@@ -336,7 +339,7 @@ fn gamepad_button(button: Button) -> Option<GamepadButton> {
     }
 }
 
-/// The engine's axis for gilrs's, or `None` for one the engine does not track.
+/// The engine's axis for the library's, or `None` for one the engine does not track.
 fn gamepad_axis(axis: Axis) -> Option<GamepadAxis> {
     match axis {
         Axis::LeftStickX => Some(GamepadAxis::LeftStickX),

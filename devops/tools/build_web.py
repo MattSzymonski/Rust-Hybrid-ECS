@@ -42,10 +42,10 @@
 #                          the PROJECT_PATH environment variable
 #
 # EXAMPLE USAGE:
-#   python devops/tools/build_web.py examples/local/master_renderer_test
-#   python devops/tools/build_web.py --dev examples/local/master_renderer_test
-#   python devops/tools/build_web.py --dev --editor examples/local/project_rs
-#   python -m http.server 8000 -d examples/local/master_renderer_test/build/web
+#   python devops/tools/build_web.py devops/tests/projects/scene
+#   python devops/tools/build_web.py --dev devops/tests/projects/scene
+#   python devops/tools/build_web.py --dev --editor devops/tests/projects/project_rs
+#   python -m http.server 8000 -d devops/tests/projects/scene/build/web
 
 # --- SCRIPT ---
 

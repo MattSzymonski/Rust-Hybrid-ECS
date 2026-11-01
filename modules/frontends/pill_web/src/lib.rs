@@ -9,6 +9,8 @@
 //!   asynchronously, and run one frame per browser animation frame.
 //! - Feed the canvas's keyboard and mouse events to the engine. The canvas is
 //!   focusable and focused at start, so keys reach the game without a click.
+//! - Provide the browser editor frontend (`pill_web_editor`) with the start-up
+//!   and canvas helpers it shares with this one.
 //!
 //! # Design
 //!
@@ -19,6 +21,10 @@
 //! future - is spawned onto that loop instead of blocked on, and the asset
 //! pack is fetched rather than embedded, since a wasm module is downloaded
 //! whole. Frames start once the attach resolves.
+//!
+//! The browser editor frontend (`pill_web_editor`, under `modules/editor/`) is
+//! a separate crate that builds on this one's start-up and canvas helpers, the
+//! way `pill_editor` builds on the desktop frontend's layers.
 //!
 //! The crate is empty on every other target: its dependencies are wasm-only,
 //! so the workspace's native builds do not see it.
@@ -32,10 +38,11 @@ use std::sync::Arc;
 
 // External crates
 use pill_core::telemetry::telemetry_target;
-use pill_core::utils::format_error_chain;
 use pill_core::{error, info, warn};
 use pill_input::winit_events::{translate_device_event, translate_window_event};
-use pill_player::{FrameDriver, RenderingRuntime, Runtime, StaticProject, SurfaceId};
+use pill_player::{
+    report_failure, FrameDriver, RenderingRuntime, Runtime, StaticProject, SurfaceId,
+};
 use wasm_bindgen::JsCast;
 use web_sys::HtmlCanvasElement;
 use winit::application::ApplicationHandler;
@@ -43,15 +50,6 @@ use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::platform::web::{EventLoopExtWebSys, WindowAttributesExtWebSys};
 use winit::window::{Window, WindowId};
-
-/// The egui editor posture: the scene on one canvas, the egui shell's UI on a
-/// transparent canvas above it.
-#[cfg(target_arch = "wasm32")]
-pub mod editor_egui;
-
-/// The scripted channel the editor drains (`editor_command`).
-#[cfg(target_arch = "wasm32")]
-pub mod scripted;
 
 /// Run `project` in the page's canvas whose element id is `canvas_id`.
 ///
@@ -82,9 +80,9 @@ pub fn run(project: StaticProject, canvas_id: &str) {
 /// can fail. A project with an `asset_pack_url` is a browser build whose
 /// assets were kept out of the module: its pack is downloaded and
 /// mounted before the project initializes, so an init that loads a `res` file
-/// finds it, exactly as the embedded path does. Both runners share this, so
-/// the game and editor postures cannot diverge.
-pub(crate) fn start_project<F>(project: StaticProject, launch: F)
+/// finds it, exactly as the embedded path does. Both browser frontends share
+/// this, so the game and editor postures cannot diverge.
+pub fn start_project<F>(project: StaticProject, launch: F)
 where
     F: FnOnce(Runtime) + 'static,
 {
@@ -289,17 +287,7 @@ impl WebApplication {
             return;
         };
         match driver.run_frame() {
-            Ok(report) => {
-                if let Some(report) = report {
-                    info!(
-                        target: telemetry_target::ENGINE,
-                        fps = report.fps,
-                        entities = report.entity_count,
-                        "frame statistics"
-                    );
-                }
-                window.request_redraw();
-            }
+            Ok(()) => window.request_redraw(),
             Err(error) => report_failure("frame render", &error),
         }
     }
@@ -315,7 +303,7 @@ impl WebApplication {
 ///
 /// Returns a description of what is missing: the document, the element, or
 /// an element that is not a canvas.
-pub(crate) fn find_canvas(canvas_id: &str) -> Result<HtmlCanvasElement, String> {
+pub fn find_canvas(canvas_id: &str) -> Result<HtmlCanvasElement, String> {
     let document = web_sys::window()
         .and_then(|window| window.document())
         .ok_or("the page has no document")?;
@@ -337,9 +325,7 @@ pub(crate) fn find_canvas(canvas_id: &str) -> Result<HtmlCanvasElement, String> 
 /// # Errors
 ///
 /// Returns the JS error if `focus` is missing or the call rejects.
-pub(crate) fn focus_without_scrolling(
-    element: &HtmlCanvasElement,
-) -> Result<(), wasm_bindgen::JsValue> {
+pub fn focus_without_scrolling(element: &HtmlCanvasElement) -> Result<(), wasm_bindgen::JsValue> {
     let element: &wasm_bindgen::JsValue = element.as_ref();
     let options = js_sys::Object::new();
     js_sys::Reflect::set(
@@ -358,14 +344,8 @@ pub(crate) fn focus_without_scrolling(
 }
 
 /// The canvas's laid-out size in physical pixels, at least 1x1.
-pub(crate) fn physical_size(canvas: &HtmlCanvasElement) -> (u32, u32) {
+pub fn physical_size(canvas: &HtmlCanvasElement) -> (u32, u32) {
     let ratio = web_sys::window().map_or(1.0, |window| window.device_pixel_ratio());
     let scale = |css_pixels: i32| (f64::from(css_pixels) * ratio).round().max(1.0) as u32;
     (scale(canvas.client_width()), scale(canvas.client_height()))
-}
-
-/// Report a failure to the log, with its whole cause chain.
-pub(crate) fn report_failure(context: &str, error: &(dyn std::error::Error + 'static)) {
-    let cause_chain = format_error_chain(error);
-    error!(target: telemetry_target::ENGINE, error = %cause_chain, "{} failed", context);
 }

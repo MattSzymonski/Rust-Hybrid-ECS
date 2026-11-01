@@ -1,5 +1,5 @@
-//! A renderer attached to a window, and the windowed runtime of a shipping
-//! build.
+//! A renderer attached to a window, and the runtime of a statically linked
+//! project drawn in one.
 //!
 //! # Responsibilities
 //!
@@ -31,7 +31,7 @@ use pill_renderer_api::{
 
 // Current crate
 use crate::render_window::{attach_window, attach_window_async, AttachedWindow, RendererWindow};
-use crate::{FrameDriver, FrameReport, RenderingError, Runtime, StaticProject};
+use crate::{FrameDriver, RenderingError, Runtime, StaticProject};
 
 // =============================================================================
 // AttachedRenderer
@@ -65,6 +65,10 @@ pub struct AttachedRenderer {
     /// takes. Declared after `renderer`, so the backend drops first.
     extra_surfaces: BTreeMap<u32, ExtraSurface>,
 }
+
+// =============================================================================
+// ExtraSurface
+// =============================================================================
 
 /// One surface attached after the primary window.
 struct ExtraSurface {
@@ -190,12 +194,15 @@ impl AttachedRenderer {
         width: u32,
         height: u32,
     ) {
-        // Renderer first, then window: the old renderer drops while its window
-        // is still alive, and only then is that window released.
+        // Step 1: Swap in the new backend and window. Renderer first, then
+        // window: the old renderer drops while its window is still alive, and
+        // only then is that window released.
         self.renderer = renderer;
         self.window = window;
         self.window_data = window_data;
         self.surface_size = (width, height);
+        // Step 2: Tell the new backend what the old one was told - the
+        // viewport, then every extra surface.
         self.renderer
             .set_surface_viewport(SurfaceId::PRIMARY, self.viewport);
         self.reattach_extra_surfaces();
@@ -273,6 +280,8 @@ impl AttachedRenderer {
         height: u32,
         options: SurfaceOptions,
     ) -> Result<(), RendererError> {
+        // Step 1: Take the window's handles as data; the surface is built on
+        // them.
         let window_data = RawWindowData::from_window(&window)?;
         // SAFETY: the window is stored in `extra_surfaces` below and kept until
         // the surface is detached or this renderer is dropped; the backend,
@@ -281,6 +290,8 @@ impl AttachedRenderer {
             self.renderer
                 .attach_surface(id, window_data, width, height, options)
         };
+        // Step 2: A backend that draws one surface leaves the surface pending;
+        // anything else it refuses is an error.
         match attached {
             Ok(()) => {}
             Err(RendererError::UnsupportedSurface { detail }) => info!(
@@ -289,6 +300,7 @@ impl AttachedRenderer {
             ),
             Err(error) => return Err(error),
         }
+        // Step 3: Keep the window, and what re-attaching the surface needs.
         self.extra_surfaces.insert(
             id.0,
             ExtraSurface {
@@ -367,7 +379,7 @@ impl AttachedRenderer {
         self.renderer = Box::new(pill_renderer_api::HeadlessRenderer);
     }
 
-    /// The current backend.
+    /// The current backend; [`Self::detach_backend`] leaves the headless one.
     pub fn renderer(&self) -> &dyn PillRenderer {
         self.renderer.as_ref()
     }
@@ -394,10 +406,15 @@ impl AttachedRenderer {
     /// copy of the assets. Both borrows last the call, which is what stops the
     /// store changing under a frame that is already being drawn.
     ///
+    /// A world holding no frame, or no asset store, draws nothing: that is not
+    /// an error.
+    ///
     /// # Errors
     ///
     /// Returns what the backend's `render` returns.
     pub fn render(&mut self, world: &World) -> Result<(), RendererError> {
+        // Step 1: Take the frame and the store it was built from, if this
+        // world has both.
         let (Some(frame), Some(assets)) = (
             world.get_resource::<RenderFrame>(),
             world.get_resource::<pill_engine::AssetManager>(),
@@ -406,8 +423,8 @@ impl AttachedRenderer {
         };
         let outcome = self.renderer.render(frame, assets)?;
         let metrics = self.renderer.metrics();
-        // A frame whose drawn-pass count moves is worth one line: it is how a
-        // chain that stopped drawing a pass - a material no pass names, a
+        // Step 2: Report a frame whose drawn-pass count moved. The line is how
+        // a chain that stopped drawing a pass - a material no pass names, a
         // shader that failed to load - is visible in a run, and how a test
         // reads what a settled frame actually drew without a person watching
         // the window.
@@ -421,6 +438,9 @@ impl AttachedRenderer {
                 "[render] frame draws"
             );
         }
+        // Step 3: Report the first frame that presented with draw calls. A
+        // window opened before any camera is enabled presents empty frames,
+        // and none of them is the start of the scene.
         if !self.presented_scene
             && matches!(outcome, pill_renderer_api::FrameOutcome::Presented)
             && self.renderer.metrics().passes_with_draws > 0
@@ -523,19 +543,23 @@ impl RenderingRuntime {
     /// # Errors
     ///
     /// Returns a [`RendererError`] when the renderer fails.
-    pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
-        let report = self.runtime.run_frame();
+    pub fn run_one_frame(&mut self) -> Result<(), RendererError> {
+        // Step 1: Run the engine's frame, which fills the frame resource.
+        self.runtime.run_frame();
+        // Step 2: Draw what it left.
         self.display.render(self.runtime.engine().world())?;
+        // Step 3: Hand back the picks and previews the GPU finished since the
+        // last frame.
         self.display
             .deliver_pick_results(self.runtime.engine_mut().world_mut());
         self.display
             .deliver_preview_results(self.runtime.engine_mut().world_mut());
-        Ok(report)
+        Ok(())
     }
 
-    /// Live frame statistics; see [`Runtime::current_frame_report`].
-    pub fn current_frame_report(&self) -> FrameReport {
-        self.runtime.current_frame_report()
+    /// Live frame rate; see [`Runtime::frames_per_second`].
+    pub fn frames_per_second(&self) -> f64 {
+        self.runtime.frames_per_second()
     }
 
     /// Read-only engine access.
@@ -552,7 +576,7 @@ impl RenderingRuntime {
 impl FrameDriver for RenderingRuntime {
     type Error = RendererError;
 
-    fn run_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
+    fn run_frame(&mut self) -> Result<(), RendererError> {
         self.run_one_frame()
     }
 
@@ -623,9 +647,8 @@ pub async fn attach_renderer<W: RendererWindow>(
         height,
         "attaching the engine renderer to the window surface"
     );
-    // Register its system the way its module entry point would, then attach
-    // through the bundle's function pointer. A build without one reports that
-    // from `attach_linked`.
+    // Step 1: Register its system the way its module entry point would. A
+    // build without one reports that from `attach_linked`.
     let linked = runtime.static_renderer();
     if let Some((renderer, owner)) = linked {
         crate::static_project::initialize_static_renderer(runtime.engine_mut(), renderer, owner)
@@ -633,6 +656,7 @@ pub async fn attach_renderer<W: RendererWindow>(
                 detail: format!("the renderer failed to initialize with status {status}"),
             })?;
     }
+    // Step 2: Build it on the window through the bundle's function pointer.
     let display = AttachedRenderer::attach_async(window, width, height, |window_data| {
         attach_linked(linked, window_data, width, height)
     })

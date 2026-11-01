@@ -18,6 +18,172 @@ use libloading::Library;
 use super::*;
 use crate::scratch::ScratchDirectory;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// A source tree with one `#[pill_hot_fn]` free function whose body returns
+/// `133.0`, so an edit to that number is a one-token body change.
+const PLAIN_SOURCE: &str = r#"
+use pill_engine::pill_hot_fn;
+
+#[pill_hot_fn]
+pub fn get_color_a() -> f32 {
+133.0
+}
+"#;
+
+/// Two `#[pill_hot]` functions, so one save can change two bodies.
+const TWO_HOT_SOURCE: &str = r#"
+use pill_engine::*;
+
+const SPEED: f32 = 1.0;
+
+#[pill_hot]
+fn movement(value: f32) -> f32 {
+value * SPEED
+}
+
+#[pill_hot]
+fn other_movement(value: f32) -> f32 {
+value - 1.0
+}
+"#;
+
+/// One `#[pill_hot]` function beside an un-annotated `helper` and a
+/// `const SPEED`, so an edit can land inside an annotated body, inside a plain
+/// one, or outside every body.
+const HOT_SOURCE: &str = r#"
+use pill_engine::*;
+
+const SPEED: f32 = 1.0;
+
+#[pill_hot]
+fn movement(value: f32) -> f32 {
+value * SPEED
+}
+
+fn helper(value: f32) -> f32 {
+value + 1.0
+}
+"#;
+
+/// One file declaring `draw` twice, in two `impl` blocks.
+const DUPLICATE_NAME_SOURCE: &str = r#"
+use pill_engine::*;
+
+struct Alpha {
+value: f32,
+}
+
+struct Beta {
+value: f32,
+}
+
+impl Alpha {
+#[pill_hot]
+fn draw(&self) -> f32 {
+    self.value * 1.0
+}
+}
+
+impl Beta {
+fn draw(&self) -> f32 {
+    self.value * 2.0
+}
+}
+"#;
+
+// =============================================================================
+// Free functions
+// =============================================================================
+
+/// A `#[pill_hot]` system declaration, as classification would report it.
+fn system_declaration(name: &str) -> source::HotFunction {
+    source::HotFunction {
+        name: name.to_string(),
+        kind: source::HotFunctionKind::System,
+        self_type: None,
+        trait_name: None,
+        takes_receiver: false,
+        signature: format!("fn {name}()"),
+        cfg_gated: false,
+        inline_always: false,
+        abi_entry_point: false,
+        annotated: true,
+    }
+}
+
+/// A `#[pill_hot_fn]` free-function declaration.
+fn plain_declaration(name: &str) -> source::HotFunction {
+    source::HotFunction {
+        name: name.to_string(),
+        kind: source::HotFunctionKind::PlainFunction,
+        self_type: None,
+        trait_name: None,
+        takes_receiver: false,
+        signature: format!("fn {name}()"),
+        cfg_gated: false,
+        inline_always: false,
+        abi_entry_point: false,
+        annotated: true,
+    }
+}
+
+/// Write a file, creating parent directories as needed.
+fn fs_write(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent");
+    }
+    std::fs::write(path, contents).expect("write file");
+}
+
+/// A session over a throwaway source tree, so classification can be driven
+/// against real files without a project or a compiler.
+fn session_over(directory: &Path, contents: &str) -> HotPatchSession {
+    std::fs::create_dir_all(directory).expect("create source dir");
+    let file = directory.join("lib.rs");
+    std::fs::write(&file, contents).expect("write source");
+
+    let mut session = HotPatchSession {
+        workspace_root: directory.to_path_buf(),
+        package: "project".to_string(),
+        crate_root: file,
+        source_root: directory.to_path_buf(),
+        package_rlib: directory.join("libproject.rlib"),
+        build_command: vec!["cargo".to_string(), "build".to_string()],
+        snapshots: HashMap::new(),
+        snapshot_taken_at: SystemTime::UNIX_EPOCH,
+        rustc_line: None,
+        generations: Vec::new(),
+        active_generations: HashMap::new(),
+        counter: 0,
+    };
+    session.refresh_snapshots();
+
+    // Put the recorded modification time firmly in the past before the
+    // caller edits the file.
+    //
+    // `classify` skips a file whose modification time still equals the one
+    // recorded when it was read. Filesystem timestamps are coarse, so a test
+    // that writes its edit within the same tick as this snapshot produces a
+    // file that looks unchanged - and the test then fails intermittently,
+    // reporting "no change detected" for an edit that is plainly there. The
+    // parallel harness makes that more likely, because the write lands sooner.
+    //
+    // The gate's imprecision is harmless in production: a missed edit falls
+    // through to a full reload, which still delivers it. It is only a
+    // problem for a test that asserts on classification itself, so the wait
+    // lives here, once for every session a test builds, rather than in each
+    // test.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    session
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
 /// A fan-out that reaches no copy is reported rather than treated as
 /// success, and the image parked in the graveyard is untouched by the
 /// refusal - which is what keeps a refusal from unmapping an image another
@@ -120,7 +286,8 @@ fn generated_source_namespaces_the_entry_and_the_export() {
     assert!(generated.contains("use project::*;"));
     // The function is copied verbatim, body included.
     assert!(generated.contains("fn movement(value: i32) -> i32 { value * 2 }"));
-    // The original attribute must NOT be duplicated.
+    // The source carries attributes at all, and exactly one `name` override:
+    // the original attribute must not be duplicated beside the generated one.
     assert!(generated.contains("#["));
     assert_eq!(generated.matches("pill_hot(name").count(), 1);
 }
@@ -341,7 +508,7 @@ fn default() -> Self { Spline(1) }\n}\n";
 /// The generated patch carries the body from the right `impl` block.
 ///
 /// Two types implementing one trait method is what makes a bare-name search
-/// unsafe: it would compile the first `fn default` in the file and install it
+/// unsafe: it would compile the first `fn size` in the file and install it
 /// for whichever type was patched.
 #[test]
 fn a_generated_trait_patch_carries_the_right_body() {
@@ -419,38 +586,6 @@ fn a_slot_lookup_omits_the_type_the_macro_cannot_see() {
     );
 
     let _ = std::fs::remove_dir_all(&directory);
-}
-
-/// A `#[pill_hot]` system declaration, as classification would report it.
-fn system_declaration(name: &str) -> source::HotFunction {
-    source::HotFunction {
-        name: name.to_string(),
-        kind: source::HotFunctionKind::System,
-        self_type: None,
-        trait_name: None,
-        takes_receiver: false,
-        signature: format!("fn {name}()"),
-        cfg_gated: false,
-        inline_always: false,
-        abi_entry_point: false,
-        annotated: true,
-    }
-}
-
-/// A `#[pill_hot_fn]` free-function declaration.
-fn plain_declaration(name: &str) -> source::HotFunction {
-    source::HotFunction {
-        name: name.to_string(),
-        kind: source::HotFunctionKind::PlainFunction,
-        self_type: None,
-        trait_name: None,
-        takes_receiver: false,
-        signature: format!("fn {name}()"),
-        cfg_gated: false,
-        inline_always: false,
-        abi_entry_point: false,
-        annotated: true,
-    }
 }
 
 /// Two sessions must never generate the same patch artifact name.
@@ -687,122 +822,6 @@ fn refreshing_without_a_cargo_artifact_keeps_the_staged_copy() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// Write a file, creating parent directories as needed.
-fn fs_write(path: &Path, contents: &str) {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent");
-    }
-    std::fs::write(path, contents).expect("write file");
-}
-
-/// A session over a throwaway source tree, so classification can be driven
-/// against real files without a project or a compiler.
-fn session_over(directory: &Path, contents: &str) -> HotPatchSession {
-    std::fs::create_dir_all(directory).expect("create source dir");
-    let file = directory.join("lib.rs");
-    std::fs::write(&file, contents).expect("write source");
-
-    let mut session = HotPatchSession {
-        workspace_root: directory.to_path_buf(),
-        package: "project".to_string(),
-        crate_root: file,
-        source_root: directory.to_path_buf(),
-        package_rlib: directory.join("libproject.rlib"),
-        build_command: vec!["cargo".to_string(), "build".to_string()],
-        snapshots: HashMap::new(),
-        snapshot_taken_at: SystemTime::UNIX_EPOCH,
-        rustc_line: None,
-        generations: Vec::new(),
-        active_generations: HashMap::new(),
-        counter: 0,
-    };
-    session.refresh_snapshots();
-
-    // Put the recorded modification time firmly in the past before the
-    // caller edits the file.
-    //
-    // `classify` skips a file whose modification time still equals the one
-    // recorded when it was read. Filesystem timestamps are coarse, so a test
-    // that writes its edit within the same tick as this snapshot produces a
-    // file that looks unchanged - and the test then fails intermittently,
-    // reporting "no change detected" for an edit that is plainly there. The
-    // parallel harness makes that more likely, because the write lands sooner.
-    //
-    // The gate's imprecision is harmless in production: a missed edit falls
-    // through to a full reload, which still delivers it. It is only a
-    // problem for a test that asserts on classification itself, so the wait
-    // lives here, once for every session a test builds, rather than in each
-    // test.
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    session
-}
-
-const PLAIN_SOURCE: &str = r#"
-use pill_engine::pill_hot_fn;
-
-#[pill_hot_fn]
-pub fn get_color_a() -> f32 {
-133.0
-}
-"#;
-
-const TWO_HOT_SOURCE: &str = r#"
-use pill_engine::*;
-
-const SPEED: f32 = 1.0;
-
-#[pill_hot]
-fn movement(value: f32) -> f32 {
-value * SPEED
-}
-
-#[pill_hot]
-fn other_movement(value: f32) -> f32 {
-value - 1.0
-}
-"#;
-
-const HOT_SOURCE: &str = r#"
-use pill_engine::*;
-
-const SPEED: f32 = 1.0;
-
-#[pill_hot]
-fn movement(value: f32) -> f32 {
-value * SPEED
-}
-
-fn helper(value: f32) -> f32 {
-value + 1.0
-}
-"#;
-
-/// One file declaring `draw` twice, in two `impl` blocks.
-const DUPLICATE_NAME_SOURCE: &str = r#"
-use pill_engine::*;
-
-struct Alpha {
-value: f32,
-}
-
-struct Beta {
-value: f32,
-}
-
-impl Alpha {
-#[pill_hot]
-fn draw(&self) -> f32 {
-    self.value * 1.0
-}
-}
-
-impl Beta {
-fn draw(&self) -> f32 {
-    self.value * 2.0
-}
-}
-"#;
-
 /// The headline classification: a body-only edit of an annotated function
 /// is identified, and names the right function.
 #[test]
@@ -823,6 +842,8 @@ fn classify_accepts_a_body_only_edit() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// A source tree that has not changed classifies as no edit to report, so an
+/// untouched file does not wake the patch path.
 #[test]
 fn classify_reports_no_change_when_nothing_moved() {
     let directory = ScratchDirectory::new("classify_unchanged");
@@ -1087,8 +1108,9 @@ fn classify_refuses_a_new_source_file() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// Rolling back a function this session never patched is refused rather
-/// than silently doing nothing, and names the function.
+/// A session that never patched a function knows no active generation and no
+/// history for it, which is what makes a rollback of that function refuse
+/// rather than write nowhere.
 #[test]
 fn rollback_refuses_an_unknown_function() {
     let directory = ScratchDirectory::new("rollback_unknown");
@@ -1296,6 +1318,8 @@ fn classify_reports_whichever_body_changed() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// Generating a patch for a function the changed source does not declare is
+/// an error rather than a patch carrying some other body.
 #[test]
 fn generation_reports_a_missing_function() {
     let session = HotPatchSession {

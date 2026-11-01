@@ -1,5 +1,5 @@
-//! The startup build plan: which modules the host builds before the project
-//! runs, announced up front and counted off as each build starts.
+//! The startup build plan: which modules a start builds, announced up front
+//! and counted off as each build starts.
 //!
 //! # Responsibilities
 //!
@@ -24,6 +24,14 @@ use pill_core::info;
 use pill_core::telemetry::{log_block, telemetry_target::HOT_RELOAD};
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// The current plan: `None` until [`announce_plan`] records one, and again
+/// once its last planned build has started.
+static PLAN: Mutex<Option<BuildPlan>> = Mutex::new(None);
+
+// =============================================================================
 // Types
 // =============================================================================
 
@@ -36,15 +44,13 @@ pub(crate) struct PlannedBuild {
     pub(crate) kind: &'static str,
 }
 
-/// The startup builds not yet started, and how many the plan had.
+/// The startup builds announced and not yet started, with the counts
+/// [`announce_build`] reports against them.
 struct BuildPlan {
     total: usize,
     started: usize,
     pending: Vec<PlannedBuild>,
 }
-
-/// The current plan; `None` before [`announce_plan`] and between runs.
-static PLAN: Mutex<Option<BuildPlan>> = Mutex::new(None);
 
 // =============================================================================
 // Free Functions
@@ -55,6 +61,8 @@ static PLAN: Mutex<Option<BuildPlan>> = Mutex::new(None);
 /// `project_name` is the project's display name. Replaces any earlier plan.
 pub(crate) fn announce_plan(project_name: &str, builds: Vec<PlannedBuild>) {
     info!(target: HOT_RELOAD, "{}", render_plan(project_name, &builds));
+    // Poisoning is ignored: a panic while the plan was held must not cost the
+    // rest of the start its plan, and the state is only counts and names.
     let mut plan = PLAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     *plan = Some(BuildPlan {
         total: builds.len(),

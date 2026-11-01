@@ -13,7 +13,7 @@ REQUIREMENTS
     the executable
 
 DESCRIPTION
-    `devops/tools/build_web.py --dev` builds `examples/local/master_renderer_test`, a
+    `devops/tools/build_web.py --dev` builds `devops/tests/projects/scene`, a
     project with a `res` directory, so the asset pack is exercised too. The
     build is served on a free local port and opened in a headless browser with
     WebGPU enabled, driven through the Chrome DevTools Protocol. Before the
@@ -47,7 +47,7 @@ USAGE
 EXAMPLE USAGE
   python devops/tests/test_web_smoke.py
   python devops/tests/test_web_smoke.py --timeout-scale 2 --seconds 20
-  python devops/tests/test_web_smoke.py --project examples/local/circus_demo --save-capture local/temp/web.png
+  python devops/tests/test_web_smoke.py --project examples/pills/pills_rust --save-capture local/temp/web.png
 
 --- SCRIPT ---
 """
@@ -75,7 +75,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import REPOSITORY_ROOT  # noqa: E402
-from core.projects import MASTER_RENDERER_TEST_ROOT, repository_relative  # noqa: E402
+from core.projects import SCENE_PROJECT_ROOT, repository_relative  # noqa: E402
 from core.suite_common import (  # noqa: E402
     SHIPPING_BUNDLE_PATHS,
     restore_paths,
@@ -89,13 +89,13 @@ from core.suite_common import (  # noqa: E402
 
 # The project built for the browser by default; its web build lands in the
 # project's `build/web`.
-PROJECT = repository_relative(MASTER_RENDERER_TEST_ROOT)
+PROJECT = repository_relative(SCENE_PROJECT_ROOT)
 BUILD_SCRIPT = REPOSITORY_ROOT / "devops" / "tools" / "build_web.py"
 
 # Tokens the page's console must show.
 PACK_TOKEN = "mounted the fetched asset pack"
 FIRST_FRAME_TOKEN = "[render] First frame: Presented; camera=true"
-FRAME_TOKEN = "frame statistics"
+FRAME_TOKEN = "FPS |"
 # The pack the page fetches, and the window of a `res` file the module must not
 # contain: a browser build keeps its assets out of the wasm.
 ASSET_PACK_FILE_NAME = "assets.pillpack"
@@ -103,10 +103,10 @@ EMBEDDED_PROBE_BYTES = 512
 MODULE_NAME = "pkg/pill_web_app_bg.wasm"
 
 # Input sent through the DevTools protocol once the first frame is up, and what
-# the project logs when its systems see it (`examples/local/master_renderer_test/
+# the project logs when its systems see it (`devops/tests/projects/scene/
 # src/controls.rs`). The key goes first and without a click, so it also checks
 # that the canvas holds keyboard focus from the start. The wheel scrolls down,
-# moving the camera back: closer would put it inside the helmet, and the
+# moving the camera back: closer would put it inside the models, and the
 # picture check would see an empty frame.
 INPUT_DELAY_SECONDS = 1.0
 INPUT_EVENTS = (

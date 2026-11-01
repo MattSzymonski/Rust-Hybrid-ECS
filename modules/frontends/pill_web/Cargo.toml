@@ -8,19 +8,13 @@ workspace = true
 
 # The browser frontend: runs a statically linked project in a page's canvas.
 # Every dependency is wasm-only, so on native targets this crate compiles to
-# nothing and the workspace's native builds are unaffected.
+# nothing and the workspace's native builds are unaffected. The editor lives in
+# its own crate under `modules/editor/` (`pill_web_editor`).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 pill_core = { path = "../../engine/pill_core" }
-# What runs the game: the engine, the linked project and the renderer attached
-# to the canvas.
+# What runs the project: the engine, the linked project and the renderer
+# attached to the canvas.
 pill_player = { path = "../../hosting/pill_player", features = ["rendering"] }
-pill_engine_core = { path = "../../engine/pill_engine_core" }
-# The egui editor posture (W-0029): the boundary types and the shared model
-# the egui shell writes its frame with, plus egui's own wgpu renderer.
-pill_editor_core = { path = "../../editor/pill_editor_core" }
-egui-wgpu = "0.36.2"
-# The device both UI canvases are drawn through.
-wgpu = "30.0.0"
 # The canvas window and the browser's event loop.
 winit = "0.30"
 # The canvas's keyboard and mouse events as engine input events.

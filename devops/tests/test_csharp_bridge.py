@@ -14,7 +14,7 @@ REQUIREMENTS
 DESCRIPTION
     End-to-end suite for the managed (C#) project backend and the extension
      -> C# component bridge. Launches the standalone host with
-    `examples/local/project_cs` and the `pill_spline` module plus a component-less
+    `devops/tests/projects/managed` and the `pill_spline` module plus a component-less
     dummy module, then verifies from console output and on-disk artifacts:
 
       1. csharp_bridge_startup  - the host starts the C# backend, the host
@@ -29,7 +29,7 @@ DESCRIPTION
               sees it in the SAME native column (sees 2 splines).
       2. csharp_hot_reload      - editing the probe file (a behavior-only change)
           is picked up by the watcher: dotnet rebuilds, the collectible
-          assembly is reloaded (`[csharp_runtime] reloaded project_cs.dll`,
+          assembly is reloaded (`[csharp_runtime] reloaded managed.dll`,
           `C# hot reload complete`), and the new assembly's probe runs with
           the expected spline count (module + pre-reload seed + post-reload
           seed = 3), proving the connection survives a managed hot reload.
@@ -80,7 +80,7 @@ from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario 
 # Session configuration
 # =============================================================================
 
-# `PROJECT_CS_SYSTEMS_CS` and `PROJECT_CS_COMPONENTS_CS` come from
+# `MANAGED_PROJECT_SYSTEMS_CS` and `MANAGED_PROJECT_COMPONENTS_CS` come from
 # `core.projects` through the star import above.
 SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "pill_spline" / "src" / "pill_spline.rs"
 SPLINE_GENERATED_FILE = (
@@ -99,7 +99,7 @@ COMMITTED_MIRROR_BYTES = None
 # The suite's own probe file. Written before the host starts and removed in the
 # suite's cleanup, so the example project carries no test-only code and this
 # suite does not depend on demo text a project edit can silently change.
-PROJECT_CS_PROBE_CS = PROJECT_CS_BRIDGE_PROBE_CS
+MANAGED_PROJECT_PROBE_CS = MANAGED_PROJECT_BRIDGE_PROBE_CS
 
 # The C# project plus a component-less dummy module: the dummy exercises the
 # codegen paths a module without components takes - a standalone
@@ -177,7 +177,7 @@ public static class ModuleSplineBridgeDemo
             spline.ControlPointCount = 4;
             spline.Elo = 30.0f;
             commands.CreateEntity().With(spline).Build();
-            Console.WriteLine("[project_cs] cs spline bridge: seeded one spline via Commands");
+            Console.WriteLine("[managed] cs spline bridge: seeded one spline via Commands");
         }
 
         long now = Stopwatch.GetTimestamp();
@@ -212,7 +212,7 @@ public static class ModuleSplineBridgeDemo
         float alpha = global::pill_dummy_color.PillDummyColor.GetColorA();
 
         Console.WriteLine(
-            $"[project_cs] cs spline bridge: sees {visibleSplines} spline(s), " +
+            $"[managed] cs spline bridge: sees {visibleSplines} spline(s), " +
             $"first P0.X={firstPointX}, count={firstPointCount}, " +
             $"omo=({omo.X},{omo.Y}) sum={omoSum} a={omoA} b={omoB} alpha={alpha}");
     }
@@ -222,15 +222,15 @@ public static class ModuleSplineBridgeDemo
 # --- C# / bridge specific output tokens ---------------------------------------
 
 # The host's collectible loader prints this after a successful assembly swap.
-CSHARP_RELOADED_TOKEN = "[csharp_runtime] reloaded project_cs.dll"
+CSHARP_RELOADED_TOKEN = "[csharp_runtime] reloaded managed.dll"
 # The same line carries the unload ledger: versions retired by a swap and
 # versions a collection has confirmed dead. An accepted reload retires one more
 # than it has collected, because the context it just unloaded has not been
 # observed by a sweep yet.
-CSHARP_RELOAD_LEDGER_PREFIX = "reloaded project_cs.dll (retired "
+CSHARP_RELOAD_LEDGER_PREFIX = "reloaded managed.dll (retired "
 CSHARP_RETIRED_SURVIVOR_TOKEN = "are still loaded after"
 CSHARP_RELOAD_LEDGER_PATTERN = re.compile(
-    r"\[csharp_runtime\] reloaded project_cs\.dll \(retired (\d+), collected (\d+)\)"
+    r"\[csharp_runtime\] reloaded managed\.dll \(retired (\d+), collected (\d+)\)"
 )
 # The host's reload poll accepts the swap only when system/signature/manifest
 # identity is unchanged (behavior-only reload).
@@ -255,7 +255,7 @@ BRIDGE_PROBE_V2_PREFIX = "cs spline bridge v2: sees"
 # inline at each `wait_for` call: `test_log_contract.py` only sees a `*_TOKEN`
 # constant, so an inline literal could be reworded with nothing to catch it.
 # Both carry BRIDGE_PROBE_PREFIX and must move with it.
-BRIDGE_PROBE_RUST_TO_CS_TOKEN = "cs spline bridge: sees 1 spline(s), first P0.X=0, count=4"
+BRIDGE_PROBE_RUST_TO_CS_TOKEN = "omo=(12,34) sum=47 a=1212 b=1234"
 BRIDGE_PROBE_CS_TO_RUST_TOKEN = "cs spline bridge: sees 2 spline(s)"
 # dotnet build's summary line; a clean managed build reports exactly these.
 DOTNET_CLEAN_WARNING_SUMMARY = "0 Warning(s)"
@@ -463,7 +463,7 @@ def verify_startup(
 # Behavior-only edit to the bridge probe: changes the log prefix but not the
 # system name, its signature, the component manifest, or the startups, so the
 # collectible reload is accepted (C# reload is behavior-only by design).
-# Matches inside the interpolated string `$"[project_cs] cs spline bridge:
+# Matches inside the interpolated string `$"[managed] cs spline bridge:
 # sees {visibleSplines} spline(s), "`.
 BRIDGE_PROBE_PREFIX_EDIT = (
     "cs spline bridge: sees {visibleSplines} spline(s), ",
@@ -502,12 +502,12 @@ SYSTEM_EXTRA_LATCH_EDIT = (
 )
 SYSTEM_EXTRA_PRINT_EDIT = (
     "                ref var sample = ref sampleRow.SplineSample;",
-    "                ref var sample = ref sampleRow.SplineSample;\n                if (!extraLogged)\n                {\n                    extraLogged = true;\n                    Console.WriteLine($\"[project_cs] sample extra={sample.Extra}\");\n                }",
+    "                ref var sample = ref sampleRow.SplineSample;\n                if (!extraLogged)\n                {\n                    extraLogged = true;\n                    Console.WriteLine($\"[managed] sample extra={sample.Extra}\");\n                }",
 )
 
 # `7.5f` through `"R"` formatting; anything else means the added field was
 # reset to zero instead of filled from its declared default.
-SAMPLE_EXTRA_TOKEN = "[project_cs] sample extra=7.5"
+SAMPLE_EXTRA_TOKEN = "[managed] sample extra=7.5"
 
 # The retirement probes: a resource and a component declared only by the probe
 # file and referenced by no query signature, so adding and removing them is a
@@ -538,7 +538,7 @@ PROBE_RETIREMENT_MARKER_SEED = (
     "        if (!_seeded)\n        {\n            _seeded = true;\n"
     "            for (int index = 0; index < 3; index++)\n"
     "                commands.CreateEntity().With(new ProbeMarker { Value = index }).Build();\n"
-    '            Console.WriteLine("[project_cs] probe retirement markers seeded");',
+    '            Console.WriteLine("[managed] probe retirement markers seeded");',
 )
 
 MARKERS_SEEDED_TOKEN = "probe retirement markers seeded"
@@ -622,7 +622,7 @@ SESSION_SCENARIOS = [
         name="csharp_hot_reload",
         phases=[
             ScenarioPhase(
-                edits=[(PROJECT_CS_PROBE_CS, [BRIDGE_PROBE_PREFIX_EDIT])],
+                edits=[(MANAGED_PROJECT_PROBE_CS, [BRIDGE_PROBE_PREFIX_EDIT])],
                 wait_token=CSHARP_RELOADED_TOKEN,
                 required_tokens=[
                     CSHARP_RELOADED_TOKEN,
@@ -641,7 +641,7 @@ SESSION_SCENARIOS = [
                 ],
             )
         ],
-        restore_after=[PROJECT_CS_PROBE_CS],
+        restore_after=[MANAGED_PROJECT_PROBE_CS],
     ),
     # Reloading repeatedly in one session. Each phase is a distinct edit to the
     # same line, so every swap is real work rather than a no-op rebuild.
@@ -656,7 +656,7 @@ SESSION_SCENARIOS = [
         name="csharp_repeated_reload_stability",
         phases=[
             ScenarioPhase(
-                edits=[(PROJECT_CS_PROBE_CS, [BRIDGE_PROBE_PREFIX_EDIT])],
+                edits=[(MANAGED_PROJECT_PROBE_CS, [BRIDGE_PROBE_PREFIX_EDIT])],
                 wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
                 required_tokens=[CSHARP_RELOADED_TOKEN, CSHARP_RELOAD_LEDGER_PREFIX],
                 forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
@@ -664,7 +664,7 @@ SESSION_SCENARIOS = [
                 alive_tokens=[(BRIDGE_PROBE_V2_PREFIX, PROBE_TIMEOUT)],
             ),
             ScenarioPhase(
-                edits=[(PROJECT_CS_PROBE_CS, [BRIDGE_PROBE_V2_TO_V3_EDIT])],
+                edits=[(MANAGED_PROJECT_PROBE_CS, [BRIDGE_PROBE_V2_TO_V3_EDIT])],
                 wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
                 required_tokens=[CSHARP_RELOADED_TOKEN, CSHARP_RELOAD_LEDGER_PREFIX],
                 forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
@@ -672,7 +672,7 @@ SESSION_SCENARIOS = [
                 alive_tokens=[(BRIDGE_PROBE_V3_PREFIX, PROBE_TIMEOUT)],
             ),
             ScenarioPhase(
-                edits=[(PROJECT_CS_PROBE_CS, [BRIDGE_PROBE_V3_TO_V4_EDIT])],
+                edits=[(MANAGED_PROJECT_PROBE_CS, [BRIDGE_PROBE_V3_TO_V4_EDIT])],
                 wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
                 required_tokens=[CSHARP_RELOADED_TOKEN, CSHARP_RELOAD_LEDGER_PREFIX],
                 forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
@@ -680,7 +680,7 @@ SESSION_SCENARIOS = [
                 alive_tokens=[(BRIDGE_PROBE_V4_PREFIX, PROBE_TIMEOUT)],
             ),
         ],
-        restore_after=[PROJECT_CS_PROBE_CS],
+        restore_after=[MANAGED_PROJECT_PROBE_CS],
     ),
     # The three refusals. C# hot reload is behavior-only by design, and these
     # pin what "behavior-only" actually means at the boundary: each rejection
@@ -695,7 +695,7 @@ SESSION_SCENARIOS = [
         name="csharp_migrates_component_layout_change",
         phases=[
             ScenarioPhase(
-                edits=[(PROJECT_CS_COMPONENTS_CS, [COMPONENT_LAYOUT_EDIT])],
+                edits=[(MANAGED_PROJECT_COMPONENTS_CS, [COMPONENT_LAYOUT_EDIT])],
                 wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
                 required_tokens=[
                     CSHARP_MANIFEST_PENDING_TOKEN,
@@ -714,7 +714,7 @@ SESSION_SCENARIOS = [
                 alive_tokens=[(BRIDGE_PROBE_PREFIX, PROBE_TIMEOUT)],
             )
         ],
-        restore_after=[PROJECT_CS_COMPONENTS_CS],
+        restore_after=[MANAGED_PROJECT_COMPONENTS_CS],
     ),
     # A field added with a declared default starts from that value instead of
     # zero, and the next generation sees it: the sample system prints the
@@ -726,9 +726,9 @@ SESSION_SCENARIOS = [
         phases=[
             ScenarioPhase(
                 edits=[
-                    (PROJECT_CS_COMPONENTS_CS, [COMPONENT_DEFAULT_FIELD_EDIT]),
+                    (MANAGED_PROJECT_COMPONENTS_CS, [COMPONENT_DEFAULT_FIELD_EDIT]),
                     (
-                        PROJECT_CS_SYSTEMS_CS,
+                        MANAGED_PROJECT_SYSTEMS_CS,
                         [SYSTEM_EXTRA_LATCH_EDIT, SYSTEM_EXTRA_PRINT_EDIT],
                     ),
                 ],
@@ -749,7 +749,7 @@ SESSION_SCENARIOS = [
                 alive_tokens=[(BRIDGE_PROBE_PREFIX, PROBE_TIMEOUT)],
             )
         ],
-        restore_after=[PROJECT_CS_COMPONENTS_CS, PROJECT_CS_SYSTEMS_CS],
+        restore_after=[MANAGED_PROJECT_COMPONENTS_CS, MANAGED_PROJECT_SYSTEMS_CS],
     ),
     # Retirement: a declaration the manifest stops naming is not a refusal
     # anymore. A deliberately unreferenced component (seeded with three rows)
@@ -763,7 +763,7 @@ SESSION_SCENARIOS = [
             ScenarioPhase(
                 edits=[
                     (
-                        PROJECT_CS_PROBE_CS,
+                        MANAGED_PROJECT_PROBE_CS,
                         [
                             PROBE_RETIREMENT_RESOURCE_ADD,
                             PROBE_RETIREMENT_MARKER_ADD,
@@ -789,7 +789,7 @@ SESSION_SCENARIOS = [
             ScenarioPhase(
                 edits=[
                     (
-                        PROJECT_CS_PROBE_CS,
+                        MANAGED_PROJECT_PROBE_CS,
                         [
                             (
                                 PROBE_RETIREMENT_MARKER_SEED[1],
@@ -819,7 +819,7 @@ SESSION_SCENARIOS = [
             ScenarioPhase(
                 edits=[
                     (
-                        PROJECT_CS_PROBE_CS,
+                        MANAGED_PROJECT_PROBE_CS,
                         [
                             (
                                 PROBE_RETIREMENT_RESOURCE_ADD[1],
@@ -843,7 +843,7 @@ SESSION_SCENARIOS = [
                 alive_tokens=[(BRIDGE_PROBE_PREFIX, PROBE_TIMEOUT)],
             ),
         ],
-        restore_after=[PROJECT_CS_PROBE_CS],
+        restore_after=[MANAGED_PROJECT_PROBE_CS],
     ),
     # Renaming a system changes the metadata the scheduler was built from, and
     # the host rebuilds it: it clears the project's systems and re-registers
@@ -855,7 +855,7 @@ SESSION_SCENARIOS = [
         name="csharp_reregisters_on_system_signature_change",
         phases=[
             ScenarioPhase(
-                edits=[(PROJECT_CS_PROBE_CS, [SYSTEM_NAME_EDIT])],
+                edits=[(MANAGED_PROJECT_PROBE_CS, [SYSTEM_NAME_EDIT])],
                 wait_token=CSHARP_SYSTEMS_REREGISTERED_TOKEN,
                 required_tokens=[
                     CSHARP_SYSTEMS_REREGISTERED_TOKEN,
@@ -872,11 +872,11 @@ SESSION_SCENARIOS = [
                 alive_tokens=[(BRIDGE_PROBE_PREFIX, PROBE_TIMEOUT)],
             )
         ],
-        restore_after=[PROJECT_CS_PROBE_CS],
+        restore_after=[MANAGED_PROJECT_PROBE_CS],
     ),
     rejection_scenario(
         "csharp_rejects_startup_change",
-        PROJECT_CS_PROBE_CS,
+        MANAGED_PROJECT_PROBE_CS,
         STARTUP_NAME_EDIT,
         CSHARP_REJECT_STARTUP_REASON,
         BRIDGE_PROBE_PREFIX,
@@ -925,7 +925,7 @@ SESSION_SCENARIOS = [
             ),
             ScenarioPhase(
                 edits=[(
-                    PROJECT_CS_PROBE_CS,
+                    MANAGED_PROJECT_PROBE_CS,
                     [
                         (
                             "ulong omoB = omo.GetB();",
@@ -948,7 +948,7 @@ SESSION_SCENARIOS = [
         ],
         # Restore the probe first so no build references GetE after the module
         # reverts (a transient reference would fail the intermediate build).
-        restore_after=[PROJECT_CS_PROBE_CS, SPLINE_LIB_RS],
+        restore_after=[MANAGED_PROJECT_PROBE_CS, SPLINE_LIB_RS],
     ),
 ]
 
@@ -960,7 +960,7 @@ SESSION_SCENARIOS = [
 # This suite exercises the C# assembly-swap reload, so it pins the reload-only
 # posture to keep the Rust patch fast path out of the host it drives.
 #
-# `rendering` is on because `project_cs` queries the renderer's own components:
+# `rendering` is on because `managed` queries the renderer's own components:
 # the managed manifest marks every type the runtime assembly declares as
 # shared, and a shared component with no native binding is refused at startup.
 # A headless host has no binding for `TracyLive.MeshRendererComponent` and dies
@@ -970,8 +970,8 @@ HOST_POSTURE = HOST_DEV_RENDERING
 
 def write_bridge_probe() -> None:
     """Writes the suite's probe file into the managed project."""
-    atomic_write(PROJECT_CS_PROBE_CS, BRIDGE_PROBE_SOURCE)
-    print(f"  [PREP] Wrote {PROJECT_CS_PROBE_CS.relative_to(WORKSPACE_ROOT)}.")
+    atomic_write(MANAGED_PROJECT_PROBE_CS, BRIDGE_PROBE_SOURCE)
+    print(f"  [PREP] Wrote {MANAGED_PROJECT_PROBE_CS.relative_to(WORKSPACE_ROOT)}.")
 
 
 def launch_host():
@@ -1038,7 +1038,7 @@ def csharp_runner() -> ScenarioRunner:
 
 def run_csharp_session() -> bool:
     """Writes the C# project's settings, launches the host, and runs the scenarios."""
-    print("\n  [TEST] Launching standalone host with project_cs...")
+    print("\n  [TEST] Launching standalone host with managed...")
     write_project_settings(CSHARP_PROJECT_ROOT, CSHARP_SETTINGS)
     write_bridge_probe()
     process, monitor = launch_host()
@@ -1184,7 +1184,7 @@ def main() -> None:
     # that edit it capture it themselves.
     for path in (
         project_settings_yaml(CSHARP_PROJECT_ROOT),
-        PROJECT_CS_COMPONENTS_CS,
+        MANAGED_PROJECT_COMPONENTS_CS,
         SPLINE_GENERATED_FILE,
         DUMMY_GENERATED_FILE,
     ):
@@ -1216,11 +1216,11 @@ def main() -> None:
             BACKUP.restore_one(csharp_settings_path)
         # The probe file belongs to the suite, so it is removed rather than
         # restored: `restore_all` put its captured content back a moment ago.
-        if PROJECT_CS_PROBE_CS.exists():
-            PROJECT_CS_PROBE_CS.unlink()
+        if MANAGED_PROJECT_PROBE_CS.exists():
+            MANAGED_PROJECT_PROBE_CS.unlink()
             print(
                 "  [CLEANUP] removed "
-                f"{PROJECT_CS_PROBE_CS.relative_to(WORKSPACE_ROOT)}"
+                f"{MANAGED_PROJECT_PROBE_CS.relative_to(WORKSPACE_ROOT)}"
             )
 
     print(f"\n{'=' * 64}")

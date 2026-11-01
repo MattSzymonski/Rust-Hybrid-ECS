@@ -18,10 +18,11 @@
 #   behaviour from its console output. The suites temporarily modify - and
 #   automatically restore - the projects' project_settings.yaml files,
 #   devops/tests/project/src/lib.rs,
-#   examples/local/project_rs/src/lib.rs, examples/local/project_cs/src/Systems.cs and
+#   devops/tests/projects/project_rs/src/lib.rs, devops/tests/projects/managed/src/Systems.cs and
 #   modules/extensions/pill_spline/pill_spline/src/lib.rs, plus
-#   examples/local/circus_demo's theme file and project source (the theme suite), so
-#   a normal developer workspace is left exactly as it was.
+#   examples/pills/pills_rust's theme file and project source
+#   (the theme suite), so a normal developer workspace is left exactly as it
+#   was.
 #
 #   Expected runtime: ~15-20 minutes (plus the initial host build unless
 #   --skip-build is used).

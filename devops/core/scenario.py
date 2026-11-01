@@ -89,8 +89,9 @@ class Scenario:
     # another reload; the runner waits for that reload so its output cannot
     # pollute the next scenario's window.
     restore_after: Sequence[Path] = field(default_factory=list)
-    # Assertions that only the restore-driven reload can satisfy (the module
-    # re-seeding fresh data after a forgotten-type drop logs existing=0).
+    # Assertions that only the restore-driven reload can satisfy: the module
+    # re-seeding fresh data after its forgotten type's column was dropped
+    # logs `existing=0`, which the reload before the restore cannot produce.
     restore_required_tokens: Sequence[str] = ()
     # Checks over the scenario's window that this module cannot know about.
     # Called as `validator(scenario.name, output)`.

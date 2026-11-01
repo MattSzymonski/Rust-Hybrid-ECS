@@ -42,10 +42,12 @@
 #
 #   With `--web` it also writes the web app crate, `build/pill_web_app`: a
 #   `cdylib` whose `#[wasm_bindgen(start)]` shim runs the bundle's project
-#   through `pill_web` on the page's canvas. It has a `[workspace]` of its own,
-#   so the engine workspace's native feature choices and `.cargo` settings stay
-#   out of the wasm build. `devops/tools/build_web.py` builds it. The host links it by path (like the project itself), so no
-#   workspace edit is needed; the folder is gitignored, and regeneration is
+#   through `pill_web` on the page's canvas (or, for `--editor`, through the
+#   browser editor frontend `pill_web_editor`). It has a `[workspace]` of its
+#   own, so the engine workspace's native feature choices and `.cargo`
+#   settings stay out of the wasm build. `devops/tools/build_web.py` builds
+#   it. The host links it by path (like the project itself), so no workspace
+#   edit is needed; the folder is gitignored, and regeneration is
 #   content-based: unchanged output is not rewritten, so a stable tree shows
 #   no diff.
 #
@@ -77,17 +79,17 @@
 #          --web             also write the web app crate for a browser build
 #                            (implies `--feature rendering`; Rust projects only).
 #          [project_path]    workspace-relative path to the project directory
-#                            (e.g. examples/local/project_rs). When omitted, the
+#                            (e.g. devops/tests/projects/project_rs). When omitted, the
 #                            PROJECT_PATH environment variable is used - the
 #                            same resolution the host uses at startup.
 #
 # EXAMPLE USAGE:
-#   python devops/tools/generate_shipping_bundle.py examples/local/project_rs
-#   python devops/tools/generate_shipping_bundle.py --feature rendering examples/local/project_rs
-#   python devops/tools/generate_shipping_bundle.py examples/local/project_cs
-#   python devops/tools/generate_shipping_bundle.py --web examples/local/master_renderer_test
+#   python devops/tools/generate_shipping_bundle.py devops/tests/projects/project_rs
+#   python devops/tools/generate_shipping_bundle.py --feature rendering devops/tests/projects/project_rs
+#   python devops/tools/generate_shipping_bundle.py devops/tests/projects/managed
+#   python devops/tools/generate_shipping_bundle.py --web devops/tests/projects/scene
 #   python devops/tools/generate_shipping_bundle.py --restore-stub
-#   set PROJECT_PATH=examples/local/project_rs
+#   set PROJECT_PATH=devops/tests/projects/project_rs
 #   python devops/tools/generate_shipping_bundle.py
 
 # --- SCRIPT ---
@@ -156,6 +158,9 @@ BUILD_SCRIPT_FILE_NAME = "build.rs"
 WEB_APP_CRATE_NAME = "pill_web_app"
 WEB_APP_DIRECTORY = Path("build") / WEB_APP_CRATE_NAME
 WEB_CRATE_DIRECTORY = Path("modules") / "frontends" / "pill_web"
+# The browser editor frontend an `--editor` build links: the scene and the
+# shell's UI on two stacked canvases, the counterpart of `pill_editor`.
+WEB_EDITOR_CRATE_DIRECTORY = Path("modules") / "editor" / "pill_web_editor"
 WEB_CANVAS_ID = "pill-canvas"
 
 # Managed (C#) project constants, mirroring `pill_development_host::config` so a generated
@@ -782,7 +787,11 @@ def build_library_source(
             "}",
         ]
     else:
+        # Skipped for the same reason as the module list: rustfmt joins this
+        # literal onto one line when the package name is short, so the shape
+        # would depend on the project's name.
         lines += [
+            "#[rustfmt::skip]",
             "pub fn project_backend() -> StaticProjectBackend {",
             "    StaticProjectBackend::Native {",
             f"        init: {package_name}::init,",
@@ -848,15 +857,25 @@ def build_library_source(
     return "\n".join(lines) + "\n"
 
 
-def build_web_app_manifest(web_app_directory: Path, root: Path) -> str:
+def build_web_app_manifest(
+    web_app_directory: Path, root: Path, editor: bool = False
+) -> str:
     """Builds the web app crate's Cargo.toml text.
 
-    The empty `[workspace]` makes the crate its own workspace root: the wasm
-    build resolves features for this crate alone, and cargo does not look for
-    an enclosing workspace.
+    An editor build links the browser editor frontend (`pill_web_editor`); a
+    game build links the browser frontend (`pill_web`), so a game page never
+    carries editor code. The empty `[workspace]` makes the crate its own
+    workspace root: the wasm build resolves features for this crate alone, and
+    cargo does not look for an enclosing workspace.
     """
-    web_path = manifest_relative_path(web_app_directory, root / WEB_CRATE_DIRECTORY)
+    frontend_directory = WEB_EDITOR_CRATE_DIRECTORY if editor else WEB_CRATE_DIRECTORY
+    frontend_path = manifest_relative_path(web_app_directory, root / frontend_directory)
     bundle_path = manifest_relative_path(web_app_directory, root / BUNDLE_DIRECTORY)
+    frontend_dependency = (
+        f'pill_web_editor = {{ path = "{frontend_path}" }}'
+        if editor
+        else f'pill_web = {{ path = "{frontend_path}" }}'
+    )
     lines = [
         "[package]",
         f'name = "{WEB_APP_CRATE_NAME}"',
@@ -867,7 +886,7 @@ def build_web_app_manifest(web_app_directory: Path, root: Path) -> str:
         'crate-type = ["cdylib"]',
         "",
         "[dependencies]",
-        f'pill_web = {{ path = "{web_path}" }}',
+        frontend_dependency,
         f'{BUNDLE_CRATE_NAME} = {{ path = "{bundle_path}" }}',
         'wasm-bindgen = "0.2"',
         "",
@@ -889,7 +908,7 @@ def build_web_app_source(
     """
     if editor:
         entry = (
-            f"    pill_web::editor_egui::run_editor_egui(\n"
+            f"    pill_web_editor::run(\n"
             f"        {BUNDLE_CRATE_NAME}::static_project(),\n"
             f'        "{WEB_CANVAS_ID}",\n'
             f'        "{EDITOR_UI_CANVAS_ID}",\n'
@@ -1109,16 +1128,16 @@ def main() -> int:
     if not project_path:
         print(
             "error: no project path: pass it as an argument or set PROJECT_PATH "
-            "(e.g. PROJECT_PATH=examples/local/project_rs).",
+            "(e.g. PROJECT_PATH=devops/tests/projects/project_rs).",
             file=sys.stderr,
         )
         return 1
 
     root = repository_root()
     # The host resolves PROJECT_PATH against the working directory, so
-    # `../examples/local/project_rs` works from the workspace dir; the generator
+    # `../devops/tests/projects/project_rs` works from the workspace dir; the generator
     # historically resolved it against the repository root, so
-    # `examples/local/project_rs` works from anywhere. Try the working directory
+    # `devops/tests/projects/project_rs` works from anywhere. Try the working directory
     # first, then the repository root, so both spellings work.
     cwd_candidate = (Path.cwd() / project_path).resolve()
     project_root = (
@@ -1305,7 +1324,7 @@ def main() -> int:
         web_app_directory = root / WEB_APP_DIRECTORY
         wrote_web = write_if_changed(
             web_app_directory / PROJECT_MANIFEST_FILE_NAME,
-            build_web_app_manifest(web_app_directory, root),
+            build_web_app_manifest(web_app_directory, root, editor),
         )
         wrote_web |= write_if_changed(
             web_app_directory / "src" / "lib.rs",

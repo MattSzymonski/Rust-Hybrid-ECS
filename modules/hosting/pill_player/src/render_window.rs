@@ -24,6 +24,10 @@ use std::future::Future;
 use pill_renderer_api::raw_window::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use pill_renderer_api::{PillRenderer, RawWindowData, RendererError};
 
+// =============================================================================
+// Renderer Window
+// =============================================================================
+
 /// A window the renderer can be attached to.
 ///
 /// Blanket-implemented for every type that hands out `raw-window-handle` 0.6
@@ -38,6 +42,10 @@ impl<T> RendererWindow for T where T: HasWindowHandle + HasDisplayHandle + 'stat
 /// renderer it belongs to.
 pub(crate) type AttachedWindow = Box<dyn Any>;
 
+// =============================================================================
+// Window Attachment
+// =============================================================================
+
 /// Attach a renderer to `window` through `attach`, returning the renderer, the
 /// window it must not outlive, and the window's handles as data - which a
 /// caller keeps to attach again later on the same window.
@@ -49,8 +57,8 @@ pub(crate) type AttachedWindow = Box<dyn Any>;
 ///
 /// # Errors
 ///
-/// Returns a [`RendererError`] when the window cannot give its handles or
-/// `attach` fails.
+/// Returns a [`RendererError`] when the window cannot give its handles, its
+/// platform is not one [`RawWindowData`] carries, or `attach` fails.
 pub(crate) fn attach_window<W: RendererWindow>(
     window: W,
     attach: impl FnOnce(RawWindowData) -> Result<Box<dyn PillRenderer>, RendererError>,
@@ -65,8 +73,9 @@ pub(crate) fn attach_window<W: RendererWindow>(
 ///
 /// # Errors
 ///
-/// Returns a [`RendererError`] when the window cannot give its handles or the
-/// future `attach` returns fails.
+/// Returns a [`RendererError`] when the window cannot give its handles, its
+/// platform is not one [`RawWindowData`] carries, or the future `attach`
+/// returns fails.
 pub(crate) async fn attach_window_async<W, F>(
     window: W,
     attach: impl FnOnce(RawWindowData) -> F,

@@ -96,10 +96,10 @@ GRAPHICS_CRATE = "wgpu"
 # Crates outside the renderer split that link the graphics crate by design:
 # `pill_editor` is the egui editor
 # executable, which owns its window and swap chain (plan decisions D8, D19);
-# `pill_web` attaches the renderer surface and draws the browser editor
-# posture's UI on wasm. The egui editor also carries `egui-wgpu`, whose name
-# differs from the crate this rule matches, so it needs no entry.
-WGPU_EXCEPTION_CRATES = {"pill_editor", "pill_web"}
+# `pill_web_editor` draws the browser editor's UI on wasm. The egui editors
+# also carry `egui-wgpu`, whose name differs from the crate this rule matches,
+# so they need no entry.
+WGPU_EXCEPTION_CRATES = {"pill_editor", "pill_web_editor"}
 
 
 # Every broken rule under `repository`, as (rule number, message) pairs.

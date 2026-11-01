@@ -1,4 +1,4 @@
-﻿//! The shell's unit tests.
+//! The shell's unit tests.
 //!
 //! # Responsibilities
 //!

@@ -3,17 +3,18 @@
 //! # Responsibilities
 //!
 //! - Builds, validates and loads one extension during startup.
-//! - Reloads a module in isolation when only its sources changed.
+//! - Reloads one module in isolation: when its sources changed, when a runtime
+//!   crate of its folder reloaded, or when a retry is requested.
 //! - Removes exactly that module's systems across a reload.
 //!
 //! # Design
 //!
 //! Each loaded module owns an [`ExtensionSlot`], which holds its
 //! configuration, its [`SystemOwner`], the currently mapped library and a
-//! bounded graveyard of retired ones. Reload is transactional in the same way
-//! the project module's is: the replacement is compiled and loaded before any
-//! engine state is touched, and a failure at any step leaves the previous
-//! generation running.
+//! graveyard of retired ones - bounded unless the module keeps every
+//! generation. Reload is transactional in the same way the project module's
+//! is: the replacement is compiled and loaded before any engine state is
+//! touched, and a failure at any step leaves the previous generation running.
 //!
 //! Isolation is what separates this from the project path. The module owns a
 //! private reload generation counter fed by its own watcher, and its systems
@@ -46,7 +47,7 @@ use crate::native_library::NativeLibrary;
 use crate::ExtensionConfig;
 
 // =============================================================================
-// Constants
+// Re-exports
 // =============================================================================
 
 /// Extension ABI revision this host understands.
@@ -62,10 +63,10 @@ pub use pill_engine::module_abi::MODULE_ABI_VERSION as EXTENSION_ABI_VERSION;
 // ExtensionSlot
 // =============================================================================
 
-// Everything below loads, versions and replaces a module DLL, none of which a
-// statically linked build does. The ABI constant above stays unconditional:
-// it describes the contract a module crate is compiled against, which is true
-// whether or not this host can load one.
+// Everything below loads, versions and replaces a module DLL, which a build
+// without the `hot_reload` feature never does. The ABI constant above stays
+// unconditional: it describes the contract a module crate is compiled
+// against, which holds whether or not this host can load one.
 #[cfg(feature = "hot_reload")]
 pub(crate) use slot::{ExtensionSlot, ReloadOutcome};
 
@@ -84,9 +85,10 @@ mod slot {
         /// Retired generations, kept mapped because engine-owned pointers and
         /// vtables may still refer to their code.
         old_libraries: Vec<NativeLibrary>,
-        /// Bumped by this module's watcher when its sources change. The slot
-        /// has exactly one producer - its own watcher - so this counter never
-        /// conflates a source save with anything the reload pipeline queues.
+        /// Bumped by this module's watcher when its sources change, and by
+        /// [`Self::request_reload`] faking a save. The slot has exactly one
+        /// real producer - its own watcher - so this counter never conflates a
+        /// source save with anything the reload pipeline queues.
         source_edit_generation: Arc<AtomicU64>,
         /// Last source-edit generation the frame loop acted on.
         last_processed_source_edit: u64,
@@ -105,8 +107,9 @@ mod slot {
         /// owning can be dropped while its image is still mapped.
         registered_resource_ids: Vec<pill_engine::ResourceId>,
         /// Every component type name (plain or persistable) the last `init`
-        /// registered, exposed to the C# backend so `project_cs` can use the
-        /// module's native components through byte-level bindings.
+        /// registered: the C# mirror codegen binds the module's native
+        /// components from it, and the renderer's capability check uses it to
+        /// name the components the active renderer does not draw.
         exposed_component_names: Vec<String>,
         /// Whether this module's retired generations may be unmapped.
         graveyard_policy: crate::reload::GraveyardPolicy,
@@ -126,7 +129,8 @@ mod slot {
     /// [`Reloaded`]: ReloadOutcome::Reloaded
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum ReloadOutcome {
-        /// The watcher has signalled nothing new; no attempt was made.
+        /// The watcher has signalled nothing new and no cascade was queued; no
+        /// attempt was made.
         Unchanged,
         /// The new generation built, initialized and was swapped in.
         Reloaded {
@@ -150,7 +154,9 @@ mod slot {
         /// # Errors
         ///
         /// Returns a [`HostError`] when the module fails to compile, cannot be
-        /// loaded, reports an incompatible ABI revision, or fails to register.
+        /// loaded, reports a missing or incompatible ABI revision, returns a
+        /// non-zero status from `init`, or registers data the first-load
+        /// failure policy forbids.
         pub(crate) fn start(
             engine: &mut Engine,
             engine_api: &EngineApi,
@@ -295,7 +301,8 @@ mod slot {
                     != self.last_processed_source_edit
         }
 
-        /// Reload this module when its watcher signalled a source change.
+        /// Reload this module when a source edit or a queued cascade reload is
+        /// pending.
         ///
         /// Returns [`ReloadOutcome::Reloaded`] when a new generation replaced
         /// the current one, [`ReloadOutcome::Failed`] when an attempt was made
@@ -341,12 +348,17 @@ mod slot {
             peer_component_names: &[String],
             before_commit: &mut dyn FnMut(),
         ) -> ReloadOutcome {
+            // Step 1: One attempt per pending signal, or nothing to do. The
+            // generation is read before the build so a save landing mid-build
+            // stays pending (see Step 3).
             let generation = self.source_edit_generation.load(Ordering::Acquire);
             if generation == self.last_processed_source_edit && !self.queued_cascade_reload {
                 return ReloadOutcome::Unchanged;
             }
             self.queued_cascade_reload = false;
 
+            // Step 2: The reload itself; a refusal leaves the current
+            // generation and its patch state untouched.
             info!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 module = self.config.name.as_str(),
@@ -362,20 +374,22 @@ mod slot {
                 before_commit,
             );
 
-            // The generation observed BEFORE the reload, deliberately, not a fresh
-            // read. A save during the build advances the counter past this value,
-            // and recording the newer one would mark that save as handled when
-            // nothing built it - the edit would then sit on disk, never compiled,
-            // until something else happened to touch the crate. Recording the
-            // baseline instead leaves the newer save pending, so the next frame
-            // rebuilds with it. This is also what makes the build cancellation in
-            // `run_build_command` mean anything: it aborts the moment the counter
-            // moves, precisely so the newer sources win.
+            // Step 3: Record the baseline - the generation observed BEFORE the
+            // reload, deliberately, not a fresh read. A save during the build
+            // advances the counter past this value, and recording the newer one
+            // would mark that save as handled when nothing built it - the edit
+            // would then sit on disk, never compiled, until something else
+            // happened to touch the crate. Recording the baseline instead leaves
+            // the newer save pending, so the next frame rebuilds with it. This is
+            // also what makes the build cancellation in `run_build_command` mean
+            // anything: it aborts the moment the counter moves, precisely so the
+            // newer sources win.
             self.last_processed_source_edit = generation;
             outcome
         }
 
-        /// Name of this module, used for reporting.
+        /// Crate name of this module: the log field, and the key callers look
+        /// a module up by.
         pub(crate) fn name(&self) -> &str {
             &self.config.name
         }
@@ -477,8 +491,8 @@ mod slot {
             self.owner
         }
 
-        /// Every component type name the current generation registered, exposed
-        /// to the C# backend for byte-level bindings.
+        /// Every component type name the current generation registered, for
+        /// the C# mirror codegen and the renderer's capability check.
         pub(crate) fn exposed_component_names(&self) -> &[String] {
             &self.exposed_component_names
         }
@@ -546,8 +560,8 @@ mod slot {
             // Steps 1 to 3 are shared with the project path and live in
             // `crate::reload`: compile before touching engine state (a newer
             // save during the build cancels it and the next frame retries),
-            // load a private copy, verify the ABI, then swap through the
-            // transaction whose step order is load-bearing.
+            // load a private copy and verify its ABI, then swap through the
+            // transaction whose own step order is load-bearing.
             let transaction = crate::reload::ReloadTransaction {
                 kind: crate::reload::ReloadSubjectKind::Extension,
                 subject: &self.config.name,
@@ -583,10 +597,10 @@ mod slot {
     impl Drop for ExtensionSlot {
         /// Announce the unload of this module's images, current and retired.
         ///
-        /// The fields drop straight after this body, and each one unmaps a
-        /// native library whose exported code engine-owned pointers may still
-        /// refer to. That makes this the riskiest moment in a host's life, so
-        /// every module names itself in the log before its images go.
+        /// The fields drop straight after this body, and each library field
+        /// unmaps an image that engine-owned pointers may still point into.
+        /// That makes this the riskiest moment in a host's life, so every
+        /// module names itself in the log before its images go.
         fn drop(&mut self) {
             info!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,

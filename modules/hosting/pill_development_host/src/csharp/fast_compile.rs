@@ -18,10 +18,10 @@
 //! faithful - references, defines, language version, analyzers and source list
 //! are MSBuild's own.
 //!
-//! The capture goes stale in exactly one way that matters: adding or removing a
-//! source file changes the list MSBuild computed. That case is detected here and
-//! sent back through a full build, which refreshes the capture for the next
-//! reload.
+//! The capture is checked against the project's source set before it is
+//! replayed: a file added or removed under the watched source directory changes
+//! the list MSBuild computed, so that case goes back through a full build, which
+//! refreshes the capture for the next reload.
 
 // Standard library
 use std::ffi::CString;
@@ -64,8 +64,9 @@ const COMPILE_STATUS_FAILED: i32 = 1;
 /// Upper bound for one compile's diagnostics text.
 ///
 /// A failing build reports kilobytes; the cap is generous enough that no real
-/// diagnostic set reaches it, and it is here so a compiler reporting a corrupt
-/// length cannot drive the host into an allocation it dies on.
+/// diagnostic set reaches it, and it bounds what a corrupt length can make the
+/// host reserve, since the two-call fetch refuses a length above it before
+/// allocating.
 const MAX_DIAGNOSTICS_BYTES: u32 = 4 * 1024 * 1024;
 
 // =============================================================================
@@ -131,10 +132,11 @@ pub(crate) struct FastCompiler {
 impl FastCompiler {
     /// Build the compiler assembly, load it, and start its warmup.
     ///
-    /// Returns `None` whenever the fast path cannot be set up - a missing
-    /// compiler project, a build failure, an ABI mismatch. Every such case is
-    /// logged once and leaves the host on the ordinary `dotnet build` path, so a
-    /// broken fast path costs reload speed and nothing else.
+    /// Returns `None` whenever the fast path cannot be set up: no captured
+    /// command line to replay (a project shape that never hot reloads), a
+    /// compiler build failure or an ABI mismatch. The build and load failures
+    /// are logged once; either way the host stays on the ordinary `dotnet build`
+    /// path, so a broken fast path costs reload speed and nothing else.
     pub(crate) fn try_new(
         runtime: &DotnetRuntimeContext,
         workspace_root: &Path,
@@ -177,11 +179,10 @@ impl FastCompiler {
             }
         };
 
-        // Step 4: Warm the compiler on a background thread. The first compile
-        // costs about 1.6 seconds - JITting Roslyn, reading the reference set
-        // and loading the analyzers - and every one after it under a tenth of
-        // that. Paying it now, while the host is still starting, is what keeps
-        // that cost off the developer's first edit.
+        // Step 4: Warm the compiler. `Warmup` queues the work and returns, so
+        // Roslyn's JIT, the reference set and the analyzers are paid for in the
+        // background while the host is still starting, which keeps that cost off
+        // the developer's first edit.
         compiler.start_warmup(runtime, &assembly);
         info!(
             target: HOT_RELOAD,
@@ -194,9 +195,11 @@ impl FastCompiler {
     ///
     /// # Errors
     ///
-    /// Returns the hosting error when an export is missing, or
-    /// [`CSharpError::InteropVersionMismatch`] when the assembly implements a
-    /// different contract than this host was built against.
+    /// Returns the export-resolution errors of
+    /// [`DotnetRuntimeContext::get_unmanaged_fn`] when the assembly lacks one of
+    /// the exports above, and [`CSharpError::InteropVersionMismatch`] when the
+    /// assembly implements a different contract than this host was built
+    /// against.
     fn resolve(
         runtime: &DotnetRuntimeContext,
         assembly: &Path,
@@ -260,6 +263,10 @@ impl FastCompiler {
         workspace_root: &Path,
         watch_directory: &str,
     ) -> FastCompileOutcome {
+        // Step 1: Refuse a capture that cannot be replayed as it stands. A file
+        // added or removed under the watched directory changes the source list
+        // MSBuild computed, so it has to go through MSBuild - which also
+        // refreshes the capture, leaving the reload after it fast again.
         if !self.response_file.is_file() {
             return FastCompileOutcome::Unavailable {
                 reason: format!(
@@ -268,17 +275,14 @@ impl FastCompiler {
                 ),
             };
         }
-
-        // A source file added or removed since the capture is the one edit whose
-        // compiler command line genuinely differs from the captured one, so it
-        // has to go through MSBuild - which also refreshes the capture, leaving
-        // the reload after it fast again.
         if let Some(reason) =
             capture_missed_a_source(&self.response_file, workspace_root, watch_directory)
         {
             return FastCompileOutcome::Unavailable { reason };
         }
 
+        // Step 2: Encode both paths for the managed entry point, which reads
+        // NUL-terminated UTF-8.
         let (Some(response_file), Some(output_assembly)) = (
             encode_path(&self.response_file),
             encode_path(&self.output_assembly),
@@ -288,6 +292,7 @@ impl FastCompiler {
             };
         };
 
+        // Step 3: Run the compile and time it for the reload log.
         let started = Instant::now();
         let status = (self.compile)(
             response_file.as_ptr().cast(),
@@ -295,13 +300,15 @@ impl FastCompiler {
         );
         let milliseconds = started.elapsed().as_secs_f64() * 1000.0;
 
+        // Step 4: Map the status onto an outcome. Two is the managed side's code
+        // for "the fast path could not run", so any status other than
+        // `COMPILE_STATUS_COMPILED` or `COMPILE_STATUS_FAILED` is a fallback
+        // rather than a fault in the gameplay source.
         match status {
             COMPILE_STATUS_COMPILED => FastCompileOutcome::Compiled { milliseconds },
             COMPILE_STATUS_FAILED => FastCompileOutcome::Failed {
                 diagnostics: self.diagnostics(),
             },
-            // Anything else is the compiler reporting that IT could not run,
-            // which is a fallback rather than a fault in the gameplay source.
             _ => FastCompileOutcome::Unavailable {
                 reason: self.diagnostics(),
             },
@@ -338,7 +345,7 @@ impl FastCompiler {
 /// The project's build writes it into the project's own `obj` directory, so
 /// it is derived from the output directory rather than stored: that
 /// directory is `<project>/bin/<configuration>/<framework>` by
-/// construction, and its fourth ancestor is the project root.
+/// construction, and the directory three levels above it is the project root.
 ///
 /// Returns `None` when the output directory has no such shape, which is the
 /// shipping posture - a bundle keeps the assembly flat beside the

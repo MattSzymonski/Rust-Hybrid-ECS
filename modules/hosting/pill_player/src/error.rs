@@ -8,9 +8,9 @@
 //! # Design
 //!
 //! The engine cannot name a renderer error without depending on the renderer
-//! contract, so the windowed boundary composes its failure sources here.
-//! Window and event-loop failures belong to the frontend that owns the event
-//! loop, which composes this type with its own.
+//! contract, which depends on the engine, so the windowed boundary composes
+//! its failure sources here. Window and event-loop failures belong to the
+//! frontend that owns the event loop, which composes this type with its own.
 
 // External crates
 use pill_core_macros::engine_error;
@@ -25,11 +25,13 @@ use pill_core_macros::engine_error;
 /// chain unchanged from wherever it was raised.
 #[engine_error(namespace = runtime::rendering, runtime = ::pill_core::error)]
 pub enum RenderingError {
-    /// Setup failed before any window existed.
+    /// Host setup failed, or the development host could not start its renderer
+    /// module; both arrive as a [`pill_core::error::HostError`].
     #[transparent]
     Host(#[from] pill_core::error::HostError),
 
-    /// The GPU surface, device, or a frame could not be obtained.
+    /// The renderer failed: registration or attach, the GPU's surface or
+    /// device, a resource it needs, or a frame it could not draw.
     #[transparent]
     Renderer(#[from] pill_renderer_api::RendererError),
 }

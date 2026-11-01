@@ -20,9 +20,9 @@ DESCRIPTION
                            reload is followed by a queued project reload.
       * cascade_total    - same edit -> the cascaded project reload line
                            (module + project = the full user-visible cost).
-      * project_reload   - editing `examples/local/project_rs/src/settings.rs` directly
+      * project_reload   - editing `devops/tests/projects/project_rs/src/settings.rs` directly
                            (project-only, no module cascade).
-      * csharp_reload    - editing `examples/local/project_cs/src/Systems.cs` ->
+      * csharp_reload    - editing `devops/tests/projects/managed/src/Systems.cs` ->
                            `C# hot reload complete` (dotnet build + collectible
                            assembly swap).
 
@@ -120,7 +120,7 @@ modules:
 
 # --- C# reload tokens ---------------------------------------------------------
 
-CSHARP_RELOADED_TOKEN = "[csharp_runtime] reloaded project_cs.dll"
+CSHARP_RELOADED_TOKEN = "[csharp_runtime] reloaded managed.dll"
 CSHARP_RELOAD_COMPLETE_TOKEN = "C# hot reload complete"
 CSHARP_RELOAD_REJECTED_TOKEN = "C# reload rejected"
 
@@ -199,14 +199,14 @@ CASCADE_EDIT = EditHook(
 # the breakdown is wall time only.
 CSHARP_EDIT = EditHook(
     label="csharp_reload",
-    path=PROJECT_CS_SYSTEMS_CS,
+    path=MANAGED_PROJECT_SYSTEMS_CS,
     edit=(
         "cs spline bridge: sees {visibleSplines} spline(s), ",
         "cs spline bridge perf: sees {visibleSplines} spline(s), ",
     ),
     wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
     settle_token=CSHARP_RELOAD_COMPLETE_TOKEN,
-    analytics_name="project_cs",
+    analytics_name="managed",
 )
 
 # =============================================================================
@@ -224,15 +224,15 @@ CSHARP_EDIT = EditHook(
 PREREQUISITE_FILES = [
     ("pill_spline module source", SPLINE_LIB_RS, "native"),
     ("project_rs source", PROJECT_RS_SETTINGS_RS, "native"),
-    ("project_cs source", PROJECT_CS_SYSTEMS_CS, "csharp"),
+    ("managed source", MANAGED_PROJECT_SYSTEMS_CS, "csharp"),
     ("project_rs settings", project_settings_yaml(NATIVE_PROJECT_ROOT), "native"),
-    ("project_cs settings", project_settings_yaml(CSHARP_PROJECT_ROOT), "csharp"),
+    ("managed settings", project_settings_yaml(CSHARP_PROJECT_ROOT), "csharp"),
 ]
 
 PREREQUISITE_ANCHORS = [
     ("pill_spline constant", SPLINE_LIB_RS, SPLINE_OFFSET_ANCHOR, "native"),
     ("project_rs constant", PROJECT_RS_SETTINGS_RS, PROJECT_EDIT.edit[0], "native"),
-    ("project_cs probe prefix", PROJECT_CS_SYSTEMS_CS, CSHARP_EDIT.edit[0], "csharp"),
+    ("managed probe prefix", MANAGED_PROJECT_SYSTEMS_CS, CSHARP_EDIT.edit[0], "csharp"),
 ]
 
 
@@ -275,7 +275,7 @@ def verify_prerequisites(run_native: bool, run_csharp: bool) -> bool:
     print("  module/project file. If the layout changed (an extension was deleted or")
     print("  renamed, a project moved, or a constant renamed), update the paths and edit")
     print("  anchors at the top of this file (SPLINE_LIB_RS, PROJECT_RS_SETTINGS_RS,")
-    print("  PROJECT_CS_SYSTEMS_CS and the EditHook definitions), or use --native-only /")
+    print("  MANAGED_PROJECT_SYSTEMS_CS and the EditHook definitions), or use --native-only /")
     print("  --csharp-only to measure only the session whose layout still matches.")
     print("  Problems found:")
     for problem in problems:
@@ -437,7 +437,7 @@ def build_host() -> bool:
     """Builds the standalone host once before the script runs.
 
     `rendering` is required, not a preference. The native session drives
-    `examples/local/project_rs`, which links `pill_master_renderer` directly, and
+    `devops/tests/projects/project_rs`, which links `pill_master_renderer` directly, and
     that turns on features in crates `pill_core` also depends on. The host
     binary links its own `pill_core.dll`, so a host built without `rendering`
     resolves a different variant than the project does. Windows keeps one
@@ -526,7 +526,7 @@ def measure_one_reload(
 
     # C# reloads have no analytics event; the breakdown is wall time only.
     timing = ReloadTiming(wall_ms=wall_ms)
-    if hook.analytics_name == "project_cs":
+    if hook.analytics_name == "managed":
         return timing
 
     # For cascade_total / project_reload the analytics line IS the wait token,
@@ -939,7 +939,7 @@ def main() -> None:
         project_settings_yaml(CSHARP_PROJECT_ROOT),
         SPLINE_LIB_RS,
         PROJECT_RS_SETTINGS_RS,
-        PROJECT_CS_SYSTEMS_CS,
+        MANAGED_PROJECT_SYSTEMS_CS,
     ):
         BACKUP.capture(path)
 
@@ -970,7 +970,7 @@ def main() -> None:
 
         if run_csharp and passed:
             if not run_session(
-                "CSHARP (project_cs + pill_spline)",
+                "CSHARP (managed + pill_spline)",
                 CSHARP_PROJECT_ROOT,
                 CSHARP_PROJECT_PATH,
                 CSHARP_SETTINGS,

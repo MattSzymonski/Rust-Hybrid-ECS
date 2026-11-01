@@ -2,35 +2,47 @@
 //!
 //! # Responsibilities
 //!
-//! - Locate one function's full text (attributes, signature and body) by name.
-//! - Enumerate every addressable function, with the type that owns it.
+//! - Locate one function's signature and body by name.
+//! - Enumerate every addressable function, with the type and trait that own it.
 //! - Produce the normalized declaration the host and the build scripts compare.
 //! - Collect a file's top-level `use` statements.
 //! - Strip named function bodies, so a body-only edit can be told from any other.
 //!
 //! # Design
 //!
-//! The host, which decides whether an edit is patchable, and each crate's build
-//! script, which records the addresses and signatures the host then asks for,
-//! must agree byte for byte about where a function starts and what its
-//! declaration says; one implementation used from both keeps them so.
+//! Two callers must agree byte for byte about where a function starts and what
+//! its declaration says: the host, which decides whether an edit is patchable,
+//! and each crate's build script, which records the addresses and signatures the
+//! host then asks for. One implementation used from both keeps them so.
 //!
-//! Deliberately a byte scanner rather than a syntax tree: the only questions
-//! asked are "where does this function start and end" and "what changed outside
-//! the bodies", and both are answered by brace matching over a mask that marks
-//! which bytes are real code. A syntax tree would add a full parse to every
-//! keystroke-triggered classification and would still need byte spans to copy
-//! text verbatim.
+//! Deliberately a byte scanner rather than a syntax tree: brace matching over a
+//! mask of real-code bytes answers the only two questions asked - where a
+//! function starts and ends, and what changed outside the bodies - while a
+//! syntax tree would add a full parse to every save-triggered classification and
+//! still need byte spans to copy text verbatim.
 //!
-//! The scanner is conservative by construction: anything it cannot confidently
-//! identify makes classification report "not body-only", which costs a full
-//! module reload rather than risking a wrong patch. The crate has no
-//! dependencies - build scripts run before everything else, so anything pulled
-//! in is paid on every clean build.
+//! Anything the scanner cannot confidently identify makes classification report
+//! "not body-only", which costs a full module reload rather than risking a wrong
+//! patch. The crate has no dependencies, because a build script runs before
+//! everything else and anything pulled in is paid on every clean build.
 
 // Standard library
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Attributes that turn a function into the module ABI's entry point.
+///
+/// The host calls these through the loaded library's export table at load time,
+/// never through a redirect, so registering an address for one would offer a
+/// patch that nothing can use.
+///
+/// Matched as a suffix so both `#[pill_module]` and a path-qualified
+/// `#[pill_engine::pill_module]` are recognized.
+const ABI_ENTRY_POINT_ATTRIBUTES: &[&str] = &["pill_module]", "pill_project]"];
 
 // =============================================================================
 // Code mask
@@ -38,8 +50,9 @@ use std::path::{Path, PathBuf};
 
 /// Marks which bytes of `source` are real code.
 ///
-/// `false` inside string literals, char literals and comments, so a brace in a
-/// string or a `//` in a URL can never confuse brace matching.
+/// `false` inside string literals and comments, so a brace in a string or a `//`
+/// inside one can never confuse brace matching. A character literal is not
+/// recognized: it stays code, including a brace written inside one.
 pub fn code_mask(source: &str) -> Vec<bool> {
     let bytes = source.as_bytes();
     let mut mask = vec![true; bytes.len()];
@@ -191,7 +204,7 @@ pub struct FunctionText {
     pub body: String,
 }
 
-/// Find the body of one method, scoped to the `impl` block that owns it.
+/// Finds one method's full text, scoped to the `impl` block that owns it.
 ///
 /// [`find_function`] searches by bare name and returns the first match, which
 /// cannot tell `impl Default for Alpha` from `impl Default for Beta`, nor an
@@ -224,7 +237,10 @@ pub fn find_method(
     })
 }
 
-/// Find `fn <name>` at the top level and return its full text.
+/// Finds the first `fn <name>` declaration and returns its full text.
+///
+/// Searches the whole file, so a function nested inside another matches too. A
+/// caller that needs a method from its own `impl` block asks [`find_method`].
 ///
 /// Returns `None` when the name does not appear as a function declaration, or
 /// when its braces are unbalanced - both of which make the caller fall back to
@@ -292,11 +308,12 @@ pub fn find_function_in(source: &str, mask: &[bool], name: &str) -> Option<Funct
 // Imports
 // =============================================================================
 
-/// Collect the file's top-level `use` statements, verbatim.
+/// Collects the file's depth-zero `use` statements, each copied from `use`
+/// through its terminating semicolon.
 ///
 /// A generated patch replays these so the copied function body resolves the
-/// same names the original did. Only depth-zero statements are taken;
-/// function-local `use` travels with the body it lives in.
+/// same names the original did; a function-local `use` travels with the body it
+/// lives in.
 pub fn top_level_use_statements(source: &str) -> Vec<String> {
     let bytes = source.as_bytes();
     let mask = code_mask(source);
@@ -335,17 +352,18 @@ pub fn top_level_use_statements(source: &str) -> Vec<String> {
 // Hot function discovery
 // =============================================================================
 
-/// Which hot-patching attribute a function carries.
+/// Which hot-patching route a function's attribute selects.
 ///
 /// The two are redirected through different machinery, so a patch has to know
 /// which one it is replacing before it can be generated or installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotFunctionKind {
-    /// `#[pill_hot]` - an ECS system, redirected through the engine's registry
-    /// in this process.
+    /// `#[pill_hot]` - an ECS system, redirected through the hot-function
+    /// registry of the artifact that declares it.
     System,
     /// `#[pill_hot_fn]` - a plain function or inherent method, redirected
-    /// through a slot that exists once per artifact linking the crate.
+    /// through its dispatch slot, one per artifact that links the crate. An
+    /// un-annotated function carries this kind too, without a slot.
     PlainFunction,
 }
 
@@ -355,14 +373,15 @@ pub struct HotFunction {
     /// The function's own name, which is also the last segment of the name the
     /// running artifact registered it under.
     pub name: String,
-    /// Which attribute marked it.
+    /// Which route the annotation selected; `PlainFunction` when nothing is
+    /// annotated.
     pub kind: HotFunctionKind,
-    /// The type whose inherent `impl` block encloses it, for a method.
+    /// The type whose `impl` block encloses it, for a method.
     ///
-    /// `None` for a free function, and also for a method the scanner could not
-    /// attribute to a simple named type - a generic or trait `impl`. A patch
-    /// for a method must name the receiver type, so classification refuses the
-    /// second case rather than generating something that cannot compile.
+    /// `None` for a free function, and for a method in a block the scanner could
+    /// not attribute to one concrete type - a generic `impl`, or a header that
+    /// is not a plain path. A patch for a method must name the receiver type, so
+    /// such a method is refused rather than generated against a guessed type.
     pub self_type: Option<String>,
     /// The trait whose `impl` block encloses it, for a trait method.
     ///
@@ -410,6 +429,20 @@ pub struct HotFunction {
     /// atomic store; an un-annotated one is redirected by overwriting its
     /// prologue, which needs writable code pages.
     pub annotated: bool,
+}
+
+/// One `impl` block whose methods can be attributed to a named type.
+pub struct ImplBlock {
+    /// Byte range of the block's body, braces included.
+    pub body: (usize, usize),
+    /// The type the block implements methods on.
+    pub type_name: String,
+    /// The trait being implemented, for `impl Trait for Type`.
+    ///
+    /// `None` for an inherent block. Two traits may define the same method name
+    /// for one type, so a trait method is only unambiguous when named through
+    /// the trait - which is why this is carried rather than discarded.
+    pub trait_name: Option<String>,
 }
 
 /// Names of the functions this file marks with `#[pill_hot]` or
@@ -514,11 +547,11 @@ fn hot_functions_in(source: &str, mask: &[bool], blocks: &[ImplBlock]) -> Vec<Ho
 /// Every function in the file the host could address, annotated or not.
 ///
 /// This is the discovery half of macro-free patching, and it deliberately
-/// mirrors what each crate's build script registers: module-level functions and
-/// inherent methods, named through their type. Anything the build script skips
-/// (a function nested inside another, or one in a generic or trait `impl`) is
-/// skipped here too, because the running artifact would have no entry for it
-/// and the lookup would simply fail.
+/// mirrors what each crate's build script treats as addressable: module-level
+/// functions, inherent methods and non-generic trait methods, each named through
+/// its type. Anything the build script skips - a function nested inside another,
+/// or one in a generic `impl` - is skipped here too, because the running
+/// artifact would have no entry for it and the lookup would simply fail.
 ///
 /// The artifact remains the source of truth: the host asks it for an address by
 /// name and refuses the patch when it has none, so a disagreement between this
@@ -567,8 +600,8 @@ pub fn all_functions(source: &str) -> Vec<HotFunction> {
                     let addressable = depth == 0 || (self_type.is_some() && depth == 1);
                     // Keyed by the whole path, not the bare name: a type may
                     // carry an inherent `draw` and a trait `draw`, and two
-                    // traits may each define `draw` for it. Deduplicating by
-                    // name alone silently dropped all but the first.
+                    // traits may each define `draw` for it. Keying by name alone
+                    // would silently drop all but the first.
                     let already = found.iter().any(|existing| {
                         existing.name == name
                             && existing.self_type == self_type
@@ -635,31 +668,20 @@ fn descriptor_at(
     }
 }
 
-/// One `impl` block whose methods can be attributed to a named type.
-pub struct ImplBlock {
-    /// Byte range of the block's body, braces included.
-    pub body: (usize, usize),
-    /// The type the block implements methods on.
-    pub type_name: String,
-    /// The trait being implemented, for `impl Trait for Type`.
-    ///
-    /// `None` for an inherent block. Two traits may define the same method name
-    /// for one type, so a trait method is only unambiguous when named through
-    /// the trait - which is why this is carried rather than discarded.
-    pub trait_name: Option<String>,
-}
-
 /// Every `impl` block in the file that names one concrete type.
 ///
 /// Both inherent blocks (`impl Spline`) and non-generic trait blocks
 /// (`impl Drawable for Spline`) qualify: each has exactly one receiver type and
 /// one address per method, which is what a patch needs.
 ///
-/// Generic blocks (`impl<T> Foo<T>`, `impl Trait for Foo<T>`) are still skipped,
-/// and unavoidably so: a generic has one instantiation per set of type
-/// arguments, so there is no single address to redirect. A method inside one is
-/// reported with no `self_type`, which classification then refuses with a clear
-/// reason instead of emitting a patch that cannot compile.
+/// Generic blocks (`impl<T> Foo<T>`, `impl Trait for Foo<T>`) are skipped, and
+/// unavoidably so: a generic has one instantiation per set of type arguments, so
+/// there is no single address to redirect. A method inside one is reported with
+/// no `self_type`, which classification then refuses with a clear reason instead
+/// of emitting a patch that cannot compile.
+///
+/// `mask` MUST be `code_mask(source)`, since it is indexed by the same byte
+/// offsets.
 pub fn inherent_impl_blocks(source: &str, mask: &[bool]) -> Vec<ImplBlock> {
     let bytes = source.as_bytes();
     let mut blocks = Vec::new();
@@ -727,7 +749,9 @@ fn impl_header_names(header: &str) -> Option<(Option<String>, String)> {
 
 /// One path with no type arguments, or `None`.
 ///
-/// Angle brackets anywhere mean a generic, which has no single address.
+/// Angle brackets anywhere mean a generic, which has no single address. A header
+/// that is not a plain path at all - a reference, a tuple - is refused by the
+/// same character test.
 fn simple_path(candidate: &str) -> Option<String> {
     let candidate = candidate.trim();
     if candidate.is_empty()
@@ -842,6 +866,19 @@ fn is_identifier_byte(byte: u8) -> bool {
 // Body stripping
 // =============================================================================
 
+/// Whether a scan continues inside a function it just matched.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkipStrategy {
+    /// Resume after the function's closing brace, so nested declarations are
+    /// part of the body rather than matches of their own. Body stripping needs
+    /// this: a nested function's body is already inside the body it blanked.
+    PastBody,
+    /// Resume just after the matched declaration, so nested functions are
+    /// matched too - which is what [`find_function`] does, since it searches
+    /// the whole file for a name.
+    IntoBody,
+}
+
 /// Replace the bodies of the named functions with a placeholder.
 ///
 /// Comparing two stripped revisions answers the only question classification
@@ -887,19 +924,6 @@ pub fn function_bodies(source: &str, names: &HashSet<String>) -> HashMap<String,
         bodies.entry(name).or_insert(found.body);
     }
     bodies
-}
-
-/// Whether a scan continues inside a function it just matched.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SkipStrategy {
-    /// Resume after the function's closing brace, so nested declarations are
-    /// part of the body rather than matches of their own. Body stripping needs
-    /// this: a nested function's body is already inside the body it blanked.
-    PastBody,
-    /// Resume just after the matched declaration, so nested functions are
-    /// matched too - which is what [`find_function`] does, since it searches
-    /// the whole file for a name.
-    IntoBody,
 }
 
 /// Every declaration of a named function, in source order, in one pass.
@@ -1004,16 +1028,6 @@ pub fn declaration_is_abi_entry_point(
         .any(|attribute| declaration_has_attribute(source, mask, declaration_start, attribute))
 }
 
-/// Attributes that turn a function into the module ABI's entry point.
-///
-/// The host calls these through the loaded library's export table at load time,
-/// never through a redirect, so registering an address for one would offer a
-/// patch that nothing can use.
-///
-/// Matched as a suffix so both `#[pill_module]` and a path-qualified
-/// `#[pill_engine::pill_module]` are recognized.
-const ABI_ENTRY_POINT_ATTRIBUTES: &[&str] = &["pill_module]", "pill_project]"];
-
 /// Absolute path of the file Cargo compiles as this crate's root.
 ///
 /// Defaults to `src/lib.rs`, and a `[lib] path = "..."` in the manifest moves
@@ -1081,23 +1095,26 @@ pub fn crate_root_file(manifest_directory: &Path) -> PathBuf {
 /// pill_hot_scan::generate_function_inventory();
 /// ```
 ///
-/// and one line in its `lib.rs`:
+/// and one line in the crate root:
 ///
 /// ```ignore
 /// include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
 /// ```
 ///
-/// Every addressable function - module-level, or an inherent method named
-/// through its type - is registered with its qualified path, its address, and
-/// the declaration it was built with, so the host can redirect any of them with
-/// nothing in the source annotated. The host decides what is patchable with the
-/// same scanner, and the two must agree byte for byte.
+/// Every addressable function - module-level, an inherent method, or a trait
+/// method whose trait the crate root can name - is registered with its qualified
+/// path, its address, and the declaration it was built with, so the host can
+/// redirect any of them with nothing in the source annotated. The host decides
+/// what is patchable with the same scanner, and the two must agree byte for byte.
 ///
 /// # Panics
 ///
-/// Panics when the generated file cannot be written, which would otherwise leave
-/// the crate compiling against a stale or absent inventory.
+/// Panics when run outside a build script, which supplies `CARGO_MANIFEST_DIR`,
+/// `OUT_DIR` and `CARGO_PKG_NAME`, and when the generated file cannot be
+/// written; that would leave the crate compiling against a stale or absent
+/// inventory.
 pub fn generate_function_inventory() {
+    // Step 1: Read the build script's environment and the crate layout it names.
     let manifest_directory = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("build scripts always have CARGO_MANIFEST_DIR"),
     );
@@ -1112,11 +1129,12 @@ pub fn generate_function_inventory() {
 
     println!("cargo:rerun-if-changed={}", source_directory.display());
 
-    // The inventory exists so the host can overwrite a function's first bytes,
-    // and that is only sound without optimization: LLVM folds identically-bodied
-    // functions into one symbol, so patching a merged twin rewrites the survivor
-    // into a jump to itself. `/OPT:NOICF` does not prevent it; the merging is
-    // LLVM's, not the linker's.
+    // Step 2: Gate the inventory on the optimization level. It exists so the
+    // host can overwrite a function's first bytes, and that is only sound
+    // without optimization: LLVM folds identically-bodied functions into one
+    // symbol, so patching a merged twin rewrites the survivor into a jump to
+    // itself. `/OPT:NOICF` does not prevent it; the merging is LLVM's, not the
+    // linker's.
     //
     // Above opt-level 0 the inventory is therefore empty, which disables
     // prologue patching by construction rather than by convention - and does not
@@ -1134,6 +1152,8 @@ pub fn generate_function_inventory() {
         return;
     }
 
+    // Step 3: Walk the crate's sources and emit one entry per addressable
+    // function.
     let mut generated = String::from(
         "// Auto-generated by pill_hot_scan - do not edit.\n\
          //\n\
@@ -1251,6 +1271,7 @@ pub fn generate_function_inventory() {
         }
     }
 
+    // Step 4: Write the file the crate's `include!` reads.
     write_inventory(&inventory_path, &generated);
 }
 
@@ -1752,9 +1773,9 @@ fn also_not_annotated() {}
         assert!(mask[0] && bytes[0] == b'l', "plain code stays unmasked");
     }
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
     // Single-pass scanning
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
     /// A deliberately naive oracle for the single-pass scanner.
     ///

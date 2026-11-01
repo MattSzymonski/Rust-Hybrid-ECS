@@ -23,7 +23,7 @@
 //! `FrameDriver::take_rumble_requests` to [`gamepads::Gamepads::play_rumble`]
 //! after them.
 
-/// Gamepads through gilrs: polled into input events, rumbled on request.
+/// Gamepads: polled into input events, rumbled on request.
 #[cfg(all(feature = "gamepad", not(target_arch = "wasm32")))]
 pub mod gamepads;
 

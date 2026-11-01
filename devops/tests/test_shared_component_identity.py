@@ -90,7 +90,7 @@ SHARED_ATTRIBUTE = "#[pill(persistable, shared)]"
 UNSHARED_ATTRIBUTE = "#[pill(persistable)]"
 
 # The project must load `pill_spline` as a module *and* link it directly, which
-# is exactly the arrangement that produces two `TypeId`s. `examples/local/project_rs`
+# is exactly the arrangement that produces two `TypeId`s. `devops/tests/projects/project_rs`
 # does both, so this suite drives it rather than the fixture project.
 TEST_PROJECT_SETTINGS = """\
 name: "Shared Identity Test"
@@ -508,7 +508,7 @@ def install_failing_reload_with_resource() -> None:
 # Process helpers
 # =============================================================================
 
-# `rendering` is required, not a preference. `examples/local/project_rs` links
+# `rendering` is required, not a preference. `devops/tests/projects/project_rs` links
 # `pill_master_renderer` directly, so the project build resolves the wgpu
 # graph, and the host's engine dylibs must match the resolution every spawned
 # build gets (`apply_cargo_host_overrides` in
@@ -517,7 +517,7 @@ HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
 
 
 def launch_host() -> Tuple[subprocess.Popen, OutputMonitor]:
-    """Starts the headless host against `examples/local/project_rs`."""
+    """Starts the headless host against `devops/tests/projects/project_rs`."""
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = NATIVE_PROJECT_PATH
     return launch_process(host_command(HOST_POSTURE), MODULES_ROOT, process_environment)

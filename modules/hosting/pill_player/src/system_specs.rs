@@ -2,8 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Report CPU, memory, storage and OS through the telemetry stack, once
-//!   per runtime.
+//! - Reports CPU, memory, storage and OS through the telemetry stack, once
+//!   per [`crate::Runtime`].
 //!
 //! # Design
 //!
@@ -17,8 +17,13 @@
 // External crates
 use pill_core::info;
 use pill_core::telemetry::log_block;
+use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 
-/// Report a summary of detected system hardware through the telemetry stack.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Reports a summary of detected system hardware through the telemetry stack.
 ///
 /// Includes CPU, core/thread count, RAM, swap, disks, OS and uptime.
 ///
@@ -29,8 +34,6 @@ use pill_core::telemetry::log_block;
 /// Called by [`Runtime::new`](crate::Runtime::new), before it creates the
 /// engine.
 pub(crate) fn print_system_specs() {
-    use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
-
     // Step 1: Snapshot system state and derive RAM, swap, and CPU figures.
     //
     // Targeted refresh, never `System::new_all()`: the report reads memory and
@@ -98,11 +101,11 @@ pub(crate) fn print_system_specs() {
     );
 }
 
-/// The `Storage` branch of the system report: one line per detected storage
-/// device, or a single "no disks detected" line when the list is empty.
+/// Builds the `Storage` branch of the system report: one line per detected
+/// storage device, or a single "no disks detected" line when the list is empty.
 ///
 /// Each device line shows the mount point, used/total space, usage percentage,
-/// and disk kind (SSD/HDD).
+/// and disk kind - SSD, HDD, or `?` when the platform does not say.
 fn disk_info_lines(disks: &sysinfo::Disks) -> Vec<String> {
     if disks.is_empty() {
         return vec!["├─ Storage: no disks detected".to_string()];
@@ -123,8 +126,8 @@ fn disk_info_lines(disks: &sysinfo::Disks) -> Vec<String> {
             sysinfo::DiskKind::HDD => "HDD",
             _ => "?",
         };
+        // Device names can be long; the mount point identifies the disk.
         let mount = disk.mount_point().to_string_lossy();
-        // Disk name can be long; just show mount point.
         let branch = if i == count - 1 { "└─" } else { "├─" };
         lines.push(format!(
             "│  {branch} {mount}  {used_gb:.0} / {total_gb:.0} GiB used ({pct:.0}%)  [{kind}]"
@@ -133,10 +136,11 @@ fn disk_info_lines(disks: &sysinfo::Disks) -> Vec<String> {
     lines
 }
 
-/// Format a duration in seconds as a compact `Nd Nh Nm` human-readable string.
+/// Formats a duration in whole seconds as a compact `Nd Nh Nm` string.
 ///
-/// Omits the days component when it is zero and returns `"unknown"` for a
-/// zero-second input, which is what a platform without an uptime reports.
+/// Drops the days component when it is zero, and the hours component when both
+/// days and hours are zero. A zero-second input reads `"unknown"`, the uptime
+/// a platform that reports none yields.
 fn format_uptime(seconds: u64) -> String {
     if seconds == 0 {
         return "unknown".to_string();
@@ -153,7 +157,10 @@ fn format_uptime(seconds: u64) -> String {
     }
 }
 
-/// Human-readable OS name.
+/// Returns the OS name and version with the build architecture.
+///
+/// A platform that reports no name reads `unknown`; one that reports no
+/// version leaves it out.
 fn os_pretty_name() -> String {
     let name = sysinfo::System::name().unwrap_or_else(|| "unknown".to_string());
     let version = sysinfo::System::os_version().unwrap_or_default();

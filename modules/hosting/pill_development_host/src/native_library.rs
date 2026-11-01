@@ -1,13 +1,16 @@
-//! Native project-library loading and Windows-safe temporary-copy handling.
+//! Native project-library loading, export resolution and the temporary copies
+//! that outlive a reload.
 //!
-//! Loaded modules are copied to unique paths before opening, so a rebuilt DLL
-//! can replace the build output while an older generation stays mapped for the
-//! pointers and vtables compiled into it.
+//! A module is staged under a unique per-generation path before it is opened,
+//! so a rebuilt DLL can replace the build output while an older generation
+//! stays mapped for the pointers and vtables compiled into it.
 //!
 //! # Responsibilities
 //!
 //! - Load native libraries from unique temporary paths.
-//! - Validate required exports and call the registration entry point.
+//! - Validate the required exports, read the ABI revision and call the
+//!   registration entry point.
+//! - Explain a failed load from the artifact's own import tables.
 //! - Remove temporary copies left behind by earlier host processes.
 //!
 //! # Design
@@ -16,13 +19,17 @@
 //! A project and an extension are the same loadable artifact - same exports,
 //! same loader, same reload transaction, same graveyard - so the loader has
 //! nothing to parameterise:
+//!
 //! - `pill_module_init(*const EngineApi) -> u32` - required: registers
-//!   components and systems before the first frame and returns zero on success;
-//!   any other status aborts the load transaction.
+//!   components and systems before the first frame and returns zero on
+//!   success; any other status fails the load transaction, and the previous
+//!   generation is re-initialized.
 //! - `pill_module_abi_version() -> u32` - optional: read before anything else
 //!   is called, so an incompatible artifact is rejected rather than invoked.
-//! Exports are cached at load time, and `pill_module_init` must be idempotent:
-//! a failed generation rolls back by re-initializing the previous artifact.
+//!
+//! Exports are cached at load time as raw function pointers, valid while the
+//! library handle keeps the image mapped; `pill_module_init` must be
+//! idempotent.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -49,7 +56,26 @@ use crate::csharp::{ResolvedFieldAccessor, ResolvedMirrorMethod};
 // Constants
 // =============================================================================
 
-/// Directory where temporary native-library copies are stored.
+/// The engine's shared libraries, by file stem: every module, project and
+/// patch imports them, and each exists once per process unless a module needs
+/// the isolated copies (see [`engine_dylib_needs_isolation`]).
+///
+/// Every one is a type-identity boundary: the UI frame and draw data
+/// (`pill_ui_frame`), the in-game egui UI and its editor core
+/// (`pill_project_ui`, `pill_editor_core`), and the `Theme`/`Handle`s of
+/// `pill_ui_theme`. A reload must find the same instance the host loaded, so
+/// all of them stage.
+pub(crate) const ENGINE_DYLIB_STEMS: [&str; 6] = [
+    "pill_core",
+    "pill_engine_core",
+    "pill_ui_frame",
+    "pill_project_ui",
+    "pill_editor_core",
+    "pill_ui_theme",
+];
+
+/// Directory, under the workspace root, where temporary native-library copies
+/// are stored.
 const TEMPORARY_DIRECTORY: &str = "pill_standalone_temp";
 
 /// How long another process's staging directory is left alone after its last
@@ -80,28 +106,60 @@ const MAX_RETAINED_STAGING_DIRECTORIES: usize = 8;
 static TEMPORARY_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// `LOAD_WITH_ALTERED_SEARCH_PATH`: make a module's dependency resolution start
-/// from the directory that contains the module, so it loads the engine dylib
-/// staged beside it rather than the host's copy from the executable directory.
+/// from the directory that contains the module, so it loads the engine dylibs
+/// staged beside it rather than the host's copies from the executable
+/// directory.
 #[cfg(windows)]
 const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 
-/// The engine's shared libraries, by file stem: every module, project and
-/// patch imports them, and each exists once per process unless a module needs
-/// the isolated copies (see [`engine_dylib_needs_isolation`]).
+/// Required registration entry point of a loadable artifact.
 ///
-/// Every one is a type-identity boundary: the UI frame and draw data
-/// (`pill_ui_frame`), the in-game egui UI and its editor core
-/// (`pill_project_ui`, `pill_editor_core`), and the `Theme`/`Handle`s of
-/// `pill_ui_theme`. A reload must find the same instance the host loaded, so
-/// all of them stage.
-pub(crate) const ENGINE_DYLIB_STEMS: [&str; 6] = [
-    "pill_core",
-    "pill_engine_core",
-    "pill_ui_frame",
-    "pill_project_ui",
-    "pill_editor_core",
-    "pill_ui_theme",
-];
+/// One name for both kinds. A project and an extension export the same
+/// symbols, load the same way, reload through the same transaction and retire
+/// into the same graveyard. The differences that are real - a project is
+/// singular where modules are an ordered list, a module's components are
+/// mirrored to C# - are policy, and live in the config and the reload
+/// transaction rather than in the loader.
+const MODULE_INIT_SYMBOL: &[u8] = b"pill_module_init";
+
+/// Optional ABI revision export, read at load time when present.
+const MODULE_ABI_VERSION_SYMBOL: &[u8] = b"pill_module_abi_version";
+
+/// Export a loadable artifact provides so a patch can reach its redirect slots.
+#[cfg(feature = "hot_patch")]
+const PLAIN_FUNCTION_INSTALL_SYMBOL: &[u8] = b"pill_hot_resolve_install";
+
+/// Export that returns one redirect slot to the artifact's own body.
+#[cfg(feature = "hot_patch")]
+const PLAIN_FUNCTION_RESET_SYMBOL: &[u8] = b"pill_hot_resolve_reset";
+
+/// Export that reports any function address in this artifact.
+#[cfg(feature = "hot_patch")]
+const FUNCTION_ADDRESS_SYMBOL: &[u8] = b"pill_hot_resolve_address";
+
+/// Export reporting how many of an artifact's functions have a known length.
+#[cfg(feature = "hot_patch")]
+const EXTENT_COVERAGE_SYMBOL: &[u8] = b"pill_hot_resolve_extent_coverage";
+
+/// Export reporting how many value-type descriptors an artifact declares.
+const VALUE_TYPE_COUNT_SYMBOL: &[u8] = b"pill_value_type_descriptor_count";
+
+/// Export copying an artifact's value-type descriptors into a host buffer.
+const VALUE_TYPE_COPY_SYMBOL: &[u8] = b"pill_copy_value_type_descriptors";
+
+/// Export reporting how many mirrored-method descriptors an artifact declares.
+const MIRROR_METHOD_COUNT_SYMBOL: &[u8] = b"pill_mirror_method_descriptor_count";
+
+/// Export copying an artifact's mirrored-method descriptors into a host buffer.
+const MIRROR_METHOD_COPY_SYMBOL: &[u8] = b"pill_copy_mirror_method_descriptors";
+
+/// Export reporting how many heap-field accessor descriptors an artifact
+/// declares.
+const FIELD_ACCESSOR_COUNT_SYMBOL: &[u8] = b"pill_field_accessor_descriptor_count";
+
+/// Export copying an artifact's heap-field accessor descriptors into a host
+/// buffer.
+const FIELD_ACCESSOR_COPY_SYMBOL: &[u8] = b"pill_copy_field_accessor_descriptors";
 
 /// Whether a module build produced engine dylibs different from the ones the
 /// host has mapped, which means the module must load against its own copies.
@@ -109,9 +167,11 @@ pub(crate) const ENGINE_DYLIB_STEMS: [&str; 6] = [
 /// When every pair is byte-identical (a plain CLI host whose feature closure
 /// matches the module build) the module keeps loading the host's single
 /// instances; only a host whose graph unions different features onto the
-/// shared engine crates (a GUI frontend) needs the isolated copies. The two
-/// dylibs are isolated together: a module's `pill_engine_core.dll` imports
-/// `pill_core.dll`, and both must come from the same build.
+/// shared engine crates (a GUI frontend) needs the isolated copies. The set
+/// is staged together: a module's `pill_engine_core.dll` imports
+/// `pill_core.dll`, and the UI dylibs share type identity across the boundary,
+/// so a module resolving some of its engine dylibs from one build and the rest
+/// from another gets mismatched symbol hashes and two `Theme` types.
 fn engine_dylib_needs_isolation(workspace_root: &Path) -> bool {
     first_engine_dylib_mismatch(workspace_root).is_some()
 }
@@ -485,30 +545,14 @@ type PlainFunctionInstallFn =
 #[cfg(feature = "hot_patch")]
 type PlainFunctionResetFn = unsafe extern "C" fn(*const std::ffi::c_char) -> u32;
 
-/// Export a loadable artifact provides so a patch can reach its redirect slots.
-#[cfg(feature = "hot_patch")]
-const PLAIN_FUNCTION_INSTALL_SYMBOL: &[u8] = b"pill_hot_resolve_install";
-
 /// Signature of the build-script-backed address resolver.
 #[cfg(feature = "hot_patch")]
 type FunctionAddressFn =
     unsafe extern "C" fn(*const std::ffi::c_char, *mut *const u8, *mut usize) -> usize;
 
-/// Export that reports any function address in this artifact.
-#[cfg(feature = "hot_patch")]
-const FUNCTION_ADDRESS_SYMBOL: &[u8] = b"pill_hot_resolve_address";
-
 /// Signature of the extent-coverage diagnostic export.
 #[cfg(feature = "hot_patch")]
 type ExtentCoverageFn = unsafe extern "C" fn() -> u64;
-
-/// Export reporting how many of an artifact's functions have a known length.
-#[cfg(feature = "hot_patch")]
-const EXTENT_COVERAGE_SYMBOL: &[u8] = b"pill_hot_resolve_extent_coverage";
-
-/// Export that returns one redirect slot to the artifact's own body.
-#[cfg(feature = "hot_patch")]
-const PLAIN_FUNCTION_RESET_SYMBOL: &[u8] = b"pill_hot_resolve_reset";
 
 /// Signature of the optional ABI revision export.
 type ModuleAbiVersionFn = unsafe extern "C" fn() -> u32;
@@ -525,9 +569,9 @@ type CopyValueTypesFn = unsafe extern "C" fn(*mut PillValueTypeDescriptor, u32) 
 ///
 /// Same shape as the value-type manifest: the artifact reports how many
 /// `#[pill_mirror_method]` descriptors it carries, then copies that many into
-/// a host-owned buffer. Each descriptor names a `#[no_mangle]` trampoline the
-/// artifact exports, which the host resolves by symbol for the callable
-/// address.
+/// a host-owned buffer. Each descriptor carries the address of the
+/// `#[no_mangle]` trampoline it was compiled with, so the host resolves
+/// nothing by symbol.
 type MirrorMethodCountFn = unsafe extern "C" fn() -> u32;
 type CopyMirrorMethodsFn = unsafe extern "C" fn(*mut PillMethodDescriptor, u32) -> u32;
 
@@ -540,39 +584,6 @@ type CopyMirrorMethodsFn = unsafe extern "C" fn(*mut PillMethodDescriptor, u32) 
 /// callable addresses.
 type FieldAccessorCountFn = unsafe extern "C" fn() -> u32;
 type CopyFieldAccessorsFn = unsafe extern "C" fn(*mut PillFieldAccessorDescriptor, u32) -> u32;
-
-/// Export reporting how many value-type descriptors an artifact declares.
-const VALUE_TYPE_COUNT_SYMBOL: &[u8] = b"pill_value_type_descriptor_count";
-
-/// Export copying an artifact's value-type descriptors into a host buffer.
-const VALUE_TYPE_COPY_SYMBOL: &[u8] = b"pill_copy_value_type_descriptors";
-
-/// Export reporting how many mirrored-method descriptors an artifact declares.
-const MIRROR_METHOD_COUNT_SYMBOL: &[u8] = b"pill_mirror_method_descriptor_count";
-
-/// Export copying an artifact's mirrored-method descriptors into a host buffer.
-const MIRROR_METHOD_COPY_SYMBOL: &[u8] = b"pill_copy_mirror_method_descriptors";
-
-/// Export reporting how many heap-field accessor descriptors an artifact
-/// declares.
-const FIELD_ACCESSOR_COUNT_SYMBOL: &[u8] = b"pill_field_accessor_descriptor_count";
-
-/// Export copying an artifact's heap-field accessor descriptors into a host
-/// buffer.
-const FIELD_ACCESSOR_COPY_SYMBOL: &[u8] = b"pill_copy_field_accessor_descriptors";
-
-/// Required registration entry point of a loadable artifact.
-///
-/// One name for both kinds. A project and an extension export the same
-/// symbols, load the same way, reload through the same transaction and retire
-/// into the same graveyard. The differences that are real - a project is
-/// singular where modules are an ordered list, a module's components are
-/// mirrored to C# - are policy, and live in the config and the reload
-/// transaction rather than in the loader.
-const MODULE_INIT_SYMBOL: &[u8] = b"pill_module_init";
-
-/// Optional ABI revision export, read at load time when present.
-const MODULE_ABI_VERSION_SYMBOL: &[u8] = b"pill_module_abi_version";
 
 /// Owns one loaded native library, either the project or an extension.
 ///
@@ -641,21 +652,18 @@ impl Drop for TemporaryCopy {
     }
 }
 
-/// Fetch the artifact's `#[pill_mirror_method]` descriptors, each with the
-/// exported address of its `#[no_mangle]` trampoline.
-///
-/// Empty when the artifact predates the exports or declares no mirrored
-/// methods. A descriptor whose trampoline symbol cannot be resolved is
-/// skipped rather than surfaced, so a stale descriptor can never hand C#
-/// a null callable.
 impl NativeLibrary {
     /// Copy and load the built shared library from a unique temporary path.
     ///
     /// # Errors
     ///
-    /// Returns an error if the temporary directory cannot be created, the
-    /// built library cannot be copied, or the copy is not a valid native
-    /// library exporting the required `pill_module_init` symbol.
+    /// Returns [`LibraryError::TemporaryDirectory`] when a staging directory
+    /// cannot be created, [`LibraryError::CopyFailed`] when the artifact cannot
+    /// be staged, [`LibraryError::LoadFailed`] when the copy is not a loadable
+    /// native library, and [`LibraryError::MissingExport`] when it does not
+    /// export `pill_module_init`. A load failure is then re-stated as
+    /// [`LibraryError::MissingImport`] or [`LibraryError::EngineDylibMismatch`]
+    /// when the gathered evidence supports one of those answers.
     pub(crate) fn load_copy(
         build_output: &Path,
         workspace_root: &Path,
@@ -810,10 +818,9 @@ impl NativeLibrary {
 
         // Step 3: Load the copy and validate its required exports.
         let load_started = Instant::now();
-        // SAFETY: `temporary_copy.path()` is a complete native module on
-        // disk - it was written by `std::fs::copy` immediately above - and
-        // `Self::load` validates the required exports before returning; see
-        // the fuller justification above the copy.
+        // SAFETY: `temporary_copy.path()` is a complete native module on disk -
+        // staged from the build output in step 2 - and `Self::load` validates
+        // the required `pill_module_init` export before returning.
         let native_library = unsafe {
             Self::load(
                 temporary_copy.path(),
@@ -823,13 +830,11 @@ impl NativeLibrary {
             )
         }
         .inspect_err(|_| {
-            // The guard removes the copy when this function returns the error.
-            // The staged engine dylibs it would have loaded against need the
-            // same treatment when this attempt asked for isolation, because
-            // nothing else deletes it for the life of the process. A dylib a
-            // live library maps cannot be deleted on Windows, so a removal
-            // failure is ignored: another module may already be using it, and
-            // the next attempt stages a fresh copy either way.
+            // The staged engine dylibs go with the copy when this attempt asked
+            // for isolation. A dylib a live library maps cannot be deleted on
+            // Windows, so a removal failure is ignored: another module may
+            // already be using it, and the next attempt stages a fresh copy
+            // either way.
             if isolated_engine {
                 for stem in ENGINE_DYLIB_STEMS {
                     let _ = std::fs::remove_file(generation_directory.join(format!("{stem}.dll")));
@@ -1024,8 +1029,7 @@ impl NativeLibrary {
             let push_address = resolve_optional(descriptor.push_symbol);
             // A descriptor whose every operation failed to resolve is not a
             // usable accessor; publish nothing rather than a row nothing could
-            // call. Which operations a generated mirror needs is checked by
-            // the codegen, which knows the field's kind.
+            // call.
             let callable = view_address.is_some()
                 || resize_address.is_some()
                 || set_address.is_some()
@@ -1066,21 +1070,20 @@ impl NativeLibrary {
         // Step 1: Open the native library and map it into this process.
         // SAFETY: The `# Safety` contract of `load` guarantees `path` names a
         // valid native library. Mapping runs the module's constructors; the
-        // returned handle keeps it mapped and is stored in the
-        // `ProjectLibrary` for the module's whole lifetime.
+        // returned handle keeps it mapped and is stored in the returned
+        // `NativeLibrary` for the module's whole lifetime.
         let library = if isolated_engine {
             // The module was compiled against an engine dylib that differs from
             // the host's; load with the module's own directory first in the
             // dependency search order so it resolves the copy staged beside it.
             #[cfg(windows)]
             {
+                // SAFETY: `path` is the complete native module on disk (staged
+                // by the caller immediately before this load), and the matching
+                // engine dylibs were copied into the same directory just above;
+                // the altered search path therefore only resolves known,
+                // self-owned DLLs.
                 unsafe {
-                    // SAFETY: `path` is the complete native module on disk
-                    // (copied by the caller immediately before this load), and
-                    // the matching engine dylib was copied into the same
-                    // directory just above; the altered search path therefore
-                    // only resolves known, self-owned DLLs.
-
                     // `load_with_flags` returns the platform-level handle; the
                     // crate-root `Library` used by `NativeLibrary` is the safe
                     // wrapper over it, which `From` provides.
@@ -1098,9 +1101,12 @@ impl NativeLibrary {
             }
             // Non-Windows loaders do not pin dependency resolution the way
             // Windows does; fall back to the default load, which resolves the
-            // module's dependencies the same way it always has.
+            // module's dependencies through the platform's own search path.
             #[cfg(not(windows))]
             {
+                // SAFETY: `path` names a complete native module on disk
+                // (validated by the caller), and the default load maps it
+                // without altering dependency resolution.
                 unsafe {
                     Library::new(path).map_err(|source| LibraryError::LoadFailed {
                         path: path.display().to_string(),
@@ -1121,9 +1127,9 @@ impl NativeLibrary {
             }
         };
 
-        // Step 2: Resolve the required `pill_module_init` export. The subject's
-        // name travels with the refusal, because one contract means the symbol
-        // no longer says which artifact is missing it.
+        // Step 2: Resolve the required `pill_module_init` export. The subject
+        // travels with the refusal: a project and an extension export the same
+        // symbol, so the symbol alone does not say which artifact lacks it.
         // SAFETY: `pill_module_init` is a mandatory export of the native ABI
         // contract, so every supported artifact provides it, and it is resolved
         // here as a pointer with the statically known C ABI signature. The
@@ -1151,13 +1157,9 @@ impl NativeLibrary {
                 .ok()
                 .map(|symbol| unsafe { symbol() });
 
-        // Step 4b: Resolve the optional value-type manifest exports. Optional,
+        // Step 4: Resolve the optional value-type manifest exports. Optional,
         // because the project contract predates them; a library that does not
         // export them simply contributes no typed value types.
-        // SAFETY: Both exports, when present, are resolved with their statically
-        // known C ABI signatures and called with a host-owned buffer; the
-        // pointer stays valid because the `library` handle keeps the module
-        // mapped for the lifetime of the returned `NativeLibrary`.
         // SAFETY: `library.get` maps a function pointer from the loaded module
         // with the statically known signature; the mapped module stays alive
         // for as long as the `library` handle held by this `NativeLibrary`.
@@ -1171,7 +1173,7 @@ impl NativeLibrary {
             unsafe { library.get(VALUE_TYPE_COPY_SYMBOL) }
                 .ok()
                 .map(|symbol| *symbol);
-        // Step 4c: Resolve the optional mirrored-method manifest exports.
+        // Step 5: Resolve the optional mirrored-method manifest exports.
         // Optional, exactly like the value-type manifest: a library built
         // before the exports simply contributes no mirrored methods.
         // SAFETY: `library.get` maps each export with its statically known C
@@ -1189,7 +1191,7 @@ impl NativeLibrary {
                 .ok()
                 .map(|symbol| *symbol);
 
-        // Step 4d: Resolve the optional heap-field accessor exports. Optional
+        // Step 6: Resolve the optional heap-field accessor exports. Optional
         // like the manifests above: a library built before the exports simply
         // contributes no container accessors.
         // SAFETY: `library.get` maps each export with its statically known C
@@ -1206,7 +1208,7 @@ impl NativeLibrary {
                 .ok()
                 .map(|symbol| *symbol);
 
-        // Step 4: Copy the resolved pointers out of the borrowed Symbol
+        // Step 7: Copy the resolved pointers out of the borrowed Symbol
         // wrappers. The `library` field keeps the module mapped, so these raw
         // pointers remain valid for the complete lifetime of the returned
         // `NativeLibrary`.
@@ -1241,11 +1243,11 @@ impl NativeLibrary {
 
     /// Reject an artifact built against a different revision of the module ABI.
     ///
-    /// Every loadable artifact exports the same optional
-    /// `pill_module_abi_version`, checked before anything calls into it: a
-    /// mismatch means the two sides disagree about what the entry points
-    /// expect, and proceeding would call through a signature one never agreed
-    /// to. No export at all predates the versioned contract.
+    /// An artifact may export `pill_module_abi_version`; when it does, the
+    /// revision is compared before anything calls into it: a mismatch means
+    /// the two sides disagree about what the entry points expect, and
+    /// proceeding would call through a signature one never agreed to. No
+    /// export at all predates the versioned contract.
     ///
     /// # Errors
     ///
@@ -1803,7 +1805,7 @@ mod tests {
     #[test]
     fn the_retained_bound_evicts_the_least_recently_written_first() {
         let now = SystemTime::now();
-        // One more than the bound allows, all well inside the grace period,
+        // Two more than the bound allows, all well inside the grace period,
         // each a second older than the next.
         let count = MAX_RETAINED_STAGING_DIRECTORIES + 2;
         let candidates: Vec<(u32, SystemTime)> = (0..count)

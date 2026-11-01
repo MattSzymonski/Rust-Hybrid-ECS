@@ -3,9 +3,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Build, load, initialize and reload the renderer module like any extension,
-//!   under an owner of its own ([`RendererModule`]), keeping the host running
-//!   when a load fails: the window stays blank until the next edit.
+//! - Build, load, initialize and reload the renderer module like any
+//!   extension, under an owner of its own ([`RendererModule`]).
 //! - Attach it to a window through its `pill_renderer_attach` export, and wrap
 //!   the backend that returns in [`ModuleRenderer`].
 //!
@@ -51,17 +50,29 @@ use crate::config::ExtensionConfig;
 use crate::extension::{ExtensionSlot, ReloadOutcome};
 use crate::reload::FirstLoadFailure;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// Export that builds a backend on a window.
 const ATTACH_SYMBOL: &[u8] = b"pill_renderer_attach";
 
 /// Export that drops a backend inside the module.
 const DETACH_SYMBOL: &[u8] = b"pill_renderer_detach";
 
+// =============================================================================
+// Types
+// =============================================================================
+
 /// `pill_renderer_attach(window, width, height) -> backend or null`.
 type AttachFn = unsafe extern "C" fn(*const RawWindowData, u32, u32) -> *mut c_void;
 
 /// `pill_renderer_detach(backend)`.
 type DetachFn = unsafe extern "C" fn(*mut c_void);
+
+// =============================================================================
+// RendererModule
+// =============================================================================
 
 /// The renderer module: its slot once a generation has loaded, and the
 /// watcher that drives both its reloads and the retry of a failed first load.
@@ -81,18 +92,6 @@ pub(crate) struct RendererModule {
     owner: SystemOwner,
 }
 
-/// What [`RendererModule::reload_if_changed`] did to the loaded generation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RendererModuleChange {
-    /// Nothing new; whatever backend exists stays valid.
-    Unchanged,
-    /// A generation loaded for the first time; it needs attaching.
-    Loaded,
-    /// An existing module reloaded (or rolled back) with this outcome; if the
-    /// `before_commit` hook ran, the backend was detached and needs attaching.
-    Reloaded(ReloadOutcome),
-}
-
 impl RendererModule {
     /// Watch the renderer module's sources and try its first load.
     ///
@@ -105,7 +104,8 @@ impl RendererModule {
     /// # Errors
     ///
     /// Returns a [`HostError`] only when the configuration is invalid or the
-    /// sources cannot be watched - the two things a later edit cannot fix.
+    /// sources cannot be watched; neither is something a later renderer edit
+    /// fixes.
     pub(crate) fn start(
         name: Option<&str>,
         engine: &mut Engine,
@@ -182,9 +182,10 @@ impl RendererModule {
     ///
     /// `before_commit` is the reload's hook (see
     /// [`ExtensionSlot::reload_if_changed_with`]); a first load has no backend
-    /// to detach and does not run it. `peer_component_names` is what the other
-    /// live subjects declare, so a type only this module dropped is dropped and
-    /// a shared one is kept.
+    /// to detach and does not run it. `peer_component_names` is every component
+    /// name the other live subjects declare, so a type only this module
+    /// declares is dropped when its new generation forgets it, and a shared
+    /// type is kept.
     pub(crate) fn reload_if_changed(
         &mut self,
         engine: &mut Engine,
@@ -264,52 +265,25 @@ impl RendererModule {
     }
 }
 
-/// Build a backend on `window` through the module's attach export.
-///
-/// # Errors
-///
-/// Returns [`RendererError::Other`] when the module lacks the attach or detach
-/// export, or reports that it could not attach (it logs why).
-///
-/// # Safety
-///
-/// `window` names a live window that outlives the returned renderer, and the
-/// returned renderer is dropped before `module` is.
-pub(crate) unsafe fn attach_module_renderer(
-    module: &RendererModule,
-    window: RawWindowData,
-    width: u32,
-    height: u32,
-) -> Result<Box<dyn PillRenderer>, RendererError> {
-    let library = module
-        .slot()
-        .ok_or_else(|| RendererError::Other {
-            detail: "the renderer module has not loaded".to_owned(),
-        })?
-        .current_library();
-    let missing = |export: &str| RendererError::Other {
-        detail: format!("the renderer module does not export `{export}`"),
-    };
-    // SAFETY: both types are the exports' exact signatures, and the pointers
-    // are used only while the module is mapped - the caller drops the renderer
-    // before the module.
-    let attach: AttachFn = unsafe { library.resolve_export(ATTACH_SYMBOL) }
-        .ok_or_else(|| missing("pill_renderer_attach"))?;
-    // SAFETY: as above.
-    let detach: DetachFn = unsafe { library.resolve_export(DETACH_SYMBOL) }
-        .ok_or_else(|| missing("pill_renderer_detach"))?;
+// =============================================================================
+// RendererModuleChange
+// =============================================================================
 
-    // SAFETY: `window` is a valid value on this stack for the call, and names a
-    // live window that outlives the backend by this function's contract.
-    let backend = unsafe { attach(&window, width, height) };
-    let backend = NonNull::new(backend.cast::<Box<dyn PillRenderer>>()).ok_or_else(|| {
-        RendererError::Other {
-            detail: "the renderer module could not attach to the window; see the log above"
-                .to_owned(),
-        }
-    })?;
-    Ok(Box::new(ModuleRenderer { backend, detach }))
+/// What [`RendererModule::reload_if_changed`] did to the loaded generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RendererModuleChange {
+    /// Nothing new; whatever backend exists stays valid.
+    Unchanged,
+    /// A generation loaded for the first time; it needs attaching.
+    Loaded,
+    /// An existing module reloaded (or rolled back) with this outcome; if the
+    /// `before_commit` hook ran, the backend was detached and needs attaching.
+    Reloaded(ReloadOutcome),
 }
+
+// =============================================================================
+// ModuleRenderer
+// =============================================================================
 
 /// A renderer backend that lives in the renderer module.
 ///
@@ -338,6 +312,9 @@ impl ModuleRenderer {
 }
 
 impl PillRenderer for ModuleRenderer {
+    // Every method of the contract is forwarded, defaulted ones included: one
+    // left out would silently run the trait's default instead of the module's
+    // renderer.
     fn capabilities(&self) -> RenderCapabilities {
         self.backend().capabilities()
     }
@@ -357,10 +334,6 @@ impl PillRenderer for ModuleRenderer {
     fn invalidate_assets(&mut self) {
         self.backend_mut().invalidate_assets();
     }
-
-    // Every method of the contract is forwarded, defaulted ones included: a
-    // method left out here would silently run the trait's default instead of
-    // the module's renderer.
 
     unsafe fn attach_surface(
         &mut self,
@@ -413,4 +386,58 @@ impl Drop for ModuleRenderer {
         // slot is dropped after this renderer.
         unsafe { (self.detach)(self.backend.as_ptr().cast()) };
     }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Build a backend on `window` through the module's attach export.
+///
+/// # Errors
+///
+/// Returns [`RendererError::Other`] when no generation has loaded, when the
+/// module lacks the attach or detach export, and when it reports that it could
+/// not attach (it logs why).
+///
+/// # Safety
+///
+/// `window` names a live window that outlives the returned renderer, and the
+/// returned renderer is dropped before `module` is.
+pub(crate) unsafe fn attach_module_renderer(
+    module: &RendererModule,
+    window: RawWindowData,
+    width: u32,
+    height: u32,
+) -> Result<Box<dyn PillRenderer>, RendererError> {
+    // Step 1: Resolve the two exports in the image that is loaded now.
+    let library = module
+        .slot()
+        .ok_or_else(|| RendererError::Other {
+            detail: "the renderer module has not loaded".to_owned(),
+        })?
+        .current_library();
+    let missing = |export: &str| RendererError::Other {
+        detail: format!("the renderer module does not export `{export}`"),
+    };
+    // SAFETY: both types are the exports' exact signatures, and the pointers
+    // are used only while the module is mapped - the caller drops the renderer
+    // before the module.
+    let attach: AttachFn = unsafe { library.resolve_export(ATTACH_SYMBOL) }
+        .ok_or_else(|| missing("pill_renderer_attach"))?;
+    // SAFETY: as above.
+    let detach: DetachFn = unsafe { library.resolve_export(DETACH_SYMBOL) }
+        .ok_or_else(|| missing("pill_renderer_detach"))?;
+
+    // Step 2: Attach on the window and take ownership of the returned pointer.
+    // SAFETY: `window` is a valid value on this stack for the call, and names a
+    // live window that outlives the backend by this function's contract.
+    let backend = unsafe { attach(&window, width, height) };
+    let backend = NonNull::new(backend.cast::<Box<dyn PillRenderer>>()).ok_or_else(|| {
+        RendererError::Other {
+            detail: "the renderer module could not attach to the window; see the log above"
+                .to_owned(),
+        }
+    })?;
+    Ok(Box::new(ModuleRenderer { backend, detach }))
 }

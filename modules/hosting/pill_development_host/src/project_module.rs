@@ -3,19 +3,24 @@
 //! # Responsibilities
 //!
 //! - Builds and loads the selected backend during startup.
-//! - Reloads native modules without dropping the libraries mapped before them.
+//! - Reloads a native generation through a graveyard that keeps earlier images
+//!   mapped while pointers into them can still be live.
 //! - Delegates managed reload polling to the C# bridge's runtime, through
 //!   `crate::csharp`.
-//! - Keeps native component-schema migration beside the DLL swap it protects.
+//! - Keeps each generation's registration record - persistable type names,
+//!   schema hashes, resource ids and every component name - so the next reload
+//!   can tell what changed and what a peer still declares.
 //!
 //! # Design
 //!
 //! The host keeps exactly one [`LoadedProject`] alive at a time. Native backends
-//! are reloaded transactionally by [`reload_native`]: the previous DLL stays
-//! mapped in a bounded graveyard while changed persist schemas migrate, so
-//! engine-owned pointers into retired code remain valid. Managed backends
-//! delegate assembly discovery and validation to the C# bridge's runtime, which
-//! reports success or rejection through `poll_reload`.
+//! are reloaded transactionally by [`reload_native`], which hands the build, the
+//! private copy and the swap to `crate::reload`: the retired DLL enters a
+//! bounded graveyard and stays mapped until no column needs its tables, so
+//! engine-owned pointers into retired code remain valid while changed persist
+//! schemas migrate. Managed backends delegate assembly discovery and validation
+//! to the C# bridge's runtime, which reports success or rejection through
+//! `poll_reload`.
 
 // The whole module is the loaded-project lifecycle: build, load, initialize,
 // reload, retire. A statically linked build does none of that - the project's
@@ -48,10 +53,6 @@ mod loaded {
     use crate::native_library::NativeLibrary;
     use crate::watcher::SourceTrigger;
     use crate::{ProjectModuleBackend, ProjectModuleConfig};
-
-    // =============================================================================
-    // Constants
-    // =============================================================================
 
     // =============================================================================
     // ManagedReloadStart
@@ -157,9 +158,10 @@ mod loaded {
         ///
         /// # Errors
         ///
-        /// Returns `HostError` when the module fails to compile, when the native
-        /// library cannot be loaded, or when the module's `pill_module_init` reports a
-        /// non-zero initialization status.
+        /// Returns `HostError` when the module fails to build, when its output
+        /// artifact is missing, when the native library cannot be loaded, when the
+        /// module's `pill_module_init` reports a non-zero initialization status, or
+        /// when the managed runtime fails to start the C# project.
         pub(crate) fn start(
             engine: &mut Engine,
             engine_api: &EngineApi,
@@ -283,15 +285,14 @@ mod loaded {
 
         /// Poll the collectible managed loader after its assembly debounce.
         ///
-        /// Returns whether this poll landed an assembly swap. This is the
-        /// frame path's half of the deliberate two-mechanism design described
-        /// on the C# arm of `reload`: the `dotnet build` fallback has no
-        /// completion signal, so every frame gives the loader a chance to
-        /// observe settled bytes, while the in-process compiler short-circuits
-        /// the interval through `NotifyAssemblyReplaced`. The debounce can
-        /// outlive the frame that triggered the build, so a swap - and the
-        /// bookkeeping it invalidates - is observed here as often as in
-        /// `reload`'s own poll.
+        /// Returns whether this poll landed an assembly swap. Two mechanisms
+        /// complete a managed reload: the in-process compiler collapses the
+        /// loader's debounce through `NotifyAssemblyReplaced`, while a rebuild
+        /// through the `dotnet build` fallback leaves no completion signal of
+        /// its own, so every frame gives the loader a chance to observe settled
+        /// bytes. The debounce can outlive the frame that triggered the build,
+        /// which is why the swap - and the bookkeeping it invalidates - is
+        /// observed here as well as on the build completion.
         pub(crate) fn poll_managed_reload(&mut self, engine: &mut Engine) -> bool {
             // Source and assembly watchers have independent debounce windows. Poll
             // every frame so a successful build is eventually observed even when
@@ -306,8 +307,8 @@ mod loaded {
         /// starts.
         ///
         /// A native project has no managed reload to time, so it ignores the
-        /// signal; the entry is still consumed, which is what keeps the
-        /// watcher's log bounded on native projects.
+        /// signal and arms nothing; the caller takes the trigger out of the
+        /// watcher's log for this reload either way, so none is left pending.
         pub(crate) fn arm_managed_reload_timing(&mut self, trigger: Option<SourceTrigger>) {
             if let Self::CSharp(project) = self {
                 project.arm_reload_timing(trigger);
@@ -454,9 +455,9 @@ mod loaded {
     /// Produce one managed build outcome with the compiler/MSBuild selection
     /// shared by the build worker and the synchronous fallback.
     ///
-    /// The in-process compiler replays the compiler command line the startup
-    /// build captured, which takes tens of milliseconds where a `dotnet build`
-    /// of the same edit takes one to three seconds. It cannot answer every
+    /// The in-process compiler replays the compiler command line the project's
+    /// last full build captured, which takes tens of milliseconds where a
+    /// `dotnet build` of the same edit takes seconds. It cannot answer every
     /// reload - a source file added or removed changes the command line itself -
     /// and it may not exist at all, so both cases fall through to the full
     /// `dotnet build`. That build also refreshes the capture, which is what
@@ -537,6 +538,12 @@ mod loaded {
 
     /// Run the full `dotnet build` for a reload the captured command line
     /// could not answer, reporting its error as text for the reload log.
+    ///
+    /// # Errors
+    ///
+    /// Returns the build's error rendered as text when the build fails or its
+    /// output artifact is missing; the caller logs it and keeps the running
+    /// assembly.
     fn run_full_project_build(
         workspace_root: &Path,
         config: &ProjectModuleConfig,
@@ -573,11 +580,11 @@ mod loaded {
         config: &ProjectModuleConfig,
         cancel_flag: Option<(&AtomicU64, u64)>,
     ) -> bool {
-        // Steps 1 to 3 are shared with the extension path and live in
-        // `crate::reload`: compile before touching engine state, load a private
-        // copy, then swap through the transaction whose step order is
-        // load-bearing. A refused step returns `None`, which for the project
-        // means nothing was replaced.
+        // Step 1: Build, load and commit through the shared transaction. Those
+        // three steps are the extension path's too, and their order is
+        // load-bearing: nothing touches engine state before the compile
+        // succeeds. A refused step returns `None`, which for the project means
+        // nothing was replaced.
         let transaction = crate::reload::ReloadTransaction {
             kind: crate::reload::ReloadSubjectKind::Project,
             subject: &config.name,
@@ -602,8 +609,9 @@ mod loaded {
         ) else {
             return false;
         };
-        // The swapped generation's declarations replace the previous set, so a
-        // later module reload asks about the project as it stands now.
+
+        // Step 2: The swapped generation's declarations replace the previous
+        // set, so a later module reload asks about the project as it stands.
         *registered_component_names = commit.exposed_component_names;
         true
     }

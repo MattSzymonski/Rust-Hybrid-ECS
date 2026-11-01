@@ -111,7 +111,7 @@ FRONTENDS = {
         ALL_DYLIBS,
     ),
     "headless reload-only": (
-        ["--package", "pill_standalone", "--no-default-features", "--features", "dev"],
+        ["--package", "pill_standalone", "--no-default-features", "--features", "development"],
         [],
         None,
         ALL_DYLIBS,

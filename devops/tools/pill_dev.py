@@ -52,7 +52,7 @@ FLAGS:
 
   --project PATH    Project module used for PROJECT_PATH (default: the project
                     `pick` recorded, else $PROJECT_PATH, else
-                    <repo>/examples/local/project_cs).
+                    <repo>/devops/tests/projects/managed).
   --session N       Interactive session a windowed host is launched into
                     (default: 1).
   --log PATH        File a windowed host's output is redirected to
@@ -106,12 +106,15 @@ sys.path.insert(0, str(REPO_ROOT / "devops"))
 
 from core.projects import (  # noqa: E402
     EXAMPLES_ROOT,
-    PROJECT_CS_ROOT,
+    OFFICIAL_EXAMPLE_PROJECTS,
     PROJECT_SETTINGS_FILENAME,
+    example_project_roots,
 )
 
 MODULES_DIRECTORY = REPO_ROOT / "modules"
-DEFAULT_PROJECT = PROJECT_CS_ROOT
+# The picker's fallback when nothing is chosen: the smallest official project
+# that draws, so a developer's first launch needs no arguments.
+DEFAULT_PROJECT = OFFICIAL_EXAMPLE_PROJECTS["cube_csharp"]
 DEFAULT_LOG = Path(r"D:\Temp\pill.log")
 
 # A project module is a directory under the examples root with the marker
@@ -258,7 +261,7 @@ def display_path(path: Path) -> str:
 
 def discover_projects() -> list[Path]:
     """Project modules under examples/, in name order."""
-    return sorted(path.parent for path in PROJECTS_DIRECTORY.glob(f"*/{PROJECT_MARKER}"))
+    return sorted(path for path in example_project_roots() if (path / PROJECT_MARKER).is_file())
 
 
 def project_language(project: Path) -> str:

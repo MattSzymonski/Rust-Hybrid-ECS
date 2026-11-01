@@ -49,7 +49,7 @@ from typing import Dict, List, Optional, Sequence
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "devops"))
 
-from core.projects import EXAMPLES_ROOT  # noqa: E402
+from core.projects import project_roots  # noqa: E402
 
 METADATA_SUFFIX = ".meta"
 
@@ -109,8 +109,10 @@ def check_root(root: Path) -> List[str]:
 
 
 def default_roots() -> List[Path]:
-    """Every example project's `res` directory."""
-    return sorted(path for path in EXAMPLES_ROOT.glob("*/res") if path.is_dir())
+    """Every example and fixture project's `res` directory."""
+    return sorted(
+        root / "res" for root in project_roots() if (root / "res").is_dir()
+    )
 
 
 def check(roots: Sequence[Path]) -> int:

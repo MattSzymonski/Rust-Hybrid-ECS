@@ -17,29 +17,59 @@
 //! wants them all in one place. A host with no editor attached never drains;
 //! the cap keeps that bounded.
 //!
-//! A notice carries owned strings only. It is queued on the frame thread and
-//! drained on the frame thread (the build runner's reader thread never writes
-//! here), so no ordering machinery beyond the mutex is needed.
+//! A notice carries owned strings only. It is queued and drained on the host's
+//! main thread - the startup loads queue before the first frame - and the build
+//! runner's reader thread never writes here, so no ordering machinery beyond
+//! the mutex is needed.
 
 // Standard library
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// How many notices wait for a drain before the oldest are dropped.
+///
+/// Generous enough that a burst (a reload plus its patches) arrives whole,
+/// small enough that a host nobody drains stays cheap.
+const NOTICE_CAPACITY: usize = 256;
+
+/// The queue [`push`] fills and [`take`] empties.
+static NOTICES: Mutex<VecDeque<HostNotice>> = Mutex::new(VecDeque::new());
+
+// =============================================================================
+// Types
+// =============================================================================
+
 /// One event the host reports to an attached editor frontend.
 #[derive(Clone, Debug)]
 pub enum HostNotice {
-    /// A module's reload ended without a swap: its build failed, the new
-    /// library could not load, or validation refused it. `output` is what can
-    /// be shown about why - the captured compiler text when there was a
-    /// build, the error otherwise.
-    ModuleFailed { module: String, output: String },
+    /// A module's load ended without a swap: its build failed, the new
+    /// library could not load, or validation refused it.
+    ModuleFailed {
+        /// The module that failed: an extension crate's name, or the project's.
+        module: String,
+        /// What can be shown about why - the captured compiler text when there
+        /// was a build, the error otherwise.
+        output: String,
+    },
     /// A module built, loaded, initialized and swapped in.
-    Reloaded { module: String, build_ms: u64 },
+    Reloaded {
+        /// The module that swapped: an extension crate's name, or the
+        /// project's.
+        module: String,
+        /// The last cargo build's wall time; `0` when no build ran (a managed
+        /// assembly swap or a shader-only reload).
+        build_ms: u64,
+    },
     /// A `#[pill_hot]` function's patch went live.
     PatchApplied {
         /// The patched function, spelled as the classifier named it.
         function: String,
-        /// The activation span the analytics report records.
+        /// Wall time from noticing the change to the slot being installed, in
+        /// milliseconds.
         milliseconds: f64,
     },
     /// A function's patch attempt failed; the previous implementation still
@@ -62,19 +92,15 @@ pub enum HostNotice {
     },
 }
 
-/// How many notices wait for a drain before the oldest are dropped.
-///
-/// Generous enough that a burst (a reload plus its patches) arrives whole,
-/// small enough that a host nobody drains stays cheap.
-const NOTICE_CAPACITY: usize = 256;
+// =============================================================================
+// Free Functions
+// =============================================================================
 
-/// The queue [`push`] fills and [`take`] empties.
-static NOTICES: Mutex<VecDeque<HostNotice>> = Mutex::new(VecDeque::new());
-
-/// Queue one notice for the frontend's next drain.
+/// Queues one notice for the frontend's next drain, dropping the oldest when
+/// the queue is full.
 pub(crate) fn push(notice: HostNotice) {
-    // One line per host event: the queue is bounded by real activity, and a
-    // frontend that never drains it needs to be visible from the log alone.
+    // Every queued notice is also logged, first and unconditionally: the
+    // console is the only record when no editor drains the queue.
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
         kind = kind_name(&notice),
@@ -100,7 +126,7 @@ fn kind_name(notice: &HostNotice) -> &'static str {
     }
 }
 
-/// Take every queued notice, oldest first.
+/// Takes every queued notice, oldest first.
 ///
 /// The editor executable calls this once per frame and folds the result into
 /// its notice resource; a host without an editor never calls it.
@@ -110,6 +136,10 @@ pub fn take() -> Vec<HostNotice> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     queue.drain(..).collect()
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

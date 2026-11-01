@@ -2,7 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Generates the C# mirror structs for the components extensions expose.
+//! - Generates the C# mirrors for the components, value types and free
+//!   functions an extension exposes to managed code.
 //! - Recompiles the project in-process with Roslyn on a hot reload.
 //! - Pairs the bridge's [`CSharpRuntime`] with that compiler as the host's
 //!   managed project, [`CSharpProject`].
@@ -29,7 +30,7 @@ use pill_engine::Engine;
 // Current crate
 use crate::watcher::SourceTrigger;
 
-/// Host-side generation of the C# mirror structs for exposed module components.
+/// Host-side generation of a module's `<module>_Components.g.cs` mirror file.
 mod codegen;
 /// In-process Roslyn compilation of the C# project, replacing MSBuild on reload.
 mod fast_compile;
@@ -47,7 +48,8 @@ pub(crate) use pill_csharp_bridge::{
     POLL_REJECTED, POLL_RELOADED,
 };
 
-/// Generate the C# mirror file for extension components.
+/// Generates a module's `<module>_Components.g.cs` mirror file from the surface
+/// it exposes to managed code.
 pub(crate) use codegen::generate_module_components_csharp;
 /// What one in-process compile attempt produced, reported to the reload path.
 pub(crate) use fast_compile::FastCompileOutcome;
@@ -167,8 +169,8 @@ impl CSharpProject {
         self.fast_compiler.clone()
     }
 
-    /// Store a build that a worker thread just reported, so the frame loop can
-    /// pick it up and complete the reload.
+    /// Store a build a worker thread has just started, so the frame loop can
+    /// collect its report and complete the reload.
     pub(crate) fn track_build(&mut self, receiver: Receiver<BuildReport>, thread: JoinHandle<()>) {
         self.build = Some(InFlightAssemblyBuild {
             receiver,
@@ -261,6 +263,10 @@ impl CSharpProject {
     }
 }
 
+// =============================================================================
+// Managed Reload Timing
+// =============================================================================
+
 /// One managed reload's armed timing, filled in as its phases complete.
 struct ManagedReloadTiming {
     /// Instant the project watcher fired the signal this reload came from.
@@ -297,14 +303,14 @@ pub(crate) struct ManagedReloadSummary {
     pub(crate) build_ms: f64,
     /// Rebuilt assembly to the loader's swap.
     pub(crate) swap_ms: f64,
-    /// What produced the assembly: `"roslyn"` or `"msbuild"`.
+    /// What produced the assembly: `"roslyn"`, `"msbuild"`, or `"unknown"`
+    /// when no build route was recorded.
     pub(crate) build_kind: &'static str,
 }
 
-/// `duration` in milliseconds.
-fn milliseconds(duration: std::time::Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
-}
+// =============================================================================
+// Assembly Build
+// =============================================================================
 
 /// One assembly build running on its own worker thread.
 ///
@@ -346,8 +352,9 @@ pub(crate) enum BuildOutcome {
         /// Compiler and analyzer errors, already formatted the way csc prints them.
         diagnostics: String,
     },
-    /// The captured command line could not answer the reload, so the full
-    /// `dotnet build` ran instead.
+    /// The in-process compiler could not answer the reload - or was never
+    /// loaded - so the full `dotnet build` ran instead; `Err` carries that
+    /// build's error text.
     Full(Result<(), String>),
 }
 
@@ -357,8 +364,8 @@ pub(crate) enum BuildOutcome {
 pub(crate) struct BuildReport {
     /// What the build produced.
     pub(crate) outcome: BuildOutcome,
-    /// When the worker finished the build, in milliseconds-scale monotonic
-    /// time shared with the frame thread.
+    /// When the worker finished the build, on the same monotonic clock as the
+    /// frame thread.
     pub(crate) finished_at: Instant,
 }
 
@@ -371,4 +378,13 @@ pub(crate) enum BuildCollection {
     Died,
     /// The build finished; the report carries what it produced.
     Finished(BuildReport),
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// `duration` in milliseconds.
+fn milliseconds(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }

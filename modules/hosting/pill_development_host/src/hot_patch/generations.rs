@@ -10,11 +10,11 @@
 //! # Design
 //!
 //! Rollback is not one operation. How a generation was *delivered* decides how
-//! it is undone: a slot is re-pointed by a single store, while a prologue patch
-//! overwrote the artifact's own bytes and can only be undone by writing bytes
-//! back. That distinction is recorded per generation rather than inferred from
-//! the function's kind, because an annotated and an un-annotated plain function
-//! are the same kind and are undone completely differently.
+//! it is undone: a slot is re-pointed by a single pointer store, while a
+//! prologue patch overwrote the artifact's own bytes and can only be undone by
+//! writing bytes back. That distinction is recorded per generation rather than
+//! inferred from the function's kind, because an annotated and an un-annotated
+//! plain function are the same kind and are undone completely differently.
 //!
 //! A reload invalidates every recorded prologue address at once: the addresses
 //! point into an image the graveyard will unmap, and a module's records include
@@ -22,24 +22,23 @@
 //! Dropping the whole set is what keeps a rollback from writing into a retired
 //! image.
 
-// Standard library
-
 // External crates
 use pill_core::info;
 use pill_core::platform::Instant;
+use pill_engine::Engine;
 
 // Current crate
 use super::{
     install_everywhere, reset_everywhere, source, HotPatchSession, LoadedPatch, PrologueRestore,
 };
 use crate::native_library::NativeLibrary;
-use pill_engine::Engine;
 
-/// One loaded patch library, kept mapped for the process lifetime.
+/// One recorded generation of one patched function, and the route back to it.
 ///
-/// Never unloaded, unlike the module graveyard: a slot holds an address inside
-/// this image and nothing re-homes those addresses. That is also what makes
-/// rollback a single pointer store rather than a rebuild.
+/// The patch library that delivered it is never unloaded, unlike the module
+/// graveyard: a slot holds an address inside that image and nothing re-homes
+/// those addresses. That is also what makes a slot rollback a single pointer
+/// store rather than a rebuild.
 pub(crate) struct Generation {
     /// Qualified name of the function this generation replaced.
     pub(super) function: String,
@@ -77,9 +76,9 @@ impl Generation {
     /// Whether this generation was delivered by overwriting code rather than by
     /// installing into a slot.
     ///
-    /// The distinction is recorded rather than inferred from the function's
-    /// kind, because an un-annotated plain function and an annotated one are the
-    /// same kind but are undone in completely different ways.
+    /// Read from the saved bytes, because the function's kind does not answer
+    /// it: an annotated and an un-annotated plain function share one kind and
+    /// are undone in completely different ways.
     fn overwrote_prologues(&self) -> bool {
         !self.prologue_restores.is_empty()
     }
@@ -90,7 +89,8 @@ impl Generation {
 pub struct PatchGeneration {
     /// Qualified name of the patched function.
     pub function: String,
-    /// One-based position in the history; zero is the original code.
+    /// One-based position in the history; the code the artifact was built with
+    /// is generation zero and has no entry.
     pub number: u32,
     /// Address currently associated with this generation.
     pub address: usize,
@@ -107,7 +107,8 @@ impl HotPatchSession {
         self.active_generations.get(qualified).copied().unwrap_or(0)
     }
 
-    /// Where a refused fan-out returns the copies it already redirected.
+    /// The generation a refused fan-out returns its already-redirected copies
+    /// to.
     ///
     /// `None` means the function is running generation zero, so the repair is
     /// each artifact's own body. A prologue-delivered generation is not a
@@ -152,6 +153,7 @@ impl HotPatchSession {
     /// re-install a body from a previous revision into it. A new patch of the
     /// function makes the history reachable again from that baseline.
     pub(crate) fn forget_prologue_patches(&mut self) {
+        // Step 1: Drop the prologue bytes a reload has invalidated.
         let mut functions: Vec<String> = Vec::new();
         for generation in &mut self.generations {
             if generation.overwrote_prologues() {
@@ -162,15 +164,14 @@ impl HotPatchSession {
                 }
             }
         }
-        // Every function, not only the prologue-patched ones. A reload
-        // re-creates the slot from the rebuilt artifact, so what runs now is
-        // the artifact's own body even for a slot-delivered generation, and an
-        // entry left in place would make `active_generation` name a generation
-        // that is not executing - and let a rollback install a body from a
-        // previous revision into the fresh image. The `Generation` records
-        // stay - the listing and their `prologue_history_dropped` refusal still
-        // describe what happened - but nothing is reachable for a rollback
-        // until a new patch re-registers the function.
+        // Step 2: Clear every active entry, not only the prologue-patched
+        // functions'. A reload re-creates the slot from the rebuilt artifact,
+        // so what runs now is the artifact's own body even for a
+        // slot-delivered generation; an entry left in place would make
+        // `active_generation` name a generation that is not executing, and let
+        // a rollback install a body from a previous revision into the fresh
+        // image. The `Generation` records stay - the listing and their
+        // `prologue_history_dropped` refusal still describe what happened.
         self.active_generations.clear();
 
         if functions.is_empty() {
@@ -187,7 +188,8 @@ impl HotPatchSession {
         );
     }
 
-    /// Whether this session has ever patched `qualified`.
+    /// Whether `qualified` has an active generation recorded, which is what a
+    /// rollback needs to reach its history.
     pub(crate) fn knows_function(&self, qualified: &str) -> bool {
         self.active_generations.contains_key(qualified)
     }
@@ -203,8 +205,10 @@ impl HotPatchSession {
     /// # Errors
     ///
     /// Returns a message when the function was never patched by this session,
-    /// when the generation does not exist, or when an artifact refuses the
-    /// address. On any error the currently running implementation is kept.
+    /// when the generation does not exist, or when an artifact refuses an
+    /// address. The active-generation entry is updated only on success, and a
+    /// prologue path that fails partway leaves the copies it already rewrote
+    /// in the state it put them.
     pub(crate) fn rollback(
         &mut self,
         engine: &mut Engine,
@@ -220,7 +224,7 @@ impl HotPatchSession {
             ));
         }
 
-        // How the generation was delivered decides how to undo it, and that is
+        // Step 1: Decide which route undoes this function's delivery. That is
         // not the same question as what kind of function it is: an un-annotated
         // function has no slot to install into, so its generations were written
         // over the code itself.
@@ -229,6 +233,7 @@ impl HotPatchSession {
             .iter()
             .any(|candidate| candidate.function == qualified && candidate.overwrote_prologues());
 
+        // Step 2: Reinstall the requested generation through that route.
         if number == 0 {
             if delivered_by_prologue {
                 self.restore_prologue_baseline(qualified)?;
@@ -262,8 +267,9 @@ impl HotPatchSession {
                 // generation zero.
                 for restore in &generation.prologue_restores {
                     // SAFETY: the address came from this artifact's inventory
-                    // when the generation was installed, and `patch_prologue`
-                    // re-validates the function's extent before writing. No
+                    // when the generation was installed, its declaration was
+                    // checked against the artifact's before that write, and
+                    // `patch_prologue` re-validates the function's extent. No
                     // system is executing: rollback runs between frames.
                     unsafe {
                         pill_engine::hot_patch::patch_prologue(restore.address, generation.address)
@@ -275,9 +281,9 @@ impl HotPatchSession {
                     source::HotFunctionKind::System => engine
                         .hot_patch(qualified, generation.address, generation.signature_hash)
                         .map_err(|error| error.to_string())?,
-                    // The fan-out count is only reported for a fresh patch;
-                    // a rollback re-installs the same set and has nothing new
-                    // to say about it.
+                    // The copy count is only used by a fresh patch, whose
+                    // install line reports it; a rollback has nowhere to put
+                    // it.
                     source::HotFunctionKind::PlainFunction => {
                         // A rollback is refused the same way a fresh install
                         // is, and the copies it reached belong back on the
@@ -296,6 +302,7 @@ impl HotPatchSession {
             }
         }
 
+        // Step 3: Record what is running now, and report it.
         self.active_generations
             .insert(qualified.to_string(), number);
         info!(

@@ -18,9 +18,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- The gameplay assembly moved from modules/project_cs to examples/local/project_cs;
-         keep the nested test -> project -> C# runtime chain pointing at it. -->
-    <ProjectReference Include="../../../../examples/local/project_cs/project_cs.csproj" />
+    <!-- The gameplay assembly is the suite's own fixture project, kept beside
+         the devops suites so a checkout ships it. -->
+    <ProjectReference Include="../../../../devops/tests/projects/managed/managed.csproj" />
     <!-- Named query-row iteration for the test systems, mirroring how a
          gameplay project references the generator. -->
     <ProjectReference Include="../generators/PillIterationGenerators.csproj"

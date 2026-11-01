@@ -16,22 +16,28 @@ DESCRIPTION
     DISCOVERY, NOT A HARDCODED LIST. The shell version enumerated eight
     example paths (`examples/cube`, `examples/city`, ...) that no longer exist
     in this repository, so it had nothing left to build. This script finds
-    examples by convention instead - any immediate subdirectory of the
-    configured examples root carrying a build manifest - so adding an example needs no
-    edit here:
+    examples by convention instead - any directory carrying a build manifest
+    under one of the two example roots - so adding an example needs no edit
+    here:
 
       * `Cargo.toml`  -> built with `cargo build --release`
       * `*.csproj`    -> built with `dotnet build -c Release`
 
-    A subdirectory with neither is skipped with that reason, not silently
-    ignored.
+    The two roots have different shapes. `examples/local/` is a flat checkout of
+    one directory per project; `examples/<group>/` holds the official examples,
+    one Rust project and one C# project per group. Both are walked one level
+    below the root they belong to, so a group folder is never mistaken for a
+    project.
+
+    A subdirectory with neither manifest is skipped with that reason, not
+    silently ignored.
 
 USAGE
   python devops/tests/test_examples.py [all | <example-path>] [--list]
 
 EXAMPLE USAGE
   python devops/tests/test_examples.py
-  python devops/tests/test_examples.py examples/local/project_rs
+  python devops/tests/test_examples.py devops/tests/projects/project_rs
   python devops/tests/test_examples.py --list
 
   Exit status: 0 when every example built, 1 when any failed, 2 on a usage
@@ -52,7 +58,7 @@ from typing import List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import REPOSITORY_ROOT, find_executable  # noqa: E402
-from core.projects import EXAMPLES_ROOT  # noqa: E402
+from core.projects import EXAMPLES_ROOT, example_project_roots  # noqa: E402
 from core.suite_common import run_suite_with_timing  # noqa: E402
 from core.test_report import (  # noqa: E402
     ANSI_BOLD,
@@ -106,17 +112,13 @@ class Example:
 
 
 def discover_examples() -> List[Tuple[Path, Optional[Example]]]:
-    """Finds every example project under the configured examples root.
+    """Finds every example project under the configured example roots.
 
     Returns `(directory, Example or None)` pairs so a directory without a
     recognised manifest can be reported as skipped rather than dropped.
     """
-    if not EXAMPLES_ROOT.is_dir():
-        return []
     discovered: List[Tuple[Path, Optional[Example]]] = []
-    for directory in sorted(EXAMPLES_ROOT.iterdir()):
-        if not directory.is_dir():
-            continue
+    for directory in example_project_roots():
         discovered.append((directory, classify_example(directory)))
     return discovered
 
@@ -216,7 +218,7 @@ def build_all_examples(tally: ResultTally) -> None:
     discovered = discover_examples()
     section("Building all example projects (release)")
     if not discovered:
-        print(f"No example directories found under {EXAMPLES_ROOT}")
+        print(f"No example directories found under {EXAMPLES_ROOT} or the official catalog")
         return
 
     for index, (directory, example) in enumerate(discovered, start=1):
@@ -261,7 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "examples:\n"
             "  test_examples.py\n"
-            "  test_examples.py examples/local/project_rs\n"
+            "  test_examples.py devops/tests/projects/project_rs\n"
             "  test_examples.py --list\n"
         ),
     )
@@ -291,7 +293,7 @@ def main() -> int:
             kind = example.kind if example else "unrecognised (no manifest)"
             print(f"  {display:<40} {kind}")
         print()
-        print(f"Total: {len(discovered)} example directory/ies under {EXAMPLES_ROOT}")
+        print(f"Total: {len(discovered)} example directory/ies, local and official")
         return 0
 
     print(colorize("Example project builds", ANSI_BOLD + ANSI_CYAN))

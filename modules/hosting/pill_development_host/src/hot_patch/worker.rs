@@ -1,4 +1,4 @@
-//! The background half of the fast patch: compile, load, pre-warm.
+//! The background half of the fast patch: compile a body, map its library.
 //!
 //! # Responsibilities
 //!
@@ -10,13 +10,13 @@
 //!
 //! # Design
 //!
-//! A patch build - one `rustc` invocation plus one `LoadLibrary` - costs
+//! One body's patch build - a `rustc` invocation plus a `LoadLibrary` - costs
 //! hundreds of milliseconds, so it runs off the frame thread: the frame thread
 //! prepares a [`PatchAttempt`], a worker turns it into [`BodyOutcome`]s, and the
 //! frame boundary installs them. Nothing in this file touches the engine, a
-//! loaded artifact or the session, which is what makes the middle step safe
-//! anywhere: no dispatch slot is written, no registry changes, nothing that
-//! belongs to the thread owning the boundary.
+//! loaded module artifact or the session, which is what makes the middle step
+//! safe on any thread: no dispatch slot is written, no registry changes,
+//! nothing that belongs to the thread owning the boundary.
 
 // Standard library
 use std::path::PathBuf;
@@ -30,6 +30,10 @@ use pill_core::platform::Instant;
 // Current crate
 use super::compile::CargoRustcLine;
 use super::{failure_code, source, PatchRefusal, PatchStages};
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// One pending patch attempt: what the frame thread prepared, and what a
 /// worker or the activation still needs.
@@ -47,10 +51,10 @@ pub(crate) struct PatchAttempt {
     pub(super) bodies: Vec<PreparedBody>,
     /// Timings so far; the worker and the activation add theirs.
     pub(super) stages: PatchStages,
-    /// When the attempt began, so the LIVE report spans preparation, the
-    /// build and the wait for the next frame boundary. The frame loop also
-    /// spans its analytics total from here: the build runs between frames, so
-    /// the frame that collects the attempt cannot time the total itself.
+    /// When the attempt began, so the reported total spans preparation, the
+    /// build and the wait for the next frame boundary. The frame loop starts
+    /// its analytics total from here: the build runs between frames, so the
+    /// frame that collects the attempt cannot time the total itself.
     pub(crate) started: Instant,
 }
 
@@ -102,6 +106,10 @@ pub(crate) struct BuiltBody {
     pub(super) load_ms: f64,
 }
 
+// =============================================================================
+// Free functions
+// =============================================================================
+
 /// Compile and map every body of one attempt.
 ///
 /// Runs on the build thread. Stops at the first failure: the bodies before it
@@ -130,12 +138,19 @@ pub(crate) fn build_attempt(mut attempt: PatchAttempt) -> (PatchAttempt, Vec<Bod
 }
 
 /// Run the replayed compiler over one body and map its product.
+///
+/// # Errors
+///
+/// `failure_code::COMPILE` when the compiler cannot be spawned or rejects the
+/// generated source, and `failure_code::LOAD` when the produced library cannot
+/// be mapped.
 fn build_body(body: &PreparedBody) -> Result<BuiltBody, PatchRefusal> {
     let source_path = body.source_path.as_path();
     let artifact_path = body.artifact_path.as_path();
     let crate_name = body.crate_name.as_str();
     let staged_dependencies = Some(body.staged_dependencies.as_path());
 
+    // Step 1: Replay the captured line over the generated source.
     let compile_started = Instant::now();
     let output = body
         .line
@@ -199,17 +214,19 @@ fn build_body(body: &PreparedBody) -> Result<BuiltBody, PatchRefusal> {
         return Err(PatchRefusal::new(failure_code::COMPILE, detail));
     }
 
-    // Read the freshly written image once, on this thread, before loading it.
-    // The first read of a new multi-megabyte file pays the platform's
-    // anti-malware scan, and paying it here keeps that cost off the frame
-    // boundary; the `LoadLibrary` below then maps a page-cached file. The read
-    // is deliberately unchecked: a file that cannot be read will fail the load
+    // Step 2: Read the freshly written image once, on this thread, before
+    // loading it. The first read of a new multi-megabyte file pays the
+    // platform's anti-malware scan, and paying it here keeps that cost off the
+    // frame boundary; the load below then maps a page-cached file. The read is
+    // deliberately unchecked: a file that cannot be read will fail the load
     // with a better error than this could produce.
     let _ = std::fs::read(artifact_path);
 
+    // Step 3: Map the image and measure what the build cost.
     let load_started = Instant::now();
-    // SAFETY: the file was just produced by rustc from a generated source and
-    // is a complete native module.
+    // SAFETY: the path names the artifact `rustc` wrote moments ago from the
+    // generated source of this same build, so mapping it runs only the patch's
+    // own initializers against the dependency graph the replayed line named.
     let library = unsafe { Library::new(artifact_path) }.map_err(|error| {
         PatchRefusal::new(
             failure_code::LOAD,

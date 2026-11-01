@@ -48,7 +48,7 @@
 #
 # EXAMPLE USAGE:
 #   python devops/tools/wasm_size_report.py examples/local/cube
-#   python devops/tools/wasm_size_report.py --build examples/local/master_renderer_test
+#   python devops/tools/wasm_size_report.py --build devops/tests/projects/scene
 #   python devops/tools/wasm_size_report.py --max-size-kb 2500 examples/local/cube
 
 # --- SCRIPT ---

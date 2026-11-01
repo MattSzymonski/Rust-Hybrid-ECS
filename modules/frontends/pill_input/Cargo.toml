@@ -17,14 +17,15 @@ pill_engine = { path = "../../engine/pill_engine" }
 # winit's window and device events, for the frontends built on winit.
 winit = { version = "0.30", optional = true }
 
-# Gamepads through gilrs. Native only: the browser build has no gamepad backend
-# here yet, and gilrs is not compiled for it.
+# Gamepads through the gilrs library, under a readable dependency name. Native
+# only: the browser build has no gamepad backend here yet, and gilrs is not
+# compiled for it.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-gilrs = { version = "0.11", optional = true }
+gamepad_library = { package = "gilrs", version = "0.11", optional = true }
 
 [features]
 # Translate winit window and device events (`winit_events`).
 winit = ["dep:winit"]
-# Poll gamepads and play rumble through gilrs (`gamepads`). Does nothing on
-# the web.
-gamepad = ["dep:gilrs"]
+# Poll gamepads and play rumble through the library (`gamepads`). Does
+# nothing on the web.
+gamepad = ["dep:gamepad_library"]

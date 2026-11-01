@@ -991,11 +991,11 @@ actions are one-click entries in the "Power Glove" command palette.
 
 Related material elsewhere in the repo:
 
-- `examples/local/master_renderer_test/` — the PBR test project, and the fullest  
+- `devops/tests/projects/master_renderer_test/` — the PBR test project, and the fullest  
 example of a project driving this renderer end to end. Its chain is five  
 passes over four named offscreen targets (`hdr`, `bloom`, `lit`, `ldr`):  
 opaque → bloom prefilter → bloom composite → tonemap → lens.
-- `examples/local/project_rs/` — the minimal scene setup.
+- `devops/tests/projects/project_rs/` — the minimal scene setup.
 - `devops/tests/test_pbr_native.py`, `devops/tests/test_renderer_assets.py` —  
 the renderer-specific suites.
 - `pill_2d_renderer/`, `pill_embedded_renderer/` — the sibling backends, for  

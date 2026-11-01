@@ -15,14 +15,15 @@ DESCRIPTION
     real source edits against the live project and an extension, then
     asserts the host's behaviour from its console output:
 
-      Session A (project = devops/tests/project, module = pill_spline)
+      Session A (project = devops/tests/projects/native, module = pill_spline)
         1. project_hot_reload      - editing the project triggers a reload and
                                      the counter system keeps ticking (data
                                      survives).
         2. schema_migration        - adding a field to a persistable component
                                      runs selective migration, data survives.
-        3. project_forgotten_type  - dropping a component registration emits the
-                                     orphaned-data warning on the project path.
+        3. project_forgotten_type  - a component the project stops registering
+                                     emits the orphaned-data warning and names
+                                     the type.
         4. module_hot_reload       - editing an extension reloads it and
                                      its persistable data survives (existing=1).
         5. module_double_reload    - two consecutive same-config reloads stay
@@ -30,15 +31,23 @@ DESCRIPTION
                                      (existing stays 1), pinning per-artifact
                                      TypeId stability (no per-reload growth).
         6. module_forgotten_type   - a module that stops registering a type
-                                     emits the orphaned-data warning; after the
-                                     restore-driven reload the data is re-seeded
-                                     from scratch (existing=0), pinning
-                                     drop-at-detection end-to-end.
-        7. init_failure_rollback   - an init that returns non-zero keeps the
+                                     emits the orphaned-data warning and names
+                                     the type. Its data survives, because the
+                                     project links the same crate and still
+                                     claims that shared type - the peer rule
+                                     `unclaimed_type_names` documents.
+        7. module_forgotten_type_drop
+                                   - the same warning for a module nothing
+                                     else links, where the orphaned column is
+                                     then dropped: the restored generation
+                                     finds no data and re-seeds from scratch
+                                     (existing=0), pinning drop-at-detection
+                                     end-to-end.
+        8. init_failure_rollback   - an init that returns non-zero keeps the
                                      previous generation and the host alive.
 
-      Session B (project = examples/local/project_rs, module = pill_spline)
-        8. cascade_reload          - editing a module the project links triggers
+      Session B (project = devops/tests/projects/native, module = pill_spline)
+        9. cascade_reload          - editing a module the project links triggers
                                      the module reload AND a project reload, and
                                      the new value reaches the running project
                                      (probe midpoint changes). The project probe
@@ -80,7 +89,13 @@ from core.suite_common import *  # noqa: E402,F401,F403
 
 # The shared scenario runner: one definition for every hot-reload suite.
 # This suite adds only its tokens and scenario tables.
-from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario  # noqa: E402
+from core.scenario import (  # noqa: E402
+    Scenario,
+    ScenarioPhase,
+    ScenarioRunner,
+    run_scenario,
+    settle_token_for_fixture_path,
+)
 
 # =============================================================================
 # Session configuration
@@ -88,14 +103,30 @@ from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario 
 
 SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "pill_spline" / "src" / "pill_spline.rs"
 
+# A module the project does not link. Its persistable component is therefore
+# declared by this artifact alone, which makes it the only subject in the
+# fixture a forgotten type can be dropped for: `pill_spline`'s `Spline` is
+# `#[pill(shared)]` and the project registers it from its own copy, so that
+# column is the project's to keep (see `peer_component_names`).
+PILL_TEST_RS = MODULES_ROOT / "extensions" / "pill_test" / "pill_test" / "src" / "pill_test.rs"
+
 # Session settings: only the extension list lives in a file now; the
 # project itself is selected by PROJECT_PATH per session.
+#
+# `engine::hot_reload` runs at debug so the scenarios can read the layer's own
+# statement of what it dropped (`FORGOTTEN_DROP_TOKEN`). The drop is otherwise
+# invisible whenever the scene re-seeds the witness it removed, and a count
+# cannot tell those two apart.
 SESSION_A_SETTINGS = """\
 name: "Suite Session A"
 build_binary_name: "SuiteSessionA"
 renderer: "none"
 modules:
   - "pill_spline"
+  - "pill_test"
+logging:
+  targets:
+    engine::hot_reload: debug
 """
 
 SESSION_B_SETTINGS = """\
@@ -110,6 +141,16 @@ modules:
 
 PROJECT_FORGOTTEN_WARN_TOKEN = "no longer registered by the project"
 MODULE_FORGOTTEN_WARN_TOKEN = "no longer registered by this module"
+# The reload layer's own record of the columns it removed for a forgotten
+# type. The forgotten-type scenarios assert on this line rather than on an
+# entity count: a scene that re-seeds the dropped witness during the reload
+# reports the same count either way, while only a real drop logs this.
+FORGOTTEN_DROP_TOKEN = "dropped orphaned columns for component types no longer registered"
+
+# The analytics line a module reload prints, named after the module that
+# reloaded. `RELOAD_MODULE_TOKEN` is the spline's; `pill_test` reloads too, and
+# its scenario has to wait for its own line rather than one the spline prints.
+PILL_TEST_RELOAD_TOKEN = "[analytics] reload pill_test"
 
 # The project probe's report line, e.g. "midpoint (390.0, 120.0)". Session B's
 # cascade scenario derives the value it expects from the reports the host
@@ -147,7 +188,7 @@ def last_probe_midpoint(output: str) -> Tuple[float, float]:
 
 # This suite measures the plain reload transaction, so it pins the reload-only
 # posture to keep the patch fast path out of the host it drives. `rendering`
-# stays ON because session B drives `examples/local/project_rs`, which links
+# stays ON because session B drives `devops/tests/projects/project_rs`, which links
 # `pill_master_renderer`: a host without it resolves `pill_core` differently
 # from that project and the project DLL fails to load with "The specified
 # procedure could not be found" (os error 127).
@@ -272,7 +313,31 @@ pub fn register(engine: &mut Engine) -> u32 {
     1
 }"""
 
-# --- devops/tests/project edits (applied from the original source) ------------
+# --- pill_test module edits (whole file, applied from the original source) ----
+
+# The module declares `ModuleTest`, a persistable component no other artifact
+# in the fixture links, and seeds `MODULE_TEST_ENTITY_COUNT` entities carrying
+# it. This stub generation declares nothing at all, which is the one way to
+# make a component type vanish from the world's point of view: dropping the
+# derive alone would leave the rest of the crate querying the type, and a
+# query registers what it names.
+PILL_TEST_STUB_NO_REGISTRATION = """\
+// Suite stub: a generation that registers nothing, so the module's persistable
+// component `ModuleTest` is forgotten. Replacing the whole file is what keeps
+// the stub from naming the type anywhere - a query would register it again and
+// the generation would no longer be one that stopped declaring it.
+use pill_engine::{pill_module, Engine};
+
+#[pill_module]
+pub fn register(_engine: &mut Engine) -> u32 {
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        "pill_test module registered (suite stub, ModuleTest NOT registered)"
+    );
+    0
+}"""
+
+# --- devops/tests/projects/native edits (applied from the original source) ----
 
 FRAMECOUNTER_MIGRATION_EDITS = [
     (
@@ -295,15 +360,33 @@ FRAMECOUNTER_MIGRATION_EDITS = [
 
 PROJECT_FORGOTTEN_EDITS = [
     (
+        "/// A two-axis velocity, paired with [`SpatialPosition`] on one archetype.\n"
         "#[derive(Debug, Clone, Serialize, Deserialize, Default, PillComponent)]\n"
         "#[pill(persistable)]\n"
-        "struct LinearVelocity {",
-        "#[derive(Debug, Clone, Serialize, Deserialize, Default, PillComponent)]\n"
-        "struct LinearVelocity {",
+        "struct LinearVelocity {\n"
+        "    horizontal_speed: f32,\n"
+        "    vertical_speed: f32,\n"
+        "}\n"
+        "\n",
+        "",
+    ),
+    (
+        "        .with(LinearVelocity {\n"
+        "            horizontal_speed: 1.5,\n"
+        "            vertical_speed: 0.25,\n"
+        "        })\n",
+        "",
+    ),
+    (
+        "        .with(LinearVelocity {\n"
+        "            horizontal_speed: 0.5,\n"
+        "            vertical_speed: 0.75,\n"
+        "        })\n",
+        "",
     ),
 ]
 
-# --- Session A scenarios (project = devops/tests/project, module = pill_spline) -----
+# --- Session A scenarios (project = devops/tests/projects/native, module = pill_spline) ---
 
 SESSION_A_SCENARIOS = [
     Scenario(
@@ -332,7 +415,7 @@ SESSION_A_SCENARIOS = [
                 wait_token=RELOAD_PROJECT_TOKEN,
                 required_tokens=[
                     MIGRATION_START_TOKEN,
-                    "'project::FrameCounter' -> OK",
+                    "'native::FrameCounter' -> OK",
                 ],
                 forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
                 alive_tokens=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
@@ -352,6 +435,13 @@ SESSION_A_SCENARIOS = [
                 ],
                 forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
                 alive_tokens=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
+                # The warning is the whole assertion on this path. The column
+                # itself survives, because this reload's own peers include the
+                # project's previous generation, whose names still hold
+                # `LinearVelocity` - so nothing it stops registering is ever
+                # unclaimed. That is the host's behaviour today, not a property
+                # of the scene; `module_forgotten_type_drop` is where a column
+                # is actually removed.
             )
         ],
         restore_after=[PROJECT_SANDBOX_LIB_RS],
@@ -450,13 +540,48 @@ SESSION_A_SCENARIOS = [
                 wait_token=RELOAD_MODULE_TOKEN,
                 required_tokens=[MODULE_FORGOTTEN_WARN_TOKEN, "pill_spline::Spline"],
                 forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
+                # No drop is asserted here. The project links this crate, so it
+                # registers the same `#[pill(shared)]` type from its own copy,
+                # and the reload layer keeps a column any peer still claims -
+                # the restored generation therefore finds its original spline
+                # instead of re-seeding one. `module_forgotten_type_drop` below
+                # is where a column is actually removed.
             )
         ],
         restore_after=[SPLINE_LIB_RS],
-        # After the restore-driven reload the module re-registers Spline and
-        # re-seeds from scratch: the orphaned data was dropped, so existing=0.
-        # This pins drop-at-detection end-to-end (audit 3.2 drop behavior).
-        restore_required_tokens=["existing=0"],
+    ),
+    Scenario(
+        name="module_forgotten_type_drop",
+        phases=[
+            ScenarioPhase(
+                edits=[
+                    (
+                        PILL_TEST_RS,
+                        [
+                            (
+                                read_source(PILL_TEST_RS),
+                                PILL_TEST_STUB_NO_REGISTRATION,
+                            )
+                        ],
+                    )
+                ],
+                wait_token=PILL_TEST_RELOAD_TOKEN,
+                required_tokens=["pill_test::ModuleTest"],
+                forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
+                # `ModuleTest` is declared by this artifact alone, so the
+                # generation that stops registering it is also the one that
+                # drops the column - the reload layer says so at debug level
+                # (`SESSION_A_SETTINGS`). Nothing else can re-seed it, so this
+                # is the suite's drop-at-detection witness.
+                wait_after=[(FORGOTTEN_DROP_TOKEN, RELOAD_TIMEOUT)],
+            )
+        ],
+        restore_after=[PILL_TEST_RS],
+        # After the restore-driven reload the module declares `ModuleTest`
+        # again and finds no data: the entities the stub generation orphaned
+        # were dropped with their only column, so it seeds its full count from
+        # scratch. Pins the drop end-to-end rather than only its log line.
+        restore_required_tokens=["entities=4 existing=0"],
     ),
     Scenario(
         name="init_failure_rollback",
@@ -482,7 +607,7 @@ SESSION_A_SCENARIOS = [
     ),
 ]
 
-# --- Session B scenario (project = examples/local/project_rs, module = pill_spline) -
+# --- Session B scenario (project = devops/tests/projects/native, module = pill_spline) ---
 
 # The offset bump the cascade scenario makes, planned against the module source
 # as it is now. Its `delta` is what the probe check below is derived from.
@@ -532,7 +657,7 @@ def session_b_scenarios(monitor: OutputMonitor) -> Optional[Sequence[Scenario]]:
                     # both reloads the probe therefore still sees exactly one.
                     #
                     # The count alone carries that meaning; the surrounding probe
-                    # wording in `examples/local/project_rs/src/lib.rs` is incidental and
+                    # wording in `devops/tests/projects/native/src/lib.rs` is incidental and
                     # edited freely by the demos. Widened from the previous
                     # `xxsees 1 spline(s)` so a probe rewording no longer fails this
                     # scenario. If it regresses, read the analytics lines just above
@@ -572,6 +697,17 @@ def session_b_scenarios(monitor: OutputMonitor) -> Optional[Sequence[Scenario]]:
 # =============================================================================
 
 
+def session_settle_token(path: Path) -> str:
+    """The token a restore of `path` settles with, for this suite's sessions.
+
+    The shared rule knows the project and the module the scenarios edit most;
+    session A also reloads `pill_test`, whose own analytics line names it.
+    """
+    if path == PILL_TEST_RS:
+        return PILL_TEST_RELOAD_TOKEN
+    return settle_token_for_fixture_path(path)
+
+
 def session_runner() -> ScenarioRunner:
     """The runner settings for this suite.
 
@@ -584,6 +720,7 @@ def session_runner() -> ScenarioRunner:
         reload_timeout=RELOAD_TIMEOUT,
         settle_timeout=SETTLE_TIMEOUT,
         stability_sleep=STABILITY_SLEEP,
+        restore_settle_token=session_settle_token,
     )
 
 

@@ -11,7 +11,7 @@ REQUIREMENTS
     surface, so this drives the windowed development host.
 
 DESCRIPTION
-    `examples/local/project_rs` ships `res/pipelines/main.pipeline`, which names the
+    `devops/tests/projects/project_rs` ships `res/pipelines/main.pipeline`, which names the
     project's own `dwdw.render_pass` by guid, and its `init` imports both and
     hands the chain to `RenderingManager`. A chain is only built when a surface
     exists, so the suite launches the windowed development host on that project

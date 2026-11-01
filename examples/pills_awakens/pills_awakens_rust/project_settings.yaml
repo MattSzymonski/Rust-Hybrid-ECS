@@ -1,0 +1,27 @@
+# Two hundred thousand pills drifting through a curl noise field, among ancient
+# pillars, watched through a free flying camera.
+#
+# The Rust twin of `pills_awakens_csharp` runs the same field over the same
+# level; the two projects differ only in the language the systems are written
+# in. The maps under `res` are downscaled from the floor demo's sources so two
+# tracked copies of the level stay a reasonable size - the field itself is
+# unchanged.
+
+name: "Pills Awakens"
+build_binary_name: "PillsAwakensRust"
+version: "0.1.0"
+description: "A curl noise field of two hundred thousand pills, among ancient pillars."
+
+modules: []
+
+# Log levels over the engine's defaults: `level` sets every target at once,
+# `targets` sets one each (off, error, warn, info, debug, trace). The renderer
+# logs every draw at `debug`, which with this many pills buries everything else.
+logging:
+  targets:
+    engine::rendering: info
+
+# Shipping and web builds start with debug drawing off; this demo shows its
+# overlay (the field's bounds, the axes, the tuning values) everywhere. F3
+# toggles it at runtime in any build.
+debug_draw: true

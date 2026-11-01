@@ -11,9 +11,8 @@ REQUIREMENTS
 
 DESCRIPTION
     Verifies the renderer's pick buffer and selection outlines on
-    `examples/local/master_renderer_test`, whose one model fills the middle of the
-    window, through the standalone dev host's test frontend
-    (`PILL_PICK_TEST=1`):
+    `devops/tests/projects/scene`, whose models fill the middle of the window,
+    through the standalone dev host's test frontend (`PILL_PICK_TEST=1`):
 
       1. center pick - a pick at the window's center answers with an entity;
       2. corner pick - a pick at its top-left corner answers with nothing;
@@ -51,7 +50,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Configuration
 # =============================================================================
 
-PROJECT_PATH = MASTER_RENDERER_TEST_PATH
+PROJECT_PATH = SCENE_PROJECT_PATH
 
 PICKS_REQUESTED_TOKEN = "[pick test] requested center"
 CENTER_HIT_TOKEN = "[pick test] center: Entity("

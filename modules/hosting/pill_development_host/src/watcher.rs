@@ -54,18 +54,6 @@ const DEFAULT_DEBOUNCE_MILLISECONDS: u64 = 60;
 /// Environment variable overriding the debounce window.
 const DEBOUNCE_OVERRIDE_VARIABLE: &str = "PILL_WATCH_DEBOUNCE_MS";
 
-/// How long to coalesce a burst of file events, resolved once per process.
-pub(crate) fn debounce_duration() -> Duration {
-    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *RESOLVED.get_or_init(|| {
-        let milliseconds = std::env::var(DEBOUNCE_OVERRIDE_VARIABLE)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_DEBOUNCE_MILLISECONDS);
-        Duration::from_millis(milliseconds)
-    })
-}
-
 /// Directory names that never contain source code worth rebuilding for.
 const IGNORED_DIRECTORY_NAMES: [&str; 3] = ["target", "bin", "obj"];
 
@@ -85,15 +73,96 @@ const REPORTED_PATH_LIMIT: usize = 5;
 const TRIGGER_LOG_CAPACITY: usize = 16;
 
 // =============================================================================
+// Types
+// =============================================================================
+
+/// One debounce window's outcome: when its signal fired and how long the save
+/// had already sat before it did.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SourceTrigger {
+    /// The generation this trigger published, which is the value the frame
+    /// loop compares its own counter against.
+    pub(crate) generation: u64,
+    /// Monotonic instant the signal was published.
+    pub(crate) fired_at: Instant,
+    /// Milliseconds from the newest edited file's modification time to the
+    /// signal, debounce included; `NaN` when no timestamp could be read.
+    pub(crate) detection_delay_ms: f64,
+}
+
+/// The project watcher's most recent triggers.
+///
+/// Lets the frame loop measure a reload from the save that caused it: the
+/// signal's instant bounds the pipeline, and the modification-time delay the
+/// watcher already reports bounds the wait before the signal even fired.
+/// Only the project watcher publishes here; the module and renderer watchers
+/// pass `None`, because nothing times a reload from their signals.
+pub(crate) struct TriggerLog {
+    /// Newest last. Guarded because the watcher thread writes while the frame
+    /// thread reads.
+    entries: Mutex<Vec<SourceTrigger>>,
+}
+
+impl TriggerLog {
+    /// An empty log.
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Record one fired trigger, evicting the oldest past the bound.
+    fn record(&self, trigger: SourceTrigger) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if entries.len() >= TRIGGER_LOG_CAPACITY {
+            entries.remove(0);
+        }
+        entries.push(trigger);
+    }
+
+    /// Take the trigger that published `generation`, if it is still logged.
+    ///
+    /// Taken rather than read, so one signal is attributed to exactly one
+    /// reload - the reload that consumed its generation.
+    pub(crate) fn take(&self, generation: u64) -> Option<SourceTrigger> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = entries
+            .iter()
+            .position(|entry| entry.generation == generation)?;
+        Some(entries.remove(index))
+    }
+}
+
+// =============================================================================
 // Free Functions
 // =============================================================================
+
+/// Returns how long a burst of file events is coalesced for, resolved once per
+/// process.
+pub(crate) fn debounce_duration() -> Duration {
+    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let milliseconds = std::env::var(DEBOUNCE_OVERRIDE_VARIABLE)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_DEBOUNCE_MILLISECONDS);
+        Duration::from_millis(milliseconds)
+    })
+}
 
 /// Whether an event kind represents a source change worth rebuilding for.
 ///
 /// Content changes, file creations, and file deletions all matter. Renames
 /// surface as a remove/create pair or a name modification depending on the
-/// platform, so they are covered by the same three kinds. Access and
-/// metadata-only events are ignored.
+/// platform, so they are covered by the same three kinds. Every `Modify` kind
+/// counts, metadata-only included, because an editor's save can surface as
+/// one; access notifications never do.
 pub(crate) fn is_relevant_event(kind: &EventKind) -> bool {
     matches!(
         kind,
@@ -113,9 +182,6 @@ fn is_relevant_path(path: &Path, watch_root: &Path) -> bool {
     let Ok(canonical_root) = watch_root.canonicalize() else {
         return false;
     };
-    // The deletion events the filter above deliberately accepts cannot be
-    // canonicalized at all: `Path::canonicalize` needs every component to
-    // exist, so the resolver walks to the nearest surviving ancestor instead.
     let Some(canonical_path) = canonicalize_through_existing_ancestor(path) else {
         return false;
     };
@@ -196,69 +262,6 @@ fn is_relevant_relative_path(relative: &Path) -> bool {
     }
 }
 
-/// One debounce window's outcome: when its signal fired and how long the save
-/// had already sat before it did.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SourceTrigger {
-    /// The generation this trigger published, which is the value the frame
-    /// loop compares its own counter against.
-    pub(crate) generation: u64,
-    /// Monotonic instant the signal was published.
-    pub(crate) fired_at: Instant,
-    /// Milliseconds from the newest edited file's modification time to the
-    /// signal, debounce included; `NaN` when no timestamp could be read.
-    pub(crate) detection_delay_ms: f64,
-}
-
-/// The project watcher's most recent triggers.
-///
-/// Lets the frame loop measure a reload from the save that caused it: the
-/// signal's instant bounds the pipeline, and the modification-time delay the
-/// watcher already reports bounds the wait before the signal even fired.
-/// Only the project watcher publishes here; the module and renderer watchers
-/// pass `None`, because nothing times a reload from their signals.
-pub(crate) struct TriggerLog {
-    /// Newest last. Guarded because the watcher thread writes while the frame
-    /// thread reads.
-    entries: Mutex<Vec<SourceTrigger>>,
-}
-
-impl TriggerLog {
-    /// An empty log.
-    pub(crate) fn new() -> Self {
-        Self {
-            entries: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Record one fired trigger, evicting the oldest past the bound.
-    fn record(&self, trigger: SourceTrigger) {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if entries.len() >= TRIGGER_LOG_CAPACITY {
-            entries.remove(0);
-        }
-        entries.push(trigger);
-    }
-
-    /// Take the trigger that published `generation`, if it is still logged.
-    ///
-    /// Taken rather than read, so one signal is attributed to exactly one
-    /// reload - the reload that consumed its generation.
-    pub(crate) fn take(&self, generation: u64) -> Option<SourceTrigger> {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let index = entries
-            .iter()
-            .position(|entry| entry.generation == generation)?;
-        Some(entries.remove(index))
-    }
-}
-
 /// Spawn the notify watcher + debounce worker skeleton shared by the source,
 /// asset and shader watchers.
 ///
@@ -270,6 +273,12 @@ impl TriggerLog {
 /// worker lives. `callback_error_message` is the message reported when the
 /// backend hands the callback an error; watching must never panic inside it,
 /// because some backends run it on their own threads.
+///
+/// # Errors
+///
+/// Returns [`WatcherError::CreationFailed`] when the platform watcher or the
+/// worker thread cannot be created, and
+/// [`WatcherError::RegistrationFailed`] when `root` cannot be watched.
 pub(crate) fn spawn_settled_watcher<F>(
     root: PathBuf,
     thread_name: &str,
@@ -281,6 +290,8 @@ pub(crate) fn spawn_settled_watcher<F>(
 where
     F: FnMut(&Path, Vec<PathBuf>) -> bool + Send + 'static,
 {
+    // Step 1: Create the watcher whose callback filters events and forwards
+    // the accepted paths to the worker.
     let (path_sender, paths) = std::sync::mpsc::channel::<PathBuf>();
     let mut watcher = RecommendedWatcher::new(
         move |result: Result<Event, notify::Error>| match result {
@@ -313,8 +324,8 @@ where
         source: Box::new(source),
     })?;
 
-    // Recursive watching covers nested trees without requiring every caller
-    // to enumerate its own directory structure.
+    // Step 2: Register a recursive watch, which covers nested trees without
+    // requiring every caller to enumerate its own directory structure.
     watcher
         .watch(&root, RecursiveMode::Recursive)
         .map_err(|source| WatcherError::RegistrationFailed {
@@ -322,6 +333,7 @@ where
             source: Box::new(source),
         })?;
 
+    // Step 3: Spawn the worker thread and hand the watcher over to it.
     std::thread::Builder::new()
         .name(thread_name.to_owned())
         .spawn(move || {
@@ -352,8 +364,9 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error if the watch directory does not exist, the watcher cannot
-/// be created, or the watch path cannot be registered.
+/// Returns [`WatcherError::WatchDirectoryMissing`] when the joined watch path
+/// does not exist, and otherwise the failures [`spawn_settled_watcher`]
+/// reports: watcher or worker creation and watch registration.
 pub(crate) fn spawn_source_watcher(
     workspace_root: PathBuf,
     module_name: &str,
@@ -362,7 +375,7 @@ pub(crate) fn spawn_source_watcher(
     triggers: Option<Arc<TriggerLog>>,
 ) -> Result<(), WatcherError> {
     // Step 1: Resolve and validate the configured watch directory.
-    // Watch paths are configured relative to the repository so the same
+    // Watch paths are configured relative to the workspace root so the same
     // configuration works regardless of the process's current directory.
     let watch_path = workspace_root.join(watch_directory);
 

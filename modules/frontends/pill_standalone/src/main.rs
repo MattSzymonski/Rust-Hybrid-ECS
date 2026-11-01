@@ -3,8 +3,9 @@
 //! # Responsibilities
 //!
 //! - Install the engine report handler and the shared telemetry stack.
-//! - Select what to run - the development host (`dev`) or the linked game
-//!   (`shipping`) - and run it through the loops in [`runner`].
+//! - Select what to run - the development host (`development`) or the linked project
+//!   (`shipping`) - and run it through the windowed or headless loop, whichever
+//!   this build compiled.
 //! - Convert the run's failure into one styled miette report at the single
 //!   reporting boundary.
 //!
@@ -22,22 +23,25 @@
 use std::path::PathBuf;
 
 // External crates
-use pill_core::error;
 use pill_core::error::{engine_report, install_engine_report_handler};
 
 // Current crate
-use crate::frontend::RunError;
+use crate::error::RunError;
 
 // =============================================================================
 // Modules
 // =============================================================================
 
 /// The standalone frontend's errors.
-mod frontend;
-/// What this binary runs: the development host, or a shipped game.
+mod error;
+/// The headless run loop.
+#[cfg(not(feature = "rendering"))]
+mod headless_standalone;
+/// What this binary runs: the development host, or a shipped project.
 mod posture;
-/// The headless and windowed run loops.
-mod runner;
+/// The windowed run loop and its `winit` application.
+#[cfg(feature = "rendering")]
+mod windowed_standalone;
 
 // =============================================================================
 // Posture
@@ -48,57 +52,14 @@ mod runner;
 // unification makes the second easy to trigger by accident - a `--workspace`
 // build where another package asks for `pill_development_host` - so it is
 // refused at compile time rather than discovered in a shipped binary.
-#[cfg(not(any(feature = "dev", feature = "shipping")))]
+#[cfg(not(any(feature = "development", feature = "shipping")))]
 compile_error!(
-    "pill_standalone needs a posture: `dev` (the default) or `shipping` - build a shipped game as `--no-default-features --features shipping`."
+    "pill_standalone needs a posture: `development` (the default) or `shipping` - build a shipped project as `--no-default-features --features shipping`."
 );
-#[cfg(all(feature = "dev", feature = "shipping"))]
+#[cfg(all(feature = "development", feature = "shipping"))]
 compile_error!(
-    "pill_standalone cannot be both `dev` and `shipping`: build a shipped game as `--no-default-features --features shipping` (and never with `hot_patch`)."
+    "pill_standalone cannot be both `development` and `shipping`: build a shipped project as `--no-default-features --features shipping` (and never with `hot_patch`)."
 );
-
-// =============================================================================
-// Constants
-// =============================================================================
-
-/// Environment variable that runs the development host in the editor posture.
-///
-/// A development and test switch: set, it gives this binary the editor host's
-/// extension set, `<extension>_editor` crates included; unset, this binary
-/// never builds or loads an editor crate.
-#[cfg(feature = "dev")]
-const EDITOR_POSTURE_ENVIRONMENT_VARIABLE: &str = "PILL_EDITOR_POSTURE";
-
-// =============================================================================
-// Project
-// =============================================================================
-
-/// The project to run: resolved from `PROJECT_PATH` and the project's
-/// `project_settings.yaml`.
-///
-/// # Errors
-///
-/// Returns the configuration error when the project cannot be resolved.
-#[cfg(feature = "dev")]
-fn project() -> miette::Result<pill_development_host::HostConfig> {
-    // The editor posture only on an explicit `1`, so a stray value never
-    // loads editor code into an ordinary run.
-    if std::env::var(EDITOR_POSTURE_ENVIRONMENT_VARIABLE).as_deref() == Ok("1") {
-        return Ok(pill_development_host::HostConfig::from_environment_for_editor()?);
-    }
-    Ok(pill_development_host::HostConfig::from_environment()?)
-}
-
-/// The project to run: the one the generated shipping bundle links in.
-///
-/// The bundle is regenerated from the project's `project_settings.yaml` by
-/// `devops/tools/generate_shipping_bundle.py` before a shipping build, so this
-/// binary never names a project or module itself. The bundle also encodes the
-/// backend - native Rust or managed C#.
-#[cfg(feature = "shipping")]
-fn project() -> miette::Result<pill_player::StaticProject> {
-    Ok(pill_shipping_bundle::static_project())
-}
 
 // =============================================================================
 // Telemetry
@@ -143,13 +104,25 @@ fn main() -> miette::Result<()> {
     install_engine_report_handler();
     // Step 2: bring up the shared telemetry stack (best-effort).
     init_telemetry();
-    // Step 3: run the project and convert the error once.
-    let outcome: Result<(), RunError> = runner::run(project()?);
+    // Step 3: resolve the project this build runs. Development reads
+    // `PROJECT_PATH` and the project's `project_settings.yaml`. Shipping asks
+    // the generated bundle, regenerated from the same settings file by
+    // `devops/tools/generate_shipping_bundle.py` before the build, so this
+    // binary never names a project or module itself.
+    #[cfg(feature = "development")]
+    let project = pill_development_host::HostConfig::from_environment()?;
+    #[cfg(feature = "shipping")]
+    let project = pill_shipping_bundle::static_project();
+    // Step 4: run the project and convert the error once.
+    #[cfg(not(feature = "rendering"))]
+    let run_result: Result<(), RunError> = headless_standalone::run(project);
+    #[cfg(feature = "rendering")]
+    let run_result: Result<(), RunError> = windowed_standalone::run(project);
 
-    outcome.map_err(|error| {
+    run_result.map_err(|error| {
         // Error correlation: the fatal failure also enters the tracing lane
         // so it appears inside any active spans and log files.
-        error!(
+        pill_core::error!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
             error = %error,
             "host terminated with an error"

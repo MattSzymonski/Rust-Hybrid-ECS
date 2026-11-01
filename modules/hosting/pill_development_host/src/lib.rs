@@ -1,4 +1,5 @@
-//! The development host every engine frontend runs a project through.
+//! The development host: it builds a project and its extensions as loadable
+//! modules and reloads them while the project runs.
 //!
 //! # Responsibilities
 //!
@@ -14,9 +15,9 @@
 //! Configuration is externalized in [`ProjectModuleConfig`], keeping backend
 //! selection out of executable crates. Running the game - the engine, the
 //! frame, the statically linked project, the renderer's window - is
-//! `pill_player`'s, which a shipping build links without this crate; the
-//! host exists only with `hot_reload`, and without it this crate is little
-//! more than its configuration types.
+//! `pill_player`'s, which a shipping build links without this crate. The
+//! reload path compiles only with `hot_reload`; without it this crate is
+//! little more than its configuration types.
 
 // ===== Module Declarations =====
 
@@ -45,11 +46,6 @@ mod csharp;
 /// Per-function hot patching: classify, generate, compile and activate a patch.
 #[cfg(feature = "hot_patch")]
 mod hot_patch;
-
-/// One entry in a patched function's history, as returned by
-/// [`DevHost::patch_generations`](runtime::DevHost::patch_generations).
-#[cfg(feature = "hot_patch")]
-pub use hot_patch::PatchGeneration;
 
 /// Lifecycle management for extensions.
 mod extension;
@@ -93,17 +89,22 @@ mod scratch;
 
 // ===== Re-exports =====
 
-// Local host modules and the shared crate-root error surface.
 /// The editor-only settings file's name in the project root.
 pub use config::EDITOR_SETTINGS_FILE;
 /// The editor's own settings file: read by the editor executable
 /// only, never by a game build.
 pub use config::{read_editor_settings, resolve_editor_theme, EditorSettings};
+/// The host's configuration: the project module, the extensions to load and
+/// the selected renderer.
 pub use config::{ExtensionConfig, HostConfig, ProjectModuleBackend, ProjectModuleConfig};
+/// The module ABI revision an extension must report before the host calls
+/// into it.
 pub use extension::EXTENSION_ABI_VERSION;
 /// The notices an editor frontend drains each frame; see [`HostNotice`].
 #[cfg(feature = "hot_reload")]
 pub use notices::{take as take_notices, HostNotice};
+/// The error surface frontends report through: the host's error types, the
+/// message renderers and the installed report handler.
 pub use pill_core::error::{
     engine_report, install_engine_report_handler, BuildError, CSharpError, ConfigError,
     EngineMessage, EngineReportHandler, HostError, LibraryError, MessageRenderer, ModuleError,
@@ -113,17 +114,24 @@ pub use pill_core::error::{
 /// Where a managed project's assemblies are, as [`ProjectModuleBackend`]
 /// names them; defined by the C# bridge.
 pub use pill_csharp_bridge::CSharpModuleConfig;
-// The frame driver frontends run the host through, and what a frame reports.
-pub use pill_player::{FrameDriver, FrameReport};
+/// What a frontend's loop needs from whatever runs the game; the development
+/// host implements it, as the shipping runtimes do.
+pub use pill_player::FrameDriver;
 
-// The development host.
+/// The project's assets as an editor tool sees them, and the standalone types
+/// a new asset can be created for.
 #[cfg(feature = "hot_reload")]
 pub use asset_browser::{standalone_file_name, standalone_types, AssetEntry, StandaloneType};
+/// One entry in a patched function's history, as returned by
+/// [`DevHost::patch_generations`](runtime::DevHost::patch_generations).
+#[cfg(feature = "hot_patch")]
+pub use hot_patch::PatchGeneration;
+/// The development host and the headless entry points that drive one.
 #[cfg(feature = "hot_reload")]
 pub use runtime::{run_one_frame, setup, DevHost};
 
-// `EngineError` has no rendering variants, so it is available to headless
-// frontends too.
+/// `EngineError` has no rendering variants, so it is available to headless
+/// frontends too.
 pub use pill_engine::EngineError;
 
 // Rendering-only: the renderer contract's data and errors, re-exported so
@@ -135,6 +143,7 @@ pub use pill_player::{RendererWindow, RenderingError};
 #[cfg(feature = "rendering")]
 pub use pill_renderer_api::{RenderViewport, RendererError};
 
-// Rendering-only entry points: attaching the renderer to a frontend's window.
+/// Rendering-only entry points: the windowed host and attaching the renderer
+/// to a frontend's window.
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
 pub use runtime::{attach_renderer, setup_rendering, RenderingHost};

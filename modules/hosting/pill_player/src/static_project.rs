@@ -22,21 +22,12 @@
 //! as a [`StaticProjectBackend::External`] backend the bridge implements, so a
 //! build that runs no C# links none of it.
 //!
-//! ## What this has to reproduce
-//!
-//! The `#[pill_project]` and `#[pill_module]` attributes generate a
-//! `#[no_mangle] extern "C"` wrapper around the function the user wrote, and
-//! the wrapper does two things before calling it:
-//!
-//! 1. `register_all_components`, which drains this artifact's `inventory`
-//!    registry into the world. Skipping it is the single most likely way to get
-//!    a static build subtly wrong, because it fails as "my components do not
-//!    exist" rather than as a link error.
-//! 2. `catch_unwind`, so a panic becomes a non-zero status instead of unwinding
-//!    across the C ABI.
-//!
-//! Statically there is no ABI to unwind across, so a panic here is an ordinary
-//! Rust panic and is left alone - converting it would only hide the backtrace.
+//! A linked entry point runs the same transaction as the macro-generated
+//! `pill_module_init` wrapper: `register_all_components` drains this artifact's
+//! `inventory` registry into the world first, and skipping it fails as "my
+//! components do not exist" rather than as a link error. The wrapper also
+//! catches panics; here there is no C ABI to unwind across, so a panic stays an
+//! ordinary Rust panic rather than becoming a status that hides the backtrace.
 
 // Standard library
 use std::any::Any;
@@ -48,7 +39,7 @@ use pill_core::info;
 use pill_engine::{Engine, SystemOwner};
 
 // Current crate
-use crate::registration::{extension_owner, register_scoped, PROJECT_SCOPE};
+use crate::registration::{extension_owner, register_module, PROJECT_SCOPE};
 use crate::LoggingSettings;
 
 // =============================================================================
@@ -127,8 +118,11 @@ pub struct StaticRenderer {
     /// Builds a backend on a window (`pill_master_renderer::attach`), as a
     /// future: a native frontend blocks on it once, a web frontend awaits it.
     ///
-    /// Unsafe for the renderer's own reason: the window must outlive the
-    /// backend, which the runtime guarantees by dropping the backend first.
+    /// # Safety
+    ///
+    /// The window must outlive the backend built on it - the renderer module's
+    /// own contract. The runtime satisfies it by keeping the backend in a field
+    /// declared before the window it was built on.
     pub attach: StaticRendererAttachFn,
 }
 
@@ -185,56 +179,18 @@ pub struct StaticProject {
     pub startup_scene: Option<&'static str>,
 }
 
-/// A project's logging settings, compiled into the binary as text.
-///
-/// Text rather than levels so the generated bundle needs nothing but string
-/// literals; [`Self::settings`] reads it into [`LoggingSettings`].
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StaticLogging {
-    /// The `level:` key, when the settings set one.
-    pub level: Option<&'static str>,
-    /// The `timestamp:` key (`date_time` or `time`), when the settings set one.
-    pub timestamp: Option<&'static str>,
-    /// The `source_location:` key, when the settings set one.
-    pub source_location: Option<bool>,
-    /// The `targets:` map, as `(target, level)` pairs in file order.
-    pub targets: &'static [(&'static str, &'static str)],
-}
-
-impl StaticLogging {
-    /// No logging settings: the engine's defaults apply.
-    pub const NONE: Self = Self {
-        level: None,
-        timestamp: None,
-        source_location: None,
-        targets: &[],
-    };
-
-    /// The settings this text describes.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first level or target that does not read, which only a
-    /// hand-edited bundle can hold: the generator refuses both.
-    pub fn settings(&self) -> Result<LoggingSettings, String> {
-        let mut settings = LoggingSettings::from_text(self.level, self.timestamp, self.targets)?;
-        settings.source_location = self.source_location;
-        Ok(settings)
-    }
-}
-
-// =============================================================================
-// Impls
-// =============================================================================
-
 impl StaticProject {
     /// Initialize every extension, then the project.
     ///
     /// Owners come from [`crate::registration`], as in the reloading host, so a
     /// statically linked module's systems are attributed to the same owner
     /// they would have had there. Nothing can be cleared or re-registered
-    /// here, but the attribution still drives scheduler ordering and
-    /// diagnostics.
+    /// here, but the attribution still decides which systems a pause suspends
+    /// and how a system list labels them.
+    ///
+    /// On success returns an external backend's guard, which the caller must
+    /// keep alive for as long as the engine - see [`ProjectBackend::start`]. A
+    /// natively linked project returns `None`.
     ///
     /// # Errors
     ///
@@ -244,18 +200,16 @@ impl StaticProject {
     /// what an external backend returns. Initialization stops at the first
     /// failure: there is no previous generation to roll back to on this path,
     /// so continuing would run a partially registered world.
-    ///
-    /// Returns an external backend's guard, which the caller must keep alive
-    /// for as long as the engine - see [`ProjectBackend::start`].
     pub(crate) fn initialize(
         &self,
         engine: &mut Engine,
     ) -> Result<Option<Box<dyn Any>>, HostError> {
-        // An external backend is handed the components every module
-        // registered, so the names are collected as each module initializes
-        // rather than reconstructed afterwards. The renderer's data crate is
-        // the first module, as in the reloading host (the bundle generator puts
-        // it there), so modules and the project find its components registered.
+        // Step 1: Every extension registers under the owner its load index
+        // gives it, and the components it adds are collected as it goes: an
+        // external backend is handed those names rather than having them
+        // reconstructed afterwards. The renderer's data crate is the first
+        // module, as in the reloading host (the bundle generator puts it
+        // there), so modules and the project find its components registered.
         let mut exposed_names: Vec<String> = Vec::new();
 
         for (index, module) in self.modules.iter().enumerate() {
@@ -280,6 +234,8 @@ impl StaticProject {
             );
         }
 
+        // Step 2: The project itself, through its linked function or through
+        // an external backend.
         let guard = match &self.backend {
             StaticProjectBackend::Native { init } => {
                 initialize_linked(engine, *init, PROJECT_SCOPE, self.startup_scene)
@@ -313,6 +269,46 @@ impl StaticProject {
     }
 }
 
+/// A project's logging settings, compiled into the binary as text.
+///
+/// Text rather than levels so the generated bundle names no engine type;
+/// [`Self::settings`] reads it into [`LoggingSettings`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StaticLogging {
+    /// The `level:` key, when the settings set one.
+    pub level: Option<&'static str>,
+    /// The `timestamp:` key (`date_time` or `time`), when the settings set one.
+    pub timestamp: Option<&'static str>,
+    /// The `source_location:` key, when the settings set one.
+    pub source_location: Option<bool>,
+    /// The `targets:` map, as `(target, level)` pairs sorted by target, the
+    /// order the bundle generator writes them in.
+    pub targets: &'static [(&'static str, &'static str)],
+}
+
+impl StaticLogging {
+    /// No logging settings: the engine's defaults apply.
+    pub const NONE: Self = Self {
+        level: None,
+        timestamp: None,
+        source_location: None,
+        targets: &[],
+    };
+
+    /// The settings this text describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message of the first level, timestamp format or target that
+    /// does not read, which only a hand-edited bundle can hold: the generator
+    /// refuses all three.
+    pub fn settings(&self) -> Result<LoggingSettings, String> {
+        let mut settings = LoggingSettings::from_text(self.level, self.timestamp, self.targets)?;
+        settings.source_location = self.source_location;
+        Ok(settings)
+    }
+}
+
 // =============================================================================
 // Free Functions
 // =============================================================================
@@ -336,7 +332,7 @@ pub(crate) fn initialize_static_renderer(
 /// Queue and load a project's startup scene, warning when it cannot be read.
 ///
 /// A failure is a warning rather than an error: a missing or unreadable scene
-/// must not stop a project from starting with its own.
+/// must not stop a project from starting.
 fn apply_project_startup_scene(engine: &mut Engine, path: &str) {
     pill_engine::queue_startup_scene(engine.world_mut(), path);
     if let Some(Err(reason)) = pill_engine::apply_startup_scene(engine) {
@@ -352,9 +348,13 @@ fn apply_project_startup_scene(engine: &mut Engine, path: &str) {
 /// Run one linked entry point the way its generated ABI wrapper would.
 ///
 /// `scope` scopes the registrations when present, which is what an extension
-/// needs and what the project must not have. Returns the non-zero status the
-/// entry point reported; the caller names the subject, because only it knows
-/// whether the failure is a module's or the project's.
+/// needs and what the project must not have.
+///
+/// # Errors
+///
+/// Returns the non-zero status the entry point reported, from the artifact's
+/// registration or from `init`; the caller names the subject, because only it
+/// knows whether the failure is a module's or the project's.
 fn initialize_linked(
     engine: &mut Engine,
     init: fn(&mut Engine) -> u32,
@@ -362,7 +362,7 @@ fn initialize_linked(
     startup_scene: Option<&'static str>,
 ) -> Result<(), u32> {
     // The same transaction the generated wrappers run, ordering included: both
-    // sides call `run_artifact_init`, so the caller owns the order and no
+    // paths end in `run_artifact_entry`, so the order lives in one place and no
     // comment has to keep two copies identical.
     let status = pill_engine::component_registry::run_artifact_entry(
         engine,
@@ -374,7 +374,7 @@ fn initialize_linked(
                 apply_project_startup_scene(engine, path);
             }
         },
-        |engine| register_scoped(engine, scope, init),
+        |engine| register_module(engine, scope, init),
     );
 
     if status == 0 {
@@ -554,14 +554,16 @@ mod tests {
     }
 
     /// Write a one-entity scene below a fresh temporary asset directory and
-    /// mount it, returning the directory (kept alive for the process) and the
-    /// id the entity carries.
+    /// mount it, returning that directory and the id the entity carries.
     fn one_entity_scene() -> (std::path::PathBuf, EntityId) {
+        // Step 1: A fresh directory below the system temp path, cleared first
+        // so a repeated run in this process never reads a previous scene.
         let root =
             std::env::temp_dir().join(format!("pill-runtime-startup-scene-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("scenes")).unwrap();
 
+        // Step 2: A world holding one entity, saved as a scene document.
         let id = EntityId::from_name("seeded");
         let mut writer = Engine::new();
         writer
@@ -590,6 +592,9 @@ mod tests {
             "{:?}",
             report.skipped_fields
         );
+        // Step 3: Render the document as a standalone scene asset, write it
+        // into that directory and mount the directory, so the project's
+        // startup scene later resolves through the store.
         let bytes = render_standalone::<pill_engine::Scene>(
             AssetGuid::random().expect("a fresh guid"),
             &document,

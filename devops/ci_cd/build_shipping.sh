@@ -46,9 +46,9 @@
 #   shipping binary.
 
 # EXAMPLE USAGE:
-#   set PROJECT_PATH=examples/local/project_rs
+#   set PROJECT_PATH=devops/tests/projects/project_rs
 #   python devops/ci_cd/build_shipping.sh                        # native shipping build
-#   set PROJECT_PATH=examples/local/project_cs
+#   set PROJECT_PATH=devops/tests/projects/managed
 #   devops/ci_cd/build_shipping.sh                            # managed (C#) shipping build
 #   devops/ci_cd/build_shipping.sh -p pill_engine             # any package, release profile
 
@@ -116,7 +116,7 @@ if [[ -n "${project_path}" ]]; then
         /*) project_root="${project_path}" ;;
         *)
             # The host resolves PROJECT_PATH against the working directory, so
-            # `../examples/local/project_rs` works from the workspace dir; try that
+            # `../devops/tests/projects/project_rs` works from the workspace dir; try that
             # first, then the repository root, so both spellings work.
             if [[ -d "${PWD}/${project_path}" ]]; then
                 project_root="${PWD}/${project_path}"

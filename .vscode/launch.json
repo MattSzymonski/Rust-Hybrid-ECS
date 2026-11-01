@@ -29,7 +29,7 @@
                     // Required by `HostConfig::from_environment`; there is no
                     // other source for it. Relative to the workspace root above.
                     "name": "PROJECT_PATH",
-                    "value": "../examples/local/project_rs"
+                    "value": "../devops/tests/projects/project_rs"
                 }
             ],
             // Extensions are built into `target/hot/build`, not
@@ -60,7 +60,7 @@
             "environment": [
                 {
                     "name": "PROJECT_PATH",
-                    "value": "../examples/local/project_rs"
+                    "value": "../devops/tests/projects/project_rs"
                 }
             ],
             "symbolOptions": {
@@ -111,7 +111,7 @@
             "args": [],
             "cwd": "${workspaceFolder}/modules",
             "env": {
-                "PROJECT_PATH": "../examples/local/project_rs"
+                "PROJECT_PATH": "../devops/tests/projects/project_rs"
             }
         },
         {
@@ -129,7 +129,7 @@
             "environment": [
                 {
                     "name": "PROJECT_PATH",
-                    "value": "../examples/local/project_rs"
+                    "value": "../devops/tests/projects/project_rs"
                 }
             ],
             "symbolOptions": {

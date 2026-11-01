@@ -7,17 +7,18 @@
 
 The standalone host is a generic launcher. It selects the project from the
 `PROJECT_PATH` environment variable and reads that project's
-`project_settings.yaml` for the extension list — there is no host-level
-configuration file. Everything else — backend, name, watch directory, build
-command, and output paths — is inferred from the project's manifest, so no
+`project_settings.yaml` for the extension list â€” there is no host-level
+configuration file. Everything else â€” backend, name, watch directory, build
+command, and output paths â€” is inferred from the project's manifest, so no
 project identity is compiled into the host.
 
 Rust project (headless):
 
-- `set PROJECT_PATH=../examples/local/project_rs` then `cargo run --package pill_standalone`
-- or, in PowerShell: `$env:PROJECT_PATH = "../examples/local/project_rs"; cargo run --package pill_standalone`
+- `set PROJECT_PATH=../examples/headless/headless_rust` then `cargo run --package pill_standalone`
+- or, in PowerShell: `$env:PROJECT_PATH = "../examples/headless/headless_rust"; cargo run --package pill_standalone`
 
-Rust project (windowed): the same, with `--features rendering`.
+Rust project (windowed): the same, with `--features rendering` (try
+`../examples/cube/cube_rust`).
 
 **The host and the project must resolve the same dependency graph.** Cargo  
 folds a dependency's resolved features into the dependent's `-C metadata`, and  
@@ -37,10 +38,22 @@ running engine at the next frame, instead of a full module reload. Everything
 a patch cannot express (signature or type changes, new components, constants)  
 falls back to the normal reload. To run the pure reload path without the patch  
 machinery - e.g. when measuring reload performance - build the host with  
-`--no-default-features --features dev` instead.
+`--no-default-features --features development` instead.
 
 C# project: point `PROJECT_PATH` at the directory containing the `.csproj`,  
-e.g. `../examples/local/project_cs`.
+e.g. `../examples/cube/cube_csharp`.
+
+## Examples
+
+`examples/` holds the official examples, each a Rust project and a C# project
+running the same demo: `cube`, `cube_no_editor`, `pills` and `headless`.
+`examples/README.md` lists them and shows how to run either half;
+`examples/local/` is a gitignored developer checkout that nothing ships.
+
+The projects under `devops/tests/projects/` are the suites' own fixtures: the
+hot-reload, C# bridge, renderer and editor suites drive them, and each carries
+the anchors its suite edits and asserts. They are tracked so a clean checkout
+can run the gate.
 
 ## Shipping builds
 
@@ -63,16 +76,16 @@ no .NET install, and no JIT.
 ```bat
 cd D:\Programming\Rust-Hybrid-ECS
 
-set PROJECT_PATH=examples/local/project_rs
+set PROJECT_PATH=devops/tests/projects/native
 python devops\ci_cd\build_release.py --features rendering   :: native shipping build
 
-set PROJECT_PATH=examples/local/project_cs
+set PROJECT_PATH=devops/tests/projects/managed
 python devops\ci_cd\build_shipping.py --features rendering   :: managed (C#), framework-dependent
 python devops\ci_cd\build_shipping.py --csharp-aot           :: managed (C#), NativeAOT self-contained
 ```
 
 `PROJECT_PATH` is resolved against the working directory first (the dev  
-convention: from `modules`, `../examples/local/project_cs`), falling back to the  
+convention: from `modules`, `../devops/tests/projects/managed`), falling back to the  
 repository root, so both spellings work from either place.
 
 Build output lands under the project's `build/<timestamp>/` directory.
@@ -89,9 +102,9 @@ directory, not just `pkg/`.
 
 ```bat
 :: once: rustup target add wasm32-unknown-unknown  and  cargo install wasm-pack
-python devops\tools\build_web.py examples/local/master_renderer_test        :: release (wasm-opt)
-python devops\tools\build_web.py --dev examples/local/master_renderer_test  :: faster, unoptimized
-python -m http.server 8000 -d examples/local/master_renderer_test/build/web
+python devops\tools\build_web.py devops/tests/projects/scene        :: release (wasm-opt)
+python devops\tools\build_web.py --dev devops/tests/projects/scene  :: faster, unoptimized
+python -m http.server 8000 -d devops/tests/projects/scene/build/web
 ```
 
 Then open http://localhost:8000/ in Chrome or Edge 113+, Safari 18+ or Firefox  
@@ -110,9 +123,9 @@ project and every other module running.
 The `modules` list in the project's `project_settings.yaml` selects which ones  
 to load, in order. An absent or empty list loads none.
 
-- `modules: ["pill_spline"]` in `project_settings.yaml` — load the spline module.
-- `modules: ["pill_spline", "pill_physics"]` — several modules.
-- `modules: []` (or omitting the key) — run with no extensions.
+- `modules: ["pill_spline"]` in `project_settings.yaml` â€” load the spline module.
+- `modules: ["pill_spline", "pill_physics"]` â€” several modules.
+- `modules: []` (or omitting the key) â€” run with no extensions.
 
 ### Adding a module
 
@@ -128,7 +141,7 @@ by existing; nothing lists it by name.
    points for you.
 3. Add `<name>` to the `modules` list in the project's `project_settings.yaml`.
 
-Everything else — watch directory, build command, output path — is derived from
+Everything else â€” watch directory, build command, output path â€” is derived from
 the directory name, so the host needs no changes. The host **generates** the
 `cdylib` wrapper it actually loads under
 `modules/extensions/<name>/generated/host_module_<name>/` on startup: it is a
@@ -158,8 +171,8 @@ without any `PATH` adjustment:
 If the staged dylib is missing (for example the toolchain was updated and the  
 binary was not rebuilt), the build script re-copies it on the next `cargo build`.
 
-- `cargo run --package editor` — Run the Rust project in the editor.
-- `dotnet build examples/local/project_cs/project_cs.csproj -c Release --nologo` — Build the C# project and its `csharp_runtime` dependency.
-- `dotnet run --project modules/csharp/pill_csharp_runtime/tests/csharp_runtime_tests.csproj -c Release` — Run the C# system discovery and scheduler-access tests.
-- `cargo test --workspace` — Run all Rust workspace tests.
-- `cargo check --workspace` — Type-check the complete Rust workspace without producing release binaries.
+- `cargo run --package editor` â€” Run the Rust project in the editor.
+- `dotnet build devops/tests/projects/managed/managed.csproj -c Release --nologo` â€” Build the C# project and its `csharp_runtime` dependency.
+- `dotnet run --project modules/csharp/pill_csharp_runtime/tests/csharp_runtime_tests.csproj -c Release` â€” Run the C# system discovery and scheduler-access tests.
+- `cargo test --workspace` â€” Run all Rust workspace tests.
+- `cargo check --workspace` â€” Type-check the complete Rust workspace without producing release binaries.
