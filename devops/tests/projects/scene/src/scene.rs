@@ -25,9 +25,10 @@ use crate::{
     TagAlphaComponent,
 };
 
-/// Scale every model draws at: the bundled mesh spans six world units, which
-/// would fill the camera's frame at the distance the scene places it.
-const MODEL_SCALE: f32 = 0.25;
+/// Scale every model draws at: the bundled mesh spans six world units, and the
+/// scene is sized so its models stay clickable in the editor's default view,
+/// which looks at the origin from sixteen units away.
+const MODEL_SCALE: f32 = 0.6;
 
 /// Where a model's middle sits relative to its origin: the mesh is authored
 /// standing on `y = 0`, so a model is lowered by half its drawn height to stand
@@ -37,10 +38,15 @@ const MODEL_CENTER_OFFSET: f32 = -3.15 * MODEL_SCALE * 0.5;
 /// Where the models stand, one per showcase variant: a row across the camera's
 /// view, spaced so no two silhouettes touch.
 const MODEL_TRANSLATIONS: [[f32; 3]; 3] = [
-    [-1.4, MODEL_CENTER_OFFSET, 0.0],
+    [-4.4, MODEL_CENTER_OFFSET, 0.0],
     [0.0, MODEL_CENTER_OFFSET, 0.0],
-    [1.4, MODEL_CENTER_OFFSET, 0.0],
+    [4.4, MODEL_CENTER_OFFSET, 0.0],
 ];
+
+/// How far back the game camera stands: far enough that the whole row fits the
+/// frame, which is what keeps the scene's screen size the same in the game view
+/// as it was when the models were smaller.
+const CAMERA_DISTANCE: f32 = 12.0;
 
 /// Creates the camera and the models in `world`.
 ///
@@ -57,7 +63,7 @@ pub(crate) fn create(world: &mut World, assets: SceneAssets) -> Result<(), Strin
             .create_entity()
             .with(CameraComponent::default())
             .with(TransformComponent {
-                translation: [0.0, 0.0, 5.0],
+                translation: [0.0, 0.0, CAMERA_DISTANCE],
                 ..Default::default()
             })
             .build()

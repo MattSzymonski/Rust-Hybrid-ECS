@@ -312,7 +312,14 @@ def spawned_builds(frontend):
     for module in module_names():
         builds[f"module {module}"] = module_selection(module, engine_features, anchor)
     for crate in rust_projects():
-        builds[f"project {crate.directory.name}"] = project_selection(crate, engine_features, anchor)
+        selection = project_selection(crate, engine_features, anchor)
+        # A project that names no extension crate selects no package of its own:
+        # it is not a workspace member, and the engine features alone are a
+        # `pill_engine/...` spec cargo cannot resolve against a dylib that has no
+        # dependency on the facade. Such a project spawns no module build, so
+        # there is no graph to compare.
+        if "--package" in selection:
+            builds[f"project {crate.directory.name}"] = selection
         modules = project_modules(crate)
         if modules:
             selection = []

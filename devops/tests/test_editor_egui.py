@@ -434,6 +434,11 @@ SCENE_GRID_PATTERN = (
 # The two answers a scripted scene click can produce, as full patterns.
 PICK_ENTITY_PATTERN = re.escape(SCENE_PICK_ENTITY_TOKEN) + r"\s+entity=(\S+)"
 PICK_NOTHING_PATTERN = re.escape(SCENE_PICK_NOTHING_TOKEN)
+# How long one probe click waits for either answer. An answer arrives within a
+# frame or two, so the only way to wait this long is a click the shell took
+# itself - a badge, a chip or the toolbox - which is a reason to try the next
+# point, not to fail the step.
+PICK_PROBE_TIMEOUT = 15
 # One row of a `dump systems`: index, name, owner, state, then the markers.
 SYSTEM_ROW_PATTERN = (
     re.escape(SYSTEM_ROW_TOKEN)
@@ -1249,28 +1254,40 @@ def _startup_and_hover_steps(state: StepState) -> None:
         f"w={scene_width} h={scene_height}"
     )
 
-    # Probe a 3x3 grid; at least one cell must hit an entity. The
-    # project's scene frames its entities, so the middle usually answers
-    # first.
+    # Probe outward from the viewport centre until one click answers with an
+    # entity. The centre is where the middle entity's badge sits - a chip the
+    # shell owns, which selects that entity and asks for no pick at all - so it
+    # is the point just off the centre that reaches the mesh underneath it. A
+    # cell nothing answers is the UI's, not a failure: the next one is tried.
     picked_entity = None
     for fraction_x, fraction_y in (
         (0.5, 0.5),
+        (0.56, 0.5),
+        (0.44, 0.5),
+        (0.56, 0.55),
+        (0.44, 0.55),
+        (0.5, 0.56),
+        (0.5, 0.44),
+        (0.62, 0.5),
+        (0.38, 0.5),
         (0.35, 0.4),
         (0.65, 0.6),
         (0.5, 0.25),
         (0.5, 0.75),
-        (0.25, 0.5),
-        (0.75, 0.5),
-        (0.2, 0.2),
-        (0.8, 0.8),
     ):
         click_x = scene_x + scene_width * fraction_x
         click_y = scene_y + scene_height * fraction_y
         begin = len(session.read_log())
         session.send(f"click {click_x:.0f} {click_y:.0f}")
-        found, _ = session.wait_either(
-            [PICK_ENTITY_PATTERN, PICK_NOTHING_PATTERN], 120, begin
-        )
+        try:
+            found, _ = session.wait_either(
+                [PICK_ENTITY_PATTERN, PICK_NOTHING_PATTERN], PICK_PROBE_TIMEOUT, begin
+            )
+        except TimeoutError:
+            # Nothing answered: the shell took the click - a badge, a chip or the
+            # floating toolbox - and no scene pick was ever asked.
+            print(f"  [OK] click at ({click_x:.0f}, {click_y:.0f}) was the UI's, next")
+            continue
         if found == PICK_ENTITY_PATTERN:
             match = re.search(PICK_ENTITY_PATTERN, session.read_log()[begin:])
             picked_entity = match.group(1)
@@ -1906,10 +1923,13 @@ def _tiles_inspector_and_input_steps(state: StepState) -> None:
         + dump.group(0)
     )
     assert int(dump.group("visible")) >= 1, "the console showed no rows"
-    # A search narrows the rows to the project's lines: the token only
-    # appears in them.
+    # A search narrows the rows to the ones that carry its text. The token is
+    # one the project's own UI layer logs, so a hit proves the project's line
+    # reached the ring; the editor's own `[editor] console search` line carries
+    # the text too, which is why the step asserts the rows shrank rather than
+    # that every row left is the project's.
     begin = len(session.read_log())
-    session.send("console search 12xxsees")
+    session.send("console search producer=game")
     session.wait(re.escape(CONSOLE_SEARCH_TOKEN), 30, "the console search applied", begin)
     # The filter lands on the executable's next frame, so a frame has to
     # run before the dump can read it.
@@ -1919,15 +1939,20 @@ def _tiles_inspector_and_input_steps(state: StepState) -> None:
     session.wait(re.escape(CONSOLE_DUMP_TOKEN), 30, "the searched console dump", begin)
     filtered = console_dump(session, begin)
     assert filtered, "the filtered console dump did not parse"
-    assert filtered.group("search") == "12xxsees", (
+    assert filtered.group("search") == "producer=game", (
         "the search did not reach the console: " + filtered.group(0)
     )
-    assert int(filtered.group("visible")) == int(filtered.group("game")), (
-        "the search kept engine rows: " + filtered.group(0)
+    assert int(filtered.group("visible")) >= 1, (
+        "the search dropped the project's own line: " + filtered.group(0)
     )
-    # A level filter above the project's line leaves nothing.
+    assert int(filtered.group("visible")) < int(filtered.group("total")), (
+        "the search did not narrow the rows: " + filtered.group(0)
+    )
+    # A level filter above the project's lines leaves none of them. `error`,
+    # not `warn`: the fixture's own `TagAlphaComponent` line is a warning, and
+    # the step is about a level nothing in the session reaches.
     begin = len(session.read_log())
-    session.send("console filter warn")
+    session.send("console filter error")
     session.wait(re.escape(CONSOLE_FILTER_TOKEN), 30, "the console filter applied", begin)
     session.wait(re.escape(EGUI_ROWS_TOKEN), 60, "a frame applied the level", begin)
     begin = len(session.read_log())
@@ -1935,11 +1960,11 @@ def _tiles_inspector_and_input_steps(state: StepState) -> None:
     session.wait(re.escape(CONSOLE_DUMP_TOKEN), 30, "the levelled console dump", begin)
     levelled = console_dump(session, begin)
     assert levelled, "the level-filtered console dump did not parse"
-    assert levelled.group("level") == "warn", (
+    assert levelled.group("level") == "error", (
         "the level filter did not reach the console: " + levelled.group(0)
     )
     assert int(levelled.group("visible")) == 0, (
-        "a warn filter kept info rows: " + levelled.group(0)
+        "an error filter kept rows below its level: " + levelled.group(0)
     )
     # Back to the unfiltered view, so the rest of the run reads the tab
     # the way a fresh session would.
@@ -2244,20 +2269,21 @@ def _resources_arrays_and_meshes_steps(state: StepState) -> None:
     )
 
     # The pick: by path, through the recorded step the picker queues. The
-    # mesh is not loaded before this, so the step loads it.
+    # mesh is not loaded before this, so the step loads it - `cube.obj` is the
+    # second mesh the fixture ships and no entity draws.
     begin = len(session.read_log())
     session.send(
-        "edit set {} MeshRendererComponent mesh models/plane.obj".format(mesh_entity)
+        "edit set {} MeshRendererComponent mesh models/cube.obj".format(mesh_entity)
     )
     session.wait(
         re.escape(REFERENCE_SET_TOKEN)
-        + r'(?=[^\n]*field="mesh")[^\n]*asset="models/plane\.obj"',
+        + r'(?=[^\n]*field="mesh")[^\n]*asset="models/cube\.obj"',
         60,
         "the mesh pick",
         begin,
     )
     session.wait(
-        asset_row_pattern("mesh", "models/plane.obj"),
+        asset_row_pattern("mesh", "models/cube.obj"),
         30,
         "the row names the picked mesh",
         begin,

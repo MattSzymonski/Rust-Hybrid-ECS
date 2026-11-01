@@ -10,11 +10,10 @@ REQUIREMENTS
   - Rust toolchain (cargo)
 
 DESCRIPTION
-    Drives the headless dev host on `examples/pills/pills_rust` - whose code default
-    is the brutalist recipe, whose `res/ui/accent.theme` overrides the accent
-    and the heading size, and whose body font is `res/fonts/Silkscreen`
- - and checks the game half of the theme pipeline end to end:
-
+    Drives the headless dev host on `devops/tests/projects/scene` - whose code
+    default is the brutalist recipe, whose `res/ui/accent.theme` overrides the
+    accent and the heading size, and whose body font is `res/fonts/Silkscreen`
+    - and checks the game half of the theme pipeline end to end:
       1. startup - the UI logs `[ui] fonts installed` with a signature, then
          `[ui] theme applied layers=code,file path=ui/accent.theme` with the
          override's accent. The code default and the file are both visible in

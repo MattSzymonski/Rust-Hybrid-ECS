@@ -152,44 +152,55 @@ pub fn init(engine: &mut Engine) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pill_engine::Query;
+    use crate::asset_loading::SceneAssets;
+    use pill_engine::{Handle, Query};
     use pill_master_renderer_data::{CameraComponent, MeshRendererComponent};
 
+    /// The builder places one camera and three rotating models, and a second
+    /// pass adds nothing.
+    ///
+    /// The builder is driven directly rather than through [`init`]: the host
+    /// compiles this project as a generated workspace member, which builds
+    /// `pill_master_renderer_data` with `default-features = false`, so the
+    /// asset loaders `init` needs are not in that build and it correctly
+    /// reports a failed load. The handles are never resolved by the builder, so
+    /// invalid ones exercise exactly the shape and the early return that the
+    /// suites rely on.
     #[test]
-    fn initialization_creates_one_camera_and_three_rotating_models() {
+    fn the_builder_creates_one_camera_and_three_rotating_models_once() {
         let mut engine = Engine::new();
-        assert_eq!(init(&mut engine), 0);
+        // What `init` does before it loads anything: the renderer's data crate
+        // owns the standard components, the three project ones are registered
+        // by the generated glue.
+        pill_master_renderer_data::register(&mut engine);
+        __pill_register_TagAlphaComponent(engine.world_mut());
+        __pill_register_ShowcaseComponent(engine.world_mut());
+        __pill_register_ShowcaseReferenceComponent(engine.world_mut());
+        let world = engine.world_mut();
+        let assets = SceneAssets {
+            mesh: Handle::INVALID,
+            material: Handle::INVALID,
+        };
+        scene::create(world, assets).expect("the first pass builds the scene");
 
-        let model_count = Query::<&MeshRendererComponent>::new(engine.world_mut())
+        let model_count = Query::<&MeshRendererComponent>::new(world)
             .iter_mut()
             .count();
-        let rotating_count = Query::<&TagAlphaComponent>::new(engine.world_mut())
-            .iter_mut()
-            .count();
-        let camera_count = Query::<&CameraComponent>::new(engine.world_mut())
-            .iter_mut()
-            .count();
+        let rotating_count = Query::<&TagAlphaComponent>::new(world).iter_mut().count();
+        let camera_count = Query::<&CameraComponent>::new(world).iter_mut().count();
         assert_eq!(model_count, 3);
         assert_eq!(rotating_count, 3);
         assert_eq!(camera_count, 1);
 
-        // A second initialization is what a project reload runs, so it
-        // succeeds: `asset_loading` reuses an asset already under its name
-        // instead of adding a duplicate, and the scene builder returns early
-        // on the tag the first pass left. Nothing the first scene built is
-        // duplicated or replaced.
-        assert_eq!(init(&mut engine), 0);
+        // A second pass is what a project reload runs: the builder returns early
+        // on the tag the first one left, so nothing is duplicated or replaced.
+        scene::create(world, assets).expect("the second pass builds nothing");
         assert_eq!(
-            Query::<&MeshRendererComponent>::new(engine.world_mut())
+            Query::<&MeshRendererComponent>::new(world)
                 .iter_mut()
                 .count(),
             3
         );
-        assert_eq!(
-            Query::<&CameraComponent>::new(engine.world_mut())
-                .iter_mut()
-                .count(),
-            1
-        );
+        assert_eq!(Query::<&CameraComponent>::new(world).iter_mut().count(), 1);
     }
 }

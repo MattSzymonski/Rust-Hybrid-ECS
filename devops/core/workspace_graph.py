@@ -155,18 +155,17 @@ def example_projects(repository: Path) -> List[Crate]:
     manifests = sorted(
         set(examples.glob("*/Cargo.toml")) | set(examples.glob("*/*/Cargo.toml"))
     )
+    # The catalog's paths are re-rooted under `repository` and then checked
+    # there, not on the real checkout: a tree that carries only what it was
+    # generated with - the renderer-boundary suite's self test builds one - has
+    # neither the official examples nor the fixtures, and a path a tree does not
+    # hold is not one of its projects.
+    catalog = [
+        path.relative_to(REPOSITORY_ROOT) for path in OFFICIAL_EXAMPLE_PROJECTS.values()
+    ] + [TEST_PROJECTS_ROOT.relative_to(REPOSITORY_ROOT) / name for name in TEST_PROJECT_NAMES]
     manifests.extend(
-        sorted(
-            repository / path.relative_to(REPOSITORY_ROOT) / "Cargo.toml"
-            for path in OFFICIAL_EXAMPLE_PROJECTS.values()
-            if (path / "Cargo.toml").is_file()
-        )
+        manifest
+        for manifest in (repository / relative / "Cargo.toml" for relative in catalog)
+        if manifest.is_file()
     )
-    manifests.extend(
-        sorted(
-            repository / TEST_PROJECTS_ROOT.relative_to(REPOSITORY_ROOT) / name / "Cargo.toml"
-            for name in TEST_PROJECT_NAMES
-            if (TEST_PROJECTS_ROOT / name / "Cargo.toml").is_file()
-        )
-    )
-    return [Crate(manifest) for manifest in manifests]
+    return [Crate(manifest) for manifest in sorted(set(manifests))]

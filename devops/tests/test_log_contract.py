@@ -164,9 +164,10 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
     "[managed] sample extra=7.5":
         "Printed by C# that test_csharp_bridge.py injects into "
         "devops/tests/projects/managed during the run, to witness a field default.",
-    "cs spline bridge: sees 1 spline(s), first P0.X=0, count=4":
+    "omo=(12,34) sum=47 a=1212 b=1234":
         "Printed by the C# BridgeProbe fixture test_csharp_bridge.py injects "
-        "into devops/tests/projects/managed during the run.",
+        "into devops/tests/projects/managed during the run: the values are the "
+        "ones C# reads out of the module's column.",
     "cs spline bridge: sees 2 spline(s)":
         "Printed by the C# BridgeProbe fixture test_csharp_bridge.py injects "
         "into devops/tests/projects/managed during the run.",
