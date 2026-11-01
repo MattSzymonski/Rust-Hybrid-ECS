@@ -72,7 +72,7 @@ FLAGS:
 
 EXAMPLE USAGE:
   python devops/tools/pill_dev.py pick
-  python devops/tools/pill_dev.py pick italian_brainrot_cs
+  python devops/tools/pill_dev.py pick circus_demo_cs
   python devops/tools/pill_dev.py cycle
   python devops/tools/pill_dev.py run --headless
   python devops/tools/pill_dev.py log --follow
@@ -274,7 +274,7 @@ def project_language(project: Path) -> str:
 def resolve_project(requested: str) -> Path | None:
     """The project the caller named, or None with the candidates listed.
 
-    A bare directory name (`italian_brainrot_cs`), a path relative to the
+    A bare directory name (`circus_demo_cs`), a path relative to the
     repository, and an absolute path are all accepted, in that order.
     """
     for candidate in (

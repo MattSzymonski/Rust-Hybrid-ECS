@@ -4,8 +4,9 @@ Suite lint for `devops/tests`: the header `run_all.py` reads, and the rules
 that keep the shared helpers from being forked again.
 
 PROTECTS: Suites keep their run_all header, stop re-forking the core helpers, say
-          why they sleep, anchor their output before they write, and name project
-          directories through `core.projects`.
+          why they sleep, anchor their output before they write, name project
+          directories through `core.projects`, and leave the fixture set inside
+          its weight budget.
 TIER: static
 
 REQUIREMENTS: Python 3.8+ (standard library only).
@@ -39,6 +40,11 @@ DESCRIPTION
                     never as a literal. A literal is how one project move
                     turned into a list of files to edit, and a stale literal
                     fails as "no such project" only when that suite runs.
+      6. budget   - the fixture set under `devops/tests/projects` stays inside
+                    its weight budget and ships no file twice. The seven
+                    fixtures this set replaced weighed 37.4 MB, almost all of
+                    it the same maps and models copied three times, and
+                    nothing measured it until an audit did.
 
     Each rule ships with a planted-violation self-test (`--self-test`), so a
     rule that stopped matching fails here, where it is cheap to see, instead
@@ -58,17 +64,22 @@ EXAMPLE USAGE
 """
 
 import argparse
+import hashlib
 import re
 import sys
+import tempfile
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 # Standalone-runnable: `run_all` and the suites this lints sit beside this
 # file, and run_all puts `devops/` on `sys.path` itself for `core`.
 SUITES_DIRECTORY = Path(__file__).resolve().parent
 sys.path.insert(0, str(SUITES_DIRECTORY))
+sys.path.insert(0, str(SUITES_DIRECTORY.parent))
 
 import run_all  # noqa: E402
+
+from core.projects import TEST_PROJECTS_ROOT  # noqa: E402
 
 # A helper under one of these names belongs to `devops/core/`: `read_log`,
 # `atomic_write` and `require` live in `core/suite_common.py`, `wait_token`
@@ -96,6 +107,15 @@ SOURCE_WRITE_PATTERN = re.compile(
 PROJECT_PATH_LITERAL_PATTERN = re.compile(
     r'"(?:\.\./)?examples/[A-Za-z0-9_.-]+"|"\.\./devops/tests/[A-Za-z0-9_.-]+"'
 )
+
+# Rule 6's two numbers: the whole fixture set's weight, and the size below which
+# a repeated file is not worth reporting. A small stub mesh legitimately ships in
+# more than one fixture; a map that size is how the set reached 37.4 MB.
+FIXTURE_BUDGET_MEGABYTES = 10.0
+FIXTURE_DUPLICATE_MINIMUM_BYTES = 4096
+
+# A fixture's build output, which is never counted and never committed.
+FIXTURE_BUILD_OUTPUT_NAMES = {"target", "build", "bin", "obj", ".git"}
 
 
 # Every suite this lint covers: the same glob `run_all.py` discovers.
@@ -183,9 +203,49 @@ def project_findings(path: Path, text: str) -> List[str]:
     return found
 
 
+# Rule 6: the fixture set is weighed, and no file ships twice.
+#
+# Measured over what a fixture commits: its sources and its assets, never the
+# build output a run leaves behind. The duplication half only reports a file
+# large enough to matter, so a stub mesh copied between fixtures stays legal.
+def fixture_findings(
+    fixtures_root: Path = TEST_PROJECTS_ROOT,
+) -> Tuple[int, List[str]]:
+    found = []
+    total_bytes = 0
+    owners: Dict[str, List[str]] = {}
+    for path in sorted(fixtures_root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(fixtures_root)
+        if any(part in FIXTURE_BUILD_OUTPUT_NAMES for part in relative.parts):
+            continue
+        size = path.stat().st_size
+        total_bytes += size
+        if size < FIXTURE_DUPLICATE_MINIMUM_BYTES:
+            continue
+        digest = hashlib.sha1(path.read_bytes()).hexdigest()
+        owners.setdefault(digest, []).append(str(relative))
+    for paths in owners.values():
+        fixtures = {path.replace("\\", "/").split("/")[0] for path in paths}
+        if len(fixtures) > 1:
+            found.append(
+                "the same file ships in several fixtures: " + ", ".join(sorted(paths))
+            )
+    limit_bytes = int(FIXTURE_BUDGET_MEGABYTES * 1024 * 1024)
+    if total_bytes > limit_bytes:
+        found.append(
+            "the fixture set weighs {:.2f} MB, over its {} MB budget".format(
+                total_bytes / (1024 * 1024), FIXTURE_BUDGET_MEGABYTES
+            )
+        )
+    return total_bytes, found
+
+
 # Every rule's findings, in report order.
 def collect() -> List[Tuple[str, List[str]]]:
     sources = [(path, path.read_text(encoding="utf-8")) for path in discover_files()]
+    measured_bytes, fixture_problems = fixture_findings()
     return [
         ("rule 1: every suite has the header run_all reads", header_findings()),
         (
@@ -203,6 +263,13 @@ def collect() -> List[Tuple[str, List[str]]]:
         (
             "rule 5: every project path comes from core.projects",
             [finding for path, text in sources for finding in project_findings(path, text)],
+        ),
+        (
+            "rule 6: the fixture set stays inside its {} MB budget "
+            "(measured {:.2f} MB)".format(
+                FIXTURE_BUDGET_MEGABYTES, measured_bytes / (1024 * 1024)
+            ),
+            fixture_problems,
         ),
     ]
 
@@ -291,6 +358,27 @@ def self_test() -> int:
         "an unknown tier is caught",
         run_all.header_field('"""\nTIER: nightly\n"""', "TIER") not in run_all.TIER_ORDER,
     )
+    # Rule 6 is measured rather than text-matched, so its self test builds a
+    # fixture tree: the same asset in two fixtures is the finding, in one is not.
+    with tempfile.TemporaryDirectory() as scratch:
+        tree = Path(scratch)
+        for name in ("native", "scene"):
+            assets = tree / name / "res"
+            assets.mkdir(parents=True)
+            (assets / "map.png").write_bytes(b"p" * (FIXTURE_DUPLICATE_MINIMUM_BYTES * 2))
+        expect(
+            "the same asset in two fixtures is caught",
+            len(fixture_findings(tree)[1]) == 1,
+        )
+        (tree / "scene" / "res" / "map.png").unlink()
+        expect("an asset in one fixture passes", fixture_findings(tree)[1] == [])
+        # The build output a run leaves behind is not the fixture's weight.
+        (tree / "native" / "target").mkdir()
+        (tree / "native" / "target" / "big.bin").write_bytes(b"b" * 4096)
+        expect(
+            "build output is not counted",
+            fixture_findings(tree)[0] == FIXTURE_DUPLICATE_MINIMUM_BYTES * 2,
+        )
     expect("the real suites pass the header rule", header_findings() == [])
     print("PASS: self test." if failures == 0 else f"FAIL: {failures} self test case(s).")
     return 0 if failures == 0 else 1
