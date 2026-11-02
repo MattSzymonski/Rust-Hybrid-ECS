@@ -11,13 +11,13 @@
 //!
 //! # Design
 //!
-//! This binary owns its event loop, and in a windowed build its window; what
-//! runs inside it is either `pill_development_host`'s development host or
-//! `pill_player` with the generated shipping bundle, both driven through
-//! `pill_player::FrameDriver`. A shipping build does not depend on
+//! This binary owns its event loop and, in a windowed build, its window. What
+//! runs inside the loop is either `pill_development_host`'s development host
+//! or `pill_player` running the generated shipping bundle; both are driven
+//! through `pill_player::FrameDriver`. A shipping build does not depend on
 //! `pill_development_host` at all, so development code cannot reach a shipped
-//! binary. There is no GPU code here: the renderer attach lives in the runtime,
-//! and the renderer itself in its own crate.
+//! binary. There is no GPU code here: the runtime attaches the renderer, and
+//! the renderer lives in its own crate.
 
 // Standard library
 use std::path::PathBuf;
@@ -47,11 +47,12 @@ mod windowed_standalone;
 // Posture
 // =============================================================================
 
-// Exactly one posture: without one there is nothing to run, and with both the
-// development host would sit beside a linked project it never uses. Feature
-// unification makes the second easy to trigger by accident - a `--workspace`
-// build where another package asks for `pill_development_host` - so it is
-// refused at compile time rather than discovered in a shipped binary.
+// Exactly one posture: without one there is nothing to run, and with both a
+// shipping binary would also link the development host, which it never runs.
+// A workspace build selects every member's default features, so a `shipping`
+// feature requested on the same command line adds the second posture to the
+// default one. The pair is refused at compile time, before such a binary can
+// be shipped.
 #[cfg(not(any(feature = "development", feature = "shipping")))]
 compile_error!(
     "pill_standalone needs a posture: `development` (the default) or `shipping` - build a shipped project as `--no-default-features --features shipping`."
@@ -65,21 +66,22 @@ compile_error!(
 // Telemetry
 // =============================================================================
 
-/// Installs the shared telemetry stack before the run loop starts.
+/// Installs the shared telemetry stack that the rest of the run logs through.
 ///
-/// Terminal logging is always active. A file lane is added when `ECS_LOG_DIR`
-/// is set. When the `profiling` feature is enabled, `profile::*` spans are
-/// routed to Tracy through an independent filter.
+/// Terminal logging is always on. When `ECS_LOG_DIR` is set, the log is also
+/// written to a rolling file in that directory. With the `profiling` feature,
+/// `profile::*` spans go to Tracy through their own filter; `profiling-fine`
+/// also sends the fine-grained zones.
 ///
-/// Setup is best-effort: a failure only degrades telemetry and is reported
-/// to stderr without aborting the run.
+/// Setup is best-effort: a failure only costs telemetry. It is printed to
+/// stderr and does not stop the run.
 fn init_telemetry() {
-    // Step 1: resolve the optional log directory from the environment.
-    let file_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
-    // Step 2: install the stack, reporting setup failures to stderr.
-    if let Err(error) = pill_player::init_telemetry(file_directory) {
-        // The one message that cannot go through the logger: it reports that
-        // the logger itself did not install.
+    // Step 1: read the optional log directory from the environment.
+    let file_log_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
+    // Step 2: install the stack, printing a setup failure to stderr.
+    if let Err(error) = pill_player::init_telemetry(file_log_directory) {
+        // This message cannot go through the logger: it reports that the
+        // logger itself failed to install.
         eprintln!("[standalone] telemetry setup failed: {error}");
     }
 }
@@ -88,40 +90,42 @@ fn init_telemetry() {
 // Reporting Boundary
 // =============================================================================
 
-/// Installs the report handler, then runs the project and reports its failure.
+/// Installs the report handler, runs the project, and turns a failure into a
+/// report.
 ///
-/// The telemetry stack is brought up before the run loop starts so that any
-/// failure is captured on every active lane.
+/// The telemetry stack is installed before the run loop starts, so a failure is
+/// logged to the terminal and, when one is configured, to the log file.
 ///
 /// # Errors
 ///
-/// Returns the project's configuration report when it cannot be resolved, or
-/// the styled [`engine_report`] of the failure the run terminated with, after
-/// recording that failure on the tracing lane for correlation with active
-/// spans and log files.
+/// Returns the configuration failure as a report when the project's settings
+/// are missing or invalid. Otherwise, returns the styled [`engine_report`] of
+/// the failure that ended the run, after also logging that failure to the
+/// tracing output, so it can be matched with the active spans and log files.
 fn main() -> miette::Result<()> {
     // Step 1: install the miette report handler before anything can fail.
     install_engine_report_handler();
-    // Step 2: bring up the shared telemetry stack (best-effort).
+    // Step 2: install the telemetry stack (best effort).
     init_telemetry();
-    // Step 3: resolve the project this build runs. Development reads
-    // `PROJECT_PATH` and the project's `project_settings.yaml`. Shipping asks
-    // the generated bundle, regenerated from the same settings file by
-    // `devops/tools/generate_shipping_bundle.py` before the build, so this
-    // binary never names a project or module itself.
+    // Step 3: get the project this build runs. A development build reads
+    // `PROJECT_PATH` and the project's `project_settings.yaml`. A shipping
+    // build uses the generated bundle, which
+    // `devops/tools/generate_shipping_bundle.py` writes from the same settings
+    // file before the build, so this binary never names a project or module
+    // itself.
     #[cfg(feature = "development")]
     let project = pill_development_host::HostConfig::from_environment()?;
     #[cfg(feature = "shipping")]
     let project = pill_shipping_bundle::static_project();
-    // Step 4: run the project and convert the error once.
+    // Step 4: run the project and turn a failure into one report.
     #[cfg(not(feature = "rendering"))]
-    let run_result: Result<(), RunError> = headless_standalone::run(project);
+    let project_run: Result<(), RunError> = headless_standalone::run(project);
     #[cfg(feature = "rendering")]
-    let run_result: Result<(), RunError> = windowed_standalone::run(project);
+    let project_run: Result<(), RunError> = windowed_standalone::run(project);
 
-    run_result.map_err(|error| {
-        // Error correlation: the fatal failure also enters the tracing lane
-        // so it appears inside any active spans and log files.
+    project_run.map_err(|error| {
+        // Also send the fatal failure to the tracing output, so it appears in
+        // any active spans and in the log files.
         pill_core::error!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
             error = %error,

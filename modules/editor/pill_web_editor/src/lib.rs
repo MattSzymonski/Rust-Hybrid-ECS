@@ -54,7 +54,7 @@ use pill_player::{
     report_failure, FrameDriver, RenderingRuntime, Runtime, StaticProject, SurfaceId,
     WindowedFrameDriver,
 };
-use pill_web::{find_canvas, focus_without_scrolling, physical_size, start_project};
+use pill_web::{canvas_element, canvas_physical_size, focus_without_scrolling, start_project};
 use web_sys::HtmlCanvasElement;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
@@ -172,14 +172,14 @@ impl ApplicationHandler for WebEditorApplication {
         };
 
         // Step 1: the scene canvas, exactly like the game-only runner.
-        let scene_canvas = match find_canvas(&self.scene_canvas_id) {
+        let scene_canvas = match canvas_element(&self.scene_canvas_id) {
             Ok(canvas) => canvas,
             Err(message) => {
                 error!(target: telemetry_target::ENGINE, "{message}");
                 return;
             }
         };
-        let laid_out = physical_size(&scene_canvas);
+        let laid_out = canvas_physical_size(&scene_canvas);
         let attributes = Window::default_attributes()
             .with_canvas(Some(scene_canvas))
             .with_focusable(false);
@@ -190,7 +190,7 @@ impl ApplicationHandler for WebEditorApplication {
         self.scene_window = Some(Arc::clone(&scene_window));
 
         // Step 2: the UI canvas above it, with its own window for input.
-        let ui_canvas = match find_canvas(&self.ui_canvas_id) {
+        let ui_canvas = match canvas_element(&self.ui_canvas_id) {
             Ok(canvas) => canvas,
             Err(message) => {
                 error!(target: telemetry_target::ENGINE, "{message}");
@@ -198,7 +198,7 @@ impl ApplicationHandler for WebEditorApplication {
             }
         };
         let focus_target = ui_canvas.clone();
-        let ui_laid_out = physical_size(&ui_canvas);
+        let ui_laid_out = canvas_physical_size(&ui_canvas);
         let ui_attributes = Window::default_attributes()
             .with_canvas(Some(ui_canvas.clone()))
             .with_focusable(true);

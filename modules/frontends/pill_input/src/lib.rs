@@ -1,32 +1,32 @@
-//! Input glue shared by the frontends.
+//! Input translation shared by the frontends.
 //!
 //! # Responsibilities
 //!
 //! - Translate winit window and device events into the engine's
 //!   [`InputEvent`](pill_engine::InputEvent)s ([`winit_events`], feature
 //!   `winit`).
-//! - Own the gamepads: poll them into input events and play the rumble systems
-//!   request ([`gamepads`], feature `gamepad`, native only).
+//! - Own the gamepads: poll them into input events and play the rumble the
+//!   game's systems request ([`gamepads`], feature `gamepad`, native only).
 //!
 //! # Design
 //!
-//! The engine defines what input is (`pill_engine::input`) and knows no
-//! platform library; `pill_player` must not link winit either. Each frontend
-//! gets its platform's events in its own loop, so translation belongs to the
-//! frontends - and every winit frontend (`pill_standalone`, `pill_editor`,
-//! `pill_web`) names this crate instead of repeating it. Only
-//! `pill_standalone` polls gamepads and plays the rumble its systems request;
-//! the other two forward window input alone.
+//! The engine defines what input is (`pill_engine::input`) and links no
+//! platform library; `pill_player` does not link winit either. Each frontend
+//! receives its platform's events in its own loop, so the translation lives
+//! here. Every frontend that handles winit events (`pill_standalone`,
+//! `pill_editor`, `pill_web`, `pill_web_editor`) uses this crate instead of
+//! repeating it. Only `pill_standalone` polls gamepads and plays the rumble
+//! its systems request; the others pass window input only.
 //!
-//! Frontends forward the results through `FrameDriver::push_input` between
-//! frames; a frontend that polls gamepads hands
+//! Frontends forward the translated events through `FrameDriver::push_input`
+//! between frames. A frontend that polls gamepads gives the requests from
 //! `FrameDriver::take_rumble_requests` to [`gamepads::Gamepads::play_rumble`]
-//! after them.
+//! after the frame.
 
-/// Gamepads: polled into input events, rumbled on request.
+/// Gamepads: polled into input events, with rumble played on request.
 #[cfg(all(feature = "gamepad", not(target_arch = "wasm32")))]
 pub mod gamepads;
 
-/// winit window and device events as engine input events.
+/// winit's window and device events as engine input events.
 #[cfg(feature = "winit")]
 pub mod winit_events;

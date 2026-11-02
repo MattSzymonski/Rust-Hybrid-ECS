@@ -10,14 +10,15 @@
 //!
 //! # Design
 //!
-//! The engine's [`KeyCode`] mirrors winit's variant for variant, so the key
-//! mapping is one list of names; a name the engine lacks fails to compile, and
-//! a count check catches a key left out. Positions and deltas stay in physical
-//! pixels, as winit reports them, and a frontend gives the frame driver the
-//! window's whole inner size, so input and the drawn surface share one space.
-//! One window event can carry two engine events - a pressed key reports both
-//! its key change and its committed text - so the translation yields a small
-//! sequence rather than one optional event.
+//! The engine's [`KeyCode`] has the same variants as winit's, so the key mapping
+//! is one list of names. A name the engine lacks fails to compile, and a count
+//! check fails the build when the list misses a key. Cursor positions and pixel
+//! scroll amounts are physical pixels, as winit reports them. Raw mouse motion
+//! is not, because winit leaves its unit to the device. A frontend gives the
+//! frame driver the window's whole inner size, so cursor positions and the
+//! drawn surface share one space. One window event can carry two engine
+//! events: a pressed key reports its key change and its committed text. The
+//! translation therefore returns a small sequence, not one optional event.
 
 // External crates
 use pill_core::math::Vector2f;
@@ -29,11 +30,11 @@ use winit::keyboard::{ModifiersState, PhysicalKey};
 // Free Functions
 // =============================================================================
 
-/// The input events a window event carries, in the order to apply them.
+/// Returns the input events a window event carries, in the order to apply them.
 ///
-/// Zero events for an event that carries no input, one for most carriers,
-/// two for a key that was both pressed or repeated and typed something: the
-/// key change first, its committed text second.
+/// A window event that carries no input returns nothing, and most events that
+/// carry input return one event. A key that is pressed or repeated and also
+/// types something returns two: the key change first, then the committed text.
 pub fn translate_window_event(event: &WindowEvent) -> impl Iterator<Item = InputEvent> {
     let events = match event {
         WindowEvent::KeyboardInput { event, .. } => {
@@ -82,21 +83,22 @@ pub fn translate_window_event(event: &WindowEvent) -> impl Iterator<Item = Input
     events.into_iter().flatten()
 }
 
-/// The events one keyboard input carries: the key change, and the text the
-/// key committed when it typed something printable.
+/// Returns the events one keyboard input carries: the key change, and the text
+/// the key committed when it typed something printable.
 ///
-/// Repeat keeps its own kind - a repeat is not a new press - and types again,
-/// which is what a held key in a text field does. Control-only text (Enter is
-/// `"\r"`, Tab is `"\t"`) belongs to the key event: those keys act, they do
-/// not type. Split out of [`translate_window_event`] because winit's key event
-/// cannot be constructed outside winit, so this is the part tests drive
-/// directly.
+/// A repeat becomes [`InputEvent::KeyRepeat`], not a new press, and it reports
+/// its text again, which is what a held key in a text field needs. Control-only
+/// text (Enter is `"\r"`, Tab is `"\t"`) is dropped because those keys act,
+/// they do not type. This is separate from [`translate_window_event`] because a
+/// winit key event cannot be built outside winit, so the tests drive this
+/// function directly.
 fn key_events(
     key: KeyCode,
     state: ElementState,
     repeat: bool,
     text: Option<&str>,
 ) -> [Option<InputEvent>; 2] {
+    // Step 1: Report the key change. A repeat is reported as `KeyRepeat`.
     let mut events = [None, None];
     events[0] = Some(if repeat {
         InputEvent::KeyRepeat { key }
@@ -106,6 +108,8 @@ fn key_events(
             state: button_state(state),
         }
     });
+
+    // Step 2: A press that typed a printable character also reports that text.
     if state == ElementState::Pressed {
         if let Some(text) = text {
             if text.chars().any(|character| !character.is_control()) {
@@ -118,7 +122,7 @@ fn key_events(
     events
 }
 
-/// The engine's modifier state for winit's.
+/// Converts winit's modifier state into the engine's.
 fn modifier_state(state: ModifiersState) -> Modifiers {
     Modifiers {
         shift: state.shift_key(),
@@ -128,7 +132,8 @@ fn modifier_state(state: ModifiersState) -> Modifiers {
     }
 }
 
-/// The input event an IME event carries, or `None` while the IME toggles.
+/// Converts an IME change into an input event, or `None` when the IME is
+/// switched on or off.
 fn ime_event(ime: &Ime) -> Option<InputEvent> {
     match ime {
         Ime::Preedit(text, cursor) => Some(InputEvent::ImePreedit {
@@ -140,7 +145,8 @@ fn ime_event(ime: &Ime) -> Option<InputEvent> {
     }
 }
 
-/// The input event a device event carries: raw mouse motion, or `None`.
+/// Returns the input event a device event carries: raw mouse motion, or `None`
+/// for any other device event.
 pub fn translate_device_event(event: &DeviceEvent) -> Option<InputEvent> {
     match event {
         DeviceEvent::MouseMotion { delta } => Some(InputEvent::MouseMotion {
@@ -150,7 +156,7 @@ pub fn translate_device_event(event: &DeviceEvent) -> Option<InputEvent> {
     }
 }
 
-/// The engine's button state for winit's.
+/// Converts winit's button state into the engine's.
 fn button_state(state: ElementState) -> ButtonState {
     match state {
         ElementState::Pressed => ButtonState::Pressed,
@@ -158,8 +164,8 @@ fn button_state(state: ElementState) -> ButtonState {
     }
 }
 
-/// The engine's mouse button for winit's, or `None` for a numbered extra
-/// button the engine does not track.
+/// Converts winit's mouse button into the engine's, or `None` for a numbered
+/// extra button the engine does not track.
 pub fn mouse_button(button: winit::event::MouseButton) -> Option<MouseButton> {
     match button {
         winit::event::MouseButton::Left => Some(MouseButton::Left),
@@ -171,10 +177,12 @@ pub fn mouse_button(button: winit::event::MouseButton) -> Option<MouseButton> {
     }
 }
 
-/// Declares [`key_code`] from the key names winit and the engine share.
+/// Declares [`key_code`], and the count of keys it maps, from the key names
+/// winit and the engine share.
 macro_rules! shared_key_codes {
     ($($name:ident),* $(,)?) => {
-        /// The engine's key for winit's, or `None` for a key winit adds later.
+        /// Returns the engine's key for winit's code, or `None` for a key winit
+        /// adds later.
         pub fn key_code(code: winit::keyboard::KeyCode) -> Option<KeyCode> {
             match code {
                 $(winit::keyboard::KeyCode::$name => Some(KeyCode::$name),)*
@@ -210,7 +218,7 @@ shared_key_codes! {
     F30, F31, F32, F33, F34, F35,
 }
 
-// Every engine key has a winit counterpart in the list above.
+// The list names every engine key, so its length must equal `KeyCode::ALL`.
 const _: () = assert!(MAPPED_KEY_COUNT == KeyCode::ALL.len());
 
 // =============================================================================
@@ -290,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn control_only_text_stays_with_the_key_event() {
+    fn control_only_text_produces_no_text_event() {
         assert_eq!(
             key_events(KeyCode::Enter, ElementState::Pressed, false, Some("\r")),
             [
