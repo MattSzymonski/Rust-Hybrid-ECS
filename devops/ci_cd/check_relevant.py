@@ -102,13 +102,59 @@ def verify_check(step: str, reason: str) -> Check:
     )
 
 
-def suite_check(name: str, reason: str) -> Check:
-    """A devops suite (`run_all.py --only <file>`)."""
+def suite_check(name: str, reason: str, steps: str = "") -> Check:
+    """A devops suite (`run_all.py --only <file>`), optionally one area of it."""
+    command = ("python", "devops/tests/run_all.py", "--only", name)
+    if steps:
+        command += ("--steps", steps)
     return Check(
-        label=f"suite:{name}",
-        command=("python", "devops/tests/run_all.py", "--only", name),
+        label=f"suite:{name}" + (f" --steps {steps}" if steps else ""),
+        command=command,
         reasons=[reason],
     )
+
+
+# The shell tab bodies whose steps are the only ones that exercise them: a
+# change confined to one of these names its area, and the suite can run that
+# area alone. Every other editor path - the shell's root, the frontend, the
+# shared session, an unmapped file - keeps the full suite, because the change
+# can reach steps no single area owns.
+EDITOR_AREA_TAB_BODIES = {
+    "modules/extensions/pill_editor_shell_egui/pill_editor_shell_egui_editor/src/shell/tab_preferences*": "preferences_and_theme",
+    "modules/extensions/pill_editor_shell_egui/pill_editor_shell_egui_editor/src/shell/tab_assets*": "assets_browser_and_pipeline",
+    "modules/extensions/pill_editor_shell_egui/pill_editor_shell_egui_editor/src/shell/tab_systems*": "systems_components_and_entities",
+}
+
+
+def editor_area_for(paths: Sequence[str]) -> str:
+    """The one area every changed editor file belongs to, or "" for the full suite.
+
+    A selection is only honest when the whole change sits inside one mapping:
+    one unmapped editor file (the shell's root, the frontend's runner) can
+    reach steps of any area, so it keeps the full run.
+    """
+    editor_paths = [
+        path
+        for path in paths
+        if matches(path, "modules/editor/pill_editor/**")
+        or matches(path, "modules/extensions/pill_editor_shell_egui/**")
+    ]
+    if not editor_paths:
+        return ""
+    areas = set()
+    for path in editor_paths:
+        area = next(
+            (
+                name
+                for pattern, name in EDITOR_AREA_TAB_BODIES.items()
+                if matches(path, pattern)
+            ),
+            "",
+        )
+        if not area:
+            return ""
+        areas.add(area)
+    return areas.pop() if len(areas) == 1 else ""
 
 
 def suite_tier(name: str) -> str:
@@ -194,8 +240,19 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                      "-p", "pill_editor_shell_egui_editor", "--offline"),
                                     "egui editor crates changed"))
     if has("modules/editor/pill_editor/**", "modules/extensions/pill_editor_shell_egui/**"):
-        selected.append(suite_check("test_editor_egui.py", "editor shell or frontend changed"))
-
+        area = editor_area_for(paths)
+        if area:
+            selected.append(
+                suite_check(
+                    "test_editor_egui.py",
+                    "one shell tab body changed",
+                    steps=area,
+                )
+            )
+        else:
+            selected.append(
+                suite_check("test_editor_egui.py", "editor shell or frontend changed")
+            )
     # pill_project_ui: the in-game egui UI. Its own unit tests cover the
     # input bridge, the tessellator and the texture mirror; the painter it
     # feeds is the renderer's `ui` module, whose tests cover the draw lists. The slot it

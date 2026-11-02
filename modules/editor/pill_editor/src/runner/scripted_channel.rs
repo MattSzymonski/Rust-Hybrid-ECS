@@ -677,12 +677,23 @@ impl EditorWindow {
             .hovered_handle
             .map(|handle| handle.to_string())
             .unwrap_or_else(|| "-".to_string());
+        // The shell's own frame counter, so a suite that waits for "a frame
+        // ran since N" asks for one dump instead of waiting for the rows
+        // heartbeat, which prints once every 210 frames.
+        let frame = self
+            .host
+            .host_mut()
+            .engine_mut()
+            .world_mut()
+            .get_resource::<EguiShellState>()
+            .map_or(0, |state| state.frame_index);
         info!(
             target: telemetry_target::ENGINE,
             active = self.active_view,
             interaction = self.interaction_name(),
             hovered = hovered.as_str(),
             keymap = %self.keymap,
+            frame,
             "[test] viewport"
         );
         for view in 0..self.views.len() {

@@ -6,9 +6,9 @@ binary and project, and asserts on their logs exactly as the earlier steps do.
 The suite's `main` keeps the parser, the preflight, the main session and the
 `finally` restore, and calls `run_lifecycle_steps` once.
 
-The step bodies are moved verbatim; their names (log patterns, tokens and the
-`wait_for_token` helper) are imported from the suite, because those constants
-are one vocabulary shared with the steps that stay in `main`.
+The step bodies are moved verbatim; their names (log patterns and tokens) come
+from `core.editor_log_tokens`, the one owner of the vocabulary they share
+with the steps that stay in `main`.
 """
 
 import json
@@ -17,10 +17,12 @@ import time
 from pathlib import Path
 
 from core import win_clipboard
-from core.editor_session import EDITOR_WINDOW_CREATED_TOKEN, EditorSession
+from core.editor_log_tokens import EDITOR_WINDOW_CREATED_TOKEN
+from core.editor_session import EditorSession
+from editor_step_areas import StepArea
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT
 from core.suite_common import MODULE_RELOAD_COMPLETE_TOKEN
-from test_editor_egui import (
+from core.editor_log_tokens import (
     CADENCE_DUMP_TOKEN,
     CLIPBOARD_PASTED_TOKEN,
     DOCK_DUMP_PATTERN,
@@ -69,8 +71,10 @@ from test_editor_egui import (
     TOAST_TOKEN,
     WINDOWS_DUMP_TOKEN,
     WINDOW_ROW_TOKEN,
-    wait_for_token,
 )
+
+
+from editor_step_support import print_ok
 
 
 def run_lifecycle_steps(session: EditorSession, binary: Path, project: str) -> None:
@@ -80,6 +84,49 @@ def run_lifecycle_steps(session: EditorSession, binary: Path, project: str) -> N
     step_12_redraw_cadence(binary, project)
     step_13_no_overlay_posture(binary, project)
     step_14_module_panels(session, binary, project)
+
+
+AREAS = (
+    StepArea(
+        name="layout_survives_restart",
+        order=13,
+        run=lambda context: step_11_layout_survives_restart(
+            context.session, context.binary, context.project
+        ),
+        sequence_only=(
+            "the dock layout and the clipboard payload the earlier session wrote"
+        ),
+    ),
+    StepArea(
+        name="recovery_after_unclean_exit",
+        order=14,
+        run=lambda context: step_11b_recovery_after_unclean_exit(
+            context.binary, context.project
+        ),
+        sequence_only=(
+            "the recovery document the killed session had already autosaved"
+        ),
+    ),
+    StepArea(
+        name="redraw_cadence",
+        order=15,
+        run=lambda context: step_12_redraw_cadence(context.binary, context.project),
+    ),
+    StepArea(
+        name="no_overlay_posture",
+        order=16,
+        run=lambda context: step_13_no_overlay_posture(
+            context.binary, context.project
+        ),
+    ),
+    StepArea(
+        name="module_panels",
+        order=17,
+        run=lambda context: step_14_module_panels(
+            context.session, context.binary, context.project
+        ),
+    ),
+)
 
 
 def step_11_layout_survives_restart(
@@ -116,11 +163,9 @@ def step_11_layout_survives_restart(
     )
     restart.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "1"})
     try:
-        wait_for_token(
-            restart, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "restart startup"
+        restart.wait_for_match(re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "restart startup"
         )
-        wait_for_token(
-            restart, re.escape(EGUI_SHELL_LOADED_TOKEN), 120, "restart shell load"
+        restart.wait_for_match(re.escape(EGUI_SHELL_LOADED_TOKEN), 120, "restart shell load"
         )
         restored = restart.request(
             "dump tabs", DOCK_DUMP_PATTERN, 60, "the restored dock"
@@ -128,7 +173,7 @@ def step_11_layout_survives_restart(
         assert re.search(r"surfaces=3\b", restored), (
             "the rearranged dock did not survive the restart: {}".format(restored)
         )
-        leaves = restart.read_log()
+        leaves = restart.text()
         floating = [
             match.group(0)
             for match in re.finditer(DOCK_LEAF_PATTERN, leaves)
@@ -139,12 +184,12 @@ def step_11_layout_survives_restart(
                 leaves[-2000:]
             )
         )
-        print("  [OK] the rearranged dock came back after a restart")
+        print_ok("the rearranged dock came back after a restart")
 
         # The third scene view came back too: the layout
         # carried its tab, so this process opened a window and a surface for
         # it before it drew anything.
-        begin = len(restart.read_log())
+        begin = restart.length()
         restart.send("dump scenes")
         restart.wait(
             re.escape(SCENE_VIEW_RECT_TOKEN) + r"\s+view=2\b",
@@ -152,10 +197,10 @@ def step_11_layout_survives_restart(
             "the third view after the restart",
             begin,
         )
-        assert "scene3" in restart.read_log(), (
+        assert "scene3" in restart.text(), (
             "the third scene view's tab did not survive the restart"
         )
-        print("  [OK] the third scene view survived the restart")
+        print_ok("the third scene view survived the restart")
 
         # The clipboard crossed the process boundary: the
         # session above copied an entity onto the OS clipboard, and this
@@ -171,15 +216,15 @@ def step_11_layout_survives_restart(
                 ),
             )
         )
-        begin = len(restart.read_log())
+        begin = restart.length()
         # The payload is put back when something else took the clipboard while
         # the restart was starting; without this the paste reports a decode
         # failure from a program the suite never asked, one step from the end.
         current = win_clipboard.read_payload()
         if current != entity_payload:
             win_clipboard.write_payload(entity_payload)
-            print(
-                "  [OK] the clipboard was restored for the restart: {!r}".format(
+            print_ok(
+                "the clipboard was restored for the restart: {!r}".format(
                     (current or "")[:80]
                 )
             )
@@ -206,7 +251,7 @@ def step_11_layout_survives_restart(
                 pasted, entities_here
             )
         )
-        begin = len(restart.read_log())
+        begin = restart.length()
         restart.send("command editor.undo")
         restart.wait(
             re.escape(HISTORY_UNDO_TOKEN), 30, "the pasted entity's undo", begin
@@ -227,12 +272,12 @@ def step_11_layout_survives_restart(
                 restored, entities_here
             )
         )
-        print("  [OK] an entity copied in one editor pasted into another")
+        print_ok("an entity copied in one editor pasted into another")
 
         # Leave through the scripted channel's own quit: the first click of a
         # freshly started session goes to focusing its window, and the menu's
         # quit path is the main session's check, not this one.
-        begin = len(restart.read_log())
+        begin = restart.length()
         restart.send("quit")
         restart.wait(
             re.escape(QUIT_REQUESTED_TOKEN), 30, "the restart's quit", begin
@@ -241,13 +286,13 @@ def step_11_layout_survives_restart(
             re.escape(LAYOUT_SAVED_TOKEN), 30, "the restart's layout save", begin
         )
         assert restart.wait_exit(timeout=60) == 0, "the restarted editor did not exit 0"
-        print("  [OK] the restarted editor saved its layout and exited 0")
+        print_ok("the restarted editor saved its layout and exited 0")
         # A clean exit leaves nothing to recover.
         recovery_file = restart.editor_state_directory / "editor_egui_recovery.json"
         assert not recovery_file.exists(), (
             "a clean exit left a recovery document behind: {}".format(recovery_file)
         )
-        print("  [OK] a clean exit removed the recovery document")
+        print_ok("a clean exit removed the recovery document")
     finally:
         restart.close()
 
@@ -265,11 +310,9 @@ def step_11b_recovery_after_unclean_exit(binary: Path, project: str) -> None:
     )
     recovered.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "1"})
     try:
-        wait_for_token(
-            recovered, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "recovery startup"
+        recovered.wait_for_match(re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "recovery startup"
         )
-        wait_for_token(
-            recovered, re.escape(EGUI_SHELL_LOADED_TOKEN), 120, "recovery shell load"
+        recovered.wait_for_match(re.escape(EGUI_SHELL_LOADED_TOKEN), 120, "recovery shell load"
         )
         # The document exists from the first frames; a change the autosave
         # watches (here an undock) rewrites it, which is what the survivor must
@@ -287,8 +330,7 @@ def step_11b_recovery_after_unclean_exit(binary: Path, project: str) -> None:
         )
         written_before = recovery_file.stat().st_mtime_ns
         recovered.send("undock entities")
-        wait_for_token(
-            recovered, re.escape(EGUI_TAB_UNDOCKED_TOKEN), 60, "the recovery undock"
+        recovered.wait_for_match(re.escape(EGUI_TAB_UNDOCKED_TOKEN), 60, "the recovery undock"
         )
         deadline = time.time() + 30
         while time.time() < deadline and recovery_file.stat().st_mtime_ns == written_before:
@@ -298,7 +340,7 @@ def step_11b_recovery_after_unclean_exit(binary: Path, project: str) -> None:
         assert recovery_file.stat().st_mtime_ns != written_before, (
             "the undock did not reach the recovery document"
         )
-        print("  [OK] the autosave recorded the rearranged dock")
+        print_ok("the autosave recorded the rearranged dock")
 
         # The unclean exit: the process is killed, so nothing removes the file.
         process = recovered.process
@@ -320,9 +362,7 @@ def step_11b_recovery_after_unclean_exit(binary: Path, project: str) -> None:
         )
         survivor.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "1"})
         try:
-            wait_for_token(
-                survivor,
-                re.escape(RECOVERED_STATE_TOKEN),
+            survivor.wait_for_match(re.escape(RECOVERED_STATE_TOKEN),
                 120,
                 "the recovered state",
             )
@@ -334,7 +374,7 @@ def step_11b_recovery_after_unclean_exit(binary: Path, project: str) -> None:
                     restored
                 )
             )
-            begin = len(survivor.read_log())
+            begin = survivor.length()
             survivor.send("quit")
             survivor.wait(
                 re.escape(QUIT_REQUESTED_TOKEN), 30, "the survivor's quit", begin
@@ -347,7 +387,7 @@ def step_11b_recovery_after_unclean_exit(binary: Path, project: str) -> None:
         assert not recovery_file.exists(), (
             "the recovering editor's clean exit left the document behind"
         )
-        print("  [OK] a killed editor's dock came back, and its clean exit cleared it")
+        print_ok("a killed editor's dock came back, and its clean exit cleared it")
     finally:
         recovered.close()
 
@@ -362,13 +402,12 @@ def step_12_redraw_cadence(binary: Path, project: str) -> None:
     )
     cadence.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "0"})
     try:
-        wait_for_token(
-            cadence, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "cadence startup"
+        cadence.wait_for_match(re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "cadence startup"
         )
-        assert REDRAW_ON_DEMAND_TOKEN in cadence.read_log(), (
+        assert REDRAW_ON_DEMAND_TOKEN in cadence.text(), (
             "the editor never reported its redraw posture"
         )
-        begin = len(cadence.read_log())
+        begin = cadence.length()
         cadence.send("command editor.pause_toggle")
         cadence.wait(
             re.escape(PAUSE_TOGGLED_TOKEN) + r"\s+paused=true",
@@ -387,13 +426,13 @@ def step_12_redraw_cadence(binary: Path, project: str) -> None:
         )
         cadence_frames = []
         for index in range(2):
-            begin = len(cadence.read_log())
+            begin = cadence.length()
             cadence.send("dump cadence")
             cadence.wait(re.escape(CADENCE_DUMP_TOKEN), 60, "the cadence dump", begin)
             dump = re.search(
                 re.escape(CADENCE_DUMP_TOKEN)
                 + r"\s+continuous=(?:true|false)\s+frames=(\d+)",
-                cadence.read_log()[begin:],
+                cadence.read_since(begin),
             )
             assert dump is not None, "the cadence dump carried no frame count"
             cadence_frames.append(int(dump.group(1)))
@@ -409,8 +448,8 @@ def step_12_redraw_cadence(binary: Path, project: str) -> None:
             "the editor drew {} frames in three idle seconds; the loop is not "
             "waiting (frames={})".format(idle_frames, cadence_frames)
         )
-        print(
-            "  [OK] the paused editor waited ({} frames in three seconds)".format(
+        print_ok(
+            "the paused editor waited ({} frames in three seconds)".format(
                 idle_frames
             )
         )
@@ -433,13 +472,11 @@ def step_13_no_overlay_posture(binary: Path, project: str) -> None:
         }
     )
     try:
-        wait_for_token(
-            plain, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "no-overlay startup"
+        plain.wait_for_match(re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "no-overlay startup"
         )
-        wait_for_token(
-            plain, re.escape(EGUI_SHELL_LOADED_TOKEN), 120, "the shell in that posture"
+        plain.wait_for_match(re.escape(EGUI_SHELL_LOADED_TOKEN), 120, "the shell in that posture"
         )
-        log = plain.read_log()
+        log = plain.text()
         assert NO_OVERLAY_TOKEN in log, (
             "the editor never reported the no-overlay posture: {}".format(log[-800:])
         )
@@ -465,18 +502,18 @@ def step_13_no_overlay_posture(binary: Path, project: str) -> None:
         assert "statistics" in dock, "the dock never named the undocked tab"
         # Edits: a preference row goes through the same queued path a click
         # takes, and reads back through the dump.
-        begin = len(plain.read_log())
+        begin = plain.length()
         plain.send("edit preference snapping_steps.rotation_degrees 9.5")
         plain.wait(
             re.escape(PREFERENCES_SAVED_TOKEN), 60, "the edit saved", begin
         )
-        begin = len(plain.read_log())
+        begin = plain.length()
         plain.send("dump preferences")
         plain.wait(re.escape(PREFERENCES_DUMP_TOKEN), 60, "the edit read back", begin)
         assert re.search(
-            r'snapping_rotation_degrees="9\.5"', plain.read_log()[begin:]
-        ), plain.read_log()[begin:][-600:]
-        print("  [OK] the no-overlay posture started, docked and edited")
+            r'snapping_rotation_degrees="9\.5"', plain.read_since(begin)
+        ), plain.read_since(begin)[-600:]
+        print_ok("the no-overlay posture started, docked and edited")
     finally:
         plain.close()
 
@@ -497,12 +534,9 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         }
     )
     try:
-        wait_for_token(
-            panels, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "panel startup"
+        panels.wait_for_match(re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "panel startup"
         )
-        wait_for_token(
-            panels,
-            re.escape(PANEL_REGISTERED_TOKEN) + r'\s+id="shell\.demo"',
+        panels.wait_for_match(re.escape(PANEL_REGISTERED_TOKEN) + r'\s+id="shell\.demo"',
             120,
             "the demo panel registration",
         )
@@ -520,7 +554,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         slot = row.group(1)
         # Docking it draws it every frame, which is what the slow body needs to
         # cross the 120-frame budget.
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("tab module:{}".format(slot))
         panels.wait(
             re.escape(PANEL_OVER_BUDGET_TOKEN), 180, "the over-budget panel", begin
@@ -536,11 +570,11 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         assert re.search(
             re.escape(TOAST_TOKEN)
             + r'\s+level="warning"\s+seq=\d+\s+text="Panel .* over its frame budget',
-            panels.read_log(),
+            panels.text(),
         ), "the over-budget panel queued no toast"
-        print("  [OK] a slow module panel armed its badge and queued a toast")
+        print_ok("a slow module panel armed its badge and queued a toast")
         # The module unloads: its marker is dropped, and its panel reads so.
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("panel unload pill_editor_shell_egui_editor")
         panels.wait(re.escape(PANEL_UNLOADED_TOKEN), 60, "the unload", begin)
         dump = panels.request(
@@ -550,18 +584,18 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             re.escape(PANEL_ROW_TOKEN) + r"\s+slot={}\s+.*?alive=false".format(slot),
             dump,
         ), "the unloaded panel still reads alive: {}".format(dump[-800:])
-        assert "module not loaded" in dump or "Module not loaded" in panels.read_log(), (
+        assert "module not loaded" in dump or "Module not loaded" in panels.text(), (
             "the tab did not say the module is gone: {}".format(dump[-800:])
         )
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("panel restore pill_editor_shell_egui_editor")
         panels.wait(
             re.escape(PANEL_RESTORED_TOKEN), 60, "the restore", begin
         )
         assert re.search(
             re.escape(PANEL_RESTORED_TOKEN) + r".*?restored=[1-9][0-9]*",
-            panels.read_log()[begin:],
-        ), "the restore registered nothing: {}".format(panels.read_log()[begin:][-400:])
+            panels.read_since(begin),
+        ), "the restore registered nothing: {}".format(panels.read_since(begin)[-400:])
         dump = panels.request(
             "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the restored panel dump"
         )
@@ -569,7 +603,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             re.escape(PANEL_ROW_TOKEN) + r"\s+slot={}\s+.*?alive=true".format(slot),
             dump,
         ), "the restored panel did not come back: {}".format(dump[-800:])
-        print("  [OK] a panel outlived its module's unload and came back")
+        print_ok("a panel outlived its module's unload and came back")
 
         # Stages 12 and 13: the shell module's other two panels - the Spline
         # Tool, and the windows and modals a panel asks the shell for. The
@@ -589,27 +623,27 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         spline_slot = spline.group(1)
         panels.send("tab module:{}".format(spline_slot))
         # The tab has to be drawn before its panel has a timing: the dump that
-        # reads it is retried for a couple of frames rather than racing the
-        # activation.
-        drawn = None
-        for _attempt in range(6):
+        # reads it is retried until it does, rather than raced.
+        def drawn_panel(_text: str):
             dump = panels.request(
                 "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the drawn spline panel"
             )
-            drawn = re.search(
+            row = re.search(
                 re.escape(PANEL_ROW_TOKEN)
                 + r"\s+slot={}\s+.*?passes=(\d+)".format(spline_slot),
                 dump,
             )
-            if drawn is not None and int(drawn.group(1)) > 0:
-                break
-            # The panel's draw line arrives on its own frame; poll the log
-            # until it appears or the loop's deadline ends it.
-            time.sleep(0.5)
-        assert drawn is not None and int(drawn.group(1)) > 0, (
-            "the Spline Tool never drew: {}".format(dump[-800:])
+            return row if row is not None and int(row.group(1)) > 0 else None
+
+        panels.wait_until(
+            drawn_panel,
+            30,
+            "the Spline Tool never drew\n",
+            label="the Spline Tool registered and drew",
+            # The panel's draw line arrives on its own frame; each attempt asks
+            # for a fresh dump, so the poll is the dump's own cadence.
+            poll=0.5,
         )
-        print("  [OK] the Spline Tool registered and drew")
 
         # A control point is a leaf of the spline's struct array, and
         # a panel row writes it through the panel contract - a queued
@@ -650,12 +684,12 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         assert original is not None, (
             "the panel element did not read back: {}".format(before[-600:])
         )
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("panel field {} {} 4.5".format(SHOWCASE_COMPONENT, leaf))
         panels.wait(
             re.escape(PANEL_FIELD_QUEUED_TOKEN), 60, "the panel's queued field write", begin
         )
-        queued = panels.read_log()[begin:]
+        queued = panels.read_since(begin)
         assert re.search(
             r'component="[^"]*{}"\s+field="{}"\s+value="4\.5"'.format(
                 re.escape(SHOWCASE_COMPONENT), re.escape(leaf)
@@ -669,36 +703,36 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "the panel edit recorded a step",
             begin,
         )
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send(
             "dump field {} {} {}".format(showcase_entity, SHOWCASE_COMPONENT, leaf)
         )
         panels.wait(re.escape(FIELD_TOKEN), 60, "the panel-edited leaf", begin)
-        assert "4.5" in panels.read_log()[begin:], (
+        assert "4.5" in panels.read_since(begin), (
             "the panel's write did not apply: {}".format(
-                panels.read_log()[begin:][-600:]
+                panels.read_since(begin)[-600:]
             )
         )
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("command editor.undo")
         panels.wait(re.escape(HISTORY_UNDO_TOKEN), 60, "the panel write's undo", begin)
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send(
             "dump field {} {} {}".format(showcase_entity, SHOWCASE_COMPONENT, leaf)
         )
         panels.wait(re.escape(FIELD_TOKEN), 60, "the restored panel leaf", begin)
-        restored = re.search(r"value=(?:F32\()?(-?[0-9.]+)", panels.read_log()[begin:])
+        restored = re.search(r"value=(?:F32\()?(-?[0-9.]+)", panels.read_since(begin))
         assert restored is not None and float(restored.group(1)) == float(
             original.group(1)
         ), "the undo did not restore the panel's element: {}".format(
-            panels.read_log()[begin:][-600:]
+            panels.read_since(begin)[-600:]
         )
-        print("  [OK] a panel row's control-point write applied and undid")
+        print_ok("a panel row's control-point write applied and undid")
         # The confirmation lives on the demo panel's tab, so that tab comes to
         # the front first: `panel window` stands in for clicking the panel's
         # own button, and a button is only clickable while its tab is shown.
         panels.send("tab module:{}".format(slot))
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("panel window {} demo.confirm".format(slot))
         panels.wait(
             re.escape(PANEL_WINDOW_REQUESTED_TOKEN), 60, "the window request", begin
@@ -718,7 +752,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         assert re.search(
             re.escape(WINDOW_ROW_TOKEN) + r'\s+id="demo\.confirm".*?modal=true', dump
         ), "the window is not modal: {}".format(dump[-600:])
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("key Enter")
         panels.wait(
             re.escape(PANEL_MODAL_ANSWERED_TOKEN) + r'\s+window="[^"]+"\s+accepted=true',
@@ -738,10 +772,10 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         assert re.search(r"count=0\b", dump), (
             "the answered modal is still on screen: {}".format(dump[-600:])
         )
-        print("  [OK] a modal window opened, took Enter and closed")
+        print_ok("a modal window opened, took Enter and closed")
         # A window dies with its module: open it again, unload the source, and
         # the shell drops it rather than drawing through a dead image.
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("panel window {} demo.confirm".format(slot))
         panels.wait(
             re.escape(PANEL_WINDOW_OPENED_TOKEN) + r'\s+slot=\d+\s+window="demo\.confirm"',
@@ -749,7 +783,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "the reopened window",
             begin,
         )
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("panel unload pill_editor_shell_egui_editor")
         panels.wait(re.escape(PANEL_UNLOADED_TOKEN), 60, "the second unload", begin)
         dump = panels.request(
@@ -758,7 +792,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         assert re.search(r"count=0\b", dump), (
             "an unloaded module's window is still on screen: {}".format(dump[-600:])
         )
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("panel restore pill_editor_shell_egui_editor")
         panels.wait(
             re.escape(PANEL_RESTORED_TOKEN),
@@ -766,7 +800,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "the second restore",
             begin,
         )
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("panel window {} demo.confirm".format(slot))
         panels.wait(
             re.escape(PANEL_WINDOW_OPENED_TOKEN) + r'\s+slot=\d+\s+window="demo\.confirm"',
@@ -774,8 +808,8 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "the re-registered window",
             begin,
         )
-        print("  [OK] a module's window closes on its unload and reopens after")
-        begin = len(panels.read_log())
+        print_ok("a module's window closes on its unload and reopens after")
+        begin = panels.length()
         panels.send("key Escape")
         panels.wait(
             re.escape(PANEL_MODAL_ANSWERED_TOKEN) + r'\s+window="[^"]+"\s+accepted=false',
@@ -783,7 +817,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "the dismiss",
             begin,
         )
-        print("  [OK] Escape dismisses a modal")
+        print_ok("Escape dismisses a modal")
         # A scene saves, empties and opens again. Save
         # writes the live world to a new `.scene` under the project's asset
         # directory, New replaces it with nothing, and Open brings the same
@@ -791,13 +825,13 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         scene_path = "scenes/egui_suite.scene"
         scene_file = (MODULES_ROOT / project / "res" / scene_path).resolve()
         scene_file.unlink(missing_ok=True)
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("scene save {}".format(scene_path))
         panels.wait(re.escape(SCENE_SAVED_TOKEN), 60, "the scene save", begin)
         saved = re.search(
             re.escape(SCENE_SAVED_TOKEN)
             + r'\s+path="scenes/egui_suite\.scene"\s+guid=\S+\s+entities=(\d+)',
-            panels.read_log()[begin:],
+            panels.read_since(begin),
         )
         assert saved is not None, "the save did not name the scene it wrote"
         saved_count = int(saved.group(1))
@@ -811,26 +845,26 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "the title naming the saved scene",
             begin,
         )
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("scene new")
         panels.wait(re.escape(SCENE_NEW_TOKEN), 60, "the new scene", begin)
         removed = re.search(
             re.escape(SCENE_NEW_TOKEN) + r"\s+entities=(\d+)",
-            panels.read_log()[begin:],
+            panels.read_since(begin),
         )
         assert removed is not None and int(removed.group(1)) == saved_count, (
             "the new scene did not empty the world: {}".format(
                 (removed.group(0) if removed else "no scene new line")
             )
         )
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("scene open {}".format(scene_path))
         panels.wait(re.escape(SCENE_OPENED_TOKEN), 60, "the scene open", begin)
         reopened = re.search(
             re.escape(SCENE_OPENED_TOKEN)
             + r'\s+path="scenes/egui_suite\.scene"\s+guid=\S+\s+entities=(\d+)'
             + r"\s+components=(\d+)",
-            panels.read_log()[begin:],
+            panels.read_since(begin),
         )
         assert reopened is not None, "the open did not name the scene it read"
         assert int(reopened.group(1)) == saved_count, (
@@ -845,7 +879,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "the title naming the opened scene",
             begin,
         )
-        print("  [OK] a scene saved, emptied and opened with its entities")
+        print_ok("a scene saved, emptied and opened with its entities")
         # The scene is a suite artifact: it must not outlive the run that made
         # it, or the next start's asset scan finds it.
         scene_file.unlink(missing_ok=True)
@@ -860,7 +894,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "module" in match.group(4)
             for match in re.finditer(DOCK_LEAF_PATTERN, dock)
         ), "the panel tab never reached the dock: {}".format(dock[-600:])
-        begin = len(panels.read_log())
+        begin = panels.length()
         panels.send("quit")
         panels.wait(re.escape(QUIT_REQUESTED_TOKEN), 30, "the panel quit", begin)
         panels.wait(re.escape(LAYOUT_SAVED_TOKEN), 30, "the panel layout", begin)
@@ -880,9 +914,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
     )
     panels_restart.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "1"})
     try:
-        wait_for_token(
-            panels_restart,
-            re.escape(EGUI_SHELL_LOADED_TOKEN),
+        panels_restart.wait_for_match(re.escape(EGUI_SHELL_LOADED_TOKEN),
             120,
             "the panel restart",
         )
@@ -902,8 +934,8 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         ), "the restarted editor did not register the panel: {}".format(
             restored[-800:]
         )
-        print("  [OK] the module tab and its panel survived a restart")
-        begin = len(panels_restart.read_log())
+        print_ok("the module tab and its panel survived a restart")
+        begin = panels_restart.length()
         panels_restart.send("quit")
         panels_restart.wait(re.escape(QUIT_REQUESTED_TOKEN), 30, "the restart's quit", begin)
         assert panels_restart.wait_exit(timeout=60) == 0, "the restarted panel editor did not exit 0"
@@ -938,14 +970,13 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
     try:
         safe.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "1"})
         try:
-            wait_for_token(
-                safe, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "safe-mode startup"
+            safe.wait_for_match(re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "safe-mode startup"
             )
             # The panel is drawn once, and the host's build failing can make it
             # appear before this suite reads `window created` - so the search
             # starts at the log's beginning rather than at a later anchor.
             safe.wait(re.escape(SAFE_MODE_TOKEN), 240, "the safe-mode panel")
-            rows_begin = len(safe.read_log())
+            rows_begin = safe.length()
             rows = safe.request(
                 "dump problems",
                 re.escape(PROBLEMS_DUMP_TOKEN),
@@ -958,16 +989,16 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             located = re.search(
                 re.escape(PROBLEM_ROW_TOKEN)
                 + r'\s+module="[^"]*"\s+severity="error"\s+file="([^"]+)"\s+line=([1-9][0-9]*)',
-                safe.read_log()[rows_begin:],
+                safe.read_since(rows_begin),
             )
             assert located and located.group(1).endswith("shell.rs"), (
                 "the safe-mode panel did not name the shell's source: {}".format(located)
             )
-            print("  [OK] safe mode showed the shell's error with its location")
+            print_ok("safe mode showed the shell's error with its location")
             # Fix the source, then press the panel's Retry through the same
             # path the button calls.
             session.edit_source(shell_source, shell_text)
-            retry_begin = len(safe.read_log())
+            retry_begin = safe.length()
             safe.send("safe_mode retry")
             safe.wait(
                 re.escape(SAFE_MODE_RETRY_TOKEN), 60, "the safe-mode retry", retry_begin
@@ -978,7 +1009,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
                 "the shell loaded after the retry",
                 retry_begin,
             )
-            print("  [OK] Retry loaded the fixed shell without a restart")
+            print_ok("Retry loaded the fixed shell without a restart")
 
             # The retried shell and the renderer now share one process, and the
             # renderer's `rendering` system lives under a reserved owner: a shell
@@ -1010,7 +1041,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
                 "the rendering system is not under the reserved renderer owner: "
                 + after_retry[0]
             )
-            print("  [OK] the retried shell and the renderer hold separate owners")
+            print_ok("the retried shell and the renderer hold separate owners")
 
             # A shell edit retires the shell's generation. The renderer's system
             # is not that generation's to clear, so it must still be there
@@ -1019,7 +1050,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
                 shell_source,
                 shell_text + "\n// The safe-mode lane reloads the shell once.\n",
             )
-            reload_begin = len(safe.read_log())
+            reload_begin = safe.length()
             safe.wait(
                 re.escape(MODULE_RELOAD_COMPLETE_TOKEN),
                 600,
@@ -1038,7 +1069,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
                 "the frame kept running after the shell reload",
                 reload_begin,
             )
-            print("  [OK] a shell reload left the renderer's system and the frame alone")
+            print_ok("a shell reload left the renderer's system and the frame alone")
         finally:
             safe.close()
     finally:

@@ -34,6 +34,7 @@ USAGE
       session.close()
 """
 
+import codecs
 import json
 import os
 import re
@@ -43,10 +44,19 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
+from core.editor_log_tokens import (  # noqa: F401 - re-exported for the suites
+    EDITOR_SCRIPTED_REJECTED_TOKEN,
+    REJECTION_PATTERN,
+)
 from core.environment import filesystem_timestamp
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name
 from core.projects import NATIVE_PROJECT_PATH
-from core.suite_common import ensure_host_lock, kill_stale_hosts, release_host_lock
+from core.suite_common import (
+    ensure_host_lock,
+    kill_stale_hosts,
+    release_host_lock,
+    verify_editor_binary,
+)
 
 # The editor binary every native-editor suite drives.
 EDITOR_BINARY = executable_name("pill_editor")
@@ -54,40 +64,35 @@ EDITOR_BINARY = executable_name("pill_editor")
 # Every suite's run artifacts live here, one folder per suite and run.
 EDITOR_VALIDATION_ROOT = REPOSITORY_ROOT / "local" / "editor-validation"
 
+# The default poll for log waits: the cursor reads only appended bytes, so a
+# poll costs one stat and, at most, one small read. The disk probes pass their
+# own slower cadence because another process writes those files. 0.3 is the
+# audit's conservative first step; the frame and count waits pass their own.
+LOG_POLL_SECONDS = 0.3
+
 # What a wait's probe produces; `wait_until` returns it unchanged.
 T = TypeVar("T")
 
-# =============================================================================
-# Shared editor log tokens
-# =============================================================================
+# When the last `[OK]` line was printed, so the next one can say how long the
+# step it closes took. One clock for the whole process: the session's waits and
+# a suite's own prints share the figure, which is the gap between two steps.
+_LAST_STEP_OK_AT: List[float] = []
 
-# Plain substrings of the lines the editor prints; each one must stay
-# printable by a Rust string, which `test_log_contract.py` checks. Suite
-# specific patterns (entity handles, labels, counts) stay in the suites.
 
-EDITOR_WINDOW_CREATED_TOKEN = "[editor] window created"
-EDITOR_ENGINE_COMMANDS_TOKEN = "[editor] engine commands applied"
-EDITOR_HISTORY_PUSH_TOKEN = "[editor] history push"
-EDITOR_HISTORY_UNDO_TOKEN = "[editor] history undo"
-EDITOR_HISTORY_REDO_TOKEN = "[editor] history redo"
-# The command registry's report after a keybindings file lands: the preset it
-# activated, how many overrides it resolved, and one line per chord two
-# commands answer to.
-EDITOR_KEYBINDINGS_APPLIED_TOKEN = "[editor] keybindings applied"
-EDITOR_KEYBINDING_CONFLICT_TOKEN = "[editor] keybinding conflict"
-# A chord the registry resolved, and the same chord when the command it named
-# has no action in the executable yet.
-EDITOR_SHORTCUT_RAN_TOKEN = "[editor] shortcut ran"
-EDITOR_SHORTCUT_INERT_TOKEN = "[editor] shortcut has no action yet"
-# The egui editor's one refusal line for a scripted line it cannot run: an
-# unknown verb, an unknown target, or a missing or malformed argument. A suite
-# typo raises `ScriptedCommandRejected` from the next wait instead of running
-# out its timeout, and `test_log_contract.py` pins the literal against Rust.
-EDITOR_SCRIPTED_REJECTED_TOKEN = "[editor] scripted command rejected"
-REJECTION_PATTERN = re.compile(
-    re.escape(EDITOR_SCRIPTED_REJECTED_TOKEN)
-    + r'\s+command="((?:[^"\\]|\\.)*)"\s+reason="((?:[^"\\]|\\.)*)"'
-)
+def print_step_ok(label: str, elapsed: Optional[float] = None) -> None:
+    """Prints a step's `[OK]` line, then the milliseconds the step took.
+
+    `elapsed` is the step's own measurement when the caller has one (a wait
+    knows how long it waited); without it the figure is the time since the
+    previous `[OK]`, which is what a reader of a slow run wants next to it.
+    """
+    now = time.monotonic()
+    if elapsed is None:
+        elapsed = now - _LAST_STEP_OK_AT[-1] if _LAST_STEP_OK_AT else 0.0
+    _LAST_STEP_OK_AT.clear()
+    _LAST_STEP_OK_AT.append(now)
+    print("  [OK] {}".format(label))
+    print("  [timing] {} {:.0f}".format(label, elapsed * 1000.0))
 
 class ScriptedCommandRejected(RuntimeError):
     """A scripted line the editor refused, raised before any timeout can hide it."""
@@ -105,14 +110,16 @@ class ScriptedCommandRejected(RuntimeError):
 
 # One run folder per suite per process: a suite that launches several editor
 # sessions (the undo suite's asset phases) shares its folder, one file set
-# per session. Cached so every session of one process agrees on the path.
+# per session. The process id keeps two suites that start in the same second
+# from sharing a folder, a log and a command file. Cached so every session of
+# one process agrees on the path.
 _RUN_DIRECTORIES: Dict[str, Path] = {}
 
 def run_directory(suite: str) -> Path:
     """The run folder of `suite` for this process; computed once, then cached."""
     if suite not in _RUN_DIRECTORIES:
-        _RUN_DIRECTORIES[suite] = EDITOR_VALIDATION_ROOT / "{}-{}".format(
-            suite, filesystem_timestamp()
+        _RUN_DIRECTORIES[suite] = EDITOR_VALIDATION_ROOT / "{}-{}-{}".format(
+            suite, filesystem_timestamp(), os.getpid()
         )
     return _RUN_DIRECTORIES[suite]
 
@@ -154,6 +161,18 @@ class EditorSession:
         self._binary = Path(binary) if binary is not None else EDITOR_BINARY
         self._process: Optional[subprocess.Popen] = None
         self._sources: Dict[Path, str] = {}
+        # The log cursor: the text decoded so far and the byte position it
+        # came from. The editor appends UTF-8, so a poll decodes only the new
+        # tail; the character length is what every anchor uses.
+        self._log_text = ""
+        self._log_byte_position = 0
+        self._log_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        # Every character this session decoded over the whole run: the read
+        # budget's figure. Appends are read once, so it tracks the log's length.
+        self._log_characters_read = 0
+        # Refusals found but not yet raised: `wait_until` raises the newest
+        # once, and `_rejections_seen` keeps an old line from raising again.
+        self._pending_rejections: List[Tuple[str, str]] = []
         # Refusals already reported to a suite, so a wait that reads the whole
         # log (the default anchor) only raises on a line new since the last
         # one: a probe that expects a refusal must not poison every later wait.
@@ -201,18 +220,29 @@ class EditorSession:
         """
         return self.sandbox / "RustHybridEcs"
 
+    def write_state_json(self, name: str, document: Dict) -> Path:
+        """Writes one of the editor's live-read state files, in one format.
+
+        The layout, the preferences and the keybindings all sit in
+        `editor_state_directory`, and every one is written the same way: two
+        spaces of indentation and a trailing newline, so a suite's file reads
+        like the editor's own and a byte comparison in a guard stays stable.
+        Returns the path it wrote, for a suite that wants to read it back.
+        """
+        path = self.editor_state_directory / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        return path
+
     def write_keybindings(self, document: Dict) -> None:
-        """Writes the keybindings file the editor watches, creating its folder.
+        """Writes the keybindings file the editor watches.
 
         The editor rereads the file every frame and applies a change without a
         restart, so a suite can rebind a shortcut mid-run and observe the
         result. The document is the `KeybindingsFile` shape: an optional
         `preset` and `overrides` mapping a command id to its chord list.
         """
-        directory = self.editor_state_directory
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / "keybindings.json"
-        path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        self.write_state_json("keybindings.json", document)
 
     def write_preferences(self, document: Dict) -> None:
         """Writes the preferences file the editor watches.
@@ -221,10 +251,7 @@ class EditorSession:
         in the document for the Preferences tab. A suite uses this to point
         `code_editor_command` at a stub before clicking a Problems row.
         """
-        directory = self.editor_state_directory
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / "preferences.json"
-        path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        self.write_state_json("preferences.json", document)
 
     @property
     def stub_editor_record(self) -> Path:
@@ -270,6 +297,7 @@ class EditorSession:
         test_seconds: Optional[int] = None,
         extra_env: Optional[Dict[str, str]] = None,
         scripted: bool = True,
+        preflight: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         """Locks the host, clears strays, and launches the editor.
 
@@ -277,8 +305,13 @@ class EditorSession:
         written and its environment variables are left unset, for the runs that
         only prove startup and exit.
 
-        Raises `SystemExit` with the build hint when the binary is missing -
-        the suites surface that as their usage error.
+        `preflight` runs under the host lock, after the strays are cleared and
+        immediately before the launch, so a check that reads the tree cannot be
+        overtaken by the wait for the lock. It returns why the launch must not
+        happen, or None.
+
+        Raises `SystemExit` with the refusal text when the binary, the images
+        beside it, or the preflight say the tree cannot be launched.
         """
         if self._process is not None:
             raise RuntimeError("this session already started an editor")
@@ -291,8 +324,22 @@ class EditorSession:
         # ever killed by the holder, never by a queued waiter.
         ensure_host_lock()
         kill_stale_hosts()
+        # The launch-time checks run under the lock, not before the wait for
+        # it: a build that started while this session queued would otherwise
+        # land between the suite's preflight and `Popen`, and the editor would
+        # die at startup on a mixed set instead of the suite refusing. The
+        # binary's own check runs at every start: a hot patch builds modules
+        # into their own tree, so it cannot make the shared images newer.
+        refusal = verify_editor_binary(self._binary)
+        if refusal is None and preflight is not None:
+            refusal = preflight()
+        if refusal:
+            release_host_lock()
+            raise SystemExit(refusal)
         self.run_directory.mkdir(parents=True, exist_ok=True)
         self.sandbox.mkdir(parents=True, exist_ok=True)
+        self._reset_log_cursor()
+        self._log_characters_read = 0
         environment = dict(os.environ)
         environment["PROJECT_PATH"] = project or self.project
         environment["LOCALAPPDATA"] = str(self.sandbox)
@@ -352,12 +399,83 @@ class EditorSession:
     # The log: file-backed, byte-anchored waits
     # -------------------------------------------------------------------------
 
+    def _reset_log_cursor(self) -> None:
+        """Forgets the cached log: a new run's file starts empty.
+
+        The read counter is deliberately not reset: a log that shrank is read
+        again from the start, and the budget has to see that second read.
+        """
+        self._log_text = ""
+        self._log_byte_position = 0
+        self._log_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._pending_rejections = []
+        self._rejections_seen = 0
+
+    def _refresh_log(self) -> None:
+        """Decodes the bytes appended since the last poll into the cache.
+
+        The editor writes through a line-buffered stdout, so a read can land
+        mid-line or mid-character; the incremental decoder holds a split
+        character until its bytes arrive, and the refusal scan looks a short
+        way back so a line split across two reads is still counted. A file
+        that shrank (truncated or replaced) is read again from the start.
+        """
+        try:
+            size = self.log_path.stat().st_size
+        except OSError:
+            return
+        if size < self._log_byte_position:
+            self._reset_log_cursor()
+        if size == self._log_byte_position:
+            return
+        try:
+            with self.log_path.open("rb") as log:
+                log.seek(self._log_byte_position)
+                chunk = log.read(size - self._log_byte_position)
+        except OSError:
+            return
+        self._log_byte_position += len(chunk)
+        appended = self._log_decoder.decode(chunk)
+        self._log_text += appended
+        self._log_characters_read += len(appended)
+        # A refusal is rare, so the whole cached text is scanned only when one
+        # may have landed; the short look-back catches a line split across two
+        # reads, and the count keeps an earlier one from raising twice.
+        if EDITOR_SCRIPTED_REJECTED_TOKEN in (appended or self._log_text[-512:]):
+            rejected = REJECTION_PATTERN.findall(self._log_text)
+            if len(rejected) > self._rejections_seen:
+                self._pending_rejections.extend(rejected[self._rejections_seen :])
+                self._rejections_seen = len(rejected)
+
+    def text(self) -> str:
+        """The whole log so far, decoding only what arrived since the last read."""
+        self._refresh_log()
+        return self._log_text
+
+    def length(self) -> int:
+        """The log's length in characters, the unit every anchor uses."""
+        self._refresh_log()
+        return len(self._log_text)
+
+    def read_since(self, offset: int) -> str:
+        """The log text from character `offset` on."""
+        self._refresh_log()
+        return self._log_text[offset:]
+
+    def log_characters_read(self) -> int:
+        """How many log characters this session has decoded so far.
+
+        The cursor reads each appended byte once, so a healthy run's count stays
+        at the log's own length. A reader that polls by rereading the whole file
+        pushes the count far past it, which is what `read_budget_exceeded`
+        watches for.
+        """
+        self._refresh_log()
+        return self._log_characters_read
+
     def read_log(self) -> str:
         """The editor log so far, tolerant of a file the writer holds open."""
-        try:
-            return self.log_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return ""
+        return self.text()
 
     def wait_until(
         self,
@@ -366,7 +484,7 @@ class EditorSession:
         timeout_message: str,
         label: str = "",
         exit_note: str = "",
-        poll: float = 0.5,
+        poll: float = LOG_POLL_SECONDS,
         announce: bool = True,
     ) -> T:
         """Polls the log until `probe` returns something other than None.
@@ -379,23 +497,29 @@ class EditorSession:
         `TimeoutError` (with `timeout_message` and the log tail) on timeout.
         """
         deadline = time.monotonic() + timeout
+        started_at = time.monotonic()
         prefix = "{}: ".format(label) if label else ""
         process = self._process
         while time.monotonic() < deadline:
-            text = self.read_log()
+            text = self.text()
             found = probe(text)
             if found is not None:
                 if announce and label:
-                    print("  [OK] {}".format(label))
+                    print_step_ok(label, time.monotonic() - started_at)
                 return found
+            if self._pending_rejections:
+                command, reason = self._pending_rejections[-1]
+                self._pending_rejections.clear()
+                raise ScriptedCommandRejected(command, reason)
             if process is not None and process.poll() is not None:
                 raise RuntimeError(
                     prefix
                     + "the editor exited {}{}\n".format(process.returncode, exit_note)
                     + text[-4000:]
                 )
-            # Half a second is the editor's log cadence: polling faster only
-            # re-reads the same bytes.
+            # The log cursor reads only appended bytes, so a fast poll costs a
+            # stat and, at most, one small read; the disk probes pass their own
+            # slower cadence.
             time.sleep(poll)
         raise TimeoutError(timeout_message + self.read_log()[-4000:])
 
@@ -412,15 +536,7 @@ class EditorSession:
         expression = re.compile(pattern)
 
         def probe(text: str) -> Optional[int]:
-            if expression.search(text[start:]):
-                return len(text)
-            if EDITOR_SCRIPTED_REJECTED_TOKEN in text:
-                rejected = REJECTION_PATTERN.findall(text)
-                if len(rejected) > self._rejections_seen:
-                    self._rejections_seen = len(rejected)
-                    command, reason = rejected[-1]
-                    raise ScriptedCommandRejected(command, reason)
-            return None
+            return len(text) if expression.search(text[start:]) else None
 
         return self.wait_until(
             probe,
@@ -432,6 +548,27 @@ class EditorSession:
     def wait_token(self, token: str, timeout: float, label: str, start: int = 0) -> int:
         """Waits for a plain token (escaped before the regex search)."""
         return self.wait(re.escape(token), timeout, label, start)
+
+    def wait_for_match(
+        self, pattern: str, timeout: float, label: str, start: int = 0
+    ) -> str:
+        """Waits until `pattern` matches at or after `start`; returns the newest match.
+
+        The wait's own match is what is returned, not the first line in the
+        log: a token a run repeats would otherwise hand back an old one.
+        """
+        expression = re.compile(pattern)
+
+        def probe(text: str) -> Optional[str]:
+            matches = list(expression.finditer(text[start:]))
+            return matches[-1].group(0) if matches else None
+
+        return self.wait_until(
+            probe,
+            timeout,
+            "{}: timeout waiting for {}\n".format(label, pattern),
+            label=label,
+        )
 
     # -------------------------------------------------------------------------
     # Engine run state: the pause gate the suites share
@@ -459,13 +596,13 @@ class EditorSession:
         seen = 0
         rate = 0.0
         while True:
-            start = len(self.read_log())
+            start = self.length()
             # Half a report interval: a fresh report is picked up as early
             # as it lands.
             time.sleep(0.5)
-            for line in self.read_log()[start:].splitlines():
+            for line in self.read_since(start).splitlines():
                 match = re.search(
-                    re.escape(EDITOR_FRAME_REPORT_TOKEN) + r"\s+fps=([0-9.]+)", line
+                    r"\[editor\] scene frame report\s+fps=([0-9.]+)", line
                 )
                 if match:
                     seen += 1
@@ -533,10 +670,10 @@ class EditorSession:
 
     def find(self, pattern: str, start: int = 0) -> re.Match:
         """The first match of `pattern` in the log from `start`, now."""
-        match = re.compile(pattern).search(self.read_log()[start:])
+        match = re.compile(pattern).search(self.read_since(start))
         if not match:
             raise RuntimeError(
-                "no match for {}\n".format(pattern) + self.read_log()[-3000:]
+                "no match for {}\n".format(pattern) + self.text()[-3000:]
             )
         return match
 
@@ -560,10 +697,10 @@ class EditorSession:
         (suites pass `re.escape(<token>)` for a literal). Returns the log text
         from the anchor through the answer, for the callers that parse it.
         """
-        start = len(self.read_log())
+        start = self.length()
         self.send(text)
         self.wait(pattern, timeout, label or "scripted {}".format(text), start)
-        return self.read_log()[start:]
+        return self.read_since(start)
 
     def send_many(self, lines: List[str]) -> None:
         """Appends several scripted commands in one write.
@@ -580,11 +717,8 @@ class EditorSession:
     # -------------------------------------------------------------------------
 
     def write_appdata_json(self, name: str, body: dict) -> Path:
-        """Writes one of the editor's live-read files under the sandbox."""
-        path = self.sandbox / "RustHybridEcs" / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(body), encoding="utf-8")
-        return path
+        """Writes one of the editor's live-read files, through the one path."""
+        return self.write_state_json(name, body)
 
     def edit_source(self, path: Path, text: str) -> None:
         """Writes `text` over a source file, LF preserved, restored on close.

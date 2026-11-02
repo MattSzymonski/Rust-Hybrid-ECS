@@ -64,6 +64,7 @@ EXAMPLE USAGE
 """
 
 import argparse
+import ast
 import hashlib
 import re
 import sys
@@ -107,6 +108,20 @@ SOURCE_WRITE_PATTERN = re.compile(
 PROJECT_PATH_LITERAL_PATTERN = re.compile(
     r'"(?:\.\./)?examples/[A-Za-z0-9_.-]+"|"\.\./devops/tests/[A-Za-z0-9_.-]+"'
 )
+
+# Rule 7's two lists: the step-area modules the editor suite is split into
+# carry sleeps too, and the one call that is deliberately not a poll - the idle
+# stretch the redraw-cadence step measures across, which IS the interval.
+STEP_MODULE_GLOB = "editor_steps_*.py"
+VERIFIED_SLEEP_EXCEPTIONS = {
+    "step_12_redraw_cadence": "the 3 s idle stretch is the interval the step measures",
+}
+
+
+def discover_step_files() -> List[Path]:
+    """The step-area modules beside the suites: they carry the step bodies."""
+    return sorted(SUITES_DIRECTORY.glob(STEP_MODULE_GLOB))
+
 
 # Rule 6's two numbers: the whole fixture set's weight, and the size below which
 # a repeated file is not worth reporting. A small stub mesh legitimately ships in
@@ -161,8 +176,50 @@ def sleep_findings(path: Path, text: str) -> List[str]:
     return found
 
 
-# Rule 4: an anchor is taken before the write it anchors.
+# Rule 7: a sleep waits for nothing unless it is a poll interval.
 #
+# A poll sleeps inside its `while`; a fixed sleep that stands in for a wait is
+# a regression the moment a step cannot see its own token, which is why the
+# editor suite has none left. The one exception is named: the cadence step's
+# 3 s idle stretch is the interval it measures, not a wait for something to
+# happen.
+def sleep_outside_poll_findings(path: Path, text: str) -> List[str]:
+    found = []
+
+    def walk(node: ast.AST, in_loop: bool, function: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            name = function
+            if isinstance(child, ast.FunctionDef):
+                name = child.name
+            elif isinstance(child, ast.ClassDef):
+                name = ""
+            if isinstance(child, ast.While):
+                walk(child, True, name)
+                continue
+            if isinstance(child, ast.Call):
+                target = child.func
+                called = (
+                    target.attr
+                    if isinstance(target, ast.Attribute)
+                    else getattr(target, "id", "")
+                )
+                base = getattr(getattr(target, "value", None), "id", "")
+                if called == "sleep" and base == "time" and not in_loop:
+                    if name not in VERIFIED_SLEEP_EXCEPTIONS:
+                        found.append(
+                            "{}:{}: sleeps outside a poll loop in {}; wait for the \n"
+                            "                            "
+                            "token or name the exception".format(
+                                path.name, child.lineno, name or "module scope"
+                            )
+                        )
+            walk(child, in_loop, name)
+
+    walk(ast.parse(text), False, "")
+    return found
+
+
+# Rule 4: an anchor is taken before the write it anchors.#
 # The test is "the statement immediately before the anchor is a write", walking
 # back over blanks, comments and progress prints. That is the shape the defect
 # takes - `atomic_write(...)` on one line, the anchor on the next - and it
@@ -245,6 +302,15 @@ def fixture_findings(
 # Every rule's findings, in report order.
 def collect() -> List[Tuple[str, List[str]]]:
     sources = [(path, path.read_text(encoding="utf-8")) for path in discover_files()]
+    step_sources = [
+        (path, path.read_text(encoding="utf-8")) for path in discover_step_files()
+    ]
+    # Rule 7 landed with the editor suite's sleep audit; it is scoped to that
+    # suite and its step modules here, and the other suites adopt it as they are
+    # touched (their sleeps predate the rule and are each a finding of their own).
+    editor_sources = [
+        (path, text) for path, text in sources if path.name == "test_editor_egui.py"
+    ]
     measured_bytes, fixture_problems = fixture_findings()
     return [
         ("rule 1: every suite has the header run_all reads", header_findings()),
@@ -270,6 +336,14 @@ def collect() -> List[Tuple[str, List[str]]]:
                 FIXTURE_BUDGET_MEGABYTES, measured_bytes / (1024 * 1024)
             ),
             fixture_problems,
+        ),
+        (
+            "rule 7: every sleep is a poll interval or a named exception",
+            [
+                finding
+                for path, text in editor_sources + step_sources
+                for finding in sleep_outside_poll_findings(path, text)
+            ],
         ),
     ]
 
@@ -321,6 +395,31 @@ def self_test() -> int:
         "a comment two lines above does not count",
         len(sleep_findings(fixture, "    # Poll until the marker shows.\n    check()\n    " + BARE_SLEEP + "\n"))
         == 1,
+    )
+    expect(
+        "a sleep outside a poll loop is caught",
+        len(
+            sleep_outside_poll_findings(
+                fixture, "def step():\n    drain()\n    " + BARE_SLEEP + "\n"
+            )
+        )
+        == 1,
+    )
+    expect(
+        "a sleep inside a poll loop passes",
+        sleep_outside_poll_findings(
+            fixture,
+            "def step():\n    while not done():\n        " + BARE_SLEEP + "\n",
+        )
+        == [],
+    )
+    expect(
+        "a named exception passes",
+        sleep_outside_poll_findings(
+            fixture,
+            "def step_12_redraw_cadence():\n    " + BARE_SLEEP + "\n",
+        )
+        == [],
     )
     expect(
         "an anchor after the write is caught",

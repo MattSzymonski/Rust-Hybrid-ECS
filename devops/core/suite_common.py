@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name
+from .environment import ProcessToolUnavailable, windows_process_commands
 from .projects import (
     CSHARP_PROJECT_PATH,
     CSHARP_PROJECT_ROOT,
@@ -929,6 +930,12 @@ EDITOR_SOURCE_ROOTS = HOST_SOURCE_ROOTS + (
     MODULES_ROOT / "csharp" / "pill_csharp_bridge",
 )
 
+# The images a `pill_editor` launch resolves beside its executable. Every cargo
+# artifact of this workspace is named `pill_*`, which is what tells them from the
+# images beside them that no build of this workspace writes: the std dylib a
+# build script stages, and the fixture modules other suites build.
+EDITOR_LOAD_SET_GLOB = "pill_*.dll"
+
 # Directories under a source root that are not build inputs: cargo's own
 # output, and the crates the host regenerates on every start.
 _NOT_HOST_SOURCE_DIRS = ("target", "generated")
@@ -971,6 +978,13 @@ def verify_editor_binary(binary: Path) -> Optional[str]:
     alone - the binary's mtime against the newest source it is compiled from -
     and its price is the one the host check already pays: a moved source forces
     a rebuild before the suite will run.
+
+    The images beside the binary are verified with it. Cargo writes one build
+    graph's artifacts in dependency order, so every shared dylib of a build is
+    older than the executable that links it; a dylib newer than the executable
+    therefore comes from a build that landed after the executable's, and a
+    launch would mix two generations - which Windows reports as an entry point
+    that no longer matches (`0xC0000139`), at the first frame.
     """
     if not binary.is_file():
         return (
@@ -985,7 +999,56 @@ def verify_editor_binary(binary: Path) -> Optional[str]:
             "test this tree. Rebuild it with `cargo build -p pill_editor` in "
             "modules/ first".format(binary, newest_path)
         )
+    for library in editor_load_set(binary):
+        if library.stat().st_mtime_ns > binary_mtime_ns:
+            return (
+                "{} beside the editor binary {} was written after it, so the "
+                "two come from different builds and the loader would mix them. "
+                "Rebuild the editor with `cargo build -p pill_editor` in "
+                "modules/ once no other build is running".format(library, binary)
+            )
     return None
+
+
+def editor_load_set(binary: Path) -> List[Path]:
+    """Every workspace-built image a launch of `binary` resolves beside it."""
+    return sorted(
+        path for path in binary.parent.glob(EDITOR_LOAD_SET_GLOB) if path.is_file()
+    )
+
+
+def concurrent_workspace_build_refusal() -> Optional[str]:
+    """Why a cargo build of this workspace makes a host launch unsafe, or None.
+
+    A build rewrites the shared dylibs a host maps at startup, so launching
+    during one turns a clean start into a loader failure. Cargo running against
+    another checkout cannot touch this tree's dylibs, so those processes are
+    ignored: a person may well have a second project open while a suite runs. A
+    query that cannot run is a refusal, not "no builds running" - the check
+    exists to prevent exactly the loader failure a silent pass lets through.
+    """
+    try:
+        cargo = windows_process_commands("cargo.exe")
+    except ProcessToolUnavailable as error:
+        return (
+            "the concurrent-build pre-check could not run, so this suite cannot "
+            "tell whether a cargo build is rewriting the shared dylibs: {}".format(
+                error
+            )
+        )
+    workspace = str(REPOSITORY_ROOT).lower()
+    running_here = [
+        line
+        for line in cargo
+        if "modules" in line.lower() and workspace in line.lower()
+    ]
+    if not running_here:
+        return None
+    return (
+        "a cargo build of this workspace is running; wait for it to finish "
+        "before launching the editor - it rewrites the shared dylibs the "
+        "modules load against:\n" + "\n".join(running_here)
+    )
 
 
 def _record_host_build(posture: HostPosture) -> None:

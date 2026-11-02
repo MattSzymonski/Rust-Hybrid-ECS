@@ -512,6 +512,34 @@ def check_editor_runs_get_their_own_folders() -> None:
         fail("only Windows runs the native editor")
 
 
+def check_editor_reads_only_new_bytes() -> None:
+    """The log cursor decodes appended bytes once; offsets are characters."""
+    from core.editor_session import EditorSession
+
+    session = EditorSession("probe-cursor")
+    session.run_directory.mkdir(parents=True, exist_ok=True)
+    session.log_path.write_bytes(b"first line\n")
+    if session.length() != len("first line\n"):
+        fail("length must count the log's characters")
+    start = session.length()
+    with session.log_path.open("ab") as log:
+        log.write(b"second line\n")
+    if session.read_since(start) != "second line\n":
+        fail("read_since must return only the text appended after the offset")
+    if session.text() != "first line\nsecond line\n":
+        fail("text must return the whole log")
+    # A character split across two writes is held until its bytes are whole,
+    # not decoded as a replacement in the middle of the line.
+    encoded = "caf\u00e9\n".encode("utf-8")
+    with session.log_path.open("ab") as log:
+        log.write(encoded[:4])
+    session.length()
+    with session.log_path.open("ab") as log:
+        log.write(encoded[4:])
+    if "caf\u00e9" not in session.read_since(0):
+        fail("a character split across two reads must still decode")
+
+
 def check_editor_waits_read_from_an_offset() -> None:
     """`wait` searches from its offset; `wait_token` escapes the token."""
     import re as regex
@@ -520,14 +548,14 @@ def check_editor_waits_read_from_an_offset() -> None:
 
     session = EditorSession("probe-waits")
     session.run_directory.mkdir(parents=True, exist_ok=True)
-    session.log_path.write_text("boot line\n", encoding="utf-8")
+    session.log_path.write_bytes(b"boot line\n")
     length = session.wait(r"boot line", 5.0, "boot line")
     if length != len("boot line\n"):
         fail("wait must return the log length it read")
     if session.find(r"boot line") is None:
         fail("find must search the whole log")
-    with session.log_path.open("a", encoding="utf-8") as log:
-        log.write("[editor] second token\n")
+    with session.log_path.open("ab") as log:
+        log.write(b"[editor] second token\n")
     if session.wait(regex.escape("[editor] second token"), 5.0, "second", length) != len(
         session.read_log()
     ):
@@ -542,12 +570,131 @@ def check_editor_waits_time_out_loudly() -> None:
 
     session = EditorSession("probe-timeout")
     session.run_directory.mkdir(parents=True, exist_ok=True)
-    session.log_path.write_text("nothing to see\n", encoding="utf-8")
+    session.log_path.write_bytes(b"nothing to see\n")
     try:
         session.wait(r"never printed", 1.0, "never printed")
     except TimeoutError:
         return
     fail("wait must raise TimeoutError when the pattern never appears")
+
+
+def check_editor_waits_report_a_dead_editor() -> None:
+    """A wait whose editor has exited reports the exit, not a timeout."""
+    import subprocess
+    import sys
+
+    from core.editor_session import EditorSession
+
+    session = EditorSession("probe-dead-editor")
+    session.run_directory.mkdir(parents=True, exist_ok=True)
+    session.log_path.write_bytes(b"boot\n")
+    session._process = subprocess.Popen([sys.executable, "-c", "pass"])
+    session._process.wait()
+    try:
+        session.wait_until(lambda _text: None, 5.0, "never printed")
+    except RuntimeError as error:
+        if "the editor exited" not in str(error):
+            fail(f"the exit error must name the editor exit, got {error}")
+        return
+    fail("a finished editor must be reported before the wait's timeout")
+
+
+def check_editor_load_set_is_verified() -> None:
+    """A dylib newer than the editor binary is refused, and named."""
+    import os
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from core.suite_common import verify_editor_binary
+
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        binary = root / "pill_editor.exe"
+        binary.write_bytes(b"")
+        # The binary must lead the newest editor source, or the source check
+        # answers first and the load set is never consulted.
+        rebuilt = time.time() + 3600.0
+        os.utime(binary, (rebuilt, rebuilt))
+        # A shared dylib from the same build is older than the binary.
+        shared = root / "pill_core.dll"
+        shared.write_bytes(b"")
+        if verify_editor_binary(binary) is not None:
+            fail("a dylib older than the binary must pass the load-set check")
+        # Touching it afterwards leaves the two from different builds.
+        touched = rebuilt + 60.0
+        os.utime(shared, (touched, touched))
+        refusal = verify_editor_binary(binary)
+        if refusal is None:
+            fail("a dylib newer than the binary must be refused")
+        if "pill_core.dll" not in refusal:
+            fail(f"the refusal must name the stale file, got {refusal}")
+
+
+def check_editor_state_writers_share_one_path() -> None:
+    """The state-file writers land in one folder, in one format."""
+    import json
+
+    from core.editor_session import EditorSession
+
+    session = EditorSession("probe-state-files")
+    session.run_directory.mkdir(parents=True, exist_ok=True)
+    preferences = session.write_appdata_json("preferences.json", {"history_step_cap": 400})
+    keybindings = session.editor_state_directory / "keybindings.json"
+    session.write_keybindings({"preset": "default"})
+    session.write_preferences({"history_step_cap": 200})
+    if preferences != session.editor_state_directory / "preferences.json":
+        fail(
+            "write_appdata_json must write into editor_state_directory, "
+            f"not {preferences.parent}"
+        )
+    if not keybindings.is_file():
+        fail("write_keybindings must write into editor_state_directory")
+    expected = {
+        "preferences.json": {"history_step_cap": 200},
+        "keybindings.json": {"preset": "default"},
+    }
+    for name, document in expected.items():
+        path = session.editor_state_directory / name
+        text = path.read_text(encoding="utf-8")
+        if not text.startswith('{\n  "'):
+            fail(f"{name} must be written with two spaces of indentation")
+        if not text.endswith("\n"):
+            fail(f"{name} must end with a newline")
+        if json.loads(text) != document:
+            fail(f"{name} carried the wrong document: {text}")
+
+
+def check_editor_read_budget() -> None:
+    """The cursor's appended reads stay inside the budget; a whole-file reread does not."""
+    from core.editor_session import EditorSession
+    from editor_step_support import read_budget_exceeded
+
+    def filled(name: str) -> "EditorSession":
+        session = EditorSession(name)
+        session.run_directory.mkdir(parents=True, exist_ok=True)
+        session.log_path.write_bytes(b"")
+        return session
+
+    # A reader that follows the cursor: every byte arrives once.
+    cursor = filled("probe-budget")
+    for chunk in range(60):
+        with cursor.log_path.open("ab") as log:
+            log.write(("line {:04d} {}\n".format(chunk, "x" * 32768)).encode())
+        cursor.length()
+    if read_budget_exceeded(cursor):
+        fail("the cursor's own reads must stay inside the budget")
+
+    # The same log reread from the start on every poll - the regression the
+    # budget exists for - multiplies what the run read.
+    planted = filled("probe-budget-planted")
+    for chunk in range(60):
+        with planted.log_path.open("ab") as log:
+            log.write(("line {:04d} {}\n".format(chunk, "x" * 32768)).encode())
+        planted._reset_log_cursor()
+        planted.length()
+    if not read_budget_exceeded(planted):
+        fail("a whole-file reread must exceed the budget")
 
 
 def check_editor_edits_keep_lf_and_restore() -> None:
@@ -778,8 +925,13 @@ CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("source edits keep line endings", check_source_edits_keep_line_endings),
     ("snapshot restores files exactly", check_snapshot_restores_files_exactly),
     ("editor runs get their own folders", check_editor_runs_get_their_own_folders),
+    ("editor reads only new bytes", check_editor_reads_only_new_bytes),
     ("editor waits read from an offset", check_editor_waits_read_from_an_offset),
     ("editor waits time out loudly", check_editor_waits_time_out_loudly),
+    ("editor waits report a dead editor", check_editor_waits_report_a_dead_editor),
+    ("editor load set is verified", check_editor_load_set_is_verified),
+    ("editor state writers share one path", check_editor_state_writers_share_one_path),
+    ("editor reads stay inside the budget", check_editor_read_budget),
     ("editor edits keep LF and restore", check_editor_edits_keep_lf_and_restore),
     ("workspace members expand like cargo", check_workspace_members_expand_globs_and_excludes),
     ("dependency records carry kind and directory",

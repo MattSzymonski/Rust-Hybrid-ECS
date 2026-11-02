@@ -138,7 +138,7 @@ def discover_suites() -> Tuple[List[Suite], List[str]]:
         shared_arguments = "add_common_suite_arguments" in source
         accepts = [
             flag
-            for flag in ("--timeout-scale", "--skip-build")
+            for flag in ("--timeout-scale", "--skip-build", "--steps")
             if shared_arguments or f'"{flag}"' in source
         ]
         suites.append(Suite(path.name, tier, protects, sets, manual, accepts))
@@ -158,6 +158,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-manual", action="store_true", help="also run RUN: manual suites.")
     parser.add_argument("--keep-going", action="store_true", help="run the remaining suites after a failure.")
     parser.add_argument("--timeout-scale", metavar="S", help="passed to every suite that accepts it.")
+    parser.add_argument(
+        "--steps",
+        metavar="AREAS",
+        help="passed to every suite that accepts it (the editor suite's area subset).",
+    )
     parser.add_argument("--skip-build", action="store_true", help="passed to every suite that accepts it.")
     parser.add_argument("--catalogue", action="store_true", help="print the suite catalogue and exit.")
     parser.add_argument("--write-catalogue", action="store_true", help="write the catalogue into README.md and exit.")
@@ -254,6 +259,8 @@ def run_suite(suite: Suite, arguments: argparse.Namespace) -> tuple:
         command += ["--timeout-scale", arguments.timeout_scale]
     if arguments.skip_build and "--skip-build" in suite.accepts:
         command.append("--skip-build")
+    if arguments.steps and "--steps" in suite.accepts:
+        command += ["--steps", arguments.steps]
     print(f"\n=== {suite.name} ===")
     started = time.monotonic()
     completed = subprocess.run(command, cwd=str(WORKSPACE_ROOT))
