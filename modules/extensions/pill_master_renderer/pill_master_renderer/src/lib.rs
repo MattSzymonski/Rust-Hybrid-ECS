@@ -91,8 +91,8 @@ use pill_engine::{pill_module, Engine};
 pub use pill_master_renderer_data::components::*;
 pub use pill_master_renderer_data::{
     AssetLoader, Material, MaterialBuilder, MaterialParameter, Mesh, MeshVertex, PassKind,
-    PassTarget, RenderPass, RenderingPipeline, Shader, ShaderBuilder, ShaderParameterSlot,
-    ShaderParameterType, ShaderTextureSlot, Texture, TextureType,
+    PassTarget, PipelinePass, RenderPass, RenderingPipeline, Shader, ShaderBuilder,
+    ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, Texture, TextureType,
 };
 pub use pill_renderer_api::{
     FrameOutcome, HeadlessRenderer, PillRenderer, RawWindowData, RenderCapabilities, RenderMetrics,

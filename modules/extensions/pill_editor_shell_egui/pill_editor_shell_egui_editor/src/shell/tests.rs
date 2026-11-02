@@ -1274,9 +1274,8 @@ fn the_toolbox_rows_fill_their_width() {
     );
 }
 
-/// The Preferences tab's Save and Cancel wear the kit's chunky face: Save is
-/// the accent one and queues the batch, Cancel throws the edits away without
-/// queueing anything.
+/// The Preferences tab's Save and Cancel: Save queues the batch, Cancel throws
+/// the edits away without queueing anything.
 #[test]
 fn the_preferences_pair_saves_and_cancels() {
     /// Draw the tab for one frame: the tab seeds its draft buffers on the

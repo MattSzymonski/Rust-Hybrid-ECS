@@ -140,7 +140,12 @@ const MID_GREY_OUT: f32 = 0.267;
 /// Barrel distortion: negative barrels the image, positive pincushions it.
 const LENS_BARREL_K1: f32 = -0.06;
 /// How far the vignette pulls the corners down.
-const LENS_VIGNETTE_STRENGTH: f32 = 1.0;
+///
+/// The shader multiplies the radius by this before its `smoothstep`, so 1.0 puts
+/// the falloff's full range inside the frame and darkens the corners to black.
+/// Half of that stops the ramp short of the corners: they lose about a third of
+/// their light, and the edges almost nothing.
+const LENS_VIGNETTE_STRENGTH: f32 = 0.5;
 /// How far red and blue split at the edge, as a scale of the radius squared.
 const LENS_CHROMATIC_ABERRATION: f32 = 0.004;
 /// Per-channel exponent applied before the grade's ramp.
@@ -149,7 +154,13 @@ const LENS_GAMMA: [f32; 3] = [1.0, 1.0, 1.0];
 /// image is mixed in. A descending ramp inverts the grade.
 const LENS_GRADE: [f32; 3] = [1.0, 0.0, 0.0];
 /// Grain amplitude.
-const LENS_GRAIN_AMPLITUDE: f32 = 0.06;
+///
+/// Zero: the shader's `min(colour + black_limit, grain_amount)` collapses to no
+/// offset, so the tile is sampled and ignored. It is off while the frame's grade
+/// is being settled - the pattern is dense at 1:1 pixels and reads as noise on a
+/// still image - and the rest of the pass stays in place, so turning it back on
+/// is this number alone.
+const LENS_GRAIN_AMPLITUDE: f32 = 0.0;
 /// Screen pixels per grain texel.
 const GRAIN_PIXELS_PER_TEXEL: f32 = 1.0;
 

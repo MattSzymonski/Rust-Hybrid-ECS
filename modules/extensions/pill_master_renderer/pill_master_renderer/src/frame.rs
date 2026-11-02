@@ -44,10 +44,14 @@ fn frame_key<T: pill_engine::Asset>(handle: Handle<T>) -> AssetKey {
 
 /// The chain a frame should run, read from the pipeline the game set.
 ///
-/// Disabled passes are dropped, handles that name no live asset are dropped
-/// with them, and the rest are ordered by their `order` field; the pipeline's
-/// own order breaks ties, so a game lists its passes in the order it wants and
-/// only an inserted pass needs an explicit `order`.
+/// Passes the chain leaves out are dropped, handles that name no live asset are
+/// dropped with them, and the rest are ordered by their `order` field; the
+/// pipeline's own order breaks ties, so a game lists its passes in the order it
+/// wants and only an inserted pass needs an explicit `order`.
+///
+/// Two switches can leave a pass out, and both are the game's own choice rather
+/// than a fault: the entry's `enabled`, which is this chain's, and the pass
+/// asset's, which every chain naming it sees.
 fn resolve_passes(
     assets: &pill_engine::AssetManager,
     manager: Option<&RenderingManager>,
@@ -69,12 +73,17 @@ fn resolve_passes(
 
     let mut stale_handles = 0usize;
     let mut passes = Vec::with_capacity(pipeline.passes.len());
-    for pass_handle in &pipeline.passes {
-        let Some(pass) = assets.get(*pass_handle) else {
+    for entry in &pipeline.passes {
+        // This chain leaves the pass out: the game's choice, not a fault.
+        if !entry.enabled {
+            continue;
+        }
+        let Some(pass) = assets.get(entry.pass) else {
             stale_handles += 1;
             continue;
         };
-        // A disabled pass is the game's own choice, not a fault to report.
+        // A disabled pass is the game's own choice too, and it is the one every
+        // chain naming the pass sees.
         if !pass.enabled {
             continue;
         }
@@ -488,6 +497,36 @@ mod tests {
         assert_eq!(passes[0].shader, None);
         assert_eq!(passes[0].settings.kind, PassKind::Geometry);
         assert_eq!(passes[0].settings.target, PassTarget::Surface);
+    }
+
+    #[test]
+    fn a_chain_entry_switched_off_is_left_out() {
+        let mut assets = AssetManager::new();
+        let kept = assets
+            .add_named("kept", RenderPass::new("kept"))
+            .expect("a free name");
+        let left_out = assets
+            .add_named("left_out", RenderPass::new("left_out"))
+            .expect("a free name");
+        let mut pipeline = RenderingPipeline::new().with_pass(kept);
+        pipeline.passes.push(crate::PipelinePass {
+            pass: left_out,
+            enabled: false,
+        });
+        let pipeline = assets.add_named("chain", pipeline).expect("a free name");
+        let mut manager = RenderingManager::new();
+        manager.set_pipeline(pipeline);
+
+        let passes = resolve_passes(&assets, Some(&manager));
+
+        assert_eq!(
+            passes
+                .iter()
+                .map(|pass| pass.name.as_str())
+                .collect::<Vec<_>>(),
+            ["kept"],
+            "the entry this chain switched off is left out, and the pass asset itself stays on"
+        );
     }
 
     #[test]

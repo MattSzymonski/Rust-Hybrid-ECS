@@ -3253,13 +3253,7 @@ fn apply_asset_changes(host: &mut DevHost) {
 
 /// One scheduler frame and its reporting, run by the wrapped runtime.
 pub(crate) fn run_frame_phase(host: &mut DevHost, frame_start: Instant) {
-    let DevHost { runtime, .. } = host;
-    runtime.run_frame_with(frame_start, |_| {
-        // No per-frame native hook exists: a project and every extension run
-        // entirely through their registered scheduler systems, so this phase
-        // has nothing of its own to do. The closure stays as the seam a future
-        // per-frame hook would use.
-    })
+    host.runtime.run_frame_from(frame_start);
 }
 
 /// Honour a pending request, if one was dropped.

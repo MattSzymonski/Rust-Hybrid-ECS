@@ -22,6 +22,7 @@ use std::future::Future;
 
 // External crates
 use pill_core::info;
+use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_engine::{Engine, World};
 use pill_renderer_api::{
@@ -624,7 +625,7 @@ impl RenderingRuntime {
     /// Returns a [`RendererError`] when the renderer fails.
     pub fn run_frame(&mut self) -> Result<(), RendererError> {
         // Step 1: Run the engine's frame, which fills the frame resource.
-        self.runtime.run_frame();
+        self.runtime.run_frame_from(Instant::now());
         // Step 2: Draw what it left and hand back the answers the GPU finished.
         self.display
             .present(self.runtime.engine_mut().world_mut())?;

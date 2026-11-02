@@ -69,14 +69,9 @@ pub fn preferences_tab(
         }
         let mut save = false;
         let mut cancel = false;
-        // The pair wears the kit's chunky face: Save is the accent one, the
-        // action the tab exists for.
-        let theme = style::current_theme();
         ui.horizontal(|ui| {
-            save = ui
-                .add(kit::ChunkyButton::new("Save preferences", &theme).accent(true))
-                .clicked();
-            cancel = ui.add(kit::ChunkyButton::new("Cancel", &theme)).clicked();
+            save = ui.button("Save preferences").clicked();
+            cancel = ui.button("Cancel").clicked();
         });
         if save {
             let values = preferences::PREFERENCE_FIELDS

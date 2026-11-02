@@ -6,7 +6,7 @@
 //! - Start a statically linked project ([`setup`]).
 //! - Mount a project's asset pack and index it ([`mount_asset_pack`]).
 //! - Run one frame: systems, deferred commands, failure reporting, frame
-//!   statistics ([`Runtime::run_frame_with`]).
+//!   statistics ([`Runtime::run_frame_from`]).
 //! - Define [`FrameDriver`], what a frontend's loop needs from whatever runs
 //!   the game.
 //!
@@ -224,26 +224,17 @@ impl Runtime {
         self.static_renderer
     }
 
-    /// Run one frame: see [`Self::run_frame_with`].
-    pub fn run_frame(&mut self) {
-        self.run_frame_with(Instant::now(), |_| {})
-    }
-
     /// Run one scheduler frame and its reporting: systems, deferred commands,
-    /// `after_systems`, then the frame statistics.
+    /// failure reporting, then the frame statistics.
     ///
-    /// `after_systems` runs once the systems have executed and their failures
-    /// have been reported, before the frame statistics are taken. `frame_start`
-    /// is when the caller's frame began, for the frame-time metric. The
-    /// statistics are logged here, roughly every three seconds, so every
-    /// frontend reports them the same way; the line is `N FPS | M entities`,
-    /// which the devops suites wait for.
+    /// `frame_start` is when the caller's frame began; the frame-time metric
+    /// measures from there, so a frontend that did work before the frame can
+    /// report it. A caller with nothing before the frame passes
+    /// `Instant::now()`. The statistics are logged here, roughly every three
+    /// seconds, so every frontend reports them the same way; the line is
+    /// `N FPS | M entities`, which the devops suites wait for.
     #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
-    pub fn run_frame_with(
-        &mut self,
-        frame_start: Instant,
-        after_systems: impl FnOnce(&mut Engine),
-    ) {
+    pub fn run_frame_from(&mut self, frame_start: Instant) {
         // Step 1: Execute one scheduler frame and report its failures.
         if let Err(errors) = self.engine.process_frame() {
             // Deferred command failures arrive as a batch; flatten them into one
@@ -264,10 +255,7 @@ impl Runtime {
             self.report_frame_error(&failure.to_plain_message());
         }
 
-        // Step 2: Whatever the caller runs after the systems.
-        after_systems(&mut self.engine);
-
-        // Step 3: Track and report the frame rate over the reporting window.
+        // Step 2: Track and report the frame rate over the reporting window.
         let fps = match self.statistics.count_frame(Instant::now()) {
             Some(fps) => fps,
             None => {
@@ -302,7 +290,7 @@ impl Runtime {
     /// The rate the current reporting window measures.
     ///
     /// For a frontend that displays a live rate - the browser's editor canvas;
-    /// the console line is logged by [`Self::run_frame_with`] itself.
+    /// the console line is logged by [`Self::run_frame_from`] itself.
     pub fn frames_per_second(&self) -> f64 {
         self.statistics.frames_per_second(Instant::now())
     }
@@ -562,7 +550,7 @@ impl FrameDriver for Runtime {
     type Error = std::convert::Infallible;
 
     fn run_frame(&mut self) -> Result<(), Self::Error> {
-        Runtime::run_frame(self);
+        Runtime::run_frame_from(self, Instant::now());
         Ok(())
     }
 
@@ -778,11 +766,6 @@ pub fn setup_with_asset_database(
             .map(|renderer| (renderer, crate::registration::renderer_owner()));
     }
     Ok(runtime)
-}
-
-/// Run one frame of `runtime`; see [`Runtime::run_frame`].
-pub fn run_one_frame(runtime: &mut Runtime) {
-    runtime.run_frame()
 }
 
 // =============================================================================
@@ -1012,7 +995,7 @@ mod tests {
             crate::StaticProjectBackend::Native { init: no_op },
         ))
         .expect("it starts");
-        run_one_frame(&mut runtime);
+        runtime.run_frame_from(Instant::now());
         assert_eq!(runtime.engine().world().entity_count(), 0);
     }
 
@@ -1042,19 +1025,6 @@ mod tests {
         assert_eq!(bytes, b"from the pack");
     }
 
-    /// The hook a host passes runs once per frame, after the systems.
-    #[test]
-    fn the_after_systems_hook_runs_once_per_frame() {
-        let _frame = FRAME_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut runtime = Runtime::new();
-        let mut calls = 0;
-        runtime.run_frame_with(Instant::now(), |_| calls += 1);
-        runtime.run_frame_with(Instant::now(), |_| calls += 1);
-        assert_eq!(calls, 2);
-    }
-
     /// One frame records one sample per metric, each under a name that says
     /// which span it measured.
     ///
@@ -1075,7 +1045,7 @@ mod tests {
             .clear();
 
         let mut runtime = Runtime::new();
-        runtime.run_frame_with(Instant::now(), |_| {});
+        runtime.run_frame_from(Instant::now());
 
         let counts = samples
             .lock()
@@ -1119,13 +1089,13 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
 
-        runtime.run_frame_with(Instant::now(), |_| {});
+        runtime.run_frame_from(Instant::now());
         assert!(
             runtime.frame_metrics.is_some(),
             "the first frame resolves the handles"
         );
 
-        runtime.run_frame_with(Instant::now(), |_| {});
+        runtime.run_frame_from(Instant::now());
         let counts = samples
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

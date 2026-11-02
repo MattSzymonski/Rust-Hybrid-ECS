@@ -34,9 +34,6 @@ use crate::posture;
 pub fn run(project: posture::Project) -> Result<(), RunError> {
     let mut driver = posture::setup(project)?;
     loop {
-        // Named through the trait on purpose: the shipped runtime also has an
-        // inherent `run_frame` that cannot fail, and on a concrete driver that
-        // one would shadow this, making the loop's two postures diverge.
-        FrameDriver::run_frame(&mut driver)?;
+        driver.run_frame()?;
     }
 }

@@ -549,21 +549,13 @@ pub fn asset_dialog_window(
                 }
             }
             ui.separator();
-            // The dialog's two answers wear the kit's chunky face: the submit
-            // is the accent one, so the action the dialog exists for reads as
-            // the primary one.
-            let theme = style::current_theme();
+            // Stock buttons, the submit first so the action the dialog exists
+            // for is the one the pointer meets first.
             ui.horizontal(|ui| {
-                if ui
-                    .add(kit::ChunkyButton::new(submit_label, &theme).accent(true))
-                    .clicked()
-                {
+                if ui.button(submit_label).clicked() {
                     submit = true;
                 }
-                if ui
-                    .add(kit::ChunkyButton::new("Cancel", &theme))
-                    .clicked()
-                {
+                if ui.button("Cancel").clicked() {
                     cancel = true;
                 }
             });

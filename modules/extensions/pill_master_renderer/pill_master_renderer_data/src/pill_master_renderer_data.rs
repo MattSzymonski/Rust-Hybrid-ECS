@@ -62,10 +62,11 @@ pub use pill_renderer_api::frame::{
 // Current crate
 pub use assets::{
     load_shipped_texture, Material, MaterialBuilder, MaterialDocument, MaterialTexture, Mesh,
-    MeshImportSettings, MeshVertex, RenderPass, RenderPassDocument, RenderingPipeline,
-    RenderingPipelineDocument, Shader, ShaderBuilder, ShaderImportSettings, ShaderParameterSlot,
-    ShaderParameterType, ShaderTextureKind, ShaderTextureSlot, Texture, TextureImportSettings,
-    TextureType, DEFAULT_COLOR_TEXTURE, DEFAULT_NORMAL_TEXTURE,
+    MeshImportSettings, MeshVertex, PipelinePass, PipelinePassDocument, RenderPass,
+    RenderPassDocument, RenderingPipeline, RenderingPipelineDocument, Shader, ShaderBuilder,
+    ShaderImportSettings, ShaderParameterSlot, ShaderParameterType, ShaderTextureKind,
+    ShaderTextureSlot, Texture, TextureImportSettings, TextureType, DEFAULT_COLOR_TEXTURE,
+    DEFAULT_NORMAL_TEXTURE,
 };
 pub use components::*;
 pub use rendering_manager::RenderingManager;

@@ -248,14 +248,16 @@ pub fn set_skybox(
     // whose depth it tests against.
     let in_chain = assets
         .get(pipeline)
-        .is_some_and(|chain| chain.passes.contains(&pass));
+        .is_some_and(|chain| chain.passes.iter().any(|entry| entry.pass == pass));
     if !in_chain {
         let opaque = assets.handle_by_name::<RenderPass>(OPAQUE_PASS);
         if let Some(chain) = assets.get_mut(pipeline) {
             let index = opaque
-                .and_then(|opaque| chain.passes.iter().position(|entry| *entry == opaque))
+                .and_then(|opaque| chain.passes.iter().position(|entry| entry.pass == opaque))
                 .map_or(0, |position| position + 1);
-            chain.passes.insert(index, pass);
+            chain
+                .passes
+                .insert(index, crate::assets::PipelinePass::new(pass));
         }
     }
 
@@ -340,8 +342,8 @@ mod tests {
             6,
             "one lit pass, the sky, and four post passes"
         );
-        assert_eq!(pipeline.passes[0], opaque, "the lit pass comes first");
-        assert_eq!(pipeline.passes[1], sky, "the sky draws behind it");
+        assert_eq!(pipeline.passes[0].pass, opaque, "the lit pass comes first");
+        assert_eq!(pipeline.passes[1].pass, sky, "the sky draws behind it");
         assert!(
             !assets.get(sky).unwrap().enabled,
             "no sky until a project sets one"
@@ -401,7 +403,7 @@ mod tests {
             .get_mut(pipeline)
             .unwrap()
             .passes
-            .retain(|pass| *pass != sky);
+            .retain(|entry| entry.pass != sky);
         let material = assets
             .add_named("sky", Material::builder("sky").build())
             .expect("a free name");
@@ -410,6 +412,6 @@ mod tests {
 
         let chain = &assets.get(pipeline).unwrap().passes;
         assert_eq!(chain.len(), 6);
-        assert_eq!(chain[1], pass);
+        assert_eq!(chain[1].pass, pass);
     }
 }
