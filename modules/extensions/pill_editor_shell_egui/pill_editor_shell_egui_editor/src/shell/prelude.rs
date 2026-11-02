@@ -45,6 +45,7 @@ pub use pill_editor_core::panels::{
     PanelEntityRow, PanelFieldValue, PanelRegistry, PanelWindowRequest,
 };
 pub use pill_editor_core::preferences;
+pub use pill_editor_core::requests::{HistoryRequest, ShellRequests};
 pub use pill_editor_core::session::{
     EguiShellState, InspectorSession, LoggedRects, LoggedTexts, MenubarSession, MenubarSlot,
     PaletteState, PanelBudget, PanelTiming, PanelWindowAnswer, PanelWindowSession,

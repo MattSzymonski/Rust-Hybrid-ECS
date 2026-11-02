@@ -210,18 +210,20 @@ pub fn run_menu_action(
         menubar::MenuAction::WriteAssetMeta => {
             assets::write_meta_selection(viewer.pending, viewer.selection, &viewer.snapshot.assets);
         }
-        menubar::MenuAction::Undo => session
-            .history_requests
-            .push(pill_editor_core::session::HistoryRequest::Undo),
-        menubar::MenuAction::Redo => session
-            .history_requests
-            .push(pill_editor_core::session::HistoryRequest::Redo),
-        menubar::MenuAction::ActivateTab(tab) => session.pending_tab = Some(tab),
+        menubar::MenuAction::Undo => viewer
+            .requests
+            .history
+            .push(pill_editor_core::requests::HistoryRequest::Undo),
+        menubar::MenuAction::Redo => viewer
+            .requests
+            .history
+            .push(pill_editor_core::requests::HistoryRequest::Redo),
+        menubar::MenuAction::ActivateTab(tab) => viewer.requests.pending_tab = Some(tab),
         // The dock is borrowed by the `DockArea` while this menu draws, so the
         // new view is docked after the pass.
-        menubar::MenuAction::NewSceneView => session.new_scene_view = true,
+        menubar::MenuAction::NewSceneView => viewer.deferred.new_scene_view = true,
         menubar::MenuAction::About => session.about_open = true,
-        menubar::MenuAction::Quit => session.quit_requested = true,
+        menubar::MenuAction::Quit => viewer.deferred.quit_requested = true,
         // The clipboard: the shell builds the payload and
         // queues the request; the executable's OS bridge carries it out.
         menubar::MenuAction::Clipboard(action) => {

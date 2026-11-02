@@ -115,6 +115,8 @@ pub mod preferences;
 pub mod previews;
 /// Build diagnostics: the problems the Problems panel shows.
 pub mod problems;
+/// The asks a shell pass raises for the editor executable.
+pub mod requests;
 /// The world resources the Inspector can show and edit.
 pub mod resources;
 /// The open scene: its path, guid and unsaved marker, and the file operations

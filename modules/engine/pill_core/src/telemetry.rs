@@ -70,6 +70,9 @@ pub mod telemetry_target {
     pub const ENGINE: &str = "engine::engine";
     /// Hot-reload coordination.
     pub const HOT_RELOAD: &str = "engine::hot_reload";
+    /// Statically linked project and module startup: what a shipped build has
+    /// where the dev host has reloads.
+    pub const LINK: &str = "engine::link";
     /// Input handling.
     pub const INPUT: &str = "engine::input";
     /// ECS world and scheduler activity.
@@ -148,6 +151,7 @@ impl LoggingConfig {
             .with_directive(DEV_LOG_TARGET, LevelFilter::DEBUG)
             .with_directive(telemetry_target::ENGINE, LevelFilter::INFO)
             .with_directive(telemetry_target::HOT_RELOAD, LevelFilter::INFO)
+            .with_directive(telemetry_target::LINK, LevelFilter::INFO)
             .with_directive(telemetry_target::INPUT, LevelFilter::INFO)
             .with_directive(telemetry_target::ECS, LevelFilter::INFO)
             .with_directive(telemetry_target::RENDERING, LevelFilter::INFO)

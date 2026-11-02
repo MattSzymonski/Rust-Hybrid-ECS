@@ -227,7 +227,7 @@ impl StaticProject {
                     .registered_component_names_since(registration_sequence),
             );
             info!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: pill_core::telemetry::telemetry_target::LINK,
                 module = module.name,
                 owner = owner.0,
                 "extension linked"
@@ -259,8 +259,8 @@ impl StaticProject {
         };
 
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            module = self.name,
+            target: pill_core::telemetry::telemetry_target::LINK,
+            project = self.name,
             modules = self.modules.len(),
             external = guard.is_some(),
             "project linked"

@@ -179,13 +179,13 @@ impl EditorWindow {
         self.apply_pending_commands();
         // Step 3c: the gizmo's persistence and the preferences file's live
         // reader, both before the snapshot so the tabs read the state this
-        // frame's edits left.
+        // frame's edits left; the console history folds the capture ring's
+        // new lines in, applying the Console tab's filters on the way.
         self.persist_gizmo_settings();
         self.watch_preferences();
         self.watch_theme();
         self.watch_keybindings();
         self.publish_console_lines();
-        self.drain_problem_open();
         // Step 3d: the panels the loaded modules asked to register, then what
         // the panels drawn last frame asked for. The sync is
         // before the snapshot so a tab's title is never a frame stale.
@@ -232,9 +232,10 @@ impl EditorWindow {
         // Step 7a: the asset previews the renderer read back, and the next one
         // to ask for.
         self.apply_asset_previews();
-        // Step 7b: the menu bar's requests - undo/redo, a window switch and a
-        // quit - taken through the same paths the scripted channel uses.
-        self.drain_menu_requests();
+        // Step 7b: what the shell pass asked for, taken from the frame it
+        // left - undo and redo, a dock tab, a Problems row and a quit - all
+        // through the same paths the scripted channel uses.
+        self.drain_shell_requests();
     }
 
     /// Step 8: draw the shell frame through the overlay, which is last.

@@ -24,6 +24,9 @@ use pill_engine::input::InputEvent;
 use pill_engine::Resource;
 use std::time::Duration;
 
+// Current crate
+use crate::requests::ShellRequests;
+
 /// The geometry and focus the frontend feeds the shell each frame.
 #[derive(Clone, Debug)]
 pub struct EguiShellInput {
@@ -194,6 +197,10 @@ pub struct EguiShellFrame {
     /// frontend starts an OLE drag with it, so a file can be dragged into
     /// Explorer.
     pub drag_out: Option<String>,
+    /// The asks the pass raised for the executable - a Problems row, an undo
+    /// or redo, a dock tab - drained by the executable at its frame boundary,
+    /// never read from the shell session directly.
+    pub requests: ShellRequests,
     /// The shell's menu asked the editor to quit. The winit frontend honours
     /// it through the same path a window close takes; a browser frontend
     /// ignores it (a page cannot close itself safely).
@@ -237,6 +244,7 @@ impl Default for EguiShellFrame {
             ime_allowed: false,
             ime_rect: None,
             drag_out: None,
+            requests: ShellRequests::default(),
             quit_requested: false,
             repaint_after: None,
             popout_frames: Vec::new(),
@@ -296,6 +304,9 @@ pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFram
         ime_rect: None,
         // Only the shell asks for a drag out; it records the path itself.
         drag_out: None,
+        // The pass fills its asks in before the frame is drained; egui's own
+        // output carries none of them.
+        requests: ShellRequests::default(),
         // Only the shell's menu can ask to quit; it sets the flag itself.
         quit_requested: false,
         repaint_after,

@@ -372,6 +372,9 @@ mod tests {
         assert!(rendered.contains("engine::rendering=debug"), "{rendered}");
         assert!(!rendered.contains("engine::rendering=info"), "{rendered}");
         assert!(rendered.contains("engine::hot_reload=info"), "{rendered}");
+        // The statically linked startup lines have their own target, defaulted
+        // beside the others.
+        assert!(rendered.contains("engine::link=info"), "{rendered}");
     }
 
     /// One level replaces every per-target default, but keeps the dependencies

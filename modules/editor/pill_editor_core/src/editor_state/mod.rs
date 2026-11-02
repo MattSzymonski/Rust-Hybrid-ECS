@@ -2641,6 +2641,25 @@ mod tests {
             .world_mut()
             .insert_resource(crate::commands::PendingEditorCommands::default());
 
+        // What the store holds for the path: whether it is loaded, and the
+        // guid it is loaded under.
+        let asset_path = std::path::Path::new("probe.theme");
+        let held = |engine: &Engine| {
+            let registry = engine
+                .world()
+                .get_resource::<pill_engine::ImportRegistry>()
+                .cloned()
+                .expect("the theme registration registers its types");
+            let assets = engine
+                .world()
+                .get_resource::<pill_engine::AssetManager>()
+                .expect("the engine has an AssetManager");
+            (
+                registry.is_loaded(assets, asset_path),
+                registry.guid_by_path(assets, asset_path),
+            )
+        };
+
         let create = EditorCommand::CreateStandaloneAsset {
             type_name: "pill_ui_theme::ThemeOverrides".to_owned(),
             folder: String::new(),
@@ -2674,6 +2693,11 @@ mod tests {
         );
         crate::drain::apply_pending(&mut engine, 1);
         assert!(!path.exists(), "the undo deletes the file");
+        assert_eq!(
+            held(&engine),
+            (false, None),
+            "the undo's delete unloads the asset with its file"
+        );
 
         let redo = crate::drain::step_history(&mut engine, crate::drain::HistoryDirection::Redo);
         assert!(
@@ -2691,6 +2715,7 @@ mod tests {
         let recorded = EditorCommand::apply_recorded(&mut engine, &replay[0].commands);
         assert!(recorded.failures.is_empty(), "{:?}", recorded.failures);
         assert!(path.exists(), "the redo writes the file again");
+        assert!(held(&engine).0, "the redo's create loads the asset again");
 
         let _ = std::fs::remove_dir_all(&root);
     }

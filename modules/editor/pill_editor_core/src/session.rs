@@ -2,13 +2,39 @@
 //!
 //! # Responsibilities
 //!
-//! - Own [`EguiShellState`]: the egui `Context` and the dock, the shell's one
-//!   world resource.
-//! - Own [`ToolboxSession`]: where each scene view's floating toolbox sits
-//!   and what the log already reported about it.
-//! - Carry the Assets tab's [`ProjectBrowser`]: the folder its grid lists.
+//! - Own [`EguiShellState`], the shell's one world resource: the reload handle,
+//!   the pass scratch, the measurements and the two requests the shell and the
+//!   executable exchange.
+//! - Own the per-tab and chrome state those groups are made of: the menu bar's
+//!   geometry ([`MenubarSession`]), the Inspector's rows and geometry
+//!   ([`InspectorSession`]), the toolbox ([`ToolboxSession`]), the command
+//!   palette ([`PaletteState`]), the toasts ([`ToastSession`]), the windows
+//!   modules open ([`PanelWindowSession`]) and the asset previews
+//!   ([`PreviewStates`]).
+//! - Own the measurements the Statistics tab and the log read
+//!   ([`StatisticsSession`], [`PanelBudget`]) and the two log-once caches
+//!   ([`LoggedRects`], [`LoggedTexts`]).
 //!
 //! # Design
+//!
+//! [`EguiShellState`]'s fields fall into four groups, and a new field belongs
+//! to the group whose owner and boundary it shares:
+//!
+//! - **the reload handle** - `context`, `dock`, `mark`, `popout_contexts`,
+//!   `applied_theme_generation`, `panels_remapped`: what a shell generation
+//!   must find exactly where the previous one left it. The executable never
+//!   writes these.
+//! - **pass scratch** - the dialog, the preferences draft, the toolbox, the
+//!   browser, the Inspector, the toasts, the palette and the previews: the
+//!   shell owns them, and they survive a reload only so a redraw continues
+//!   where it was.
+//! - **measurements** - `frame_index`, `stats`, `panel_budget`: the shell
+//!   writes them around each pass; the Statistics tab and the log read them.
+//! - **requests** - `requests` (a pass's asks for the executable, drained onto
+//!   the frame) and `pending_panel_window` (the scripted channel's ask for a
+//!   panel window, cleared only when that panel draws). `console_filters` is
+//!   the one shared field: the Console tab and the executable both read and
+//!   write it.
 //!
 //! The type lives in this shared `dylib`, not in the reloadable shell
 //! module, so its identity is stable across shell reloads: the arriving
@@ -29,8 +55,15 @@ use crate::boundary::SCENE_VIEWS_MAX;
 use crate::browser::ProjectBrowser;
 use crate::layout::{EditorDock, EditorTab};
 use crate::notices::NoticeLevel;
+use crate::requests::ShellRequests;
 
-/// The egui shell's session: the UI context and the dock layout.
+/// The egui shell's session: the reload handle, the pass scratch, the
+/// measurements and the two requests the shell and the executable exchange.
+///
+/// The file header is the ownership map: a field that must survive a reload
+/// sits under the reload handle, a field a pass writes under pass scratch, a
+/// field the Statistics tab or the log reads under measurements, and a field
+/// another side answers under requests.
 pub struct EguiShellState {
     /// The egui context: fonts, memory and widget state.
     pub context: Context,
@@ -63,8 +96,7 @@ pub struct EguiShellState {
     /// pass drew - one value, because the three answer one question (may this
     /// tile be asked for now?).
     pub previews: PreviewStates,
-    /// The menu bar's already-logged geometry and the requests its items
-    /// raised.
+    /// The menu bar's logged geometry and its open state.
     pub menubar: MenubarSession,
     /// The Inspector's collapsed component sections and its logged geometry.
     pub inspector: InspectorSession,
@@ -75,8 +107,12 @@ pub struct EguiShellState {
     /// The Console tab's filters: the tab edits these, and
     /// the executable applies them to the history on the next frame.
     pub console_filters: crate::console::ConsoleFilterSettings,
-    /// The Problems row a click asked to open, drained by the executable.
-    pub problem_open: Option<usize>,
+    /// The asks this pass raised for the executable: a Problems row, an undo
+    /// or redo, a dock tab. `settle_pass` drains the value onto
+    /// [`crate::boundary::EguiShellFrame`] and the executable answers them at
+    /// its frame boundary, so nothing here is read from the session by the
+    /// executable itself.
+    pub requests: ShellRequests,
     /// The per-tab and whole-pass timings the Statistics tab shows.
     pub stats: StatisticsSession,
     /// Every module panel's build time, and which of them overshoots the
@@ -89,9 +125,11 @@ pub struct EguiShellState {
     pub panels_remapped: bool,
     /// The windows the module panels asked for.
     pub panel_windows: PanelWindowSession,
-    /// A window the scripted channel asked a panel to open: the panel's slot
-    /// and the window id it should choose.
-    pub panel_window_ping: Option<(u16, String)>,
+    /// The window a scripted `panel window <slot> <id>` line asked a panel to
+    /// open: the panel's slot and the window id it should choose. The shell
+    /// clears it only in the pass where that panel draws - a request must not
+    /// be dropped by a frame where its tab was not on screen.
+    pub pending_panel_window: Option<(u16, String)>,
     /// One egui context per popped-out tab. A popped-out
     /// window runs its own pass, so it owns its own context - the main one is
     /// running the dock in the same frame. The map lives in the session for
@@ -278,8 +316,9 @@ pub struct PaletteState {
     pub query: String,
     /// The selected row's index in the filtered list.
     pub selected: usize,
-    /// A run the scripted channel asked for, drained by the shell's next
-    /// pass so the palette and a click take the same action path.
+    /// A run the palette asked for: its own Enter or click sets it in the pass
+    /// that takes it, and the scripted channel sets it between passes so the
+    /// next pass takes it - either way both paths run the same action.
     pub run_requested: bool,
     /// The query the log already reported, so one query logs one line.
     pub logged_query: Option<String>,
@@ -363,8 +402,14 @@ pub enum MenubarSlot {
     Title(usize),
 }
 
-/// The menu bar's logged geometry: the strip and each title, so a placement is
-/// reported once (the toolbox's pattern) and a suite can click the titles.
+/// The menu bar's session state: the logged geometry of the strip, its titles
+/// and each open menu's entries, and which menu and windows are open.
+///
+/// The log reports each placement once (the toolbox's pattern), so a suite can
+/// click the titles. The requests the menu items raise do not live here: a
+/// pass's asks for the executable are [`crate::requests::ShellRequests`], and
+/// a dock edit the pass cannot make while the dock draws is the shell's
+/// `FrameRequests`.
 #[derive(Default)]
 pub struct MenubarSession {
     /// The strip's and each title's last logged rectangle, keyed by slot: the
@@ -374,31 +419,11 @@ pub struct MenubarSession {
     /// menu's entries log while it is open, so their presence is the proof it
     /// opened.
     pub entries: LoggedRects<String>,
-    /// Undo/redo the menus asked for, drained by the executable.
-    pub history_requests: Vec<HistoryRequest>,
-    /// The dock tab the Window menu asked for, drained by the executable.
-    pub pending_tab: Option<EditorTab>,
-    /// Whether the Window menu asked for one more scene view; the shell docks
-    /// it after the pass, because the dock is borrowed by the `DockArea` while
-    /// the menu draws.
-    pub new_scene_view: bool,
     /// Whether the About window is open.
     pub about_open: bool,
     /// The menu whose dropdown is open, while one is; the log reports each
     /// opening once so a suite can tell an open menu from a closed one.
     pub open: Option<crate::menubar::Menu>,
-    /// Whether a menu asked the editor to quit; the shell moves it to the
-    /// frame at the end of the pass and clears it.
-    pub quit_requested: bool,
-}
-
-/// An undo or redo the menu bar asked for, drained by the executable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HistoryRequest {
-    /// Undo the newest recorded step.
-    Undo,
-    /// Redo the newest undone step.
-    Redo,
 }
 
 /// One toast on screen: a short-lived line about something the host did.
@@ -987,12 +1012,12 @@ impl EguiShellState {
             toasts: ToastSession::default(),
             palette: PaletteState::default(),
             console_filters: crate::console::ConsoleFilterSettings::default(),
-            problem_open: None,
+            requests: ShellRequests::default(),
             stats: StatisticsSession::default(),
             panel_budget: PanelBudget::default(),
             panels_remapped: false,
             panel_windows: PanelWindowSession::default(),
-            panel_window_ping: None,
+            pending_panel_window: None,
             popout_contexts: std::collections::BTreeMap::new(),
         }
     }

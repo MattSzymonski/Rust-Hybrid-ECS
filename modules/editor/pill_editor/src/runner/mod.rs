@@ -70,10 +70,11 @@ use pill_editor_core::panels::{
 use pill_editor_core::preferences::{self, PreferencesView};
 use pill_editor_core::previews;
 use pill_editor_core::problems::{self as problem_parser, Severity};
+use pill_editor_core::requests::HistoryRequest;
 use pill_editor_core::scripted::{
     AssetEdit, Dump, KeyChord, PaletteRequest, ScriptedCommand, ToolbarAction,
 };
-use pill_editor_core::session::{EguiShellState, HistoryRequest};
+use pill_editor_core::session::EguiShellState;
 use pill_editor_core::state_watch::StateFileWatch;
 use pill_editor_core::style::{
     layers_text, merge_layers, ThemeLayer, ThemeLayerInfo, UserThemeSelection,
@@ -2578,22 +2579,17 @@ impl EditorWindow {
         }
     }
 
-    /// Open the Problems row a click asked for.
+    /// Open the Problems row at `index` in the configured code editor.
+    ///
+    /// One body for both callers: the frame-boundary drain when a shell pass
+    /// asked for a row, and the scripted channel's `problem open`, which runs
+    /// it at once so a suite's wait cannot race the spawn.
     ///
     /// The `code_editor_command` preference names the program and its flags;
     /// the row's `file:line` goes last as one argument, which is the form VS
     /// Code, CLion and every other editor's command line accepts. A missing
     /// or empty preference falls back to `code`.
-    fn drain_problem_open(&mut self) {
-        let request = {
-            let world = self.host.host_mut().engine_mut().world_mut();
-            world
-                .get_resource_mut::<EguiShellState>()
-                .and_then(|state| state.problem_open.take())
-        };
-        let Some(index) = request else {
-            return;
-        };
+    fn open_problem(&mut self, index: usize) {
         info!(
             target: telemetry_target::ENGINE,
             index,
@@ -2967,32 +2963,38 @@ impl EditorWindow {
         }
     }
 
-    /// Drain what the menu bar asked for at the frame boundary: undo and redo
-    /// through the scripted channel's own walk, the Window menu's tab through
-    /// the shared activation, and a quit through the frame's flag.
-    fn drain_menu_requests(&mut self) {
-        let (requests, tab, quit) = {
+    /// Drain what the shell pass asked for, from the frame it left.
+    ///
+    /// The pass raises its asks while it draws and `settle_pass` moves them
+    /// onto [`EguiShellFrame`]; this phase answers them after the pass and
+    /// before presentation: undo and redo through the scripted channel's own
+    /// walk, a dock tab through the shared activation, a Problems row through
+    /// [`Self::open_problem`], and a quit through the frame's flag.
+    fn drain_shell_requests(&mut self) {
+        let (requests, quit) = {
             let world = self.host.host_mut().engine_mut().world_mut();
             let quit = world
                 .get_resource::<EguiShellFrame>()
                 .is_some_and(|frame| frame.quit_requested);
-            match world.get_resource_mut::<EguiShellState>() {
-                Some(state) => (
-                    std::mem::take(&mut state.menubar.history_requests),
-                    state.menubar.pending_tab.take(),
-                    quit,
-                ),
-                None => (Vec::new(), None, quit),
-            }
+            // One take for every ask: the frame's value is cleared as a whole,
+            // so no request is answered twice or left for the next frame.
+            let requests = world
+                .get_resource_mut::<EguiShellFrame>()
+                .map(|frame| frame.requests.drain())
+                .unwrap_or_default();
+            (requests, quit)
         };
-        for request in requests {
+        for request in requests.history {
             match request {
                 HistoryRequest::Undo => self.scripted_undo(),
                 HistoryRequest::Redo => self.scripted_redo(),
             }
         }
-        if let Some(tab) = tab {
+        if let Some(tab) = requests.pending_tab {
             self.activate_tab(tab);
+        }
+        if let Some(index) = requests.problem_open {
+            self.open_problem(index);
         }
         if quit {
             info!(

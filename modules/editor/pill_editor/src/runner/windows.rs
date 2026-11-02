@@ -659,6 +659,9 @@ impl EditorWindow {
             ime_allowed,
             ime_rect,
             drag_out,
+            // The pass's asks are drained at the frame boundary (Step 7b), not
+            // while the frame is presented.
+            requests: _,
             // The menu bar's quit is drained at the frame boundary (Step 7b),
             // not while the frame is presented.
             quit_requested: _,

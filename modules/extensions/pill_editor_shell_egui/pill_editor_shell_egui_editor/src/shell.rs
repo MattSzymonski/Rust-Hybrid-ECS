@@ -396,10 +396,7 @@ pub fn run_frame(
     // A window the scripted channel asked for: the panel itself decides what
     // that id means. Kept until the pinged panel is drawn - a request must not
     // be dropped by a frame where that tab was not on screen.
-    let panel_window_ping = state.panel_window_ping.clone();
-    // A tile drag that left the windows hands its path to the executable,
-    // through the frame the frontend drains.
-    let mut drag_out: Option<String> = None;
+    let pending_panel_window = state.pending_panel_window.clone();
     let panel_answer =
         state
             .panel_windows
@@ -409,6 +406,10 @@ pub fn run_frame(
                 window: answer.window.clone(),
                 accepted: answer.accepted,
             });
+    // What the pass could not act on while the dock and its tabs were
+    // borrowed: each tab and menu writes the value where the request is
+    // raised, and `settle_pass` applies it after the pass.
+    let mut deferred = pill_editor_shell_egui_editor::shell::FrameRequests::default();
     let mut panel_window_requests: Vec<(u16, PanelCommand)> = Vec::new();
     let EguiShellState {
         dock,
@@ -421,11 +422,11 @@ pub fn run_frame(
         toasts,
         palette,
         console_filters,
-        problem_open,
+        requests: shell_requests,
         stats,
         panel_budget,
         panel_windows: windows,
-        panel_window_ping: window_ping,
+        pending_panel_window: window_ping,
         popout_contexts,
         previews,
         ..
@@ -461,10 +462,8 @@ pub fn run_frame(
         overlay_regions: Vec::new(),
         frames_per_second: shell_input.frames_per_second,
         active_tabs: &active_tabs,
-        tab_redock: None,
-        tab_popout: None,
         console_filters,
-        problem_open,
+        requests: shell_requests,
         stats,
         panels,
         panel_budget,
@@ -473,12 +472,12 @@ pub fn run_frame(
         panel_detail: panel_feed.detail.as_ref(),
         panel_answer,
         panel_window_requests: &mut panel_window_requests,
-        panel_window_ping: panel_window_ping
+        pending_panel_window: pending_panel_window
             .as_ref()
             .map(|(slot, window)| (*slot, window.as_str())),
-        panel_window_ping_used: false,
+        pending_panel_window_used: false,
         clipboard,
-        drag_out: &mut drag_out,
+        deferred: &mut deferred,
         previews,
         badges: &shell_input.badges,
     };
@@ -575,23 +574,15 @@ pub fn run_frame(
     shell_frame.scene_rects = std::mem::take(&mut viewer.scene_rects);
     shell_frame.game_rect = viewer.game_rect.take();
     shell_frame.overlay_regions = std::mem::take(&mut viewer.overlay_regions);
-    shell_frame.quit_requested = std::mem::take(&mut menubar.quit_requested);
-    // What the pass could not act on while the dock and its tabs were borrowed,
-    // in one value: the settle stage applies it in the order the pass requires
-    // (its module docs say why each request sits where it does).
-    let requests = pill_editor_shell_egui_editor::shell::FrameRequests {
-        drag_out: viewer.drag_out.take(),
-        tab_popout: viewer.tab_popout.take(),
-        tab_redock: viewer.tab_redock.take(),
-        new_scene_view: std::mem::take(&mut menubar.new_scene_view),
-        answer_taken: viewer.panel_answer.is_some(),
-        ping_used: viewer.panel_window_ping_used,
-    };
+    // The pass's deferred requests live in `viewer.deferred`: each tab and
+    // menu wrote the value where the request was raised, and the settle stage
+    // applies them in the order the pass requires (its module docs say why
+    // each request sits where it does). The viewer is passed whole, so the
+    // value needs no second argument and cannot disagree with itself.
     *frame = pill_editor_shell_egui_editor::shell::settle_pass(
         dock,
         popout_contexts,
         popout_inputs,
-        menubar,
         windows,
         window_ping,
         toasts,
@@ -599,7 +590,6 @@ pub fn run_frame(
         frame_index,
         &mut viewer,
         shell_frame,
-        requests,
     );
     let ui_micros = ui_started.elapsed().as_micros() as u64;
     // The Statistics tab's top row: the pass this frame actually took,
@@ -796,18 +786,18 @@ pub struct EditorTabViewer<'a> {
     /// bar carries its accent underline under these tabs alone, so a tab that
     /// is not selected keeps the strip's neutral line.
     pub active_tabs: &'a [EditorTab],
-    /// The surface a tab menu asked to re-dock, drained by `run_frame`
-    /// after the dock finishes drawing.
-    pub tab_redock: Option<SurfaceIndex>,
-    /// The tab a tab menu asked to pop out into its own window, drained by
-    /// `run_frame` after the dock finishes drawing for the same reason.
-    pub tab_popout: Option<EditorTab>,
+    /// What the pass could not act on while the dock and its tabs were
+    /// borrowed: a tab pop-out or re-dock, a new scene view, a tile drag that
+    /// left the windows, and a quit. Written where each request is raised,
+    /// applied by `settle_pass` after the pass.
+    pub deferred: &'a mut FrameRequests,
     /// The Console tab's filters; the executable applies them
     /// to the history on its next frame.
     pub console_filters: &'a mut ConsoleFilterSettings,
-    /// The Problems row a click asked to open; the executable
-    /// drains it and launches the configured code editor.
-    pub problem_open: &'a mut Option<usize>,
+    /// The asks this pass raises for the executable: the Problems row a click
+    /// asked to open, the menu's undo/redo and its dock tab. `settle_pass`
+    /// moves the value onto the frame the executable drains.
+    pub requests: &'a mut ShellRequests,
     /// The timings the Statistics tab reads: the shell writes
     /// them around each tab body, the tab only formats them.
     pub stats: &'a mut StatisticsSession,
@@ -832,15 +822,13 @@ pub struct EditorTabViewer<'a> {
     pub panel_window_requests: &'a mut Vec<(u16, PanelCommand)>,
     /// The slot a scripted window request named, and the window id it wants
     /// that panel to open.
-    pub panel_window_ping: Option<(u16, &'a str)>,
-    /// Whether the pinged panel drew this pass, so the request is spent.
-    pub panel_window_ping_used: bool,
+    pub pending_panel_window: Option<(u16, &'a str)>,
+    /// Whether the pending window's panel drew this pass, so the request is
+    /// spent.
+    pub pending_panel_window_used: bool,
     /// The shell's side of the OS clipboard: the request
     /// the executable carries out, and the text it read back.
     pub clipboard: &'a mut pill_editor_core::clipboard::EditorClipboard,
-    /// The asset path a tile drag handed to the OS: the
-    /// executable starts an OLE drag with it.
-    pub drag_out: &'a mut Option<String>,
     /// The asset tiles' previews: the textures to draw and the tiles this pass
     /// drew, so the executable asks only for what is on screen.
     pub previews: &'a mut pill_editor_core::session::PreviewStates,
@@ -969,7 +957,7 @@ pub fn tab_body(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, tab: Editor
                 dialog: viewer.asset_dialog,
                 pending: viewer.pending,
                 overlay_regions: &mut viewer.overlay_regions,
-                drag_out: viewer.drag_out,
+                drag_out: &mut viewer.deferred.drag_out,
                 previews: viewer.previews,
             };
             assets_tab(ui, viewer.snapshot, viewer.browser, &mut writes);
@@ -981,7 +969,7 @@ pub fn tab_body(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, tab: Editor
             viewer.pending,
         ),
         EditorTab::Console => console_tab(ui, viewer.snapshot, viewer.console_filters),
-        EditorTab::Problems => problems_tab(ui, viewer.snapshot, viewer.problem_open),
+        EditorTab::Problems => problems_tab(ui, viewer.snapshot, &mut viewer.requests.problem_open),
         EditorTab::Statistics => {
             statistics_tab(ui, viewer.snapshot, viewer.stats, viewer.frames_per_second)
         }
@@ -1015,11 +1003,11 @@ pub fn draw_module_panel(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, sl
     };
 
     let requested_window = viewer
-        .panel_window_ping
+        .pending_panel_window
         .filter(|(pinged, _)| *pinged == slot)
         .map(|(_, window)| window);
     if requested_window.is_some() {
-        viewer.panel_window_ping_used = true;
+        viewer.pending_panel_window_used = true;
     }
     let mut context = PanelContext {
         frames_per_second: viewer.frames_per_second,
@@ -1079,7 +1067,7 @@ pub fn tab_context_menu(
         ))
         .clicked()
     {
-        viewer.tab_popout = Some(tab);
+        viewer.deferred.tab_popout = Some(tab);
         ui.close();
     }
     if !path.surface.is_main()
@@ -1087,7 +1075,7 @@ pub fn tab_context_menu(
             .add(icons::IconButton::new(icons::Icon::ArrowSquareIn, "Redock"))
             .clicked()
     {
-        viewer.tab_redock = Some(path.surface);
+        viewer.deferred.tab_redock = Some(path.surface);
         ui.close();
     }
     // The dock owns this menu's shell, so its drawn content is what is

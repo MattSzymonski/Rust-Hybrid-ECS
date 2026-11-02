@@ -744,8 +744,8 @@ pub fn setup_with_asset_database(
     // mounted, because mounting has to precede every module's and the
     // project's init.
     info!(
-        target: telemetry_target::ENGINE,
-        module = project.name,
+        target: telemetry_target::LINK,
+        project = project.name,
         modules = project.modules.len(),
         "ECS host starting (statically linked)"
     );

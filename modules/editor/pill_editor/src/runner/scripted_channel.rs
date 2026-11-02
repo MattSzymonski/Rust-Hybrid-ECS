@@ -1905,7 +1905,7 @@ impl EditorWindow {
             );
             return;
         };
-        state.panel_window_ping = Some((slot, id.to_string()));
+        state.pending_panel_window = Some((slot, id.to_string()));
         info!(
             target: telemetry_target::ENGINE,
             slot,
@@ -1993,26 +1993,19 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// Run `problem open <index>`: the same request a click on the row makes.
+    /// Run `problem open <index>`: the same action a click on the row takes.
     ///
-    /// The request is drained at once rather than on the next frame: a suite
+    /// The row opens at once rather than at the next frame boundary: a suite
     /// that sends this line waits for the editor it launches, and one frame of
-    /// delay would make the assertion race the spawn.
+    /// delay would make the assertion race the spawn. The body is the one the
+    /// frame drain calls, so the two paths differ only in when they run.
     pub(super) fn scripted_problem_open(&mut self, index: usize) {
-        let world = self.host.host_mut().engine_mut().world_mut();
-        let found = world
-            .get_resource_mut::<EguiShellState>()
-            .map(|state| {
-                state.problem_open = Some(index);
-            })
-            .is_some();
         info!(
             target: telemetry_target::ENGINE,
             index,
-            found,
             "[editor] problem open scripted"
         );
-        self.drain_problem_open();
+        self.open_problem(index);
     }
 
     /// Run `editor.redo` from the scripted channel: the same walk, queueing
