@@ -298,7 +298,7 @@ pub struct ToolboxSession {
     pub origins: Vec<Option<Pos2>>,
     /// Per-scene-view panel rectangles whose rows the log already reported,
     /// so the rect lines appear once per placement and once per drag.
-    pub logged: Vec<Option<Rect>>,
+    pub logged: LoggedRects<usize>,
     /// Per-scene-view row rectangles, in [`crate::toolbox::TOOLBOX_ITEMS`]
     /// order: the face a row's button drew this pass, which is what a click
     /// aims at. A row's face is narrower than the row it sits in, so the
@@ -310,7 +310,7 @@ impl Default for ToolboxSession {
     fn default() -> Self {
         Self {
             origins: vec![None; SCENE_VIEWS_MAX],
-            logged: vec![None; SCENE_VIEWS_MAX],
+            logged: LoggedRects::default(),
             faces: vec![Vec::new(); SCENE_VIEWS_MAX],
         }
     }
@@ -330,17 +330,13 @@ impl ToolboxSession {
         self.origins[view] = Some(origin);
     }
 
-    /// The rectangle of `view`'s toolbox the log already reported.
-    pub fn logged(&self, view: usize) -> Option<Rect> {
-        self.logged.get(view).copied().flatten()
-    }
-
-    /// Record `view`'s toolbox rectangle as logged.
-    pub fn set_logged(&mut self, view: usize, rect: Rect) {
-        if self.logged.len() <= view {
-            self.logged.resize(view + 1, None);
-        }
-        self.logged[view] = Some(rect);
+    /// Record `view`'s toolbox rectangle as logged, answering whether it is a
+    /// placement the log has not named yet.
+    ///
+    /// Pixel-exact: the panel is dragged as a whole, so a fraction of a point
+    /// is a move the user made.
+    pub fn remember_logged(&mut self, view: usize, rect: Rect) -> bool {
+        self.logged.remember_exact(view, rect)
     }
 
     /// The face `view`'s row `index` drew this pass, when it drew one.
@@ -357,18 +353,27 @@ impl ToolboxSession {
     }
 }
 
+/// The slot a menu-bar rectangle is remembered under: the strip itself, or one
+/// title by its [`crate::menubar::Menu::ALL`] index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MenubarSlot {
+    /// The strip behind the titles.
+    Bar,
+    /// One menu title, by its index in [`crate::menubar::Menu::ALL`].
+    Title(usize),
+}
+
 /// The menu bar's logged geometry: the strip and each title, so a placement is
 /// reported once (the toolbox's pattern) and a suite can click the titles.
+#[derive(Default)]
 pub struct MenubarSession {
-    /// The strip's last logged rectangle.
-    pub bar: Option<Rect>,
-    /// Each title's last logged rectangle, by [`crate::menubar::Menu::ALL`]
-    /// index.
-    pub titles: [Option<Rect>; crate::menubar::MENU_TITLE_COUNT],
+    /// The strip's and each title's last logged rectangle, keyed by slot: the
+    /// bar reports a placement once, and a title that moves is reported again.
+    pub geometry: LoggedRects<MenubarSlot>,
     /// Each open menu entry's last logged rectangle, keyed `menu/label`; a
     /// menu's entries log while it is open, so their presence is the proof it
     /// opened.
-    pub entries: Vec<(String, Rect)>,
+    pub entries: LoggedRects<String>,
     /// Undo/redo the menus asked for, drained by the executable.
     pub history_requests: Vec<HistoryRequest>,
     /// The dock tab the Window menu asked for, drained by the executable.
@@ -385,22 +390,6 @@ pub struct MenubarSession {
     /// Whether a menu asked the editor to quit; the shell moves it to the
     /// frame at the end of the pass and clears it.
     pub quit_requested: bool,
-}
-
-impl Default for MenubarSession {
-    fn default() -> Self {
-        Self {
-            bar: None,
-            titles: [None; crate::menubar::MENU_TITLE_COUNT],
-            entries: Vec::new(),
-            history_requests: Vec::new(),
-            pending_tab: None,
-            about_open: false,
-            open: None,
-            quit_requested: false,
-            new_scene_view: false,
-        }
-    }
 }
 
 /// An undo or redo the menu bar asked for, drained by the executable.
@@ -559,6 +548,179 @@ impl PanelBudget {
     }
 }
 
+/// The rectangles a pass last reported, so a placement reaches the log once
+/// rather than once a frame.
+///
+/// One type for every "log this rectangle once" cache: the comparison rule is
+/// [`Self::remember`]'s, the prune is [`Self::forget_missing`]'s and dropping
+/// everything is [`Self::clear`]'s, so eleven collections cannot drift into
+/// eleven rules.
+///
+/// A placement is compared **quantized** to whole points by default, because
+/// egui lays a panel out in fractional points: a fraction of a point of jitter
+/// is the same place, and a line per frame of it is noise. A caller that needs
+/// the pixel-exact comparison says so with [`Self::remember_exact`].
+#[derive(Clone, Debug)]
+pub struct LoggedRects<K: Ord + Clone> {
+    /// The rectangle last logged per key, as it was logged.
+    entries: BTreeMap<K, Rect>,
+}
+
+impl<K: Ord + Clone> Default for LoggedRects<K> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: Ord + Clone> LoggedRects<K> {
+    /// Record `rect` for `key`, answering whether it is a placement to log.
+    pub fn remember(&mut self, key: K, rect: Rect) -> bool {
+        let quantized = Self::quantize(rect);
+        match self.entries.get(&key) {
+            Some(logged) if Self::quantize(*logged) == quantized => false,
+            _ => {
+                self.entries.insert(key, quantized);
+                true
+            }
+        }
+    }
+
+    /// [`Self::remember`] without the quantization: any pixel difference is a
+    /// new placement.
+    pub fn remember_exact(&mut self, key: K, rect: Rect) -> bool {
+        match self.entries.get(&key) {
+            Some(logged) if *logged == rect => false,
+            _ => {
+                self.entries.insert(key, rect);
+                true
+            }
+        }
+    }
+
+    /// The rectangle last logged for `key`.
+    #[must_use]
+    pub fn get(&self, key: &K) -> Option<Rect> {
+        self.entries.get(key).copied()
+    }
+
+    /// Every remembered key with its rectangle, in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, Rect)> {
+        self.entries.iter().map(|(key, rect)| (key, *rect))
+    }
+
+    /// Whether `key` has a logged rectangle.
+    #[must_use]
+    pub fn contains(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// Drop every key `seen` does not name.
+    ///
+    /// A row that stopped drawing is struck off instead of keeping its last
+    /// placement forever: the geometry of everything a session has ever drawn
+    /// is not worth remembering, and an unbounded cache of it is a slow leak.
+    pub fn forget_missing(&mut self, seen: &BTreeSet<K>) {
+        self.entries.retain(|key, _| seen.contains(key));
+    }
+
+    /// Drop every entry.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// How many rectangles are remembered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is remembered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Whether two rectangles are the same placement under [`Self::remember`]'s
+    /// rule, for the callers that keep a single rectangle rather than a cache.
+    #[must_use]
+    pub fn same_placement(left: Rect, right: Rect) -> bool {
+        Self::quantize(left) == Self::quantize(right)
+    }
+
+    /// `rect` with both corners rounded to whole points.
+    fn quantize(rect: Rect) -> Rect {
+        Rect::from_min_max(
+            Pos2::new(rect.min.x.round(), rect.min.y.round()),
+            Pos2::new(rect.max.x.round(), rect.max.y.round()),
+        )
+    }
+}
+
+/// The texts a pass last reported per key, so a row logs a changed value once
+/// rather than once a frame.
+#[derive(Clone, Debug)]
+pub struct LoggedTexts<K: Ord + Clone> {
+    /// The text last logged per key.
+    entries: BTreeMap<K, String>,
+}
+
+impl<K: Ord + Clone> Default for LoggedTexts<K> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: Ord + Clone> LoggedTexts<K> {
+    /// Record `text` for `key`, answering whether it changed since the last
+    /// draw that reported it.
+    pub fn remember(&mut self, key: K, text: &str) -> bool {
+        match self.entries.get(&key) {
+            Some(logged) if logged == text => false,
+            _ => {
+                self.entries.insert(key, text.to_owned());
+                true
+            }
+        }
+    }
+
+    /// The text last logged for `key`.
+    #[must_use]
+    pub fn get(&self, key: &K) -> Option<&str> {
+        self.entries.get(key).map(String::as_str)
+    }
+
+    /// Every remembered key with its text, in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &str)> {
+        self.entries.iter().map(|(key, text)| (key, text.as_str()))
+    }
+
+    /// Drop every key `seen` does not name; see [`LoggedRects::forget_missing`].
+    pub fn forget_missing(&mut self, seen: &BTreeSet<K>) {
+        self.entries.retain(|key, _| seen.contains(key));
+    }
+
+    /// Drop every entry.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// How many texts are remembered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is remembered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// The Inspector's session state: which component sections are collapsed, and
 /// the geometry its log already reported.
 ///
@@ -571,16 +733,20 @@ pub struct InspectorSession {
     /// The component type names whose sections are collapsed.
     pub collapsed: std::collections::BTreeSet<String>,
     /// Each section header's last logged rectangle, keyed by type name.
-    pub section_rects: Vec<(String, Rect)>,
+    pub section_rects: LoggedRects<String>,
     /// The Add Component button's last logged rectangle.
     pub add_rect: Option<Rect>,
     /// Whether the Add Component popup is open.
     pub add_open: bool,
     /// The addable entries' last logged rectangles, keyed by type name.
-    pub add_entries: Vec<(String, Rect)>,
-    /// The row signatures already logged, so a panel that redraws every frame
-    /// does not flood the log with the same row.
-    pub rows_logged: std::collections::HashSet<String>,
+    pub add_entries: LoggedRects<String>,
+    /// The row model each drawn component's section shows, keyed by its
+    /// registered type name: the rows, their once-per-subject log memory and
+    /// the selection's write targets.
+    pub row_models: std::collections::BTreeMap<String, crate::inspector::CachedRows>,
+    /// The one-shot notices the Inspector already logged, keyed by what they
+    /// describe (the selected asset's key): the tab redraws every frame.
+    pub notices_logged: std::collections::BTreeSet<String>,
     /// The entity whose rows were last reported. A different subject clears
     /// the row memories below, because the rows on screen are that entity's.
     pub subject: Option<pill_engine::Entity>,
@@ -588,7 +754,7 @@ pub struct InspectorSession {
     /// `entity.component.field`: what a suite drops an asset onto.
     /// Only a row on screen keeps an entry; see the shell's
     /// `remember_asset_row_rect`.
-    pub asset_row_rects: Vec<(String, Rect)>,
+    pub asset_row_rects: LoggedRects<String>,
     /// Whether the row and section rectangles reach the log.
     ///
     /// The frontend sets it from the frame's [`crate::boundary::EguiShellInput`]:
@@ -597,7 +763,7 @@ pub struct InspectorSession {
     pub log_rects: bool,
     /// Each asset reference row's last logged text, keyed the same way: the
     /// row logs again whenever it draws a different asset.
-    pub asset_row_texts: Vec<(String, String)>,
+    pub asset_row_texts: LoggedTexts<String>,
     /// The `component.field` whose asset picker is open, if one is.
     pub asset_picker: Option<String>,
     /// The open asset picker's search text.
@@ -605,10 +771,10 @@ pub struct InspectorSession {
     /// Each entity reference row's last logged rectangle, keyed by
     /// `entity.component.field`: what a suite drags an
     /// entity onto.
-    pub entity_row_rects: Vec<(String, Rect)>,
+    pub entity_row_rects: LoggedRects<String>,
     /// Each entity reference row's last logged text, keyed the same way: the
     /// row logs again whenever it draws a different entity.
-    pub entity_row_texts: Vec<(String, String)>,
+    pub entity_row_texts: LoggedTexts<String>,
     /// The `component.field` whose entity picker is open, if one is.
     pub entity_picker: Option<String>,
     /// The open entity picker's search text.
@@ -620,15 +786,56 @@ pub struct InspectorSession {
     pub settings_search: String,
     /// Each reference-list row's last logged rectangle, keyed by
     /// `asset:family[index]`: what a suite drags to reorder a list.
-    pub settings_row_rects: Vec<(String, Rect)>,
+    pub settings_row_rects: LoggedRects<String>,
     /// Each Hierarchy row's last logged rectangle, keyed by the entity's
     /// display: what a suite drags onto an entity reference
     /// row. The Entities tab shares this session, since the cache is the same
     /// "geometry the log already reported" concern.
-    pub hierarchy_row_rects: Vec<(String, Rect)>,
+    pub hierarchy_row_rects: LoggedRects<String>,
     /// Each scene badge's last logged rectangle, keyed by `view:entity`:
     /// what a suite clicks to select through a badge.
-    pub badge_rects: Vec<(String, Rect)>,
+    pub badge_rects: LoggedRects<String>,
+    /// The Hierarchy rows this pass drew, so [`Self::begin_geometry_pass`] can
+    /// drop the ones that left: the tab redraws what it shows, and the
+    /// Entities list can be tens of thousands of rows long.
+    pub hierarchy_seen: BTreeSet<String>,
+    /// The scene badges this pass drew, keyed like [`Self::badge_rects`].
+    pub badge_seen: BTreeSet<String>,
+}
+
+impl InspectorSession {
+    /// Forget every rectangle and text the log already reported.
+    ///
+    /// Called when the subject changes: the rows on screen are another
+    /// entity's, so their geometry has to be reported again for the new one.
+    pub fn clear_geometry(&mut self) {
+        self.section_rects.clear();
+        self.add_rect = None;
+        self.add_entries.clear();
+        self.asset_row_rects.clear();
+        self.asset_row_texts.clear();
+        self.entity_row_rects.clear();
+        self.entity_row_texts.clear();
+        self.settings_row_rects.clear();
+        self.hierarchy_row_rects.clear();
+        self.badge_rects.clear();
+    }
+
+    /// Start a frame of geometry reporting: drop the rows and badges the
+    /// previous frame did not draw, then collect this frame's.
+    ///
+    /// The seen sets accumulate every pass of a frame, the main dock pass and
+    /// the popped-out tabs', so a tab that draws in its own window still counts
+    /// as drawn. Without the prune the two caches grow with every entity the
+    /// session ever listed and never shrink again; a hidden row's rectangle is
+    /// not one a suite can click, so forgetting it costs nothing - it logs
+    /// again when the row comes back.
+    pub fn begin_geometry_pass(&mut self) {
+        let hierarchy_seen = std::mem::take(&mut self.hierarchy_seen);
+        self.hierarchy_row_rects.forget_missing(&hierarchy_seen);
+        let badge_seen = std::mem::take(&mut self.badge_seen);
+        self.badge_rects.forget_missing(&badge_seen);
+    }
 }
 
 /// The preview state of every asset tile, keyed by the panel's row key.
@@ -808,5 +1015,62 @@ impl EguiShellState {
 impl Default for EguiShellState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cell of the log-token surface: a rectangle that repeats draws once, a
+    /// rectangle that moves draws again, and a key that stops drawing is
+    /// dropped so the cache cannot grow with everything the session ever drew.
+    #[test]
+    fn a_logged_rect_answers_once_per_placement() {
+        let mut logged = LoggedRects::default();
+        let rect = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(110.0, 40.0));
+        assert!(
+            logged.remember("row".to_owned(), rect),
+            "the first draw logs"
+        );
+        assert!(
+            !logged.remember("row".to_owned(), rect),
+            "the same placement does not log again"
+        );
+        let jittered = rect.translate(egui::vec2(0.2, -0.3));
+        assert!(
+            !logged.remember("row".to_owned(), jittered),
+            "a fraction of a point is the same placement"
+        );
+        let moved = rect.translate(egui::vec2(0.0, 12.0));
+        assert!(logged.remember("row".to_owned(), moved), "a move logs");
+
+        let seen = BTreeSet::from(["other".to_owned()]);
+        logged.forget_missing(&seen);
+        assert!(logged.is_empty(), "a key that stopped drawing is dropped");
+    }
+
+    /// The strict comparison is the caller's choice, not the type's second
+    /// accidental rule: half a point is a new placement only for [`LoggedRects::remember_exact`].
+    #[test]
+    fn the_exact_rule_takes_every_pixel() {
+        let mut logged = LoggedRects::default();
+        let rect = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(110.0, 40.0));
+        assert!(logged.remember_exact("header".to_owned(), rect));
+        assert!(!logged.remember_exact("header".to_owned(), rect));
+        assert!(logged.remember_exact("header".to_owned(), rect.translate(egui::vec2(0.5, 0.0))));
+    }
+
+    /// A row logs the text it draws once per change, not once per frame.
+    #[test]
+    fn a_logged_text_answers_only_on_change() {
+        let mut logged = LoggedTexts::default();
+        assert!(logged.remember("cfg:speed".to_owned(), "1.5"));
+        assert!(!logged.remember("cfg:speed".to_owned(), "1.5"));
+        assert!(logged.remember("cfg:speed".to_owned(), "2.0"));
+        assert_eq!(logged.get(&"cfg:speed".to_owned()), Some("2.0"));
+        let seen = BTreeSet::new();
+        logged.forget_missing(&seen);
+        assert!(logged.is_empty());
     }
 }

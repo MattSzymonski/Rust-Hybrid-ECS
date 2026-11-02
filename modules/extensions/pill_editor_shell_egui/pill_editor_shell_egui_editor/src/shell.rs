@@ -218,7 +218,6 @@ pub use inspector_fields::inspector_row;
 pub use inspector_fields::is_scalar_field;
 pub use inspector_fields::remember_entity_row_rect;
 pub use inspector_fields::remember_entity_row_text;
-pub use inspector_fields::remember_inspector_row;
 pub use inspector_fields::EntityRowInput;
 
 /// The [`inspector_widgets`] module: the inspector's field controls.
@@ -484,6 +483,10 @@ pub fn run_frame(
         badges: &shell_input.badges,
     };
     let output = context.run_ui(raw_input, |ui| {
+        // What the tabs and badges draw this pass is what their rectangle
+        // caches keep: the dock pass opens the frame's window for it, so a row
+        // that left the list stops occupying the session.
+        viewer.inspector.begin_geometry_pass();
         // The strip comes first, so the dock - and every viewport rectangle it
         // reports - starts below it.
         menu_bar(ui, menubar, &mark, &mut viewer);

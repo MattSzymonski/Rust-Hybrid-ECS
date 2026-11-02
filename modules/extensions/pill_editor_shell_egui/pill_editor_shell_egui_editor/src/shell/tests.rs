@@ -603,8 +603,9 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
         .expect("the tile drew");
     let row = session
         .asset_row_rects
-        .first()
-        .map(|(_, rect)| *rect)
+        .iter()
+        .next()
+        .map(|(_, rect)| rect)
         .expect("the asset row drew");
     let from = tile.center();
     let to = row.center();
@@ -686,11 +687,14 @@ fn a_dragged_row_reorders_the_list() {
                         ASSET,
                         document,
                         references,
-                        &[],
-                        &[],
-                        pending,
-                        session,
-                        regions,
+                        &mut SettingsWalk {
+                            assets: &[],
+                            engine_assets: &[],
+                            pending,
+                            session,
+                            overlay_regions: regions,
+                            read_only: false,
+                        },
                     );
                 });
             });
@@ -730,12 +734,7 @@ fn a_dragged_row_reorders_the_list() {
     let rows: Vec<egui::Rect> = (0..3)
         .map(|index| {
             let key = format!("{ASSET}:passes[{index}]");
-            session
-                .settings_row_rects
-                .iter()
-                .find(|(logged, _)| *logged == key)
-                .map(|(_, rect)| *rect)
-                .expect("the row drew")
+            session.settings_row_rects.get(&key).expect("the row drew")
         })
         .collect();
 
@@ -977,7 +976,7 @@ fn a_reference_keys_family_is_what_a_list_row_belongs_to() {
 /// row that scrolls out and back do not log again, a real move does.
 #[test]
 fn a_rows_placement_is_logged_once_per_place() {
-    let mut logged = Vec::new();
+    let mut logged = LoggedRects::default();
     let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 40.0));
     assert!(inspector_fields::record_row_placement(&mut logged, "row", rect).is_some());
     assert!(inspector_fields::record_row_placement(&mut logged, "row", rect).is_none());

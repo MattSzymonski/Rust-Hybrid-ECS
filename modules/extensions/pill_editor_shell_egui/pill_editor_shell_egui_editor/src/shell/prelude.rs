@@ -46,10 +46,10 @@ pub use pill_editor_core::panels::{
 };
 pub use pill_editor_core::preferences;
 pub use pill_editor_core::session::{
-    EguiShellState, InspectorSession, MenubarSession, PaletteState, PanelBudget, PanelTiming,
-    PanelWindowAnswer, PanelWindowSession, PanelWindowState, StatisticsSession, Toast,
-    ToastSession, ToolboxSession, PANEL_BUDGET_FRAMES, PANEL_BUDGET_MICROS, PANEL_WINDOWS_MAX,
-    TOASTS_MAX, TOAST_FRAMES,
+    EguiShellState, InspectorSession, LoggedRects, LoggedTexts, MenubarSession, MenubarSlot,
+    PaletteState, PanelBudget, PanelTiming, PanelWindowAnswer, PanelWindowSession,
+    PanelWindowState, StatisticsSession, Toast, ToastSession, ToolboxSession, PANEL_BUDGET_FRAMES,
+    PANEL_BUDGET_MICROS, PANEL_WINDOWS_MAX, TOASTS_MAX, TOAST_FRAMES,
 };
 pub use pill_editor_core::style;
 pub use pill_editor_core::systems;

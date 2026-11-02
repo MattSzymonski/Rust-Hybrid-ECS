@@ -23,6 +23,10 @@
 //! queues batches, the executable applies them at the frame boundary, and
 //! the history records them - the same split the Assets pipeline follows.
 
+// Standard library
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 // External crates
 use egui::Color32;
 use pill_engine::component_registry::FieldDecorator;
@@ -34,6 +38,7 @@ use crate::editor_state::{
     AssetListing, ComponentView, EditorCommand, EngineAsset, EntityDetail, EntityListEntry,
 };
 use crate::icons::Icon;
+use crate::session::InspectorSession;
 
 /// The name after the last `::`, for labels and history entries.
 pub fn short_component_name(name: &str) -> &str {
@@ -603,6 +608,233 @@ fn channel_run(
     (leaves.len() >= minimum).then_some(leaves)
 }
 
+/// The log lines a drawn row can emit, as bits: the row's own line and the
+/// `mixed` line a scalar or vector row adds when the selection disagrees.
+///
+/// A cached row carries this, so a row that redraws every frame logs once per
+/// subject without rebuilding a key: the row's position in the cached model is
+/// its identity for the session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowLogged(u8);
+
+impl RowLogged {
+    /// The row's own `[editor] inspector row kind=…` line.
+    pub const ROW: u8 = 1 << 0;
+    /// The `mixed` line a row adds when the selection disagrees on its value.
+    pub const MIXED: u8 = 1 << 1;
+
+    /// Whether `flag`'s line has already been logged for this row.
+    #[must_use]
+    pub fn has(self, flag: u8) -> bool {
+        self.0 & flag != 0
+    }
+
+    /// Mark `flag`'s line as logged.
+    pub fn mark(&mut self, flag: u8) {
+        self.0 |= flag;
+    }
+}
+
+/// One row of a component's cached model and the lines it has already logged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CachedRow {
+    /// The row to draw.
+    pub row: FieldRow,
+    /// The lines this row already logged for the current subject.
+    pub logged: RowLogged,
+}
+
+/// One component's cached row model and the selection's write targets.
+///
+/// The rows are rebuilt only when [`row_layout`] moves; the targets only when
+/// the selection's per-component answer moves. Both live in the shared
+/// session, so a shell reload keeps them.
+#[derive(Default)]
+pub struct CachedRows {
+    /// The layout the cached rows were built from.
+    pub layout: Option<RowLayout>,
+    /// The rows, in field order, each with its log memory.
+    pub rows: Vec<CachedRow>,
+    /// The selection the cached targets were derived from.
+    pub targets_stamp: Option<u64>,
+    /// The entities the section's edits reach (the primary first).
+    pub targets: Vec<Entity>,
+}
+
+/// The layout fingerprint of one component's row model: the field names, the
+/// decorators and the value kinds [`rows`] reads - never the values
+/// themselves, so a value edit does not rebuild the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowLayout(u64);
+
+/// The stamp that decides when a component's cached rows are rebuilt.
+pub fn row_layout(component: &ComponentView) -> RowLayout {
+    let mut hasher = DefaultHasher::new();
+    component.fields.len().hash(&mut hasher);
+    component.values.len().hash(&mut hasher);
+    for (descriptor, value) in component.fields.iter().zip(component.values.iter()) {
+        descriptor.name.hash(&mut hasher);
+        descriptor.decorators.len().hash(&mut hasher);
+        for decorator in descriptor.decorators.iter() {
+            hash_decorator(decorator, &mut hasher);
+        }
+        hash_value_kind(value, &mut hasher);
+    }
+    RowLayout(hasher.finish())
+}
+
+/// Hash what one decorator contributes to the row model: its kind and the
+/// payload the row shows or the widget derives from it.
+fn hash_decorator(decorator: &FieldDecorator, hasher: &mut DefaultHasher) {
+    match decorator {
+        FieldDecorator::HideInInspector => 0u8.hash(hasher),
+        FieldDecorator::Header(text) => {
+            1u8.hash(hasher);
+            text.hash(hasher);
+        }
+        FieldDecorator::Space(pixels) => {
+            2u8.hash(hasher);
+            pixels.to_bits().hash(hasher);
+        }
+        FieldDecorator::Tooltip(text) => {
+            3u8.hash(hasher);
+            text.hash(hasher);
+        }
+        FieldDecorator::Range { min, max } => {
+            4u8.hash(hasher);
+            min.to_bits().hash(hasher);
+            max.to_bits().hash(hasher);
+        }
+        FieldDecorator::Min(value) => {
+            5u8.hash(hasher);
+            value.to_bits().hash(hasher);
+        }
+        FieldDecorator::TextArea { min_lines, .. } => {
+            6u8.hash(hasher);
+            min_lines.hash(hasher);
+        }
+        FieldDecorator::Multiline(count) => {
+            7u8.hash(hasher);
+            count.hash(hasher);
+        }
+        FieldDecorator::Color => 8u8.hash(hasher),
+        FieldDecorator::Vector => 9u8.hash(hasher),
+    }
+}
+
+/// Hash the parts of a value the row model reads: its kind, an array's element
+/// count and element kinds, a list's element count, an asset's type.
+fn hash_value_kind(value: &FieldValue, hasher: &mut DefaultHasher) {
+    let kind: u8 = match value {
+        FieldValue::F32(_) => 1,
+        FieldValue::F64(_) => 2,
+        FieldValue::I8(_) => 3,
+        FieldValue::I16(_) => 4,
+        FieldValue::I32(_) => 5,
+        FieldValue::I64(_) => 6,
+        FieldValue::U8(_) => 7,
+        FieldValue::U16(_) => 8,
+        FieldValue::U32(_) => 9,
+        FieldValue::U64(_) => 10,
+        FieldValue::Bool(_) => 11,
+        FieldValue::Usize(_) => 12,
+        FieldValue::Isize(_) => 13,
+        FieldValue::Array(_) => 14,
+        FieldValue::List { .. } => 15,
+        FieldValue::Text(_) => 16,
+        FieldValue::Asset { .. } => 17,
+        FieldValue::Entity { .. } => 18,
+        FieldValue::Opaque { .. } => 19,
+    };
+    kind.hash(hasher);
+    match value {
+        FieldValue::Array(elements) => {
+            elements.len().hash(hasher);
+            for element in elements {
+                hash_value_kind(element, hasher);
+            }
+        }
+        FieldValue::List { element_count, .. } => element_count.hash(hasher),
+        FieldValue::Asset { asset_type, .. } => asset_type.hash(hasher),
+        _ => {}
+    }
+}
+
+/// A stamp over what changes a component's write targets: which entities are
+/// selected and whether each carries the component.
+fn selection_stamp(details: &[EntityDetail], component: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    details.len().hash(&mut hasher);
+    for detail in details {
+        detail.entity.hash(&mut hasher);
+        detail
+            .components
+            .iter()
+            .any(|view| view.type_name == component)
+            .hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Take one component's cached rows and write targets out of the session,
+/// rebuilding whichever part moved.
+///
+/// Taking them out is what lets the caller draw with the same
+/// `&mut InspectorSession` the model lives in: the draw also borrows the
+/// session for its pickers and rectangles. The caller hands both back with
+/// [`store_component_rows`] after the section's rows.
+pub fn take_component_rows(
+    session: &mut InspectorSession,
+    component: &ComponentView,
+    selected: &[EntityDetail],
+    primary: Entity,
+) -> (Vec<CachedRow>, Vec<Entity>) {
+    let type_name = component.type_name.as_str();
+    let layout = row_layout(component);
+    let targets_stamp = selection_stamp(selected, type_name);
+    if !session.row_models.contains_key(type_name) {
+        session
+            .row_models
+            .insert(type_name.to_string(), CachedRows::default());
+    }
+    let entry = session
+        .row_models
+        .get_mut(type_name)
+        .expect("the row-model entry was inserted just above");
+    if entry.layout != Some(layout) {
+        entry.layout = Some(layout);
+        entry.rows = rows(component)
+            .into_iter()
+            .map(|row| CachedRow {
+                row,
+                logged: RowLogged::default(),
+            })
+            .collect();
+    }
+    if entry.targets_stamp != Some(targets_stamp) {
+        entry.targets_stamp = Some(targets_stamp);
+        selection_targets_into(selected, primary, type_name, &mut entry.targets);
+    }
+    (
+        std::mem::take(&mut entry.rows),
+        std::mem::take(&mut entry.targets),
+    )
+}
+
+/// Hand one component's rows and targets back after its section drew.
+pub fn store_component_rows(
+    session: &mut InspectorSession,
+    type_name: &str,
+    rows: Vec<CachedRow>,
+    targets: Vec<Entity>,
+) {
+    let Some(entry) = session.row_models.get_mut(type_name) else {
+        return;
+    };
+    entry.rows = rows;
+    entry.targets = targets;
+}
+
 /// The axis label a vector row shows for element `index`: `X`, `Y`, `Z`, `W`.
 pub fn axis_label(index: usize) -> &'static str {
     match index {
@@ -694,16 +926,9 @@ pub fn selection_asset_edit(
     field: &str,
     reference: Option<String>,
 ) -> (Vec<EditorCommand>, String, String) {
-    let commands = targets
-        .iter()
-        .map(|target| asset_edit(*target, component, field, reference.clone()).0)
-        .collect();
-    let (_command, label) = asset_edit(primary, component, field, reference);
-    (
-        commands,
-        label,
-        field_coalesce_key(primary, component, field),
-    )
+    batch(targets, primary, component, field, |target| {
+        asset_edit(target, component, field, reference.clone())
+    })
 }
 
 /// The recorded entity reference edit: `SetFieldEntity` under the field edit's
@@ -735,16 +960,9 @@ pub fn selection_entity_edit(
     field: &str,
     reference: Option<Entity>,
 ) -> (Vec<EditorCommand>, String, String) {
-    let commands = targets
-        .iter()
-        .map(|target| entity_edit(*target, component, field, reference).0)
-        .collect();
-    let (_command, label) = entity_edit(primary, component, field, reference);
-    (
-        commands,
-        label,
-        field_coalesce_key(primary, component, field),
-    )
+    batch(targets, primary, component, field, |target| {
+        entity_edit(target, component, field, reference)
+    })
 }
 
 /// The entities an entity row's picker offers: every entity the Hierarchy
@@ -848,12 +1066,18 @@ pub fn element_edit(
             index,
             value,
         },
-        format!(
-            "set {}[{}].{}",
-            short_component_name(component),
-            index,
-            field
-        ),
+        element_label(component, field, index),
+    )
+}
+
+/// The step label an array element's edit records under:
+/// `set {short}[{index}].{field}`.
+fn element_label(component: &str, field: &str, index: usize) -> String {
+    format!(
+        "set {}[{}].{}",
+        short_component_name(component),
+        index,
+        field
     )
 }
 
@@ -875,7 +1099,21 @@ pub fn selection_targets(
     primary: Entity,
     component: &str,
 ) -> Vec<Entity> {
-    let mut targets = vec![primary];
+    let mut targets = Vec::new();
+    selection_targets_into(details, primary, component, &mut targets);
+    targets
+}
+
+/// [`selection_targets`], written into a caller's buffer so a redraw reuses
+/// the allocation.
+pub fn selection_targets_into(
+    details: &[EntityDetail],
+    primary: Entity,
+    component: &str,
+    targets: &mut Vec<Entity>,
+) {
+    targets.clear();
+    targets.push(primary);
     for detail in details {
         if detail.entity == primary {
             continue;
@@ -888,7 +1126,6 @@ pub fn selection_targets(
             targets.push(detail.entity);
         }
     }
-    targets
 }
 
 /// One recorded batch writing `value` into `field` on every target, with its
@@ -904,14 +1141,83 @@ pub fn selection_field_edit(
     field: &str,
     value: FieldValue,
 ) -> (Vec<EditorCommand>, String, String) {
+    batch(targets, primary, component, field, |target| {
+        field_edit(target, component, field, value.clone())
+    })
+}
+
+/// One recorded batch writing element `index` of `field` on every target.
+///
+/// The step is labelled and keyed on the element (`field[index]`), which is what
+/// [`element_write`] does for a single entity: a drag on one element of an
+/// array is one undo step, and two elements are two.
+pub fn selection_element_edit(
+    targets: &[Entity],
+    primary: Entity,
+    component: &str,
+    field: &str,
+    index: usize,
+    value: FieldValue,
+) -> (Vec<EditorCommand>, String, String) {
+    batch(
+        targets,
+        primary,
+        component,
+        &element_coalesce_field(field, index),
+        |target| element_edit(target, component, field, index, value.clone()),
+    )
+}
+
+/// One recorded field write on an editor-editable resource.
+///
+/// `SetResourceField` labelled `set {resource}.{field}`; a resource has no
+/// selection, so the batch shape's per-entity half does not apply.
+pub fn resource_edit(resource: &str, field: &str, value: FieldValue) -> (EditorCommand, String) {
+    (
+        EditorCommand::SetResourceField {
+            resource: resource.to_string(),
+            field: field.to_string(),
+            value,
+        },
+        format!("set {resource}.{field}"),
+    )
+}
+
+/// The coalesce key a resource field's writes share, so a drag on one row is
+/// one undo step.
+pub fn resource_coalesce_key(resource: &str, field: &str) -> String {
+    format!("resource.{resource}.{field}")
+}
+
+/// The field name an array element's coalesce key and label name:
+/// `field[index]`.
+fn element_coalesce_field(field: &str, index: usize) -> String {
+    format!("{field}[{index}]")
+}
+
+/// A selection's batch of one-entity edits: `make` runs once per target, and
+/// the primary's own run names the step.
+///
+/// Every selection builder is this shape - one command per target, the
+/// primary's label and the primary's coalesce key - so a new reference kind is
+/// a new `make` rather than a fourth copy of the loop.
+fn batch(
+    targets: &[Entity],
+    primary: Entity,
+    component: &str,
+    coalesce_field: &str,
+    make: impl Fn(Entity) -> (EditorCommand, String),
+) -> (Vec<EditorCommand>, String, String) {
     let mut commands = Vec::with_capacity(targets.len());
     for target in targets {
-        let (command, _step_label) = field_edit(*target, component, field, value.clone());
-        commands.push(command);
+        commands.push(make(*target).0);
     }
-    let (_command, label) = field_edit(primary, component, field, value);
-    let key = field_coalesce_key(primary, component, field);
-    (commands, label, key)
+    let (_command, label) = make(primary);
+    (
+        commands,
+        label,
+        field_coalesce_key(primary, component, coalesce_field),
+    )
 }
 
 /// Element `index` of an array value, when it is one and the index fits.
@@ -954,6 +1260,38 @@ impl RecordedEdit {
     }
 }
 
+/// What a field's text names when the field is a reference rather than a value.
+enum ReferenceWrite {
+    /// The asset reference the text names, `None` to clear it.
+    Asset(Option<String>),
+    /// The entity reference the text names, `None` to clear it.
+    Entity(Option<Entity>),
+}
+
+/// The reference `text` names for `current`, or `None` when the field holds a
+/// plain value.
+///
+/// The one place that knows how a reference row reads its text, shared by
+/// [`field_write`] and [`selection_write`]: the two differ in how many entities
+/// they write, never in what the text means.
+///
+/// # Errors
+///
+/// The message saying why the text does not name an entity.
+fn reference_write(
+    current: &FieldValue,
+    value_text: &str,
+) -> Option<Result<ReferenceWrite, String>> {
+    if matches!(current, FieldValue::Asset { .. }) {
+        let reference = (!is_cleared_reference(value_text)).then(|| value_text.trim().to_owned());
+        return Some(Ok(ReferenceWrite::Asset(reference)));
+    }
+    if matches!(current, FieldValue::Entity { .. }) {
+        return Some(parse_entity_reference(value_text).map(ReferenceWrite::Entity));
+    }
+    None
+}
+
 /// One field's write, decided in one place.
 ///
 /// A field's text means three different things depending on the value it
@@ -974,21 +1312,24 @@ pub fn field_write(
     value_text: &str,
 ) -> Result<RecordedEdit, String> {
     let coalesce = field_coalesce_key(entity, component, field);
-    if matches!(current, FieldValue::Asset { .. }) {
-        let reference = (!is_cleared_reference(value_text)).then(|| value_text.trim().to_owned());
-        let edit = asset_edit(entity, component, field, reference);
-        return Ok(RecordedEdit::one(edit, coalesce));
+    match reference_write(current, value_text) {
+        Some(Ok(ReferenceWrite::Asset(reference))) => Ok(RecordedEdit::one(
+            asset_edit(entity, component, field, reference),
+            coalesce,
+        )),
+        Some(Ok(ReferenceWrite::Entity(reference))) => Ok(RecordedEdit::one(
+            entity_edit(entity, component, field, reference),
+            coalesce,
+        )),
+        Some(Err(message)) => Err(message),
+        None => {
+            let value = parse_field_value(value_text, current)?;
+            Ok(RecordedEdit::one(
+                field_edit(entity, component, field, value),
+                coalesce,
+            ))
+        }
     }
-    if matches!(current, FieldValue::Entity { .. }) {
-        let reference = parse_entity_reference(value_text)?;
-        let edit = entity_edit(entity, component, field, reference);
-        return Ok(RecordedEdit::one(edit, coalesce));
-    }
-    let value = parse_field_value(value_text, current)?;
-    Ok(RecordedEdit::one(
-        field_edit(entity, component, field, value),
-        coalesce,
-    ))
 }
 
 /// One array element's write, keyed on the element.
@@ -1011,7 +1352,7 @@ pub fn element_write(
     let element = element_field(current, index)
         .ok_or_else(|| format!("`{field}[{index}]` is outside the array"))?;
     let value = parse_field_value(value_text, &element)?;
-    let coalesce = field_coalesce_key(entity, component, &format!("{field}[{index}]"));
+    let coalesce = field_coalesce_key(entity, component, &element_coalesce_field(field, index));
     Ok(RecordedEdit::one(
         element_edit(entity, component, field, index, value),
         coalesce,
@@ -1032,30 +1373,31 @@ pub fn selection_write(
     current: &FieldValue,
     value_text: &str,
 ) -> Result<RecordedEdit, String> {
-    if matches!(current, FieldValue::Asset { .. }) {
-        let reference = (!is_cleared_reference(value_text)).then(|| value_text.trim().to_owned());
-        return Ok(RecordedEdit::many(selection_asset_edit(
+    match reference_write(current, value_text) {
+        Some(Ok(ReferenceWrite::Asset(reference))) => Ok(RecordedEdit::many(selection_asset_edit(
             targets, primary, component, field, reference,
-        )));
+        ))),
+        Some(Ok(ReferenceWrite::Entity(reference))) => Ok(RecordedEdit::many(
+            selection_entity_edit(targets, primary, component, field, reference),
+        )),
+        Some(Err(message)) => Err(message),
+        None => {
+            let value = parse_field_value(value_text, current)?;
+            Ok(RecordedEdit::many(selection_field_edit(
+                targets, primary, component, field, value,
+            )))
+        }
     }
-    if matches!(current, FieldValue::Entity { .. }) {
-        let reference = parse_entity_reference(value_text)?;
-        return Ok(RecordedEdit::many(selection_entity_edit(
-            targets, primary, component, field, reference,
-        )));
-    }
-    let value = parse_field_value(value_text, current)?;
-    Ok(RecordedEdit::many(selection_field_edit(
-        targets, primary, component, field, value,
-    )))
 }
 
 /// One recorded batch writing every leaf of a grouped row: the colour
 /// or vector a row draws, across the whole selection, as one undo step.
 ///
 /// `values` holds one value per leaf, in the row's own order. The label and the
-/// coalesce key both name the first leaf, so a colour reads as one edit of one
-/// field however many channels and entities it wrote.
+/// coalesce key both name the first leaf in the form the rest of the write path
+/// uses for it - `field[index]` for an array element, `field` otherwise - so a
+/// colour row's picker and its per-channel fields record the same step for one
+/// element instead of two names for one edit.
 pub fn selection_leaf_edit(
     targets: &[Entity],
     primary: Entity,
@@ -1076,12 +1418,22 @@ pub fn selection_leaf_edit(
         }
     }
     let label = match leaves.first() {
-        Some(leaf) => format!("set {}.{}", short_component_name(component), leaf.field),
+        Some(leaf) => match leaf.element {
+            Some(element) => element_label(component, &leaf.field, element),
+            None => format!("set {}.{}", short_component_name(component), leaf.field),
+        },
         None => format!("set {}", short_component_name(component)),
     };
     let key = leaves
         .first()
-        .map(|leaf| field_coalesce_key(primary, component, &leaf.field))
+        .map(|leaf| match leaf.element {
+            Some(element) => field_coalesce_key(
+                primary,
+                component,
+                &element_coalesce_field(&leaf.field, element),
+            ),
+            None => field_coalesce_key(primary, component, &leaf.field),
+        })
         .unwrap_or_default();
     (commands, label, key)
 }
@@ -1421,6 +1773,76 @@ mod tests {
         assert_eq!(
             selection_targets(&details, primary, "Health"),
             vec![primary, carrier, other]
+        );
+    }
+
+    /// A component view with one scalar field of the given kind.
+    fn single_field_view(value: FieldValue) -> ComponentView {
+        ComponentView {
+            type_name: "TransformComponent".to_string(),
+            persistable: true,
+            editable: true,
+            fields: vec![crate::editor_state::ComponentFieldView {
+                name: "speed".to_string(),
+                decorators: Vec::new(),
+            }],
+            values: vec![value],
+            asset_labels: Vec::new(),
+            entity_labels: Vec::new(),
+        }
+    }
+
+    /// The row model is rebuilt on a layout change, not on a value edit: the
+    /// stamp reads kinds and lengths, and the cache keeps its rows - and their
+    /// log memory - across a frame that only changed a value.
+    #[test]
+    fn the_row_model_rebuilds_on_layout_not_on_values() {
+        let mut view = single_field_view(FieldValue::F32(1.0));
+        let layout = row_layout(&view);
+        view.values[0] = FieldValue::F32(2.5);
+        assert_eq!(
+            row_layout(&view),
+            layout,
+            "a value edit must not rebuild the row model"
+        );
+        view.values[0] = FieldValue::Bool(true);
+        assert_ne!(
+            row_layout(&view),
+            layout,
+            "a value kind change must rebuild it"
+        );
+
+        let mut session = InspectorSession::default();
+        let primary = Entity::from_raw(1, 0);
+        let value_view = single_field_view(FieldValue::F32(1.0));
+        let (mut rows, targets) = take_component_rows(&mut session, &value_view, &[], primary);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(targets, vec![primary]);
+        assert!(!rows[0].logged.has(RowLogged::ROW));
+        rows[0].logged.mark(RowLogged::ROW);
+        store_component_rows(&mut session, &value_view.type_name, rows, targets);
+
+        let (rows, targets) = take_component_rows(&mut session, &value_view, &[], primary);
+        assert!(
+            rows[0].logged.has(RowLogged::ROW),
+            "the cached row keeps the line it already logged"
+        );
+        store_component_rows(&mut session, &value_view.type_name, rows, targets);
+
+        let mut edited = value_view.clone();
+        edited.values[0] = FieldValue::F32(9.0);
+        let (rows, targets) = take_component_rows(&mut session, &edited, &[], primary);
+        assert!(
+            rows[0].logged.has(RowLogged::ROW),
+            "a value edit kept the rows"
+        );
+        store_component_rows(&mut session, &edited.type_name, rows, targets);
+
+        edited.values[0] = FieldValue::Bool(false);
+        let (rows, _) = take_component_rows(&mut session, &edited, &[], primary);
+        assert!(
+            !rows[0].logged.has(RowLogged::ROW),
+            "a layout change logs the new row"
         );
     }
 
@@ -2593,5 +3015,43 @@ mod tests {
             EditorCommand::SetField { entity, field, .. }
                 if *entity == second && field == "fill.b"
         ));
+    }
+
+    /// One array element's colour records the same step whether it is written
+    /// through the row's picker or one channel at a time: an element leaf's
+    /// label and coalesce key are the per-element form.
+    #[test]
+    fn a_colours_picker_and_its_channels_record_the_same_step() {
+        let entity = Entity::from_raw(1, 0);
+        let leaves: Vec<RowLeaf> = (0..3)
+            .map(|element| RowLeaf {
+                index: 0,
+                field: "a".to_string(),
+                element: Some(element),
+            })
+            .collect();
+        let picked = vec![
+            FieldValue::F32(1.0),
+            FieldValue::F32(0.0),
+            FieldValue::F32(0.0),
+        ];
+        let (picker_commands, picker_label, picker_key) =
+            selection_leaf_edit(&[entity], entity, "demo::Tint", &leaves, &picked);
+        let (channel_commands, channel_label, channel_key) = selection_element_edit(
+            &[entity],
+            entity,
+            "demo::Tint",
+            "a",
+            0,
+            FieldValue::F32(1.0),
+        );
+        assert_eq!(picker_label, "set Tint[0].a");
+        assert_eq!(channel_label, picker_label);
+        assert_eq!(channel_key, picker_key);
+        assert_eq!(
+            picker_commands.first(),
+            channel_commands.first(),
+            "one element, one command"
+        );
     }
 }

@@ -71,7 +71,9 @@ pub fn settings_level(ui: &mut egui::Ui, add_contents: &mut dyn FnMut(&mut egui:
 /// A leaf draws from its key and its value alone; these exist for the rows
 /// below it - the pickers' listing and store, the writes they queue, the
 /// session's collapse state and the frame's overlay regions - so they travel as
-/// one value instead of eight positional arguments.
+/// one value instead of eight positional arguments. Every row below the walk
+/// takes it whole, so a borrow added here reaches the whole family instead of
+/// being threaded through five signatures.
 pub struct SettingsWalk<'a> {
     /// The listing the pickers read.
     pub assets: &'a [AssetListing],
@@ -127,29 +129,9 @@ pub fn asset_settings_rows(
                 if reference_family(field).is_some() {
                     continue;
                 }
-                reference_row(
-                    ui,
-                    asset_path,
-                    settings,
-                    field,
-                    walk.assets,
-                    walk.engine_assets,
-                    walk.pending,
-                    walk.session,
-                    walk.overlay_regions,
-                );
+                reference_row(ui, asset_path, settings, field, walk);
             }
-            reference_list_rows(
-                ui,
-                asset_path,
-                settings,
-                references,
-                walk.assets,
-                walk.engine_assets,
-                walk.pending,
-                walk.session,
-                walk.overlay_regions,
-            );
+            reference_list_rows(ui, asset_path, settings, references, walk);
         }
         other => {
             read_only_row(ui, "settings", &other.to_string());
@@ -178,17 +160,12 @@ pub struct ListEntryDrag {
 /// A chain's pass list is the first such family. A drag reorders the list, and
 /// a drag or a remove rewrites the whole array in one recorded step, so undo
 /// takes back that one change and not the file.
-#[allow(clippy::too_many_arguments)]
 pub fn reference_list_rows(
     ui: &mut egui::Ui,
     asset_path: &str,
     root: &JsonValue,
     references: &[AssetReferenceField],
-    assets: &[AssetListing],
-    engine_assets: &[EngineAsset],
-    pending: &mut PendingEditorCommands,
-    session: &mut InspectorSession,
-    overlay_regions: &mut Vec<ShellRect>,
+    walk: &mut SettingsWalk<'_>,
 ) {
     let mut families: Vec<(String, String)> = references
         .iter()
@@ -200,11 +177,7 @@ pub fn reference_list_rows(
     families.sort();
     families.dedup();
     for (family, target) in families {
-        let entries = root
-            .get(&family)
-            .and_then(|list| list.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let entries = reference_entries(root, &family);
         let mut rows: Vec<egui::Rect> = Vec::new();
         // The block a drop reads its insertion point from: the heading, the
         // list's own rows and the row that appends one, so a release anywhere
@@ -217,22 +190,10 @@ pub fn reference_list_rows(
                         .color(style::text_muted()),
                 )
                 .on_hover_text("Drag a row to reorder the list");
-                for index in 0..entries.len() {
-                    let field =
-                        list_entry_field(references, &family, index, &entries[index], &target);
+                for (index, entry) in entries.iter().enumerate() {
+                    let field = list_entry_field(references, &family, index, entry, &target);
                     rows.push(reference_list_entry_row(
-                        ui,
-                        asset_path,
-                        root,
-                        &family,
-                        &entries,
-                        index,
-                        &field,
-                        assets,
-                        engine_assets,
-                        pending,
-                        session,
-                        overlay_regions,
+                        ui, asset_path, root, &family, index, &field, walk,
                     ));
                 }
                 // Appending is the picker of the entry one past the end: the
@@ -244,24 +205,21 @@ pub fn reference_list_rows(
                     nested: true,
                     label: None,
                 };
-                list_append_row(
-                    ui,
-                    asset_path,
-                    root,
-                    &append,
-                    assets,
-                    engine_assets,
-                    pending,
-                    session,
-                    overlay_regions,
-                );
+                list_append_row(ui, asset_path, root, &append, walk);
             })
             .response
             .rect;
-        list_drag_update(
-            ui, &family, &entries, &rows, block, asset_path, root, pending,
-        );
+        list_drag_update(ui, &family, &entries, &rows, block, asset_path, root, walk);
     }
+}
+
+/// The entries a reference family's list holds, cloned out of the settings
+/// document: what the family's block draws and what an entry's remove rewrites.
+pub fn reference_entries(root: &JsonValue, family: &str) -> Vec<JsonValue> {
+    root.get(family)
+        .and_then(|list| list.as_array())
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// The reference field one list entry draws: the one the snapshot expanded for
@@ -294,20 +252,14 @@ pub fn list_entry_field(
 /// a person grabs an entry by its name more often than by the handle - so the
 /// row moves wherever it is held, while a press that does not move still opens
 /// the picker. The row's rectangle is what a drop turns into an index.
-#[allow(clippy::too_many_arguments)]
 pub fn reference_list_entry_row(
     ui: &mut egui::Ui,
     asset_path: &str,
     root: &JsonValue,
     family: &str,
-    entries: &[JsonValue],
     index: usize,
     field: &AssetReferenceField,
-    assets: &[AssetListing],
-    engine_assets: &[EngineAsset],
-    pending: &mut PendingEditorCommands,
-    session: &mut InspectorSession,
-    overlay_regions: &mut Vec<ShellRect>,
+    walk: &mut SettingsWalk<'_>,
 ) -> egui::Rect {
     let key = field.key.as_str();
     let drag = ListEntryDrag {
@@ -355,15 +307,16 @@ pub fn reference_list_entry_row(
                 let button = button.interact(egui::Sense::click_and_drag());
                 button.dnd_set_drag_payload(drag);
                 if let Some(dropped) = dropped_asset_path(&button) {
-                    chosen = assets
+                    chosen = walk
+                        .assets
                         .iter()
                         .find(|row| row.key() == dropped)
                         .and_then(|row| row.guid.clone())
                         .map(Some);
                 }
                 if button.clicked() {
-                    session.settings_picker = Some(key.to_string());
-                    session.settings_search.clear();
+                    walk.session.settings_picker = Some(key.to_string());
+                    walk.session.settings_search.clear();
                     pill_core::info!(
                         target: pill_core::telemetry::telemetry_target::ENGINE,
                         slot = key,
@@ -385,27 +338,24 @@ pub fn reference_list_entry_row(
             },
         )
         .response;
-    if session.settings_picker.as_deref() == Some(key) {
+    if walk.session.settings_picker.as_deref() == Some(key) {
         if let Some(rect) = button_rect {
-            if let Some(reference) = reference_picker(
-                ui,
-                field,
-                assets,
-                engine_assets,
-                pending,
-                session,
-                overlay_regions,
-                rect,
-            ) {
-                session.settings_picker = None;
+            if let Some(reference) = reference_picker(ui, field, rect, walk) {
+                walk.session.settings_picker = None;
                 chosen = Some(reference);
             }
         }
     }
     if remove {
-        let mut fewer = entries.to_vec();
+        let mut fewer = reference_entries(root, family);
         fewer.remove(index);
-        settings_commit(pending, asset_path, root, family, JsonValue::Array(fewer));
+        settings_commit(
+            walk.pending,
+            asset_path,
+            root,
+            family,
+            JsonValue::Array(fewer),
+        );
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
             slot = key,
@@ -418,9 +368,9 @@ pub fn reference_list_entry_row(
             Some(guid) => JsonValue::String(guid),
             None => JsonValue::Null,
         };
-        settings_commit(pending, asset_path, root, key, value);
+        settings_commit(walk.pending, asset_path, root, key, value);
     }
-    remember_list_row_rect(session, asset_path, family, index, response.rect);
+    remember_list_row_rect(walk.session, asset_path, family, index, response.rect);
     response.rect
 }
 
@@ -429,17 +379,12 @@ pub fn reference_list_entry_row(
 ///
 /// Its label column stays empty so the button lines up with the rows above it,
 /// and it takes a file dragged from the Assets tab like any other picker.
-#[allow(clippy::too_many_arguments)]
 pub fn list_append_row(
     ui: &mut egui::Ui,
     asset_path: &str,
     root: &JsonValue,
     field: &AssetReferenceField,
-    assets: &[AssetListing],
-    engine_assets: &[EngineAsset],
-    pending: &mut PendingEditorCommands,
-    session: &mut InspectorSession,
-    overlay_regions: &mut Vec<ShellRect>,
+    walk: &mut SettingsWalk<'_>,
 ) {
     let mut chosen: Option<Option<String>> = None;
     let mut button_rect = None;
@@ -457,32 +402,24 @@ pub fn list_append_row(
                 egui::Button::new(icons::rich(icons::Icon::Plus, "Add")),
             );
             if let Some(dropped) = dropped_asset_path(&button) {
-                chosen = assets
+                chosen = walk
+                    .assets
                     .iter()
                     .find(|row| row.key() == dropped)
                     .and_then(|row| row.guid.clone())
                     .map(Some);
             }
             if button.clicked() {
-                session.settings_picker = Some(field.key.clone());
-                session.settings_search.clear();
+                walk.session.settings_picker = Some(field.key.clone());
+                walk.session.settings_search.clear();
             }
             button_rect = Some(button.rect);
         },
     );
-    if session.settings_picker.as_deref() == Some(field.key.as_str()) {
+    if walk.session.settings_picker.as_deref() == Some(field.key.as_str()) {
         if let Some(rect) = button_rect {
-            if let Some(reference) = reference_picker(
-                ui,
-                field,
-                assets,
-                engine_assets,
-                pending,
-                session,
-                overlay_regions,
-                rect,
-            ) {
-                session.settings_picker = None;
+            if let Some(reference) = reference_picker(ui, field, rect, walk) {
+                walk.session.settings_picker = None;
                 chosen = Some(reference);
             }
         }
@@ -492,7 +429,7 @@ pub fn list_append_row(
             Some(guid) => serde_json::json!({ "guid": guid }),
             None => JsonValue::Null,
         };
-        settings_commit(pending, asset_path, root, &field.key, value);
+        settings_commit(walk.pending, asset_path, root, &field.key, value);
     }
 }
 
@@ -504,6 +441,10 @@ pub fn list_append_row(
 /// drop target, so a release anywhere over the block counts - on a picker
 /// button, in a gap, or on the row that appends - which is what makes dropping
 /// between two rows work.
+// The parameters are one list's drawn state (`family`, `entries`, `rows`,
+// `block`), the settings document a drop commits into, and the walk. Grouping
+// them would name a type that exists only to satisfy the lint, so the allow
+// stays while the walk removes the borrow tail.
 #[allow(clippy::too_many_arguments)]
 pub fn list_drag_update(
     ui: &mut egui::Ui,
@@ -513,7 +454,7 @@ pub fn list_drag_update(
     block: egui::Rect,
     asset_path: &str,
     root: &JsonValue,
-    pending: &mut PendingEditorCommands,
+    walk: &mut SettingsWalk<'_>,
 ) {
     if !block.is_positive() {
         return;
@@ -563,7 +504,13 @@ pub fn list_drag_update(
     if moved == entries {
         return;
     }
-    settings_commit(pending, asset_path, root, family, JsonValue::Array(moved));
+    settings_commit(
+        walk.pending,
+        asset_path,
+        root,
+        family,
+        JsonValue::Array(moved),
+    );
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
         family,
@@ -926,17 +873,12 @@ pub fn reference_path<'a>(
 /// form. The same row serves a material's shader and its declared slots,
 /// because what differs between them is data; a list entry draws through
 /// [`reference_list_entry_row`], which keeps this row's picker.
-#[allow(clippy::too_many_arguments)]
 pub fn reference_row(
     ui: &mut egui::Ui,
     asset_path: &str,
     root: &JsonValue,
     field: &AssetReferenceField,
-    assets: &[AssetListing],
-    engine_assets: &[EngineAsset],
-    pending: &mut PendingEditorCommands,
-    session: &mut InspectorSession,
-    overlay_regions: &mut Vec<ShellRect>,
+    walk: &mut SettingsWalk<'_>,
 ) {
     let key = field.key.as_str();
     let label = settings_row_label(key);
@@ -956,15 +898,16 @@ pub fn reference_row(
             egui::Button::new(icons::rich(icons::Icon::Code, &text)).truncate(),
         );
         if let Some(dropped) = dropped_asset_path(&response) {
-            chosen = assets
+            chosen = walk
+                .assets
                 .iter()
                 .find(|row| row.key() == dropped)
                 .and_then(|row| row.guid.clone())
                 .map(Some);
         }
         if response.clicked() {
-            session.settings_picker = Some(key.to_string());
-            session.settings_search.clear();
+            walk.session.settings_picker = Some(key.to_string());
+            walk.session.settings_search.clear();
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,
                 slot = key,
@@ -987,32 +930,23 @@ pub fn reference_row(
         }
     });
 
-    if session.settings_picker.as_deref() == Some(key) {
+    if walk.session.settings_picker.as_deref() == Some(key) {
         if let Some(rect) = button_rect {
-            if let Some(reference) = reference_picker(
-                ui,
-                field,
-                assets,
-                engine_assets,
-                pending,
-                session,
-                overlay_regions,
-                rect,
-            ) {
-                session.settings_picker = None;
+            if let Some(reference) = reference_picker(ui, field, rect, walk) {
+                walk.session.settings_picker = None;
                 chosen = Some(reference);
             }
         }
     }
 
     if let Some(reference) = chosen {
-        session.settings_picker = None;
+        walk.session.settings_picker = None;
         let value = match reference {
             Some(guid) if field.nested => serde_json::json!({ "guid": guid }),
             Some(guid) => JsonValue::String(guid),
             None => JsonValue::Null,
         };
-        settings_commit(pending, asset_path, root, key, value);
+        settings_commit(walk.pending, asset_path, root, key, value);
     }
 }
 
@@ -1025,19 +959,14 @@ pub fn reference_row(
 /// open until the caller takes the choice. A list entry's picker offers no
 /// `None`: an entry leaves a list through its row's remove button, not by
 /// being emptied in place.
-#[allow(clippy::too_many_arguments)]
 pub fn reference_picker(
     ui: &mut egui::Ui,
     field: &AssetReferenceField,
-    assets: &[AssetListing],
-    engine_assets: &[EngineAsset],
-    pending: &mut PendingEditorCommands,
-    session: &mut InspectorSession,
-    overlay_regions: &mut Vec<ShellRect>,
     anchor: egui::Rect,
+    walk: &mut SettingsWalk<'_>,
 ) -> Option<Option<String>> {
     let key = field.key.as_str();
-    let current_path = reference_path(field, assets);
+    let current_path = reference_path(field, walk.assets);
     let clearable = reference_family(field).is_none();
     let mut chosen: Option<Option<String>> = None;
     let picker_id = egui::Id::new(("pill_editor_shell_egui.reference_picker", key.to_string()));
@@ -1046,7 +975,7 @@ pub fn reference_picker(
         picker_id,
         anchor,
         anchor.width().max(180.0),
-        overlay_regions,
+        walk.overlay_regions,
         &mut |ui| {
             egui::ScrollArea::vertical()
                 .max_height(inspector_fields::ASSET_PICKER_HEIGHT)
@@ -1054,8 +983,11 @@ pub fn reference_picker(
                     if clearable && ui.selectable_label(field.guid.is_none(), "None").clicked() {
                         chosen = Some(None);
                     }
-                    let (files, built) =
-                        inspector::picker_candidates(assets, engine_assets, Some(&field.target));
+                    let (files, built) = inspector::picker_candidates(
+                        walk.assets,
+                        walk.engine_assets,
+                        Some(&field.target),
+                    );
                     for candidate in files {
                         let current = current_path == Some(candidate.path.as_str());
                         ui.horizontal(|ui| {
@@ -1090,15 +1022,15 @@ pub fn reference_picker(
                                 .small_button("o")
                                 .on_hover_text("Show this asset in the Assets panel");
                             if focus.double_clicked() {
-                                pending.focus_asset(candidate.key());
-                                session.settings_picker = None;
+                                walk.pending.focus_asset(candidate.key());
+                                walk.session.settings_picker = None;
                                 pill_core::info!(
                                     target: pill_core::telemetry::telemetry_target::ENGINE,
                                     path = candidate.path.as_str(),
                                     "[editor] asset focused"
                                 );
                             } else if focus.clicked() {
-                                pending.focus_asset(candidate.key());
+                                walk.pending.focus_asset(candidate.key());
                             }
                         });
                     }
@@ -1127,7 +1059,7 @@ pub fn reference_picker(
     // was: a picker that only closes by picking fights the person who changed
     // their mind. The press that opens it landed on the button.
     if popup.pressed_outside {
-        session.settings_picker = None;
+        walk.session.settings_picker = None;
     }
     chosen
 }

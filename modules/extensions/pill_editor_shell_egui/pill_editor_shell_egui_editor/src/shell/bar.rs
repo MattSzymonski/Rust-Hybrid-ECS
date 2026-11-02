@@ -41,8 +41,7 @@ pub fn menu_bar(
         .show(ui, |ui| {
             let bar = ui.max_rect();
             let mut open_menu: Option<menubar::Menu> = None;
-            if session.bar != Some(bar) {
-                session.bar = Some(bar);
+            if session.geometry.remember_exact(MenubarSlot::Bar, bar) {
                 pill_core::info!(
                     target: pill_core::telemetry::telemetry_target::ENGINE,
                     x = bar.min.x,
@@ -72,8 +71,10 @@ pub fn menu_bar(
                         open_menu = Some(*menu);
                     }
                     let response = title.response;
-                    if session.titles[index] != Some(response.rect) {
-                        session.titles[index] = Some(response.rect);
+                    if session
+                        .geometry
+                        .remember_exact(MenubarSlot::Title(index), response.rect)
+                    {
                         pill_core::info!(
                             target: pill_core::telemetry::telemetry_target::ENGINE,
                             name = menu.name(),
@@ -130,21 +131,7 @@ pub fn menu_body(
                     egui::Button::selectable(checked.unwrap_or(false), label.as_str()),
                 );
                 let key = format!("{}/{}", menu.name(), label);
-                if session
-                    .entries
-                    .iter()
-                    .find(|(logged, _)| *logged == key)
-                    .is_none_or(|(_, rect)| *rect != response.rect)
-                {
-                    if let Some((_, rect)) = session
-                        .entries
-                        .iter_mut()
-                        .find(|(logged, _)| *logged == key)
-                    {
-                        *rect = response.rect;
-                    } else {
-                        session.entries.push((key, response.rect));
-                    }
+                if session.entries.remember_exact(key, response.rect) {
                     pill_core::info!(
                         target: pill_core::telemetry::telemetry_target::ENGINE,
                         menu = menu.name(),

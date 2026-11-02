@@ -183,6 +183,7 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
         let hovered = response.hovered();
         let selected = viewer.selection.entities().contains(&badge.entity);
         let key = format!("{view}:{}", badge.entity);
+        viewer.inspector.badge_seen.insert(key.clone());
         if remember_moved_rect(&mut viewer.inspector.badge_rects, &key, rect) {
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,

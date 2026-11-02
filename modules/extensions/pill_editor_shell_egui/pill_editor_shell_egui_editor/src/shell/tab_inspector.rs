@@ -60,13 +60,8 @@ pub fn inspector_tab(
     let subject = snapshot.detail.as_ref().map(|detail| detail.entity);
     if session.subject != subject {
         session.subject = subject;
-        session.rows_logged.clear();
-        session.section_rects.clear();
-        session.add_rect = None;
-        session.asset_row_texts.clear();
-        session.asset_row_rects.clear();
-        session.entity_row_texts.clear();
-        session.entity_row_rects.clear();
+        session.row_models.clear();
+        session.clear_geometry();
     }
     match snapshot.detail.as_ref() {
         Some(detail) => {
@@ -100,9 +95,9 @@ pub fn inspector_tab(
         // here can repoint it.
         if detail.row.read_only {
             // The one line that says the section refused to offer an edit,
-            // printed once per selected asset: the tab redraws every frame, so
-            // the notice alone is not something a suite could wait on.
-            if remember_inspector_row(session, &detail.key(), "asset-read-only", &[]) {
+            // printed once per asset per session: the tab redraws every frame,
+            // so the notice alone is not something a suite could wait on.
+            if session.notices_logged.insert(detail.key()) {
                 pill_core::info!(
                     target: pill_core::telemetry::telemetry_target::ENGINE,
                     asset = detail.key().as_str(),
@@ -166,7 +161,10 @@ pub fn inspector_header(
                         .active(session.add_open),
                 )
                 .on_hover_text("Add Component");
-            if session.add_rect != Some(button.rect) {
+            if session
+                .add_rect
+                .is_none_or(|logged| !LoggedRects::<String>::same_placement(logged, button.rect))
+            {
                 session.add_rect = Some(button.rect);
                 pill_core::info!(
                     target: pill_core::telemetry::telemetry_target::ENGINE,
@@ -334,13 +332,19 @@ pub fn entity_inspector(
             ui.add_space(4.0);
             continue;
         }
-        for row in inspector::rows(component) {
-            let targets = inspector_targets(snapshot, detail.entity, &component.type_name);
+        let (mut rows, targets) = inspector::take_component_rows(
+            session,
+            component,
+            &snapshot.selected_details,
+            detail.entity,
+        );
+        for cached in &mut rows {
             inspector_field_row(
                 ui,
                 detail.entity,
                 component,
-                &row,
+                &cached.row,
+                &mut cached.logged,
                 &targets,
                 &snapshot.selected_details,
                 &snapshot.assets,
@@ -351,6 +355,7 @@ pub fn entity_inspector(
                 overlay_regions,
             );
         }
+        inspector::store_component_rows(session, component.type_name.as_str(), rows, targets);
         ui.add_space(6.0);
     }
 }

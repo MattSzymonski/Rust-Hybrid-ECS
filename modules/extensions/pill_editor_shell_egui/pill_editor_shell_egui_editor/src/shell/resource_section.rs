@@ -50,14 +50,11 @@ pub fn queue_edit(
     field: &ResourceFieldView,
     value: FieldValue,
 ) {
+    let (command, label) = inspector::resource_edit(&view.name, &field.field, value);
     pending.push_recorded(
-        vec![EditorCommand::SetResourceField {
-            resource: view.name.clone(),
-            field: field.field.clone(),
-            value,
-        }],
-        format!("set {}.{}", view.name, field.field),
-        Some(format!("resource.{}.{}", view.name, field.field)),
+        vec![command],
+        label,
+        Some(inspector::resource_coalesce_key(&view.name, &field.field)),
     );
 }
 

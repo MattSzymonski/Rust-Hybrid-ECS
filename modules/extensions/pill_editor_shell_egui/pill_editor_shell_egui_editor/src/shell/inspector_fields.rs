@@ -8,7 +8,8 @@
 //! - `inspector_asset_row` and `inspector_entity_row`: a reference row - the
 //!   named target, its picker, its clear button and a drop target for an
 //!   asset or entity dragged out of another tab.
-//! - `remember_inspector_row` and `field_widget_name`: the once-per-row logging the suite asserts on.
+//! - `field_widget_name` and the row's `RowLogged` memory: the once-per-row
+//!   logging the suite asserts on.
 //! - `remember_asset_row_text`, `remember_asset_row_rect` and the entity row's
 //!   twins: a row's current text (logged per change) and its rectangle (logged
 //!   per placement), which the editor suite waits on.
@@ -19,16 +20,16 @@
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// Log one drawn Inspector row once per session.
+/// Log one drawn Inspector row's line once per subject.
 ///
-/// The gate and its line belong together: nine arms open with them, and each
-/// spelled the token and the field list itself. A macro rather than a function
-/// because the log's fields are typed - a `pixels` number and a `text` string
-/// must reach the log as themselves - and because the patch scanner lists every
-/// module-level function of this crate.
+/// The gate is the row's own memory: its position in the session's cached
+/// model is its identity, so no key is rebuilt and nothing is allocated. A
+/// macro rather than a function because the log's fields are typed - a
+/// `pixels` number and a `text` string must reach the log as themselves.
 macro_rules! log_row_once {
-    ($session:expr, $type_name:expr, $kind:literal, [$($part:expr),* $(,)?], $($field:tt)*) => {
-        if remember_inspector_row($session, $type_name, $kind, &[$($part),*]) {
+    ($logged:expr, $flag:expr, $type_name:expr, $kind:literal, $($field:tt)*) => {
+        if !$logged.has($flag) {
+            $logged.mark($flag);
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,
                 component = $type_name,
@@ -52,6 +53,7 @@ pub fn inspector_field_row(
     entity: Entity,
     component: &ComponentView,
     row: &inspector::FieldRow,
+    logged: &mut inspector::RowLogged,
     targets: &[Entity],
     details: &[EntityDetail],
     assets: &[AssetListing],
@@ -65,10 +67,10 @@ pub fn inspector_field_row(
     match row {
         inspector::FieldRow::Header { text } => {
             log_row_once!(
-                session,
+                logged,
+                inspector::RowLogged::ROW,
                 type_name,
                 "header",
-                [text.as_str()],
                 text = text.as_str(),
             );
             ui.add_space(6.0);
@@ -77,10 +79,10 @@ pub fn inspector_field_row(
         }
         inspector::FieldRow::Space { pixels } => {
             log_row_once!(
-                session,
+                logged,
+                inspector::RowLogged::ROW,
                 type_name,
                 "space",
-                [&pixels.to_string()],
                 pixels = *pixels,
             );
             ui.add_space(*pixels);
@@ -97,23 +99,19 @@ pub fn inspector_field_row(
             let tooltip = tooltip.as_deref();
             if row_is_mixed(details, type_name, *index, value) {
                 log_row_once!(
-                    session,
+                    logged,
+                    inspector::RowLogged::MIXED,
                     type_name,
                     "mixed",
-                    [field.as_str()],
                     field = field.as_str(),
                     entities = targets.len(),
                 );
             }
             log_row_once!(
-                session,
+                logged,
+                inspector::RowLogged::ROW,
                 type_name,
                 "field",
-                [
-                    field.as_str(),
-                    field_widget_name(widget),
-                    tooltip.unwrap_or_default(),
-                ],
                 field = field.as_str(),
                 widget = field_widget_name(widget),
                 tooltip = tooltip.unwrap_or_default(),
@@ -183,19 +181,19 @@ pub fn inspector_field_row(
                 &FieldValue::Array(values.clone()),
             ) {
                 log_row_once!(
-                    session,
+                    logged,
+                    inspector::RowLogged::MIXED,
                     type_name,
                     "mixed",
-                    [field.as_str()],
                     field = field.as_str(),
                     entities = targets.len(),
                 );
             }
             log_row_once!(
-                session,
+                logged,
+                inspector::RowLogged::ROW,
                 type_name,
                 "vector",
-                [field.as_str(), tooltip.as_deref().unwrap_or_default()],
                 field = field.as_str(),
                 tooltip = tooltip.as_deref().unwrap_or_default(),
             );
@@ -240,10 +238,10 @@ pub fn inspector_field_row(
         } => {
             let values = leaf_values(component, leaves);
             log_row_once!(
-                session,
+                logged,
+                inspector::RowLogged::ROW,
                 type_name,
                 "color",
-                [field.as_str(), tooltip.as_deref().unwrap_or_default()],
                 field = field.as_str(),
                 channels = leaves.len(),
                 tooltip = tooltip.as_deref().unwrap_or_default(),
@@ -307,18 +305,13 @@ pub fn inspector_field_row(
             field,
             tooltip,
         } => {
-            // The grouped row is a second shape under the same token; its
-            // signature carries the shape so it is not deduped against the
-            // ungrouped vector row of the same field.
+            // The row's own memory keeps the grouped and ungrouped shapes
+            // apart: they are two rows, so each logs its own line.
             log_row_once!(
-                session,
+                logged,
+                inspector::RowLogged::ROW,
                 type_name,
                 "vector",
-                [
-                    field.as_str(),
-                    tooltip.as_deref().unwrap_or_default(),
-                    "group",
-                ],
                 field = field.as_str(),
                 axes = leaves.len(),
                 tooltip = tooltip.as_deref().unwrap_or_default(),
@@ -409,10 +402,10 @@ pub fn inspector_field_row(
                 return;
             };
             log_row_once!(
-                session,
+                logged,
+                inspector::RowLogged::ROW,
                 type_name,
                 "read-only",
-                [field.as_str(), tooltip.as_deref().unwrap_or_default()],
                 field = field.as_str(),
                 tooltip = tooltip.as_deref().unwrap_or_default(),
             );
@@ -855,22 +848,7 @@ pub fn inspector_entity_row(
 /// Record the entity an entity row draws, returning whether it changed since
 /// the last frame that drew the row.
 pub fn remember_entity_row_text(session: &mut InspectorSession, key: &str, text: &str) -> bool {
-    if let Some((_, logged)) = session
-        .entity_row_texts
-        .iter_mut()
-        .find(|(logged_key, _)| logged_key == key)
-    {
-        if logged == text {
-            return false;
-        }
-        logged.clear();
-        logged.push_str(text);
-        return true;
-    }
-    session
-        .entity_row_texts
-        .push((key.to_owned(), text.to_owned()));
-    true
+    session.entity_row_texts.remember(key.to_owned(), text)
 }
 
 /// Log an entity row's rectangle once per placement, keyed by
@@ -908,29 +886,21 @@ pub fn remember_entity_row_rect(
 /// Record `rect` as `key`'s placement, returning it when that is a placement
 /// the log has not named yet.
 ///
-/// Rectangles compare in whole points: a panel that re-lays itself out with a
-/// fraction of a point of jitter sits in the same place, and a line per frame
-/// of that is what turned the row tokens into noise. A row that leaves the
-/// visible area keeps its last placement, so it does not log again when it
-/// scrolls back to where it was.
+/// The comparison is [`LoggedRects`]'s, so a row and a section header cannot
+/// disagree about what counts as moved. A row that leaves the visible area
+/// keeps its last placement, so it does not log again when it scrolls back to
+/// where it was.
 pub fn record_row_placement(
-    logged: &mut Vec<(String, egui::Rect)>,
+    logged: &mut LoggedRects<String>,
     key: &str,
     rect: egui::Rect,
 ) -> Option<egui::Rect> {
-    let quantized = egui::Rect::from_min_max(
-        egui::pos2(rect.min.x.round(), rect.min.y.round()),
-        egui::pos2(rect.max.x.round(), rect.max.y.round()),
-    );
-    if let Some((_, previous)) = logged.iter_mut().find(|(logged_key, _)| logged_key == key) {
-        if *previous == quantized {
-            return None;
-        }
-        *previous = quantized;
-        return Some(quantized);
-    }
-    logged.push((key.to_owned(), quantized));
-    Some(quantized)
+    logged.remember(key.to_owned(), rect).then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(rect.min.x.round(), rect.min.y.round()),
+            egui::pos2(rect.max.x.round(), rect.max.y.round()),
+        )
+    })
 }
 
 /// Record the asset an asset row draws, returning whether it changed since
@@ -938,22 +908,7 @@ pub fn record_row_placement(
 /// first draw and on every change, so a suite can wait for a pick to show up
 /// and for an undo to bring the previous asset back.
 pub fn remember_asset_row_text(session: &mut InspectorSession, key: &str, text: &str) -> bool {
-    if let Some((_, logged)) = session
-        .asset_row_texts
-        .iter_mut()
-        .find(|(logged_key, _)| logged_key == key)
-    {
-        if logged == text {
-            return false;
-        }
-        logged.clear();
-        logged.push_str(text);
-        return true;
-    }
-    session
-        .asset_row_texts
-        .push((key.to_owned(), text.to_owned()));
-    true
+    session.asset_row_texts.remember(key.to_owned(), text)
 }
 
 /// Log an asset row's rectangle once per placement, keyed by
@@ -1070,25 +1025,9 @@ pub fn queue_element_edit(
     index: usize,
     value: FieldValue,
 ) {
-    let mut commands = Vec::with_capacity(targets.len());
-    let mut label = String::new();
-    for target in targets {
-        let (command, step_label) =
-            inspector::element_edit(*target, type_name, field, index, value.clone());
-        if label.is_empty() {
-            label = step_label;
-        }
-        commands.push(command);
-    }
-    pending.push_recorded(
-        commands,
-        label,
-        Some(inspector::field_coalesce_key(
-            entity,
-            type_name,
-            &format!("{field}[{index}]"),
-        )),
-    );
+    let (commands, label, key) =
+        inspector::selection_element_edit(targets, entity, type_name, field, index, value);
+    pending.push_recorded(commands, label, Some(key));
 }
 
 /// Whether the selected entities disagree on this row's value.
@@ -1106,27 +1045,6 @@ pub fn row_is_mixed(
             .and_then(|view| view.values.get(index))
             .is_some_and(|other| other != value)
     })
-}
-
-/// Note one Inspector row's signature, answering whether it is new, so a
-/// panel that redraws every frame does not flood the log with the same row.
-///
-/// The signature is built here from the component, the row's kind and its
-/// distinguishing parts, so no call site joins a `|`-string by hand.
-pub fn remember_inspector_row(
-    session: &mut InspectorSession,
-    type_name: &str,
-    kind: &str,
-    parts: &[&str],
-) -> bool {
-    let mut signature = format!("{type_name}|{kind}");
-    for part in parts {
-        signature.push('|');
-        signature.push_str(part);
-    }
-    // One lookup, not a scan: the set grows with the subject's component model,
-    // and the answer only changes on the first draw of a row.
-    session.rows_logged.insert(signature)
 }
 
 /// The wire name a row's widget logs under, so suites can assert what the

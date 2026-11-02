@@ -309,18 +309,9 @@ pub fn engine_badge(ui: &mut egui::Ui) {
 /// Note one keyed rectangle, answering whether it is new or has moved, so a
 /// section that shifts as the panel grows or collapses reports its place
 /// again instead of leaving a stale one in the log.
-pub fn remember_moved_rect(
-    logged: &mut Vec<(String, egui::Rect)>,
-    key: &str,
-    rect: egui::Rect,
-) -> bool {
-    if let Some(entry) = logged.iter_mut().find(|(name, _)| name == key) {
-        if entry.1 == rect {
-            return false;
-        }
-        entry.1 = rect;
-        return true;
-    }
-    logged.push((key.to_string(), rect));
-    true
+///
+/// Pixel-exact: a section header is an anchor a suite clicks, so half a point
+/// of drift is a different target and not the same placement.
+pub fn remember_moved_rect(logged: &mut LoggedRects<String>, key: &str, rect: egui::Rect) -> bool {
+    logged.remember_exact(key.to_owned(), rect)
 }

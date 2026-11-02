@@ -102,8 +102,7 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
     }
     viewer.toolbox.set_faces(view, faces);
     viewer.overlay_regions.push(shell_rect(panel));
-    if viewer.toolbox.logged(view) != Some(panel) {
-        viewer.toolbox.set_logged(view, panel);
+    if viewer.toolbox.remember_logged(view, panel) {
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
             view,

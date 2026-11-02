@@ -34,18 +34,9 @@ pub fn remember_hierarchy_row_rect(
     rect: egui::Rect,
 ) {
     let key = entity.to_string();
-    match session
-        .hierarchy_row_rects
-        .iter_mut()
-        .find(|(logged, _)| *logged == key)
-    {
-        Some((_, logged)) => {
-            if *logged == rect {
-                return;
-            }
-            *logged = rect;
-        }
-        None => session.hierarchy_row_rects.push((key, rect)),
+    session.hierarchy_seen.insert(key.clone());
+    if !session.hierarchy_row_rects.remember_exact(key, rect) {
+        return;
     }
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
