@@ -74,25 +74,19 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
         egui::TextStyle::Small.resolve(ui.style()),
         style::text_muted(),
     );
-    // The rows wear the kit's chunky face: the panel floats over the scene, so
-    // its buttons are the one place the editor draws the brutalist look the
-    // theme's tokens describe. The face is narrower than the row it sits in -
-    // the shadow's offset is part of the button's own size - so it is centred
-    // in the row and its rectangle is recorded for the scripted suite, which
-    // clicks the face rather than the row.
-    let theme = style::current_theme();
+    // The rows are ordinary buttons, each filling its row's width, so the panel
+    // reads as one column of controls: a selected row takes the theme's
+    // selection colour and the rest stay at the widget's idle fill. A row's
+    // rectangle is recorded for the scripted suite, which clicks its centre.
     let mut faces = Vec::with_capacity(toolbox::TOOLBOX_ITEMS.len());
     for item in toolbox::TOOLBOX_ITEMS {
         let rect = toolbox::item_rect(item, origin);
         let button = ui
             .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                    ui.add(
-                        kit::ChunkyButton::new(item.label(&state), &theme)
-                            .selected(item.active(&state)),
-                    )
-                })
-                .inner
+                ui.add_sized(
+                    rect.size(),
+                    egui::Button::new(item.label(&state)).selected(item.active(&state)),
+                )
             })
             .inner;
         faces.push(button.rect);

@@ -1056,11 +1056,11 @@ fn a_vectors_components_keep_one_width() {
     );
 }
 
-/// The floating toolbox's rows wear the kit's chunky face: the face is the
-/// theme's raised fill on a shadow of the line colour, it is narrower than the
-/// row it sits in, and a click on it still queues the row's command.
+/// The floating toolbox's rows are ordinary buttons, each one as wide as its
+/// row: the panel reads as one column of controls, an active row takes the
+/// theme's selection colour, and a click still queues the row's command.
 #[test]
-fn the_toolbox_rows_wear_the_chunky_face() {
+fn the_toolbox_rows_fill_their_width() {
     /// Draw the toolbox over a viewport-sized screen, one frame.
     fn draw(
         context: &egui::Context,
@@ -1136,40 +1136,33 @@ fn the_toolbox_rows_wear_the_chunky_face() {
                 .expect("every row drew its face this pass")
         })
         .collect();
-    let origin = toolbox::default_origin(egui::Rect::from_min_size(
-        egui::Pos2::ZERO,
-        egui::vec2(1280.0, 720.0),
-    ));
+    // The panel anchors off the viewport's own corner, which sits inside the
+    // central panel's margin, so the test reads the origin back from the first
+    // row it drew rather than assuming the screen's corner.
+    let origin = faces[0].min
+        - egui::vec2(
+            toolbox::TOOLBOX_PADDING,
+            toolbox::TOOLBOX_HANDLE_HEIGHT + toolbox::TOOLBOX_ITEM_GAP,
+        );
     for (item, face) in toolbox::TOOLBOX_ITEMS.iter().zip(&faces) {
         let row = toolbox::item_rect(*item, origin);
         assert!(
             row.contains_rect(*face),
-            "{}'s face {face:?} is not inside its row {row:?}",
+            "{}'s button {face:?} is not inside its row {row:?}",
             item.name()
         );
         assert!(
-            face.width() < row.width(),
-            "{}'s face is the chunky button's own size, not the row's: {face:?}",
+            (face.width() - row.width()).abs() < 0.5,
+            "{}'s button takes the whole row's width: {face:?} in {row:?}",
             item.name()
         );
     }
 
-    // The face is the kit's: the active row (the default tool) wears the
-    // accent fill, a neutral row the raised one. A face is its allocated
-    // rectangle shrunk by the shadow offset, and the shadow is that rectangle
-    // translated back onto the allocation, so the shadow sits below and right
-    // of the fill.
+    // The active row (the default tool) is painted with the theme's selection
+    // colour by egui's own button, and a row at rest is not.
     let first = faces[0];
     let neutral = faces[1];
-    let active_face = first.shrink(pill_editor_core::kit::SHADOW_OFFSET);
-    let neutral_face = neutral.shrink(pill_editor_core::kit::SHADOW_OFFSET);
-    let neutral_shadow = neutral_face.translate(egui::vec2(
-        pill_editor_core::kit::SHADOW_OFFSET,
-        pill_editor_core::kit::SHADOW_OFFSET,
-    ));
-    let mut accented = 0;
-    let mut raised = 0;
-    let mut shadowed = 0;
+    let selection_fill = palette.selection;
     let mut output = context.run_ui(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1218,26 +1211,26 @@ fn the_toolbox_rows_wear_the_chunky_face() {
         },
     );
     output.textures_delta.clear();
-    for clipped in &output.shapes {
-        let egui::Shape::Rect(rect) = &clipped.shape else {
-            continue;
-        };
-        if rect.stroke.width != 0.0 {
-            continue;
-        }
-        if rect.rect == active_face && rect.fill == palette.accent {
-            accented += 1;
-        }
-        if rect.rect == neutral_face && rect.fill == palette.panel_raised {
-            raised += 1;
-        }
-        if rect.rect == neutral_shadow && rect.fill == palette.line {
-            shadowed += 1;
-        }
-    }
-    assert_eq!(accented, 1, "the active row's face is the accent fill");
-    assert_eq!(raised, 1, "a neutral row's face is the raised fill");
-    assert_eq!(shadowed, 1, "the face sits on a shadow of the line colour");
+    // A painted fill counts for a row when it covers that row's width, so the
+    // panel's own background (narrower than a row) never matches.
+    let painted = |face: egui::Rect, fill: egui::Color32| {
+        output.shapes.iter().any(|clipped| match &clipped.shape {
+            egui::Shape::Rect(rect) => {
+                rect.fill == fill
+                    && rect.rect.intersects(face)
+                    && rect.rect.width() >= face.width() - 2.0
+            }
+            _ => false,
+        })
+    };
+    assert!(
+        painted(first, selection_fill),
+        "the active row's button takes the selection colour"
+    );
+    assert!(
+        !painted(neutral, selection_fill),
+        "a row at rest is not painted as the selection"
+    );
 
     // A press and a release on the face still queue the row's command.
     let center = first.center();

@@ -35,23 +35,24 @@ use crate::icons::Icon;
 // Geometry
 // =============================================================================
 
-/// The panel's width, in logical points: wide enough for a row's icon, its
-/// label and the button padding.
-pub const TOOLBOX_WIDTH: f32 = 124.0;
+/// The panel's width, in logical points: one button across the panel, wide
+/// enough for the longest row's label and the button padding.
+pub const TOOLBOX_WIDTH: f32 = 128.0;
 
 /// The gap between the panel and the viewport's edges: the default anchor
 /// and the clamp both keep it, so a dragged toolbox never touches the edge.
 pub const TOOLBOX_MARGIN: f32 = 10.0;
 
 /// The drag handle's height: the panel's full-width top strip.
-pub const TOOLBOX_HANDLE_HEIGHT: f32 = 16.0;
+pub const TOOLBOX_HANDLE_HEIGHT: f32 = 18.0;
 
 /// The gap between the handle and the first row, and between two rows.
-pub const TOOLBOX_ITEM_GAP: f32 = 4.0;
+pub const TOOLBOX_ITEM_GAP: f32 = 3.0;
 
-/// One row's height: tall enough for the kit's chunky face (32 points) with a
-/// little air above and below it, since the panel's rows wear that face.
-pub const TOOLBOX_ITEM_HEIGHT: f32 = 44.0;
+/// One row's height: a stock button's height, so the rows read as one column
+/// of ordinary buttons.
+pub const TOOLBOX_ITEM_HEIGHT: f32 = 24.0;
+
 /// The inset between a row and the panel's sides, and below the last row.
 pub const TOOLBOX_PADDING: f32 = 6.0;
 
