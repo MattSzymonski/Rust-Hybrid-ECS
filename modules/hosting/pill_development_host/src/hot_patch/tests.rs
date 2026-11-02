@@ -114,8 +114,8 @@ fn system_declaration(name: &str) -> source::HotFunction {
         signature: format!("fn {name}()"),
         cfg_gated: false,
         inline_always: false,
-        abi_entry_point: false,
-        annotated: true,
+        is_abi_entry_point: false,
+        is_annotated: true,
     }
 }
 
@@ -131,8 +131,8 @@ fn plain_declaration(name: &str) -> source::HotFunction {
         signature: format!("fn {name}()"),
         cfg_gated: false,
         inline_always: false,
-        abi_entry_point: false,
-        annotated: true,
+        is_abi_entry_point: false,
+        is_annotated: true,
     }
 }
 
@@ -402,8 +402,8 @@ fn a_method_is_named_through_its_type() {
         signature: "fn mix(&self, other: Tint) -> Tint".to_string(),
         cfg_gated: false,
         inline_always: false,
-        abi_entry_point: false,
-        annotated: false,
+        is_abi_entry_point: false,
+        is_annotated: false,
     };
 
     assert_eq!(
@@ -437,8 +437,8 @@ fn a_trait_method_is_named_through_its_trait() {
         signature: "fn default() -> Self".to_string(),
         cfg_gated: false,
         inline_always: false,
-        abi_entry_point: false,
-        annotated: false,
+        is_abi_entry_point: false,
+        is_annotated: false,
     };
 
     assert_eq!(
@@ -553,8 +553,8 @@ fn size(&self) -> u32 { 222 }\n}\n";
         signature: "fn size(&self) -> u32".to_string(),
         cfg_gated: false,
         inline_always: false,
-        abi_entry_point: false,
-        annotated: false,
+        is_abi_entry_point: false,
+        is_annotated: false,
     };
     let generated_source = session
         .generate(
@@ -598,8 +598,8 @@ fn a_slot_lookup_omits_the_type_the_macro_cannot_see() {
         signature: "fn get_color_a(&self) -> f32".to_string(),
         cfg_gated: false,
         inline_always: false,
-        abi_entry_point: false,
-        annotated: true,
+        is_abi_entry_point: false,
+        is_annotated: true,
     };
 
     assert_eq!(

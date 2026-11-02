@@ -1157,7 +1157,7 @@ impl HotPatchSession {
             // module it depends on, and so does every other module that links
             // it. Offering the replacement to all of them is what avoids the
             // cascading project reload this edit would otherwise trigger.
-            source::HotFunctionKind::PlainFunction if !declaration.annotated => {
+            source::HotFunctionKind::PlainFunction if !declaration.is_annotated => {
                 let found_address = resolve_patch_address(library)
                     .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
                 prologue_restores = prologue_patch_everywhere(
@@ -1205,7 +1205,7 @@ impl HotPatchSession {
             // The form the delivering route looks up, so a rollback asks the
             // same question the install did.
             lookup_name: match function_kind {
-                source::HotFunctionKind::PlainFunction if declaration.annotated => {
+                source::HotFunctionKind::PlainFunction if declaration.is_annotated => {
                     slot_name.to_string()
                 }
                 _ => qualified.to_string(),
@@ -1285,7 +1285,7 @@ impl HotPatchSession {
         // needs no slot, no descriptor and no signature text. It exports one
         // address, and the host writes a jump to it. A method still goes into a
         // local trait so its body can keep using `self`.
-        if !declaration.annotated {
+        if !declaration.is_annotated {
             let (definition, address_expression) = if declaration.takes_receiver {
                 let self_type = declaration
                     .self_type

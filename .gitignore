@@ -54,6 +54,7 @@ __pycache__/
 .agents/*
 .claude/*
 .github/skills/*
+.github/instructions/*
 AGENTS.md
 .github/copilot-instructions.md
 
