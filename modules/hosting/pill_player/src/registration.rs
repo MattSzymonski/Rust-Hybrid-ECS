@@ -35,10 +35,16 @@ pub fn extension_owner(index: usize) -> SystemOwner {
     SystemOwner::extension(index)
 }
 
-/// The owner of the renderer: the next one after the `extension_count`
-/// extensions, as if it were one more extension.
-pub fn renderer_owner(extension_count: usize) -> SystemOwner {
-    SystemOwner::extension(extension_count)
+/// The owner of the systems a renderer registers.
+///
+/// Reserved by the engine rather than taken as "one past the extensions"
+/// ([`SystemOwner::RENDERER`]). A host that skipped an extension keeps that
+/// module's owner in reserve until it loads, so a count of the loaded
+/// extensions does not name the next free index - deriving the renderer's owner
+/// from it aliased the pending module's, and a reload of either subject then
+/// cleared the other's systems.
+pub fn renderer_owner() -> SystemOwner {
+    SystemOwner::RENDERER
 }
 
 // =============================================================================
@@ -75,15 +81,19 @@ pub fn register_module(
 mod tests {
     use super::*;
 
-    /// Extensions are one-based, and the renderer takes the owner after the
-    /// last one.
+    /// Extensions are one-based, and the renderer's owner is reserved outside
+    /// the extension range whatever the host loaded.
     #[test]
     fn owners_follow_the_load_order() {
         for index in 0..4usize {
             assert_eq!(extension_owner(index).0, index as u64 + 1);
+            assert_ne!(renderer_owner(), extension_owner(index));
+            assert_eq!(extension_owner(index).extension_index(), Some(index));
         }
-        assert_eq!(renderer_owner(3), extension_owner(3));
-        assert_ne!(renderer_owner(3), SystemOwner::PROJECT);
+        assert_eq!(renderer_owner(), SystemOwner::RENDERER);
+        assert_eq!(renderer_owner().extension_index(), None);
+        assert_ne!(renderer_owner(), SystemOwner::PROJECT);
+        assert_ne!(renderer_owner(), SystemOwner::ENGINE);
     }
 
     /// A scoped entry point's status is returned, and the unscoped path still

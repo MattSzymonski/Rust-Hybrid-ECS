@@ -30,7 +30,7 @@ metrics = { version = "0.24", optional = true }
 
 [features]
 # A windowed runtime: attaching a renderer to a window and drawing frames.
-# Without it the runtime names no renderer attach path at all.
+# Without it the player names no renderer attach path at all.
 rendering = []
 # Route profiling spans to Tracy through the shared telemetry stack.
 profiling = ["pill_engine/profiling", "pill_core/tracy"]

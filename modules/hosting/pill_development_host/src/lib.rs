@@ -6,7 +6,7 @@
 //! - Builds and loads native or C# project modules and the extensions.
 //! - Watches project sources and coordinates safe hot reloads, around the
 //!   frames the wrapped [`pill_player::Runtime`] runs.
-//! - Exposes [`setup`], [`run_one_frame`] and, windowed, [`setup_rendering`] /
+//! - Exposes [`setup`], [`run_frame`] and, windowed, [`setup_rendering`] /
 //!   [`attach_renderer`] to frontends, which own their event loops and drive
 //!   the host through [`FrameDriver`].
 //!
@@ -128,7 +128,7 @@ pub use asset_browser::{standalone_file_name, standalone_types, AssetEntry, Stan
 pub use hot_patch::PatchGeneration;
 /// The development host and the headless entry points that drive one.
 #[cfg(feature = "hot_reload")]
-pub use runtime::{run_one_frame, setup, DevHost};
+pub use runtime::{run_frame, setup, DevHost};
 
 /// `EngineError` has no rendering variants, so it is available to headless
 /// frontends too.

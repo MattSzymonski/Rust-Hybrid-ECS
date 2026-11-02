@@ -42,6 +42,7 @@ use pill_core::{error, info, warn};
 use pill_input::winit_events::{translate_device_event, translate_window_event};
 use pill_player::{
     report_failure, FrameDriver, RenderingRuntime, Runtime, StaticProject, SurfaceId,
+    WindowedFrameDriver,
 };
 use wasm_bindgen::JsCast;
 use web_sys::HtmlCanvasElement;

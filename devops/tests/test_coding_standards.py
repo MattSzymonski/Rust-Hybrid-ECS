@@ -182,13 +182,14 @@ USE_PATH_PATTERN = re.compile(r"^use\s+([A-Za-z0-9_:]+)")
 USE_STANDARD_ROOTS = frozenset({"std", "core", "alloc"})
 USE_CRATE_ROOTS = frozenset({"crate", "super", "self"})
 
-# The import-group content rule covers the renderer. The rest of the
-# repository still carries imports under the wrong header; widening this is
+# The import-group content rule covers the renderer and the player. The rest of
+# the repository still carries imports under the wrong header; widening this is
 # tracked as follow-up work, and the order rule above keeps gating every
 # crate in the meantime.
 IMPORT_GROUP_CONTENT_SCOPE = (
     "modules/extensions/pill_master_renderer/",
     "modules/rendering/",
+    "modules/hosting/pill_player/",
 )
 
 # Shader sources carry the same comment ban as Rust sources.

@@ -78,10 +78,24 @@ impl SystemOwner {
         Self(index as u64 + 1)
     }
 
-    /// The extension index this owner encodes, or `None` for the project and
-    /// the engine.
+    /// Owner of the systems a renderer registers.
+    ///
+    /// Reserved rather than taken from the extension range. A host that skips an
+    /// extension keeps that module's owner in reserve until it loads - the
+    /// editor's safe mode retries it - so a count of the extensions that *did*
+    /// load does not name the next free index, and an owner derived from it can
+    /// alias the pending module's. Two subjects under one owner would let a
+    /// reload of either clear the other's systems, and let a stale-suspension
+    /// resume reach a renderer paused against a replaced component layout.
+    ///
+    /// `u64::MAX - 1`, which no [`Self::extension`] index reaches, nor
+    /// [`Self::PROJECT`] nor [`Self::ENGINE`].
+    pub const RENDERER: Self = Self(u64::MAX - 1);
+
+    /// The extension index this owner encodes, or `None` for the project, the
+    /// renderer and the engine.
     pub fn extension_index(self) -> Option<usize> {
-        if self == Self::PROJECT || self == Self::ENGINE {
+        if self == Self::PROJECT || self == Self::ENGINE || self == Self::RENDERER {
             None
         } else {
             Some((self.0 - 1) as usize)
@@ -90,11 +104,12 @@ impl SystemOwner {
 }
 
 impl std::fmt::Display for SystemOwner {
-    /// `project`, `engine`, or `extension <n>` - the one place a consumer
-    /// turns an owner into text.
+    /// `project`, `renderer`, `engine`, or `extension <n>` - the one place a
+    /// consumer turns an owner into text.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.extension_index() {
             None if *self == Self::PROJECT => formatter.write_str("project"),
+            None if *self == Self::RENDERER => formatter.write_str("renderer"),
             None => formatter.write_str("engine"),
             Some(index) => write!(formatter, "extension {index}"),
         }

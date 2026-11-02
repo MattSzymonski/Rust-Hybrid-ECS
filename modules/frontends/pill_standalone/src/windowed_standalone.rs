@@ -36,7 +36,7 @@ use pill_core::info;
 use pill_core::telemetry::telemetry_target;
 use pill_input::gamepads::Gamepads;
 use pill_input::winit_events::{translate_device_event, translate_window_event};
-use pill_player::{report_failure, FrameDriver};
+use pill_player::{report_failure, FrameDriver, WindowedFrameDriver};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -301,7 +301,7 @@ impl ApplicationHandler for WindowedApplication {
             }
             WindowEvent::Resized(size) => {
                 if let Some(driver) = &mut self.driver {
-                    FrameDriver::resize_surface(
+                    WindowedFrameDriver::resize_surface(
                         driver,
                         pill_player::SurfaceId::PRIMARY,
                         size.width,

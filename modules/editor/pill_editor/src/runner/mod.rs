@@ -89,6 +89,7 @@ use pill_input::winit_events::translate_window_event;
 use pill_player::{
     editor_view_surfaces, CameraBinding, CameraComponent, FrameDriver, PickHit, PickRequests,
     PickResults, SelectionOutlines, SurfaceCameras, SurfaceId, SurfaceOptions, TransformComponent,
+    WindowedFrameDriver,
 };
 use pill_ui_theme::{load_overrides, ThemeOverrides, ThemePathScope};
 use winit::application::ApplicationHandler;

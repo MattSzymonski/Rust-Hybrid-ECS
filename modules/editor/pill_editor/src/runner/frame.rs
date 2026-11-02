@@ -219,7 +219,7 @@ impl EditorWindow {
         // Step 6: run the world frame; the shell's egui pass runs inside it
         // (a registered post-update system) and leaves the frame resource
         // for presentation.
-        self.host.run_one_frame().map_err(EditorError::Renderer)?;
+        self.host.run_frame().map_err(EditorError::Renderer)?;
         Ok(())
     }
 

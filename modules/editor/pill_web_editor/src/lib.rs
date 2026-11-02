@@ -52,6 +52,7 @@ use pill_engine_core::input::InputEvent;
 use pill_input::winit_events::translate_window_event;
 use pill_player::{
     report_failure, FrameDriver, RenderingRuntime, Runtime, StaticProject, SurfaceId,
+    WindowedFrameDriver,
 };
 use pill_web::{find_canvas, focus_without_scrolling, physical_size, start_project};
 use web_sys::HtmlCanvasElement;

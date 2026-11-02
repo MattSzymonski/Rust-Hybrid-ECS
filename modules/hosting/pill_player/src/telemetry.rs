@@ -13,7 +13,7 @@
 //!
 //! # Design
 //!
-//! This crate is the runtime every executable links, so it owns the
+//! This crate is what every executable links, so it owns the
 //! executable-facing telemetry entry point and every frontend shares one
 //! setup. Logging verbosity (terminal and file) is independent of Tracy:
 //! `profile::*` spans are routed only when the `profiling` feature is active,
@@ -30,14 +30,12 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 // External crates
-use tracing::level_filters::LevelFilter;
-
-// Current crate
 use pill_core::telemetry::{
     set_show_source_location, set_timestamp_format, telemetry_target, LoggingConfig,
     TelemetryBuilder, TelemetryError, TelemetryHandles, TimestampFormat, DEV_LOG_TARGET,
 };
 use pill_core::utils::format_error_chain;
+use tracing::level_filters::LevelFilter;
 
 // =============================================================================
 // Shared State
@@ -91,7 +89,10 @@ impl LoggingSettings {
     /// # Errors
     ///
     /// Returns a message naming the accepted values for anything else.
-    pub fn parse_level(text: &str) -> Result<LevelFilter, String> {
+    ///
+    /// Private: [`Self::from_text`] is the one door both host tiers come
+    /// through, so neither can grow its own spelling of these checks.
+    fn parse_level(text: &str) -> Result<LevelFilter, String> {
         match text.trim().to_ascii_lowercase().as_str() {
             "off" => Ok(LevelFilter::OFF),
             "error" => Ok(LevelFilter::ERROR),
@@ -113,7 +114,9 @@ impl LoggingSettings {
     /// Returns a message naming the target when it holds anything else - a
     /// `=`, a `,`, a space - which would otherwise change what the filter
     /// directive means.
-    pub fn check_target(target: &str) -> Result<(), String> {
+    ///
+    /// Private for the same reason [`Self::parse_level`] is.
+    fn check_target(target: &str) -> Result<(), String> {
         let valid = !target.is_empty()
             && target
                 .chars()
@@ -127,16 +130,22 @@ impl LoggingSettings {
         }
     }
 
-    /// Build the settings from the text a shipping bundle carries.
+    /// Build the settings from the text a bundle or a project file carries.
+    ///
+    /// The one conversion both host tiers use: the shipping bundle passes its
+    /// compiled-in strings and the development host passes its YAML's, so a
+    /// level or a target that does not read is refused with the same message in
+    /// both tiers.
     ///
     /// # Errors
     ///
     /// Returns the message of the first level, timestamp format or target that
-    /// does not read; the bundle generator validates all three, so this only
-    /// fails on a hand-edited bundle.
+    /// does not read. A bad level inside a target override is prefixed with that
+    /// target, so the message says which entry to fix.
     pub fn from_text(
         level: Option<&str>,
         timestamp: Option<&str>,
+        source_location: Option<bool>,
         targets: &[(&str, &str)],
     ) -> Result<Self, String> {
         let level = level.map(Self::parse_level).transpose()?;
@@ -145,13 +154,15 @@ impl LoggingSettings {
             .iter()
             .map(|(target, level)| {
                 Self::check_target(target)?;
-                Ok((target.to_string(), Self::parse_level(level)?))
+                let level =
+                    Self::parse_level(level).map_err(|details| format!("{target}: {details}"))?;
+                Ok((target.to_string(), level))
             })
             .collect::<Result<_, String>>()?;
         Ok(Self {
             level,
             timestamp,
-            source_location: None,
+            source_location,
             targets,
         })
     }
@@ -353,7 +364,8 @@ mod tests {
     #[test]
     fn a_target_override_replaces_the_engine_default() {
         let settings =
-            LoggingSettings::from_text(None, None, &[("engine::rendering", "debug")]).unwrap();
+            LoggingSettings::from_text(None, None, None, &[("engine::rendering", "debug")])
+                .unwrap();
 
         let rendered = format!("{}", settings.terminal_config().build_env_filter().unwrap());
 
@@ -366,7 +378,7 @@ mod tests {
     /// at `warn`.
     #[test]
     fn a_level_replaces_every_engine_default() {
-        let settings = LoggingSettings::from_text(Some("debug"), None, &[]).unwrap();
+        let settings = LoggingSettings::from_text(Some("debug"), None, None, &[]).unwrap();
 
         let rendered = format!("{}", settings.terminal_config().build_env_filter().unwrap());
 
@@ -377,14 +389,17 @@ mod tests {
 
     #[test]
     fn bundle_text_with_a_bad_level_is_refused() {
-        assert!(LoggingSettings::from_text(Some("loud"), None, &[]).is_err());
-        assert!(LoggingSettings::from_text(None, None, &[("wgpu", "loud")]).is_err());
-        assert!(LoggingSettings::from_text(None, Some("unix"), &[]).is_err());
+        assert!(LoggingSettings::from_text(Some("loud"), None, None, &[]).is_err());
+        // The message names the target whose level did not read.
+        let details = LoggingSettings::from_text(None, None, None, &[("wgpu", "loud")])
+            .expect_err("a bad target level is refused");
+        assert!(details.starts_with("wgpu: "), "{details}");
+        assert!(LoggingSettings::from_text(None, Some("unix"), None, &[]).is_err());
     }
 
     #[test]
     fn bundle_text_reads_the_timestamp_format() {
-        let settings = LoggingSettings::from_text(None, Some("time"), &[]).unwrap();
+        let settings = LoggingSettings::from_text(None, Some("time"), None, &[]).unwrap();
 
         assert_eq!(settings.timestamp, Some(TimestampFormat::Time));
     }

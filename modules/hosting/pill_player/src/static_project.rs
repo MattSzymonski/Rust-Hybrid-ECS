@@ -11,14 +11,14 @@
 //!
 //! # Design
 //!
-//! The dependency direction forces this shape: the runtime cannot name the
-//! project crate, or every game would need its own runtime, so the crate that
+//! The dependency direction forces this shape: this crate cannot name the
+//! project crate, or every game would need its own player, so the crate that
 //! links both - the generated shipping bundle - passes the functions in. That
 //! also makes the set of linked modules explicit at the call site, which is what
 //! a shipping build wants: `project_settings.yaml` is a development convenience
 //! and should not decide what a released binary contains.
 //!
-//! For the same reason the runtime names no C# type: a managed project arrives
+//! For the same reason this crate names no C# type: a managed project arrives
 //! as a [`StaticProjectBackend::External`] backend the bridge implements, so a
 //! build that runs no C# links none of it.
 //!
@@ -59,14 +59,14 @@ pub struct StaticModule {
     /// The function `#[pill_module]` was written on.
     ///
     /// A loaded module reaches the same function through its `pill_module_init`
-    /// export; here the runtime calls it directly.
+    /// export; here this crate calls it directly.
     pub init: fn(&mut Engine) -> u32,
 }
 
 /// A project that registers itself by other means than a linked Rust
 /// function: a C# assembly, through `pill_csharp_bridge`.
 ///
-/// The runtime calls it once, after every extension registered, and keeps
+/// This crate calls it once, after every extension registered, and keeps
 /// what it returns until the engine is gone.
 pub trait ProjectBackend {
     /// Register the project's systems and data with `engine`.
@@ -80,7 +80,7 @@ pub trait ProjectBackend {
     /// # Errors
     ///
     /// Returns a [`HostError`] when the project cannot start; there is no
-    /// previous generation to fall back to, so the runtime stops there.
+    /// previous generation to fall back to, so the player stops there.
     fn start(
         &self,
         engine: &mut Engine,
@@ -96,7 +96,7 @@ pub enum StaticProjectBackend {
         /// The function `#[pill_project]` was written on.
         init: fn(&mut Engine) -> u32,
     },
-    /// A project started by a backend outside the runtime - the C# bridge's
+    /// A project started by a backend outside this crate - the C# bridge's
     /// CoreCLR or NativeAOT backend today.
     ///
     /// Shared rather than boxed so a [`StaticProject`] stays cloneable, as the
@@ -104,10 +104,10 @@ pub enum StaticProjectBackend {
     External(Arc<dyn ProjectBackend>),
 }
 
-/// The renderer a windowed shipping build links, as the two functions the
-/// runtime needs from it.
+/// The renderer a windowed shipping build links, as the two functions this
+/// crate needs from it.
 ///
-/// Function pointers rather than a dependency: the runtime names no renderer
+/// Function pointers rather than a dependency: this crate names no renderer
 /// type. The shipping bundle - the one crate that depends on the renderer -
 /// fills this in.
 #[derive(Clone, Copy)]
@@ -121,7 +121,7 @@ pub struct StaticRenderer {
     /// # Safety
     ///
     /// The window must outlive the backend built on it - the renderer module's
-    /// own contract. The runtime satisfies it by keeping the backend in a field
+    /// own contract. This crate satisfies it by keeping the backend in a field
     /// declared before the window it was built on.
     pub attach: StaticRendererAttachFn,
 }
@@ -163,7 +163,7 @@ pub struct StaticProject {
     /// page: the shipping bundle names the file `build_web.py` puts beside it.
     ///
     /// Read by `pill_web` alone. A native build embeds its pack instead and
-    /// leaves this `None`, and the runtime ignores it: fetching is a browser's
+    /// leaves this `None`, and this crate ignores it: fetching is a browser's
     /// job, so nothing outside a browser frontend can act on it.
     pub asset_pack_url: Option<&'static str>,
     /// The `logging:` section of the project's settings, as the bundle
@@ -303,31 +303,18 @@ impl StaticLogging {
     /// does not read, which only a hand-edited bundle can hold: the generator
     /// refuses all three.
     pub fn settings(&self) -> Result<LoggingSettings, String> {
-        let mut settings = LoggingSettings::from_text(self.level, self.timestamp, self.targets)?;
-        settings.source_location = self.source_location;
-        Ok(settings)
+        LoggingSettings::from_text(
+            self.level,
+            self.timestamp,
+            self.source_location,
+            self.targets,
+        )
     }
 }
 
 // =============================================================================
 // Free Functions
 // =============================================================================
-
-/// Register the statically linked renderer's `rendering` system under `owner`,
-/// exactly as its module entry point would.
-///
-/// # Errors
-///
-/// Returns the renderer's non-zero status, or `u32::MAX` for a registration
-/// error it left in the world.
-#[cfg(feature = "rendering")]
-pub(crate) fn initialize_static_renderer(
-    engine: &mut Engine,
-    renderer: StaticRenderer,
-    owner: SystemOwner,
-) -> Result<(), u32> {
-    initialize_linked(engine, renderer.init, Some(owner), None)
-}
 
 /// Queue and load a project's startup scene, warning when it cannot be read.
 ///
@@ -348,14 +335,17 @@ fn apply_project_startup_scene(engine: &mut Engine, path: &str) {
 /// Run one linked entry point the way its generated ABI wrapper would.
 ///
 /// `scope` scopes the registrations when present, which is what an extension
-/// needs and what the project must not have.
+/// needs and what the project must not have. `startup_scene` is the project's
+/// own startup scene, applied after the component types exist and before the
+/// project seeds its entities over them; an extension passes `None`, because a
+/// module has no scene of its own.
 ///
 /// # Errors
 ///
 /// Returns the non-zero status the entry point reported, from the artifact's
 /// registration or from `init`; the caller names the subject, because only it
 /// knows whether the failure is a module's or the project's.
-fn initialize_linked(
+pub(crate) fn initialize_linked(
     engine: &mut Engine,
     init: fn(&mut Engine) -> u32,
     scope: Option<SystemOwner>,
@@ -385,6 +375,29 @@ fn initialize_linked(
 }
 
 // =============================================================================
+// Test Projects
+// =============================================================================
+
+/// A project with nothing set but `backend`: what a test starts from.
+///
+/// Every other field holds one boring value, so a test names only the field it
+/// is about: `StaticProject { modules: MODULES, ..test_project(backend) }`.
+#[cfg(test)]
+pub(crate) fn test_project(backend: StaticProjectBackend) -> StaticProject {
+    StaticProject {
+        name: "project",
+        backend,
+        modules: &[],
+        renderer: None,
+        asset_pack: None,
+        asset_pack_url: None,
+        logging: StaticLogging::NONE,
+        debug_draw: false,
+        startup_scene: None,
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -405,7 +418,7 @@ mod tests {
 
     /// A backend that records the names it was handed and returns a guard.
     struct RecordingBackend {
-        /// The names the runtime handed to `start`.
+        /// The names [`crate::Runtime`] handed to `start`.
         seen: std::sync::Mutex<Vec<String>>,
     }
 
@@ -441,17 +454,10 @@ mod tests {
 
         let mut engine = Engine::new();
         let project = StaticProject {
-            name: "project",
-            backend: StaticProjectBackend::Native {
-                init: project_module_init,
-            },
             modules: MODULES,
-            renderer: None,
-            asset_pack: None,
-            asset_pack_url: None,
-            logging: StaticLogging::NONE,
-            debug_draw: false,
-            startup_scene: None,
+            ..test_project(StaticProjectBackend::Native {
+                init: project_module_init,
+            })
         };
         project.initialize(&mut engine).expect("both succeed");
 
@@ -475,15 +481,8 @@ mod tests {
 
         let mut engine = Engine::new();
         let project = StaticProject {
-            name: "project",
-            backend: StaticProjectBackend::Native { init: no_op },
             modules: MODULES,
-            renderer: None,
-            asset_pack: None,
-            asset_pack_url: None,
-            logging: StaticLogging::NONE,
-            debug_draw: false,
-            startup_scene: None,
+            ..test_project(StaticProjectBackend::Native { init: no_op })
         };
         let Err(error) = project.initialize(&mut engine) else {
             panic!("a non-zero module status must be reported");
@@ -500,17 +499,7 @@ mod tests {
     #[test]
     fn a_native_project_returns_no_guard() {
         let mut engine = Engine::new();
-        let project = StaticProject {
-            name: "project",
-            backend: StaticProjectBackend::Native { init: no_op },
-            modules: &[],
-            renderer: None,
-            asset_pack: None,
-            asset_pack_url: None,
-            logging: StaticLogging::NONE,
-            debug_draw: false,
-            startup_scene: None,
-        };
+        let project = test_project(StaticProjectBackend::Native { init: no_op });
         let guard = project.initialize(&mut engine).expect("it succeeds");
         assert!(guard.is_none());
     }
@@ -533,15 +522,8 @@ mod tests {
         });
         let mut engine = Engine::new();
         let project = StaticProject {
-            name: "project",
-            backend: StaticProjectBackend::External(backend.clone()),
             modules: MODULES,
-            renderer: None,
-            asset_pack: None,
-            asset_pack_url: None,
-            logging: StaticLogging::NONE,
-            debug_draw: false,
-            startup_scene: None,
+            ..test_project(StaticProjectBackend::External(backend.clone()))
         };
         let guard = project.initialize(&mut engine).expect("it succeeds");
 
@@ -559,7 +541,7 @@ mod tests {
         // Step 1: A fresh directory below the system temp path, cleared first
         // so a repeated run in this process never reads a previous scene.
         let root =
-            std::env::temp_dir().join(format!("pill-runtime-startup-scene-{}", std::process::id()));
+            std::env::temp_dir().join(format!("pill-player-startup-scene-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("scenes")).unwrap();
 
@@ -629,15 +611,9 @@ mod tests {
         });
         let mut engine = Engine::new();
         let project = StaticProject {
-            name: "project",
-            backend: StaticProjectBackend::External(backend),
             modules: MODULES,
-            renderer: None,
-            asset_pack: None,
-            asset_pack_url: None,
-            logging: StaticLogging::NONE,
-            debug_draw: false,
             startup_scene: Some("scenes/one.scene"),
+            ..test_project(StaticProjectBackend::External(backend))
         };
         project.initialize(&mut engine).expect("it succeeds");
 

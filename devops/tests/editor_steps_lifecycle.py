@@ -19,6 +19,7 @@ from pathlib import Path
 from core import win_clipboard
 from core.editor_session import EDITOR_WINDOW_CREATED_TOKEN, EditorSession
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT
+from core.suite_common import MODULE_RELOAD_COMPLETE_TOKEN
 from test_editor_egui import (
     CADENCE_DUMP_TOKEN,
     CLIPBOARD_PASTED_TOKEN,
@@ -29,6 +30,7 @@ from test_editor_egui import (
     ENTITIES_DUMP_TOKEN,
     ENTITY_ROW_TOKEN,
     FIELD_TOKEN,
+    FRAME_HEARTBEAT_TOKEN,
     FRAME_IDLE_TOKEN,
     HISTORY_PUSH_TOKEN,
     HISTORY_UNDO_TOKEN,
@@ -62,6 +64,8 @@ from test_editor_egui import (
     SCENE_TITLE_TOKEN,
     SCENE_VIEW_RECT_TOKEN,
     SHOWCASE_COMPONENT,
+    SYSTEMS_DUMP_TOKEN,
+    SYSTEM_ROW_PATTERN,
     TOAST_TOKEN,
     WINDOWS_DUMP_TOKEN,
     WINDOW_ROW_TOKEN,
@@ -975,6 +979,66 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
                 retry_begin,
             )
             print("  [OK] Retry loaded the fixed shell without a restart")
+
+            # The retried shell and the renderer now share one process, and the
+            # renderer's `rendering` system lives under a reserved owner: a shell
+            # generation that took that owner (an owner derived from the loaded
+            # extension count aliased the pending shell's) would clear the
+            # renderer's system when its own reload retired its generation, and
+            # the scene would stop drawing with nothing in the log to say why.
+            def rendering_systems() -> list:
+                """The systems dump's `rendering` rows."""
+                dump = safe.request(
+                    "dump systems",
+                    re.escape(SYSTEMS_DUMP_TOKEN),
+                    60,
+                    "the systems after the retry",
+                )
+                return [
+                    match.group(0)
+                    for match in re.finditer(SYSTEM_ROW_PATTERN, dump)
+                    if 'name="rendering"' in match.group(0)
+                ]
+
+            after_retry = rendering_systems()
+            assert len(after_retry) == 1, (
+                "the renderer registers exactly one `rendering` system: {}".format(
+                    after_retry
+                )
+            )
+            assert 'owner="renderer"' in after_retry[0], (
+                "the rendering system is not under the reserved renderer owner: "
+                + after_retry[0]
+            )
+            print("  [OK] the retried shell and the renderer hold separate owners")
+
+            # A shell edit retires the shell's generation. The renderer's system
+            # is not that generation's to clear, so it must still be there
+            # afterwards, and the editor must keep drawing frames.
+            session.edit_source(
+                shell_source,
+                shell_text + "\n// The safe-mode lane reloads the shell once.\n",
+            )
+            reload_begin = len(safe.read_log())
+            safe.wait(
+                re.escape(MODULE_RELOAD_COMPLETE_TOKEN),
+                600,
+                "the shell reloaded after the edit",
+                reload_begin,
+            )
+            after_reload = rendering_systems()
+            assert len(after_reload) == 1, (
+                "a shell reload cleared or duplicated the renderer's system: "
+                "{}".format(after_reload)
+            )
+            assert 'owner="renderer"' in after_reload[0], after_reload[0]
+            safe.wait(
+                re.escape(FRAME_HEARTBEAT_TOKEN),
+                120,
+                "the frame kept running after the shell reload",
+                reload_begin,
+            )
+            print("  [OK] a shell reload left the renderer's system and the frame alone")
         finally:
             safe.close()
     finally:

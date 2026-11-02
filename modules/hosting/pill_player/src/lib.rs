@@ -66,11 +66,15 @@ pub use pill_renderer_api::{
 };
 
 /// Engine start-up, the asset pack a shipped build mounts, and the frame every
-/// build runs - including [`FrameDriver`].
+/// build runs - including [`FrameDriver`] and, windowed, [`WindowedFrameDriver`].
 pub use runtime::{
     insert_debug_resources, mount_asset_pack, run_one_frame, set_surface_camera, setup,
     setup_with_asset_database, FrameDriver, PackSource, Runtime,
 };
+
+/// What a driver that draws through a renderer adds to [`FrameDriver`].
+#[cfg(feature = "rendering")]
+pub use runtime::WindowedFrameDriver;
 
 /// The static-link contract a shipping bundle passes in.
 pub use static_project::{

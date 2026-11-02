@@ -5,7 +5,7 @@
 //!
 //! - Build and load the extensions and the project, and watch their sources.
 //! - Reload, patch and roll back at every frame boundary, around the frame the
-//!   wrapped [`pill_player::Runtime`] runs ([`run_one_frame`]).
+//!   wrapped [`pill_player::Runtime`] runs ([`run_frame`]).
 //! - With `rendering`: load the renderer as a reloadable module, rebuild it
 //!   with its data crate, pause it on a layout it was not built against, and
 //!   deliver re-cooked shaders ([`RenderingHost`]).
@@ -40,7 +40,7 @@ use pill_core::{error, info};
 use pill_core::telemetry::{log_block_colored, Colorize};
 use pill_engine::Engine;
 use pill_engine::EngineApi;
-use pill_engine::{AssetGuid, InputEvent, RumbleRequest};
+use pill_engine::{AssetGuid, SystemOwner};
 use pill_player::registration::extension_owner;
 #[cfg(feature = "rendering")]
 use pill_player::{AttachedRenderer, RendererWindow};
@@ -121,11 +121,32 @@ struct PendingModule {
     source_edit_generation: Arc<AtomicU64>,
 }
 
+/// Debug assertion: every entry of `subjects` names a distinct owner.
+///
+/// The subjects are the things a reload, a pause or a stale-suspension resume
+/// can retire or reach: the extensions, the pending modules, the renderer and
+/// the project. One owner shared by two of them means one of them can clear or
+/// resume the other's systems.
+#[cfg(debug_assertions)]
+fn assert_unique_owners(subjects: &[(&str, SystemOwner)]) {
+    for (index, (subject, owner)) in subjects.iter().enumerate() {
+        let shared = subjects[index + 1..]
+            .iter()
+            .find(|(_, candidate)| candidate == owner);
+        if let Some((other, _)) = shared {
+            debug_assert!(
+                false,
+                "{subject} and {other} register under the same system owner {owner}"
+            );
+        }
+    }
+}
+
 /// The headless development host.
 ///
 /// It owns the runtime (the engine and its frame), the loaded project image and
 /// every extension slot, and reloads them at each frame boundary
-/// ([`run_one_frame`]). Bundling this state lets headless, windowed, and editor
+/// ([`run_frame`]). Bundling this state lets headless, windowed, and editor
 /// frontends share the same engine lifetime and hot-reload behavior.
 pub struct DevHost {
     /// The directory every spawned cargo build runs in and every artifact path
@@ -339,6 +360,38 @@ impl DevHost {
             .collect()
     }
 
+    /// Every subject this host registers systems for, with its owner: the
+    /// loaded extensions, the modules whose first load failed and wait for a
+    /// retry, and the project.
+    ///
+    /// The renderer is not one of them - it belongs to [`RenderingHost`] - so
+    /// the windowed host adds it before it checks.
+    pub(crate) fn subject_owners(&self) -> Vec<(&str, SystemOwner)> {
+        let mut owners: Vec<(&str, SystemOwner)> = self
+            .extensions
+            .iter()
+            .map(|slot| (slot.name(), slot.owner()))
+            .collect();
+        owners.extend(
+            self.pending_modules
+                .iter()
+                .map(|pending| (pending.config.name.as_str(), pending.owner)),
+        );
+        owners.push(("the project", SystemOwner::PROJECT));
+        owners
+    }
+
+    /// Debug assertion: no two subjects register under one owner.
+    ///
+    /// Owners decide what a reload clears, what a pause suspends and what a
+    /// stale suspension resumes. Two subjects sharing one would let a reload of
+    /// either retire the other's systems, and let a resume reach a renderer that
+    /// was paused against a replaced component layout.
+    #[cfg(debug_assertions)]
+    pub(crate) fn assert_owner_isolation(&self) {
+        assert_unique_owners(&self.subject_owners());
+    }
+
     /// Whether any watcher's work waits for a frame boundary: the editor's
     /// sleeping heartbeat takes a frame when one does, so an edit reaches a
     /// paused, idle editor without user input.
@@ -437,6 +490,11 @@ impl DevHost {
                         &pending.config.output_subdirectory,
                         &pending.config.build_command,
                     ));
+                // The module moved out of the pending set into the loaded one
+                // under the owner it reserved; the set as a whole must still be
+                // one owner per subject.
+                #[cfg(debug_assertions)]
+                self.assert_owner_isolation();
                 Ok(())
             }
             Err(error) => {
@@ -605,27 +663,12 @@ impl FrameDriver for DevHost {
     type Error = std::convert::Infallible;
 
     fn run_frame(&mut self) -> Result<(), Self::Error> {
-        run_one_frame(self);
+        run_frame(self);
         Ok(())
     }
 
-    // The bare dev host draws no surface; its renderer lives in
-    // [`RenderingHost`], which implements the same methods for real.
-    fn resize_surface(&mut self, _id: pill_renderer_api::SurfaceId, _width: u32, _height: u32) {}
-
-    fn set_surface_viewport(
-        &mut self,
-        _id: pill_renderer_api::SurfaceId,
-        _viewport: Option<pill_renderer_api::RenderViewport>,
-    ) {
-    }
-
-    fn push_input(&mut self, event: InputEvent) {
-        self.engine_mut().push_input_event(event);
-    }
-
-    fn take_rumble_requests(&mut self) -> Vec<RumbleRequest> {
-        self.engine_mut().take_rumble_requests()
+    fn engine_mut(&mut self) -> &mut pill_engine::Engine {
+        DevHost::engine_mut(self)
     }
 }
 
@@ -1018,7 +1061,7 @@ impl RenderingHost {
     /// # Errors
     ///
     /// Returns a [`RendererError`] when the renderer cannot draw the frame.
-    pub fn run_one_frame(&mut self) -> Result<(), RendererError> {
+    pub fn run_frame(&mut self) -> Result<(), RendererError> {
         let frame_start = Instant::now();
 
         // Step 1: The data crate's schemas before any reload, when it has an
@@ -1082,13 +1125,10 @@ impl RenderingHost {
             self.unsupported_data_check_pending = false;
             self.report_unsupported_render_data(data_extension.as_deref());
         }
-        self.display.render(self.host.runtime.engine().world())?;
+        // Draw, then hand back the answers the GPU finished: one call, so the
+        // order cannot differ between the two windowed drivers.
         self.display
-            .deliver_pick_results(self.host.runtime.engine_mut().world_mut());
-        // Previews too: the renderer reads one back between
-        // frames, and the editor's tiles pick the pixels up next frame.
-        self.display
-            .deliver_preview_results(self.host.runtime.engine_mut().world_mut());
+            .present(self.host.runtime.engine_mut().world_mut())?;
         self.scene_drawn = true;
         Ok(())
     }
@@ -1117,57 +1157,18 @@ impl FrameDriver for RenderingHost {
     type Error = RendererError;
 
     fn run_frame(&mut self) -> Result<(), RendererError> {
-        self.run_one_frame()
+        RenderingHost::run_frame(self)
     }
 
-    fn push_input(&mut self, event: InputEvent) {
-        self.host.engine_mut().push_input_event(event);
+    fn engine_mut(&mut self) -> &mut pill_engine::Engine {
+        self.host.engine_mut()
     }
+}
 
-    fn take_rumble_requests(&mut self) -> Vec<RumbleRequest> {
-        self.host.engine_mut().take_rumble_requests()
-    }
-
-    fn attach_surface<W: RendererWindow>(
-        &mut self,
-        id: pill_renderer_api::SurfaceId,
-        window: W,
-        width: u32,
-        height: u32,
-        options: pill_renderer_api::SurfaceOptions,
-    ) -> Result<(), RendererError> {
-        // Kept by the display, which re-attaches it after every renderer
-        // reload (`AttachedRenderer::replace_backend`).
-        self.display
-            .attach_surface(id, window, width, height, options)
-    }
-
-    fn detach_surface(&mut self, id: pill_renderer_api::SurfaceId) {
-        self.display.detach_surface(id);
-    }
-
-    fn resize_surface(&mut self, id: pill_renderer_api::SurfaceId, width: u32, height: u32) {
-        self.display.resize_surface(id, width, height);
-    }
-
-    fn set_surface_viewport(
-        &mut self,
-        id: pill_renderer_api::SurfaceId,
-        viewport: Option<RenderViewport>,
-    ) {
-        self.display.set_surface_viewport(id, viewport);
-    }
-
-    fn set_surface_ready(&mut self, id: pill_renderer_api::SurfaceId, ready: bool) {
-        self.display.set_surface_ready(id, ready);
-    }
-
-    fn set_surface_camera(
-        &mut self,
-        id: pill_renderer_api::SurfaceId,
-        binding: Option<pill_renderer_api::CameraBinding>,
-    ) {
-        pill_player::set_surface_camera(self.host.engine_mut().world_mut(), id, binding);
+#[cfg(feature = "rendering")]
+impl pill_player::WindowedFrameDriver for RenderingHost {
+    fn display_mut(&mut self) -> &mut AttachedRenderer {
+        &mut self.display
     }
 }
 
@@ -1630,6 +1631,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         editor_revision: 0,
     };
 
+    #[cfg(debug_assertions)]
+    host.assert_owner_isolation();
     Ok(host)
 }
 
@@ -1782,11 +1785,12 @@ type RendererModule = crate::renderer_module::RendererModule;
 
 /// Load the renderer module and attach it to `window`.
 ///
-/// The module takes the owner after the last extension, so its `rendering`
-/// system is cleared and re-registered with it rather than living forever
-/// under the engine's owner. A renderer that did not load, or loaded but could
-/// not attach, leaves the window blank rather than ending the host: the scene
-/// keeps running, and the next renderer edit loads and attaches again.
+/// The module registers under the engine's reserved renderer owner, so its
+/// `rendering` system is cleared and re-registered with it rather than living
+/// forever under the engine's owner, and no extension it shares a host with can
+/// alias it. A renderer that did not load, or loaded but could not attach,
+/// leaves the window blank rather than ending the host: the scene keeps running,
+/// and the next renderer edit loads and attaches again.
 ///
 /// # Errors
 ///
@@ -1804,8 +1808,16 @@ fn attach_renderer_module<W: RendererWindow>(
         host.runtime.engine_mut(),
         &host.engine_api,
         &host.workspace_root,
-        pill_player::registration::renderer_owner(host.extensions.len()),
+        pill_player::registration::renderer_owner(),
     )?;
+    // The renderer is one more subject: its owner must be outside every
+    // extension's, including the ones a failed first load still holds in reserve.
+    #[cfg(debug_assertions)]
+    {
+        let mut subjects = host.subject_owners();
+        subjects.push(("the renderer", renderer_module.owner()));
+        assert_unique_owners(&subjects);
+    }
     let display = AttachedRenderer::attach(window, width, height, |window_data| {
         if renderer_module.slot().is_none() {
             // Already logged by the failed load.
@@ -2970,8 +2982,8 @@ fn suspend_stale_subjects(host: &mut DevHost) {
 /// statistics when the reporting window elapses.
 ///
 /// The two phases back to back: a windowed host runs them itself, with its
-/// renderer step between them (see [`RenderingHost::run_one_frame`]).
-pub fn run_one_frame(host: &mut DevHost) {
+/// renderer step between them (see [`RenderingHost::run_frame`]).
+pub fn run_frame(host: &mut DevHost) {
     let frame_start = Instant::now();
     run_reload_phase(host);
     run_frame_phase(host, frame_start)

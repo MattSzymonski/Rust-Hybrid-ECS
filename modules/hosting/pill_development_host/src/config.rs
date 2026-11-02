@@ -552,31 +552,20 @@ impl ProjectLoggingSettings {
             path: path.display().to_string(),
             details,
         };
-        let level = self
-            .level
-            .as_deref()
-            .map(pill_player::LoggingSettings::parse_level)
-            .transpose()
-            .map_err(invalid)?;
-        let timestamp = self
-            .timestamp
-            .as_deref()
-            .map(pill_core::telemetry::TimestampFormat::parse)
-            .transpose()
-            .map_err(invalid)?;
-        let mut targets = Vec::with_capacity(self.targets.len());
-        for (target, level) in &self.targets {
-            pill_player::LoggingSettings::check_target(target).map_err(invalid)?;
-            let level = pill_player::LoggingSettings::parse_level(level)
-                .map_err(|details| invalid(format!("{target}: {details}")))?;
-            targets.push((target.clone(), level));
-        }
-        Ok(pill_player::LoggingSettings {
-            level,
-            timestamp,
-            source_location: self.source_location,
-            targets,
-        })
+        let targets: Vec<(&str, &str)> = self
+            .targets
+            .iter()
+            .map(|(target, level)| (target.as_str(), level.as_str()))
+            .collect();
+        // One conversion for both host tiers: the same text rules refuse a bad
+        // level or target here and in a shipping bundle.
+        pill_player::LoggingSettings::from_text(
+            self.level.as_deref(),
+            self.timestamp.as_deref(),
+            self.source_location,
+            &targets,
+        )
+        .map_err(invalid)
     }
 }
 
@@ -2463,6 +2452,10 @@ serde = { version = "1", features = ["derive"] }
             .validate(&path)
             .expect_err("an unknown level is refused");
         assert!(error.to_string().contains("loud"), "{error}");
+        // The message names the target whose level did not read, which is the
+        // same text a shipping bundle's bad target produces: both tiers come
+        // through one conversion.
+        assert!(error.to_string().contains("wgpu: "), "{error}");
 
         let time_only = read("logging:\n  timestamp: time\n")
             .logging

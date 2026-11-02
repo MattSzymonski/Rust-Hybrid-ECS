@@ -7,7 +7,7 @@
 //!
 //! # Design
 //!
-//! This lives in the runtime, which links only into executables, rather
+//! This lives in the player, which links only into executables, rather
 //! than in the engine core: `sysinfo` reaches the system through the
 //! `windows` crate, which declares its functions as `raw-dylib` imports of
 //! about seventy system DLLs. In the shared `pill_engine_core.dll` that would
@@ -18,6 +18,13 @@
 use pill_core::info;
 use pill_core::telemetry::log_block;
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Bytes in one gibibyte, the unit every memory and storage figure is in.
+const BYTES_PER_GIBIBYTE: f64 = 1024.0 * 1024.0 * 1024.0;
 
 // =============================================================================
 // Free Functions
@@ -33,38 +40,32 @@ use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 ///
 /// Called by [`Runtime::new`](crate::Runtime::new), before it creates the
 /// engine.
-pub(crate) fn print_system_specs() {
-    // Step 1: Snapshot system state and derive RAM, swap, and CPU figures.
+pub(crate) fn print_machine_info() {
+    // Step 1: Snapshot system state and derive memory, swap, and CPU figures.
     //
     // Targeted refresh, never `System::new_all()`: the report reads memory and
-    // CPU figures only, while `new_all` also enumerates every process on the
+    // CPU identity only, while `new_all` also enumerates every process on the
     // machine - paid in the middle of start-up for information nothing here
-    // consumes.
+    // consumes. `CpuRefreshKind::nothing()` still lists the CPUs, so the brand
+    // and the count are there; it skips the usage and frequency refreshes, and
+    // on Windows those are what open the performance-data query.
     let system = System::new_with_specifics(
         RefreshKind::nothing()
             .with_memory(MemoryRefreshKind::everything())
-            .with_cpu(CpuRefreshKind::everything()),
+            .with_cpu(CpuRefreshKind::nothing()),
     );
     let disks = Disks::new_with_refreshed_list();
 
-    let total_ram_gb = system.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-    let used_ram_gb =
-        (system.total_memory() - system.available_memory()) as f64 / (1024.0 * 1024.0 * 1024.0);
-    let ram_pct = if system.total_memory() > 0 {
-        (used_ram_gb / total_ram_gb) * 100.0
-    } else {
-        0.0
-    };
+    let total_memory_gib = system.total_memory() as f64 / BYTES_PER_GIBIBYTE;
+    let used_memory_gib =
+        (system.total_memory() - system.available_memory()) as f64 / BYTES_PER_GIBIBYTE;
+    let memory_usage_percent = percent(used_memory_gib, total_memory_gib);
 
-    let total_swap_gb = system.total_swap() as f64 / (1024.0 * 1024.0 * 1024.0);
-    let used_swap_gb = system.used_swap() as f64 / (1024.0 * 1024.0 * 1024.0);
-    let swap_pct = if total_swap_gb > 0.0 {
-        (used_swap_gb / total_swap_gb) * 100.0
-    } else {
-        0.0
-    };
+    let total_swap_gib = system.total_swap() as f64 / BYTES_PER_GIBIBYTE;
+    let used_swap_gib = system.used_swap() as f64 / BYTES_PER_GIBIBYTE;
+    let swap_usage_percent = percent(used_swap_gib, total_swap_gib);
 
-    let cpu_name = system
+    let cpu_brand = system
         .cpus()
         .first()
         .map(|cpu| cpu.brand().to_string())
@@ -73,32 +74,44 @@ pub(crate) fn print_system_specs() {
     let physical_cores = sysinfo::System::physical_core_count().unwrap_or(0);
     let logical_threads = system.cpus().len();
 
-    let uptime_secs = System::uptime();
-    let uptime_str = format_uptime(uptime_secs);
+    let uptime_seconds = System::uptime();
+    let uptime_text = format_uptime(uptime_seconds);
 
     // Step 2: Emit the hardware report as one multi-line entry.
     let mut lines = vec![
-        format!("├─ CPU: {cpu_name}"),
+        format!("├─ CPU: {cpu_brand}"),
         format!("│  └─ Cores: {physical_cores} physical, {logical_threads} logical threads"),
         "├─ Memory".to_string(),
-        format!("│  ├─ RAM: {used_ram_gb:.1} / {total_ram_gb:.1} GiB used ({ram_pct:.0}%)"),
+        format!(
+            "│  ├─ RAM: {used_memory_gib:.1} / {total_memory_gib:.1} GiB used ({memory_usage_percent:.0}%)"
+        ),
     ];
-    if total_swap_gb > 0.0 {
+    if total_swap_gib > 0.0 {
         lines.push(format!(
-            "│  └─ Swap: {used_swap_gb:.1} / {total_swap_gb:.1} GiB used ({swap_pct:.0}%)"
+            "│  └─ Swap: {used_swap_gib:.1} / {total_swap_gib:.1} GiB used ({swap_usage_percent:.0}%)"
         ));
     } else {
         lines.push("│  └─ Swap: none".to_string());
     }
     lines.extend(disk_info_lines(&disks));
     lines.push(format!("├─ OS: {}", os_pretty_name()));
-    lines.push(format!("│  └─ Uptime: {uptime_str}"));
+    lines.push(format!("│  └─ Uptime: {uptime_text}"));
     lines.push("└─ GPU: use external tools (dxdiag / lspci)".to_string());
     info!(
         target: pill_core::telemetry::telemetry_target::SYSTEM,
         "{}",
         log_block("System specs", lines)
     );
+}
+
+/// `used` as a percentage of `total`, or `0.0` when there is nothing to divide
+/// by: a machine that reports no swap, and a disk that reports no size.
+fn percent(used: f64, total: f64) -> f64 {
+    if total > 0.0 {
+        (used / total) * 100.0
+    } else {
+        0.0
+    }
 }
 
 /// Builds the `Storage` branch of the system report: one line per detected
@@ -111,26 +124,26 @@ fn disk_info_lines(disks: &sysinfo::Disks) -> Vec<String> {
         return vec!["├─ Storage: no disks detected".to_string()];
     }
     let mut lines = vec!["├─ Storage".to_string()];
-    let count = disks.len();
-    for (i, disk) in disks.iter().enumerate() {
-        let total_gb = disk.total_space() as f64 / (1024.0 * 1024.0 * 1024.0);
-        let avail_gb = disk.available_space() as f64 / (1024.0 * 1024.0 * 1024.0);
-        let used_gb = total_gb - avail_gb;
-        let pct = if total_gb > 0.0 {
-            (used_gb / total_gb) * 100.0
-        } else {
-            0.0
-        };
-        let kind = match disk.kind() {
+    let disk_count = disks.len();
+    for (index, disk) in disks.iter().enumerate() {
+        let total_space_gib = disk.total_space() as f64 / BYTES_PER_GIBIBYTE;
+        let available_space_gib = disk.available_space() as f64 / BYTES_PER_GIBIBYTE;
+        let used_space_gib = total_space_gib - available_space_gib;
+        let used_percent = percent(used_space_gib, total_space_gib);
+        let disk_kind = match disk.kind() {
             sysinfo::DiskKind::SSD => "SSD",
             sysinfo::DiskKind::HDD => "HDD",
             _ => "?",
         };
         // Device names can be long; the mount point identifies the disk.
-        let mount = disk.mount_point().to_string_lossy();
-        let branch = if i == count - 1 { "└─" } else { "├─" };
+        let mount_point = disk.mount_point().to_string_lossy();
+        let branch = if index == disk_count - 1 {
+            "└─"
+        } else {
+            "├─"
+        };
         lines.push(format!(
-            "│  {branch} {mount}  {used_gb:.0} / {total_gb:.0} GiB used ({pct:.0}%)  [{kind}]"
+            "│  {branch} {mount_point}  {used_space_gib:.0} / {total_space_gib:.0} GiB used ({used_percent:.0}%)  [{disk_kind}]"
         ));
     }
     lines
@@ -164,10 +177,10 @@ fn format_uptime(seconds: u64) -> String {
 fn os_pretty_name() -> String {
     let name = sysinfo::System::name().unwrap_or_else(|| "unknown".to_string());
     let version = sysinfo::System::os_version().unwrap_or_default();
-    let arch = std::env::consts::ARCH;
+    let architecture = std::env::consts::ARCH;
     if version.is_empty() {
-        format!("{name} ({arch})")
+        format!("{name} ({architecture})")
     } else {
-        format!("{name} {version} ({arch})")
+        format!("{name} {version} ({architecture})")
     }
 }
