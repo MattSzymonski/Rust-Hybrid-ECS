@@ -1,26 +1,26 @@
-//! Lifecycle management for extensions.
+//! Loading and reloading of extension modules.
 //!
 //! # Responsibilities
 //!
-//! - Builds, validates and loads one extension during startup.
-//! - Reloads one module in isolation: when its sources changed, when a runtime
-//!   crate of its folder reloaded, or when a retry is requested.
-//! - Removes exactly that module's systems across a reload.
+//! - Builds, checks and loads one extension when the host starts.
+//! - Reloads one module on its own: after a source edit, after a runtime crate
+//!   in its folder reloads, or when a retry is requested.
+//! - Clears only that module's systems when it is replaced.
 //!
 //! # Design
 //!
-//! Each loaded module owns an [`ExtensionSlot`], which holds its
-//! configuration, its [`SystemOwner`], the currently mapped library and a
-//! graveyard of retired ones - bounded unless the module keeps every
-//! generation. Reload is transactional in the same way the project module's
-//! is: the replacement is compiled and loaded before any engine state is
-//! touched, and a failure at any step leaves the previous generation running.
+//! Each loaded module has one [`ExtensionSlot`]. The slot holds the module's
+//! configuration, its [`SystemOwner`], the library that is loaded now and the
+//! retired libraries that are still mapped. It keeps a limited number of
+//! retired libraries unless the module asks to keep every generation. A reload
+//! works like the project reload: the replacement is compiled and loaded
+//! before any engine state is touched, and a failure at any step leaves the
+//! previous generation running.
 //!
-//! Isolation is what separates this from the project path. The module owns a
-//! private reload generation counter fed by its own watcher, and its systems
-//! are cleared through [`Engine::clear_systems_owned_by`] rather than the
-//! global clear, so reloading one module never disturbs the project or any
-//! other module.
+//! The module reloads on its own. Its own watcher adds to a counter that only
+//! this module reads, and its systems are removed through
+//! [`Engine::clear_systems_owned_by`] instead of the global clear. Reloading
+//! one module therefore never disturbs the project or another module.
 
 // Standard library
 #[cfg(feature = "hot_reload")]
@@ -52,21 +52,23 @@ use crate::ExtensionConfig;
 
 /// Extension ABI revision this host understands.
 ///
-/// A module reporting anything else is rejected before it is handed a pointer
-/// into engine memory, because the two sides then disagree about the contract.
+/// The host rejects a module that reports any other revision, before it passes
+/// the module a pointer into engine memory: the two sides would disagree about
+/// the contract that pointer follows.
 ///
-/// Read from `pill_engine` so the host and every module (whose ABI export is
-/// generated from the same constant by `#[pill_module]`) can never drift.
+/// The value comes from `pill_engine`, so the host and every module cannot
+/// drift apart. `#[pill_module]` generates the module's ABI export from the
+/// same constant.
 pub use pill_engine::module_abi::MODULE_ABI_VERSION as EXTENSION_ABI_VERSION;
 
 // =============================================================================
 // ExtensionSlot
 // =============================================================================
 
-// Everything below loads, versions and replaces a module DLL, which a build
-// without the `hot_reload` feature never does. The ABI constant above stays
-// unconditional: it describes the contract a module crate is compiled
-// against, which holds whether or not this host can load one.
+// Everything below loads, versions and replaces a module DLL; a build without
+// the `hot_reload` feature never does that. The ABI constant above is compiled
+// in every build: it describes the contract a module crate is compiled
+// against, and that holds whether or not this host can load one.
 #[cfg(feature = "hot_reload")]
 pub(crate) use slot::{ExtensionSlot, ReloadOutcome};
 
@@ -74,118 +76,97 @@ pub(crate) use slot::{ExtensionSlot, ReloadOutcome};
 mod slot {
     use super::*;
 
-    /// One loaded extension and everything needed to reload it.
+    /// One loaded extension module, with the state a reload needs.
     pub(crate) struct ExtensionSlot {
-        /// How this module is built, watched and loaded.
-        config: ExtensionConfig,
-        /// Owner tag applied to every system this module registers.
-        owner: SystemOwner,
-        /// Currently active library.
-        current: NativeLibrary,
-        /// Retired generations, kept mapped because engine-owned pointers and
+        /// The module's configuration: how it is built, watched and loaded.
+        extension_config: ExtensionConfig,
+        /// The owner tag applied to every system this module registers.
+        system_owner: SystemOwner,
+        /// The library of the generation that is loaded now.
+        current_library: NativeLibrary,
+        /// The retired libraries, kept mapped because engine-owned pointers and
         /// vtables may still refer to their code.
-        old_libraries: Vec<NativeLibrary>,
-        /// Bumped by this module's watcher when its sources change, and by
-        /// [`Self::request_reload`] faking a save. The slot has exactly one
-        /// real producer - its own watcher - so this counter never conflates a
-        /// source save with anything the reload pipeline queues.
+        retired_libraries: Vec<NativeLibrary>,
+        /// The watcher adds one when this module's sources change, and
+        /// [`Self::request_reload`] adds one to fake a save. Only the watcher
+        /// is a real producer, so the counter never mixes a source save with a
+        /// rebuild the reload pipeline queues for another reason.
         source_edit_generation: Arc<AtomicU64>,
-        /// Last source-edit generation the frame loop acted on.
-        last_processed_source_edit: u64,
-        /// A rebuild the reload pipeline queued rather than the watcher: an
-        /// editor crate's, after a runtime crate of its folder reloaded. Kept
-        /// apart from the watcher's counter so a fast-path patch of a source
-        /// edit can never swallow it.
-        queued_cascade_reload: bool,
-        /// Persistable component type names the last `init` registered, used to
-        /// detect types the next generation forgets to re-register.
+        /// The last generation the reload pass acted on.
+        last_processed_source_edit_generation: u64,
+        /// A rebuild that the reload pipeline queued instead of the watcher: an
+        /// editor crate's, after a runtime crate in its folder reloaded. It is
+        /// a flag of its own, not part of the watcher's counter, so a fast-path
+        /// patch of a source edit cannot consume it by accident.
+        cascade_reload_queued: bool,
+        /// The persistable component type names the last `init` registered,
+        /// used to detect types the next generation forgets to re-register.
         registered_type_names: Vec<String>,
-        /// The schema hash of each of those types as the last `init` declared
-        /// it, to find the ones another module's reload has re-laid out since.
-        registered_schemas: Vec<(String, u64)>,
-        /// Resource ids the last `init` registered, so a type this module stops
-        /// owning can be dropped while its image is still mapped.
+        /// The schema hash of each of those types, as the last `init` declared
+        /// it. Comparing them with the world's current hashes finds the types
+        /// whose layout another module's reload has replaced since.
+        registered_schema_hashes: Vec<(String, u64)>,
+        /// The resource ids the last `init` registered. They let the reload
+        /// drop a resource this module stops owning while the image that
+        /// created it is still mapped.
         registered_resource_ids: Vec<pill_engine::ResourceId>,
-        /// Every component type name (plain or persistable) the last `init`
-        /// registered: the C# mirror codegen binds the module's native
-        /// components from it, and the renderer's capability check uses it to
-        /// name the components the active renderer does not draw.
+        /// Every component type name, plain or persistable, that the last
+        /// `init` registered. The C# mirror codegen binds the module's native
+        /// components from this list, and the renderer's capability check uses
+        /// it to name the components the active renderer does not draw.
         exposed_component_names: Vec<String>,
         /// Whether this module's retired generations may be unmapped.
         graveyard_policy: crate::reload::GraveyardPolicy,
     }
 
-    /// What a module reload attempt did.
-    ///
-    /// Three states, not a `bool`: the caller performs success bookkeeping
-    /// only on [`Reloaded`] - patch baselines are re-synced, prologue records
-    /// are forgotten, and the editor revision moves - while a failed attempt
-    /// must do none of that (the previous image is still current, its patches
-    /// are still installed, and its recorded prologues are still the rollback
-    /// path), and "nothing was pending" is not an attempt at all. The
-    /// generation is carried so the log lines name the edit the outcome
-    /// belongs to instead of whatever the counter reads by the time they run.
-    ///
-    /// [`Reloaded`]: ReloadOutcome::Reloaded
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum ReloadOutcome {
-        /// The watcher has signalled nothing new and no cascade was queued; no
-        /// attempt was made.
-        Unchanged,
-        /// The new generation built, initialized and was swapped in.
-        Reloaded {
-            /// The source-edit generation this reload delivered.
-            generation: u64,
-        },
-        /// The build produced nothing usable or the swap was refused; the
-        /// previous generation is still current.
-        ///
-        /// No error string: every refusal already logs its own reason where it
-        /// is detected, and carrying a second copy here would print it twice.
-        Failed {
-            /// The source-edit generation the attempt was made for.
-            generation: u64,
-        },
-    }
-
     impl ExtensionSlot {
-        /// Build, load and initialize one extension.
+        /// Builds, loads and initializes one extension.
+        ///
+        /// `source_edit_generation` is the module's edit counter, shared with
+        /// its watcher. `first_load_failure` decides what a failed `init` costs
+        /// the world.
         ///
         /// # Errors
         ///
         /// Returns a [`HostError`] when the module fails to compile, cannot be
         /// loaded, reports a missing or incompatible ABI revision, returns a
-        /// non-zero status from `init`, or registers data the first-load
+        /// non-zero status from `init`, or registers data that the first-load
         /// failure policy forbids.
         pub(crate) fn start(
             engine: &mut Engine,
             engine_api: &EngineApi,
             workspace_root: &Path,
-            config: &ExtensionConfig,
-            owner: SystemOwner,
+            extension_config: &ExtensionConfig,
+            system_owner: SystemOwner,
             source_edit_generation: Arc<AtomicU64>,
             first_load_failure: crate::reload::FirstLoadFailure,
         ) -> Result<Self, HostError> {
             // Step 1: Compile the module through the shared command runner.
-            let output_path = build_extension(workspace_root, config, None)?;
+            let module_output_path = build_extension(workspace_root, extension_config, None)?;
 
-            // Step 2: Load a uniquely named copy so the next compilation stays free
-            // to replace the build output while this generation remains mapped.
-            let library = NativeLibrary::load_copy(&output_path, workspace_root, &config.name)?;
+            // Step 2: Load a uniquely named copy, so the next compilation can
+            // replace the build output while this generation stays mapped.
+            let module_library = NativeLibrary::load_copy(
+                &module_output_path,
+                workspace_root,
+                &extension_config.name,
+            )?;
 
             // Step 3: Check the contract before handing the module anything.
-            library.check_module_abi(&config.name)?;
+            module_library.check_module_abi(&extension_config.name)?;
 
-            // Step 4: Register the module's components and systems under its
-            // own owner, so a later reload can remove exactly these systems.
-            // The capture, init and failure handling are shared with the
-            // project path - see `crate::reload`.
-            // Under `ClearSystemsOnly` the module may register no data of its
-            // own, so what already exists is noted first: re-registering a
-            // shared component the host registered - which `#[pill_module]`'s
-            // generated `init` does for every derived component it links - is
-            // not new data, and must not count against it.
-            let registered_before = (first_load_failure
+            // Step 4: Register the module's components and systems under this
+            // module's owner, so a later reload can remove exactly these
+            // systems. The capture, the init call and the failure handling come
+            // from `crate::reload` and are shared with the project path.
+            //
+            // Under `ClearSystemsOnly` the module must not register data of its
+            // own, so the names and resource ids that exist before the init are
+            // recorded. A shared component that the host already registered,
+            // which `#[pill_module]`'s generated `init` re-registers for every
+            // derived component it links, is not new data and must not count
+            // against the module.
+            let previous_registrations = (first_load_failure
                 == crate::reload::FirstLoadFailure::ClearSystemsOnly)
                 .then(|| {
                     (
@@ -193,20 +174,20 @@ mod slot {
                         engine.world().resource_ids_registered_since(0),
                     )
                 });
-            let init = crate::reload::initialize_generation(
+            let initialized_generation = crate::reload::initialize_generation(
                 engine,
                 engine_api,
-                &config.name,
-                Some(owner),
-                owner,
-                &library,
+                &extension_config.name,
+                Some(system_owner),
+                system_owner,
+                &module_library,
                 first_load_failure,
             );
-            // Under the two keep-the-world policies a refused image stays
-            // mapped for good: that is half of what makes keeping the world
-            // sound (see `FirstLoadFailure`). It leaks one image and its
-            // staged copy, which the next host startup cleans up.
-            let refuse = |library: NativeLibrary, error: HostError| {
+            // Under both policies that keep the world, a refused image stays
+            // mapped for the rest of the run, which is half of what makes
+            // keeping the world sound (see `FirstLoadFailure`). That leaks one
+            // image and its staged copy; the next host start cleans up the copy.
+            let refuse_library = |library: NativeLibrary, error: HostError| {
                 if matches!(
                     first_load_failure,
                     crate::reload::FirstLoadFailure::ClearSystemsOnly
@@ -216,42 +197,43 @@ mod slot {
                 }
                 Err(error)
             };
-            if init.status != 0 {
-                return refuse(
-                    library,
+            if initialized_generation.status != 0 {
+                return refuse_library(
+                    module_library,
                     ModuleError::InitializationFailed {
-                        module: config.name.clone(),
-                        status: init.status,
+                        module: extension_config.name.clone(),
+                        status: initialized_generation.status,
                     }
                     .into(),
                 );
             }
-            // The other half, for the policy that keeps the world without
+            // The other half applies to the policy that keeps the world without
             // touching what the artifact registered: a module that may keep the
-            // world on failure must own no data, so one that registered data
-            // nobody had registered before it is refused. `ClearGenerationData`
-            // is exempt because it drops exactly that data on the failing path
-            // - which is what lets the editor retry a shell module that
-            // registers components.
-            if let Some((components_before, resources_before)) = &registered_before {
-                let new_components = init
+            // world on failure must own no data. One that registered data nobody
+            // had registered before it is therefore refused.
+            // `ClearGenerationData` is exempt because it drops exactly that data
+            // on the failure path, which is what lets the editor retry a shell
+            // module that registers components.
+            if let Some((previous_component_names, previous_resource_ids)) = &previous_registrations
+            {
+                let new_component_count = initialized_generation
                     .component_names
                     .iter()
-                    .filter(|name| !components_before.contains(name))
+                    .filter(|name| !previous_component_names.contains(name))
                     .count();
-                let new_resources = init
+                let new_resource_count = initialized_generation
                     .registered_resource_ids
                     .iter()
-                    .filter(|id| !resources_before.contains(id))
+                    .filter(|id| !previous_resource_ids.contains(id))
                     .count();
-                if new_components != 0 || new_resources != 0 {
-                    engine.clear_systems_owned_by(owner);
-                    return refuse(
-                        library,
+                if new_component_count != 0 || new_resource_count != 0 {
+                    engine.clear_systems_owned_by(system_owner);
+                    return refuse_library(
+                        module_library,
                         ModuleError::RegisteredForbiddenData {
-                            module: config.name.clone(),
-                            components: new_components,
-                            resources: new_resources,
+                            module: extension_config.name.clone(),
+                            components: new_component_count,
+                            resources: new_resource_count,
                         }
                         .into(),
                     );
@@ -260,58 +242,58 @@ mod slot {
 
             info!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                module = config.name.as_str(),
-                owner = owner.0,
+                module = extension_config.name.as_str(),
+                owner = system_owner.0,
                 "extension loaded"
             );
 
             Ok(Self {
-                config: config.clone(),
-                owner,
-                current: library,
-                old_libraries: Vec::new(),
+                extension_config: extension_config.clone(),
+                system_owner,
+                current_library: module_library,
+                retired_libraries: Vec::new(),
                 source_edit_generation,
-                last_processed_source_edit: 0,
-                queued_cascade_reload: false,
-                registered_type_names: init.registered_type_names,
-                registered_schemas: init.registered_schemas,
-                registered_resource_ids: init.registered_resource_ids,
-                exposed_component_names: init.component_names,
+                last_processed_source_edit_generation: 0,
+                cascade_reload_queued: false,
+                registered_type_names: initialized_generation.registered_type_names,
+                registered_schema_hashes: initialized_generation.registered_schemas,
+                registered_resource_ids: initialized_generation.registered_resource_ids,
+                exposed_component_names: initialized_generation.component_names,
                 graveyard_policy: crate::reload::GraveyardPolicy::Bounded,
             })
         }
 
         /// Never unmap this module's retired generations.
         ///
-        /// For a module whose images leave state behind that the reload
-        /// transaction cannot track: see [`crate::reload::GraveyardPolicy::KeepAll`].
+        /// Use it for a module whose images leave behind state that the reload
+        /// transaction cannot track; see [`crate::reload::GraveyardPolicy::KeepAll`].
         #[cfg(feature = "rendering")]
         pub(crate) fn keep_every_generation(&mut self) {
             self.graveyard_policy = crate::reload::GraveyardPolicy::KeepAll;
         }
 
-        /// Whether a watcher signal is waiting to be turned into a reload.
+        /// Whether a watcher signal is waiting to become a reload.
         ///
-        /// The caller asks before gathering the peer declaration set, so the
-        /// per-frame reload pass allocates nothing for modules with no
+        /// The caller asks this before it gathers the peer declaration set, so
+        /// the per-frame reload pass allocates nothing for modules that have no
         /// pending change.
         pub(crate) fn has_pending_reload(&self) -> bool {
-            self.queued_cascade_reload
+            self.cascade_reload_queued
                 || self.source_edit_generation.load(Ordering::Acquire)
-                    != self.last_processed_source_edit
+                    != self.last_processed_source_edit_generation
         }
 
-        /// Reload this module when a source edit or a queued cascade reload is
+        /// Reloads this module when a source edit or a queued cascade reload is
         /// pending.
         ///
         /// Returns [`ReloadOutcome::Reloaded`] when a new generation replaced
         /// the current one, [`ReloadOutcome::Failed`] when an attempt was made
         /// and the previous generation was kept, and
         /// [`ReloadOutcome::Unchanged`] when nothing was pending. The caller
-        /// gates its success bookkeeping on the outcome: a failed attempt
-        /// leaves every patch, baseline and record of the current generation
-        /// in place. Every module keeps its own counter, so this never
-        /// rebuilds another module or the project.
+        /// decides what to do from the outcome: a failed attempt leaves every
+        /// patch, baseline and record of the current generation in place.
+        /// Every module has its own counter, so this never rebuilds another
+        /// module or the project.
         pub(crate) fn reload_if_changed(
             &mut self,
             engine: &mut Engine,
@@ -328,40 +310,42 @@ mod slot {
             )
         }
 
-        /// [`Self::reload_if_changed`], running `before_commit` once the
-        /// replacement has built, loaded and passed the ABI check, immediately
-        /// before it is swapped in - and not at all when an earlier step
-        /// refused it.
+        /// Same as [`Self::reload_if_changed`], but runs `on_before_commit` once
+        /// the replacement has built, loaded and passed the ABI check, just
+        /// before it is swapped in. It does not run at all when an earlier step
+        /// refuses the replacement.
         ///
-        /// For a module whose caller holds state built on the current image
-        /// that has to be released while that image is still mapped: the
+        /// Use it for a module whose caller holds state built on the current
+        /// image that has to be released while that image is still mapped: the
         /// renderer module's GPU backend.
         ///
-        /// `peer_component_names` is every component name the other live
-        /// subjects declare; a type only they name is not this module's to
-        /// drop when its new generation forgets it.
+        /// `peer_component_names` lists every component name the other live
+        /// subjects declare. A type that only they name is not this module's to
+        /// drop when the new generation forgets it.
         pub(crate) fn reload_if_changed_with(
             &mut self,
             engine: &mut Engine,
             engine_api: &EngineApi,
             workspace_root: &Path,
             peer_component_names: &[String],
-            before_commit: &mut dyn FnMut(),
+            on_before_commit: &mut dyn FnMut(),
         ) -> ReloadOutcome {
-            // Step 1: One attempt per pending signal, or nothing to do. The
-            // generation is read before the build so a save landing mid-build
-            // stays pending (see Step 3).
+            // Step 1: Nothing to do when no signal is pending; otherwise one
+            // attempt. The generation is read before the build, so a save that
+            // arrives during the build stays pending (see Step 3).
             let generation = self.source_edit_generation.load(Ordering::Acquire);
-            if generation == self.last_processed_source_edit && !self.queued_cascade_reload {
+            if generation == self.last_processed_source_edit_generation
+                && !self.cascade_reload_queued
+            {
                 return ReloadOutcome::Unchanged;
             }
-            self.queued_cascade_reload = false;
+            self.cascade_reload_queued = false;
 
-            // Step 2: The reload itself; a refusal leaves the current
+            // Step 2: The reload itself. A refusal leaves the current
             // generation and its patch state untouched.
             info!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                module = self.config.name.as_str(),
+                module = self.extension_config.name.as_str(),
                 generation,
                 "extension reload triggered"
             );
@@ -371,124 +355,132 @@ mod slot {
                 workspace_root,
                 generation,
                 peer_component_names,
-                before_commit,
+                on_before_commit,
             );
 
-            // Step 3: Record the baseline - the generation observed BEFORE the
-            // reload, deliberately, not a fresh read. A save during the build
-            // advances the counter past this value, and recording the newer one
-            // would mark that save as handled when nothing built it - the edit
-            // would then sit on disk, never compiled, until something else
-            // happened to touch the crate. Recording the baseline instead leaves
-            // the newer save pending, so the next frame rebuilds with it. This is
-            // also what makes the build cancellation in `run_build_command` mean
-            // anything: it aborts the moment the counter moves, precisely so the
-            // newer sources win.
-            self.last_processed_source_edit = generation;
+            // Step 3: Record the baseline: the generation seen before the
+            // reload, not a fresh read. A save during the build moves the
+            // counter past this value. Recording the newer value would mark
+            // that save as handled although nothing built it, and the edit
+            // would sit on disk uncompiled until something else touched the
+            // crate. Recording the older value leaves the newer save pending,
+            // so the next frame rebuilds with it.
+            //
+            // This is also what the build cancellation in `run_build_command`
+            // depends on: it stops the moment the counter moves, so the newer
+            // sources win.
+            self.last_processed_source_edit_generation = generation;
             outcome
         }
 
-        /// Crate name of this module: the log field, and the key callers look
-        /// a module up by.
+        /// The crate name of this module. It is the field the log lines carry
+        /// and the key callers use to find a module.
         pub(crate) fn name(&self) -> &str {
-            &self.config.name
+            &self.extension_config.name
         }
 
         /// The extension folder holding this module's crate.
         pub(crate) fn folder(&self) -> &str {
-            &self.config.folder
+            &self.extension_config.folder
         }
 
         /// Whether this module is its folder's editor crate.
         pub(crate) fn is_editor_crate(&self) -> bool {
-            self.config.is_editor_crate
+            self.extension_config.is_editor_crate
         }
 
-        /// Rebuild and reload this module on the next reload pass, though its
-        /// own sources did not change: an editor crate links its folder's
-        /// runtime crates, so it is stale once one of them reloads.
+        /// Rebuilds and reloads this module on the next reload pass, although
+        /// its own sources did not change. An editor crate links its folder's
+        /// runtime crates, so it is out of date once one of them reloads.
         pub(crate) fn queue_cascade_reload(&mut self) {
-            self.queued_cascade_reload = true;
+            self.cascade_reload_queued = true;
         }
 
-        /// Force a full rebuild and reload on the next pass, as if a source
-        /// save had arrived: the editor's safe mode retries a shell whose
-        /// generation stopped this way.
+        /// Forces a full rebuild and reload on the next pass, as if a source
+        /// save had arrived. The editor's safe-mode Retry rebuilds a loaded
+        /// shell module this way.
         pub(crate) fn request_reload(&mut self) {
             self.source_edit_generation.fetch_add(1, Ordering::AcqRel);
         }
 
-        /// The module's crate directory, relative to the workspace root: the
-        /// parent of the source directory its watcher watches.
+        /// The module's crate directory, relative to the workspace root. It is
+        /// the parent of the source directory the watcher watches.
         #[cfg(feature = "rendering")]
         pub(crate) fn crate_directory(&self) -> &Path {
-            Path::new(&self.config.watch_directory)
+            Path::new(&self.extension_config.watch_directory)
                 .parent()
                 .unwrap_or_else(|| Path::new(""))
         }
 
-        /// The generation this module's watcher has signalled but nothing has acted
-        /// on yet, if any.
+        /// The generation the watcher has signalled but nothing has handled
+        /// yet, if any.
         ///
-        /// Lets the per-function fast path look at a pending change before
-        /// [`Self::reload_if_changed`] turns it into a full rebuild. The value is
-        /// returned rather than just a flag so the caller can hand the exact
-        /// generation it acted on back to [`Self::consume_pending_reload`].
+        /// The per-function fast path uses it to look at a pending change
+        /// before [`Self::reload_if_changed`] turns the change into a full
+        /// rebuild. It returns the generation itself rather than a flag, so the
+        /// caller can pass the exact generation it handled to
+        /// [`Self::consume_pending_reload`].
         #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         pub(crate) fn pending_reload_generation(&self) -> Option<u64> {
             let generation = self.source_edit_generation.load(Ordering::Acquire);
-            (generation != self.last_processed_source_edit).then_some(generation)
+            (generation != self.last_processed_source_edit_generation).then_some(generation)
         }
 
-        /// Mark one observed generation as handled without rebuilding.
+        /// Marks one generation as handled without rebuilding.
         ///
-        /// Called only when a patch has already delivered that edit, so the reload
-        /// it would otherwise trigger has nothing left to do.
+        /// Call this only when a patch has already delivered that edit; the
+        /// reload it would otherwise cause has nothing left to do.
         ///
-        /// Takes the generation the caller acted on rather than reading a fresh one,
-        /// for the same reason [`Self::reload_if_changed`] records its baseline: a
-        /// save that lands while the patch is compiling advances the counter past
-        /// it, and that save has not been delivered by anything. Recording it as
-        /// handled would strand the edit on disk.
+        /// It takes the generation the caller acted on instead of reading a
+        /// fresh one, for the same reason [`Self::reload_if_changed`] records
+        /// its baseline: a save that arrives while the patch is compiling moves
+        /// the counter past that generation, and nothing has delivered that
+        /// save. Recording it as handled would leave the edit on disk, never
+        /// compiled.
         #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         pub(crate) fn consume_pending_reload(&mut self, generation: u64) {
-            self.last_processed_source_edit = generation;
+            self.last_processed_source_edit_generation = generation;
         }
 
-        /// The module's currently loaded library: a patch target, and where the
-        /// renderer module's attach and detach exports are resolved.
+        /// The library of the generation that is loaded now. It is a patch
+        /// target, and the renderer module resolves its attach and detach
+        /// exports from it.
         #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         pub(crate) fn current_library(&self) -> &NativeLibrary {
-            &self.current
+            &self.current_library
         }
 
-        /// The address of the current generation's export named `name`, if it
-        /// has one; how the windowed host finds the renderer data crate's
-        /// shader reload function.
+        /// The address of the current generation's export named `export_name`,
+        /// if it has one. The windowed host uses this to find the renderer data
+        /// crate's shader reload function.
         ///
-        /// Valid while this generation stays current: callers look it up again
-        /// after every reload rather than keep an address across one.
+        /// The address is valid only while this generation stays current, so
+        /// callers look it up again after every reload instead of keeping it
+        /// across one.
         #[cfg_attr(not(feature = "rendering"), allow(dead_code))]
         pub(crate) fn export_address(
             &self,
-            name: &str,
+            export_name: &str,
         ) -> Option<pill_engine::component_registry::ExportAddress> {
             // SAFETY: the symbol is read as a plain address and never called
             // here; whoever calls it states its signature.
-            let address = unsafe { self.current.resolve_export::<*const ()>(name.as_bytes()) }?;
+            let address = unsafe {
+                self.current_library
+                    .resolve_export::<*const ()>(export_name.as_bytes())
+            }?;
             Some(pill_engine::component_registry::ExportAddress(address))
         }
 
         /// The persistable components this module registered whose layout
-        /// another module's reload has replaced since; empty while it is
-        /// current. See [`crate::reload::stale_components`].
+        /// another module's reload has replaced since. The list is empty while
+        /// this generation is current. See [`crate::reload::stale_components`].
         pub(crate) fn stale_components(&self, world: &pill_engine::World) -> Vec<String> {
-            crate::reload::stale_components(world, &self.registered_schemas)
+            crate::reload::stale_components(world, &self.registered_schema_hashes)
         }
 
         /// The owner tag this module's systems are registered under.
         pub(crate) fn owner(&self) -> SystemOwner {
-            self.owner
+            self.system_owner
         }
 
         /// Every component type name the current generation registered, for
@@ -497,57 +489,60 @@ mod slot {
             &self.exposed_component_names
         }
 
-        /// The current generation's `#[derive(PillMirror)]` value-type
-        /// descriptors, used by the C# codegen to resolve nested struct tags.
+        /// The `#[derive(PillMirror)]` value-type descriptors of this module's
+        /// own crate in the current generation, which the C# codegen uses to
+        /// resolve nested struct tags.
         ///
-        /// Only descriptors this module's own package declared: an artifact
-        /// also carries the submissions of every crate it links (an extension
-        /// depending on an extension), and those belong to the module that
-        /// owns them - emitting them here would duplicate the owner's
-        /// generated file with a second C# type of the same name.
+        /// Only the descriptors this module's own package declared. An artifact
+        /// also carries the declarations of every crate it links (an extension
+        /// can depend on another extension), and those belong to the module that
+        /// owns them. Emitting them here would add a second C# type with the
+        /// same name to the owner's generated file.
         pub(crate) fn value_type_descriptors(
             &self,
         ) -> Vec<pill_engine::component_registry::PillValueTypeDescriptor> {
             let module_name = self.name();
-            self.current
+            self.current_library
                 .value_type_descriptors()
                 .into_iter()
                 .filter(|descriptor| descriptor.crate_name == module_name)
                 .collect()
         }
 
-        /// The current generation's `#[pill_mirror_method]` entries, each with
-        /// the resolved address of its C-ABI trampoline, used by the C#
-        /// codegen and the managed runtime's method table.
+        /// The `#[pill_mirror_method]` entries of the current generation, each
+        /// with the resolved address of its C-ABI trampoline. The C# codegen
+        /// and the managed runtime's method table use them.
         ///
         /// Filtered to this module's own declarations for the same reason as
-        /// [`Self::value_type_descriptors`]: the managed table is keyed by the
+        /// [`Self::value_type_descriptors`]. The managed table is keyed by the
         /// declaring names, and a linked dependency's copy of the same
-        /// trampoline would shadow the owner's address - a patch reaches the
-        /// owner's copy, so the managed call would read stale code.
+        /// trampoline would hide the owner's address. A patch reaches the
+        /// owner's copy, so a managed call through that address would run stale
+        /// code.
         pub(crate) fn mirror_methods(&self) -> Vec<crate::csharp::ResolvedMirrorMethod> {
             let module_name = self.name();
-            self.current
+            self.current_library
                 .mirror_methods()
                 .into_iter()
                 .filter(|method| method.crate_name == module_name)
                 .collect()
         }
 
-        /// The current generation's heap-field accessors, each with the
-        /// resolved addresses of its operation trampolines, used by the C#
-        /// mirror codegen and the managed runtime's method table.
+        /// The heap-field accessors of the current generation, each with the
+        /// resolved addresses of the trampolines for its operations. The C#
+        /// mirror codegen and the managed runtime's method table use them.
         pub(crate) fn field_accessors(&self) -> Vec<crate::csharp::ResolvedFieldAccessor> {
-            self.current.field_accessors()
+            self.current_library.field_accessors()
         }
 
-        /// Rebuild and swap one generation, keeping the previous one on any failure.
+        /// Rebuilds and swaps one generation, and keeps the previous one on any
+        /// failure.
         ///
-        /// Returns [`ReloadOutcome::Reloaded`] when the swap happened; every
-        /// refusal on the way - build, load, ABI, or a rolled-back init -
-        /// reports [`ReloadOutcome::Failed`] carrying the generation, so the
-        /// caller can skip the bookkeeping that only a replaced image
-        /// justifies and still log which edit was lost.
+        /// Returns [`ReloadOutcome::Reloaded`] when the swap happened. Every
+        /// refusal on the way - build, load, ABI check or a rolled-back init -
+        /// returns [`ReloadOutcome::Failed`] with the generation, so the caller
+        /// can skip the bookkeeping that only a replaced image justifies and
+        /// still log which edit was lost.
         fn reload(
             &mut self,
             engine: &mut Engine,
@@ -555,21 +550,21 @@ mod slot {
             workspace_root: &Path,
             generation: u64,
             peer_component_names: &[String],
-            before_commit: &mut dyn FnMut(),
+            on_before_commit: &mut dyn FnMut(),
         ) -> ReloadOutcome {
             // Steps 1 to 3 are shared with the project path and live in
             // `crate::reload`: compile before touching engine state (a newer
             // save during the build cancels it and the next frame retries),
-            // load a private copy and verify its ABI, then swap through the
-            // transaction whose own step order is load-bearing.
+            // then load a private copy and verify its ABI, and finally swap
+            // through the transaction, whose own step order is load-bearing.
             let transaction = crate::reload::ReloadTransaction {
                 kind: crate::reload::ReloadSubjectKind::Extension,
-                subject: &self.config.name,
-                owner: self.owner,
-                current: &mut self.current,
-                old_libraries: &mut self.old_libraries,
+                subject: &self.extension_config.name,
+                owner: self.system_owner,
+                current: &mut self.current_library,
+                old_libraries: &mut self.retired_libraries,
                 registered_type_names: &mut self.registered_type_names,
-                registered_schemas: &mut self.registered_schemas,
+                registered_schemas: &mut self.registered_schema_hashes,
                 registered_resource_ids: &mut self.registered_resource_ids,
                 peer_component_names,
                 graveyard_policy: self.graveyard_policy,
@@ -578,36 +573,76 @@ mod slot {
                 engine,
                 engine_api,
                 workspace_root,
-                |cancel_flag| build_extension(workspace_root, &self.config, cancel_flag),
+                |cancel_flag| build_extension(workspace_root, &self.extension_config, cancel_flag),
                 Some((&self.source_edit_generation, generation)),
                 crate::reload::LoadValidation::ModuleAbi,
-                before_commit,
+                on_before_commit,
                 transaction,
             ) else {
                 // A refused step left the previous generation running.
                 return ReloadOutcome::Failed { generation };
             };
-            // Refresh the C#-exposed component set to the new generation's
-            // registrations (plain and persistable alike).
+            // Refresh the C#-exposed component set with what the new generation
+            // registered (plain and persistable alike).
             self.exposed_component_names = commit.exposed_component_names;
             ReloadOutcome::Reloaded { generation }
         }
     }
 
     impl Drop for ExtensionSlot {
-        /// Announce the unload of this module's images, current and retired.
+        /// Announces the unload of this module's images, current and retired.
         ///
-        /// The fields drop straight after this body, and each library field
+        /// The fields are dropped right after this body, and each library field
         /// unmaps an image that engine-owned pointers may still point into.
-        /// That makes this the riskiest moment in a host's life, so every
-        /// module names itself in the log before its images go.
+        /// That is the riskiest moment in a host's life, so each module names
+        /// itself in the log before its images go.
         fn drop(&mut self) {
             info!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                module = %self.config.name,
-                generations = self.old_libraries.len() + 1,
+                module = %self.extension_config.name,
+                generations = self.retired_libraries.len() + 1,
                 "unloading extension"
             );
         }
+    }
+
+    // =========================================================================
+    // ReloadOutcome
+    // =========================================================================
+
+    /// What a module reload attempt did.
+    ///
+    /// There are three states rather than a `bool` because each one asks the
+    /// caller for a different action. Only [`Reloaded`] justifies the success
+    /// bookkeeping: the patch baselines are rebuilt, the recorded prologues are
+    /// forgotten and the editor revision moves. A failed attempt must leave all
+    /// of that alone, because the previous image is still current, its patches
+    /// are still installed and its prologues are still the rollback path.
+    /// "Nothing was pending" is not an attempt at all.
+    ///
+    /// The outcome carries the generation, so the log lines can name the edit
+    /// the outcome belongs to instead of whatever the counter holds by the time
+    /// they run.
+    ///
+    /// [`Reloaded`]: ReloadOutcome::Reloaded
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ReloadOutcome {
+        /// The watcher signalled nothing new and no cascade rebuild was
+        /// queued, so no attempt was made.
+        Unchanged,
+        /// The new generation was built, initialized and swapped in.
+        Reloaded {
+            /// The source-edit generation this reload delivered.
+            generation: u64,
+        },
+        /// The build produced nothing usable, or the swap was refused. The
+        /// previous generation is still current.
+        ///
+        /// No error string: every refusal already logs its own reason where it
+        /// is detected, and a second copy here would print it twice.
+        Failed {
+            /// The source-edit generation the attempt was made for.
+            generation: u64,
+        },
     }
 }

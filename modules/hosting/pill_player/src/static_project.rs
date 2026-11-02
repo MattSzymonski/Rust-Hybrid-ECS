@@ -2,8 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Describes a project and its extensions as ordinary Rust functions
-//!   compiled into the binary, rather than DLLs discovered at runtime.
+//! - Describes a project and its extensions as ordinary Rust functions that
+//!   are compiled into the binary, rather than as DLLs found at run time.
 //! - Initializes them in the same order, and under the same owners, that the
 //!   hot-reloading host uses.
 //! - Defines [`ProjectBackend`], the extension point through which a project
@@ -11,23 +11,24 @@
 //!
 //! # Design
 //!
-//! The dependency direction forces this shape: this crate cannot name the
+//! The dependency direction forces this shape. This crate cannot name the
 //! project crate, or every game would need its own player, so the crate that
 //! links both - the generated shipping bundle - passes the functions in. That
-//! also makes the set of linked modules explicit at the call site, which is what
-//! a shipping build wants: `project_settings.yaml` is a development convenience
-//! and should not decide what a released binary contains.
+//! also makes the set of linked modules visible at the call site. A shipping
+//! build wants exactly that: the bundle generator reads
+//! `project_settings.yaml` while the binary is built, and the released binary
+//! holds what the generator baked in instead of reading a settings file.
 //!
 //! For the same reason this crate names no C# type: a managed project arrives
 //! as a [`StaticProjectBackend::External`] backend the bridge implements, so a
 //! build that runs no C# links none of it.
 //!
 //! A linked entry point runs the same transaction as the macro-generated
-//! `pill_module_init` wrapper: `register_all_components` drains this artifact's
-//! `inventory` registry into the world first, and skipping it fails as "my
+//! `pill_module_init` wrapper. `register_all_components` drains this artifact's
+//! `inventory` registry into the world first; skipping it fails as "my
 //! components do not exist" rather than as a link error. The wrapper also
-//! catches panics; here there is no C ABI to unwind across, so a panic stays an
-//! ordinary Rust panic rather than becoming a status that hides the backtrace.
+//! catches panics. Here there is no C ABI to unwind across, so a panic stays an
+//! ordinary Rust panic instead of becoming a status that hides the backtrace.
 
 // Standard library
 use std::any::Any;
@@ -48,9 +49,9 @@ use crate::LoggingSettings;
 
 /// One extension compiled into the binary.
 ///
-/// The counterpart of an extension the development host loads: the same
-/// module, named the same way, but reached by a direct call instead of through
-/// `pill_module_init` in a loaded DLL.
+/// It is the counterpart of an extension the development host loads: the same
+/// module, named the same way, but reached by a direct call instead of the
+/// `pill_module_init` export of a loaded DLL.
 #[derive(Clone, Copy)]
 pub struct StaticModule {
     /// Crate name, used for logging exactly as the reloading host uses the
@@ -59,14 +60,14 @@ pub struct StaticModule {
     /// The function `#[pill_module]` was written on.
     ///
     /// A loaded module reaches the same function through its `pill_module_init`
-    /// export; here this crate calls it directly.
+    /// export. Here this crate calls it directly.
     pub init: fn(&mut Engine) -> u32,
 }
 
 /// A project that registers itself by other means than a linked Rust
 /// function: a C# assembly, through `pill_csharp_bridge`.
 ///
-/// This crate calls it once, after every extension registered, and keeps
+/// This crate calls it once, after every extension has registered, and keeps
 /// what it returns until the engine is gone.
 pub trait ProjectBackend {
     /// Register the project's systems and data with `engine`.
@@ -74,12 +75,12 @@ pub trait ProjectBackend {
     /// `exposed_component_names` are the components the extensions registered,
     /// in registration order, for a backend that binds them (the C# bridge
     /// gives managed code byte-level access to them). The returned guard holds
-    /// whatever must live as long as the systems it registered - for C#, the
-    /// .NET runtime itself; dropping it earlier would unload their code.
+    /// whatever must stay alive as long as the systems it registered - for C#,
+    /// the .NET runtime itself. Dropping it earlier would unload their code.
     ///
     /// # Errors
     ///
-    /// Returns a [`HostError`] when the project cannot start; there is no
+    /// Returns a [`HostError`] when the project cannot start. There is no
     /// previous generation to fall back to, so the player stops there.
     fn start(
         &self,
@@ -96,20 +97,21 @@ pub enum StaticProjectBackend {
         /// The function `#[pill_project]` was written on.
         init: fn(&mut Engine) -> u32,
     },
-    /// A project started by a backend outside this crate - the C# bridge's
-    /// CoreCLR or NativeAOT backend today.
+    /// A project started by a backend outside this crate: the C# bridge's
+    /// CoreCLR or NativeAOT backend.
     ///
-    /// Shared rather than boxed so a [`StaticProject`] stays cloneable, as the
-    /// windowed frontend needs.
+    /// Shared rather than boxed, so a [`StaticProject`] stays cloneable. The
+    /// windowed frontend needs that: it clones the project to run the setup and
+    /// keeps the copy it reads its name from.
     External(Arc<dyn ProjectBackend>),
 }
 
 /// The renderer a windowed shipping build links, as the two functions this
 /// crate needs from it.
 ///
-/// Function pointers rather than a dependency: this crate names no renderer
-/// type. The shipping bundle - the one crate that depends on the renderer -
-/// fills this in.
+/// Function pointers rather than a dependency, because this crate names no
+/// renderer type. The shipping bundle, the one crate that depends on the
+/// renderer, fills this in.
 #[derive(Clone, Copy)]
 pub struct StaticRenderer {
     /// The renderer's registration (`pill_master_renderer::register`), which
@@ -120,9 +122,9 @@ pub struct StaticRenderer {
     ///
     /// # Safety
     ///
-    /// The window must outlive the backend built on it - the renderer module's
-    /// own contract. This crate satisfies it by keeping the backend in a field
-    /// declared before the window it was built on.
+    /// The window must outlive the backend built on it. That is the renderer
+    /// module's own contract. This crate meets it by keeping the backend in a
+    /// field declared before the window it was built on.
     pub attach: StaticRendererAttachFn,
 }
 
@@ -132,7 +134,7 @@ pub type StaticRendererAttachFn =
 
 /// A project and its extensions, compiled into the binary.
 ///
-/// Takes the place of the development host's project settings. There is no
+/// It takes the place of the development host's project settings. There is no
 /// project path, no build command and no watch directory, because nothing is
 /// built or watched.
 #[derive(Clone)]
@@ -143,28 +145,29 @@ pub struct StaticProject {
     pub backend: StaticProjectBackend,
     /// Extensions, initialized in order **before** the project.
     ///
-    /// The order matters for the same reason it does with reloading: the
-    /// project may name types a module defines, so the module has to have
-    /// registered them first. A managed project additionally needs every
-    /// module's components registered before its assembly loads, so the
-    /// bindings it is handed can resolve them.
+    /// The order matters here for the same reason it does with reloading: the
+    /// project may name types a module defines, so the module has to register
+    /// them first. A managed project also needs every module's components
+    /// registered before its assembly loads, so the bindings it is handed can
+    /// resolve them.
     pub modules: &'static [StaticModule],
     /// The renderer this binary links, when it was built to draw.
     ///
     /// `None` for a headless shipping build, which links no renderer at all.
     pub renderer: Option<StaticRenderer>,
     /// The project's `res` directory as an asset pack, embedded in the binary
-    /// by the shipping bundle; mounted before anything initializes.
+    /// by the shipping bundle and mounted before anything initializes.
     ///
     /// `None` for a project without a `res` directory, and for the browser
     /// posture, whose pack is fetched instead (see [`Self::asset_pack_url`]).
     pub asset_pack: Option<&'static [u8]>,
     /// Where the browser posture fetches its asset pack from, relative to the
-    /// page: the shipping bundle names the file `build_web.py` puts beside it.
+    /// page. The shipping bundle names the file that `build_web.py` puts beside
+    /// it.
     ///
-    /// Read by `pill_web` alone. A native build embeds its pack instead and
-    /// leaves this `None`, and this crate ignores it: fetching is a browser's
-    /// job, so nothing outside a browser frontend can act on it.
+    /// `pill_web` is the only code that reads it. A native build embeds its
+    /// pack instead and leaves this `None`, and this crate ignores it: fetching
+    /// is a browser's job.
     pub asset_pack_url: Option<&'static str>,
     /// The `logging:` section of the project's settings, as the bundle
     /// generator validated it; [`StaticLogging::NONE`] for none.
@@ -172,56 +175,60 @@ pub struct StaticProject {
     /// Whether debug drawing starts on: the settings' `debug_draw:` key,
     /// `false` when absent. A system can still switch it at runtime.
     pub debug_draw: bool,
-    /// The scene the project's settings named as its startup scene, loaded
-    /// once every component is registered: before a natively linked project's
-    /// `init` seeds anything, and once an external backend's `start` has
-    /// returned (`startup_scene:` in `project_settings.yaml`).
+    /// The scene the project's settings named as its startup scene, loaded once
+    /// every component is registered (`startup_scene:` in
+    /// `project_settings.yaml`).
+    ///
+    /// A natively linked project gets it before its `init` seeds anything; an
+    /// external backend gets it once its `start` has returned.
     pub startup_scene: Option<&'static str>,
 }
 
 impl StaticProject {
     /// Initialize every extension, then the project.
     ///
-    /// Owners come from [`crate::registration`], as in the reloading host, so a
-    /// statically linked module's systems are attributed to the same owner
-    /// they would have had there. Nothing can be cleared or re-registered
-    /// here, but the attribution still decides which systems a pause suspends
-    /// and how a system list labels them.
+    /// Owners come from [`crate::registration`], as they do in the reloading
+    /// host, so a statically linked module's systems are attributed to the same
+    /// owner they would have had there. Nothing here can be cleared or
+    /// re-registered, but the attribution still decides which systems a pause
+    /// suspends and how a system list labels them.
     ///
-    /// On success returns an external backend's guard, which the caller must
-    /// keep alive for as long as the engine - see [`ProjectBackend::start`]. A
-    /// natively linked project returns `None`.
+    /// On success it returns an external backend's guard, which the caller must
+    /// keep alive for as long as the engine lives (see [`ProjectBackend::start`]).
+    /// A natively linked project returns `None`.
     ///
     /// # Errors
     ///
     /// Returns [`ModuleError::InitializationFailed`] naming the first module
-    /// whose init reported a non-zero status,
-    /// [`LibraryError::InitializationFailed`] when a native project's does, or
-    /// what an external backend returns. Initialization stops at the first
-    /// failure: there is no previous generation to roll back to on this path,
-    /// so continuing would run a partially registered world.
+    /// whose registration or init reported a non-zero status,
+    /// [`LibraryError::InitializationFailed`] when a native project's entry
+    /// point does, or what an external backend returns.
+    ///
+    /// Initialization stops at the first failure: there is no previous
+    /// generation to roll back to on this path, so continuing would run a
+    /// partially registered world.
     pub(crate) fn initialize(
         &self,
         engine: &mut Engine,
     ) -> Result<Option<Box<dyn Any>>, HostError> {
-        // Step 1: Every extension registers under the owner its load index
-        // gives it, and the components it adds are collected as it goes: an
-        // external backend is handed those names rather than having them
-        // reconstructed afterwards. The renderer's data crate is the first
-        // module, as in the reloading host (the bundle generator puts it
-        // there), so modules and the project find its components registered.
-        let mut exposed_names: Vec<String> = Vec::new();
+        // Step 1: Register every extension under the owner its load index
+        // gives it, and collect the components it adds as we go, so an
+        // external backend is handed those names instead of rebuilding them
+        // afterwards. The renderer's data crate is the first module, as in the
+        // reloading host (the bundle generator puts it there), so modules and
+        // the project find its components registered.
+        let mut exposed_component_names: Vec<String> = Vec::new();
 
         for (index, module) in self.modules.iter().enumerate() {
-            let owner = extension_owner(index);
+            let system_owner = extension_owner(index);
             let registration_sequence = engine.world().component_registration_sequence();
-            initialize_linked(engine, module.init, Some(owner), None).map_err(|status| {
-                ModuleError::InitializationFailed {
+            run_linked_entry_point(engine, module.init, Some(system_owner), None).map_err(
+                |status| ModuleError::InitializationFailed {
                     module: module.name.to_string(),
                     status,
-                }
-            })?;
-            exposed_names.extend(
+                },
+            )?;
+            exposed_component_names.extend(
                 engine
                     .world()
                     .registered_component_names_since(registration_sequence),
@@ -229,32 +236,32 @@ impl StaticProject {
             info!(
                 target: pill_core::telemetry::telemetry_target::LINK,
                 module = module.name,
-                owner = owner.0,
+                owner = system_owner.0,
                 "extension linked"
             );
         }
 
         // Step 2: The project itself, through its linked function or through
         // an external backend.
-        let guard = match &self.backend {
+        let project_guard = match &self.backend {
             StaticProjectBackend::Native { init } => {
-                initialize_linked(engine, *init, PROJECT_SCOPE, self.startup_scene)
+                run_linked_entry_point(engine, *init, PROJECT_SCOPE, self.startup_scene)
                     .map_err(|status| LibraryError::InitializationFailed { status })?;
                 None
             }
             // No build, no codegen, no watcher: whatever the backend loads was
             // produced when this binary was built.
             //
-            // A managed project registers its components inside `start`, so
-            // its startup scene goes in once that returns - the earliest point
-            // at which its types exist. A native project's goes in between its
-            // registration and its `init`; see `initialize_linked`.
-            StaticProjectBackend::External(backend) => {
-                let guard = backend.start(engine, &exposed_names)?;
+            // A managed project registers its components inside `start`, so its
+            // startup scene goes in once that returns - the earliest point at
+            // which its types exist. A native project's scene goes in between
+            // its registration and its `init`; see `run_linked_entry_point`.
+            StaticProjectBackend::External(project_backend) => {
+                let project_guard = project_backend.start(engine, &exposed_component_names)?;
                 if let Some(path) = self.startup_scene {
                     apply_project_startup_scene(engine, path);
                 }
-                Some(guard)
+                Some(project_guard)
             }
         };
 
@@ -262,16 +269,16 @@ impl StaticProject {
             target: pill_core::telemetry::telemetry_target::LINK,
             project = self.name,
             modules = self.modules.len(),
-            external = guard.is_some(),
+            external = project_guard.is_some(),
             "project linked"
         );
-        Ok(guard)
+        Ok(project_guard)
     }
 }
 
 /// A project's logging settings, compiled into the binary as text.
 ///
-/// Text rather than levels so the generated bundle names no engine type;
+/// Text rather than levels, so the generated bundle names no engine type.
 /// [`Self::settings`] reads it into [`LoggingSettings`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StaticLogging {
@@ -281,8 +288,8 @@ pub struct StaticLogging {
     pub timestamp: Option<&'static str>,
     /// The `source_location:` key, when the settings set one.
     pub source_location: Option<bool>,
-    /// The `targets:` map, as `(target, level)` pairs sorted by target, the
-    /// order the bundle generator writes them in.
+    /// The `targets:` map, as `(target, level)` pairs sorted by target. The
+    /// bundle generator writes them in that order.
     pub targets: &'static [(&'static str, &'static str)],
 }
 
@@ -300,8 +307,8 @@ impl StaticLogging {
     /// # Errors
     ///
     /// Returns the message of the first level, timestamp format or target that
-    /// does not read, which only a hand-edited bundle can hold: the generator
-    /// refuses all three.
+    /// does not read. Only a hand-edited bundle can hold one, because the
+    /// generator refuses all three.
     pub fn settings(&self) -> Result<LoggingSettings, String> {
         LoggingSettings::from_text(
             self.level,
@@ -318,14 +325,14 @@ impl StaticLogging {
 
 /// Queue and load a project's startup scene, warning when it cannot be read.
 ///
-/// A failure is a warning rather than an error: a missing or unreadable scene
-/// must not stop a project from starting.
-fn apply_project_startup_scene(engine: &mut Engine, path: &str) {
-    pill_engine::queue_startup_scene(engine.world_mut(), path);
+/// A failure is a warning rather than an error, because a missing or unreadable
+/// scene must not stop a project from starting.
+fn apply_project_startup_scene(engine: &mut Engine, scene_path: &str) {
+    pill_engine::queue_startup_scene(engine.world_mut(), scene_path);
     if let Some(Err(reason)) = pill_engine::apply_startup_scene(engine) {
         pill_core::warn!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
-            path,
+            path = scene_path,
             reason,
             "[engine] startup scene not loaded"
         );
@@ -334,26 +341,26 @@ fn apply_project_startup_scene(engine: &mut Engine, path: &str) {
 
 /// Run one linked entry point the way its generated ABI wrapper would.
 ///
-/// `scope` scopes the registrations when present, which is what an extension
-/// needs and what the project must not have. `startup_scene` is the project's
-/// own startup scene, applied after the component types exist and before the
-/// project seeds its entities over them; an extension passes `None`, because a
-/// module has no scene of its own.
+/// `scope` sets the owner the registrations are recorded under when present.
+/// An extension needs that; the project must not have it. `startup_scene` is
+/// the project's own startup scene, applied after the component types exist and
+/// before the project seeds its entities over them. An extension passes `None`,
+/// because a module has no scene of its own.
 ///
 /// # Errors
 ///
 /// Returns the non-zero status the entry point reported, from the artifact's
-/// registration or from `init`; the caller names the subject, because only it
+/// registration or from `init`. The caller names the subject, because only it
 /// knows whether the failure is a module's or the project's.
-pub(crate) fn initialize_linked(
+pub(crate) fn run_linked_entry_point(
     engine: &mut Engine,
     init: fn(&mut Engine) -> u32,
     scope: Option<SystemOwner>,
     startup_scene: Option<&'static str>,
 ) -> Result<(), u32> {
-    // The same transaction the generated wrappers run, ordering included: both
-    // paths end in `run_artifact_entry`, so the order lives in one place and no
-    // comment has to keep two copies identical.
+    // The same transaction the generated wrappers run, in the same order: both
+    // paths end in `run_artifact_entry`, so the order lives in one place rather
+    // than in two copies that have to stay identical.
     let status = pill_engine::component_registry::run_artifact_entry(
         engine,
         |engine| {
@@ -380,7 +387,7 @@ pub(crate) fn initialize_linked(
 
 /// A project with nothing set but `backend`: what a test starts from.
 ///
-/// Every other field holds one boring value, so a test names only the field it
+/// Every other field holds one plain value, so a test names only the field it
 /// is about: `StaticProject { modules: MODULES, ..test_project(backend) }`.
 #[cfg(test)]
 pub(crate) fn test_project(backend: StaticProjectBackend) -> StaticProject {
@@ -418,8 +425,8 @@ mod tests {
 
     /// A backend that records the names it was handed and returns a guard.
     struct RecordingBackend {
-        /// The names [`crate::Runtime`] handed to `start`.
-        seen: std::sync::Mutex<Vec<String>>,
+        /// The component names `StaticProject::initialize` handed to `start`.
+        recorded_component_names: std::sync::Mutex<Vec<String>>,
     }
 
     impl ProjectBackend for RecordingBackend {
@@ -428,7 +435,7 @@ mod tests {
             _engine: &mut Engine,
             exposed_component_names: &[String],
         ) -> Result<Box<dyn Any>, HostError> {
-            *self.seen.lock().unwrap() = exposed_component_names.to_vec();
+            *self.recorded_component_names.lock().unwrap() = exposed_component_names.to_vec();
             Ok(Box::new(42u32))
         }
     }
@@ -518,7 +525,7 @@ mod tests {
         }];
 
         let backend = Arc::new(RecordingBackend {
-            seen: std::sync::Mutex::new(Vec::new()),
+            recorded_component_names: std::sync::Mutex::new(Vec::new()),
         });
         let mut engine = Engine::new();
         let project = StaticProject {
@@ -530,7 +537,7 @@ mod tests {
         let guard = guard.expect("an external backend's guard is returned");
         assert_eq!(guard.downcast_ref::<u32>(), Some(&42));
         assert!(
-            !backend.seen.lock().unwrap().is_empty(),
+            !backend.recorded_component_names.lock().unwrap().is_empty(),
             "the backend must see what the module registered"
         );
     }
@@ -574,9 +581,9 @@ mod tests {
             "{:?}",
             report.skipped_fields
         );
-        // Step 3: Render the document as a standalone scene asset, write it
-        // into that directory and mount the directory, so the project's
-        // startup scene later resolves through the store.
+        // Step 3: Render the document as a standalone scene asset and write it
+        // into that directory, then mount the directory. The project's startup
+        // scene then resolves through the store like any other asset.
         let bytes = render_standalone::<pill_engine::Scene>(
             AssetGuid::random().expect("a fresh guid"),
             &document,
@@ -607,7 +614,7 @@ mod tests {
         }];
 
         let backend = Arc::new(RecordingBackend {
-            seen: std::sync::Mutex::new(Vec::new()),
+            recorded_component_names: std::sync::Mutex::new(Vec::new()),
         });
         let mut engine = Engine::new();
         let project = StaticProject {

@@ -2,15 +2,17 @@
 //!
 //! # Responsibilities
 //!
-//! - Declares [`RenderingError`], what bringing up or running a windowed
-//!   runtime fails with: a setup failure or a renderer failure.
+//! - Declares [`RenderingError`], the failure that stops a windowed runtime
+//!   from starting or running: host setup failed, or the renderer did.
 //!
 //! # Design
 //!
-//! The engine cannot name a renderer error without depending on the renderer
-//! contract, which depends on the engine, so the windowed boundary composes
-//! its failure sources here. Window and event-loop failures belong to the
-//! frontend that owns the event loop, which composes this type with its own.
+//! The engine cannot name a renderer error: the renderer contract already
+//! depends on the engine, so the engine cannot also depend on the contract.
+//! This crate depends on both and defines the one error that names both
+//! failure sources. Window and event-loop failures stay with the frontend
+//! that owns the event loop; a frontend that reports a whole run as one
+//! error composes this type with its own.
 
 // External crates
 use pill_core_macros::engine_error;
@@ -19,14 +21,15 @@ use pill_core_macros::engine_error;
 // Rendering Errors
 // =============================================================================
 
-/// Anything that can go wrong bringing up or running a windowed runtime.
+/// Anything that can go wrong while a windowed runtime is set up or runs.
 ///
-/// Transparent in every arm, so `?` carries the leaf error and its source
-/// chain unchanged from wherever it was raised.
+/// Both arms are transparent, so `?` keeps the original error's code, message
+/// and source chain.
 #[engine_error(namespace = runtime::rendering, runtime = ::pill_core::error)]
 pub enum RenderingError {
-    /// Host setup failed, or the development host could not start its renderer
-    /// module; both arrive as a [`pill_core::error::HostError`].
+    /// Host setup failed. In the development host this includes starting its
+    /// renderer module, whose configuration or source watcher can fail. The
+    /// error is a [`pill_core::error::HostError`].
     #[transparent]
     Host(#[from] pill_core::error::HostError),
 
@@ -43,25 +46,28 @@ pub enum RenderingError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `code()` comes from the diagnostic trait `#[engine_error]` implements.
+    // `code()` comes from the `miette::Diagnostic` trait, which `#[engine_error]` implements.
     use miette::Diagnostic as _;
 
-    /// Every arm is transparent, so a composed error reports the code of the
-    /// error it carries rather than one of its own.
+    /// Both arms are transparent, so a composed error reports the code of the
+    /// error it carries, not one of its own.
     #[test]
     fn every_composed_arm_reports_the_leaf_code() {
-        let renderer =
+        let renderer_failure =
             RenderingError::Renderer(pill_renderer_api::RendererError::RendererResourceNotFound);
         assert_eq!(
-            renderer.code().map(|code| code.to_string()).as_deref(),
+            renderer_failure
+                .code()
+                .map(|code| code.to_string())
+                .as_deref(),
             Some("engine::renderer::renderer_resource_not_found")
         );
 
-        let host = RenderingError::from(pill_core::error::HostError::from(
+        let host_failure = RenderingError::from(pill_core::error::HostError::from(
             pill_core::error::ConfigError::EmptyModuleName,
         ));
         assert_eq!(
-            host.code().map(|code| code.to_string()).as_deref(),
+            host_failure.code().map(|code| code.to_string()).as_deref(),
             Some("host::config::empty_module_name")
         );
     }

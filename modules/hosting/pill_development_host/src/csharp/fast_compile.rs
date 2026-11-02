@@ -2,26 +2,28 @@
 //!
 //! # Responsibilities
 //!
-//! - Build and load the managed compiler assembly beside the running runtime.
+//! - Build the managed compiler assembly and load it into the running runtime.
 //! - Replay the compiler command line the startup build captured.
-//! - Decide when the capture is too stale to replay and a full build is needed.
+//! - Decide when the capture no longer matches the project and a full build is
+//!   needed.
 //!
 //! # Design
 //!
-//! A `dotnet build` of a one-file gameplay edit costs seconds, while the C#
-//! compilation inside it costs tens of milliseconds. The rest is process start,
-//! MSBuild evaluation, a restore pass and a walk of the project reference graph,
-//! recomputing an answer that has not changed since the host started. This
-//! module skips all of it: the project's startup build reports the exact `csc`
-//! invocation it used, and a reload replays that invocation through Roslyn
-//! inside the host process. Replaying the capture is what makes the fast path
-//! faithful - references, defines, language version, analyzers and source list
-//! are MSBuild's own.
+//! A `dotnet build` of a one-file gameplay edit takes seconds, while the C#
+//! compilation inside it takes tens of milliseconds. The rest of the time goes
+//! to starting a process, evaluating MSBuild, running a restore pass and walking
+//! the project reference graph, all to recompute an answer that has not changed
+//! since the host started. This module skips all of it. The project's startup
+//! build reports the exact `csc` invocation it used, and a reload replays that
+//! invocation through Roslyn inside the host process. Replaying the capture is
+//! what keeps the fast path faithful: the references, defines, language version,
+//! analyzers and source list are the ones MSBuild chose.
 //!
-//! The capture is checked against the project's source set before it is
-//! replayed: a file added or removed under the watched source directory changes
-//! the list MSBuild computed, so that case goes back through a full build, which
-//! refreshes the capture for the next reload.
+//! Before a capture is replayed, it is checked against the project's source
+//! files. A file added or removed under the watched source directory changes
+//! the list MSBuild computed, so that case goes through a full build instead.
+//! The full build also refreshes the capture, so the reload after it is fast
+//! again.
 
 // Standard library
 use std::ffi::CString;
@@ -47,8 +49,8 @@ use crate::CSharpModuleConfig;
 
 /// Export-contract version this host requires of the compiler assembly.
 ///
-/// Checked before any other export is used, for the same reason the managed
-/// runtime's interop version is: a compiler assembly left from an older checkout
+/// It is checked before any other export is used, as the managed runtime's
+/// interop version is. A compiler assembly left over from an older checkout
 /// would otherwise be called through signatures it no longer has.
 const COMPILER_ABI_VERSION: u32 = 1;
 
@@ -63,10 +65,10 @@ const COMPILE_STATUS_FAILED: i32 = 1;
 
 /// Upper bound for one compile's diagnostics text.
 ///
-/// A failing build reports kilobytes; the cap is generous enough that no real
-/// diagnostic set reaches it, and it bounds what a corrupt length can make the
-/// host reserve, since the two-call fetch refuses a length above it before
-/// allocating.
+/// A failing build reports a few kilobytes, so no real diagnostic set reaches
+/// this cap. The cap limits how much memory a corrupt length can make the host
+/// reserve: the helper that fetches the text rejects a length above it before
+/// allocating anything.
 const MAX_DIAGNOSTICS_BYTES: u32 = 4 * 1024 * 1024;
 
 // =============================================================================
@@ -123,37 +125,39 @@ pub(crate) struct FastCompiler {
     diagnostics_length: DiagnosticsLengthFn,
     /// `CopyDiagnostics` export.
     copy_diagnostics: CopyDiagnosticsFn,
-    /// Absolute path of the captured compiler command line.
-    response_file: PathBuf,
+    /// Absolute path of the file holding the captured compiler arguments.
+    response_file_path: PathBuf,
     /// Absolute path the recompiled project assembly is written to.
-    output_assembly: PathBuf,
+    output_assembly_path: PathBuf,
 }
 
 impl FastCompiler {
     /// Build the compiler assembly, load it, and start its warmup.
     ///
-    /// Returns `None` whenever the fast path cannot be set up: no captured
-    /// command line to replay (a project shape that never hot reloads), a
-    /// compiler build failure or an ABI mismatch. The build and load failures
-    /// are logged once; either way the host stays on the ordinary `dotnet build`
-    /// path, so a broken fast path costs reload speed and nothing else.
+    /// Returns `None` when the fast path cannot be set up: there is no captured
+    /// command line to replay (a project shape that never hot reloads), the
+    /// compiler build fails, or the assembly is missing an export or implements
+    /// another ABI version. Build and load failures are each logged with one
+    /// warning; either way the host stays on the ordinary `dotnet build` path,
+    /// so a broken fast path costs reload speed and nothing else.
     pub(crate) fn try_new(
         runtime: &DotnetRuntimeContext,
         workspace_root: &Path,
         config: &CSharpModuleConfig,
     ) -> Option<Self> {
-        // Step 1: Resolve the two paths this compiler works between. A shipping
-        // layout has no project `obj` directory and reports no capture path,
-        // which is also the posture that never reloads.
-        let response_file = workspace_root.join(compiler_arguments_file(config)?);
-        let output_assembly = workspace_root
+        // Step 1: Find the capture file and the path the output assembly is
+        // written to. A shipping layout has no project `obj` directory, so it
+        // has no capture file; that layout never hot reloads.
+        let response_file_path = workspace_root.join(compiler_arguments_file(config)?);
+        let output_assembly_path = workspace_root
             .join(&config.project_output_subdirectory)
             .join(format!("{}.dll", config.project_assembly_name));
 
-        // Step 2: Build the compiler if its sources changed, then load it.
-        // Built here rather than by the project's own build because nothing
-        // references it: keeping Roslyn out of every managed project's reference
-        // graph is what keeps it out of the shipping bundle.
+        // Step 2: Build the compiler (MSBuild rebuilds it only when its sources
+        // changed), then find the assembly it wrote. It is built here rather
+        // than by the project's own build because nothing references it:
+        // keeping Roslyn out of every managed project's reference graph is what
+        // keeps it out of the shipping bundle.
         if let Err(error) = crate::build_runner::build_csharp_compiler(workspace_root) {
             warn!(
                 target: HOT_RELOAD,
@@ -162,12 +166,19 @@ impl FastCompiler {
             );
             return None;
         }
-        let assembly = workspace_root
+        let compiler_assembly_path = workspace_root
             .join(CSHARP_COMPILER_OUTPUT_SUBDIRECTORY)
             .join(format!("{CSHARP_COMPILER_ASSEMBLY_NAME}.dll"));
 
-        // Step 3: Validate the export contract before resolving anything else.
-        let compiler = match Self::resolve(runtime, &assembly, response_file, output_assembly) {
+        // Step 3: Bind the exports, checking the contract version first so an
+        // assembly from another compiler version is refused before its other
+        // exports are resolved or called.
+        let compiler = match Self::resolve(
+            runtime,
+            &compiler_assembly_path,
+            response_file_path,
+            output_assembly_path,
+        ) {
             Ok(compiler) => compiler,
             Err(error) => {
                 warn!(
@@ -179,11 +190,11 @@ impl FastCompiler {
             }
         };
 
-        // Step 4: Warm the compiler. `Warmup` queues the work and returns, so
-        // Roslyn's JIT, the reference set and the analyzers are paid for in the
-        // background while the host is still starting, which keeps that cost off
-        // the developer's first edit.
-        compiler.start_warmup(runtime, &assembly);
+        // Step 4: Ask the compiler to warm up. `Warmup` queues the work and
+        // returns at once, so Roslyn's JIT, the reference set and the analyzers
+        // are prepared in the background while the host is still starting. That
+        // keeps the cost away from the developer's first edit.
+        compiler.start_warmup(runtime, &compiler_assembly_path);
         info!(
             target: HOT_RELOAD,
             "in-process C# compiler ready; reloads will skip MSBuild"
@@ -202,12 +213,12 @@ impl FastCompiler {
     /// against.
     fn resolve(
         runtime: &DotnetRuntimeContext,
-        assembly: &Path,
-        response_file: PathBuf,
-        output_assembly: PathBuf,
+        compiler_assembly_path: &Path,
+        response_file_path: PathBuf,
+        output_assembly_path: PathBuf,
     ) -> Result<Self, CSharpError> {
         let abi_version = runtime.get_unmanaged_fn::<CompilerAbiVersionFn>(
-            assembly,
+            compiler_assembly_path,
             COMPILER_INTEROP_TYPE,
             "CompilerAbiVersion",
         )?;
@@ -219,73 +230,75 @@ impl FastCompiler {
         }
         Ok(Self {
             compile: runtime.get_unmanaged_fn::<CompileFn>(
-                assembly,
+                compiler_assembly_path,
                 COMPILER_INTEROP_TYPE,
                 "Compile",
             )?,
             diagnostics_length: runtime.get_unmanaged_fn::<DiagnosticsLengthFn>(
-                assembly,
+                compiler_assembly_path,
                 COMPILER_INTEROP_TYPE,
                 "DiagnosticsLength",
             )?,
             copy_diagnostics: runtime.get_unmanaged_fn::<CopyDiagnosticsFn>(
-                assembly,
+                compiler_assembly_path,
                 COMPILER_INTEROP_TYPE,
                 "CopyDiagnostics",
             )?,
-            response_file,
-            output_assembly,
+            response_file_path,
+            output_assembly_path,
         })
     }
 
-    /// Ask the compiler to populate its caches on a background thread.
+    /// Ask the compiler to prepare its caches on a background thread.
     ///
-    /// Best effort: a warmup that cannot be resolved or cannot start only means
-    /// the first reload pays the full Roslyn startup cost.
-    fn start_warmup(&self, runtime: &DotnetRuntimeContext, assembly: &Path) {
-        let Ok(warmup) =
-            runtime.get_unmanaged_fn::<WarmupFn>(assembly, COMPILER_INTEROP_TYPE, "Warmup")
-        else {
+    /// This is best effort: if the export is missing or the request cannot be
+    /// made, the first reload simply pays the full Roslyn startup cost.
+    fn start_warmup(&self, runtime: &DotnetRuntimeContext, compiler_assembly_path: &Path) {
+        let Ok(warmup) = runtime.get_unmanaged_fn::<WarmupFn>(
+            compiler_assembly_path,
+            COMPILER_INTEROP_TYPE,
+            "Warmup",
+        ) else {
             return;
         };
-        let Some(response_file) = encode_path(&self.response_file) else {
+        let Some(encoded_response_file_path) = encode_path(&self.response_file_path) else {
             return;
         };
-        warmup(response_file.as_ptr().cast());
+        warmup(encoded_response_file_path.as_ptr().cast());
     }
 
     /// Recompile the project in-process, or say why that was not possible.
     ///
-    /// `watch_directory` is the project's source directory, workspace-relative;
-    /// it is what the captured source list is checked against.
+    /// `watch_directory` is the project's source directory, relative to the
+    /// workspace root. The captured source list is checked against it.
     pub(crate) fn compile(
         &self,
         workspace_root: &Path,
         watch_directory: &str,
     ) -> FastCompileOutcome {
-        // Step 1: Refuse a capture that cannot be replayed as it stands. A file
+        // Step 1: Reject a capture that cannot be replayed as it is. A file
         // added or removed under the watched directory changes the source list
-        // MSBuild computed, so it has to go through MSBuild - which also
-        // refreshes the capture, leaving the reload after it fast again.
-        if !self.response_file.is_file() {
+        // MSBuild computed, so that case goes through MSBuild instead - which
+        // also refreshes the capture, so the reload after it is fast again.
+        if !self.response_file_path.is_file() {
             return FastCompileOutcome::Unavailable {
                 reason: format!(
                     "no captured compiler arguments at {}",
-                    self.response_file.display()
+                    self.response_file_path.display()
                 ),
             };
         }
         if let Some(reason) =
-            capture_missed_a_source(&self.response_file, workspace_root, watch_directory)
+            sources_changed_since_capture(&self.response_file_path, workspace_root, watch_directory)
         {
             return FastCompileOutcome::Unavailable { reason };
         }
 
-        // Step 2: Encode both paths for the managed entry point, which reads
-        // NUL-terminated UTF-8.
-        let (Some(response_file), Some(output_assembly)) = (
-            encode_path(&self.response_file),
-            encode_path(&self.output_assembly),
+        // Step 2: Encode both paths as NUL-terminated UTF-8, which is what the
+        // managed entry point reads.
+        let (Some(encoded_response_file_path), Some(encoded_output_assembly_path)) = (
+            encode_path(&self.response_file_path),
+            encode_path(&self.output_assembly_path),
         ) else {
             return FastCompileOutcome::Unavailable {
                 reason: "a compiler path contains an interior NUL".to_string(),
@@ -293,14 +306,14 @@ impl FastCompiler {
         };
 
         // Step 3: Run the compile and time it for the reload log.
-        let started = Instant::now();
+        let started_at = Instant::now();
         let status = (self.compile)(
-            response_file.as_ptr().cast(),
-            output_assembly.as_ptr().cast(),
+            encoded_response_file_path.as_ptr().cast(),
+            encoded_output_assembly_path.as_ptr().cast(),
         );
-        let milliseconds = started.elapsed().as_secs_f64() * 1000.0;
+        let milliseconds = started_at.elapsed().as_secs_f64() * 1000.0;
 
-        // Step 4: Map the status onto an outcome. Two is the managed side's code
+        // Step 4: Turn the status into an outcome. The managed side uses two
         // for "the fast path could not run", so any status other than
         // `COMPILE_STATUS_COMPILED` or `COMPILE_STATUS_FAILED` is a fallback
         // rather than a fault in the gameplay source.
@@ -317,10 +330,10 @@ impl FastCompiler {
 
     /// Read back the last compile's diagnostics as UTF-8.
     ///
-    /// A compile with nothing to say reports no diagnostics at all, which is an
-    /// empty string rather than a failure; anything else that goes wrong is
-    /// reported as text, because the caller is already on a failure path and
-    /// has nowhere better to put an error.
+    /// A compile with nothing to report has no diagnostics, which is an empty
+    /// string rather than a failure. Any other problem reading them is returned
+    /// as text: the caller is already handling a failure and has nowhere better
+    /// to put an error.
     fn diagnostics(&self) -> String {
         if (self.diagnostics_length)() == 0 {
             return String::new();
@@ -340,16 +353,17 @@ impl FastCompiler {
 // Free Functions
 // =============================================================================
 
-/// Workspace-relative path of `config`'s captured compiler command line.
+/// Workspace-relative path of the captured compiler command line for `config`.
 ///
-/// The project's build writes it into the project's own `obj` directory, so
-/// it is derived from the output directory rather than stored: that
-/// directory is `<project>/bin/<configuration>/<framework>` by
-/// construction, and the directory three levels above it is the project root.
+/// The project's build writes the capture into the project's `obj` directory,
+/// so the path is worked out from the output directory instead of stored. The
+/// reloading host sets that directory to
+/// `<project>/bin/<configuration>/<framework>`, so the project root is the
+/// directory three levels above it.
 ///
-/// Returns `None` when the output directory has no such shape, which is the
-/// shipping posture - a bundle keeps the assembly flat beside the
-/// executable. That posture never hot reloads, so it never needs a capture.
+/// Returns `None` when the output directory has no such shape. That is the
+/// shipping layout, where the assembly sits beside the executable. It never
+/// hot reloads, so it never needs a capture.
 fn compiler_arguments_file(config: &CSharpModuleConfig) -> Option<PathBuf> {
     let output_directory = Path::new(&config.project_output_subdirectory);
     let project_root = output_directory.ancestors().nth(3)?;
@@ -365,38 +379,39 @@ fn compiler_arguments_file(config: &CSharpModuleConfig) -> Option<PathBuf> {
 
 /// Encode a path as NUL-terminated UTF-8 for the managed entry points.
 ///
-/// Returns `None` for a path containing an interior NUL, which cannot cross the
-/// boundary at all.
+/// Returns `None` when the path contains a NUL byte inside it, because such a
+/// path cannot be passed across the boundary at all.
 fn encode_path(path: &Path) -> Option<CString> {
     CString::new(path.to_string_lossy().into_owned()).ok()
 }
 
-/// Report whether the captured source list still describes the project.
+/// Report whether the captured source list still matches the project.
 ///
-/// Returns `None` when the two agree, or the reason they do not. Only files
-/// under the watched source directory are compared: the capture also lists
-/// generated mirrors and SDK-generated files from elsewhere, and those change
-/// only as part of work that rebuilds the project anyway.
-fn capture_missed_a_source(
-    response_file: &Path,
+/// Returns `None` when the two agree, or a sentence saying why they do not.
+/// Only files under the watched source directory are compared. The capture also
+/// lists generated files from other directories, such as the C# code generated
+/// for each module and the files the .NET SDK writes, and those change only as
+/// part of work that rebuilds the project anyway.
+fn sources_changed_since_capture(
+    response_file_path: &Path,
     workspace_root: &Path,
     watch_directory: &str,
 ) -> Option<String> {
     let Ok(watch_root) = std::fs::canonicalize(workspace_root.join(watch_directory)) else {
-        // No source directory to compare against: leave the decision to the
-        // build, which will report the real problem.
+        // The source directory cannot be read, so leave the decision to the
+        // build: it reports the real problem.
         return Some(format!(
             "cannot read the source directory {watch_directory}"
         ));
     };
     // MSBuild wrote the capture into the project's `obj` directory and resolved
     // relative source paths against the project root, which is its parent.
-    let project_root = response_file.parent()?.parent()?;
+    let project_root = response_file_path.parent()?.parent()?;
 
-    let Ok(contents) = std::fs::read_to_string(response_file) else {
+    let Ok(contents) = std::fs::read_to_string(response_file_path) else {
         return Some("the captured compiler arguments could not be read".to_string());
     };
-    let mut captured: Vec<PathBuf> = Vec::new();
+    let mut captured_source_paths: Vec<PathBuf> = Vec::new();
     for line in contents.lines() {
         let line = line.trim().trim_matches('"');
         // Everything that is not a switch is a source file path.
@@ -407,36 +422,36 @@ fn capture_missed_a_source(
             continue;
         };
         if resolved.starts_with(&watch_root) {
-            captured.push(resolved);
+            captured_source_paths.push(resolved);
         }
     }
 
-    let mut present = Vec::new();
-    collect_csharp_sources(&watch_root, &mut present);
-    captured.sort();
-    present.sort();
-    if captured == present {
+    let mut present_source_paths = Vec::new();
+    collect_csharp_sources(&watch_root, &mut present_source_paths);
+    captured_source_paths.sort();
+    present_source_paths.sort();
+    if captured_source_paths == present_source_paths {
         return None;
     }
     Some(format!(
         "the project's source file set changed ({} captured, {} on disk)",
-        captured.len(),
-        present.len()
+        captured_source_paths.len(),
+        present_source_paths.len()
     ))
 }
 
 /// Collect every `.cs` file under one directory, recursively.
-fn collect_csharp_sources(directory: &Path, found: &mut Vec<PathBuf>) {
+fn collect_csharp_sources(directory: &Path, found_source_paths: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_csharp_sources(&path, found);
+            collect_csharp_sources(&path, found_source_paths);
         } else if path.extension().is_some_and(|extension| extension == "cs") {
             if let Ok(resolved) = std::fs::canonicalize(&path) {
-                found.push(resolved);
+                found_source_paths.push(resolved);
             }
         }
     }

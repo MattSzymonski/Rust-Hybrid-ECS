@@ -2,17 +2,17 @@
 //!
 //! # Responsibilities
 //!
-//! - Reports CPU, memory, storage and OS through the telemetry stack, once
-//!   per [`crate::Runtime`].
+//! - Reports CPU, memory, storage and OS through the telemetry stack when a
+//!   [`crate::Runtime`] is created.
 //!
 //! # Design
 //!
-//! This lives in the player, which links only into executables, rather
-//! than in the engine core: `sysinfo` reaches the system through the
-//! `windows` crate, which declares its functions as `raw-dylib` imports of
-//! about seventy system DLLs. In the shared `pill_engine_core.dll` that would
-//! make every hot patch generate an import library for each of them at link
-//! time.
+//! The report lives in the player, which is linked into executables, and not
+//! in the engine core. `sysinfo` reaches the system through the `windows`
+//! crate, whose functions are `raw-dylib` imports naming about seventy system
+//! DLLs (rustc creates the import library for each DLL when it links). A
+//! shared `pill_engine_core.dll` that carried those imports would make every
+//! hot patch generate an import library for each DLL.
 
 // External crates
 use pill_core::info;
@@ -30,25 +30,28 @@ const BYTES_PER_GIBIBYTE: f64 = 1024.0 * 1024.0 * 1024.0;
 // Free Functions
 // =============================================================================
 
-/// Reports a summary of detected system hardware through the telemetry stack.
+/// Reports the detected hardware through the telemetry stack.
 ///
-/// Includes CPU, core/thread count, RAM, swap, disks, OS and uptime.
+/// The report has the CPU brand and its physical core and logical thread
+/// counts, RAM and swap in GiB, one line per disk, the OS name and version
+/// with the build architecture, and the system uptime. It ends with a line
+/// that leaves the GPU to external tools.
 ///
-/// Emitted under `telemetry_target::SYSTEM` as one multi-line event, so the
-/// report can be filtered or redirected like any other engine output and keeps
-/// its box-drawing layout as a single block.
+/// It goes out as one multi-line event under `telemetry_target::SYSTEM`, so
+/// it can be filtered or redirected like any other engine output, and its
+/// box-drawing layout stays in one block.
 ///
-/// Called by [`Runtime::new`](crate::Runtime::new), before it creates the
+/// [`Runtime::new`](crate::Runtime::new) calls it before it creates the
 /// engine.
-pub(crate) fn print_machine_info() {
-    // Step 1: Snapshot system state and derive memory, swap, and CPU figures.
+pub(crate) fn report_machine_specs() {
+    // Step 1: Read memory, swap and CPU identity into a fresh snapshot.
     //
-    // Targeted refresh, never `System::new_all()`: the report reads memory and
-    // CPU identity only, while `new_all` also enumerates every process on the
-    // machine - paid in the middle of start-up for information nothing here
-    // consumes. `CpuRefreshKind::nothing()` still lists the CPUs, so the brand
-    // and the count are there; it skips the usage and frequency refreshes, and
-    // on Windows those are what open the performance-data query.
+    // Refresh only what the report reads. `System::new_all()` would also
+    // list every process on the machine, which nothing here uses, and that
+    // work would run in the middle of start-up. `CpuRefreshKind::nothing()`
+    // still lists the CPUs, so the brand and the counts are filled in, but it
+    // skips the usage and frequency refreshes; on Windows the usage refresh is
+    // the one that opens the performance-data query.
     let system = System::new_with_specifics(
         RefreshKind::nothing()
             .with_memory(MemoryRefreshKind::everything())
@@ -71,16 +74,18 @@ pub(crate) fn print_machine_info() {
         .map(|cpu| cpu.brand().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let physical_cores = sysinfo::System::physical_core_count().unwrap_or(0);
-    let logical_threads = system.cpus().len();
+    let physical_core_count = sysinfo::System::physical_core_count().unwrap_or(0);
+    let logical_thread_count = system.cpus().len();
 
     let uptime_seconds = System::uptime();
     let uptime_text = format_uptime(uptime_seconds);
 
-    // Step 2: Emit the hardware report as one multi-line entry.
+    // Step 2: Emit the hardware report as one multi-line event.
     let mut lines = vec![
         format!("├─ CPU: {cpu_brand}"),
-        format!("│  └─ Cores: {physical_cores} physical, {logical_threads} logical threads"),
+        format!(
+            "│  └─ Cores: {physical_core_count} physical, {logical_thread_count} logical threads"
+        ),
         "├─ Memory".to_string(),
         format!(
             "│  ├─ RAM: {used_memory_gib:.1} / {total_memory_gib:.1} GiB used ({memory_usage_percent:.0}%)"
@@ -93,7 +98,7 @@ pub(crate) fn print_machine_info() {
     } else {
         lines.push("│  └─ Swap: none".to_string());
     }
-    lines.extend(disk_info_lines(&disks));
+    lines.extend(storage_report_lines(&disks));
     lines.push(format!("├─ OS: {}", os_pretty_name()));
     lines.push(format!("│  └─ Uptime: {uptime_text}"));
     lines.push("└─ GPU: use external tools (dxdiag / lspci)".to_string());
@@ -115,11 +120,13 @@ fn percent(used: f64, total: f64) -> f64 {
 }
 
 /// Builds the `Storage` branch of the system report: one line per detected
-/// storage device, or a single "no disks detected" line when the list is empty.
+/// storage device, or a single "no disks detected" line when the list is
+/// empty.
 ///
-/// Each device line shows the mount point, used/total space, usage percentage,
-/// and disk kind - SSD, HDD, or `?` when the platform does not say.
-fn disk_info_lines(disks: &sysinfo::Disks) -> Vec<String> {
+/// Each device line shows the mount point, used and total space in GiB, the
+/// usage percentage, and the disk kind: SSD, HDD, or `?` when the platform
+/// does not say.
+fn storage_report_lines(disks: &sysinfo::Disks) -> Vec<String> {
     if disks.is_empty() {
         return vec!["├─ Storage: no disks detected".to_string()];
     }
@@ -135,15 +142,15 @@ fn disk_info_lines(disks: &sysinfo::Disks) -> Vec<String> {
             sysinfo::DiskKind::HDD => "HDD",
             _ => "?",
         };
-        // Device names can be long; the mount point identifies the disk.
+        // Device names can be long, so the line shows the mount point instead.
         let mount_point = disk.mount_point().to_string_lossy();
-        let branch = if index == disk_count - 1 {
+        let branch_glyph = if index == disk_count - 1 {
             "└─"
         } else {
             "├─"
         };
         lines.push(format!(
-            "│  {branch} {mount_point}  {used_space_gib:.0} / {total_space_gib:.0} GiB used ({used_percent:.0}%)  [{disk_kind}]"
+            "│  {branch_glyph} {mount_point}  {used_space_gib:.0} / {total_space_gib:.0} GiB used ({used_percent:.0}%)  [{disk_kind}]"
         ));
     }
     lines
@@ -151,9 +158,9 @@ fn disk_info_lines(disks: &sysinfo::Disks) -> Vec<String> {
 
 /// Formats a duration in whole seconds as a compact `Nd Nh Nm` string.
 ///
-/// Drops the days component when it is zero, and the hours component when both
-/// days and hours are zero. A zero-second input reads `"unknown"`, the uptime
-/// a platform that reports none yields.
+/// The days part is dropped when it is zero, and the hours part when both
+/// days and hours are zero. Zero seconds reads `"unknown"`, which is what a
+/// platform that cannot report uptime returns.
 fn format_uptime(seconds: u64) -> String {
     if seconds == 0 {
         return "unknown".to_string();
@@ -172,8 +179,8 @@ fn format_uptime(seconds: u64) -> String {
 
 /// Returns the OS name and version with the build architecture.
 ///
-/// A platform that reports no name reads `unknown`; one that reports no
-/// version leaves it out.
+/// A platform that reports no name gives `unknown`; one that reports no
+/// version just leaves it out.
 fn os_pretty_name() -> String {
     let name = sysinfo::System::name().unwrap_or_else(|| "unknown".to_string());
     let version = sysinfo::System::os_version().unwrap_or_default();

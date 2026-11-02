@@ -1,19 +1,20 @@
-//! A renderer attached to a window, and the player that draws a statically
-//! linked project in one.
+//! A renderer attached to a window, and the runtime that draws a statically
+//! linked project there.
 //!
 //! # Responsibilities
 //!
-//! - Keep a renderer backend and the window it draws on together, dropping
-//!   the backend first ([`AttachedRenderer`]); resize, viewport, re-targeting
-//!   and drawing the frame the `rendering` system filled in.
+//! - Keep a renderer backend and the window it draws on together, and drop the
+//!   backend first ([`AttachedRenderer`]). Resize a surface, set its
+//!   viewport, move rendering to another window, and draw the frame the
+//!   `rendering` system filled in.
 //! - Run a statically linked project in a window ([`RenderingRuntime`]):
 //!   register the linked renderer, attach it, and draw every frame.
 //!
 //! # Design
 //!
-//! The development host keeps its own windowed host, because its renderer is
-//! a reloadable module, but it holds the same [`AttachedRenderer`]: only where
-//! a backend comes from differs between the two, never how it is kept and
+//! The development host has its own windowed host because its renderer is a
+//! reloadable module, but it keeps the same [`AttachedRenderer`]. The two
+//! differ only in where a backend comes from, never in how it is kept or
 //! drawn with.
 
 // Standard library
@@ -31,51 +32,34 @@ use pill_renderer_api::{
 };
 
 // Current crate
-use crate::render_window::{attach_window, attach_window_async, AttachedWindow, RendererWindow};
+use crate::render_window::{
+    attach_renderer_to_window, attach_renderer_to_window_async, AttachedWindow, RendererWindow,
+};
 use crate::{FrameDriver, RenderingError, Runtime, StaticProject, WindowedFrameDriver};
 
 // =============================================================================
-// AttachedRenderer
+// Constants
 // =============================================================================
 
-/// A renderer backend and the window it draws on.
+/// The message a windowed build reports when it has no renderer to attach.
 ///
-/// The field order is the drop order: the backend's surface is built on the
-/// window's raw handles and must not outlive the window.
-pub struct AttachedRenderer {
-    /// The backend drawing on the primary window; declared first so it drops
-    /// first.
-    renderer: Box<dyn PillRenderer>,
-    /// The primary window: the same record every extra surface keeps, so each
-    /// per-surface operation is one lookup and a backend swap replays one
-    /// shape. Declared after `renderer`, so the backend drops before the
-    /// window it draws on.
-    primary: SurfaceRecord,
-    /// Whether a frame with draw calls has been presented, for the one-time
-    /// first-frame line.
-    presented_scene: bool,
-    /// The draw count last reported in the log, so a frame that changes how
-    /// much it draws is reported once rather than every frame.
-    reported_passes_with_draws: u32,
-    /// Whether the backend was dropped with [`Self::detach_backend`] and none
-    /// has replaced it yet. [`Self::replace_backend`] asserts it, because
-    /// assigning over a live backend drops it while its module may be gone.
-    detached: bool,
-    /// Every surface attached after the primary window, by surface id.
-    /// Declared after `renderer`, so the backend drops first.
-    extra_surfaces: BTreeMap<u32, SurfaceRecord>,
-}
+/// Both ways to reach this are build decisions rather than runtime failures: a
+/// project whose settings select no `renderer:`, and a shipping bundle
+/// generated without the rendering feature. The message names those two, not
+/// the feature, because the code that reports it is only compiled when that
+/// feature is on.
+const NO_LINKED_RENDERER: &str = "this build links no renderer: the project selects no `renderer:`, or its shipping bundle was generated without the rendering feature";
 
 // =============================================================================
 // SurfaceRecord
 // =============================================================================
 
-/// One surface: the window it draws on, and everything re-attaching it to
-/// another backend takes.
+/// The window one surface draws on, plus what is needed to attach it to
+/// another backend.
 ///
-/// The primary window and every surface attached later are kept the same way,
-/// so a resize, a viewport or a pacing change is one lookup rather than a
-/// branch, and a backend swap replays the same facts for both.
+/// The primary window and every extra surface are kept in the same record, so
+/// a resize, a viewport change or a pacing change needs one lookup instead of
+/// a branch, and a backend swap repeats the same steps for all of them.
 struct SurfaceRecord {
     /// The frontend window, held only to keep it alive while the backend draws
     /// on it.
@@ -89,9 +73,41 @@ struct SurfaceRecord {
     viewport: Option<RenderViewport>,
     /// How the surface presents; `None` for the primary, which takes the
     /// backend's default.
-    options: Option<SurfaceOptions>,
+    surface_options: Option<SurfaceOptions>,
     /// Whether the surface may present (the frontend's pacing).
     ready: bool,
+}
+
+// =============================================================================
+// AttachedRenderer
+// =============================================================================
+
+/// A renderer backend and the window it draws on.
+///
+/// Fields drop in declaration order. The backend's surface is built on the
+/// window's raw handles, so the backend must not outlive the window.
+pub struct AttachedRenderer {
+    /// The backend drawing on the primary window; declared first so it drops
+    /// first.
+    renderer: Box<dyn PillRenderer>,
+    /// The primary window, kept in the same record as every extra surface. A
+    /// per-surface operation is then one lookup instead of a branch, and a
+    /// backend swap repeats the same steps for both. Declared after
+    /// `renderer`, so the backend drops before the window it draws on.
+    primary_surface: SurfaceRecord,
+    /// Whether a frame with draw calls has been presented, for the one-time
+    /// first-frame line.
+    has_presented_scene: bool,
+    /// The pass count last written to the log, so a frame that changes how
+    /// much it draws is reported once rather than every frame.
+    last_reported_pass_count: u32,
+    /// Whether [`Self::detach_backend`] dropped the backend and nothing has
+    /// replaced it yet. [`Self::replace_backend`] asserts this, because
+    /// assigning over a live backend drops it while its module may be gone.
+    detached: bool,
+    /// Every surface attached after the primary window, by surface id.
+    /// Declared after `renderer`, so the backend drops first.
+    extra_surfaces: BTreeMap<u32, SurfaceRecord>,
 }
 
 impl AttachedRenderer {
@@ -107,7 +123,7 @@ impl AttachedRenderer {
         height: u32,
         attach: impl FnOnce(RawWindowData) -> Result<Box<dyn PillRenderer>, RendererError>,
     ) -> Result<Self, RendererError> {
-        let (renderer, window, window_data) = attach_window(window, attach)?;
+        let (renderer, window, window_data) = attach_renderer_to_window(window, attach)?;
         Ok(Self::from_parts(
             renderer,
             window,
@@ -117,8 +133,8 @@ impl AttachedRenderer {
         ))
     }
 
-    /// [`Self::attach`] with a backend built asynchronously by the future
-    /// `attach` returns.
+    /// Like [`Self::attach`], but the backend is built asynchronously: `attach`
+    /// returns a future that produces it.
     ///
     /// # Errors
     ///
@@ -134,7 +150,8 @@ impl AttachedRenderer {
         W: RendererWindow,
         F: Future<Output = Result<Box<dyn PillRenderer>, RendererError>>,
     {
-        let (renderer, window, window_data) = attach_window_async(window, attach).await?;
+        let (renderer, window, window_data) =
+            attach_renderer_to_window_async(window, attach).await?;
         Ok(Self::from_parts(
             renderer,
             window,
@@ -144,10 +161,10 @@ impl AttachedRenderer {
         ))
     }
 
-    /// A renderer over a backend and the parts of the window it was built on.
+    /// Build a renderer from a backend and the parts of its window.
     ///
-    /// The one place the struct is built, so the synchronous and asynchronous
-    /// attach paths cannot drift apart.
+    /// This is the one place the struct is built, so the synchronous and
+    /// asynchronous attach paths cannot drift apart.
     fn from_parts(
         renderer: Box<dyn PillRenderer>,
         window: AttachedWindow,
@@ -157,25 +174,25 @@ impl AttachedRenderer {
     ) -> Self {
         Self {
             renderer,
-            primary: SurfaceRecord {
+            primary_surface: SurfaceRecord {
                 window,
                 window_data,
                 size: (width, height),
                 viewport: None,
-                options: None,
+                surface_options: None,
                 ready: true,
             },
-            presented_scene: false,
-            reported_passes_with_draws: 0,
+            has_presented_scene: false,
+            last_reported_pass_count: 0,
             detached: false,
             extra_surfaces: BTreeMap::new(),
         }
     }
 
     /// The record for surface `id`: the primary window, or one attached later.
-    fn surface_mut(&mut self, id: SurfaceId) -> Option<&mut SurfaceRecord> {
+    fn surface_record_mut(&mut self, id: SurfaceId) -> Option<&mut SurfaceRecord> {
         if id == SurfaceId::PRIMARY {
-            Some(&mut self.primary)
+            Some(&mut self.primary_surface)
         } else {
             self.extra_surfaces.get_mut(&id.0)
         }
@@ -197,13 +214,13 @@ impl AttachedRenderer {
         height: u32,
         attach: impl FnOnce(RawWindowData) -> Result<Box<dyn PillRenderer>, RendererError>,
     ) -> Result<(), RendererError> {
-        let parts = attach_window(window, attach)?;
-        self.install(parts, width, height);
+        let attachment = attach_renderer_to_window(window, attach)?;
+        self.install_attachment(attachment, width, height);
         Ok(())
     }
 
-    /// [`Self::retarget`] with a backend built asynchronously by the future
-    /// `attach` returns.
+    /// Like [`Self::retarget`], but the backend is built asynchronously:
+    /// `attach` returns a future that produces it.
     ///
     /// # Errors
     ///
@@ -220,33 +237,33 @@ impl AttachedRenderer {
         W: RendererWindow,
         F: Future<Output = Result<Box<dyn PillRenderer>, RendererError>>,
     {
-        let parts = attach_window_async(window, attach).await?;
-        self.install(parts, width, height);
+        let attachment = attach_renderer_to_window_async(window, attach).await?;
+        self.install_attachment(attachment, width, height);
         Ok(())
     }
 
     /// Take over a backend and the window it was built on, replacing both.
-    fn install(
+    fn install_attachment(
         &mut self,
         (renderer, window, window_data): (Box<dyn PillRenderer>, AttachedWindow, RawWindowData),
         width: u32,
         height: u32,
     ) {
-        // Step 1: Swap in the new backend and window. Renderer first, then
-        // window: the old renderer drops while its window is still alive, and
-        // only then is that window released. What the old window was told - the
-        // viewport and the pacing - survives the swap, because they belong to
-        // the surface, not to the backend.
-        let viewport = self.primary.viewport;
-        let ready = self.primary.ready;
+        // Step 1: Swap in the new backend and window. The renderer is assigned
+        // first, so the old renderer drops while its window is still alive and
+        // that window is released only afterwards. The viewport and pacing the
+        // old window was given survive the swap, because they belong to the
+        // surface, not to the backend.
+        let viewport = self.primary_surface.viewport;
+        let ready = self.primary_surface.ready;
         self.renderer = renderer;
         self.detached = false;
-        self.primary = SurfaceRecord {
+        self.primary_surface = SurfaceRecord {
             window,
             window_data,
             size: (width, height),
             viewport,
-            options: None,
+            surface_options: None,
             ready,
         };
         // Step 2: Tell the new backend what the old one was told.
@@ -256,12 +273,14 @@ impl AttachedRenderer {
     /// Replace the backend on the same window, keeping the viewport, the pacing
     /// and every extra surface.
     ///
-    /// # Precondition
+    /// The current backend must be detached first ([`Self::detach_backend`]).
+    /// Assigning over a live backend drops it, and a backend that lives in a
+    /// module the host is about to unload must be gone before that unload.
+    /// Every caller detaches first, and this asserts it in debug builds.
     ///
-    /// The current backend is detached ([`Self::detach_backend`]). Assigning
-    /// over a live backend drops it, and a backend that lives in a module the
-    /// host is about to unload must be gone before that unload - which is why
-    /// every caller detaches first and this asserts it in debug builds.
+    /// # Panics
+    ///
+    /// Panics in debug builds if the current backend has not been detached.
     pub fn replace_backend(&mut self, renderer: Box<dyn PillRenderer>) {
         debug_assert!(
             self.detached,
@@ -272,16 +291,16 @@ impl AttachedRenderer {
         self.replay_surfaces();
     }
 
-    /// Tell a new backend what the one it replaced was told: the primary's
-    /// viewport and pacing, then every extra surface.
+    /// Tell a new backend what the one it replaced was told: the primary
+    /// surface's viewport and pacing first, then every extra surface.
     ///
-    /// The pacing is what a replacement would otherwise forget - a window the
-    /// frontend asked to hold would start presenting again on the first frame
-    /// after a renderer reload - and it is recorded for the primary now for the
-    /// same reason the extra surfaces' always was.
+    /// The pacing is easy to forget. Without it, a window the frontend asked to
+    /// hold would start presenting again on the first frame after a renderer
+    /// reload. The primary keeps it in its surface record for the same reason
+    /// the extra surfaces do.
     fn replay_surfaces(&mut self) {
-        let viewport = self.primary.viewport;
-        let ready = self.primary.ready;
+        let viewport = self.primary_surface.viewport;
+        let ready = self.primary_surface.ready;
         self.renderer
             .set_surface_viewport(SurfaceId::PRIMARY, viewport);
         self.renderer.set_surface_ready(SurfaceId::PRIMARY, ready);
@@ -289,27 +308,27 @@ impl AttachedRenderer {
     }
 
     /// Attach every extra surface to the current backend again, with its size,
-    /// viewport and pacing - after the backend was replaced (a renderer reload)
-    /// or retargeted.
+    /// viewport and pacing, after the backend was replaced (a renderer reload)
+    /// or moved to another window.
     ///
-    /// A surface the new backend refuses is kept and reported: its window is
-    /// still open, and the next replacement tries again.
+    /// A surface the new backend refuses stays in the map and its refusal is
+    /// logged: its window is still open, and the next replacement tries again.
     fn reattach_extra_surfaces(&mut self) {
         for (id, surface) in &self.extra_surfaces {
-            let options = surface.options.unwrap_or_default();
-            // SAFETY: the surface's window is kept alive in `extra_surfaces`
-            // until the surface is detached or this renderer is dropped, and
-            // the backend - declared first - drops before it either way.
-            let attached = unsafe {
+            let surface_options = surface.surface_options.unwrap_or_default();
+            // SAFETY: `extra_surfaces` keeps the surface's window alive until
+            // the surface is detached or this renderer is dropped. The backend
+            // is declared before that map, so it drops first either way.
+            let attach_result = unsafe {
                 self.renderer.attach_surface(
                     SurfaceId(*id),
                     surface.window_data,
                     surface.size.0,
                     surface.size.1,
-                    options,
+                    surface_options,
                 )
             };
-            match attached {
+            match attach_result {
                 Ok(()) => {
                     self.renderer
                         .set_surface_viewport(SurfaceId(*id), surface.viewport);
@@ -329,16 +348,15 @@ impl AttachedRenderer {
     }
 
     /// Draw into another window as surface `id`, sized `width` by `height`
-    /// physical pixels; the window is kept alive until [`Self::detach_surface`].
+    /// physical pixels. The window stays alive until [`Self::detach_surface`].
     ///
-    /// Which camera draws into it comes from the world's
-    /// [`pill_renderer_api::SurfaceCameras`]; a surface with no binding stays
-    /// empty.
+    /// The world's [`pill_renderer_api::SurfaceCameras`] decides which camera
+    /// draws into the surface; a surface with no binding stays empty.
     ///
-    /// A backend that draws one surface only - the placeholder a development
+    /// A backend that draws only one surface - the placeholder a development
     /// host holds while its renderer module builds or reloads - leaves the
-    /// surface pending rather than refused: it is kept, and attached to the
-    /// next backend that replaces this one.
+    /// surface pending instead of refusing it. The surface is kept and attached
+    /// to the next backend that replaces this one.
     ///
     /// # Errors
     ///
@@ -350,7 +368,7 @@ impl AttachedRenderer {
         window: W,
         width: u32,
         height: u32,
-        options: SurfaceOptions,
+        surface_options: SurfaceOptions,
     ) -> Result<(), RendererError> {
         // Step 1: Take the window's handles as data; the surface is built on
         // them.
@@ -358,13 +376,13 @@ impl AttachedRenderer {
         // SAFETY: the window is stored in `extra_surfaces` below and kept until
         // the surface is detached or this renderer is dropped; the backend,
         // declared first, drops before it.
-        let attached = unsafe {
+        let attach_result = unsafe {
             self.renderer
-                .attach_surface(id, window_data, width, height, options)
+                .attach_surface(id, window_data, width, height, surface_options)
         };
         // Step 2: A backend that draws one surface leaves the surface pending;
         // anything else it refuses is an error.
-        match attached {
+        match attach_result {
             Ok(()) => {}
             Err(RendererError::UnsupportedSurface { detail }) => info!(
                 target: telemetry_target::RENDERING,
@@ -380,7 +398,7 @@ impl AttachedRenderer {
                 window_data,
                 size: (width, height),
                 viewport: None,
-                options: Some(options),
+                surface_options: Some(surface_options),
                 ready: true,
             },
         );
@@ -396,10 +414,11 @@ impl AttachedRenderer {
 
     /// Forward a physical resize of surface `id`.
     ///
-    /// One method serves every surface: the size is recorded in the surface's
-    /// own record, so a caller never has to know which form reaches which.
+    /// One method serves every surface. The size is recorded in the surface's
+    /// own record, so the caller does not need to know whether it resizes the
+    /// primary window or an extra surface.
     pub fn resize_surface(&mut self, id: SurfaceId, width: u32, height: u32) {
-        let Some(record) = self.surface_mut(id) else {
+        let Some(record) = self.surface_record_mut(id) else {
             return;
         };
         record.size = (width, height);
@@ -410,7 +429,7 @@ impl AttachedRenderer {
 
     /// Restrict drawing to a region of surface `id`; `None` draws all of it.
     pub fn set_surface_viewport(&mut self, id: SurfaceId, viewport: Option<RenderViewport>) {
-        let Some(record) = self.surface_mut(id) else {
+        let Some(record) = self.surface_record_mut(id) else {
             return;
         };
         record.viewport = viewport;
@@ -419,9 +438,9 @@ impl AttachedRenderer {
 
     /// Whether surface `id` may present on the next frame; see
     /// [`PillRenderer::set_surface_ready`]. Applies to the primary surface too,
-    /// which records it so a backend swap cannot drop it.
+    /// which keeps it in its record so a backend swap cannot lose it.
     pub fn set_surface_ready(&mut self, id: SurfaceId, ready: bool) {
-        if let Some(record) = self.surface_mut(id) {
+        if let Some(record) = self.surface_record_mut(id) {
             record.ready = ready;
         }
         self.renderer.set_surface_ready(id, ready);
@@ -449,34 +468,34 @@ impl AttachedRenderer {
         self.renderer.as_ref()
     }
 
-    /// The window's handles as data.
+    /// The primary window's handles as data.
     pub fn window_data(&self) -> RawWindowData {
-        self.primary.window_data
+        self.primary_surface.window_data
     }
 
     /// The surface size last handed to the backend.
     pub fn surface_size(&self) -> (u32, u32) {
-        self.primary.size
+        self.primary_surface.size
     }
 
     /// The region drawn to, or `None` for the whole window.
     pub fn viewport(&self) -> Option<RenderViewport> {
-        self.primary.viewport
+        self.primary_surface.viewport
     }
 
-    /// Draw the frame the `rendering` system left in `world`, when it did.
+    /// Draw the frame the `rendering` system left in `world`, if it left one.
     ///
-    /// The renderer reads both resources straight out of the world - the
-    /// frame, and the store the assets live in - rather than being handed a
-    /// copy of the assets. Both borrows last the call, which is what stops the
-    /// store changing under a frame that is already being drawn.
+    /// The renderer reads the frame and the asset store straight out of the
+    /// world instead of being handed a copy of the assets. Both borrows last
+    /// for the whole call, which stops the store from changing while a frame
+    /// that uses it is being drawn.
     ///
-    /// A world holding no frame, or no asset store, draws nothing: that is not
-    /// an error.
+    /// A world with no frame, or with no asset store, draws nothing. That is
+    /// not an error.
     ///
     /// # Errors
     ///
-    /// Returns what the backend's `render` returns.
+    /// Returns whatever the backend's `render` returns.
     pub fn render(&mut self, world: &World) -> Result<(), RendererError> {
         // Step 1: Take the frame and the store it was built from, if this
         // world has both.
@@ -488,13 +507,12 @@ impl AttachedRenderer {
         };
         let outcome = self.renderer.render(frame, assets)?;
         let metrics = self.renderer.metrics();
-        // Step 2: Report a frame whose drawn-pass count moved. The line is how
-        // a chain that stopped drawing a pass - a material no pass names, a
-        // shader that failed to load - is visible in a run, and how a test
-        // reads what a settled frame actually drew without a person watching
-        // the window.
-        if metrics.passes_with_draws != self.reported_passes_with_draws {
-            self.reported_passes_with_draws = metrics.passes_with_draws;
+        // Step 2: Report a frame whose drawn-pass count changed. This line
+        // shows, in a run's log, that a pass stopped drawing (a material no
+        // pass names, a shader that failed to load). It also lets a test check
+        // what a settled frame drew without anyone watching the window.
+        if metrics.passes_with_draws != self.last_reported_pass_count {
+            self.last_reported_pass_count = metrics.passes_with_draws;
             info!(
                 target: telemetry_target::RENDERING,
                 passes_with_draws = metrics.passes_with_draws,
@@ -504,15 +522,15 @@ impl AttachedRenderer {
             );
         }
         // Step 3: Report the first frame that presented with draw calls. A
-        // window opened before any camera is enabled presents empty frames,
-        // and none of them is the start of the scene.
-        if !self.presented_scene
+        // window opened before any camera is enabled presents empty frames;
+        // none of those is the start of the scene.
+        if !self.has_presented_scene
             && matches!(outcome, pill_renderer_api::FrameOutcome::Presented)
             && self.renderer.metrics().passes_with_draws > 0
         {
-            self.presented_scene = true;
-            // Through the log rather than stdout: a browser has no stdout, and
-            // the terminal lane prints the same line on native.
+            self.has_presented_scene = true;
+            // Through the log rather than stdout, because a browser has no
+            // stdout. The terminal lane prints the same line on native.
             info!(
                 target: telemetry_target::RENDERING,
                 "[render] First frame: {outcome:?}; camera={}; instances={}; {:?}",
@@ -529,17 +547,19 @@ impl AttachedRenderer {
     /// Draw the frame the `rendering` system left in `world`, then hand back
     /// the picks and previews the GPU finished since the last frame.
     ///
-    /// The order is the renderer's contract: an answer to a request made this
-    /// frame cannot exist before the draw that produces it, so a frontend that
-    /// delivered first would read the previous frame's results again. Both
-    /// windowed drivers call this one method, which is why neither of them can
-    /// get the order wrong.
+    /// The order matters: the renderer cannot answer a request made this frame
+    /// before the draw that produces the answer. A frontend that delivered
+    /// first would read the previous frame's results again. Both windowed
+    /// drivers call this one method, so neither of them can get the order
+    /// wrong.
     ///
     /// # Errors
     ///
     /// Returns what [`Self::render`] returns.
     pub fn present(&mut self, world: &mut World) -> Result<(), RendererError> {
+        // Step 1: Draw the frame the `rendering` system left in the world.
         self.render(world)?;
+        // Step 2: Hand back the picks and previews the GPU finished meanwhile.
         self.deliver_pick_results(world);
         self.deliver_preview_results(world);
         Ok(())
@@ -548,31 +568,31 @@ impl AttachedRenderer {
     /// Move the picks the renderer has answered since the last call into the
     /// world's [`pill_renderer_api::PickResults`].
     ///
-    /// Answers arrive frames after their request, whenever the GPU finishes;
-    /// a world without the resource drops them. Reachable through
-    /// [`Self::present`], which keeps the delivery after the draw.
+    /// An answer arrives a few frames after its request, when the GPU
+    /// finishes. A world without the resource drops the answers. Callers reach
+    /// this through [`Self::present`], which delivers them after the draw.
     fn deliver_pick_results(&mut self, world: &mut World) {
-        let results = self.renderer.take_pick_results();
-        if results.is_empty() {
+        let pick_results = self.renderer.take_pick_results();
+        if pick_results.is_empty() {
             return;
         }
         if let Some(delivered) = world.get_resource_mut::<pill_renderer_api::PickResults>() {
-            delivered.results.extend(results);
+            delivered.results.extend(pick_results);
         }
     }
 
     /// Move the previews the renderer has read back since the last call into
     /// the world's [`pill_renderer_api::PreviewResults`].
     ///
-    /// Like a pick, a preview is answered frames after it was asked; a world
-    /// without the resource drops it.
+    /// Like a pick, a preview is answered a few frames after it was asked. A
+    /// world without the resource drops the result.
     fn deliver_preview_results(&mut self, world: &mut World) {
-        let results = self.renderer.take_preview_results();
-        if results.is_empty() {
+        let preview_results = self.renderer.take_preview_results();
+        if preview_results.is_empty() {
             return;
         }
         if let Some(delivered) = world.get_resource_mut::<pill_renderer_api::PreviewResults>() {
-            delivered.results.extend(results);
+            delivered.results.extend(preview_results);
         }
     }
 }
@@ -583,13 +603,13 @@ impl AttachedRenderer {
 
 /// A statically linked project running in a window.
 ///
-/// The field order is the drop order: the engine first, as in every host,
+/// Fields drop in declaration order. The engine goes first, as in every host,
 /// then the backend, then the window it drew on.
 pub struct RenderingRuntime {
     /// The engine and its frame state.
     runtime: Runtime,
     /// The linked renderer's backend on the window.
-    display: AttachedRenderer,
+    attached_renderer: AttachedRenderer,
 }
 
 impl RenderingRuntime {
@@ -611,9 +631,9 @@ impl RenderingRuntime {
                 detail: NO_LINKED_RENDERER.to_owned(),
             });
         };
-        self.display
+        self.attached_renderer
             .retarget_async(window, width, height, |window_data| {
-                attach_linked(renderer, window_data, width, height)
+                attach_linked_renderer(renderer, window_data, width, height)
             })
             .await
     }
@@ -627,7 +647,7 @@ impl RenderingRuntime {
         // Step 1: Run the engine's frame, which fills the frame resource.
         self.runtime.run_frame_from(Instant::now());
         // Step 2: Draw what it left and hand back the answers the GPU finished.
-        self.display
+        self.attached_renderer
             .present(self.runtime.engine_mut().world_mut())?;
         Ok(())
     }
@@ -662,7 +682,7 @@ impl FrameDriver for RenderingRuntime {
 
 impl WindowedFrameDriver for RenderingRuntime {
     fn display_mut(&mut self) -> &mut AttachedRenderer {
-        &mut self.display
+        &mut self.attached_renderer
     }
 }
 
@@ -670,25 +690,17 @@ impl WindowedFrameDriver for RenderingRuntime {
 // Free Functions
 // =============================================================================
 
-/// Why a windowed build can end up with no renderer to attach.
-///
-/// Both ways to reach it are build decisions rather than runtime failures, so the
-/// message names them instead of the feature that is already on wherever it can
-/// appear: a project whose settings select no `renderer:`, and a shipping bundle
-/// generated without the rendering feature.
-const NO_LINKED_RENDERER: &str = "this build links no renderer: the project selects no `renderer:`, or its shipping bundle was generated without the rendering feature";
-
 /// Register the linked renderer and attach it to `window`.
 ///
-/// For a frontend that finishes project setup before any window exists, so a
-/// slow start never shows a blank surface. Asynchronous because building the
-/// renderer is: a native frontend blocks on it once, a web frontend awaits it.
+/// A frontend calls this after project setup succeeds, so a slow start never
+/// shows a blank surface. Asynchronous because building the renderer is: a
+/// native frontend blocks on it once, a web frontend awaits it.
 ///
 /// # Errors
 ///
-/// Returns a [`RenderingError`]: the renderer's registration failed, or the
-/// backend could not attach to the window. A build that links no renderer
-/// returns the error [`Self`]'s caller reports, naming the two ways a windowed
+/// Returns [`RenderingError::Renderer`] when the renderer's registration fails
+/// or the backend cannot attach to the window. A build that links no renderer
+/// also returns it, carrying the message that names the two ways a windowed
 /// build ends up without one.
 pub async fn attach_renderer<W: RendererWindow>(
     mut runtime: Runtime,
@@ -703,7 +715,7 @@ pub async fn attach_renderer<W: RendererWindow>(
         "attaching the engine renderer to the window surface"
     );
     // Step 1: A build with no linked renderer stops here, before any window is
-    // bound: registering nothing and failing the attach later would report the
+    // bound. Registering nothing and failing the attach later would report the
     // same fact one step further in, as a renderer error.
     let Some((renderer, owner)) = runtime.static_renderer() else {
         return Err(RenderingError::Renderer(RendererError::Other {
@@ -711,7 +723,7 @@ pub async fn attach_renderer<W: RendererWindow>(
         }));
     };
     // Step 2: Register its system the way its module entry point would.
-    crate::static_project::initialize_linked(
+    crate::static_project::run_linked_entry_point(
         runtime.engine_mut(),
         renderer.init,
         Some(owner),
@@ -721,11 +733,14 @@ pub async fn attach_renderer<W: RendererWindow>(
         detail: format!("the renderer failed to initialize with status {status}"),
     })?;
     // Step 3: Build it on the window through the bundle's function pointer.
-    let display = AttachedRenderer::attach_async(window, width, height, |window_data| {
-        attach_linked(renderer, window_data, width, height)
+    let attached_renderer = AttachedRenderer::attach_async(window, width, height, |window_data| {
+        attach_linked_renderer(renderer, window_data, width, height)
     })
     .await?;
-    Ok(RenderingRuntime { runtime, display })
+    Ok(RenderingRuntime {
+        runtime,
+        attached_renderer,
+    })
 }
 
 /// Start a statically linked project and attach its renderer to `window`.
@@ -748,7 +763,7 @@ pub async fn setup_rendering<W: RendererWindow>(
 /// # Errors
 ///
 /// The returned future fails when the renderer cannot attach.
-fn attach_linked(
+fn attach_linked_renderer(
     renderer: crate::StaticRenderer,
     window_data: RawWindowData,
     width: u32,
@@ -772,18 +787,18 @@ mod tests {
 
     use super::*;
 
-    /// What a backend was told, as one line per call.
-    type Calls = Arc<Mutex<Vec<String>>>;
+    /// The calls a backend was told, one line per call.
+    type RecordedCalls = Arc<Mutex<Vec<String>>>;
 
     /// A backend that records what it is told, so a test can see what a
     /// replacement replays.
     struct RecordingRenderer {
-        calls: Calls,
+        calls: RecordedCalls,
     }
 
     impl RecordingRenderer {
         /// A backend recording into `calls`.
-        fn new(calls: Calls) -> Self {
+        fn new(calls: RecordedCalls) -> Self {
             Self { calls }
         }
 
@@ -822,7 +837,7 @@ mod tests {
 
     /// A renderer over `renderer` and a synthetic primary window, for the tests
     /// that check what a replacement replays.
-    fn attached_over(renderer: Box<dyn PillRenderer>) -> AttachedRenderer {
+    fn attached_renderer_over(renderer: Box<dyn PillRenderer>) -> AttachedRenderer {
         AttachedRenderer::from_parts(
             renderer,
             Box::new(()),
@@ -840,54 +855,63 @@ mod tests {
 
     /// A backend replacement replays the primary surface's pacing.
     ///
-    /// A window the frontend asked to hold would otherwise present again on the
-    /// first frame after a renderer reload - the primary's pacing used to be
-    /// the one fact the extra surfaces kept and it did not.
+    /// Without the replay, a window the frontend asked to hold would start
+    /// presenting again on the first frame after a renderer reload.
     #[test]
     fn a_replacement_replays_the_primary_surfaces_pacing() {
-        let first = Arc::new(Mutex::new(Vec::new()));
-        let mut attached = attached_over(Box::new(RecordingRenderer::new(first.clone())));
+        let first_backend_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut attached_renderer = attached_renderer_over(Box::new(RecordingRenderer::new(
+            first_backend_calls.clone(),
+        )));
 
         // The frontend holds the primary, and sets a viewport while it does.
-        attached.set_surface_ready(SurfaceId::PRIMARY, false);
-        attached.set_surface_viewport(SurfaceId::PRIMARY, None);
-        let held = first
+        attached_renderer.set_surface_ready(SurfaceId::PRIMARY, false);
+        attached_renderer.set_surface_viewport(SurfaceId::PRIMARY, None);
+        let recorded_before_replacement = first_backend_calls
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         assert!(
-            held.iter().any(|line| line == "ready 0 false"),
-            "the first backend was told to hold: {held:?}"
+            recorded_before_replacement
+                .iter()
+                .any(|line| line == "ready 0 false"),
+            "the first backend was told to hold: {recorded_before_replacement:?}"
         );
 
         // A renderer reload replaces the backend.
-        attached.detach_backend();
-        let second = Arc::new(Mutex::new(Vec::new()));
-        attached.replace_backend(Box::new(RecordingRenderer::new(second.clone())));
-        let replayed = second
+        attached_renderer.detach_backend();
+        let replacement_backend_calls = Arc::new(Mutex::new(Vec::new()));
+        attached_renderer.replace_backend(Box::new(RecordingRenderer::new(
+            replacement_backend_calls.clone(),
+        )));
+        let recorded_after_replacement = replacement_backend_calls
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         assert!(
-            replayed.iter().any(|line| line == "ready 0 false"),
-            "the replacement was told to hold the primary: {replayed:?}"
+            recorded_after_replacement
+                .iter()
+                .any(|line| line == "ready 0 false"),
+            "the replacement was told to hold the primary: {recorded_after_replacement:?}"
         );
         assert!(
-            replayed.iter().any(|line| line.starts_with("viewport 0")),
-            "the replacement was told the viewport: {replayed:?}"
+            recorded_after_replacement
+                .iter()
+                .any(|line| line.starts_with("viewport 0")),
+            "the replacement was told the viewport: {recorded_after_replacement:?}"
         );
     }
 
-    /// A resize reaches the surface's record and the backend, for the primary
-    /// and for a surface attached later alike.
+    /// A resize of the primary reaches its record and the backend.
     #[test]
-    fn a_resize_is_recorded_for_every_surface() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let mut attached = attached_over(Box::new(RecordingRenderer::new(calls.clone())));
+    fn a_primary_resize_reaches_the_surface_and_the_backend() {
+        let backend_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut attached_renderer =
+            attached_renderer_over(Box::new(RecordingRenderer::new(backend_calls.clone())));
 
-        attached.resize_surface(SurfaceId::PRIMARY, 1024, 768);
-        assert_eq!(attached.surface_size(), (1024, 768));
-        let recorded = calls
+        attached_renderer.resize_surface(SurfaceId::PRIMARY, 1024, 768);
+        assert_eq!(attached_renderer.surface_size(), (1024, 768));
+        let recorded = backend_calls
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
@@ -903,10 +927,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "call detach_backend first")]
     fn replacing_a_live_backend_trips_the_precondition() {
-        let mut attached = attached_over(Box::new(RecordingRenderer::new(Arc::new(Mutex::new(
-            Vec::new(),
-        )))));
-        attached.replace_backend(Box::new(RecordingRenderer::new(Arc::new(Mutex::new(
+        let mut attached_renderer = attached_renderer_over(Box::new(RecordingRenderer::new(
+            Arc::new(Mutex::new(Vec::new())),
+        )));
+        attached_renderer.replace_backend(Box::new(RecordingRenderer::new(Arc::new(Mutex::new(
             Vec::new(),
         )))));
     }

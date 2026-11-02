@@ -4,146 +4,168 @@
 //! # Responsibilities
 //!
 //! - Builds and loads native or C# project modules and the extensions.
-//! - Watches project sources and coordinates safe hot reloads, around the
-//!   frames the wrapped [`pill_player::Runtime`] runs.
-//! - Exposes [`setup`], [`run_frame`] and, windowed, [`setup_rendering`] /
-//!   [`attach_renderer`] to frontends, which own their event loops and drive
-//!   the host through [`FrameDriver`].
+//! - Watches project sources and runs hot reloads at frame boundaries, just
+//!   before the wrapped [`pill_player::Runtime`] runs its frame.
+//! - Exposes [`setup`], [`run_frame`] and, when the host draws into a window,
+//!   [`setup_rendering`] and [`attach_renderer`]. A frontend owns its event
+//!   loop and drives the host through [`FrameDriver`].
 //!
 //! # Design
 //!
-//! Configuration is externalized in [`ProjectModuleConfig`], keeping backend
-//! selection out of executable crates. Running the game - the engine, the
-//! frame, the statically linked project, the renderer's window - is
-//! `pill_player`'s, which a shipping build links without this crate. The
-//! reload path compiles only with `hot_reload`; without it this crate is
-//! little more than its configuration types.
+//! The configuration types ([`ProjectModuleConfig`], [`HostConfig`]) keep
+//! backend selection out of executable crates. Running the game is
+//! `pill_player`'s job: the engine, the frame, the statically linked project
+//! and the renderer's window. A shipping build links that crate without this
+//! one. The reload path compiles only with `hot_reload`; without that feature
+//! this crate is mostly its configuration types.
 
-// ===== Module Declarations =====
+// =============================================================================
+// Module Declarations
+// =============================================================================
 
-/// Build, link, and hot-reload analytics collector and console reports.
+/// Collects build, load and reload measurements and prints them as console
+/// reports.
 ///
-/// Every measurement it collects is about building, loading or reloading, so a
+/// Its measurements come from the build, load and reload pipeline, so a
 /// statically linked build has nothing to report.
 #[cfg(feature = "hot_reload")]
 mod analytics;
-/// The startup build plan: the modules about to be built, announced up front
-/// and counted off as each build starts.
+/// The startup build plan: logs the modules a start will build, then counts
+/// each build as it begins.
 #[cfg(feature = "hot_reload")]
 mod build_progress;
-/// Project-module build execution and output-path resolution.
+/// Build commands for the project and its extensions, artifact staging and
+/// output-path resolution.
 #[cfg(feature = "hot_reload")]
 mod build_runner;
-/// Project-module configuration shared by every host frontend.
+/// Project and extension configuration shared by every host frontend.
 mod config;
-/// C# development tooling over `pill_csharp_bridge`: mirror generation and the
-/// in-process compiler, plus the bridge items the host names.
+/// C# development tooling on top of `pill_csharp_bridge`: generates the C#
+/// mirrors, runs the in-process compiler, and re-exports the bridge items the
+/// host names.
 ///
 /// A shipped C# project needs none of it: it starts through the bridge's
-/// `CSharpBackend`, which the runtime runs.
+/// `CSharpBackend`, run by the bridge's runtime.
 #[cfg(feature = "hot_reload")]
 mod csharp;
-/// Per-function hot patching: classify, generate, compile and activate a patch.
+/// Per-function hot patching: decides which edits can be patched, then
+/// generates, compiles and activates the patch.
 #[cfg(feature = "hot_patch")]
 mod hot_patch;
 
-/// Lifecycle management for extensions.
+/// Builds, loads and reloads the extension modules.
 mod extension;
-/// Native project-library loading and Windows-safe temporary-copy handling.
+/// Loads native module libraries from temporary copies that must outlive a
+/// reload.
 #[cfg(feature = "hot_reload")]
 mod native_library;
-/// Reloads, patches, failures and rollbacks, queued for an attached editor.
+/// Reloads, patches, failures and rollbacks, queued as notices for an attached
+/// editor.
 #[cfg(feature = "hot_reload")]
 mod notices;
-/// Lifecycle management for the active native or managed project module.
+/// The loaded project module: its startup build and load, and each reload
+/// after that.
 mod project_module;
-/// The sequence every reload runs once its replacement image is loaded.
+/// The steps every reload runs once its replacement image is loaded.
 #[cfg(feature = "hot_reload")]
 mod reload;
 
-/// The GPU renderer as a loaded module: starting it and driving its backend.
+/// The GPU renderer as a loaded module: builds and attaches it, then drives
+/// its backend.
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
 mod renderer_module;
-/// The development host: reloads around the runtime's frames.
+/// The development host: `DevHost` and `RenderingHost`, with the functions
+/// that set them up, run their frames and reload their modules.
 #[cfg(feature = "hot_reload")]
 mod runtime;
-/// Source-tree watching and reload signalling for the main thread.
+/// Watches the source tree and tells the main thread when to reload.
 #[cfg(feature = "hot_reload")]
 mod watcher;
 
-/// The project's `res`, watched so edited assets are reimported in place.
+/// Watches the project's `res` folder so an edited asset is imported again
+/// while the host runs.
 #[cfg(feature = "hot_reload")]
 mod asset_watcher;
 
-/// The project's assets as a tool sees them: tree, settings, moves.
+/// The project's assets as a tool sees them: the tree listing, import settings
+/// and moves.
 #[cfg(feature = "hot_reload")]
 mod asset_browser;
 
-/// Re-cooks edited renderer shaders on a worker thread and queues the results.
+/// Watches the renderer's shader sources, cooks them again after an edit on a
+/// worker thread, and queues the results.
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
 mod shader_watcher;
 
-/// Test-only scratch directories and explicit file dates.
+/// Test-only helpers: temporary directories and explicit file dates.
 #[cfg(test)]
 mod scratch;
 
-// ===== Re-exports =====
+// =============================================================================
+// Re-exports
+// =============================================================================
 
 /// The editor-only settings file's name in the project root.
 pub use config::EDITOR_SETTINGS_FILE;
-/// The editor's own settings file: read by the editor executable
-/// only, never by a game build.
+/// The editor's own settings file and its reader, used by the editor
+/// executable and never by a game build.
 pub use config::{read_editor_settings, resolve_editor_theme, EditorSettings};
-/// The host's configuration: the project module, the extensions to load and
-/// the selected renderer.
+/// The host's configuration: the project, the extensions to load and the
+/// selected renderer.
 pub use config::{ExtensionConfig, HostConfig, ProjectModuleBackend, ProjectModuleConfig};
-/// The module ABI revision an extension must report before the host calls
-/// into it.
+/// The module ABI revision an extension must report, checked before the host
+/// calls into it.
 pub use extension::EXTENSION_ABI_VERSION;
-/// The notices an editor frontend drains each frame; see [`HostNotice`].
+/// The notice type an editor frontend reads, and the function that empties the
+/// queue each frame.
 #[cfg(feature = "hot_reload")]
 pub use notices::{take as take_notices, HostNotice};
-/// The error surface frontends report through: the host's error types, the
-/// message renderers and the installed report handler.
+/// The error types frontends report through, with the message renderers and
+/// the installed report handler.
 pub use pill_core::error::{
     engine_report, install_engine_report_handler, BuildError, CSharpError, ConfigError,
     EngineMessage, EngineReportHandler, HostError, LibraryError, MessageRenderer, ModuleError,
     PlainMessageRenderer, SemanticRole, StyledDiagnosticProxy, TerminalMessageRenderer,
     WatcherError,
 };
-/// Where a managed project's assemblies are, as [`ProjectModuleBackend`]
-/// names them; defined by the C# bridge.
+/// The assembly names and output directories of a managed project, as
+/// [`ProjectModuleBackend`] stores them; defined by the C# bridge.
 pub use pill_csharp_bridge::CSharpModuleConfig;
-/// What a frontend's loop needs from whatever runs the game; the development
+/// What a frontend's loop needs from whatever runs the game. The development
 /// host implements it, as the shipping runtimes do.
 pub use pill_player::FrameDriver;
 
-/// The project's assets as an editor tool sees them, and the standalone types
-/// a new asset can be created for.
+/// The project's assets as an editor tool sees them, plus the standalone asset
+/// types a new asset can be created for.
 #[cfg(feature = "hot_reload")]
 pub use asset_browser::{standalone_file_name, standalone_types, AssetEntry, StandaloneType};
 /// One entry in a patched function's history, as returned by
 /// [`DevHost::patch_generations`](runtime::DevHost::patch_generations).
 #[cfg(feature = "hot_patch")]
 pub use hot_patch::PatchGeneration;
-/// The development host and the headless entry points that drive one.
+/// The development host and the entry points that create and drive it without
+/// a window.
 #[cfg(feature = "hot_reload")]
 pub use runtime::{run_frame, setup, DevHost};
 
-/// `EngineError` has no rendering variants, so it is available to headless
-/// frontends too.
+/// The engine's composed error. It has no rendering variants, so headless
+/// frontends use it too.
 pub use pill_engine::EngineError;
 
-// Rendering-only: the renderer contract's data and errors, re-exported so
-// frontends never name a renderer crate and stay free of a wgpu dependency of
-// their own. The viewport describes where a renderer draws, so a headless build
-// has nothing to point it at.
+// These come through the host so a frontend never names a renderer crate and
+// needs no wgpu dependency of its own. A headless build has no renderer, so it
+// also has no viewport to describe.
+
+/// The bound a frontend's window type meets so a renderer can attach to it,
+/// and the error a windowed runtime returns.
 #[cfg(feature = "rendering")]
 pub use pill_player::{RendererWindow, RenderingError};
+/// The rectangle of a render target a renderer draws into, and the renderer's
+/// error.
 #[cfg(feature = "rendering")]
 pub use pill_renderer_api::{RenderViewport, RendererError};
 
-/// Rendering-only entry points: the windowed host and attaching the renderer
+/// Rendering-only entry points: the windowed host, and attaching the renderer
 /// to a frontend's window.
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
 pub use runtime::{attach_renderer, setup_rendering, RenderingHost};

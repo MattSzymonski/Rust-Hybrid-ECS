@@ -3,91 +3,103 @@
 //! # Responsibilities
 //!
 //! - Emit `PILL_HOST_PROFILE_DIRECTORY`, the profile directory the host was
-//!   built into, so the project and extension builds it spawns land in the
-//!   same one.
+//!   built into, so the project and extension builds it starts write to the
+//!   same directory.
 //! - Emit `PILL_HOST_TARGET_TRIPLE`, empty for a native build, so
 //!   host-spawned module builds can pass the `--target` a launcher gave the
 //!   host.
 //!
 //! # Design
 //!
-//! The host shells out to cargo for the project and every extension, and those
-//! builds must land in the profile the host itself was built with. A release
-//! host that loads debug-profile modules fails in `LoadLibrary` with "The
+//! The host runs cargo for the project and for every extension, and those
+//! builds must use the profile the host itself was built with. A release host
+//! that loads debug-profile modules fails in `LoadLibrary` with "The
 //! specified procedure could not be found" (os error 127), because the two
 //! sides resolve different crate-metadata hashes. The same hashing makes a
-//! natively built module unloadable by a host cargo built with `--target`.
+//! natively built module unloadable by a host that cargo built with
+//! `--target`.
 //!
 //! `cfg!(debug_assertions)` cannot answer this: `release-with-debug` inherits
 //! `release`, so its assertions stay off, yet it builds into
-//! `target/release-with-debug`. The only thing that knows the real profile
-//! directory is `OUT_DIR`, which cargo shapes as
-//! `<target>/<profile-directory>/build/<package>-<hash>/out`.
+//! `target/release-with-debug`. `OUT_DIR` always points into the real profile
+//! directory: cargo shapes it as
+//! `<target>/[<triple>/]<profile>/build/<package>-<hash>/out`, so the script
+//! reads the profile from there.
 
 // Standard library
 use std::path::{Path, PathBuf};
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// Profile directory assumed when `OUT_DIR` cannot be parsed.
 ///
-/// `debug` is the safe fallback: it is what an ordinary `cargo build`
-/// produces, so a host that guesses wrong still matches the default build.
+/// `debug` is the safe fallback: an ordinary `cargo build` writes there, so a
+/// host that falls back still matches the default build.
 const FALLBACK_PROFILE_DIRECTORY: &str = "debug";
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Emits the host's profile directory and target triple as `rustc-env` values.
 fn main() {
-    // Step 1: Declare the inputs. The workspace manifest carries the
-    // `[profile.*]` sections, and its path must name a file that exists: cargo
-    // treats a missing one as changed on every build, recompiling the host and
-    // every binary that links it.
+    // Step 1: Declare the inputs. The workspace manifest holds the
+    // `[profile.*]` sections, and its path must name a file that exists:
+    // cargo treats a missing path as changed on every build, so this script
+    // would rerun each time.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../Cargo.toml");
 
-    // Step 2: Resolve the layout, falling back to the default build profile.
+    // Step 2: Read the layout from `OUT_DIR`, falling back to the default
+    // build profile.
     let (profile_directory, target_triple) = out_directory_layout();
     let profile_directory =
         profile_directory.unwrap_or_else(|| FALLBACK_PROFILE_DIRECTORY.to_string());
     println!("cargo:rustc-env=PILL_HOST_PROFILE_DIRECTORY={profile_directory}");
 
     // Empty when the host was built natively (no `--target`), which is the
-    // common `cargo run` case; set to the triple when a tool such as the
+    // usual `cargo run` case. Set to the triple when a tool such as the
     // dioxus CLI passed `--target <host>` explicitly.
     println!("cargo:rustc-env=PILL_HOST_TARGET_TRIPLE={target_triple}");
 }
 
-/// Parses `OUT_DIR` into `(profile directory, target triple)`.
+/// Reads the profile directory and the target triple out of `OUT_DIR`.
 ///
-/// `OUT_DIR` is `<target-root>/[<triple>/]<profile>/build/<package>-<hash>/out`,
-/// so three parents up is the profile directory, and that directory's parent
-/// is the target root when native or the triple cargo was invoked with. The
-/// parent names are what tell the two apart; a natively built module loaded
-/// into a `--target` host fails only at the DLL boundary with a silent
-/// `LoadLibrary` "procedure not found".
+/// `OUT_DIR` has the shape
+/// `<target-root>/[<triple>/]<profile>/build/<package>-<hash>/out`, so the
+/// profile directory is three folders up. The folder above it is the target
+/// root in a native build and the triple in a `--target` build, and its name
+/// decides which. A natively built module loaded into a `--target` host fails
+/// only when it is loaded, with a `LoadLibrary` "procedure not found" error.
 fn out_directory_layout() -> (Option<String>, String) {
-    // Step 1: Read `OUT_DIR`; without it neither value can be derived.
+    // Step 1: Read `OUT_DIR`; without it there is nothing to report, so
+    // return no profile directory and an empty triple.
     let Some(out_directory) = std::env::var_os("OUT_DIR").map(PathBuf::from) else {
         return (None, String::new());
     };
 
-    // Step 2: Walk out of `build/<package>-<hash>/out` to the profile
-    // directory and its parent.
-    let package_build = out_directory.parent();
-    let build = package_build.and_then(Path::parent);
-    let profile = build.and_then(Path::parent);
-    let target_root = profile.and_then(Path::parent);
-    let profile_name = profile
+    // Step 2: Walk up from `build/<package>-<hash>/out` to the profile
+    // directory and the folder above it.
+    let package_build_directory = out_directory.parent();
+    let build_directory = package_build_directory.and_then(Path::parent);
+    let profile_directory = build_directory.and_then(Path::parent);
+    let target_root_directory = profile_directory.and_then(Path::parent);
+    let profile_directory_name = profile_directory
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned());
 
-    // Step 3: A rustc target triple always contains at least one hyphen
-    // (`x86_64-pc-windows-msvc`, `aarch64-apple-darwin`,
-    // `wasm32-unknown-unknown`); a bare target root such as `target` never
-    // does. The one false positive - a `CARGO_TARGET_DIR` whose own name
-    // contains a hyphen - cannot occur here: every build that compiles this
-    // host writes under the workspace's `target` directory.
-    let triple = target_root
+    // Step 3: Take the folder above the profile directory as the target triple
+    // only when its name contains a hyphen. Every rustc target triple has at
+    // least one (`x86_64-pc-windows-msvc`, `aarch64-apple-darwin`,
+    // `wasm32-unknown-unknown`), and the workspace's `target` folder has none.
+    // A `CARGO_TARGET_DIR` whose own folder name contains a hyphen would be
+    // mistaken for a triple; the editor and host builds here do not set it.
+    let target_triple = target_root_directory
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| name.contains('-'))
         .unwrap_or_default();
-    (profile_name, triple)
+    (profile_directory_name, target_triple)
 }

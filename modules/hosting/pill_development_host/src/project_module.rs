@@ -3,29 +3,30 @@
 //! # Responsibilities
 //!
 //! - Builds and loads the selected backend during startup.
-//! - Reloads a native generation through a graveyard that keeps earlier images
-//!   mapped while pointers into them can still be live.
-//! - Delegates managed reload polling to the C# bridge's runtime, through
+//! - Reloads a native generation through a graveyard (the retired library
+//!   images the host keeps mapped), so pointers into an earlier image stay
+//!   valid.
+//! - Leaves managed reload polling to the C# bridge's runtime, through
 //!   `crate::csharp`.
-//! - Keeps each generation's registration record - persistable type names,
-//!   schema hashes, resource ids and every component name - so the next reload
-//!   can tell what changed and what a peer still declares.
+//! - Keeps a record of each generation's registrations - persistable type
+//!   names, schema hashes, resource ids and every component name - so the next
+//!   reload can tell what changed and what another module still declares.
 //!
 //! # Design
 //!
-//! The host keeps exactly one [`LoadedProject`] alive at a time. Native backends
-//! are reloaded transactionally by [`reload_native`], which hands the build, the
-//! private copy and the swap to `crate::reload`: the retired DLL enters a
-//! bounded graveyard and stays mapped until no column needs its tables, so
-//! engine-owned pointers into retired code remain valid while changed persist
-//! schemas migrate. Managed backends delegate assembly discovery and validation
-//! to the C# bridge's runtime, which reports success or rejection through
-//! `poll_reload`.
+//! The host keeps exactly one [`LoadedProject`] alive at a time. A native
+//! reload runs through [`reload_native`], which hands the build, the private
+//! copy and the swap to `crate::reload`. The replaced DLL moves into a bounded
+//! graveyard and stays mapped until no column needs its tables, so
+//! engine-owned pointers into the old image stay valid while changed persist
+//! schemas are migrated. A managed backend leaves assembly discovery and
+//! validation to the C# bridge's runtime, which reports success or rejection
+//! through `poll_reload`.
 
-// The whole module is the loaded-project lifecycle: build, load, initialize,
-// reload, retire. A statically linked build does none of that - the project's
-// entry point is called once at setup and there is no library object to keep -
-// so nothing here is compiled without `hot_reload`.
+// This module covers the whole loaded-project lifecycle: build, load,
+// initialize, reload and retire. A statically linked build does none of it -
+// the project's entry point is called once at setup and there is no library
+// object to keep - so none of this is compiled without `hot_reload`.
 #[cfg(feature = "hot_reload")]
 pub(crate) use loaded::{LoadedProject, ManagedReloadStart};
 
@@ -60,16 +61,16 @@ mod loaded {
 
     /// What starting a reload through the managed path produced.
     pub(crate) enum ManagedReloadStart {
-        /// The project's backend is native; the caller reloads it on the
+        /// The project's backend is native, so the caller reloads it on the
         /// frame thread.
         NotManaged,
-        /// A worker thread is building the assembly. The frame keeps running;
-        /// the finish lands when [`LoadedProject::collect_managed_build`]
-        /// reports the build.
+        /// A worker thread is building the assembly. The frame keeps running,
+        /// and the result is collected when
+        /// [`LoadedProject::collect_managed_build`] reports the build.
         Building,
-        /// The build thread could not start; the caller builds on the frame
-        /// thread through [`LoadedProject::build_now`] and consumes the report
-        /// through the same handler the worker's reports go through.
+        /// The build thread could not start. The caller builds on the frame
+        /// thread through [`LoadedProject::build_now`], and that report goes
+        /// through the same handler as a worker's report.
         Unavailable,
     }
 
@@ -77,34 +78,39 @@ mod loaded {
     // LoadedProject
     // =============================================================================
 
-    /// The backend-specific state kept alive by the host loop.
+    /// The backend-specific state the host loop keeps alive.
     ///
-    /// The enum lets the host hold either a mapped native library or a managed
-    /// runtime behind one interface; the variant in use is fixed at startup and
+    /// The host holds either a mapped native library or a managed runtime,
+    /// behind one interface. The backend is fixed at startup, so the variant
     /// only changes across a full restart.
     pub(crate) enum LoadedProject {
         /// A mapped native module plus any retired DLLs that must stay mapped.
         Native {
+            /// The generation the host is calling into right now.
             current: NativeLibrary,
-            /// Old DLLs intentionally remain mapped because engine-owned function
-            /// pointers and vtables may still refer to their code.
+            /// The DLLs of earlier generations stay mapped on purpose:
+            /// engine-owned function pointers and vtables may still point into
+            /// their code.
             old_libraries: Vec<NativeLibrary>,
-            /// Persistable component type names the last `pill_module_init` registered,
-            /// used to detect types the next generation forgets to re-register.
+            /// Persistable component type names the last `pill_module_init`
+            /// registered. The next reload compares them to find types the new
+            /// generation no longer registers.
             registered_type_names: Vec<String>,
-            /// The schema hash of each of those types as the last
-            /// `pill_module_init` declared it, to find the ones a module
-            /// reload has re-laid out since.
+            /// The schema hash of each of those types, as the last
+            /// `pill_module_init` declared it. Comparing them with the world
+            /// finds the types whose layout another module's reload has
+            /// replaced since.
             registered_schemas: Vec<(String, u64)>,
-            /// Resource ids the last `pill_module_init` registered, so a type the
-            /// project stops owning can be dropped while its image is mapped.
+            /// Resource ids the last `pill_module_init` registered, so a
+            /// resource the project stops owning can be dropped while the
+            /// image that holds its drop function is still mapped.
             registered_resource_ids: Vec<pill_engine::ResourceId>,
             /// Every component type name the last `pill_module_init`
-            /// registered, plain and persistable alike.
+            /// registered, both plain and persistable.
             ///
             /// A module reload treats the project as a peer: a shared type the
-            /// project also declares is not the module's to retire, so the
-            /// drop of a forgotten type asks this set before it runs.
+            /// project also declares is not the module's to retire, so before
+            /// a module drops a forgotten type it checks this set.
             registered_component_names: Vec<String>,
         },
         /// A collectible managed runtime hosting the C# project assembly,
@@ -113,10 +119,10 @@ mod loaded {
     }
 
     impl LoadedProject {
-        /// The project's currently loaded native library, as a patch target.
+        /// The native library the loaded project uses now, as a patch target.
         ///
-        /// `None` for the C# backend, which has no native redirect slots to install
-        /// into.
+        /// `None` for the C# backend, which has no native redirect slots to
+        /// install into.
         #[cfg(feature = "hot_patch")]
         pub(crate) fn native_library(&self) -> Option<&NativeLibrary> {
             match self {
@@ -126,9 +132,10 @@ mod loaded {
         }
 
         /// The persistable components the native project registered whose
-        /// layout a module reload has replaced since; empty while it is
-        /// current, and always empty for the C# backend, which registers its
-        /// own descriptor components. See [`crate::reload::stale_components`].
+        /// layout has been replaced since, by another module's reload. Empty
+        /// while the layouts are current, and always empty for the C# backend,
+        /// whose components are its own descriptor-defined set. See
+        /// [`crate::reload::stale_components`].
         pub(crate) fn stale_components(&self, world: &pill_engine::World) -> Vec<String> {
             match self {
                 Self::Native {
@@ -139,11 +146,11 @@ mod loaded {
         }
 
         /// Every component type name the loaded project's generation
-        /// registered, plain and persistable alike.
+        /// registered, both plain and persistable.
         ///
-        /// Read by a module reload to decide whether a type that module
-        /// forgot is still declared by the project; empty for the C# backend,
-        /// whose components are its own descriptor-defined set.
+        /// A module reload reads it to decide whether a type it forgot is
+        /// still declared by the project. Empty for the C# backend, whose
+        /// components are its own descriptor-defined set.
         pub(crate) fn component_names(&self) -> &[String] {
             match self {
                 Self::Native {
@@ -171,8 +178,8 @@ mod loaded {
             mirror_methods: &[crate::csharp::ResolvedMirrorMethod],
         ) -> Result<Self, HostError> {
             // Step 1: Build the module through the shared command runner.
-            // Build before branching so both backends use the same command runner,
-            // diagnostics, output validation, and initial failure behavior.
+            // Build before choosing a backend, so both use the same command
+            // runner, diagnostics, output validation and failure handling.
             let output_path = build_project_module(workspace_root, config, None)?;
 
             // Step 2: Initialize the backend-specific runtime.
@@ -186,9 +193,9 @@ mod loaded {
 
                     // Native modules register their components and systems
                     // through the stable EngineApi table before the first frame
-                    // is run. The capture, init and failure handling are shared
+                    // runs. The capture, init and failure handling are shared
                     // with the extension path - see `crate::reload`.
-                    let init = crate::reload::initialize_generation(
+                    let generation_init = crate::reload::initialize_generation(
                         engine,
                         engine_api,
                         &config.name,
@@ -197,19 +204,19 @@ mod loaded {
                         &library,
                         crate::reload::FirstLoadFailure::ClearWorld,
                     );
-                    if init.status != 0 {
+                    if generation_init.status != 0 {
                         return Err(LibraryError::InitializationFailed {
-                            status: init.status,
+                            status: generation_init.status,
                         }
                         .into());
                     }
                     Ok(Self::Native {
                         current: library,
                         old_libraries: Vec::new(),
-                        registered_type_names: init.registered_type_names,
-                        registered_schemas: init.registered_schemas,
-                        registered_resource_ids: init.registered_resource_ids,
-                        registered_component_names: init.component_names,
+                        registered_type_names: generation_init.registered_type_names,
+                        registered_schemas: generation_init.registered_schemas,
+                        registered_resource_ids: generation_init.registered_resource_ids,
+                        registered_component_names: generation_init.component_names,
                     })
                 }
                 // The managed runtime performs assembly discovery, component
@@ -224,18 +231,19 @@ mod loaded {
             }
         }
 
-        /// Rebuild and replace the active module while preserving a working old
-        /// generation whenever compilation, loading, or registration fails.
+        /// Rebuilds and replaces the active module, keeping a working old
+        /// generation running whenever compilation, loading or registration
+        /// fails.
         ///
-        /// Returns whether the running image was replaced. Every failed
-        /// branch (a build error, a load refusal, a rolled-back init) keeps the
-        /// current image and reports `false`, so the caller can gate the
-        /// bookkeeping that only a replacement invalidates - patch records
-        /// pointing into an image the graveyard will unmap - on there being a
-        /// replacement at all.
+        /// Returns whether the running image was replaced. Every failed branch
+        /// (a build error, a load refusal, a rolled-back init) keeps the
+        /// current image and returns `false`. The caller uses that answer to
+        /// gate bookkeeping that only a replacement invalidates, such as patch
+        /// records pointing into an image the graveyard will unmap.
         ///
-        /// `cancel_flag` is the watcher's reload signal: a newer save during the
-        /// build aborts the in-flight compilation and the next frame retries.
+        /// `cancel_flag` is the watcher's reload signal: a newer save during
+        /// the build cancels the compilation in flight, and the next frame
+        /// tries again.
         pub(crate) fn reload(
             &mut self,
             engine: &mut Engine,
@@ -269,13 +277,13 @@ mod loaded {
                     config,
                     cancel_flag,
                 ),
-                // Managed reloads never route through here. A reload of a
-                // C# project produces a [`BuildReport`] - from the build
-                // worker, or from [`Self::build_now`] when the worker could
-                // not start - and every outcome is consumed by the host's one
-                // `finish_managed_build` handler, which owns the record,
-                // notify and poll sequence and its log lines. Reaching this
-                // arm would mean a caller bypassed that one handler.
+                // Managed reloads never come through here. A C# reload
+                // produces a [`BuildReport`] - from the build worker, or from
+                // [`Self::build_now`] when the worker could not start - and
+                // the host's single `finish_managed_build` handler consumes
+                // every outcome, owning the record, notify and poll steps and
+                // their log lines. Reaching this arm would mean a caller
+                // bypassed that handler.
                 Self::CSharp(_) => {
                     debug_assert!(false, "managed reload bypassed finish_managed_build");
                     false
@@ -283,31 +291,34 @@ mod loaded {
             }
         }
 
-        /// Poll the collectible managed loader after its assembly debounce.
+        /// Polls the managed loader after its assembly debounce (the short
+        /// wait that groups a burst of file changes into one batch).
         ///
-        /// Returns whether this poll landed an assembly swap. Two mechanisms
-        /// complete a managed reload: the in-process compiler collapses the
-        /// loader's debounce through `NotifyAssemblyReplaced`, while a rebuild
-        /// through the `dotnet build` fallback leaves no completion signal of
-        /// its own, so every frame gives the loader a chance to observe settled
-        /// bytes. The debounce can outlive the frame that triggered the build,
-        /// which is why the swap - and the bookkeeping it invalidates - is
-        /// observed here as well as on the build completion.
+        /// Returns whether this poll swapped in a new assembly. A managed
+        /// reload completes in one of two ways. An in-process compile calls
+        /// `NotifyAssemblyReplaced`, which ends the loader's debounce. A
+        /// rebuild through the `dotnet build` fallback leaves no completion
+        /// signal of its own, so the host polls the loader every frame to give
+        /// it a chance to notice the settled assembly. The debounce can last
+        /// past the frame that started the build, which is why the swap - and
+        /// the bookkeeping it invalidates - is checked here as well as when
+        /// the build completes.
         pub(crate) fn poll_managed_reload(&mut self, engine: &mut Engine) -> bool {
-            // Source and assembly watchers have independent debounce windows. Poll
-            // every frame so a successful build is eventually observed even when
-            // the assembly was not ready during the source-triggered reload call.
-            if let Self::CSharp(runtime) = self {
-                return managed_poll_replaced_assembly(runtime, engine);
+            // Source and assembly watchers have independent debounce windows.
+            // Poll every frame so a successful build is eventually observed,
+            // even when the assembly was not ready during the source-triggered
+            // reload call.
+            if let Self::CSharp(project) = self {
+                return poll_managed_assembly_swap(project, engine);
             }
             false
         }
 
-        /// Arm the managed backend's reload timing for the reload this signal
-        /// starts.
+        /// Arms the managed backend's reload timing for the reload this
+        /// signal starts.
         ///
         /// A native project has no managed reload to time, so it ignores the
-        /// signal and arms nothing; the caller takes the trigger out of the
+        /// signal and arms nothing. The caller takes the trigger out of the
         /// watcher's log for this reload either way, so none is left pending.
         pub(crate) fn arm_managed_reload_timing(&mut self, trigger: Option<SourceTrigger>) {
             if let Self::CSharp(project) = self {
@@ -315,21 +326,26 @@ mod loaded {
             }
         }
 
-        /// Drop an armed managed reload timing whose reload produced no swap.
+        /// Drops an armed managed reload timing whose reload produced no swap.
         pub(crate) fn abandon_managed_reload_timing(&mut self) {
             if let Self::CSharp(project) = self {
                 project.abandon_reload_timing();
             }
         }
 
-        /// Record a managed assembly rebuild that finished at `at`.
-        pub(crate) fn record_assembly_rebuilt_at(&mut self, at: Instant, kind: &'static str) {
+        /// Records a managed assembly rebuild that finished at `finished_at`,
+        /// and what produced it.
+        pub(crate) fn record_assembly_rebuilt_at(
+            &mut self,
+            finished_at: Instant,
+            build_kind: &'static str,
+        ) {
             if let Self::CSharp(project) = self {
-                project.record_assembly_rebuilt_at(at, kind);
+                project.record_assembly_rebuilt_at(finished_at, build_kind);
             }
         }
 
-        /// Collapse the managed loader's debounce after the in-process
+        /// Collapses the managed loader's debounce after the in-process
         /// compiler wrote a settled assembly.
         pub(crate) fn notify_assembly_replaced(&mut self) {
             if let Self::CSharp(project) = self {
@@ -337,24 +353,24 @@ mod loaded {
             }
         }
 
-        /// Start a managed reload: the assembly builds on its own thread while
-        /// the frame loop keeps running, and the finish lands when the build
-        /// reports. See [`ManagedReloadStart`].
+        /// Starts a managed reload: the assembly builds on its own thread
+        /// while the frame loop keeps running, and the result is collected
+        /// when the build reports. See [`ManagedReloadStart`].
         pub(crate) fn start_managed_reload(
             &mut self,
             workspace_root: &Path,
             config: &ProjectModuleConfig,
-            cancel: Option<(Arc<AtomicU64>, u64)>,
+            cancel_flag: Option<(Arc<AtomicU64>, u64)>,
         ) -> ManagedReloadStart {
             match self {
                 Self::CSharp(project) => {
-                    start_csharp_assembly_build(project, workspace_root, config, cancel)
+                    start_csharp_assembly_build(project, workspace_root, config, cancel_flag)
                 }
                 Self::Native { .. } => ManagedReloadStart::NotManaged,
             }
         }
 
-        /// Try to collect a finished managed assembly build without waiting.
+        /// Tries to collect a finished managed assembly build without waiting.
         ///
         /// A native project never has one.
         pub(crate) fn collect_managed_build(&mut self) -> BuildCollection {
@@ -364,20 +380,20 @@ mod loaded {
             }
         }
 
-        /// Build the managed assembly on the frame thread and report the
-        /// outcome.
+        /// Builds the managed assembly on the frame thread and returns the
+        /// report.
         ///
         /// The synchronous twin of the build worker: the same compiler/MSBuild
-        /// selection, wrapping the result as a [`BuildReport`] so the caller
-        /// consumes it through the one outcome handler the worker's reports
-        /// also go through. Used when the worker could not start, or when one
-        /// stopped without reporting. `None` for a native project, which has
-        /// no assembly to build.
+        /// selection, wrapped as a [`BuildReport`] so the caller consumes it
+        /// through the one outcome handler the worker's reports also go
+        /// through. Used when the worker could not start, or when one stopped
+        /// without reporting. `None` for a native project, which has no
+        /// assembly to build.
         pub(crate) fn build_now(
             &mut self,
             workspace_root: &Path,
             config: &ProjectModuleConfig,
-            cancel: Option<(Arc<AtomicU64>, u64)>,
+            cancel_flag: Option<(Arc<AtomicU64>, u64)>,
         ) -> Option<BuildReport> {
             match self {
                 Self::CSharp(project) => Some(BuildReport {
@@ -385,7 +401,7 @@ mod loaded {
                         project.compiler_handle(),
                         workspace_root,
                         config,
-                        cancel,
+                        cancel_flag,
                     ),
                     finished_at: Instant::now(),
                 }),
@@ -406,20 +422,23 @@ mod loaded {
     // Free Functions
     // =============================================================================
 
-    /// Poll the managed loader and report whether it swapped the assembly.
+    /// Polls the managed loader and returns whether it swapped the assembly.
     ///
-    /// Exists so the poll's error is reported rather than dropped. `poll_reload`
-    /// logs the statuses it understands, but a `CSharpError` returned through
-    /// `?` - re-registration refusing an arriving assembly's systems is the one
-    /// that matters - reaches the caller as a plain `Err` that both call sites
-    /// would otherwise discard. A project left with no systems and nothing on
-    /// the console is the worst outcome available here, so it is logged loudly.
-    fn managed_poll_replaced_assembly(runtime: &mut CSharpProject, engine: &mut Engine) -> bool {
-        match runtime.poll_reload(engine) {
+    /// The function exists so a poll error is reported instead of dropped.
+    /// `poll_reload` logs the statuses it understands, but a `CSharpError`
+    /// returned through `?` reaches the caller as a plain `Err`, which its
+    /// callers would otherwise discard. The one that matters is
+    /// re-registration refusing the arriving assembly's systems: a project
+    /// left with no systems and nothing on the console is the worst outcome
+    /// available here, so the error is logged loudly.
+    fn poll_managed_assembly_swap(project: &mut CSharpProject, engine: &mut Engine) -> bool {
+        match project.poll_reload(engine) {
             Ok(status) if status == POLL_RELOADED => {
-                // The swap is the end of the reload: report the whole span,
-                // from the save's timestamp to this instant, in phases.
-                if let Some(summary) = runtime.finish_reload_timing() {
+                // The swap ends the reload, so report the whole span in
+                // phases: from the save's timestamp when the watcher could
+                // time it, otherwise from the reload signal, up to this
+                // instant.
+                if let Some(summary) = project.finish_reload_timing() {
                     info!(
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                         total_ms = format!("{:.1}", summary.total_ms).as_str(),
@@ -437,7 +456,7 @@ mod loaded {
                 if status == POLL_REJECTED {
                     // The loader refused the arriving assembly, so this
                     // attempt ends without a swap.
-                    runtime.abandon_reload_timing();
+                    project.abandon_reload_timing();
                 }
                 false
             }
@@ -452,21 +471,21 @@ mod loaded {
         }
     }
 
-    /// Produce one managed build outcome with the compiler/MSBuild selection
-    /// shared by the build worker and the synchronous fallback.
+    /// Produces one managed build outcome, using the compiler choice the build
+    /// worker and the synchronous fallback share.
     ///
-    /// The in-process compiler replays the compiler command line the project's
-    /// last full build captured, which takes tens of milliseconds where a
+    /// The in-process compiler replays the compiler command line captured by
+    /// the project's last full build. That takes tens of milliseconds, where a
     /// `dotnet build` of the same edit takes seconds. It cannot answer every
-    /// reload - a source file added or removed changes the command line itself -
-    /// and it may not exist at all, so both cases fall through to the full
-    /// `dotnet build`. That build also refreshes the capture, which is what
-    /// makes the reload after it fast again.
+    /// reload - adding or removing a source file changes the command line
+    /// itself - and it may not be loaded at all, so both cases fall back to
+    /// the full `dotnet build`. That build also refreshes the captured command
+    /// line, which is what makes the reload after it fast again.
     fn build_csharp_outcome(
         compiler: Option<Arc<FastCompiler>>,
         workspace_root: &Path,
         config: &ProjectModuleConfig,
-        cancel: Option<(Arc<AtomicU64>, u64)>,
+        cancel_flag: Option<(Arc<AtomicU64>, u64)>,
     ) -> BuildOutcome {
         match compiler {
             Some(compiler) => match compiler.compile(workspace_root, &config.watch_directory) {
@@ -480,7 +499,7 @@ mod loaded {
                         reason = reason.as_str(),
                         "falling back to a full C# build"
                     );
-                    BuildOutcome::Full(run_full_project_build(workspace_root, config, cancel))
+                    BuildOutcome::Full(run_full_project_build(workspace_root, config, cancel_flag))
                 }
             },
             None => {
@@ -489,15 +508,15 @@ mod loaded {
                     reason = "no in-process compiler is loaded",
                     "falling back to a full C# build"
                 );
-                BuildOutcome::Full(run_full_project_build(workspace_root, config, cancel))
+                BuildOutcome::Full(run_full_project_build(workspace_root, config, cancel_flag))
             }
         }
     }
 
-    /// Start a C# assembly build on its own worker thread.
+    /// Starts a C# assembly build on its own worker thread.
     ///
     /// The worker owns everything the build needs and touches nothing that
-    /// belongs to the frame boundary: it runs the in-process compiler, or the
+    /// belongs to the frame boundary. It runs the in-process compiler, or the
     /// full `dotnet build` fallback when the captured command line cannot
     /// answer the reload, and reports what it produced. Compiling the project
     /// costs hundreds of milliseconds, so it happens here: the frame keeps
@@ -506,7 +525,7 @@ mod loaded {
         project: &mut CSharpProject,
         workspace_root: &Path,
         config: &ProjectModuleConfig,
-        cancel: Option<(Arc<AtomicU64>, u64)>,
+        cancel_flag: Option<(Arc<AtomicU64>, u64)>,
     ) -> ManagedReloadStart {
         let compiler = project.compiler_handle();
         let workspace = workspace_root.to_path_buf();
@@ -515,7 +534,8 @@ mod loaded {
         let thread = thread::Builder::new()
             .name("pill-csharp-build".to_string())
             .spawn(move || {
-                let outcome = build_csharp_outcome(compiler, &workspace, &build_config, cancel);
+                let outcome =
+                    build_csharp_outcome(compiler, &workspace, &build_config, cancel_flag);
                 // A receiver that has gone away means the host is shutting
                 // down; the report's job is then nobody's.
                 let _ = sender.send(BuildReport {
@@ -536,7 +556,7 @@ mod loaded {
         }
     }
 
-    /// Run the full `dotnet build` for a reload the captured command line
+    /// Runs the full `dotnet build` for a reload the captured command line
     /// could not answer, reporting its error as text for the reload log.
     ///
     /// # Errors
@@ -547,12 +567,12 @@ mod loaded {
     fn run_full_project_build(
         workspace_root: &Path,
         config: &ProjectModuleConfig,
-        cancel: Option<(Arc<AtomicU64>, u64)>,
+        cancel_flag: Option<(Arc<AtomicU64>, u64)>,
     ) -> Result<(), String> {
-        let cancel_flag = cancel
+        let borrowed_cancel_flag = cancel_flag
             .as_ref()
             .map(|(generation, baseline)| (generation.as_ref(), *baseline));
-        build_project_module(workspace_root, config, cancel_flag)
+        build_project_module(workspace_root, config, borrowed_cancel_flag)
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
@@ -580,9 +600,9 @@ mod loaded {
         config: &ProjectModuleConfig,
         cancel_flag: Option<(&AtomicU64, u64)>,
     ) -> bool {
-        // Step 1: Build, load and commit through the shared transaction. Those
-        // three steps are the extension path's too, and their order is
-        // load-bearing: nothing touches engine state before the compile
+        // Step 1: Build, load and commit through the shared transaction. The
+        // extension path runs the same three steps in the same order, and the
+        // order matters: nothing touches engine state before the compile
         // succeeds. A refused step returns `None`, which for the project means
         // nothing was replaced.
         let transaction = crate::reload::ReloadTransaction {

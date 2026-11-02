@@ -1,27 +1,30 @@
-//! Build, link, and hot-reload analytics: an in-process collector that times
-//! every phase of the compile → stage → load → init → migrate pipeline and
-//! prints a structured report to the host console.
+//! Build, link and hot-reload analytics. An in-process collector times each
+//! phase of the pipeline (compile, stage, load, init, migrate) and prints a
+//! report to the host console.
 //!
 //! # Responsibilities
 //!
-//! - Time each module's build command, staging copy, DLL load, registration,
+//! - Time each module's build command, staging copy, DLL load, registration
 //!   and schema migration.
-//! - Measure the host process and the cargo child process memory (working set
-//!   and peak high-water mark).
-//! - Inspect each loaded DLL: artifact size, image size and imported DLLs.
-//! - Read each module's direct cargo dependencies from the `.fingerprint` JSON.
-//! - Parse cargo `--timings` HTML for per-crate compile+link wall time.
-//! - Print a full startup report and a compact line per hot reload.
+//! - Measure the memory used by the host process and by the cargo child
+//!   process, both current and peak.
+//! - Inspect each loaded DLL: its file size, its image size and the DLLs it
+//!   imports.
+//! - Read each module's direct cargo dependencies from the `.fingerprint`
+//!   JSON.
+//! - Read cargo's `--timings` HTML for the compile and link time of each
+//!   crate.
+//! - Print one full report at startup and one short line per hot reload.
 //!
 //! # Design
 //!
-//! A process-wide collector is used because the build pipeline spans several
-//! modules (`build_runner`, `native_library`, `reload`, `runtime`) and no
-//! single one owns the whole transaction. Records are keyed by module name,
-//! which is unique across the project and extensions. The collector is
-//! deliberately best-effort: a missing DLL, a PE image that cannot be parsed,
-//! or an absent cargo-timings report degrades the report to `-` instead of
-//! failing the build.
+//! The collector is process-wide because the build pipeline is spread over
+//! several modules (`build_runner`, `native_library`, `reload`, `runtime`)
+//! and no single one sees the whole transaction. Entries are keyed by module
+//! name, which is unique across the project and its extensions. Everything
+//! here is best-effort: a missing DLL, an image that cannot be parsed or an
+//! absent cargo-timings report shows as `-` in the report and never fails
+//! the build.
 
 // Standard library
 use std::collections::HashMap;
@@ -41,9 +44,9 @@ use serde_json::Value;
 
 /// How many distinct fallback reasons the tally remembers.
 ///
-/// A cap rather than a growing list: the tally's counters still total every
-/// refusal and failure, so a long session loses only the listing of a ninth
-/// distinct cause, never the count.
+/// The list is capped instead of growing without bound. The tally's counters
+/// still count every refusal and failure, so a long session loses only the
+/// listing of one more distinct cause, never the totals.
 #[cfg(feature = "hot_patch")]
 const MAX_TRACKED_FALLBACK_REASONS: usize = 8;
 
@@ -56,19 +59,19 @@ const MAX_FALLBACK_DETAIL_CHARS: usize = 160;
 // Build Tree Locations
 // =============================================================================
 
-/// Subdirectory, relative to the workspace root, where cargo writes its
-/// `--timings` HTML report for every host-driven build.
+/// The folder, relative to the workspace root, where cargo writes its
+/// `--timings` HTML report.
 ///
-/// Derived from the private module build tree rather than named, because that
-/// is where the reports land: every build the host spawns runs with
-/// `CARGO_TARGET_DIR` pointing at
+/// The path comes from the private module build tree because that is where
+/// the reports land. Every build the host starts sets `CARGO_TARGET_DIR` to
 /// [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`], and cargo writes the
-/// report under whichever target directory it was given. A named
-/// `target/cargo-timings` would find only the reports of the developer's own
-/// `cargo build` runs.
+/// report under whatever target directory it is given. A fixed
+/// `target/cargo-timings` would only ever hold the reports from the
+/// developer's own `cargo build` runs.
 ///
-/// Cargo does NOT insert the target triple here, so this stays the same under
-/// the dioxus CLI's `--target` builds; only the artifact directories move.
+/// Cargo does not add the target triple here, so the path stays the same for
+/// `--target` builds such as the dioxus CLI's; only the artifact folders
+/// move.
 fn cargo_timings_directory() -> String {
     format!(
         "{}/cargo-timings",
@@ -76,13 +79,13 @@ fn cargo_timings_directory() -> String {
     )
 }
 
-/// Directory, relative to the workspace root, where cargo writes each
+/// The folder, relative to the workspace root, where cargo writes each
 /// compiled crate's fingerprint JSON.
 ///
-/// Derived from the same private build tree as [`cargo_timings_directory`]:
-/// every build the host spawns runs with `CARGO_TARGET_DIR` pointing at
-/// [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`], so the fingerprints of
-/// the builds this report describes are the ones under it.
+/// It sits in the same private build tree as [`cargo_timings_directory`].
+/// Every build the host starts sets `CARGO_TARGET_DIR` to
+/// [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`], so the fingerprints
+/// under it belong to the builds this report describes.
 fn cargo_fingerprint_directory() -> String {
     format!(
         "{}/.fingerprint",
@@ -90,7 +93,8 @@ fn cargo_fingerprint_directory() -> String {
     )
 }
 
-/// Which pipeline a module belongs to; used for the report's `kind` column.
+/// Which pipeline a module belongs to. It is shown in the report's `kind`
+/// column.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModuleKind {
     /// An extension loaded from its private hot-load copy.
@@ -121,7 +125,7 @@ pub(crate) struct PeImport {
     pub symbols: Vec<String>,
 }
 
-/// The interesting parts of a Windows PE executable header.
+/// The parts of a Windows PE header that this report uses.
 pub(crate) struct PeInspection {
     /// DLL names referenced by the import directory.
     pub import_dlls: Vec<String>,
@@ -133,88 +137,122 @@ pub(crate) struct PeInspection {
     pub image_size: u64,
 }
 
-/// Parse a Windows PE file's import and export directories and image size.
+/// Read a Windows PE file's import and export tables and its image size.
 ///
-/// Returns `None` for anything that is not a PE32/PE32+ image (including
-/// `.so` and `.dylib` on other platforms). Pure byte parsing: no OS calls, so
-/// it compiles and runs everywhere even though it only understands PE files.
-/// The parse degrades rather than fails: a truncated or malformed table
-/// yields what was readable up to that point.
+/// Returns `None` for anything that is not a PE32 or PE32+ image, which
+/// includes every `.so` and `.dylib`. It only reads the file's bytes and uses
+/// no platform-specific API, so it builds and runs everywhere even though PE
+/// is a Windows format. Inside a valid image a damaged table is read only as
+/// far as it parses, so a partial answer is returned instead of a failure.
 pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
     // Step 1: The DOS stub and the PE signature, which is all that separates a
     // PE image from any other file.
-    let data = std::fs::read(path).ok()?;
-    if data.len() < 0x40 || &data[0..2] != b"MZ" {
+    let image_bytes = std::fs::read(path).ok()?;
+    if image_bytes.len() < 0x40 || &image_bytes[0..2] != b"MZ" {
         return None;
     }
-    let e_lfanew = u32::from_le_bytes(data[0x3c..0x40].try_into().ok()?) as usize;
-    if e_lfanew + 24 > data.len() || &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
+    let e_lfanew = u32::from_le_bytes(image_bytes[0x3c..0x40].try_into().ok()?) as usize;
+    if e_lfanew + 24 > image_bytes.len() || &image_bytes[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
         return None;
     }
-    let coff = e_lfanew + 4;
-    let number_of_sections = u16::from_le_bytes(data[coff + 2..coff + 4].try_into().ok()?) as usize;
-    let size_of_optional = u16::from_le_bytes(data[coff + 16..coff + 18].try_into().ok()?) as usize;
-    let opt = coff + 20;
+    let coff_header_offset = e_lfanew + 4;
+    let number_of_sections = u16::from_le_bytes(
+        image_bytes[coff_header_offset + 2..coff_header_offset + 4]
+            .try_into()
+            .ok()?,
+    ) as usize;
+    let size_of_optional_header = u16::from_le_bytes(
+        image_bytes[coff_header_offset + 16..coff_header_offset + 18]
+            .try_into()
+            .ok()?,
+    ) as usize;
+    let optional_header_offset = coff_header_offset + 20;
     // 60 bytes covers every fixed field read below; the deepest is the
-    // `SizeOfImage` at offset 56. The file's own `SizeOfOptionalHeader` must
-    // not be able to vouch for a header shorter than the reads that follow.
-    if size_of_optional < 60 || opt + size_of_optional > data.len() {
+    // `SizeOfImage` at offset 56. A header that declares fewer bytes than that
+    // is refused before those fields are read, so a short header can never
+    // vouch for reads that run past it.
+    if size_of_optional_header < 60
+        || optional_header_offset + size_of_optional_header > image_bytes.len()
+    {
         return None;
     }
-    let magic = u16::from_le_bytes(data[opt..opt + 2].try_into().ok()?);
+    let magic = u16::from_le_bytes(
+        image_bytes[optional_header_offset..optional_header_offset + 2]
+            .try_into()
+            .ok()?,
+    );
     // The data-directory table starts at a different offset in PE32 vs PE32+;
     // `SizeOfImage` sits at offset 56 in both.
     let data_directory_offset = match magic {
-        0x10b => opt + 96,
-        0x20b => opt + 112,
+        0x10b => optional_header_offset + 96,
+        0x20b => optional_header_offset + 112,
         _ => return None,
     };
-    let image_size = u32::from_le_bytes(data[opt + 56..opt + 60].try_into().ok()?) as u64;
-    if data_directory_offset + 16 > data.len() {
+    let image_size = u32::from_le_bytes(
+        image_bytes[optional_header_offset + 56..optional_header_offset + 60]
+            .try_into()
+            .ok()?,
+    ) as u64;
+    if data_directory_offset + 16 > image_bytes.len() {
         return None;
     }
     let import_rva = u32::from_le_bytes(
-        data[data_directory_offset + 8..data_directory_offset + 12]
+        image_bytes[data_directory_offset + 8..data_directory_offset + 12]
             .try_into()
             .ok()?,
     );
     let import_size = u32::from_le_bytes(
-        data[data_directory_offset + 12..data_directory_offset + 16]
+        image_bytes[data_directory_offset + 12..data_directory_offset + 16]
             .try_into()
             .ok()?,
     );
     let export_rva = u32::from_le_bytes(
-        data[data_directory_offset..data_directory_offset + 4]
+        image_bytes[data_directory_offset..data_directory_offset + 4]
             .try_into()
             .ok()?,
     );
     let export_size = u32::from_le_bytes(
-        data[data_directory_offset + 4..data_directory_offset + 8]
+        image_bytes[data_directory_offset + 4..data_directory_offset + 8]
             .try_into()
             .ok()?,
     );
 
     // Step 2: Map an RVA to a file offset through the section table.
-    let sections = coff + 20 + size_of_optional;
+    let section_table_offset = coff_header_offset + 20 + size_of_optional_header;
     let rva_to_offset = |rva: u32| -> Option<usize> {
         if rva == 0 {
             return None;
         }
         for index in 0..number_of_sections {
-            let section = sections + index * 40;
-            if section + 40 > data.len() {
+            let section_entry_offset = section_table_offset + index * 40;
+            if section_entry_offset + 40 > image_bytes.len() {
                 break;
             }
-            let virtual_size = u32::from_le_bytes(data[section + 8..section + 12].try_into().ok()?);
-            let virtual_address =
-                u32::from_le_bytes(data[section + 12..section + 16].try_into().ok()?);
-            let raw_size = u32::from_le_bytes(data[section + 16..section + 20].try_into().ok()?);
-            let raw_pointer = u32::from_le_bytes(data[section + 20..section + 24].try_into().ok()?);
-            let span = virtual_size.max(raw_size);
-            if rva >= virtual_address && rva < virtual_address.saturating_add(span) {
-                let offset = raw_pointer as usize + (rva - virtual_address) as usize;
-                if offset < data.len() {
-                    return Some(offset);
+            let virtual_size = u32::from_le_bytes(
+                image_bytes[section_entry_offset + 8..section_entry_offset + 12]
+                    .try_into()
+                    .ok()?,
+            );
+            let virtual_address = u32::from_le_bytes(
+                image_bytes[section_entry_offset + 12..section_entry_offset + 16]
+                    .try_into()
+                    .ok()?,
+            );
+            let raw_size = u32::from_le_bytes(
+                image_bytes[section_entry_offset + 16..section_entry_offset + 20]
+                    .try_into()
+                    .ok()?,
+            );
+            let raw_pointer = u32::from_le_bytes(
+                image_bytes[section_entry_offset + 20..section_entry_offset + 24]
+                    .try_into()
+                    .ok()?,
+            );
+            let section_span = virtual_size.max(raw_size);
+            if rva >= virtual_address && rva < virtual_address.saturating_add(section_span) {
+                let file_offset = raw_pointer as usize + (rva - virtual_address) as usize;
+                if file_offset < image_bytes.len() {
+                    return Some(file_offset);
                 }
             }
         }
@@ -226,7 +264,7 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
     let mut import_dlls = Vec::new();
     let mut imports = Vec::new();
     if import_rva != 0 && import_size != 0 {
-        if let Some(directory) = rva_to_offset(import_rva) {
+        if let Some(import_directory_offset) = rva_to_offset(import_rva) {
             // The named entries of one lookup table (the original thunk table
             // when present, the address table otherwise).
             let symbol_names = |lookup_rva: u32| -> Vec<String> {
@@ -236,36 +274,36 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
                 };
                 let entry_size = if magic == 0x20b { 8 } else { 4 };
                 while names.len() < 4096 {
-                    let Some(bytes) = data.get(offset..offset + entry_size) else {
+                    let Some(bytes) = image_bytes.get(offset..offset + entry_size) else {
                         break;
                     };
-                    let entry = if entry_size == 8 {
+                    let thunk_value = if entry_size == 8 {
                         u64::from_le_bytes(bytes.try_into().ok().unwrap_or_default())
                     } else {
                         u32::from_le_bytes(bytes.try_into().ok().unwrap_or_default()) as u64
                     };
-                    if entry == 0 {
+                    if thunk_value == 0 {
                         break; // A null thunk terminates the table.
                     }
                     offset += entry_size;
                     let ordinal = 1u64 << (entry_size * 8 - 1);
-                    if entry & ordinal != 0 {
+                    if thunk_value & ordinal != 0 {
                         continue; // An ordinal import; nothing to name.
                     }
-                    let Some(name_offset) = rva_to_offset(entry as u32) else {
+                    let Some(name_offset) = rva_to_offset(thunk_value as u32) else {
                         break;
                     };
                     // `IMAGE_IMPORT_BY_NAME`: a u16 hint, then the name.
                     let name_start = name_offset + 2;
-                    if name_start >= data.len() {
+                    if name_start >= image_bytes.len() {
                         break;
                     }
-                    let end = data[name_start..]
+                    let end = image_bytes[name_start..]
                         .iter()
                         .position(|&byte| byte == 0)
                         .map(|position| name_start + position)
                         .unwrap_or(name_start);
-                    if let Ok(name) = std::str::from_utf8(&data[name_start..end]) {
+                    if let Ok(name) = std::str::from_utf8(&image_bytes[name_start..end]) {
                         names.push(name.to_string());
                     }
                 }
@@ -273,33 +311,38 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
             };
             let mut index = 0usize;
             while index < 4096 {
-                let descriptor = directory + index * 20;
-                if descriptor + 20 > data.len() {
+                let descriptor = import_directory_offset + index * 20;
+                if descriptor + 20 > image_bytes.len() {
                     break;
                 }
                 let original_first_thunk =
-                    u32::from_le_bytes(data[descriptor..descriptor + 4].try_into().ok()?);
-                let name_rva =
-                    u32::from_le_bytes(data[descriptor + 12..descriptor + 16].try_into().ok()?);
+                    u32::from_le_bytes(image_bytes[descriptor..descriptor + 4].try_into().ok()?);
+                let name_rva = u32::from_le_bytes(
+                    image_bytes[descriptor + 12..descriptor + 16]
+                        .try_into()
+                        .ok()?,
+                );
                 if name_rva == 0 {
                     break; // A null descriptor terminates the import table.
                 }
                 if let Some(offset) = rva_to_offset(name_rva) {
-                    let end = data[offset..]
+                    let end = image_bytes[offset..]
                         .iter()
                         .position(|&byte| byte == 0)
                         .map(|position| offset + position)
                         .unwrap_or(offset);
-                    if let Ok(name) = std::str::from_utf8(&data[offset..end]) {
+                    if let Ok(name) = std::str::from_utf8(&image_bytes[offset..end]) {
                         let first_thunk = u32::from_le_bytes(
-                            data[descriptor + 16..descriptor + 20].try_into().ok()?,
+                            image_bytes[descriptor + 16..descriptor + 20]
+                                .try_into()
+                                .ok()?,
                         );
-                        let lookup = if original_first_thunk != 0 {
+                        let lookup_table_rva = if original_first_thunk != 0 {
                             original_first_thunk
                         } else {
                             first_thunk
                         };
-                        let symbols = symbol_names(lookup);
+                        let symbols = symbol_names(lookup_table_rva);
                         import_dlls.push(name.to_string());
                         imports.push(PeImport {
                             dll: name.to_string(),
@@ -316,15 +359,15 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
     // name.
     let mut exports = Vec::new();
     if export_rva != 0 && export_size != 0 {
-        if let Some(directory) = rva_to_offset(export_rva) {
+        if let Some(export_directory_offset) = rva_to_offset(export_rva) {
             let read_u32 = |offset: usize| -> Option<u32> {
-                let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+                let bytes: [u8; 4] = image_bytes.get(offset..offset + 4)?.try_into().ok()?;
                 Some(u32::from_le_bytes(bytes))
             };
-            let number_of_names = read_u32(directory + 24).unwrap_or(0) as usize;
+            let number_of_names = read_u32(export_directory_offset + 24).unwrap_or(0) as usize;
             // `AddressOfNames` (+32) is the name-pointer table; `+28` is the
             // function-RVA table, which happens to parse as garbage names.
-            let names_rva = read_u32(directory + 32).unwrap_or(0);
+            let names_rva = read_u32(export_directory_offset + 32).unwrap_or(0);
             if let Some(names_offset) = rva_to_offset(names_rva) {
                 for index in 0..number_of_names.min(16384) {
                     let Some(name_rva) = read_u32(names_offset + index * 4) else {
@@ -333,12 +376,12 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
                     let Some(name_offset) = rva_to_offset(name_rva) else {
                         continue;
                     };
-                    let end = data[name_offset..]
+                    let end = image_bytes[name_offset..]
                         .iter()
                         .position(|&byte| byte == 0)
                         .map(|position| name_offset + position)
                         .unwrap_or(name_offset);
-                    if let Ok(name) = std::str::from_utf8(&data[name_offset..end]) {
+                    if let Ok(name) = std::str::from_utf8(&image_bytes[name_offset..end]) {
                         exports.push(name.to_string());
                     }
                 }
@@ -360,24 +403,24 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
 
 /// Current and peak working set (resident set) of a process, in bytes.
 ///
-/// `pid` of `None` queries the host process itself. Returns `None` when the
-/// OS exposes no usable counter (for example a missing `/proc` on Linux).
+/// A `pid` of `None` asks about the host process itself. Returns `None` when
+/// the OS exposes no usable counter, for example when Linux has no `/proc`.
 pub(crate) fn process_memory(pid: Option<u32>) -> Option<(u64, u64)> {
     #[cfg(target_os = "windows")]
     {
-        // Windows process-memory counters without any static dependency. The
-        // two functions needed are loaded at runtime from the OS-provided
-        // `psapi.dll` and `kernel32.dll` through `libloading`, which the host
-        // already links. This matters: adding a cargo crate that shares
-        // features with `colored` (via `windows-sys`) changes the feature
-        // unification of shared crates between the host build and the
-        // extension builds, which silently splits the shared
-        // `pill_core.dll` into two incompatible variants.
+        // Windows process-memory counters without a static dependency. The
+        // three functions this needs are loaded at runtime from the OS's own
+        // `kernel32.dll` and `psapi.dll` through `libloading`, which the host
+        // already links. That matters: a cargo crate that shares features with
+        // `colored` (through `windows-sys`) would change how shared crates are
+        // feature-unified between the host build and the extension builds, and
+        // that silently splits the shared `pill_core.dll` into two incompatible
+        // variants.
         use libloading::{Library, Symbol};
 
-        // The leading fields of `PROCESS_MEMORY_COUNTERS`. `GetProcessMemoryInfo`
-        // rejects a `cb` smaller than the documented struct, so the full
-        // structure is declared (the trailing fields are never read).
+        // A local copy of `PROCESS_MEMORY_COUNTERS`. `GetProcessMemoryInfo`
+        // rejects a `cb` smaller than the documented struct, so every field is
+        // declared, even the trailing ones this code never reads.
         #[repr(C)]
         struct ProcessMemoryCounters {
             cb: u32,
@@ -413,11 +456,11 @@ pub(crate) fn process_memory(pid: Option<u32>) -> Option<(u64, u64)> {
             // closing; `OpenProcess` returns a real handle closed below.
             const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
             const PROCESS_VM_READ: u32 = 0x0010;
-            let handle = match pid {
+            let process_handle = match pid {
                 Some(pid) => open_process(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid),
                 None => -1isize,
             };
-            if handle == 0 {
+            if process_handle == 0 {
                 return None;
             }
 
@@ -434,18 +477,19 @@ pub(crate) fn process_memory(pid: Option<u32>) -> Option<(u64, u64)> {
                 peak_pagefile_usage: 0,
                 private_usage: 0,
             };
-            // SAFETY: `counters` is a valid out-parameter sized to the leading
-            // fields and `handle` names the target process.
-            let ok = get_process_memory_info(
-                handle,
+            // SAFETY: `counters` is a valid out-parameter with `cb` set to its
+            // own size, and `process_handle` names the target process.
+            let memory_info_succeeded = get_process_memory_info(
+                process_handle,
                 &mut counters,
                 std::mem::size_of::<ProcessMemoryCounters>() as u32,
             );
             if pid.is_some() {
-                // SAFETY: `handle` came from `OpenProcess` and is closed exactly once.
-                close_handle(handle);
+                // SAFETY: `process_handle` came from `OpenProcess` and is closed
+                // exactly once.
+                close_handle(process_handle);
             }
-            if ok == 0 {
+            if memory_info_succeeded == 0 {
                 return None;
             }
             Some((
@@ -496,14 +540,15 @@ pub(crate) struct CargoTiming {
     pub total_seconds: f64,
 }
 
-/// Parse the newest `.html` report under the build tree's `cargo-timings`
-/// directory.
+/// Read the newest `.html` report under the build tree's `cargo-timings`
+/// folder.
 ///
-/// Cargo embeds a JSON `UNIT_DATA` array at the end of the HTML: one entry per
-/// unit with `name`, `mode`, `start`, `duration` (seconds) and `sections`.
-/// Only crates that actually compiled or linked in that invocation carry a
-/// non-zero duration, which is exactly what a rebuild report wants. Returns
-/// `None` when no report exists yet or its embedded JSON cannot be parsed.
+/// Cargo embeds a JSON `UNIT_DATA` array at the end of the HTML, with one
+/// entry per unit carrying `name`, `mode`, `start`, `duration` (in seconds)
+/// and `sections`. Only crates that actually compiled or linked in that run
+/// have a non-zero duration, which is exactly what a report about a rebuild
+/// needs. Returns `None` when there is no report yet, or when the embedded
+/// JSON cannot be parsed.
 pub(crate) fn parse_latest_cargo_timings(workspace_root: &Path) -> Option<CargoTiming> {
     let timings_directory = workspace_root.join(cargo_timings_directory());
     let mut reports: Vec<PathBuf> = std::fs::read_dir(&timings_directory)
@@ -520,12 +565,12 @@ pub(crate) fn parse_latest_cargo_timings(workspace_root: &Path) -> Option<CargoT
             .and_then(|metadata| metadata.modified())
             .unwrap_or(UNIX_EPOCH)
     });
-    let newest = reports.last()?;
-    let content = std::fs::read_to_string(newest).ok()?;
+    let newest_report = reports.last()?;
+    let content = std::fs::read_to_string(newest_report).ok()?;
 
-    // `DURATION = <seconds>;` is the total wall time of the cargo invocation.
-    // The value ends at the first `;`; the text after it (the `UNIT_DATA`
-    // script) must not be included in the parse.
+    // `DURATION = <seconds>;` holds the total wall time of that cargo run. The
+    // value ends at the first `;`, and the text after it (the `UNIT_DATA`
+    // script) must not be part of the parse.
     let total_seconds = content
         .find("DURATION = ")
         .map(|index| &content[index + "DURATION = ".len()..])
@@ -533,12 +578,12 @@ pub(crate) fn parse_latest_cargo_timings(workspace_root: &Path) -> Option<CargoT
         .and_then(|value| value.trim().parse::<f64>().ok())
         .unwrap_or(0.0);
 
-    // The `UNIT_DATA` array closes with `];`; the first `];` after the opening
-    // bracket is the terminator because no interior value in the pretty-printed
-    // JSON ever ends with a `]` immediately followed by `;`. The slice keeps
-    // both brackets so serde sees a JSON array, not the bare contents.
-    let open = content.find("const UNIT_DATA = [")?;
-    let array_start = open + "const UNIT_DATA = [".len() - 1;
+    // The `UNIT_DATA` array closes with `];`, and the first `];` after the
+    // opening bracket is that terminator: in this pretty-printed JSON no value
+    // ends with a `]` directly followed by a `;`. The slice keeps both
+    // brackets so serde receives a JSON array rather than its bare contents.
+    let unit_data_open_index = content.find("const UNIT_DATA = [")?;
+    let array_start = unit_data_open_index + "const UNIT_DATA = [".len() - 1;
     let array_end = content[array_start..].find("];")? + array_start;
     let units: Vec<Value> = serde_json::from_str(&content[array_start..=array_end]).ok()?;
 
@@ -587,19 +632,19 @@ pub(crate) fn read_cargo_deps(workspace_root: &Path, crate_name: &str) -> Vec<St
         .collect();
     directories.sort();
 
-    let mut deps = Vec::new();
+    let mut dependency_names = Vec::new();
     for directory in directories {
-        let lib_json = directory.join(format!("lib-{crate_name}.json"));
-        if !lib_json.exists() {
+        let lib_json_path = directory.join(format!("lib-{crate_name}.json"));
+        if !lib_json_path.exists() {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&lib_json) else {
+        let Ok(content) = std::fs::read_to_string(&lib_json_path) else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        let Ok(fingerprint_value) = serde_json::from_str::<Value>(&content) else {
             continue;
         };
-        if let Some(dependency_list) = value.get("deps").and_then(Value::as_array) {
+        if let Some(dependency_list) = fingerprint_value.get("deps").and_then(Value::as_array) {
             for dependency in dependency_list {
                 // Cargo's fingerprint `deps` is an array of arrays, each one
                 // `[fingerprint, name, is_public, local_fingerprint]`.
@@ -608,15 +653,18 @@ pub(crate) fn read_cargo_deps(workspace_root: &Path, crate_name: &str) -> Vec<St
                     .and_then(|entry| entry.get(1))
                     .and_then(Value::as_str);
                 if let Some(name) = name {
-                    if !deps.iter().any(|existing: &String| existing == name) {
-                        deps.push(name.to_string());
+                    if !dependency_names
+                        .iter()
+                        .any(|existing_name: &String| existing_name == name)
+                    {
+                        dependency_names.push(name.to_string());
                     }
                 }
             }
         }
         break;
     }
-    deps
+    dependency_names
 }
 
 // =============================================================================
@@ -635,7 +683,7 @@ struct ModuleAnalytics {
     load_ms: f64,
     init_ms: f64,
     migrate_ms: f64,
-    /// The staged DLL's size on disk.
+    /// The DLL's size on disk, as the build left it.
     artifact_bytes: u64,
     /// `SizeOfImage` from the DLL's PE header, in bytes.
     image_size: u64,
@@ -671,9 +719,9 @@ impl ModuleAnalytics {
 
 /// How a generation of code reached the running process.
 ///
-/// Both kinds print the same `[analytics] reload ...` line so one parser reads
-/// both; the `kind=` field is what separates them. A patch is not a second
-/// format, it is a reload whose phases happen to be much cheaper.
+/// Both kinds print the same `[analytics] reload ...` line, so one parser
+/// reads both; the `kind=` field tells them apart. A patch is not a second
+/// format. It is a reload whose phases happen to be much cheaper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(feature = "hot_patch"), allow(dead_code))]
 pub(crate) enum EventKind {
@@ -695,13 +743,13 @@ impl EventKind {
 
 /// Which of the three mechanisms delivered a patch.
 ///
-/// `kind=patch` alone conflates two very different guarantees, which is why this
-/// is reported separately. A slot route is provable: the replacement is one
-/// atomic pointer store, and any call that reaches the dispatcher runs the new
-/// code. The prologue route is best-effort by construction - it overwrites a
-/// live function's first bytes, so it cannot reach a caller that inlined the
-/// body, and the twelve-byte write is not atomic. A benchmark that averages the
-/// two is averaging a guarantee with an approximation.
+/// `kind=patch` on its own hides a real difference in guarantees, which is why
+/// the route is reported separately. A slot route is provable: the replacement
+/// is one atomic pointer store, and any call that reaches the dispatcher runs
+/// the new code. The prologue route is best-effort: it overwrites the first
+/// bytes of a live function, so it cannot reach a caller that inlined the body,
+/// and the twelve-byte write is not atomic. Averaging the two would mix a
+/// guarantee with an approximation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(feature = "hot_patch"), allow(dead_code))]
 pub(crate) enum PatchRoute {
@@ -727,10 +775,11 @@ impl PatchRoute {
     }
 
     /// Whether a call that reaches the function is guaranteed to run the new
-    /// code, as opposed to possibly running an inlined or unreached copy.
+    /// code, rather than possibly running an inlined or unreached copy.
     ///
-    /// Only the patch path asks, so without `hot_patch` this has no caller -
-    /// the same reason [`EventKind`] carries the allow on its own declaration.
+    /// Only the hot-patch path asks, so without `hot_patch` this has no
+    /// caller. That is the same reason [`EventKind`] carries the allow on its
+    /// own declaration.
     #[cfg_attr(not(feature = "hot_patch"), allow(dead_code))]
     pub(crate) fn is_provable(self) -> bool {
         matches!(self, Self::EngineSlot | Self::ArtifactSlot)
@@ -743,8 +792,8 @@ struct ReloadEvent {
     /// Whether this was a whole-artifact reload or an in-place patch.
     kind: EventKind,
     /// Which mechanisms delivered a patch, and how many copies they reached in
-    /// total. `None` for a reload, which has no route: it replaces the whole
-    /// artifact rather than redirecting anything.
+    /// total. `None` for a reload, which has no route because it replaces the
+    /// whole artifact instead of redirecting a function.
     route: Option<(Vec<PatchRoute>, usize)>,
     /// The module's name, or the names of the patched functions.
     name: String,
@@ -758,24 +807,24 @@ struct ReloadEvent {
     /// generation.
     reload_count: u32,
     /// Crates that actually compiled or linked in this reload's cargo
-    /// invocation(s), with their wall times, sorted by time descending. This
-    /// is how a dependent crate that was relinked shows up (e.g. editing
-    /// `pill_dummy_color` also relinks `pill_spline`).
+    /// invocations, with their wall times, sorted by time descending. This is
+    /// how a dependent crate that was relinked shows up: editing
+    /// `pill_dummy_color`, for example, also relinks `pill_spline`.
     cargo_crates: Vec<(String, u64)>,
 }
 
 /// Why one change fell back to a full reload instead of patching.
 ///
-/// Identical causes collapse into one entry with a count, because the usual
-/// case is the same edit failing the same way on every save - five separate
-/// copies of one compiler error would bury the reload line they explain.
+/// Identical causes collapse into one entry with a count. The usual case is
+/// the same edit failing the same way on every save, and five copies of one
+/// compiler error would bury the reload line they explain.
 struct PatchFallback {
     /// Qualified function, or `None` when the fast path declined before it
     /// could attribute the change to one.
     function: Option<String>,
     /// `refused` when the fast path declined, `failed` when it tried and could
-    /// not finish. The distinction matters: a refusal is a precondition the
-    /// change did not meet, a failure means the patch itself did not build.
+    /// not finish. The difference matters. A refusal means the change did not
+    /// meet a precondition; a failure means the patch itself did not build.
     outcome: &'static str,
     /// Short machine-readable cause, such as `compile` or `edited-before-arming`.
     code: String,
@@ -791,10 +840,10 @@ struct Analytics {
     started: Instant,
     modules: Vec<ModuleAnalytics>,
     pending_reload_events: Vec<ReloadEvent>,
-    /// Per-crate compile+link times accumulated from the cargo `--timings`
-    /// reports of the builds in the current reload transaction. Snapshot and
-    /// cleared by [`record_reload`], so each reload line shows exactly which
-    /// crates its own build actually rebuilt.
+    /// Per-crate compile and link times collected from the cargo `--timings`
+    /// reports of the builds in the current reload transaction.
+    /// [`record_reload`] takes a copy and then clears them, so each reload
+    /// line shows exactly which crates its own build rebuilt.
     pending_cargo_crates: HashMap<String, u64>,
     host_current_bytes: u64,
     host_peak_bytes: u64,
@@ -835,9 +884,11 @@ fn analytics() -> &'static Mutex<Analytics> {
     })
 }
 
-/// Find a module's entry by name, creating it (with a default kind) on first
-/// use. The kind is corrected by [`record_module_artifact`], which always runs
-/// before any load/init/migrate record for a module.
+/// Find a module's entry by name, creating it on first use.
+///
+/// A caller that only knows a load or phase timing passes `Extension`. A build
+/// later corrects the kind through [`record_module_artifact`], which always
+/// runs before any load, init or migrate record for that module.
 fn find_or_create(collector: &mut Analytics, name: &str, kind: ModuleKind) -> usize {
     if let Some(index) = collector
         .modules
@@ -850,14 +901,14 @@ fn find_or_create(collector: &mut Analytics, name: &str, kind: ModuleKind) -> us
     collector.modules.len() - 1
 }
 
-/// Record the outcome of one module's build/stage step.
+/// Record the outcome of one module's build and stage step.
 ///
-/// Called by `build_extension` and `build_project_module` after the real build
-/// branch, with the artifact path being the DLL the host actually loads (the
-/// hot copy for extensions). Also inspects the DLL's PE image size and
-/// imports, reads the crate's direct cargo dependencies, and — when timing
-/// reports are enabled — pulls the per-crate compile+link time from the newest
-/// cargo `--timings` report.
+/// `build_extension` and `build_project_module` call it after the real build
+/// branch, with the path of the DLL the host actually loads (the hot copy for
+/// extensions). It also inspects the DLL's PE image size and imports, reads the
+/// crate's direct cargo dependencies, and, when timing reports are enabled,
+/// takes the per-crate compile and link time from the newest cargo `--timings`
+/// report.
 pub(crate) fn record_module_artifact(
     name: &str,
     kind: ModuleKind,
@@ -880,9 +931,9 @@ pub(crate) fn record_module_artifact(
         module.image_size = inspection.image_size;
     }
     module.cargo_deps = read_cargo_deps(workspace_root, name);
-    // Only read a timing report when this process's builds were asked to write
-    // one: `--timings` is opt-in, and a leftover HTML from an earlier run must
-    // not be reported as this build's timings.
+    // Read a timing report only when this process's builds were asked to write
+    // one. `--timings` is opt-in, and a leftover HTML file from an earlier run
+    // must not be reported as this build's timings.
     if crate::config::cargo_timings_enabled() {
         if let Some(timing) = parse_latest_cargo_timings(workspace_root) {
             module.cargo_unit_ms = timing.crate_durations_ms.get(name).copied();
@@ -903,10 +954,10 @@ pub(crate) fn record_module_artifact(
 
 /// Record the wall time and peak memory of one cargo invocation.
 ///
-/// Called by `run_build_command` on success. The peak working set is sampled
-/// from the cargo child process by the build watchdog; the host process memory
-/// is captured at the same time so a heavy compile's effect on the host shows
-/// up in the report.
+/// `run_build_command` calls it after a successful build. The build watchdog
+/// samples the cargo child process's peak working set, and the host's own
+/// memory is read at the same time, so the report shows what a heavy compile
+/// did to the host.
 pub(crate) fn record_build_command(name: &str, elapsed_ms: u64, cargo_peak_bytes: u64) {
     let mut collector = analytics()
         .lock()
@@ -914,9 +965,9 @@ pub(crate) fn record_build_command(name: &str, elapsed_ms: u64, cargo_peak_bytes
     let index = find_or_create(&mut collector, name, ModuleKind::Extension);
     collector.modules[index].build_wall_ms = elapsed_ms;
     collector.cargo_child_peak_bytes = collector.cargo_child_peak_bytes.max(cargo_peak_bytes);
-    if let Some((current, peak)) = process_memory(None) {
-        collector.host_current_bytes = current;
-        collector.host_peak_bytes = collector.host_peak_bytes.max(peak);
+    if let Some((current_bytes, peak_bytes)) = process_memory(None) {
+        collector.host_current_bytes = current_bytes;
+        collector.host_peak_bytes = collector.host_peak_bytes.max(peak_bytes);
     }
 }
 
@@ -929,11 +980,11 @@ pub(crate) fn record_load(name: &str, load_ms: f64) {
     collector.modules[index].load_ms = load_ms;
 }
 
-/// The last cargo build wall time recorded for `name`, when there is one.
+/// The last cargo build wall time recorded for `name`, if there is one.
 ///
-/// The reload toasts show it ("reloaded in 820 ms"); a module that never ran
-/// a recorded build - a load-only extension, or the first reload after a
-/// restart - reports `None` rather than a misleading zero.
+/// The reload toasts show it ("reloaded in 820 ms"). A module that never ran a
+/// recorded build, such as a load-only extension or the first reload after a
+/// restart, returns `None` instead of a misleading zero.
 pub(crate) fn module_build_ms(name: &str) -> Option<u64> {
     let collector = analytics()
         .lock()
@@ -1004,15 +1055,15 @@ pub(crate) fn record_reload(name: &str) {
     collector.pending_reload_events.push(snapshot);
 }
 
-/// Record one function patch, in the same shape a module reload is recorded.
+/// Record one function patch in the same shape as a module reload.
 ///
-/// The phase mapping is deliberate rather than approximate. `build` is `rustc`,
-/// the patch's analogue of a module's cargo build; `stage` is everything that
-/// prepares the thing to build (classification, source generation and the flag
-/// capture); `load` is `LoadLibrary`; and `init` is the install that makes the
-/// new code live, which is what `pill_module_init` does for a reload. `migrate` is
-/// always zero because a patch cannot change a component schema - that is
-/// precisely the kind of edit it refuses.
+/// The phase mapping is deliberate, not an approximation. `build` is `rustc`,
+/// which plays the part of a module's cargo build. `stage` is everything that
+/// prepares the build: classification, source generation and the flag capture.
+/// `load` is `LoadLibrary`. `init` is the install that makes the new code live,
+/// the same job `pill_module_init` does for a reload. `migrate` is always zero,
+/// because a patch cannot change a component schema - that is exactly the kind
+/// of edit it refuses.
 #[cfg(feature = "hot_patch")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_patch(
@@ -1040,8 +1091,9 @@ pub(crate) fn record_patch(
         init_ms: activate_ms,
         migrate_ms: 0.0,
         artifact_bytes,
-        // A function's generation IS its patch count, so the shared
-        // `(reload #N)` column stays meaningful for both kinds.
+        // A function's generation is its patch count, so the shared
+        // `(reload #N)` column means the same thing for a patch as for a
+        // reload.
         reload_count: generation,
         // No cargo invocation ran, so there is no per-crate breakdown to show.
         cargo_crates: Vec::new(),
@@ -1068,11 +1120,12 @@ pub(crate) fn record_patch_failure(function: &str, code: &str, detail: &str) {
     remember_fallback(&mut collector, Some(function), "failed", code, detail);
 }
 
-/// Fold one fallback reason into the tally, collapsing repeats.
+/// Add one fallback reason to the tally, counting a repeat instead of adding a
+/// second entry.
 ///
-/// Keyed on function, outcome and code rather than on the detail text, so a
-/// compiler message that shifts a column number between saves does not read as
-/// a new cause.
+/// The match uses the function, the outcome and the code, not the detail text,
+/// so a compiler message whose column number moves between saves is not a new
+/// cause.
 #[cfg(feature = "hot_patch")]
 fn remember_fallback(
     collector: &mut Analytics,
@@ -1090,10 +1143,11 @@ fn remember_fallback(
     if collector.patch_fallbacks.len() >= MAX_TRACKED_FALLBACK_REASONS {
         return;
     }
-    // Only the first line: the host already summarizes a compiler failure into
-    // one, and anything multi-line here would break the report's shape.
+    // Keep the first line of the detail only. The host already summarizes a
+    // compiler failure to one line, and a multi-line entry would break the
+    // report's shape.
     let first_line = detail.lines().next().unwrap_or("").trim();
-    let trimmed: String = if first_line.chars().count() > MAX_FALLBACK_DETAIL_CHARS {
+    let capped_detail: String = if first_line.chars().count() > MAX_FALLBACK_DETAIL_CHARS {
         first_line
             .chars()
             .take(MAX_FALLBACK_DETAIL_CHARS)
@@ -1106,16 +1160,17 @@ fn remember_fallback(
         function: function.map(str::to_string),
         outcome,
         code: code.to_string(),
-        detail: trimmed,
+        detail: capped_detail,
         count: 1,
     });
 }
 
-/// The running patch / refusal / failure tally as report lines, empty until
-/// the fast path has done something.
+/// Formats the running patch, refusal and failure tally as report lines.
+/// Returns an empty list until the fast path has done something.
 ///
-/// Takes its own lock rather than borrowing the caller's, because
-/// `print_reload_events` has already released it by the time it asks.
+/// Takes its own lock instead of using the caller's, because
+/// `print_reload_events` has already released the lock when it asks for these
+/// lines.
 fn patch_tally_lines() -> Vec<String> {
     let collector = analytics()
         .lock()
@@ -1130,11 +1185,11 @@ fn patch_tally_lines() -> Vec<String> {
         collector.patch_refusals.to_string().yellow(),
         collector.patch_failures.to_string().yellow(),
     )];
-    // The counts say a reload ran; these lines say why. Listed here rather
-    // than left to the moment of failure, which has long scrolled past by the
-    // time the reload report appears.
+    // The summary line above gives only counts. These lines give the reason
+    // behind each one, recorded here because the moment of failure has long
+    // scrolled past by the time the reload report appears.
     for fallback in &collector.patch_fallbacks {
-        let repeats = if fallback.count > 1 {
+        let repeat_suffix = if fallback.count > 1 {
             format!(" x{}", fallback.count)
         } else {
             String::new()
@@ -1144,7 +1199,7 @@ fn patch_tally_lines() -> Vec<String> {
             fallback.function.as_deref().unwrap_or("(change)"),
             fallback.outcome,
             format!("({})", fallback.code).dimmed(),
-            repeats,
+            repeat_suffix,
         ));
         if !fallback.detail.is_empty() {
             lines.push(format!("        {}", fallback.detail.dimmed()));
@@ -1194,9 +1249,9 @@ pub(crate) fn print_startup_report() {
     let mut collector = analytics()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Startup builds accumulated their `--timings` crates into the pending
-    // set; they belong to the startup report's `cargo` column only, so drop
-    // them before any reload transaction starts accumulating.
+    // Startup builds left their crates in the pending set, which only the
+    // reload report reads. Clear it here so the first reload does not list
+    // every crate the startup built.
     collector.pending_cargo_crates.clear();
     info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -1205,8 +1260,8 @@ pub(crate) fn print_startup_report() {
     );
 }
 
-/// One column of the startup table: its header, alignment, and one cell per
-/// module row plus the total row.
+/// One column of the startup table. It holds the header, the alignment, one
+/// cell per module row and the total row.
 struct ReportColumn {
     header: &'static str,
     left_aligned: bool,
@@ -1242,8 +1297,8 @@ impl ReportColumn {
 ///
 /// The title and the `elapsed: ... builds: N    reloads: N` line are parsed by
 /// the suites and the benchmark harness (`devops/`), so their text stays as it
-/// is. Columns that are empty for every module (at
-/// startup: `migrate`, and `cargo` without `--timings`) are left out.
+/// is. Columns that are empty for every module, such as `migrate` at startup
+/// and `cargo` without `--timings`, are left out.
 fn render_startup_report(collector: &Analytics) -> String {
     let elapsed_seconds = collector.started.elapsed().as_secs_f64();
     let total_reloads: u64 = collector
@@ -1254,14 +1309,14 @@ fn render_startup_report(collector: &Analytics) -> String {
     let modules = &collector.modules;
 
     // Step 1: Build the table columns, then drop the ones with nothing in them.
-    let milliseconds = |value: f64| {
+    let format_milliseconds = |value: f64| {
         if value > 0.0 {
             format!("{value:.1}ms")
         } else {
             "-".to_string()
         }
     };
-    let count = |value: usize| {
+    let format_count = |value: usize| {
         if value > 0 {
             value.to_string()
         } else {
@@ -1303,36 +1358,36 @@ fn render_startup_report(collector: &Analytics) -> String {
             left_aligned: false,
             cells: modules
                 .iter()
-                .map(|module| milliseconds(module.stage_ms))
+                .map(|module| format_milliseconds(module.stage_ms))
                 .collect(),
-            total: milliseconds(sum(|module| module.stage_ms)),
+            total: format_milliseconds(sum(|module| module.stage_ms)),
         },
         ReportColumn {
             header: "load",
             left_aligned: false,
             cells: modules
                 .iter()
-                .map(|module| milliseconds(module.load_ms))
+                .map(|module| format_milliseconds(module.load_ms))
                 .collect(),
-            total: milliseconds(sum(|module| module.load_ms)),
+            total: format_milliseconds(sum(|module| module.load_ms)),
         },
         ReportColumn {
             header: "init",
             left_aligned: false,
             cells: modules
                 .iter()
-                .map(|module| milliseconds(module.init_ms))
+                .map(|module| format_milliseconds(module.init_ms))
                 .collect(),
-            total: milliseconds(sum(|module| module.init_ms)),
+            total: format_milliseconds(sum(|module| module.init_ms)),
         },
         ReportColumn {
             header: "migrate",
             left_aligned: false,
             cells: modules
                 .iter()
-                .map(|module| milliseconds(module.migrate_ms))
+                .map(|module| format_milliseconds(module.migrate_ms))
                 .collect(),
-            total: milliseconds(sum(|module| module.migrate_ms)),
+            total: format_milliseconds(sum(|module| module.migrate_ms)),
         },
         ReportColumn {
             header: "size",
@@ -1351,7 +1406,7 @@ fn render_startup_report(collector: &Analytics) -> String {
             left_aligned: false,
             cells: modules
                 .iter()
-                .map(|module| count(module.import_dlls.len()))
+                .map(|module| format_count(module.import_dlls.len()))
                 .collect(),
             total: String::new(),
         },
@@ -1371,9 +1426,9 @@ fn render_startup_report(collector: &Analytics) -> String {
     let widths: Vec<usize> = columns.iter().map(ReportColumn::width).collect();
     let table_width = widths.iter().sum::<usize>() + 2 * (widths.len() - 1);
 
-    // Step 2: The title and the run totals. Colored for the terminal; the log
+    // Step 2: The title and the run totals, colored for the terminal. The log
     // formatter strips the codes for the file lane and for piped output, which
-    // is what the harness parses, so the parsed line stays plain text there.
+    // is what the harness reads, so the line it parses is plain text.
     let mut lines: Vec<String> = vec![
         "BUILD / LINK / HOT-RELOAD ANALYTICS · startup"
             .cyan()
@@ -1443,8 +1498,9 @@ fn render_startup_report(collector: &Analytics) -> String {
         .map(|(column, width)| column.pad(&column.total, *width).yellow().to_string())
         .collect()));
 
-    // Step 4: What each module links against (system DLLs only counted) and
-    // its direct dependencies, wrapped under the module's name.
+    // Step 4: What each module links against (system DLLs are only counted,
+    // not named) and its direct dependencies, wrapped under the module's
+    // name.
     let name_width = widths[0];
     let indent = " ".repeat(name_width + 2);
     let wrap_width = table_width.max(60).saturating_sub(name_width + 2 + 6);
@@ -1492,9 +1548,12 @@ fn render_startup_report(collector: &Analytics) -> String {
     log_block_colored(heading, lines)
 }
 
-/// Split a module's imported DLLs into the ones worth naming (the engine's
-/// `pill_*` dylibs and Rust's `std`, without the `.dll` and the `std` hash)
-/// and a count of the rest, which are Windows system and runtime libraries.
+/// Split a module's imports into the names worth showing and a count of the
+/// rest.
+///
+/// The names kept are the `pill_*` dylibs and Rust's `std`, with the `.dll`
+/// suffix and the `std` hash removed. The rest are Windows system and runtime
+/// libraries, which are only counted.
 fn linked_libraries(import_dlls: &[String]) -> (Vec<String>, usize) {
     let mut linked = Vec::new();
     let mut system_count = 0;
@@ -1511,40 +1570,40 @@ fn linked_libraries(import_dlls: &[String]) -> (Vec<String>, usize) {
     (linked, system_count)
 }
 
-/// Join `items` with `, ` into lines no longer than `width` characters, never
-/// splitting an item.
+/// Join the names with `, ` into lines of at most `width` characters, never
+/// splitting one name. A name longer than `width` still gets its own line.
 fn wrap_list(items: &[&str], width: usize) -> Vec<String> {
     let mut lines = Vec::new();
-    let mut current = String::new();
+    let mut current_line = String::new();
     for item in items {
-        if !current.is_empty() && current.len() + 2 + item.len() > width {
-            lines.push(format!("{current},"));
-            current.clear();
+        if !current_line.is_empty() && current_line.len() + 2 + item.len() > width {
+            lines.push(format!("{current_line},"));
+            current_line.clear();
         }
-        if !current.is_empty() {
-            current.push_str(", ");
+        if !current_line.is_empty() {
+            current_line.push_str(", ");
         }
-        current.push_str(item);
+        current_line.push_str(item);
     }
-    if !current.is_empty() {
-        lines.push(current);
+    if !current_line.is_empty() {
+        lines.push(current_line);
     }
     lines
 }
 
-/// Log one line per completed hot reload plus one aggregate total line, as a
-/// single multi-line entry.
+/// Log one line per completed hot reload and a summary of the whole
+/// transaction, as a single multi-line entry.
 ///
-/// Called by the frame loop right after reloads are processed, so the console
-/// shows the rebuild → stage → load → init → migrate breakdown as it happens.
-/// `reload_started` is the moment the reload transaction began (before the
-/// first build), so the total spans the whole cascade - the edited module
-/// plus the queued project reload - not only the last one. Returns the number
-/// of reload events reported.
+/// Called at the end of the reload step, once the frame's reloads are done, so
+/// the console shows the build → stage → load → init → migrate breakdown as it
+/// happens. `reload_started` is the moment the reload transaction began, before
+/// the first build, so the total spans the whole cascade - the edited module
+/// plus the queued project reload - and not only the last reload. Returns the
+/// number of reload events reported.
 ///
 /// The `[analytics] reload ...` and `crates rebuilt by cargo:` lines keep the
-/// exact text the suites and `devops/benchmarks/hot_reload_harness.py` parse;
-/// their colors reach an interactive terminal only (see `log_block_colored`).
+/// exact text the suites and `devops/benchmarks/hot_reload_harness.py` parse.
+/// Their colors reach an interactive terminal only (see `log_block_colored`).
 pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
     let events = drain_reload_events();
     let count = events.len();
@@ -1600,7 +1659,7 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
         // cargo `--timings` breakdown shows every crate the build actually
         // recompiled or relinked (dependents included).
         if !event.cargo_crates.is_empty() {
-            let parts: Vec<String> = event
+            let crate_time_texts: Vec<String> = event
                 .cargo_crates
                 .iter()
                 .map(|(crate_name, duration_ms)| {
@@ -1614,15 +1673,16 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
             lines.push(format!(
                 "    {} {}",
                 "crates rebuilt by cargo:".bold(),
-                parts.join(&" | ".dimmed().to_string())
+                crate_time_texts.join(&" | ".dimmed().to_string())
             ));
         }
     }
-    // Step 2: One aggregate number for the whole transaction (module + project
-    // for a cascade, or a single reload otherwise), reconciled against the
-    // visible phase sums so the unaccounted remainder - the gap between the
-    // two reloads plus scheduling - is shown explicitly instead of silently
-    // missing. Integer milliseconds, so the parts add up exactly to the total.
+    // Step 2: One total for the whole transaction (module + project for a
+    // cascade, or a single reload otherwise). The recorded phases are summed
+    // and subtracted, so the rest - the wait between two reloads in a
+    // cascade, scheduling and rounding - is printed as its own term instead
+    // of going missing. Everything is whole milliseconds, so the parts add up
+    // exactly to the total.
     let total_ms = reload_started.elapsed().as_millis() as u64;
     let segment_ms: Vec<u64> = events
         .iter()
@@ -1651,14 +1711,14 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
         format_ms(total_ms).yellow(),
         format!("({total_ms}ms)").dimmed(),
     ));
-    let parts: Vec<String> = events
+    let segment_texts: Vec<String> = events
         .iter()
         .zip(&segment_ms)
         .map(|(event, segment)| format!("{} {}ms", event.name.cyan(), segment.to_string().yellow()))
         .collect();
     lines.push(format!(
         "    = {} + {} {}ms",
-        parts.join(&" + ".dimmed().to_string()),
+        segment_texts.join(&" + ".dimmed().to_string()),
         "gap/scheduling".dimmed(),
         gap_ms.to_string().yellow(),
     ));
@@ -1689,7 +1749,8 @@ mod tests {
 
     /// The startup report keeps the line the benchmark harness parses, drops
     /// columns that are empty for every module, lines its rows up, and names
-    /// only the engine's own libraries among the imports.
+    /// the engine's `pill_*` libraries and `std` among the imports while the
+    /// rest are only counted.
     #[test]
     fn startup_report_layout() {
         let mut extension =
@@ -1828,10 +1889,10 @@ const CONCURRENCY_DATA = [
 ];
 </script></body></html>"#;
 
-    /// The two slot routes promise something the prologue route cannot, and the
-    /// benchmark harness keys off exactly this.
+    /// The two slot routes give a promise the prologue route cannot, and the
+    /// benchmark harness relies on exactly that difference.
     ///
-    /// A slot install is one atomic pointer store, so any call reaching the
+    /// A slot install is one atomic pointer store, so any call that reaches the
     /// dispatcher runs the new code. The prologue route overwrites a live
     /// function's first bytes: a caller that inlined the body still runs the old
     /// one, and the twelve-byte write is not atomic. Reporting both as `patch`
@@ -1922,7 +1983,7 @@ const CONCURRENCY_DATA = [
         assert_eq!(timing.total_seconds, 3.0);
         assert_eq!(timing.crate_durations_ms.get("pill_core"), Some(&1200));
         assert_eq!(timing.crate_durations_ms.get("project"), Some(&1090));
-        // Fresh units (duration 0.0) are excluded from the map.
+        // A unit that did not run (duration 0.0) is left out of the map.
         assert!(!timing.crate_durations_ms.contains_key("serde"));
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -1947,17 +2008,16 @@ const CONCURRENCY_DATA = [
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// The parser reads a real report from this workspace without choking on
+    /// The parser reads a real report from this workspace without failing on
     /// it, and every crate it names carries a duration.
     ///
-    /// Two states are skipped rather than asserted on, because neither says
-    /// anything about the parser. The workspace may never have produced a report
-    /// (a fresh checkout), and the newest report may come from a build where
-    /// nothing needed recompiling: an up-to-date build still writes a full
-    /// report, but every unit in it has `"duration": 0`, and the parser
-    /// deliberately keeps only units that actually ran. Asserting on a
-    /// non-empty result would make this test depend on what the developer
-    /// happened to build last.
+    /// Two states are skipped instead of asserted on, because neither says
+    /// anything about the parser. The workspace may never have produced a
+    /// report (a fresh checkout), and the newest report may come from a build
+    /// where nothing needed recompiling: an up-to-date build still writes a
+    /// full report, but every unit in it has `"duration": 0`, and the parser
+    /// keeps only units that actually ran. Asserting a non-empty result would
+    /// make this test depend on what the developer happened to build last.
     #[test]
     fn parses_real_workspace_timings_when_present() {
         // Two levels up from `hosting/pill_development_host`, same as the host's own
@@ -2045,11 +2105,13 @@ const CONCURRENCY_DATA = [
             image[0..2].copy_from_slice(b"MZ");
             image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
             image[0x40..0x44].copy_from_slice(b"PE\0\0");
-            let coff = 0x44usize;
-            image[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes());
-            image[coff + 16..coff + 18].copy_from_slice(&declared_size.to_le_bytes());
-            // A valid PE32 magic, so the parse reaches the `SizeOfImage` read
-            // the guard has to stop it before.
+            let coff_header_offset = 0x44usize;
+            image[coff_header_offset + 2..coff_header_offset + 4]
+                .copy_from_slice(&1u16.to_le_bytes());
+            image[coff_header_offset + 16..coff_header_offset + 18]
+                .copy_from_slice(&declared_size.to_le_bytes());
+            // A valid PE32 magic, so the parse would reach the `SizeOfImage`
+            // read if the guard did not stop it first.
             image[0x58..0x5a].copy_from_slice(&0x10bu16.to_le_bytes());
 
             let path = std::env::temp_dir().join(format!(

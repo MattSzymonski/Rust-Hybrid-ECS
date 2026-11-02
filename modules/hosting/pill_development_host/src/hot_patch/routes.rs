@@ -2,21 +2,23 @@
 //!
 //! # Responsibilities
 //!
-//! - Resolve a function's address and signature inside a loaded patch image.
-//! - Walk every image that may carry a copy: loaded artifacts, then the patches
-//!   already in the process.
-//! - Install, reset, or prologue-patch that function in each of them.
+//! - Find a function's address and signature inside a loaded patch image.
+//! - Visit every image that may hold a copy: the loaded artifacts first, then
+//!   the patches already in the process.
+//! - Install, reset or prologue-patch that function in each of them.
 //!
 //! # Design
 //!
 //! A crate linked into several artifacts is compiled into each of them, and a
-//! generated patch links its own copy of whatever its body calls. A replacement
-//! that reached only the crate's own DLL would leave every other copy running
-//! the old code, so all three routes fan out across both kinds - which is why
-//! they share one traversal ([`every_copy`]) rather than each walking their own.
+//! generated patch links its own copy of everything its body calls. A
+//! replacement that reached only the crate's own DLL would leave every other
+//! copy running the old code. That is why all three routes send the change to
+//! both kinds of image, through one shared traversal ([`every_loaded_copy`])
+//! instead of each one visiting the images itself.
 //!
-//! Leaving the patches out of that walk freezes a chain of hot functions at
-//! whatever the callee looked like when the caller was compiled.
+//! If that traversal skipped the patches, a chain of hot functions would stop
+//! updating: a patched caller would keep calling the callee as it was when the
+//! caller was compiled.
 
 // External crates
 use libloading::{Library, Symbol};
@@ -30,19 +32,23 @@ use crate::native_library::NativeLibrary;
 // Constants
 // =============================================================================
 
-/// Export a generated prologue patch carries so the host can find its new body.
+/// Export a generated prologue patch carries, through which the host finds the
+/// patch's replacement body.
 ///
-/// One export, not a registry: a prologue patch replaces exactly one function,
-/// so there is nothing to look up by name.
+/// The patch declares this one export rather than a registry: it replaces
+/// exactly one function, so there is nothing to look up by name.
 const PATCH_ADDRESS_EXPORT: &[u8] = b"pill_patch_address";
 
-/// Address resolver a generated patch exports, distinct from an artifact's.
+/// Export a generated patch uses to report the address and signature of the
+/// function it replaces. An artifact exports a different name for the same
+/// question.
 const PATCH_ADDRESS_RESOLVER: &[u8] = b"pill_patch_resolve_address";
 
-/// Slot installer a generated patch exports.
+/// Export through which a generated patch redirects its own copy of a function.
 const PATCH_INSTALL_RESOLVER: &[u8] = b"pill_patch_resolve_install";
 
-/// Slot reset a generated patch exports.
+/// Export through which a generated patch returns its own copy of a function to
+/// the body it was compiled with.
 const PATCH_RESET_RESOLVER: &[u8] = b"pill_patch_resolve_reset";
 
 // =============================================================================
@@ -53,8 +59,9 @@ const PATCH_RESET_RESOLVER: &[u8] = b"pill_patch_resolve_reset";
 ///
 /// A crate linked into several artifacts is compiled into each of them, and a
 /// generated patch links its own copy of whatever its body calls. Both kinds
-/// therefore hold code a replacement has to reach, and normalizing the two here
-/// is what lets one traversal ([`every_copy`]) write that walk once.
+/// therefore hold code a replacement has to reach. Treating the two the same
+/// way here is what lets one traversal ([`every_loaded_copy`]) serve every
+/// route.
 enum PatchCopy<'a> {
     /// A module or project DLL the host loaded.
     Artifact(&'a NativeLibrary),
@@ -63,15 +70,16 @@ enum PatchCopy<'a> {
 }
 
 impl PatchCopy<'_> {
-    /// Point this copy's redirect slot at `address`.
+    /// Points this copy's redirect slot at `address`.
     ///
+    /// A copy's redirect slot is the pointer its compiled stub calls through.
     /// `Ok(false)` means this image has nothing to redirect, which is not a
     /// failure.
     ///
     /// # Errors
     ///
-    /// Fails exactly as the wrapped image reports it: the copy cannot be asked,
-    /// or it refuses the replacement.
+    /// Fails for the same reasons as the wrapped image: it cannot be asked for
+    /// its installer, or it refuses the replacement.
     fn install_plain_function(
         &self,
         qualified: &str,
@@ -86,17 +94,17 @@ impl PatchCopy<'_> {
         }
     }
 
-    /// Empty this copy's redirect slot, restoring its own body.
+    /// Empties this copy's redirect slot, so it runs its own body again.
     ///
-    /// Both arms pass their detail through untouched: a patch reports a
-    /// missing resolver export as an error the same way an artifact does, so a
-    /// copy that cannot be interrogated aborts the rollback instead of being
-    /// skipped as one that declares nothing.
+    /// Both arms pass the error text through unchanged. Like an artifact, a
+    /// patch reports a missing resolver export as an error, so a copy that
+    /// cannot be asked stops the rollback instead of being skipped as a copy
+    /// that declares nothing.
     ///
     /// # Errors
     ///
-    /// Fails when the wrapped image cannot be asked, or refuses with a reason
-    /// of its own.
+    /// Fails when the image cannot be asked for its reset export, or refuses
+    /// for a reason of its own.
     fn reset_plain_function(&self, qualified: &str) -> Result<bool, String> {
         match self {
             Self::Artifact(artifact) => artifact.reset_plain_function(qualified),
@@ -104,11 +112,12 @@ impl PatchCopy<'_> {
         }
     }
 
-    /// Where this copy's own compiled `qualified` lives, and the declaration it
-    /// was built with.
+    /// Returns where this copy's own compiled `qualified` lives, and the
+    /// declaration it was built with.
     ///
-    /// The declaration is `None` when the image cannot report one, which the
-    /// prologue gate refuses: "no data" is not "nothing to check".
+    /// The declaration is `None` when the image cannot report one. The prologue
+    /// gate refuses that case: a missing declaration must never pass as
+    /// "nothing to check".
     fn function_address(&self, qualified: &str) -> Option<(usize, Option<String>)> {
         match self {
             Self::Artifact(artifact) => artifact.function_address(qualified),
@@ -116,10 +125,11 @@ impl PatchCopy<'_> {
         }
     }
 
-    /// How many of this copy's functions have a known extent, when it can say.
+    /// Returns how many of this copy's functions have a known extent (their
+    /// length, as the exception directory records it), when it can answer.
     ///
-    /// Only an artifact is asked for the diagnostic export; a patch reports
-    /// nothing, so a prologue refusal quotes coverage for artifacts alone.
+    /// Only an artifact has the diagnostic export; a patch answers `None`, so a
+    /// prologue refusal quotes coverage for artifacts alone.
     fn extent_coverage(&self) -> Option<(usize, usize)> {
         match self {
             Self::Artifact(artifact) => artifact.extent_coverage(),
@@ -128,17 +138,25 @@ impl PatchCopy<'_> {
     }
 }
 
-/// The two operations a fan-out performs on one copy of the function.
+/// The two operations applied to one copy of the function: install and reset.
 ///
-/// The trait exists so the refusal handling below can be tested: in production
-/// the copy that takes a replacement and the copy that refuses it are both
+/// The trait exists so the refusal handling below can be tested. In production
+/// both the copy that accepts a replacement and the copy that refuses it are
 /// loaded images, and a unit test can build neither. [`PatchCopy`] is the only
 /// implementation that ships.
 trait RedirectSlot {
-    /// Point this copy's redirect slot at `address`.
+    /// Points this copy's redirect slot at `address`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the image cannot be asked, or refuses the replacement.
     fn install(&self, qualified: &str, address: usize, signature: &str) -> Result<bool, String>;
 
-    /// Empty this copy's redirect slot, restoring its own body.
+    /// Empties this copy's redirect slot, so it runs its own body again.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the image cannot be asked, or refuses the reset.
     fn reset(&self, qualified: &str) -> Result<bool, String>;
 }
 
@@ -152,29 +170,31 @@ impl RedirectSlot for PatchCopy<'_> {
     }
 }
 
-/// An earlier loaded patch, offered as a target for later patches.
+/// A patch loaded earlier, which a later patch also has to reach.
 ///
 /// A patch links its own copy of everything its body calls, and those copies go
-/// stale the moment a callee is patched. Without this target, a chain of hot
-/// functions freezes: patch a caller of `pill_dummy_color::get_color_a`, then
-/// patch `get_color_a` itself, and the caller's patch keeps running the
-/// `get_color_a` it was compiled with.
+/// stale as soon as a callee is patched. This target is what keeps a chain of
+/// hot functions moving: patch a caller of `pill_dummy_color::get_color_a`, then
+/// patch `get_color_a` itself, and without this the caller's patch keeps running
+/// the `get_color_a` it was compiled with.
 pub(crate) struct LoadedPatch {
-    /// The function this patch replaced, used as its label.
+    /// The qualified name of the function this patch replaced. It also labels
+    /// the patch in error messages.
     pub function: String,
-    /// Which generation it was.
+    /// The generation number under which this patch was recorded.
     pub generation: u32,
-    /// The loaded image. Never unloaded: a slot or a jump may point into it for
-    /// the rest of the process, and nothing re-homes those addresses.
+    /// The loaded image. It is never unloaded, because a slot or a jump may
+    /// point into it for the rest of the process and nothing moves those
+    /// addresses.
     pub library: Library,
 }
 
 impl LoadedPatch {
-    /// Offer a replacement to this patch's own copy of one `#[pill_hot_fn]`.
+    /// Offers a replacement to this patch's own copy of one `#[pill_hot_fn]`.
     ///
     /// A patch links its own copy of whatever its body calls, slots included,
-    /// and those slots start empty. Skipping them leaves a patched caller
-    /// calling the compiled-in version of a callee patched afterwards.
+    /// and those slots start empty. If this copy were skipped, a patched caller
+    /// would keep calling the version of a callee that is patched afterwards.
     ///
     /// # Errors
     ///
@@ -188,13 +208,15 @@ impl LoadedPatch {
     ) -> Result<bool, String> {
         type InstallFn =
             unsafe extern "C" fn(*const std::ffi::c_char, usize, *const std::ffi::c_char) -> u32;
-        // SAFETY: generated by `pill_hot_resolver!` with this exact C ABI.
+        // SAFETY: the export is generated by `pill_hot_resolver!` with exactly
+        // this C ABI signature, so reading it as `InstallFn` is valid.
         //
-        // A missing export is an error, not an `Ok(false)`: the latter means
+        // A missing export is an error, not `Ok(false)`. `Ok(false)` means
         // "asked, and this image does not link the crate", and every caller
-        // skips those. Folding an image that cannot be interrogated into that
-        // answer would leave its copies running old code while the console
-        // reports a provable install, so the caller falls back to a reload.
+        // skips those copies. An image that cannot be asked must not be folded
+        // into that answer: its copies would keep running the old code while
+        // the log reports the install as complete, so the caller gets an error
+        // and falls back to a reload.
         let install =
             unsafe { self.library.get::<InstallFn>(PATCH_INSTALL_RESOLVER) }.map_err(|error| {
                 format!(
@@ -212,8 +234,9 @@ impl LoadedPatch {
         // SAFETY: both strings are NUL-terminated and live until the call
         // returns, and `address` points into an image that is never unloaded.
         let status = unsafe { install(name.as_ptr(), address, signature.as_ptr()) };
-        // The generated installer reports 0 for installed, 1 for "this patch
-        // declares nothing", and 2 for a shape mismatch.
+        // The generated installer returns 0 when it installed the replacement,
+        // 1 when this patch does not declare the function, and 2 when the
+        // signature no longer matches.
         match status {
             0 => Ok(true),
             1 => Ok(false),
@@ -224,19 +247,21 @@ impl LoadedPatch {
         }
     }
 
-    /// Return this patch's copy of one `#[pill_hot_fn]` to its own body.
+    /// Returns this patch's copy of one `#[pill_hot_fn]` to its own body.
     ///
-    /// A missing export is an error for the same reason it is in
-    /// [`Self::install_plain_function`]: "cannot ask" must not read as "asked,
-    /// and it declares nothing", or a rollback would leave this copy running a
-    /// patched body while reporting that everything was restored.
+    /// A missing export is an error for the same reason as in
+    /// [`Self::install_plain_function`]: "cannot ask" must not be read as
+    /// "asked, and it declares nothing". Otherwise a rollback would leave this
+    /// copy running a patched body while reporting that everything was
+    /// restored.
     ///
     /// # Errors
     ///
     /// Fails when the patch exports no reset symbol.
     pub(super) fn reset_plain_function(&self, qualified: &str) -> Result<bool, String> {
         type ResetFn = unsafe extern "C" fn(*const std::ffi::c_char) -> u32;
-        // SAFETY: generated by `pill_hot_resolver!` with this exact C ABI.
+        // SAFETY: the export is generated by `pill_hot_resolver!` with exactly
+        // this C ABI signature, so reading it as `ResetFn` is valid.
         let reset =
             unsafe { self.library.get::<ResetFn>(PATCH_RESET_RESOLVER) }.map_err(|error| {
                 format!(
@@ -248,29 +273,31 @@ impl LoadedPatch {
         let Ok(name) = std::ffi::CString::new(qualified) else {
             return Ok(false);
         };
-        // SAFETY: the string is NUL-terminated and lives until the call returns.
+        // SAFETY: the name is NUL-terminated and stays alive until the call
+        // returns.
         Ok(unsafe { reset(name.as_ptr()) == 0 })
     }
 
-    /// Address and recorded declaration of one function inside this patch.
+    /// Returns the address and recorded declaration of one function inside this
+    /// patch.
     ///
-    /// The declaration is `None` when the patch recorded none. That absence is
-    /// kept visible rather than flattened into an empty string, which the
-    /// prologue gate would read as "no gate" - the exact reading a missing
-    /// declaration must never get.
+    /// The declaration is `None` when the patch recorded none. That absence
+    /// stays visible instead of being flattened into an empty string, which the
+    /// prologue gate would read as "nothing to check" - the one reading a
+    /// missing declaration must never get.
     fn function_address(&self, qualified: &str) -> Option<(usize, Option<String>)> {
         type AddressFn =
             unsafe extern "C" fn(*const std::ffi::c_char, *mut *const u8, *mut usize) -> usize;
         // SAFETY: the export is generated by `pill_hot_resolver!` with exactly
-        // this C ABI signature, and the borrow ends before the library moves.
+        // this C ABI signature, so reading it as `AddressFn` is valid.
         let resolve: Symbol<AddressFn> =
             unsafe { self.library.get(PATCH_ADDRESS_RESOLVER) }.ok()?;
         let name = std::ffi::CString::new(qualified).ok()?;
         let mut signature_pointer: *const u8 = std::ptr::null();
         let mut signature_length: usize = 0;
-        // SAFETY: a NUL-terminated name and two writable slots, as the export
-        // requires. A patch is never unloaded, so anything it reports stays
-        // valid for the process lifetime.
+        // SAFETY: `name` is a NUL-terminated string and both out-parameters
+        // point at writable slots, as the export requires. A patch is never
+        // unloaded, so anything it reports stays valid for the process.
         let address =
             unsafe { resolve(name.as_ptr(), &mut signature_pointer, &mut signature_length) };
         if address == 0 {
@@ -279,8 +306,9 @@ impl LoadedPatch {
         let signature = if signature_pointer.is_null() {
             None
         } else {
-            // SAFETY: the export wrote a pointer and length describing a
-            // `&'static str` inside the loaded patch.
+            // SAFETY: the export wrote a pointer and a length describing a
+            // `&'static str` inside the loaded patch, so those bytes are
+            // readable for that length.
             let bytes = unsafe { std::slice::from_raw_parts(signature_pointer, signature_length) };
             Some(String::from_utf8_lossy(bytes).into_owned())
         };
@@ -288,20 +316,22 @@ impl LoadedPatch {
     }
 }
 
-/// One artifact's copy of a prologue-patched function, and the bytes it had.
+/// One artifact's copy of a prologue-patched function, with the bytes it held
+/// before the patch.
 ///
-/// Saved so a rollback can put the function back exactly as the artifact was
-/// built, which is the only way back for a mechanism that overwrites code in
-/// place. The address, not the artifact name, is what a later rollback writes
-/// to: an artifact that reloads gets a new image, so its old addresses are
-/// dropped rather than re-aimed.
+/// The bytes are saved so a rollback can put the function back exactly as the
+/// artifact was built; overwriting code in place has no other way back. A later
+/// rollback writes to the address, not to the artifact name: a reloaded
+/// artifact is a new image, so its old addresses are dropped instead of being
+/// used again.
 #[derive(Debug, Clone)]
 pub(crate) struct PrologueRestore {
-    /// Artifact the patched copy lives in, for diagnostics.
+    /// The label of the artifact the patched copy lives in, used in error
+    /// messages.
     pub artifact: String,
-    /// Address of the function that was overwritten.
+    /// Address of the function whose first bytes were overwritten.
     pub address: usize,
-    /// The bytes that were there before.
+    /// The bytes that were at that address before the patch.
     pub original: Vec<u8>,
 }
 
@@ -309,17 +339,17 @@ pub(crate) struct PrologueRestore {
 // Free Functions
 // =============================================================================
 
-/// Ask a loaded patch for one function's address and signature hash.
+/// Asks a loaded patch for one function's address and signature hash.
 ///
 /// # Errors
 ///
 /// Fails when the patch exports no resolver, when `lookup_name` contains an
-/// interior NUL byte, or when the patch defines no such function.
+/// interior NUL byte, or when the patch does not define that function.
 pub(super) fn resolve_in(library: &Library, lookup_name: &str) -> Result<(usize, u64), String> {
     type ResolveFn = unsafe extern "C" fn(*const std::ffi::c_char, *mut u64) -> usize;
 
     // SAFETY: the export is generated by `pill_hot_resolver!` with exactly this
-    // C ABI signature, and the borrow ends before the library is moved.
+    // C ABI signature, so reading it as `ResolveFn` is valid.
     let resolve: Symbol<ResolveFn> =
         unsafe { library.get(PATCH_RESOLVER_EXPORT) }.map_err(|_| {
             format!(
@@ -331,7 +361,8 @@ pub(super) fn resolve_in(library: &Library, lookup_name: &str) -> Result<(usize,
     let encoded = std::ffi::CString::new(lookup_name)
         .map_err(|_| "the function name contains a NUL byte".to_string())?;
     let mut signature_hash: u64 = 0;
-    // SAFETY: a NUL-terminated name and a writable u64, as the export requires.
+    // SAFETY: `encoded` is a NUL-terminated string and `signature_hash` is a
+    // writable `u64`, as the export requires.
     let address = unsafe { resolve(encoded.as_ptr(), &mut signature_hash) };
 
     if address == 0 {
@@ -340,11 +371,11 @@ pub(super) fn resolve_in(library: &Library, lookup_name: &str) -> Result<(usize,
     Ok((address, signature_hash))
 }
 
-/// Ask a loaded patch where its replacement for a plain function lives.
+/// Asks a loaded patch where its replacement for a plain function lives.
 ///
 /// Returns the address to jump to and the signature text the patch compiled it
-/// with, which every receiving artifact checks against its own before
-/// accepting the replacement.
+/// with, which every receiving artifact checks against its own before accepting
+/// the replacement.
 ///
 /// # Errors
 ///
@@ -359,7 +390,7 @@ pub(super) fn resolve_plain_in(
         unsafe extern "C" fn(*const std::ffi::c_char, *mut *const u8, *mut usize) -> usize;
 
     // SAFETY: the export is generated by `pill_hot_resolver!` with exactly this
-    // C ABI signature, and the borrow ends before the library is moved.
+    // C ABI signature, so reading it as `ResolvePlainFn` is valid.
     let resolve: Symbol<ResolvePlainFn> =
         unsafe { library.get(PATCH_PLAIN_EXPORT) }.map_err(|_| {
             format!(
@@ -372,9 +403,10 @@ pub(super) fn resolve_plain_in(
         .map_err(|_| "the function name contains a NUL byte".to_string())?;
     let mut signature_pointer: *const u8 = std::ptr::null();
     let mut signature_length: usize = 0;
-    // SAFETY: a NUL-terminated name and two writable slots, as the export
-    // requires. On success it writes a pointer into the patch's own static
-    // storage, which stays mapped because patches are never unloaded.
+    // SAFETY: `encoded` is a NUL-terminated string and both out-parameters point
+    // at writable slots, as the export requires. On success the export writes a
+    // pointer into the patch's own static storage, which stays mapped because
+    // patches are never unloaded.
     let address = unsafe {
         resolve(
             encoded.as_ptr(),
@@ -391,20 +423,22 @@ pub(super) fn resolve_plain_in(
             "the patch reported no signature for `{lookup_name}`"
         ));
     }
-    // SAFETY: the export wrote a pointer and length describing a `&'static str`
-    // inside the loaded patch, so the bytes are readable and valid UTF-8.
+    // SAFETY: the export wrote a pointer and a length describing a `&'static
+    // str` inside the patch image, which stays loaded, so the bytes are
+    // readable for that length.
     let signature = unsafe { std::slice::from_raw_parts(signature_pointer, signature_length) };
     let signature = std::str::from_utf8(signature)
         .map_err(|_| "the patch reported a signature that is not UTF-8".to_string())?;
     Ok((address, signature.to_string()))
 }
 
-/// Every image that could carry a copy of a function, labelled for diagnostics.
+/// Returns every image that could carry a copy of a function, each with a label
+/// for diagnostics.
 ///
-/// Artifacts first, then patches. A fan-out that walked only one kind would
-/// leave the other running the body it was compiled with, so the two are
-/// deliberately not separable.
-fn every_copy<'a>(
+/// Artifacts come first, then patches. A route that visited only one kind would
+/// leave the other running the body it was compiled with, so the two kinds are
+/// deliberately kept in one iterator.
+fn every_loaded_copy<'a>(
     targets: &'a [(&'a str, &'a NativeLibrary)],
     patches: &'a [LoadedPatch],
 ) -> impl Iterator<Item = (String, PatchCopy<'a>)> + 'a {
@@ -419,43 +453,44 @@ fn every_copy<'a>(
         }))
 }
 
-/// Report a completed fan-out, or explain that it reached nothing.
+/// Reports which copies took the change, or explains that none was reached.
 ///
-/// Every fan-out shares this ending: reaching no copy at all is an error rather
-/// than a silent success, because it means the replacement is not running
-/// anywhere. The message differs by route, so it is supplied by the caller.
+/// All three routes end this way. Reaching no copy is an error rather than a
+/// silent success, because it means the replacement is not running anywhere.
+/// The wording of that error differs per route, so the caller supplies it.
 ///
 /// # Errors
 ///
-/// Fails when `reached` is empty, with the message `nothing_reached` builds.
-fn report_fan_out(
-    reached: &[String],
+/// Fails when `reached_labels` is empty, with the message `nothing_reached`
+/// builds.
+fn report_reached_copies(
+    reached_labels: &[String],
     function: &str,
     nothing_reached: impl FnOnce() -> String,
     message: &'static str,
 ) -> Result<(), String> {
-    if reached.is_empty() {
+    if reached_labels.is_empty() {
         return Err(nothing_reached());
     }
     debug!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         function,
-        artifacts = reached.join(", ").as_str(),
+        artifacts = reached_labels.join(", ").as_str(),
         message
     );
     Ok(())
 }
 
-/// Offer one replacement to every loaded image, and report how many took it.
+/// Offers one replacement to every loaded image, and reports how many took it.
 ///
 /// A crate linked into several artifacts is compiled into each of them, so the
 /// project DLL runs its own embedded copy of a module it depends on. Installing
 /// only into the module's own DLL would leave that copy running the old code,
 /// which is what would otherwise force a cascading project reload.
 ///
-/// `previous` is what those copies are running now: a refusal returns the copies
-/// it already redirected to it. `None` means generation zero, so each copy's own
-/// body is where they belong.
+/// `previous` is what those copies are running now. If one copy refuses, the
+/// copies already redirected are put back on it. `None` means generation zero,
+/// so each copy belongs on its own body.
 ///
 /// # Errors
 ///
@@ -470,17 +505,18 @@ pub(super) fn install_everywhere(
     signature: &str,
     previous: Option<(usize, &str)>,
 ) -> Result<usize, String> {
-    let copies: Vec<(String, PatchCopy<'_>)> = every_copy(targets, patches).collect();
+    let copies: Vec<(String, PatchCopy<'_>)> = every_loaded_copy(targets, patches).collect();
     install_across(&copies, qualified, address, signature, previous)
 }
 
-/// Offer one replacement to every copy in `copies`, and report how many took it.
+/// Offers one replacement to every copy in `copies`, and reports how many took
+/// it.
 ///
 /// # Errors
 ///
 /// Fails at the first refusal, after putting the copies already redirected back
-/// on what they were running. A repair that itself fails is appended to the
-/// error rather than hiding the original refusal.
+/// on what they were running. If that repair fails too, its error is appended
+/// to the refusal instead of hiding it.
 fn install_across<C: RedirectSlot>(
     copies: &[(String, C)],
     qualified: &str,
@@ -488,44 +524,45 @@ fn install_across<C: RedirectSlot>(
     signature: &str,
     previous: Option<(usize, &str)>,
 ) -> Result<usize, String> {
-    let mut installed = Vec::new();
-    let mut redirected = Vec::new();
+    let mut installed_labels = Vec::new();
+    let mut redirected_copies = Vec::new();
     for (label, copy) in copies {
         match copy.install(qualified, address, signature) {
             Ok(true) => {
-                installed.push(label.clone());
-                redirected.push(copy);
+                installed_labels.push(label.clone());
+                redirected_copies.push(copy);
             }
-            // Nothing to redirect here: this image does not link the crate, or a
-            // patch of it declares nothing.
+            // Nothing to redirect here: this image does not link the crate, or
+            // this patch declares nothing.
             Ok(false) => {}
-            // A refusal is reported rather than tolerated: leaving some
-            // artifacts patched and others not would be worse than not
-            // patching at all, and the caller falls back to a full reload.
-            // The copies that already took the replacement are returned to
-            // what they were running first, so a fan-out that failed halfway
-            // leaves no artifact running the new body while its siblings run
-            // the old one - and none silently losing a patch it already had.
+            // A refusal is reported, not tolerated: leaving some artifacts
+            // patched and others not would be worse than not patching at all,
+            // and the caller falls back to a full reload. The copies that
+            // already took the replacement are put back on what they were
+            // running, so a half-finished install leaves no artifact on the new
+            // body while its siblings run the old one, and no copy silently
+            // loses a patch it already had.
             Err(detail) => {
-                let unwind = match repair(&redirected, qualified, previous) {
-                    Ok(()) => String::new(),
-                    Err(unwind_detail) => {
-                        format!("; the partial install could not be unwound: {unwind_detail}")
-                    }
-                };
-                let reached = if installed.is_empty() {
+                let unwind_note =
+                    match restore_previous_install(&redirected_copies, qualified, previous) {
+                        Ok(()) => String::new(),
+                        Err(unwind_detail) => {
+                            format!("; the partial install could not be unwound: {unwind_detail}")
+                        }
+                    };
+                let reached_text = if installed_labels.is_empty() {
                     String::from("none")
                 } else {
-                    installed.join(", ")
+                    installed_labels.join(", ")
                 };
                 return Err(format!(
-                    "{label}: {detail}; copies already redirected: {reached}{unwind}"
+                    "{label}: {detail}; copies already redirected: {reached_text}{unwind_note}"
                 ));
             }
         }
     }
-    report_fan_out(
-        &installed,
+    report_reached_copies(
+        &installed_labels,
         qualified,
         || {
             format!(
@@ -535,28 +572,29 @@ fn install_across<C: RedirectSlot>(
         },
         "plain function redirected in every artifact that links it",
     )?;
-    // The count feeds the analytics line's `copies=` field, so a fan-out is
-    // reported rather than assumed.
-    Ok(installed.len())
+    // The count feeds the analytics line's `copies=` field, so the number of
+    // copies is measured, not assumed.
+    Ok(installed_labels.len())
 }
 
-/// Put the copies a refused fan-out redirected back on what they were running.
+/// Puts the copies a refused install already redirected back on what they were
+/// running.
 ///
 /// Generation zero - the body each artifact was built with - is only the right
 /// answer when nothing was installed before. A copy that was already running an
-/// earlier generation has to be re-aimed at that generation, or the refusal
-/// reverts a working patch while the session still records it as live.
+/// earlier generation has to be pointed at that generation again; otherwise the
+/// refusal undoes a working patch while the session still records it as live.
 ///
 /// # Errors
 ///
-/// Fails when a copy cannot be re-aimed: it no longer exports the installer, or
-/// its own shape changed.
-fn repair<C: RedirectSlot>(
-    redirected: &[&C],
+/// Fails when a copy cannot be redirected again: it no longer exports the
+/// installer, or its own shape changed.
+fn restore_previous_install<C: RedirectSlot>(
+    redirected_copies: &[&C],
     qualified: &str,
     previous: Option<(usize, &str)>,
 ) -> Result<(), String> {
-    for copy in redirected {
+    for copy in redirected_copies {
         match previous {
             Some((address, signature)) => copy.install(qualified, address, signature),
             None => copy.reset(qualified),
@@ -565,7 +603,7 @@ fn repair<C: RedirectSlot>(
     Ok(())
 }
 
-/// Ask a loaded prologue patch where its replacement body lives.
+/// Asks a loaded prologue patch where its replacement body lives.
 ///
 /// # Errors
 ///
@@ -573,8 +611,7 @@ fn repair<C: RedirectSlot>(
 pub(super) fn resolve_patch_address(library: &Library) -> Result<usize, String> {
     type AddressFn = unsafe extern "C" fn() -> usize;
     // SAFETY: every prologue patch the host generates exports this symbol with
-    // exactly this C ABI signature, and the borrow ends before the library is
-    // moved.
+    // exactly this C ABI signature, so reading it as `AddressFn` is valid.
     let resolve: Symbol<AddressFn> =
         unsafe { library.get(PATCH_ADDRESS_EXPORT) }.map_err(|_| {
             format!(
@@ -593,9 +630,9 @@ pub(super) fn resolve_patch_address(library: &Library) -> Result<usize, String> 
 
 /// The check one reachable copy must pass before its prologue is overwritten.
 ///
-/// Pure, so the policy is pinned by tests without a patch image: a copy that
-/// cannot report a declaration is refused - not exempted - and a copy whose
-/// declaration differs from the edit's is refused with both shapes named.
+/// A pure function, so the policy can be pinned by tests without a patch image:
+/// a copy that cannot report a declaration is refused, not exempted, and a copy
+/// whose declaration differs from the edit's is refused with both shapes named.
 ///
 /// # Errors
 ///
@@ -604,41 +641,42 @@ pub(super) fn resolve_patch_address(library: &Library) -> Result<usize, String> 
 fn check_recorded_declaration(
     label: &str,
     qualified: &str,
-    recorded: Option<&str>,
-    expected: &str,
+    recorded_declaration: Option<&str>,
+    expected_declaration: &str,
 ) -> Result<(), String> {
-    let Some(recorded) = recorded else {
+    let Some(recorded_declaration) = recorded_declaration else {
         return Err(format!(
             "{label}: `{qualified}` carries no recorded declaration, so its shape \
              cannot be checked before its prologue is overwritten; rebuild {label} \
              so its build-script inventory records one"
         ));
     };
-    if recorded != expected {
+    if recorded_declaration != expected_declaration {
         return Err(format!(
-            "{label}: `{qualified}` was built as `{recorded}` but the edit \
-             declares `{expected}`; refusing to redirect callers compiled for \
+            "{label}: `{qualified}` was built as `{recorded_declaration}` but the edit \
+             declares `{expected_declaration}`; refusing to redirect callers compiled for \
              the old shape"
         ));
     }
     Ok(())
 }
 
-/// Redirect every loaded copy of one function by overwriting its prologue.
+/// Redirects every loaded copy of one function by overwriting its prologue.
 ///
 /// This is the macro-free route. Nothing in the running artifact was prepared
 /// for the patch: the host asks each artifact for the function's address
-/// through its build-script inventory and writes a jump over the first bytes.
+/// through its build-script inventory, then writes a jump over the function's
+/// first bytes.
 ///
-/// The safety contract is the caller's: this must run at a frame boundary, on
-/// the thread that runs the frame loop, with no system executing - which is
-/// exactly where the fast path is invoked from.
+/// The thread contract is the caller's: run this at a frame boundary, on the
+/// thread that runs the frame loop, with no system executing. That is where the
+/// fast path is invoked from.
 ///
 /// # Errors
 ///
 /// Fails when a reachable copy's declaration is missing or differs from the
 /// edit's, and when writing a prologue fails. Either way nothing is left
-/// patched: the first pass writes nothing, and the second unwinds what it wrote.
+/// patched: the first pass writes nothing, and the second undoes what it wrote.
 pub(super) fn prologue_patch_everywhere(
     targets: &[(&str, &NativeLibrary)],
     patches: &[LoadedPatch],
@@ -646,32 +684,33 @@ pub(super) fn prologue_patch_everywhere(
     replacement: usize,
     expected_signature: &str,
 ) -> Result<Vec<PrologueRestore>, String> {
-    // Step 1: resolve every copy and check the shapes, before a single prologue
-    // is rewritten. A refusal then fires while the process is still untouched -
-    // with a write-as-you-go fan-out, the copy visited first would have to be
-    // patched and then unpatched again when a later copy refuses.
+    // Step 1: find every copy and check the declarations before a single
+    // prologue is rewritten. A refusal then fires while the process is still
+    // untouched. If instead each copy were patched as it was found, the first
+    // copy would have to be patched and then unpatched again when a later copy
+    // refuses.
     let mut reachable = Vec::new();
-    for (label, copy) in every_copy(targets, patches) {
+    for (label, copy) in every_loaded_copy(targets, patches) {
         let Some((address, signature)) = copy.function_address(qualified) else {
             // Nothing to overwrite here: this image does not link the crate, or
-            // a patch of it declares nothing.
+            // this patch declares nothing.
             continue;
         };
 
-        // The gate. Overwriting a function's first bytes can check nothing
-        // about what it jumps to, so the shape has to be checked before the
-        // write - and checked against what THIS artifact was built with, not
-        // against another copy. A copy that cannot report a declaration at all
-        // is refused rather than exempted: an absent signature passing the gate
-        // silently is exactly how a stale staged artifact would be patched.
-        // Classification should already have refused a changed signature; this
-        // is what catches it having been wrong.
+        // The gate. Overwriting a function's first bytes does not check what
+        // it jumps to, so the declaration has to be checked before the write,
+        // against what THIS artifact was built with and not against another
+        // copy. A copy that cannot report a declaration is refused rather than
+        // exempted: a missing signature that passed silently is exactly how a
+        // stale staged artifact would get patched. Classification should
+        // already have refused a changed signature; this catches it when it
+        // was wrong.
         check_recorded_declaration(&label, qualified, signature.as_deref(), expected_signature)?;
         reachable.push((label, address, copy));
     }
 
-    // Step 2: write, unwinding if a write itself fails - the one case the check
-    // above cannot rule out.
+    // Step 2: write the jumps. A failed write is undone, which is the one case
+    // the check above cannot rule out.
     let mut restores: Vec<PrologueRestore> = Vec::new();
     for (label, address, copy) in reachable {
         // SAFETY: `address` came from the artifact's own inventory, so it names
@@ -686,9 +725,9 @@ pub(super) fn prologue_patch_everywhere(
                 original,
             }),
             Err(detail) => {
-                // Say how widespread the cause is, so a refusal reads as a
-                // diagnosis rather than a dead end. Only an artifact carries the
-                // diagnostic export, so a patch contributes nothing here.
+                // Report how widespread the cause is, so a refusal says more
+                // than "no". Only an artifact has the diagnostic export, so a
+                // patch adds no coverage here.
                 let coverage = copy
                     .extent_coverage()
                     .map(|(known, total)| {
@@ -697,11 +736,13 @@ pub(super) fn prologue_patch_everywhere(
                         )
                     })
                     .unwrap_or_default();
-                // Undo whatever already landed, so a failure never leaves the
-                // process half-patched.
+                // Undo every write that already happened, so a failure never
+                // leaves the process half-patched.
                 for restore in restores.iter().rev() {
-                    // SAFETY: the same contract, with bytes this function saved
-                    // moments ago from that exact address.
+                    // SAFETY: the same contract as the write above:
+                    // `restore.address` is the address this function just
+                    // patched, so it still names that function, and
+                    // `restore.original` is exactly the bytes read from it.
                     let _ = unsafe {
                         pill_engine::hot_patch::restore_prologue(restore.address, &restore.original)
                     };
@@ -710,12 +751,12 @@ pub(super) fn prologue_patch_everywhere(
             }
         }
     }
-    let reached: Vec<String> = restores
+    let reached_labels: Vec<String> = restores
         .iter()
         .map(|restore| restore.artifact.clone())
         .collect();
-    report_fan_out(
-        &reached,
+    report_reached_copies(
+        &reached_labels,
         qualified,
         || {
             format!(
@@ -728,11 +769,11 @@ pub(super) fn prologue_patch_everywhere(
     Ok(restores)
 }
 
-/// Return one function to its own body in every image that declares it.
+/// Returns one function to its own body in every image that declares it.
 ///
 /// The counterpart of [`install_everywhere`] for a rollback to generation zero.
-/// A plain function has one baseline per artifact, so each is asked to empty
-/// its own slot rather than being handed an address belonging to another.
+/// A plain function has one baseline per artifact, so each artifact is asked to
+/// empty its own slot instead of being handed an address from another one.
 ///
 /// # Errors
 ///
@@ -742,16 +783,16 @@ pub(super) fn reset_everywhere(
     patches: &[LoadedPatch],
     qualified: &str,
 ) -> Result<(), String> {
-    let mut restored = Vec::new();
-    for (label, copy) in every_copy(targets, patches) {
+    let mut restored_labels = Vec::new();
+    for (label, copy) in every_loaded_copy(targets, patches) {
         match copy.reset_plain_function(qualified) {
-            Ok(true) => restored.push(label),
+            Ok(true) => restored_labels.push(label),
             Ok(false) => {}
             Err(detail) => return Err(format!("{label}: {detail}")),
         }
     }
-    report_fan_out(
-        &restored,
+    report_reached_copies(
+        &restored_labels,
         qualified,
         || format!("no loaded artifact declares `{qualified}`"),
         "plain function restored to its original body in every artifact",
@@ -770,25 +811,25 @@ mod tests {
 
     /// A stand-in for one loaded image's redirect slot.
     ///
-    /// The slot holds an address; the tests use the generation number as the
-    /// address, so "where does this copy point" reads as "what is it running".
+    /// The slot holds an address, and the tests use the generation number as
+    /// that address, so reading where a copy points also tells what it runs.
     struct FakeCopy {
         generation: Cell<u32>,
-        refuses: bool,
+        refuses_replacement: bool,
     }
 
     impl FakeCopy {
         fn new(generation: u32) -> Self {
             Self {
                 generation: Cell::new(generation),
-                refuses: false,
+                refuses_replacement: false,
             }
         }
 
         fn refusing() -> Self {
             Self {
                 generation: Cell::new(0),
-                refuses: true,
+                refuses_replacement: true,
             }
         }
     }
@@ -800,7 +841,7 @@ mod tests {
             address: usize,
             _signature: &str,
         ) -> Result<bool, String> {
-            if self.refuses {
+            if self.refuses_replacement {
                 return Err(String::from("`demo::function` changed shape"));
             }
             self.generation.set(address as u32);
@@ -813,7 +854,7 @@ mod tests {
         }
     }
 
-    /// A fan-out that fails halfway must leave every copy on the generation it
+    /// An install that fails halfway must leave every copy on the generation it
     /// was running, not on the code its artifact was built with.
     ///
     /// Generation zero is only the right answer when nothing was installed
@@ -842,8 +883,8 @@ mod tests {
         );
     }
 
-    /// With nothing installed before, a refused fan-out does return the copies
-    /// it reached to the body their artifact was built with.
+    /// With nothing installed before, a refused install does put the copies it
+    /// reached back on the body their artifact was built with.
     #[test]
     fn a_refused_fan_out_with_no_earlier_generation_restores_the_original_bodies() {
         let copies = vec![
@@ -860,7 +901,7 @@ mod tests {
         );
     }
 
-    /// A reachable copy whose declaration is missing is refused, not waved
+    /// A reachable copy whose declaration is missing is refused, not let
     /// through: the gate is the only check the prologue route can make, so
     /// "no data" has to mean "no write".
     #[test]

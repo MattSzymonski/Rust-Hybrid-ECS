@@ -3,30 +3,31 @@
 //! # Responsibilities
 //!
 //! - Generate `generated/<module>_Components.g.cs` inside each extension that
-//!   exposes a managed surface - its components, its mirrored value types, the
-//!   object classes, enums and resource markers its type rows declare, and its
-//!   mirrored free functions - from that surface's real registered descriptors
-//!   (name, size, alignment, field layout).
-//! - Keep the declaration with the module: nothing is hand-written in the C#
-//!   project, so the generated file derives entirely from what the Rust module
-//!   itself registered.
+//!   exposes a managed surface: its components, its `#[derive(PillMirror)]`
+//!   value types, the object classes, enums and resource markers its type rows
+//!   declare, and its mirrored free functions. Everything comes from the
+//!   descriptors the module itself registered - name, size, alignment and
+//!   field layout.
+//! - Write the declaration into the module's own folder: nothing in the C#
+//!   project is hand-written, so the file derives only from what the Rust
+//!   module registered.
 //!
 //! # Design
 //!
 //! A component with a registered field layout becomes a `LayoutKind.Explicit`
-//! struct with one field per descriptor; one with no field metadata becomes an
-//! opaque `[StructLayout(LayoutKind.Sequential, Size = N)]` blob whose sole
-//! field is an alignment pad. Both expose the live bytes as a `Raw` span in
-//! safe code, and the explicit struct also pads where its fields alone would
-//! not give it the module's alignment. The host compares the mirror's size and
-//! alignment against the module binding when the managed manifest is
-//! registered, so a generator bug cannot silently produce a mismatched mirror.
+//! struct whose fields sit at the descriptor's byte offsets; a component with
+//! no field metadata becomes an opaque
+//! `[StructLayout(LayoutKind.Sequential, Size = N)]` struct whose only field
+//! is an alignment pad. Both expose the live bytes as a `Raw` span in safe
+//! code. The explicit struct also adds a pad when its fields alone would not
+//! give it the module's alignment. When the managed manifest is registered,
+//! the host compares the mirror's size and alignment with the module binding,
+//! so a generator bug cannot ship a mismatched mirror silently.
 //!
 //! The file is regenerated on every startup and module reload of a C# project.
-//! A committed copy serves as a bootstrap so standalone C# builds (IDE,
-//! `dotnet build`, the C# runtime regression tests) compile without a prior
-//! host run; identical content is left untouched, so a matching module keeps
-//! the tree clean.
+//! A committed copy lets standalone C# builds (IDE, `dotnet build`, the C#
+//! runtime regression tests) compile without a prior host run. Identical
+//! content is left untouched, so a matching module keeps the tree clean.
 
 // Standard library
 use std::path::Path;
@@ -47,11 +48,12 @@ use super::mirror_codegen;
 
 /// C# reserved keywords that cannot name a parameter.
 ///
-/// A Rust argument may legally be named like any of these (`event`, `string`,
-/// `ref`, ...) because Rust reserves a different set of words. Emitting it
-/// verbatim would make the generated project fail to compile, so such an
-/// argument falls back to a positional `argN` name (clearer in generated code
-/// than `@`-escaping, and immune to future keyword additions).
+/// A Rust argument can legally carry one of these words (`event`, `string`,
+/// `object`, ...), because Rust's keyword list is different. Emitting it
+/// verbatim would stop the generated project from compiling, so such an
+/// argument falls back to a positional `argN` name. That reads better in
+/// generated code than `@`-escaping, and it keeps working when C# adds a
+/// keyword.
 const CSHARP_RESERVED_KEYWORDS: &[&str] = &[
     "abstract",
     "as",
@@ -136,11 +138,11 @@ const CSHARP_RESERVED_KEYWORDS: &[&str] = &[
 // Types
 // =============================================================================
 
-/// One nested C# struct definition to emit, deduplicated by Rust path.
+/// One nested C# struct to write out, keyed by the Rust path it came from.
 struct EmittedStruct {
-    /// Rust qualified path the definition was generated from.
+    /// Rust path (written with `::`) the definition was generated from.
     qualified: String,
-    /// Full C# struct text (without the namespace wrapper).
+    /// Full C# struct text, without the namespace wrapper.
     definition: String,
 }
 
@@ -148,12 +150,12 @@ struct EmittedStruct {
 // Free Functions
 // =============================================================================
 
-/// C# primitive whose alignment drives the generated struct's alignment.
+/// The C# primitive used as a pad field to force a struct's alignment.
 ///
-/// A struct with no fields defaults to 1-byte alignment in C# regardless of
-/// `Size`, so a single private pad field of a matching-alignment primitive is
-/// emitted to make the runtime's field-walk layout measurement report the
-/// alignment the module registered.
+/// A C# struct with no fields has 1-byte alignment, whatever its `Size` says.
+/// The generator therefore adds one private pad field of the primitive that
+/// matches the module's alignment, so the runtime's layout check, which reads
+/// alignment off the fields, reports the registered value.
 fn alignment_primitive(align: usize) -> Option<&'static str> {
     match align {
         1 => Some("byte"),
@@ -164,41 +166,42 @@ fn alignment_primitive(align: usize) -> Option<&'static str> {
     }
 }
 
-/// Split a derived C#-facing name (`pill_spline.Spline`) into its namespace and
-/// type-name halves.
+/// Splits a C# name such as `pill_spline.Spline` into its namespace and its
+/// type name.
 fn split_csharp_name(csharp_name: &str) -> Option<(&str, &str)> {
     let dot = csharp_name.rfind('.')?;
     Some((&csharp_name[..dot], &csharp_name[dot + 1..]))
 }
 
-/// The namespace a `::`-qualified Rust path lives in: every segment before the
-/// last, joined with dots (`pill_dummy_color::Tint` gives `pill_dummy_color`).
-/// `None` when the path has no separator.
+/// Returns the C# namespace of a Rust path: every segment before the last,
+/// joined with dots (`pill_dummy_color::Tint` gives `pill_dummy_color`).
+///
+/// Returns `None` when the path has no `::` separator.
 fn path_namespace(qualified: &str) -> Option<String> {
     qualified
         .rfind("::")
         .map(|separator| qualified[..separator].replace("::", "."))
 }
 
-/// Generate `<module>_Components.g.cs` inside the extension's `generated`
-/// directory for the surface the module exposes to managed code: its exposed
-/// components, its `#[derive(PillMirror)]` value types, the types its type rows
-/// declare, and its `#[pill_mirror_fn]` free functions.
+/// Generates `<module>_Components.g.cs` in the extension's `generated`
+/// directory, covering the surface the module exposes to managed code: its
+/// exposed components, its `#[derive(PillMirror)]` value types, the types its
+/// type rows declare, and its `#[pill_mirror_fn]` free functions.
 ///
 /// Returns `Ok(true)` when the mirror file was written or removed, and
-/// `Ok(false)` when the existing file already matched what this call would
-/// generate. The change flag lets the reload path queue a C# project rebuild
-/// only when the module's mirror surface actually moved.
+/// `Ok(false)` when the file on disk already matched what this call would
+/// generate. The caller uses the flag to rebuild the C# project only when what
+/// C# can see has changed.
 ///
 /// # Errors
 ///
 /// Returns a message when an exposed component's derived name has no
-/// namespace, a field layout cannot be expressed in C# (an alignment above 8,
+/// namespace; a field layout cannot be expressed in C# (an alignment above 8,
 /// a field outside the type, overlapping siblings, an array whose count does
-/// not divide its size, an unsupported type tag), a container field has no
-/// published accessor or trampoline, two mirrored types collide on one C# name,
-/// a declared value type disagrees with the field using it, a declared type or
-/// mirrored member cannot be emitted, or a file operation fails.
+/// not divide its size, an unsupported type tag); a container field has no
+/// published accessor or trampoline; two mirrored types collide on one C#
+/// name; a declared value type disagrees with the field using it; a declared
+/// type or mirrored member cannot be emitted; or a file operation fails.
 pub(crate) fn generate_module_components_csharp(
     workspace_root: &Path,
     module_name: &str,
@@ -217,14 +220,14 @@ pub(crate) fn generate_module_components_csharp(
     )
 }
 
-/// Generate `generated/<module_name>_Components.g.cs` inside `crate_root`.
+/// Writes `generated/<module_name>_Components.g.cs` inside `crate_root`.
 ///
-/// The implementation behind [`generate_module_components_csharp`], taking the
-/// directory that holds the module's `generated/` folder directly.
+/// This is the implementation behind [`generate_module_components_csharp`]. It
+/// takes the directory that holds the module's `generated/` folder directly.
 ///
 /// # Errors
 ///
-/// As [`generate_module_components_csharp`].
+/// Returns the same errors as [`generate_module_components_csharp`].
 pub(crate) fn generate_components_csharp(
     crate_root: &Path,
     module_name: &str,
@@ -236,11 +239,10 @@ pub(crate) fn generate_components_csharp(
     let generated_dir = crate_root.join("generated");
     let output_path = generated_dir.join(format!("{module_name}_Components.g.cs"));
 
-    // Step 1: drop the mirror file when the module has no managed surface at
-    // all - no exposed components, no mirrored value types, no mirrored free
-    // functions and no declared types. A surface that stopped being exposed
-    // must not linger in the C# project, where it would compile against a
-    // binding that no longer exists.
+    // Step 1: when the module exposes nothing to managed code - no components,
+    // no value types, no free functions and no declared types - delete the
+    // mirror file. A surface that went away must not stay in the C# project,
+    // where it would compile against a binding that no longer exists.
     let has_free_functions = methods.iter().any(|method| method.is_free_function);
     let has_declared_types = methods
         .iter()
@@ -258,11 +260,11 @@ pub(crate) fn generate_components_csharp(
     std::fs::create_dir_all(&generated_dir)
         .map_err(|error| format!("cannot create {}: {error}", generated_dir.display()))?;
 
-    // Step 2: render the whole file into `content` - the usings, the declared
-    // types, the nested value-type and component namespaces, then the free
-    // functions.
-    let mut content = String::new();
-    content.push_str(
+    // Step 2: write the whole file into `generated_file_text`: the usings, the
+    // nested value-type and component namespaces, the declared types, then the
+    // free functions.
+    let mut generated_file_text = String::new();
+    generated_file_text.push_str(
         "// AUTO-GENERATED by the Rust host from this extension's registered metadata.\n\
          // Do not edit: derived from the components, mirrored value types, declared\n\
          // types and mirrored free functions the module itself declares.\n\
@@ -278,17 +280,17 @@ pub(crate) fn generate_components_csharp(
          using System.Runtime.InteropServices;\n\n",
     );
 
-    // The namespace every value type is emitted in, decided before anything is
-    // emitted so a generated signature can name a value type by its full name
-    // from any namespace (an object class taking a `MeshVertex` span, say).
+    // The namespace each value type is written into. It is decided up front so
+    // that any generated signature can name a value type in full, from any
+    // namespace - an object class taking a `MeshVertex` span, for example.
     let value_namespaces = value_type_namespaces(module_name, exposed, value_types);
     let scope = mirror_codegen::MirrorScope::new(methods, value_types, &|type_name| {
         value_namespaces.get(type_name).cloned()
     })?;
 
-    // Nested `#[derive(PillMirror)]` struct definitions, deduplicated by Rust
-    // qualified path and pushed in dependency order, so concatenating them in
-    // order always compiles. Emitted once per file, before the components.
+    // Nested `#[derive(PillMirror)]` structs, one per Rust path, added in
+    // dependency order so that writing them out in order always compiles. Each
+    // is emitted once per file, before the components that use it.
     let mut nested_definitions: Vec<EmittedStruct> = Vec::new();
     let mut component_blocks: Vec<(String, String)> = Vec::new();
 
@@ -299,14 +301,14 @@ pub(crate) fn generate_components_csharp(
                 component.csharp_name
             )
         })?;
-        // Components registered with the derive carry a typed field layout;
-        // everything else keeps the opaque ABI blob.
-        let body = if component.fields.is_empty() {
+        // Components registered by the derive carry a typed field layout; all
+        // others get the opaque ABI blob.
+        let component_struct_text = if component.fields.is_empty() {
             emit_blob_component(name, component.size, component.align)?
         } else {
-            // The C# name is the Rust path with `::` replaced by `.`, so
-            // mapping the dots back recovers the name the accessor rows carry
-            // and the path mirrored methods resolve against.
+            // The C# name is the Rust path with `::` turned into `.`, so
+            // turning the dots back recovers the name the accessor rows use and
+            // the path that mirrored methods resolve against.
             let rust_type_name = component.csharp_name.replace('.', "::");
             emit_typed_struct(
                 name,
@@ -322,13 +324,12 @@ pub(crate) fn generate_components_csharp(
                 &scope,
             )?
         };
-        component_blocks.push((namespace.to_string(), body));
+        component_blocks.push((namespace.to_string(), component_struct_text));
     }
 
-    // Mirror every plain value type the module declared, not just the ones a
-    // component referenced, so `#[derive(PillMirror)]` on its own is enough to
-    // expose a type to C#. Referenced types are already in `nested_definitions`
-    // and are skipped here.
+    // Write out every value type the module declared, not only the ones a
+    // component references, so `#[derive(PillMirror)]` alone exposes a type to
+    // C#. Types already in `nested_definitions` are skipped here.
     for value_type in value_types {
         if nested_definitions
             .iter()
@@ -365,9 +366,9 @@ pub(crate) fn generate_components_csharp(
         });
     }
 
-    // Each nested definition goes to the namespace the pre-pass chose for it;
-    // an opaque stand-in (a type no descriptor declares) goes beside the
-    // components that use it.
+    // Each nested definition goes to the namespace chosen for it above. An
+    // opaque stand-in - a type no descriptor declares - goes beside the
+    // component that uses it.
     let default_namespace = default_value_namespace(module_name, exposed);
     let nested_namespaces: Vec<String> = nested_definitions
         .iter()
@@ -380,17 +381,17 @@ pub(crate) fn generate_components_csharp(
         })
         .collect();
     for (nested, namespace) in nested_definitions.iter().zip(&nested_namespaces) {
-        content.push_str(&format!(
+        generated_file_text.push_str(&format!(
             "namespace {namespace} {{\n\n{}\n\n}}\n\n",
             nested.definition
         ));
     }
     // A component in another namespace sees those types through `using`, so a
-    // field typed with one compiles wherever it was declared.
+    // field of one of those types compiles wherever it was declared.
     let mut nested_namespace_set: Vec<&String> = nested_namespaces.iter().collect();
     nested_namespace_set.sort();
     nested_namespace_set.dedup();
-    for (namespace, body) in &component_blocks {
+    for (namespace, component_struct_text) in &component_blocks {
         let usings: String = nested_namespace_set
             .iter()
             .filter(|nested| **nested != namespace)
@@ -401,22 +402,23 @@ pub(crate) fn generate_components_csharp(
         } else {
             format!("{usings}\n")
         };
-        content.push_str(&format!(
-            "namespace {namespace} {{\n\n{usings}{body}\n\n}}\n\n"
+        generated_file_text.push_str(&format!(
+            "namespace {namespace} {{\n\n{usings}{body}\n\n}}\n\n",
+            body = component_struct_text
         ));
     }
 
-    // The object classes, enums and resource markers the module's type rows
-    // declare, each in its crate's root namespace.
+    // The object classes, enums and resource markers declared by the module's
+    // type rows, each in its crate's root namespace.
     for declared in &scope.declared {
-        content.push_str(&mirror_codegen::emit_declared_type(
+        generated_file_text.push_str(&mirror_codegen::emit_declared_type(
             declared, methods, &scope,
         )?);
     }
 
     // `#[pill_mirror_fn]` free functions become one static class per declaring
-    // module, after the struct mirrors. The methods are sorted by module path
-    // then name upstream, so grouping is a single scan.
+    // module, written after the struct mirrors. Upstream code sorts the methods
+    // by module path and then name, so one scan groups them.
     if has_free_functions {
         let free_functions: Vec<&ResolvedMirrorMethod> = methods
             .iter()
@@ -431,7 +433,7 @@ pub(crate) fn generate_components_csharp(
             {
                 group_end += 1;
             }
-            content.push_str(&mirror_codegen::emit_free_function_class(
+            generated_file_text.push_str(&mirror_codegen::emit_free_function_class(
                 module_path,
                 &free_functions[group_start..group_end],
                 &scope,
@@ -440,27 +442,27 @@ pub(crate) fn generate_components_csharp(
         }
     }
 
-    // Step 3: write only when the file is missing or its content differs. "Up
-    // to date" is a content comparison, not a timestamp one: a module rebuild
-    // that leaves the registered layout alone keeps the file and its mtime, so
-    // the committed bootstrap stays clean.
+    // Step 3: write only when the file is missing or its content differs.
+    // "Up to date" means the bytes match, not the timestamps: a module rebuild
+    // that leaves the registered layout alone keeps the file and its
+    // modification time, so the committed copy stays clean.
     match std::fs::read(&output_path) {
-        Ok(existing) if existing == content.as_bytes() => return Ok(false),
+        Ok(existing) if existing == generated_file_text.as_bytes() => return Ok(false),
         _ => {}
     }
 
-    std::fs::write(&output_path, content)
+    std::fs::write(&output_path, generated_file_text)
         .map_err(|error| format!("cannot write {}: {error}", output_path.display()))?;
     Ok(true)
 }
 
-/// Emit the opaque ABI-blob mirror for a component with no field metadata.
+/// Writes the opaque ABI-blob mirror for a component with no field metadata.
 ///
 /// # Errors
 ///
-/// Returns a message when `align` has no C# primitive with that alignment.
+/// Returns a message when `align` has no matching C# primitive.
 fn emit_blob_component(name: &str, size: usize, align: usize) -> Result<String, String> {
-    let align_primitive = alignment_primitive(align)
+    let pad_primitive = alignment_primitive(align)
         .ok_or_else(|| format!("unsupported alignment {align} for exposed component {name}"))?;
     Ok(format!(
         "[StructLayout(LayoutKind.Sequential, Size = {size})]\n\
@@ -476,36 +478,37 @@ fn emit_blob_component(name: &str, size: usize, align: usize) -> Result<String, 
          }}\n",
         size = size,
         align = align,
-        align_primitive = align_primitive,
+        align_primitive = pad_primitive,
     ))
 }
 
-/// Emit a typed C# struct from a compile-time field layout.
+/// Writes a typed C# struct from a compile-time field layout.
 ///
-/// `size`/`align` come from the Rust type; alignment above 8 is rejected
-/// because no C# primitive can drive it. `struct:` fields are resolved against
-/// the module's registered `#[derive(PillMirror)]` types (recursively),
-/// falling back to an opaque blob of the field's size when a type is not
-/// declared. Nested definitions are appended to `emitted` in dependency order.
+/// `size` and `align` come from the Rust type. An alignment above 8 is
+/// rejected because no C# primitive can drive it. `struct:` fields are looked
+/// up among the module's registered `#[derive(PillMirror)]` types, recursively;
+/// when a type is not declared, an opaque blob of the field's size is used
+/// instead. Nested definitions are added to `emitted_structs` in dependency
+/// order.
 ///
-/// `owner_type_name` is the component's Rust type name when this struct
-/// mirrors a component row — which is what enables the heap-field accessor
-/// members — and empty for a `PillMirror` value type. The many parameters
-/// mirror the descriptor fields plus the recursion context; clippy's argument
-/// threshold sits below this signature's count.
+/// `owner_type_name` is the component's Rust type name when the struct mirrors
+/// a component row, which turns on the heap-field accessor members. It is empty
+/// for a `PillMirror` value type. The many parameters are the descriptor fields
+/// plus the recursion context; clippy's argument threshold is lower than their
+/// count.
 ///
-/// `qualified` is the Rust path mirrored methods resolve against: a component
-/// row passes its own name, so `#[pill_mirror_impl]` methods attach to it the
-/// same way they attach to a `PillMirror` value type.
+/// `qualified` is the Rust path that mirrored methods resolve against. A
+/// component row passes its own name, so `#[pill_mirror_impl]` methods attach
+/// to it just as they attach to a `PillMirror` value type.
 ///
 /// # Errors
 ///
-/// Returns a message when a field has no size or runs past the type's bytes,
-/// an array reports zero elements or a size its count does not divide, two
-/// emitted fields overlap, a type tag or element alignment has no C# mirror, a
-/// container field has no published accessor or trampoline, a nested value
-/// type collides on its C# name or disagrees with the field using it, a
-/// mirrored member cannot be lowered, or no free range is left for the
+/// Returns a message when a field has no size or runs past the type's bytes;
+/// an array reports zero elements or a size its count does not divide; two
+/// emitted fields overlap; a type tag or element alignment has no C# mirror; a
+/// container field has no published accessor or trampoline; a nested value
+/// type collides on its C# name or disagrees with the field using it; a
+/// mirrored member cannot be lowered; or no free range is left for the
 /// alignment pad.
 #[allow(clippy::too_many_arguments)]
 fn emit_typed_struct(
@@ -514,7 +517,7 @@ fn emit_typed_struct(
     size: usize,
     align: usize,
     value_types: &[PillValueTypeDescriptor],
-    emitted: &mut Vec<EmittedStruct>,
+    emitted_structs: &mut Vec<EmittedStruct>,
     methods: &[ResolvedMirrorMethod],
     qualified: &str,
     accessors: &[ResolvedFieldAccessor],
@@ -527,18 +530,18 @@ fn emit_typed_struct(
         ));
     }
 
-    // Step 1: validate the descriptor and resolve every field to concrete C#
-    // declarations with byte offsets and element sizes.
-    let mut resolved: Vec<(String, usize, usize)> = Vec::new();
-    // The strongest alignment the emitted C# fields force; a container field
-    // contributes nothing, which is what the pad below compensates for.
+    // Step 1: check the descriptor and turn each field into a C# declaration
+    // with its byte offset and element size.
+    let mut resolved_fields: Vec<(String, usize, usize)> = Vec::new();
+    // The largest alignment the written C# fields force. A container field
+    // adds no field, so it adds nothing here; the pad below makes up for that.
     let mut emitted_alignment: usize = 1;
     let mut sorted: Vec<&ComponentFieldDescriptor> = fields.iter().collect();
     sorted.sort_by_key(|field| field.offset);
     for field in &sorted {
-        // Heap-owning containers carry no C# field: the header is an
-        // implementation detail of the Rust container, and its elements are
-        // reached through the accessor members emitted below.
+        // A Rust-owned container (`Vec`, `String`) gets no C# field: its
+        // header is private to the Rust type, and its elements are reached
+        // through the accessor members written below.
         if is_opaque_container_tag(field.type_tag) {
             continue;
         }
@@ -551,32 +554,36 @@ fn emit_typed_struct(
             ));
         }
         // An engine-owned native buffer is mirrored as its three raw words
-        // rather than skipped: `#[repr(C)]` pins the handle to `(ptr, len,
-        // cap)`, so managed code reads the live buffer straight out of the row
-        // and iterates it without a single boundary call.
+        // instead of being skipped: `#[repr(C)]` fixes the handle at `(ptr,
+        // len, cap)`, so managed code reads the live buffer out of the row and
+        // iterates it without calling across the boundary.
         if field.type_tag.starts_with("dynbuf:") {
-            let word = std::mem::size_of::<usize>();
-            if field.size != 3 * word || field.align != word {
+            let word_bytes = std::mem::size_of::<usize>();
+            if field.size != 3 * word_bytes || field.align != word_bytes {
                 return Err(format!(
                     "`DynamicBuffer` field `{}` of `{name}` is {}-byte/{}-aligned; the mirror \
                      needs the {}-byte `(ptr, len, cap)` handle of a 64-bit target",
                     field.name,
                     field.size,
                     field.align,
-                    3 * word
+                    3 * word_bytes
                 ));
             }
             let pascal = snake_to_pascal(field.name);
-            resolved.push((format!("private UIntPtr {pascal}Ptr"), field.offset, word));
-            resolved.push((
-                format!("private UIntPtr {pascal}Len"),
-                field.offset + word,
-                word,
+            resolved_fields.push((
+                format!("private UIntPtr {pascal}Ptr"),
+                field.offset,
+                word_bytes,
             ));
-            resolved.push((
+            resolved_fields.push((
+                format!("private UIntPtr {pascal}Len"),
+                field.offset + word_bytes,
+                word_bytes,
+            ));
+            resolved_fields.push((
                 format!("private UIntPtr {pascal}Cap"),
-                field.offset + 2 * word,
-                word,
+                field.offset + 2 * word_bytes,
+                word_bytes,
             ));
             emitted_alignment = emitted_alignment.max(field.align);
             continue;
@@ -615,16 +622,18 @@ fn emit_typed_struct(
             cs.to_string()
         } else if base_tag == "entity" && element_size == std::mem::size_of::<pill_engine::Entity>()
         {
-            // A reference to another entity. The runtime's own
-            // handle type is the mirror of the Rust one - same `(id, generation)`
-            // layout - so the field is typed rather than left an opaque blob.
+            // A reference to another entity. The runtime's own handle type
+            // matches the Rust one - same `(id, generation)` layout - so the
+            // field gets that type instead of an opaque blob.
             "Entity".to_string()
         } else if let Some(typed_handle) = typed_handle {
-            // An asset handle whose asset this module mirrors is typed by it,
-            // so a C# field holds a `Handle<Mesh>` a mirrored call returned.
+            // An asset handle whose asset this module mirrors takes that
+            // asset's type, so a C# field holds the `Handle<Mesh>` a mirrored
+            // call returned.
             typed_handle
         } else if let Some(qualified) = base_tag.strip_prefix("struct:") {
-            // A handle to an asset nobody mirrors stays the opaque `Handle`.
+            // An asset handle whose asset nobody mirrors stays the opaque
+            // `Handle`.
             let qualified = if qualified.starts_with("Handle<") {
                 "Handle"
             } else {
@@ -635,7 +644,7 @@ fn emit_typed_struct(
                 element_size,
                 element_align,
                 value_types,
-                emitted,
+                emitted_structs,
                 methods,
                 scope,
             )?
@@ -649,14 +658,14 @@ fn emit_typed_struct(
         if is_array {
             for index in 0..field.element_count {
                 let offset = field.offset + index * element_size;
-                resolved.push((
+                resolved_fields.push((
                     format!("public {cs_type} {pascal}{index}"),
                     offset,
                     element_size,
                 ));
             }
         } else {
-            resolved.push((
+            resolved_fields.push((
                 format!("public {cs_type} {pascal}"),
                 field.offset,
                 element_size,
@@ -664,10 +673,11 @@ fn emit_typed_struct(
         }
     }
 
-    // Step 2: siblings must not overlap - two C# fields over one byte range
-    // would be a silent data race on the same storage.
-    resolved.sort_by_key(|(_, offset, _)| *offset);
-    for pair in resolved.windows(2) {
+    // Step 2: sibling fields must not overlap. Two C# fields over one byte
+    // range would read and write the same storage, so the layout would be
+    // wrong rather than merely odd.
+    resolved_fields.sort_by_key(|(_, offset, _)| *offset);
+    for pair in resolved_fields.windows(2) {
         let (_, left_offset, left_size) = &pair[0];
         let (_, right_offset, _) = &pair[1];
         if *left_offset + *left_size > *right_offset {
@@ -678,13 +688,12 @@ fn emit_typed_struct(
         }
     }
 
-    // Step 3: raise the struct's alignment when the emitted fields cannot.
-    // C# struct alignment is driven by its fields, and a container field emits
-    // no C# field at all, so a mirror can fall short of the alignment the
-    // module registered - which the manifest registration compares. A pad with
-    // the alignment's primitive is placed over bytes no emitted field claims (a
-    // container's header region, or trailing padding), exactly as the opaque
-    // blob mirror does with its sequential pad.
+    // Step 3: raise the struct's alignment when the fields cannot. C# takes a
+    // struct's alignment from its fields, and a container field adds none, so
+    // the mirror can fall short of the alignment the module registered - the
+    // value the manifest registration checks. A pad field of the matching
+    // primitive goes over bytes no field uses (a container's header area or
+    // trailing padding), just as the opaque blob mirror pads its layout.
     let mut alignment_pad: Option<(usize, &'static str)> = None;
     if emitted_alignment < align {
         let pad_primitive = alignment_primitive(align).ok_or_else(|| {
@@ -698,7 +707,7 @@ fn emit_typed_struct(
                     "type `{name}` needs an {align}-byte alignment pad but has no free range inside its {size} bytes"
                 ));
             }
-            for (_, offset, field_size) in &resolved {
+            for (_, offset, field_size) in &resolved_fields {
                 if pad_offset < offset + field_size && *offset < pad_end {
                     pad_offset = offset + field_size;
                     continue 'search;
@@ -709,77 +718,80 @@ fn emit_typed_struct(
         alignment_pad = Some((pad_offset, pad_primitive));
     }
 
-    // Step 4: emit the struct. `Size` forces the exact Rust byte size even
-    // when trailing padding exists; `Raw` keeps the live-bytes escape hatch.
-    let mut body = String::new();
-    body.push_str(&format!(
+    // Step 4: write the struct. `Size` forces the exact Rust byte size, even
+    // with trailing padding; `Raw` keeps the escape hatch to the live bytes.
+    let mut struct_text = String::new();
+    struct_text.push_str(&format!(
         "[StructLayout(LayoutKind.Explicit, Size = {size})]\npublic partial struct {name}\n{{\n"
     ));
-    for (declaration, offset, _) in &resolved {
-        body.push_str(&format!("    [FieldOffset({offset})] {declaration};\n"));
+    for (declaration, offset, _) in &resolved_fields {
+        struct_text.push_str(&format!("    [FieldOffset({offset})] {declaration};\n"));
     }
     if let Some((pad_offset, pad_primitive)) = alignment_pad {
-        body.push_str(&format!(
+        struct_text.push_str(&format!(
             "    [FieldOffset({pad_offset})] private readonly {pad_primitive} _alignmentPad;\n"
         ));
     }
-    body.push_str(
+    struct_text.push_str(
         "    /// Live ABI bytes of this component row (safe code).\n\
          \x20\x20\x20\x20public readonly Span<byte> Raw =>\n\
          \x20\x20\x20\x20\x20\x20\x20\x20MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));\n",
     );
-    // Mirrored methods (from `#[pill_mirror_impl]`) become typed C# instance
-    // methods that call the Rust implementation through its C-ABI trampoline.
+    // Mirrored methods (from `#[pill_mirror_impl]`) become typed C# members
+    // that call the Rust implementation through its trampoline: instance
+    // methods when they take a receiver, static ones when they do not.
     if !qualified.is_empty() {
-        body.push_str(&emit_value_type_methods(qualified, methods, scope)?);
+        struct_text.push_str(&emit_value_type_methods(qualified, methods, scope)?);
     }
-    // Heap-field accessors (components only): a value type never carries a
-    // container field, so an empty owner type means nothing to emit.
+    // Heap-field accessors, for components only: a value type never carries a
+    // container field, so an empty owner type means there is nothing to write.
     if !owner_type_name.is_empty() {
-        body.push_str(&emit_heap_field_accessors(
+        struct_text.push_str(&emit_heap_field_accessors(
             name,
             owner_type_name,
             fields,
             value_types,
-            emitted,
+            emitted_structs,
             methods,
             accessors,
             scope,
         )?);
     }
-    body.push_str("}\n");
-    Ok(body)
+    struct_text.push_str("}\n");
+    Ok(struct_text)
 }
 
-/// Emit (once) the typed C# struct for a `struct:<path>` field tag.
+/// Writes the typed C# struct for a `struct:<path>` field tag, once.
 ///
-/// Resolves the path against the module's registered `#[derive(PillMirror)]`
-/// types; when the type is declared, its own field layout is emitted
-/// recursively. When it is not (an enum, a plain struct that never derived
-/// `PillMirror`, a foreign type), an opaque blob of the field's element
-/// size/alignment is emitted so the mirror still compiles and stays
-/// size-correct.
+/// The path is looked up among the module's registered `#[derive(PillMirror)]`
+/// types. A declared type is written from its own field layout, recursively.
+/// Anything else - an enum, a plain struct that never derived `PillMirror`, a
+/// foreign type - becomes an opaque blob of the field's element size and
+/// alignment, so the mirror still compiles and keeps the right size.
 ///
 /// # Errors
 ///
-/// Returns a message when two nested types map to one C# name, when a declared
-/// value type's size or alignment disagrees with the field using it, or when a
-/// recursive definition or the opaque fallback cannot be emitted.
+/// Returns a message when two nested types map to one C# name; when a declared
+/// value type's size or alignment disagrees with the field using it; or when a
+/// recursive definition or the opaque fallback cannot be written.
 fn emit_nested_struct(
     qualified: &str,
     size: usize,
     align: usize,
     value_types: &[PillValueTypeDescriptor],
-    emitted: &mut Vec<EmittedStruct>,
+    emitted_structs: &mut Vec<EmittedStruct>,
     methods: &[ResolvedMirrorMethod],
     scope: &mirror_codegen::MirrorScope,
 ) -> Result<String, String> {
     let cs_name = last_path_segment(qualified);
-    if let Some(existing) = emitted.iter().find(|entry| entry.qualified == qualified) {
-        // Already emitted for an earlier field; reuse the same C# name.
+    if let Some(existing) = emitted_structs
+        .iter()
+        .find(|entry| entry.qualified == qualified)
+    {
+        // Already written for an earlier field, so reuse that C# name.
         return Ok(last_path_segment(&existing.qualified));
     }
-    if let Some(existing) = emitted
+    if let Some(existing) = emitted_structs
         .iter()
         .find(|entry| last_path_segment(&entry.qualified) == cs_name)
     {
@@ -805,7 +817,7 @@ fn emit_nested_struct(
                 descriptor.size,
                 descriptor.align,
                 value_types,
-                emitted,
+                emitted_structs,
                 methods,
                 descriptor.type_name,
                 &[],
@@ -815,20 +827,21 @@ fn emit_nested_struct(
         }
         None => emit_opaque_struct(&cs_name, size, align)?,
     };
-    emitted.push(EmittedStruct {
+    emitted_structs.push(EmittedStruct {
         qualified: qualified.to_string(),
         definition,
     });
     Ok(cs_name)
 }
 
-/// Emit an opaque blob struct for a nested type with no `PillMirror` descriptor.
+/// Writes an opaque blob struct for a nested type with no `PillMirror`
+/// descriptor.
 ///
 /// # Errors
 ///
-/// Returns a message when `align` has no C# primitive with that alignment.
+/// Returns a message when `align` has no matching C# primitive.
 fn emit_opaque_struct(name: &str, size: usize, align: usize) -> Result<String, String> {
-    let align_primitive = alignment_primitive(align)
+    let pad_primitive = alignment_primitive(align)
         .ok_or_else(|| format!("unsupported alignment {align} for nested value type `{name}`"))?;
     Ok(format!(
         "[StructLayout(LayoutKind.Sequential, Size = {size})]\n\
@@ -842,14 +855,15 @@ fn emit_opaque_struct(name: &str, size: usize, align: usize) -> Result<String, S
          \x20\x20\x20\x20\x20\x20\x20\x20MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));\n\
          }}\n",
         size = size,
-        align_primitive = align_primitive,
+        align_primitive = pad_primitive,
     ))
 }
 
-/// The parameter name the generated C# uses for one mirrored-method argument.
+/// Returns the parameter name the generated C# uses for one mirrored-method
+/// argument.
 ///
-/// Prefers the Rust parameter name captured by the macro; falls back to a
-/// positional `argN` when the name is blank or is a C# reserved keyword.
+/// Uses the Rust parameter name the macro captured, or a positional `argN` when
+/// that name is blank or is a C# reserved keyword.
 pub(super) fn csharp_parameter_name(argument_index: usize, rust_name: &str) -> String {
     if !rust_name.is_empty() && !CSHARP_RESERVED_KEYWORDS.contains(&rust_name) {
         rust_name.to_string()
@@ -858,17 +872,17 @@ pub(super) fn csharp_parameter_name(argument_index: usize, rust_name: &str) -> S
     }
 }
 
-/// Emit the C# members that mirror a value type's (or a component row's)
+/// Writes the C# members that mirror a value type's (or a component row's)
 /// `#[pill_mirror_impl]` functions.
 ///
-/// `&self`/`&mut self` methods become instance members that hand the
+/// A `&self` or `&mut self` method becomes an instance member and hands the
 /// trampoline the receiver's live address - a component row's column slot, or
 /// the local the call was made on - so a `&mut self` method writes through to
-/// it; functions with no receiver become static members. Every member calls
-/// its trampoline through `TracyLive.MirrorCall`, which owns the pointer work,
+/// it. A function with no receiver becomes a static member. Every member calls
+/// its trampoline through `TracyLive.MirrorCall`, which does the pointer work,
 /// so the generated body compiles without `AllowUnsafeBlocks`.
 ///
-/// Returns an empty string when the value type has no mirrored functions.
+/// Returns an empty string when the type has no mirrored functions.
 ///
 /// # Errors
 ///
@@ -878,25 +892,25 @@ fn emit_value_type_methods(
     methods: &[ResolvedMirrorMethod],
     scope: &mirror_codegen::MirrorScope,
 ) -> Result<String, String> {
-    let mut output = String::new();
+    let mut members = String::new();
     if scope.declared_kind(qualified).is_some() {
-        // An object's, enum's or resource's functions are emitted on its own
+        // An object's, enum's or resource's functions are written on its own
         // declaration, never on a struct mirror.
-        return Ok(output);
+        return Ok(members);
     }
     for method in mirror_codegen::members_of(methods, qualified) {
-        output.push_str(&mirror_codegen::emit_member(
+        members.push_str(&mirror_codegen::emit_member(
             method,
             &mirror_codegen::MemberHost::ValueStruct,
             scope,
         )?);
     }
-    Ok(output)
+    Ok(members)
 }
 
-/// The namespace a value type no component references is emitted in: the first
-/// exposed component's namespace, or - when the module exposes no components -
-/// `pill_<module_name>`.
+/// Returns the namespace for a value type that no component references: the
+/// first exposed component's namespace, or `pill_<module_name>` when the module
+/// exposes no components.
 fn default_value_namespace(module_name: &str, exposed: &[ModuleExposedComponent]) -> String {
     exposed
         .first()
@@ -905,8 +919,9 @@ fn default_value_namespace(module_name: &str, exposed: &[ModuleExposedComponent]
         .unwrap_or_else(|| format!("pill_{module_name}"))
 }
 
-/// The namespace of the first component whose fields name `qualified` - used
-/// for an opaque stand-in no descriptor declares.
+/// Returns the namespace of the first component whose fields name `qualified`.
+///
+/// Used to place an opaque stand-in that no descriptor declares.
 fn opaque_namespaces(exposed: &[ModuleExposedComponent], qualified: &str) -> Option<String> {
     exposed
         .iter()
@@ -924,15 +939,14 @@ fn opaque_namespaces(exposed: &[ModuleExposedComponent], qualified: &str) -> Opt
         .map(|(namespace, _)| namespace.to_string())
 }
 
-/// Decide the namespace of every value type before anything is emitted.
+/// Works out the namespace of every value type before anything is written.
 ///
-/// A value type lives in the namespace of the first component that references
-/// it, directly or through another value type, so C# refers to
-/// `pill_spline.Vector3f` beside `pill_spline.Spline`. A value type no
-/// component references goes to the first component's namespace - or, when
-/// the module exposes no components at all, to the namespace of its own
-/// declaring module, so `#[derive(PillMirror)]` alone exposes the type where a
-/// C# project would `using` it.
+/// A value type goes into the namespace of the first component that references
+/// it, directly or through another value type, so C# sees `pill_spline.Vector3f`
+/// beside `pill_spline.Spline`. A value type no component references goes into
+/// the first component's namespace. When the module exposes no components at
+/// all, it goes into the namespace of its own declaring module, so
+/// `#[derive(PillMirror)]` alone exposes it where a C# project can `using` it.
 fn value_type_namespaces(
     module_name: &str,
     exposed: &[ModuleExposedComponent],
@@ -965,15 +979,20 @@ fn value_type_namespaces(
         }
     }
 
-    let mut assigned = std::collections::HashMap::new();
+    let mut namespaces_by_type_name = std::collections::HashMap::new();
     for component in exposed {
         if let Some((namespace, _)) = split_csharp_name(&component.csharp_name) {
-            visit(&component.fields, namespace, value_types, &mut assigned);
+            visit(
+                &component.fields,
+                namespace,
+                value_types,
+                &mut namespaces_by_type_name,
+            );
         }
     }
     let default_namespace = default_value_namespace(module_name, exposed);
     for value_type in value_types {
-        if assigned.contains_key(value_type.type_name) {
+        if namespaces_by_type_name.contains_key(value_type.type_name) {
             continue;
         }
         let namespace = if exposed.is_empty() {
@@ -981,73 +1000,76 @@ fn value_type_namespaces(
         } else {
             default_namespace.clone()
         };
-        assigned.insert(value_type.type_name.to_string(), namespace);
+        namespaces_by_type_name.insert(value_type.type_name.to_string(), namespace);
         visit(
             value_type.fields,
-            &assigned[value_type.type_name].clone(),
+            &namespaces_by_type_name[value_type.type_name].clone(),
             value_types,
-            &mut assigned,
+            &mut namespaces_by_type_name,
         );
     }
-    assigned
+    namespaces_by_type_name
 }
 
-/// Emit the C# members that reach a component's heap-owning fields.
+/// Writes the C# members that reach a component's heap-owning fields.
 ///
-/// A `Vec<E>` field becomes a count, a read-only span, a writable span, and a
-/// resize method; a `DynamicBuffer<E>` field becomes a count and two spans
-/// whose reads come straight out of the row, plus a resize method; a
-/// `Vec<String>` field becomes a count, element get/set, an append, and a
-/// resize (one boundary call per element, never a span); a `String` field
-/// becomes a getter and a setter.
+/// A `Vec<E>` field becomes a count, a read-only span, a writable span and a
+/// resize method. A `DynamicBuffer<E>` field becomes a count and two spans
+/// that read straight out of the row, plus a resize method. A `Vec<String>`
+/// field becomes a count, element get and set, an append and a resize - one
+/// boundary call per element, never a span. A `String` field becomes a getter
+/// and a setter.
 ///
-/// Each member that calls native code passes the row's address to the
-/// module's trampoline through a `MirrorMethods.Invoke*` helper, so the
-/// buffer is read and written where it lives: one boundary call per member
-/// use, none per element. Those calls go through raw C-ABI function pointers
-/// (no delegate stub, no marshalling layer), and the trampoline addresses
-/// come from a per-struct `EnsureAccessorsBound()` cache guarded by
-/// `MirrorMethods.Generation`: reloading the declaring module maps it at a
-/// fresh base address, so the addresses of the previous bind would dangle.
-/// All of it stays safe C#, so the reloadable project assembly needs no
+/// A member that calls native code passes the row's address to the module's
+/// trampoline through a `MirrorMethods.Invoke*` helper, so the buffer is read
+/// and written where it lives: one boundary call per member use, none per
+/// element. Those calls go through raw C-ABI function pointers, with no
+/// delegate stub and no marshalling layer. The trampoline addresses come from
+/// a per-struct `EnsureAccessorsBound()` cache keyed on
+/// `MirrorMethods.Generation`: a reload maps the declaring module at a fresh
+/// base address, so the addresses from the previous bind would dangle. All of
+/// it stays safe C#, so the reloadable project assembly needs no
 /// `AllowUnsafeBlocks`.
 ///
-/// Read-only members stay on the value type and address it with
-/// `MirrorMethods.AddressOf(ref Unsafe.AsRef(in this))`; reading through a
-/// copy reads the same container header, so a copy is harmless there.
+/// Read-only members stay on the value type; the ones that call native code
+/// address it with `MirrorMethods.AddressOf(ref Unsafe.AsRef(in this))`.
+/// Reading through a copy reads the same container header, so a copy is
+/// harmless there.
 ///
 /// The members that MUTATE a container header - every `Resize`, `Set` and
-/// `Push`, the calls whose trampoline reallocates through the address it is
-/// handed - are emitted on a nested `ref struct {Name}RowRef` instead, bound
-/// once to the live row with `Bind(ref row)`. A C# struct is copied on
-/// assignment, so a mutator on the value type would reallocate through the
-/// copy and leave the live row pointing at the freed block; on the row-ref
-/// type that call does not compile, and the handle itself copies as a pointer.
+/// `Push`, each of which reallocates through the address it is handed - are
+/// written on a nested `ref struct {Name}RowRef` instead, bound once to the
+/// live row with `Bind(ref row)`. A C# struct is copied on assignment, so a
+/// mutator on the value type would reallocate through the copy and leave the
+/// live row pointing at the freed block. On the row-ref type that call does
+/// not compile, and copying the handle copies only a pointer.
 ///
-/// Every span is a lease, not ownership: resizing or replacing the container
-/// invalidates it, exactly as a `&mut Vec` would in Rust.
+/// Every span is a loan, not ownership: resizing or replacing the container
+/// makes it invalid, as growing a Rust `Vec` makes its earlier slices invalid.
 ///
-/// The parameters are the descriptor fields plus the recursion context, as
-/// for [`emit_typed_struct`]; clippy's threshold is below the (internal)
+/// The parameters are the descriptor fields plus the recursion context, as in
+/// [`emit_typed_struct`]; clippy's threshold is below the (internal)
 /// signature's size.
 ///
 /// # Errors
 ///
-/// Returns a message when a container field has no published accessor, when
-/// the accessor's kind or element tag disagrees with the field, when a
-/// trampoline the generated members call was not published, or when a span's
-/// element type cannot be resolved.
+/// Returns a message when a container field has no published accessor; when the
+/// accessor's kind or element tag disagrees with the field; when a trampoline
+/// the generated members call was not published; or when a span's element type
+/// cannot be resolved.
 #[allow(clippy::too_many_arguments)]
 fn emit_heap_field_accessors(
     cs_name: &str,
     type_name: &str,
     fields: &[ComponentFieldDescriptor],
     value_types: &[PillValueTypeDescriptor],
-    emitted: &mut Vec<EmittedStruct>,
+    emitted_structs: &mut Vec<EmittedStruct>,
     methods: &[ResolvedMirrorMethod],
     accessors: &[ResolvedFieldAccessor],
     scope: &mirror_codegen::MirrorScope,
 ) -> Result<String, String> {
+    // Step 1: collect the heap-owning fields, in layout order like the typed
+    // fields, so a regenerated mirror keeps the same member order.
     let mut containers: Vec<&ComponentFieldDescriptor> = fields
         .iter()
         .filter(|field| is_heap_owned_tag(field.type_tag))
@@ -1055,22 +1077,22 @@ fn emit_heap_field_accessors(
     if containers.is_empty() {
         return Ok(String::new());
     }
-    // Layout order, like the typed fields, so a regenerated mirror keeps its
-    // member order stable.
     containers.sort_by_key(|field| field.offset);
 
-    // Trampoline addresses collected while the fields are emitted, turned
-    // into one `EnsureAccessorsBound()` per struct at the end.
+    // Trampoline addresses gathered while the fields are written, turned into
+    // one `EnsureAccessorsBound()` per struct at the end.
     let mut bound_declarations: Vec<String> = Vec::new();
     let mut bound_assignments: Vec<String> = Vec::new();
 
-    // The first container's member name, used in the row-ref type's doc
-    // example; every container has at least one mutating member.
+    // The first container's PascalCase name, used in the row-ref type's doc
+    // example.
     let example_pascal = snake_to_pascal(containers[0].name);
 
-    let mut output = String::new();
-    // Header-mutating members, emitted on the nested row-ref type at the end.
+    let mut members = String::new();
+    // Header-mutating members, written on the nested row-ref type at the end.
     let mut mutators = String::new();
+    // Step 2: write each container's read-only members and record the
+    // trampoline slots they call.
     for field in containers {
         let Some(accessor) = accessors
             .iter()
@@ -1085,8 +1107,9 @@ fn emit_heap_field_accessors(
         let pascal = snake_to_pascal(field.name);
         let camel = snake_to_camel(field.name);
         let view_operation = crate::csharp::accessor_operation_name(&accessor.field_name, "view");
-        // The generated members call these trampolines; a missing one would
-        // fail at C# call time instead of build time, so refuse here.
+        // The generated members call these trampolines. A missing one would
+        // fail when C# calls it instead of when the project builds, so refuse
+        // here.
         let require = |operation: &str, present: bool| -> Result<(), String> {
             if present {
                 Ok(())
@@ -1154,7 +1177,7 @@ fn emit_heap_field_accessors(
             bound_assignments.push(format!(
                 "        {resize_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{resize_operation}\");"
             ));
-            output.push_str(&format!(
+            members.push_str(&format!(
                 r#"
     /// Number of strings in `{field}` (Rust `Vec<String>`).
     public readonly int {pascal}Count
@@ -1240,7 +1263,7 @@ fn emit_heap_field_accessors(
                 cs_name,
                 field.name,
                 value_types,
-                emitted,
+                emitted_structs,
                 methods,
                 scope,
             )?;
@@ -1253,7 +1276,7 @@ fn emit_heap_field_accessors(
             bound_assignments.push(format!(
                 "        {resize_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{resize_operation}\");"
             ));
-            output.push_str(&format!(
+            members.push_str(&format!(
                 r#"
     /// Number of live elements in `{field}` (engine-owned `DynamicBuffer<{element_tag}>`);
     /// read straight out of the row, with no boundary call.
@@ -1297,10 +1320,10 @@ fn emit_heap_field_accessors(
                     field.name, accessor.kind
                 ));
             }
-            // The layout tag and the accessor's element tag come from the same
-            // derive, so a disagreement means the module and its registered
-            // layout drifted apart; refuse rather than emit a sized-by-guess
-            // span.
+            // The layout tag and the accessor's element tag both come from the
+            // same derive, so a mismatch means the module and its registered
+            // layout disagree. Refuse rather than write a span whose size is a
+            // guess.
             if accessor.element_tag != element_tag {
                 return Err(format!(
                     "field `{}` of `{cs_name}` is tagged `{element_tag}` but its module published \
@@ -1308,9 +1331,9 @@ fn emit_heap_field_accessors(
                     field.name, accessor.element_tag
                 ));
             }
-            // The span's element type: a primitive, or a `#[derive(PillMirror)]`
-            // struct whose descriptor supplies both the Rust size and the C#
-            // struct a `Span<T>` of it needs.
+            // The span's element type is a primitive, or a
+            // `#[derive(PillMirror)]` struct whose descriptor gives both the
+            // Rust size and the C# struct that `Span<T>` needs.
             require("view", accessor.view_address.is_some())?;
             require("resize", accessor.resize_address.is_some())?;
             let element_type = resolve_span_element_type(
@@ -1318,7 +1341,7 @@ fn emit_heap_field_accessors(
                 cs_name,
                 field.name,
                 value_types,
-                emitted,
+                emitted_structs,
                 methods,
                 scope,
             )?;
@@ -1338,7 +1361,7 @@ fn emit_heap_field_accessors(
             bound_assignments.push(format!(
                 "        {resize_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{resize_operation}\");"
             ));
-            output.push_str(&format!(
+            members.push_str(&format!(
                 r#"
     /// Number of live elements in `{field}` (Rust `Vec<{element_tag}>`).
     public readonly int {pascal}Count
@@ -1419,7 +1442,7 @@ fn emit_heap_field_accessors(
         bound_assignments.push(format!(
             "        {set_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{set_operation}\");"
         ));
-        output.push_str(&format!(
+        members.push_str(&format!(
             r#"
     /// Decoded UTF-8 text of `{field}` (Rust `String`).
     public readonly string Get{pascal}()
@@ -1449,8 +1472,9 @@ fn emit_heap_field_accessors(
             set_address = set_address,
         ));
     }
+    // Step 3: write one resolver per struct for all the recorded slots.
     if !bound_assignments.is_empty() {
-        output.push_str(&format!(
+        members.push_str(&format!(
             r#"
     private static int _accessorsBoundGeneration = -1;
 {declarations}
@@ -1473,9 +1497,10 @@ fn emit_heap_field_accessors(
             assignments = bound_assignments.join("\n"),
         ));
     }
-    // The header-mutating members, on a handle that can only name a live row.
+    // Step 4: write the header-mutating members on a handle that can only
+    // name a live row.
     if !mutators.is_empty() {
-        output.push_str(&format!(
+        members.push_str(&format!(
             r#"
     /// Borrowed handle to one live `{cs_name}` row.
     ///
@@ -1513,20 +1538,20 @@ fn emit_heap_field_accessors(
             mutators = mutators,
         ));
     }
-    Ok(output)
+    Ok(members)
 }
 
-/// Resolve the C# element type a generated span iterates.
+/// Returns the C# element type for a generated span to iterate.
 ///
-/// A primitive maps straight across; a `struct:<path>` element must be
-/// declared with `#[derive(PillMirror)]`, because that descriptor is where the
-/// span's C# struct and its size both come from.
+/// A primitive maps straight across. A `struct:<path>` element must be declared
+/// with `#[derive(PillMirror)]`, because that descriptor supplies both the C#
+/// struct and the size a span of it needs.
 ///
 /// # Errors
 ///
 /// Returns a message when a `struct:` element carries no `PillMirror`
 /// descriptor, when the tag is neither a primitive nor a struct, or when the
-/// element's own definition cannot be emitted.
+/// element's own definition cannot be written.
 fn resolve_span_element_type(
     element_tag: &str,
     cs_name: &str,
@@ -1564,9 +1589,10 @@ fn resolve_span_element_type(
     ))
 }
 
-/// Map a primitive type tag to its C# type, byte size, and alignment.
-fn cs_primitive(tag: &str) -> Option<(&'static str, usize, usize)> {
-    match tag {
+/// Returns the C# type, byte size and alignment for a primitive type tag, or
+/// `None` for a tag with no primitive mirror.
+fn cs_primitive(type_tag: &str) -> Option<(&'static str, usize, usize)> {
+    match type_tag {
         "f32" => Some(("float", 4, 4)),
         "f64" => Some(("double", 8, 8)),
         "i8" => Some(("sbyte", 1, 1)),
@@ -1577,8 +1603,8 @@ fn cs_primitive(tag: &str) -> Option<(&'static str, usize, usize)> {
         "u32" => Some(("uint", 4, 4)),
         "i64" => Some(("long", 8, 8)),
         "u64" => Some(("ulong", 8, 8)),
-        // Rust `bool` is one byte; C# `bool` is marshal-ambiguous, so the
-        // mirror exposes the raw byte.
+        // Rust `bool` takes one byte, but C# gives `bool` an ambiguous
+        // marshalled size, so the mirror exposes a plain byte.
         "bool" => Some(("byte", 1, 1)),
         "usize" => Some((
             "UIntPtr",
@@ -1594,23 +1620,23 @@ fn cs_primitive(tag: &str) -> Option<(&'static str, usize, usize)> {
     }
 }
 
-/// Convert a snake_case Rust identifier to the camelCase used for private
-/// members in C# mirrors: `entry_count` becomes `entryCount`.
-fn snake_to_camel(name: &str) -> String {
-    let pascal = snake_to_pascal(name);
-    let mut characters = pascal.chars();
+/// Returns a snake_case Rust identifier in the camelCase form used for
+/// private C# members: `entry_count` becomes `entryCount`.
+fn snake_to_camel(snake_case_name: &str) -> String {
+    let pascal_name = snake_to_pascal(snake_case_name);
+    let mut characters = pascal_name.chars();
     match characters.next() {
         Some(first) => first.to_lowercase().collect::<String>() + characters.as_str(),
         None => String::new(),
     }
 }
 
-/// Last path segment of a fully-qualified Rust type name.
-fn last_path_segment(qualified: &str) -> String {
-    qualified
+/// Returns the last segment of a fully-qualified Rust type name.
+fn last_path_segment(qualified_type_name: &str) -> String {
+    qualified_type_name
         .rsplit("::")
         .next()
-        .unwrap_or(qualified)
+        .unwrap_or(qualified_type_name)
         .to_string()
 }
 
@@ -1620,20 +1646,20 @@ fn last_path_segment(qualified: &str) -> String {
 
 /// Regression tests for the host-side C# mirror generation.
 ///
-/// Each test drives [`generate_module_components_csharp`] against a fresh temp
-/// workspace shaped like the real repo (`<root>/extensions/<module>/<module>/generated/`),
-/// covering: generated content, the alignment-pad matrix, namespace splitting,
-/// the up-to-date / missing / stale rewrite conditions, per-module file
-/// isolation, stale-file removal when a module stops exposing components,
-/// determinism, and the error paths.
+/// Each test runs [`generate_module_components_csharp`] against a fresh
+/// temporary workspace shaped like the real repository
+/// (`<root>/extensions/<module>/<module>/generated/`). They cover the
+/// generated text and its namespaces, the alignment pads, mirrored methods
+/// and heap-field accessors, the rewrite and removal conditions, per-module
+/// file isolation, deterministic output, and the error paths.
 #[cfg(test)]
 mod tests {
     use super::*;
     use pill_engine::ComponentId;
     use std::path::{Path, PathBuf};
 
-    /// Drive the codegen with the module's real signature; tests that do not
-    /// exercise mirrored methods pass an empty method table.
+    /// Runs the codegen through the module entry point; tests that exercise
+    /// no mirrored methods or accessors pass empty tables.
     fn call_codegen(
         workspace: &Path,
         module_name: &str,
@@ -1683,7 +1709,7 @@ mod tests {
         }
     }
 
-    /// Create a fresh temp workspace and the module directory under it.
+    /// Creates a fresh temporary workspace and the module directory inside it.
     fn temp_workspace(test_name: &str, module_name: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("pill_codegen_{}_{}", test_name, std::process::id()));
@@ -1694,9 +1720,9 @@ mod tests {
     }
 
     /// One exposed component with a synthetic stable identity.
-    fn exposed(name: &str, size: usize, align: usize) -> ModuleExposedComponent {
+    fn exposed(csharp_name: &str, size: usize, align: usize) -> ModuleExposedComponent {
         ModuleExposedComponent {
-            csharp_name: name.to_string(),
+            csharp_name: csharp_name.to_string(),
             component_id: ComponentId::descriptor(0xABCD_0001_0000_0001),
             size,
             align,
@@ -1706,13 +1732,13 @@ mod tests {
 
     /// One exposed component carrying a compile-time field layout.
     fn exposed_typed(
-        name: &str,
+        csharp_name: &str,
         size: usize,
         align: usize,
         fields: Vec<ComponentFieldDescriptor>,
     ) -> ModuleExposedComponent {
         ModuleExposedComponent {
-            csharp_name: name.to_string(),
+            csharp_name: csharp_name.to_string(),
             component_id: ComponentId::descriptor(0xABCD_0001_0000_0001),
             size,
             align,
@@ -1722,14 +1748,14 @@ mod tests {
 
     /// One compile-time field descriptor for a typed-mirror test.
     fn field(
-        name: &'static str,
+        field_name: &'static str,
         type_tag: &'static str,
         offset: usize,
         size: usize,
         align: usize,
     ) -> ComponentFieldDescriptor {
         ComponentFieldDescriptor {
-            name,
+            name: field_name,
             type_tag,
             offset,
             size,
@@ -1741,7 +1767,7 @@ mod tests {
 
     /// One compile-time array-field descriptor for a typed-mirror test.
     fn array_field(
-        name: &'static str,
+        field_name: &'static str,
         type_tag: &'static str,
         offset: usize,
         size: usize,
@@ -1749,7 +1775,7 @@ mod tests {
         element_count: usize,
     ) -> ComponentFieldDescriptor {
         ComponentFieldDescriptor {
-            name,
+            name: field_name,
             type_tag,
             offset,
             size,
@@ -1759,8 +1785,9 @@ mod tests {
         }
     }
 
-    /// Path of a module's mirror file inside a temp workspace shaped like the
-    /// real repo: `<root>/extensions/<module>/<module>/generated/`.
+    /// Returns the path of a module's mirror file inside a temporary workspace
+    /// shaped like the real repository:
+    /// `<root>/extensions/<module>/<module>/generated/`.
     fn generated_path(workspace: &Path, module_name: &str) -> PathBuf {
         workspace
             .join("extensions")
@@ -1792,7 +1819,7 @@ mod tests {
         },
     ];
 
-    /// Text of a module's generated mirror file, read back for assertions.
+    /// Returns the text of a module's generated mirror file for assertions.
     fn read_generated(workspace: &Path, module_name: &str) -> String {
         std::fs::read_to_string(generated_path(workspace, module_name))
             .expect("generated file is readable")
@@ -1841,8 +1868,8 @@ mod tests {
         assert!(content.contains("MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1)"));
     }
 
-    /// Multiple components from the same module land in one file, each in its
-    /// own namespace, with per-component size and alignment.
+    /// Several components from one module go into one file, each in its own
+    /// namespace, with its own size and alignment.
     #[test]
     fn generates_multiple_components_in_multiple_namespaces() {
         let workspace = temp_workspace("multi", "pill_spline");
@@ -1896,13 +1923,13 @@ mod tests {
     #[test]
     fn unsupported_alignment_is_rejected() {
         let workspace = temp_workspace("bad_align", "pill_spline");
-        let result = call_codegen(
+        let codegen_result = call_codegen(
             &workspace,
             "pill_spline",
             &[exposed("pill_spline.Spline", 16, 3)],
             &[],
         );
-        let error = result.expect_err("alignment 3 is unsupported");
+        let error = codegen_result.expect_err("alignment 3 is unsupported");
         assert!(error.contains("unsupported alignment"));
         assert!(
             !generated_path(&workspace, "pill_spline").exists(),
@@ -1914,13 +1941,14 @@ mod tests {
     #[test]
     fn name_without_namespace_is_rejected() {
         let workspace = temp_workspace("no_namespace", "pill_spline");
-        let result = call_codegen(&workspace, "pill_spline", &[exposed("Spline", 4, 4)], &[]);
-        let error = result.expect_err("a name without '.' cannot be namespaced");
+        let codegen_result =
+            call_codegen(&workspace, "pill_spline", &[exposed("Spline", 4, 4)], &[]);
+        let error = codegen_result.expect_err("a name without '.' cannot be namespaced");
         assert!(error.contains("no namespace separator"));
     }
 
-    /// A typed component emits an explicit-layout struct with one C# field per
-    /// Rust field, each carrying its byte offset, plus the Raw accessor.
+    /// A typed component's plain fields each become one C# field at their byte
+    /// offset, inside an explicit-layout struct with the Raw accessor.
     #[test]
     fn typed_mirror_emits_explicit_fields() {
         let workspace = temp_workspace("typed", "pill_spline");
@@ -2011,19 +2039,17 @@ mod tests {
 
     /// A file spanning two namespaces puts a nested type beside the component
     /// that uses it, not beside whichever component came first, and lets the
-    /// other namespace see it through `using`. The renderer data's mirror is
-    /// such a file: `pill_engine` components first, then renderer components
-    /// holding asset handles.
+    /// other namespace see it through `using`.
     #[test]
     fn a_nested_type_lives_in_the_namespace_of_its_first_user() {
         let workspace = temp_workspace("namespaces", "pill_spline");
-        let first = exposed_typed(
+        let first_component = exposed_typed(
             "pill_engine.common_components.TransformComponent",
             40,
             4,
             vec![field("translation", "f32", 0, 12, 4)],
         );
-        let second = exposed_typed(
+        let second_component = exposed_typed(
             "pill_master_renderer.component.Path",
             16,
             4,
@@ -2039,7 +2065,13 @@ mod tests {
             align: 4,
             fields: VECTOR2F_FIELDS,
         }];
-        call_codegen(&workspace, "pill_spline", &[first, second], &value_types).unwrap();
+        call_codegen(
+            &workspace,
+            "pill_spline",
+            &[first_component, second_component],
+            &value_types,
+        )
+        .unwrap();
 
         let content = read_generated(&workspace, "pill_spline");
         assert!(content.contains(
@@ -2051,9 +2083,9 @@ mod tests {
         assert!(!content.contains("namespace pill_master_renderer.component {\n\nusing"));
     }
 
-    /// A `struct:` field with no `PillMirror` descriptor (a foreign type, an
-    /// enum, or a struct that never derived) degrades to an opaque blob of the
-    /// field's size so the mirror still compiles and stays size-correct.
+    /// A `struct:` field with no `PillMirror` descriptor - a foreign type, an
+    /// enum, or a struct that never derived the trait - becomes an opaque blob
+    /// of the field's size, so the mirror still compiles with the right size.
     #[test]
     fn typed_mirror_falls_back_to_opaque_nested() {
         let workspace = temp_workspace("opaque", "pill_spline");
@@ -2071,8 +2103,8 @@ mod tests {
         assert!(content.contains("[FieldOffset(0)] public Vec3 Foreign;"));
     }
 
-    /// An array of nested structs resolves each element through the inventory
-    /// and validates the element size against the descriptor.
+    /// An array of nested structs resolves each element through the registered
+    /// value types and checks the element size against the descriptor.
     #[test]
     fn typed_mirror_handles_arrays_of_nested_structs() {
         let workspace = temp_workspace("array_nested", "pill_spline");
@@ -2122,8 +2154,8 @@ mod tests {
             align: 4,
             fields: VECTOR2F_FIELDS,
         }];
-        let result = call_codegen(&workspace, "pill_spline", &[component], &value_types);
-        let error = result.expect_err("a size mismatch must be rejected");
+        let codegen_result = call_codegen(&workspace, "pill_spline", &[component], &value_types);
+        let error = codegen_result.expect_err("a size mismatch must be rejected");
         assert!(error.contains("rebuild the module"));
     }
 
@@ -2184,8 +2216,8 @@ mod tests {
             4,
             vec![field("a", "u64", 0, 8, 8), field("b", "u32", 4, 4, 4)],
         );
-        let result = call_codegen(&workspace, "pill_spline", &[component], &[]);
-        let error = result.expect_err("overlapping fields must be rejected");
+        let codegen_result = call_codegen(&workspace, "pill_spline", &[component], &[]);
+        let error = codegen_result.expect_err("overlapping fields must be rejected");
         assert!(error.contains("overlap"));
     }
 
@@ -2199,8 +2231,8 @@ mod tests {
             4,
             vec![field("a", "u32", 0, 4, 4), field("b", "u32", 4, 4, 4)],
         );
-        let result = call_codegen(&workspace, "pill_spline", &[component], &[]);
-        let error = result.expect_err("an out-of-bounds field must be rejected");
+        let codegen_result = call_codegen(&workspace, "pill_spline", &[component], &[]);
+        let error = codegen_result.expect_err("an out-of-bounds field must be rejected");
         assert!(error.contains("outside the"));
     }
 
@@ -2210,13 +2242,13 @@ mod tests {
     fn typed_mirror_rejects_over_alignment() {
         let workspace = temp_workspace("over_align", "pill_spline");
         let component = exposed_typed("pill_spline.Big", 32, 16, vec![field("a", "u32", 0, 4, 4)]);
-        let result = call_codegen(&workspace, "pill_spline", &[component], &[]);
-        let error = result.expect_err("alignment 16 is not expressible");
+        let codegen_result = call_codegen(&workspace, "pill_spline", &[component], &[]);
+        let error = codegen_result.expect_err("alignment 16 is not expressible");
         assert!(error.contains("alignment"));
     }
 
-    /// Regenerating with identical content must not touch the file (mtime
-    /// preserved), which keeps the committed bootstrap clean.
+    /// Regenerating with identical content must not touch the file or its
+    /// modification time, so the committed mirror file stays clean.
     #[test]
     fn skips_rewrite_when_content_is_identical() {
         let workspace = temp_workspace("up_to_date", "pill_spline");
@@ -2331,26 +2363,27 @@ mod tests {
         );
     }
 
-    /// The same input produces byte-identical output on fresh workspaces, so
-    /// regeneration never dirties the committed bootstrap.
+    /// The same input produces byte-identical output on two fresh workspaces,
+    /// so regenerating never changes the committed mirror file.
     #[test]
     fn output_is_deterministic() {
-        let first = temp_workspace("deterministic_a", "pill_spline");
-        let second = temp_workspace("deterministic_b", "pill_spline");
+        let first_workspace = temp_workspace("deterministic_a", "pill_spline");
+        let second_workspace = temp_workspace("deterministic_b", "pill_spline");
         let components = [
             exposed("pill_spline.Spline", 196, 4),
             exposed("pill_spline.Path", 12, 4),
         ];
-        call_codegen(&first, "pill_spline", &components, &[]).unwrap();
-        call_codegen(&second, "pill_spline", &components, &[]).unwrap();
+        call_codegen(&first_workspace, "pill_spline", &components, &[]).unwrap();
+        call_codegen(&second_workspace, "pill_spline", &components, &[]).unwrap();
 
         assert_eq!(
-            read_generated(&first, "pill_spline"),
-            read_generated(&second, "pill_spline")
+            read_generated(&first_workspace, "pill_spline"),
+            read_generated(&second_workspace, "pill_spline")
         );
     }
 
-    /// Fields of the standalone value-type test's `Tint` (three f32 channels).
+    /// Fields of the `Tint` value type used by the value-type-only test (three
+    /// f32 channels).
     static TINT_FIELDS: &[ComponentFieldDescriptor] = &[
         ComponentFieldDescriptor {
             name: "r",
@@ -2413,9 +2446,9 @@ mod tests {
         assert!(content.contains("[FieldOffset(8)] public float B;"));
     }
 
-    /// `#[pill_mirror_fn]` free functions become a static class named after
-    /// their declaring module, in that module's namespace: no component and no
-    /// value type needs to exist for the file to be generated.
+    /// `#[pill_mirror_fn]` free functions become one static class named after
+    /// the module that declares them, in that module's namespace. No component
+    /// or value type has to exist for the file to be generated.
     #[test]
     fn free_functions_emit_a_static_class_in_the_module_namespace() {
         let workspace = temp_workspace("free_fn", "pill_dummy_color");
@@ -2470,9 +2503,10 @@ mod tests {
         assert!(content.contains("public static byte Grade()"));
     }
 
-    /// Mirrored methods become typed C# instance methods that call the
-    /// module's trampoline through `MirrorCall` and hand it the receiver's live
-    /// address. A value type without methods emits no method block.
+    /// A mirrored method with a receiver becomes a typed C# instance method
+    /// that calls the module's trampoline through `MirrorCall` and hands it the
+    /// receiver's live address. A type with no mirrored methods gets no method
+    /// block.
     #[test]
     fn mirrored_methods_are_emitted_on_value_types() {
         static FIELDS: &[ComponentFieldDescriptor] = &[
@@ -2545,9 +2579,9 @@ mod tests {
         assert!(!content.contains("Unused"));
     }
 
-    /// Mirrored methods on a component row reach the same emission path as
-    /// value-type methods, which is how a C# project samples a module's math
-    /// off the component instead of reimplementing it.
+    /// Mirrored methods on a component row are written the same way as
+    /// value-type methods, so a C# project can call a module's math on the
+    /// component instead of reimplementing it.
     #[test]
     fn mirrored_methods_are_emitted_on_component_rows() {
         let workspace = temp_workspace("mirror_component", "pill_spline");
@@ -2635,9 +2669,9 @@ mod tests {
     }
 
     /// The codegen reports whether the mirror file on disk changed, so the
-    /// reload path can queue a C# rebuild only when the module's mirror
-    /// surface actually moved: a matching re-run reports no change, and adding
-    /// a method (or a first run on a fresh workspace) reports a change.
+    /// reload path queues a C# rebuild only when what C# can see changed. A
+    /// matching re-run reports no change; adding a method or running on a
+    /// fresh workspace reports a change.
     #[test]
     fn codegen_reports_whether_the_mirror_changed() {
         static FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
@@ -2658,14 +2692,14 @@ mod tests {
             align: 8,
             fields: FIELDS,
         }];
-        let methods_without = [mirrored_method(
+        let methods_with_one_member = [mirrored_method(
             "pill_spline::OmoMO",
             "get_sum",
             "u64",
             &[],
             &[],
         )];
-        let methods_with = [
+        let methods_with_two_members = [
             mirrored_method("pill_spline::OmoMO", "get_sum", "u64", &[], &[]),
             mirrored_method("pill_spline::OmoMO", "get_b", "u64", &[], &[]),
         ];
@@ -2676,7 +2710,7 @@ mod tests {
             "pill_spline",
             std::slice::from_ref(&component),
             &value_types,
-            &methods_without,
+            &methods_with_one_member,
             &[],
         )
         .unwrap());
@@ -2686,7 +2720,7 @@ mod tests {
             "pill_spline",
             std::slice::from_ref(&component),
             &value_types,
-            &methods_without,
+            &methods_with_one_member,
             &[],
         )
         .unwrap());
@@ -2696,7 +2730,7 @@ mod tests {
             "pill_spline",
             &[component],
             &value_types,
-            &methods_with,
+            &methods_with_two_members,
             &[],
         )
         .unwrap());
@@ -2727,9 +2761,9 @@ mod tests {
         }
     }
 
-    /// A `vec:f32` field emits count/span/span/resize members that resolve the
-    /// module's accessor trampolines and hand them the live row address; the
-    /// container header itself is never a C# field.
+    /// A `vec:f32` field emits count, two spans and a resize member. Each one
+    /// resolves the module's accessor trampoline and hands it the live row
+    /// address. The container header itself never becomes a C# field.
     #[test]
     fn heap_vec_field_emits_span_accessors() {
         let workspace = temp_workspace("heap_vec", "pill_spline");
@@ -2781,8 +2815,8 @@ mod tests {
         assert!(content.contains(
             "global::TracyLive.MirrorMethods.InvokeView(_pointsViewAddress, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out global::TracyLive.BufferView view);"
         ));
-        // The member path is raw function pointers: no delegate types and no
-        // marshalling layer, and the bind check costs one int compare.
+        // The member path uses raw function pointers, so there are no delegate
+        // types and no marshalling layer, and a bind check costs one int compare.
         assert!(!content.contains("UnmanagedFunctionPointer"));
         assert!(!content.contains("Resolve<"));
         assert!(content.contains("internal static void EnsureAccessorsBound()"));
@@ -2805,9 +2839,9 @@ mod tests {
         );
     }
 
-    /// A struct with several container fields resolves all of their
-    /// trampoline addresses in one bind check: the generated resolver is a
-    /// single method per struct, not one per field.
+    /// A struct with several container fields resolves every trampoline
+    /// address in one bind check. The generated resolver is a single method
+    /// per struct, not one per field.
     #[test]
     fn heap_fields_share_one_bind_resolver_per_struct() {
         let workspace = temp_workspace("heap_multi_field", "pill_spline");
@@ -2911,8 +2945,9 @@ mod tests {
         assert!(
             content.contains("global::TracyLive.MirrorMethods.InvokeUtf8Write(_nameSetAddress,")
         );
-        // The setter is a header mutator: it is on the row-ref handle and
-        // writes through the bound row's address, not the caller's struct.
+        // The setter changes the container header, so it lives on the row-ref
+        // handle and writes through the bound row's address, not the caller's
+        // struct.
         assert!(content.contains("public ref struct LabelRowRef"));
         assert!(content.contains("public static LabelRowRef Bind(ref Label row)"));
         assert!(content
@@ -2928,10 +2963,11 @@ mod tests {
     /// Header-mutating members exist only on the row-ref handle, and the
     /// handle binds to a live row with `Bind(ref ...)`.
     ///
-    /// A value-type mutator would reallocate through whatever struct the
-    /// caller holds - `var copy = row.Write<Trail>(); copy.ResizePoints(8);` -
-    /// leaving the live row pointing at the freed block. Copying the handle
-    /// copies a pointer, and the copying call form stops compiling.
+    /// A mutator on the value type would reallocate through whatever struct
+    /// the caller holds - `var copy = row.Write<Trail>(); copy.ResizePoints(8);`
+    /// - and leave the live row pointing at the freed block. `Bind` takes a
+    /// `ref`, so the compiler refuses a copy, and copying the handle copies
+    /// only a pointer.
     #[test]
     fn heap_mutators_require_a_row_ref() {
         let workspace = temp_workspace("heap_row_ref", "pill_spline");
@@ -2977,8 +3013,9 @@ mod tests {
     }
 
     /// A `vec:string` field emits per-element accessors: count, get, set,
-    /// push, resize - one boundary call per element, never a span, because the
-    /// elements are separately allocated strings on the Rust side.
+    /// push and resize. Each element read or write is one boundary call and
+    /// never a span, because every string is allocated separately on the Rust
+    /// side.
     #[test]
     fn heap_vec_string_field_emits_element_accessors() {
         let workspace = temp_workspace("heap_vec_string", "pill_spline");
@@ -3014,7 +3051,7 @@ mod tests {
         assert!(!content.contains("NamesMut"));
         assert!(!content.contains("UIntPtr NamesPtr"));
         assert!(content.contains("[FieldOffset(0)] private readonly ulong _alignmentPad;"));
-        // The per-element surface.
+        // The five per-element members.
         assert!(content.contains("public readonly int NamesCount"));
         assert!(content.contains("public readonly string GetNames(int index)"));
         assert!(content.contains("public void SetNames(int index, string value)"));
@@ -3062,7 +3099,7 @@ mod tests {
         let mut accessor =
             resolved_accessor("pill_spline::NameList", "names", "vecstring", "string");
         accessor.item_address = None;
-        let result = generate_module_components_csharp(
+        let codegen_result = generate_module_components_csharp(
             &workspace,
             "pill_spline",
             &[component],
@@ -3070,7 +3107,7 @@ mod tests {
             &[],
             &[accessor],
         );
-        let error = result.expect_err("a missing element trampoline must be refused");
+        let error = codegen_result.expect_err("a missing element trampoline must be refused");
         assert!(error.contains("`item` trampoline"));
     }
 
@@ -3095,7 +3132,7 @@ mod tests {
             "vec",
             "struct:pill_core::math::Vector2f",
         )];
-        let result = generate_module_components_csharp(
+        let codegen_result = generate_module_components_csharp(
             &workspace,
             "pill_spline",
             std::slice::from_ref(&component),
@@ -3103,7 +3140,7 @@ mod tests {
             &[],
             &accessors,
         );
-        let error = result.expect_err("an undeclared element type must be refused");
+        let error = codegen_result.expect_err("an undeclared element type must be refused");
         assert!(error.contains("PillMirror"));
 
         let value_types = [PillValueTypeDescriptor {
@@ -3135,9 +3172,9 @@ mod tests {
         assert!(nested_index < component_index);
     }
 
-    /// A container field whose module published no accessor is a drift bug -
-    /// the module and the mirror would disagree about what exists - so codegen
-    /// refuses rather than emitting a mirror that cannot compile.
+    /// A container field whose module published no accessor means the module
+    /// and its mirror disagree about what exists. Codegen stops with an error
+    /// rather than writing a mirror that cannot compile.
     #[test]
     fn heap_field_without_a_published_accessor_is_refused() {
         let workspace = temp_workspace("heap_missing_accessor", "pill_spline");
@@ -3147,7 +3184,7 @@ mod tests {
             8,
             vec![field("points", "vec:f32", 0, 24, 8)],
         );
-        let result = generate_module_components_csharp(
+        let codegen_result = generate_module_components_csharp(
             &workspace,
             "pill_spline",
             &[component],
@@ -3155,13 +3192,14 @@ mod tests {
             &[],
             &[],
         );
-        let error = result.expect_err("a container field without an accessor must be refused");
+        let error =
+            codegen_result.expect_err("a container field without an accessor must be refused");
         assert!(error.contains("no accessor"));
     }
 
     /// An engine-owned `DynamicBuffer` field is mirrored as its three raw
-    /// words plus zero-call accessor members: count and spans read the row
-    /// directly, and only resizing resolves a trampoline.
+    /// words plus accessor members that need no calls. The count and the
+    /// spans read the row directly; only resizing resolves a trampoline.
     #[test]
     fn dynamic_buffer_field_emits_zero_call_members() {
         let workspace = temp_workspace("dynbuf", "pill_spline");

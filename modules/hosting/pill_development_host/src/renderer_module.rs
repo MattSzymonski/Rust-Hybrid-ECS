@@ -3,29 +3,30 @@
 //!
 //! # Responsibilities
 //!
-//! - Build, load, initialize and reload the renderer module like any
-//!   extension, under an owner of its own ([`RendererModule`]).
+//! - Build, load, initialize and reload the renderer module with the same
+//!   machinery as an extension, under an owner of its own
+//!   ([`RendererModule`]).
 //! - Attach it to a window through its `pill_renderer_attach` export, and wrap
-//!   the backend that returns in [`ModuleRenderer`].
+//!   the backend that export returns in [`ModuleRenderer`].
 //!
 //! # Design
 //!
-//! The host links no renderer: wgpu exists only inside the module. The backend
-//! the module returns is a `Box<Box<dyn PillRenderer>>` behind a raw pointer;
-//! [`ModuleRenderer`] calls through it and, when dropped, hands it back to the
-//! module's `pill_renderer_detach`, so the renderer is freed by the image that
-//! allocated it while that image is still mapped. A `ModuleRenderer` must
-//! therefore be dropped before the module's slot - `RenderingHost` declares its
-//! fields in that order.
+//! The host links no renderer: wgpu exists only inside the module. The module
+//! returns the backend as a `Box<Box<dyn PillRenderer>>` behind a raw pointer.
+//! [`ModuleRenderer`] calls through that pointer and, when dropped, hands it
+//! back to the module's `pill_renderer_detach`, so the renderer is freed by the
+//! image that allocated it while that image is still mapped. A `ModuleRenderer`
+//! must therefore be dropped before the module's slot, and `RenderingHost`
+//! declares its fields in that order.
 //!
-//! The module is kept out of the host's extension list: that list reloads its
+//! The module is kept out of the host's extension list. That list reloads its
 //! members on a source change, and a renderer reload has to detach the backend
-//! first. `RenderingHost` reloads it instead, detaching through the reload's
-//! `before_commit` hook and attaching whichever generation is current after.
+//! first. `RenderingHost` reloads it instead: it detaches through the reload's
+//! `before_commit` hook and attaches whichever generation is current after.
 //!
-//! A failed load never costs the scene: the module first loads when the window
-//! opens, after the project filled the world, so it loads under
-//! [`FirstLoadFailure::ClearSystemsOnly`] - a refused generation clears its own
+//! A failed load never costs the scene. The module first loads when the window
+//! opens, after the project has filled the world, so it loads under
+//! [`FirstLoadFailure::ClearSystemsOnly`]: a refused generation clears its own
 //! systems, stays mapped, and must have registered no data.
 
 // Standard library
@@ -64,115 +65,128 @@ const DETACH_SYMBOL: &[u8] = b"pill_renderer_detach";
 // Types
 // =============================================================================
 
-/// `pill_renderer_attach(window, width, height) -> backend or null`.
+/// Signature of the `pill_renderer_attach` export: it builds a backend on the
+/// window the data describes, or returns null.
 type AttachFn = unsafe extern "C" fn(*const RawWindowData, u32, u32) -> *mut c_void;
 
-/// `pill_renderer_detach(backend)`.
+/// Signature of the `pill_renderer_detach` export: it drops a backend inside
+/// the module.
 type DetachFn = unsafe extern "C" fn(*mut c_void);
 
 // =============================================================================
 // RendererModule
 // =============================================================================
 
-/// The renderer module: its slot once a generation has loaded, and the
-/// watcher that drives both its reloads and the retry of a failed first load.
+/// The renderer module: the slot a loaded generation lives in, and the edit
+/// counter its source watcher moves. The host compares that counter to decide
+/// when to reload the module or retry a failed first load.
 pub(crate) struct RendererModule {
-    /// The loaded module, or `None` while no generation has loaded yet.
+    /// The slot of the loaded generation, or `None` while no generation has
+    /// loaded yet.
     slot: Option<ExtensionSlot>,
-    /// Build, watch and output configuration derived from the module's name
-    /// (the project's `renderer:` setting); `None` when the project selects no
-    /// renderer, which leaves the module permanently unloaded.
-    config: Option<ExtensionConfig>,
-    /// Bumped by the watcher on every save under the module's `src/`.
+    /// How to build, watch and output the module, derived from its name (the
+    /// project's `renderer:` setting). `None` when the project selects no
+    /// renderer, which leaves the module unloaded for the whole run.
+    extension_config: Option<ExtensionConfig>,
+    /// Shared with the source watcher, which adds one on every save under the
+    /// module's `src/`.
     source_edit_generation: Arc<AtomicU64>,
-    /// The source-edit generation the last failed first load was tried at,
-    /// so a failure is retried once per edit rather than once per frame.
-    last_failed_generation: u64,
-    /// Owner every generation's systems are registered under.
-    owner: SystemOwner,
+    /// The source-edit generation the last failed first load was tried at. It
+    /// makes the host retry a failure once per edit, not once per frame.
+    last_failed_source_edit_generation: u64,
+    /// The engine owner every generation's systems are registered under.
+    system_owner: SystemOwner,
 }
 
 impl RendererModule {
     /// Watch the renderer module's sources and try its first load.
     ///
-    /// A first load that fails - it does not build, load, pass the ABI check,
-    /// initialize, or it registers data - is logged, not returned: the host
-    /// keeps running with the window blank, and the next save tries again.
-    /// The module's `init` registers the `rendering` system under `owner`; the
-    /// data it draws was registered by the host before anything loaded.
+    /// A first load that fails - because it does not build, load, pass the ABI
+    /// check or initialize, or because it registers data - is logged, not
+    /// returned: the host keeps running with the window blank, and the next
+    /// save tries again. The module's `init` registers the `rendering` system
+    /// under `system_owner`; the components, assets and resources it draws
+    /// belong to `pill_renderer_api` and to the renderer data crate, and other
+    /// subjects registered them before it loaded.
     ///
     /// # Errors
     ///
     /// Returns a [`HostError`] only when the configuration is invalid or the
-    /// sources cannot be watched; neither is something a later renderer edit
-    /// fixes.
+    /// sources cannot be watched. A later renderer edit fixes neither.
     pub(crate) fn start(
-        name: Option<&str>,
+        renderer_name: Option<&str>,
         engine: &mut Engine,
         engine_api: &EngineApi,
         workspace_root: &Path,
-        owner: SystemOwner,
+        system_owner: SystemOwner,
     ) -> Result<Self, HostError> {
-        // No renderer selected: nothing to watch or load. With no watcher the
-        // edit counter never moves, so `reload_if_changed` never retries.
-        let Some(name) = name else {
+        // Step 1: Without a selected renderer there is nothing to watch or
+        // load. The edit counter then never moves, so `reload_if_changed`
+        // never reloads or retries.
+        let Some(renderer_name) = renderer_name else {
             info!(
                 target: telemetry_target::HOT_RELOAD,
                 "the project selects no renderer; the window stays blank"
             );
             return Ok(Self {
                 slot: None,
-                config: None,
+                extension_config: None,
                 source_edit_generation: Arc::new(AtomicU64::new(0)),
-                last_failed_generation: 0,
-                owner,
+                last_failed_source_edit_generation: 0,
+                system_owner,
             });
         };
-        let config = ExtensionConfig::located_workspace_member(workspace_root, name);
-        config.validate()?;
-        // The watcher first: it is what retries a first load that fails below.
+        // Step 2: Build the configuration and start the watcher before the
+        // first load, because the watcher is what retries a load that fails
+        // below.
+        let extension_config =
+            ExtensionConfig::located_workspace_member(workspace_root, renderer_name);
+        extension_config.validate()?;
         let source_edit_generation = Arc::new(AtomicU64::new(0));
         crate::watcher::spawn_source_watcher(
             workspace_root.to_path_buf(),
-            &config.name,
-            &config.watch_directory,
+            &extension_config.name,
+            &extension_config.watch_directory,
             Arc::clone(&source_edit_generation),
             None,
         )?;
         let mut module = Self {
             slot: None,
-            config: Some(config),
+            extension_config: Some(extension_config),
             source_edit_generation,
-            last_failed_generation: 0,
-            owner,
+            last_failed_source_edit_generation: 0,
+            system_owner,
         };
+        // Step 3: Try the first generation now. A failure is logged and leaves
+        // the module unloaded.
         module.try_first_load(engine, engine_api, workspace_root, 0);
         Ok(module)
     }
 
-    /// The loaded module, if a generation has loaded.
+    /// The slot of the loaded generation, if one has loaded.
     pub(crate) fn slot(&self) -> Option<&ExtensionSlot> {
         self.slot.as_ref()
     }
 
-    /// Owner every generation's systems are registered under.
+    /// The engine owner every generation's systems are registered under.
     pub(crate) fn owner(&self) -> SystemOwner {
-        self.owner
+        self.system_owner
     }
 
     /// Ask for a rebuild and reload on the next [`Self::reload_if_changed`], as
     /// a save under the module's sources would.
     ///
-    /// Used when the renderer's data crate reloaded: the renderer compiles that
+    /// Used when the renderer's data crate reloaded. The renderer compiles that
     /// crate into its own image, so it must be rebuilt against the new source
-    /// before it may read the data again. A no-op when no renderer is selected.
+    /// before it may read the data again. A no-op when no renderer is
+    /// selected.
     pub(crate) fn request_rebuild(&self) {
-        if let Some(config) = &self.config {
-            // The startup batch may have validated the renderer's artifact;
-            // a rebuild request means the reason it must rebuild (a reloaded
-            // data crate) happened after the batch, so its token must not
-            // let the next load skip the compile.
-            crate::build_runner::forget_batch_validation(&config.name);
+        if let Some(extension_config) = &self.extension_config {
+            // The startup batch may already have marked the renderer's
+            // artifact as built. A rebuild request means the reason to rebuild
+            // (a reloaded data crate) came after that batch, so forget the
+            // mark; otherwise the next load would skip the compile.
+            crate::build_runner::forget_batch_validation(&extension_config.name);
             self.source_edit_generation.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -181,11 +195,11 @@ impl RendererModule {
     /// failed.
     ///
     /// `before_commit` is the reload's hook (see
-    /// [`ExtensionSlot::reload_if_changed_with`]); a first load has no backend
-    /// to detach and does not run it. `peer_component_names` is every component
-    /// name the other live subjects declare, so a type only this module
-    /// declares is dropped when its new generation forgets it, and a shared
-    /// type is kept.
+    /// [`ExtensionSlot::reload_if_changed_with`]). A first load has no backend
+    /// to detach, so it does not run. `peer_component_names` lists every
+    /// component name the other live subjects declare. A type the new
+    /// generation forgets is dropped only when no other subject declares it,
+    /// so a shared type is kept.
     pub(crate) fn reload_if_changed(
         &mut self,
         engine: &mut Engine,
@@ -203,47 +217,48 @@ impl RendererModule {
                 before_commit,
             ));
         }
-        let generation = self.source_edit_generation.load(Ordering::Acquire);
-        if generation == self.last_failed_generation {
+        let source_edit_generation = self.source_edit_generation.load(Ordering::Acquire);
+        if source_edit_generation == self.last_failed_source_edit_generation {
             return RendererModuleChange::Unchanged;
         }
-        if self.try_first_load(engine, engine_api, workspace_root, generation) {
+        if self.try_first_load(engine, engine_api, workspace_root, source_edit_generation) {
             RendererModuleChange::Loaded
         } else {
             RendererModuleChange::Unchanged
         }
     }
 
-    /// Build, load and initialize the first generation from the sources at
-    /// `generation`; `true` when it loaded.
+    /// Build, load and initialize the first generation from the sources as of
+    /// `source_edit_generation`, and return `true` when it loaded.
     fn try_first_load(
         &mut self,
         engine: &mut Engine,
         engine_api: &EngineApi,
         workspace_root: &Path,
-        generation: u64,
+        source_edit_generation: u64,
     ) -> bool {
-        let Some(config) = &self.config else {
+        let Some(extension_config) = &self.extension_config else {
             return false;
         };
-        let module_name = config.name.clone();
+        let module_name = extension_config.name.clone();
         match ExtensionSlot::start(
             engine,
             engine_api,
             workspace_root,
-            config,
-            self.owner,
+            extension_config,
+            self.system_owner,
             Arc::clone(&self.source_edit_generation),
             FirstLoadFailure::ClearSystemsOnly,
         ) {
             Ok(mut slot) => {
-                // A renderer image leaves state behind - wgpu's, the driver's,
-                // `tracing` callsites - that nothing can release, and evicting
-                // one hangs the frame loop. Every generation stays mapped.
+                // A renderer image leaves state behind that nothing can
+                // release: wgpu's, the graphics driver's, and the `tracing`
+                // callsite registry's. Unloading one hangs the frame loop, so
+                // every generation stays mapped.
                 slot.keep_every_generation();
-                // The sources this generation was built from are handled; a
-                // save after this point is the next reload.
-                slot.consume_pending_reload(generation);
+                // Mark the source edit this generation was built from as
+                // handled. A save after this point is the next reload.
+                slot.consume_pending_reload(source_edit_generation);
                 self.slot = Some(slot);
                 info!(
                     target: telemetry_target::HOT_RELOAD,
@@ -253,7 +268,7 @@ impl RendererModule {
                 true
             }
             Err(failure) => {
-                self.last_failed_generation = generation;
+                self.last_failed_source_edit_generation = source_edit_generation;
                 error!(
                     target: telemetry_target::HOT_RELOAD,
                     module = module_name.as_str(),
@@ -269,15 +284,19 @@ impl RendererModule {
 // RendererModuleChange
 // =============================================================================
 
-/// What [`RendererModule::reload_if_changed`] did to the loaded generation.
+/// What [`RendererModule::reload_if_changed`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RendererModuleChange {
-    /// Nothing new; whatever backend exists stays valid.
+    /// Nothing new: no reload was pending, or the first load failed again.
+    /// Whatever backend exists stays valid.
     Unchanged,
-    /// A generation loaded for the first time; it needs attaching.
+    /// A generation loaded for the first time. It needs attaching.
     Loaded,
-    /// An existing module reloaded (or rolled back) with this outcome; if the
-    /// `before_commit` hook ran, the backend was detached and needs attaching.
+    /// The module already had a slot, with the outcome of its reload pass:
+    /// [`ReloadOutcome::Unchanged`] when nothing was pending. A reload that
+    /// ran the `before_commit` hook detached the backend, so it needs
+    /// attaching again, even when the reload rolled back to the old
+    /// generation.
     Reloaded(ReloadOutcome),
 }
 
@@ -290,37 +309,40 @@ pub(crate) enum RendererModuleChange {
 /// Drives the module's `dyn PillRenderer` through the pointer the attach
 /// export returned, and hands it back to the module's detach export on drop.
 struct ModuleRenderer {
-    /// The module's `Box<dyn PillRenderer>`, owned by this value.
-    backend: NonNull<Box<dyn PillRenderer>>,
-    /// The module's detach export, which frees `backend` inside the module.
-    detach: DetachFn,
+    /// The renderer backend the module built, owned by this value.
+    module_backend: NonNull<Box<dyn PillRenderer>>,
+    /// The module's detach export, which frees `module_backend` inside the
+    /// module.
+    detach_export: DetachFn,
 }
 
 impl ModuleRenderer {
-    /// The backend, for a call that only reads it.
-    fn backend(&self) -> &dyn PillRenderer {
-        // SAFETY: `backend` came from the module's attach export, is owned by
-        // this value until drop, and the module stays mapped for that long.
-        unsafe { self.backend.as_ref() }.as_ref()
+    /// The module's backend, borrowed for a call that only reads it.
+    fn module_backend(&self) -> &dyn PillRenderer {
+        // SAFETY: `module_backend` came from the module's attach export and is
+        // owned by this value until drop, and the module stays mapped for that
+        // long.
+        unsafe { self.module_backend.as_ref() }.as_ref()
     }
 
-    /// The backend, for a call that changes it.
-    fn backend_mut(&mut self) -> &mut dyn PillRenderer {
-        // SAFETY: as in `backend`; `&mut self` makes this the only borrow.
-        unsafe { self.backend.as_mut() }.as_mut()
+    /// The module's backend, borrowed for a call that changes it.
+    fn module_backend_mut(&mut self) -> &mut dyn PillRenderer {
+        // SAFETY: the same reasoning as in `module_backend`; `&mut self` makes
+        // this the only live borrow.
+        unsafe { self.module_backend.as_mut() }.as_mut()
     }
 }
 
 impl PillRenderer for ModuleRenderer {
-    // Every method of the contract is forwarded, defaulted ones included: one
-    // left out would silently run the trait's default instead of the module's
-    // renderer.
+    // Every method of the contract is forwarded, including the ones with
+    // defaults. A method left out would silently run the trait's default
+    // instead of the module's renderer.
     fn capabilities(&self) -> RenderCapabilities {
-        self.backend().capabilities()
+        self.module_backend().capabilities()
     }
 
     fn metrics(&self) -> RenderMetrics {
-        self.backend().metrics()
+        self.module_backend().metrics()
     }
 
     fn render(
@@ -328,11 +350,11 @@ impl PillRenderer for ModuleRenderer {
         frame: &RenderFrame,
         assets: &AssetManager,
     ) -> Result<FrameOutcome, RendererError> {
-        self.backend_mut().render(frame, assets)
+        self.module_backend_mut().render(frame, assets)
     }
 
     fn invalidate_assets(&mut self) {
-        self.backend_mut().invalidate_assets();
+        self.module_backend_mut().invalidate_assets();
     }
 
     unsafe fn attach_surface(
@@ -345,17 +367,17 @@ impl PillRenderer for ModuleRenderer {
     ) -> Result<(), RendererError> {
         // SAFETY: forwarded from this method's own contract.
         unsafe {
-            self.backend_mut()
+            self.module_backend_mut()
                 .attach_surface(id, window, width, height, options)
         }
     }
 
     fn detach_surface(&mut self, id: pill_renderer_api::SurfaceId) {
-        self.backend_mut().detach_surface(id);
+        self.module_backend_mut().detach_surface(id);
     }
 
     fn resize_surface(&mut self, id: pill_renderer_api::SurfaceId, width: u32, height: u32) {
-        self.backend_mut().resize_surface(id, width, height);
+        self.module_backend_mut().resize_surface(id, width, height);
     }
 
     fn set_surface_viewport(
@@ -363,28 +385,28 @@ impl PillRenderer for ModuleRenderer {
         id: pill_renderer_api::SurfaceId,
         viewport: Option<RenderViewport>,
     ) {
-        self.backend_mut().set_surface_viewport(id, viewport);
+        self.module_backend_mut().set_surface_viewport(id, viewport);
     }
 
     fn set_surface_ready(&mut self, id: pill_renderer_api::SurfaceId, ready: bool) {
-        self.backend_mut().set_surface_ready(id, ready);
+        self.module_backend_mut().set_surface_ready(id, ready);
     }
 
     fn take_pick_results(&mut self) -> Vec<pill_renderer_api::PickResult> {
-        self.backend_mut().take_pick_results()
+        self.module_backend_mut().take_pick_results()
     }
 
     fn take_preview_results(&mut self) -> Vec<pill_renderer_api::PreviewImage> {
-        self.backend_mut().take_preview_results()
+        self.module_backend_mut().take_preview_results()
     }
 }
 
 impl Drop for ModuleRenderer {
     fn drop(&mut self) {
         // SAFETY: the pointer came from the module's attach export and is
-        // released exactly once, here; the module is still mapped because its
+        // released exactly once, here. The module is still mapped because its
         // slot is dropped after this renderer.
-        unsafe { (self.detach)(self.backend.as_ptr().cast()) };
+        unsafe { (self.detach_export)(self.module_backend.as_ptr().cast()) };
     }
 }
 
@@ -420,24 +442,29 @@ pub(crate) unsafe fn attach_module_renderer(
     let missing = |export: &str| RendererError::Other {
         detail: format!("the renderer module does not export `{export}`"),
     };
-    // SAFETY: both types are the exports' exact signatures, and the pointers
-    // are used only while the module is mapped - the caller drops the renderer
-    // before the module.
-    let attach: AttachFn = unsafe { library.resolve_export(ATTACH_SYMBOL) }
+    // SAFETY: both type aliases match the exports' signatures exactly, and the
+    // resolved pointers are only called while the module is mapped; the caller
+    // drops the renderer before the module.
+    let attach_export: AttachFn = unsafe { library.resolve_export(ATTACH_SYMBOL) }
         .ok_or_else(|| missing("pill_renderer_attach"))?;
-    // SAFETY: as above.
-    let detach: DetachFn = unsafe { library.resolve_export(DETACH_SYMBOL) }
+    // SAFETY: the same reasoning as above; `pill_renderer_detach` takes one
+    // pointer and returns nothing, which is what `DetachFn` states.
+    let detach_export: DetachFn = unsafe { library.resolve_export(DETACH_SYMBOL) }
         .ok_or_else(|| missing("pill_renderer_detach"))?;
 
     // Step 2: Attach on the window and take ownership of the returned pointer.
     // SAFETY: `window` is a valid value on this stack for the call, and names a
     // live window that outlives the backend by this function's contract.
-    let backend = unsafe { attach(&window, width, height) };
-    let backend = NonNull::new(backend.cast::<Box<dyn PillRenderer>>()).ok_or_else(|| {
-        RendererError::Other {
-            detail: "the renderer module could not attach to the window; see the log above"
-                .to_owned(),
-        }
-    })?;
-    Ok(Box::new(ModuleRenderer { backend, detach }))
+    let module_backend = unsafe { attach_export(&window, width, height) };
+    let module_backend =
+        NonNull::new(module_backend.cast::<Box<dyn PillRenderer>>()).ok_or_else(|| {
+            RendererError::Other {
+                detail: "the renderer module could not attach to the window; see the log above"
+                    .to_owned(),
+            }
+        })?;
+    Ok(Box::new(ModuleRenderer {
+        module_backend,
+        detach_export,
+    }))
 }

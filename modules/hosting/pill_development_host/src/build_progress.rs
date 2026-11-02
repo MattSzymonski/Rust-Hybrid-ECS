@@ -1,5 +1,5 @@
 //! The startup build plan: which modules a start builds, announced up front
-//! and counted off as each build starts.
+//! and counted as each build starts.
 //!
 //! # Responsibilities
 //!
@@ -11,10 +11,11 @@
 //!
 //! # Design
 //!
-//! The plan is process-wide because its builds start in different places: the
-//! extensions and the project in `setup`, the renderer's GPU module only when a
-//! window opens. A build of a module that is not (or no longer) in the plan -
-//! every reload - is not announced here; its caller logs it.
+//! The plan lives in one global because the start records it in `setup` and
+//! the builds that report against it run elsewhere: the extensions and the
+//! project build during `setup`, while the renderer's GPU module builds only
+//! once a window opens. A build of a module that is not in the plan, or no
+//! longer in it (any reload), is not announced here; its caller logs it.
 
 // Standard library
 use std::sync::Mutex;
@@ -27,99 +28,108 @@ use pill_core::telemetry::{log_block, telemetry_target::HOT_RELOAD};
 // Constants
 // =============================================================================
 
-/// The current plan: `None` until [`announce_plan`] records one, and again
-/// once its last planned build has started.
-static PLAN: Mutex<Option<BuildPlan>> = Mutex::new(None);
+/// The plan for the current start. It is `None` until [`announce_plan`]
+/// records one, and `None` again once the last planned build has started.
+static STARTUP_BUILD_PLAN: Mutex<Option<BuildPlan>> = Mutex::new(None);
 
 // =============================================================================
 // Types
 // =============================================================================
 
-/// One module the startup will build, and what it is.
+/// One module the startup will build, and what kind of module it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlannedBuild {
     /// The module's name, as its build reports it.
     pub(crate) module: String,
-    /// What it is: `extension`, `project` or `renderer`.
+    /// Which kind of module it is: `extension`, `project` or `renderer`.
     pub(crate) kind: &'static str,
 }
 
-/// The startup builds announced and not yet started, with the counts
-/// [`announce_build`] reports against them.
+/// The builds a start announced and that have not started yet, plus the
+/// counts [`announce_build`] uses for its message.
 struct BuildPlan {
-    total: usize,
-    started: usize,
-    pending: Vec<PlannedBuild>,
+    total_build_count: usize,
+    started_build_count: usize,
+    pending_builds: Vec<PlannedBuild>,
 }
 
 // =============================================================================
 // Free Functions
 // =============================================================================
 
-/// Record the startup build plan and log it, as one multi-line entry.
+/// Records the startup build plan and logs it as one multi-line entry.
 ///
-/// `project_name` is the project's display name. Replaces any earlier plan.
+/// `project_name` is the project's display name. Any earlier plan is replaced.
 pub(crate) fn announce_plan(project_name: &str, builds: Vec<PlannedBuild>) {
     info!(target: HOT_RELOAD, "{}", render_plan(project_name, &builds));
-    // Poisoning is ignored: a panic while the plan was held must not cost the
-    // rest of the start its plan, and the state is only counts and names.
-    let mut plan = PLAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A panic while the lock was held poisons it. Ignore that: the plan holds
+    // only counts and names, and dropping it would cost the rest of the start
+    // its progress, so the poisoned value is used as it is.
+    let mut plan = STARTUP_BUILD_PLAN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     *plan = Some(BuildPlan {
-        total: builds.len(),
-        started: 0,
-        pending: builds,
+        total_build_count: builds.len(),
+        started_build_count: 0,
+        pending_builds: builds,
     });
 }
 
-/// Log that the build of `module` is starting, when it is part of the startup
-/// plan and has not started yet.
+/// Logs that the build of `module` is starting, if that build belongs to the
+/// startup plan and has not started yet.
 ///
-/// Returns `false` for any other build (every reload), so the caller logs it
-/// its usual way instead.
+/// Returns `true` when it logged the build. It returns `false` for any other
+/// build (any reload), so the caller logs it in its usual way instead.
 pub(crate) fn announce_build(module: &str) -> bool {
-    let mut plan = PLAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut plan = STARTUP_BUILD_PLAN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(current) = plan.as_mut() else {
         return false;
     };
-    let Some(position) = current
-        .pending
+    let Some(pending_build_index) = current
+        .pending_builds
         .iter()
         .position(|build| build.module == module)
     else {
         return false;
     };
-    current.pending.remove(position);
-    current.started += 1;
-    // Two blank lines set each build apart from the cargo output above it.
-    // Printed to the terminal directly: an empty log event would still carry
-    // the time, level and target.
+    current.pending_builds.remove(pending_build_index);
+    current.started_build_count += 1;
+    // Two blank lines separate each build from the cargo output above it.
+    // They are printed straight to the terminal: an empty log event would
+    // still add the time, level and target.
     println!("\n");
     info!(
         target: HOT_RELOAD,
         "{}",
-        render_step(current.started, current.total, module)
+        render_step(current.started_build_count, current.total_build_count, module)
     );
-    // Once every planned build has started, later builds are reloads.
-    if current.pending.is_empty() {
+    // The plan is dropped once every planned build has started; from then on,
+    // any build is a reload.
+    if current.pending_builds.is_empty() {
         *plan = None;
     }
     true
 }
 
-/// The message [`announce_plan`] logs: a heading and the numbered modules.
-fn render_plan(project_name: &str, builds: &[PlannedBuild]) -> String {
-    let name_width = builds
+/// Builds the message [`announce_plan`] logs: a heading and the numbered
+/// modules.
+fn render_plan(project_name: &str, planned_builds: &[PlannedBuild]) -> String {
+    let module_name_width = planned_builds
         .iter()
         .map(|build| build.module.len())
         .max()
         .unwrap_or(0);
-    // Numbered like the build steps that follow (`[n/total]`), with `n` padded
-    // to the width of the total so the names line up.
-    let total = builds.len();
-    let number_width = total.to_string().len();
-    let lines = builds.iter().enumerate().map(|(index, build)| {
+    // The numbers use the same `[n/total]` form as the build steps that
+    // follow. `n` is padded to the width of the total so every module name
+    // starts in the same column, and the names are padded so the kinds line
+    // up.
+    let total_build_count = planned_builds.len();
+    let build_number_width = total_build_count.to_string().len();
+    let lines = planned_builds.iter().enumerate().map(|(index, build)| {
         format!(
-            "[{:>number_width$}/{total}] {:<name_width$}  {}",
+            "[{:>build_number_width$}/{total_build_count}] {:<module_name_width$}  {}",
             index + 1,
             build.module,
             build.kind
@@ -131,9 +141,11 @@ fn render_plan(project_name: &str, builds: &[PlannedBuild]) -> String {
     )
 }
 
-/// The `[n/m] ------------- Building of <module> started` message.
-fn render_step(started: usize, total: usize, module: &str) -> String {
-    format!("[{started}/{total}] ------------- Building of {module} started")
+/// Builds the `[n/m] ------------- Building of <module> started` message.
+fn render_step(started_build_count: usize, total_build_count: usize, module_name: &str) -> String {
+    format!(
+        "[{started_build_count}/{total_build_count}] ------------- Building of {module_name} started"
+    )
 }
 
 // =============================================================================
@@ -144,10 +156,10 @@ fn render_step(started: usize, total: usize, module: &str) -> String {
 mod tests {
     use super::*;
 
-    fn planned(module: &str, kind: &'static str) -> PlannedBuild {
+    fn planned_build(module_name: &str, module_kind: &'static str) -> PlannedBuild {
         PlannedBuild {
-            module: module.to_string(),
-            kind,
+            module: module_name.to_string(),
+            kind: module_kind,
         }
     }
 
@@ -158,8 +170,8 @@ mod tests {
         let text = render_plan(
             "Bouncing Balls",
             &[
-                planned("pill_spline", "extension"),
-                planned("project", "project"),
+                planned_build("pill_spline", "extension"),
+                planned_build("project", "project"),
             ],
         );
 
@@ -167,25 +179,25 @@ mod tests {
             text.contains("Hot reloading of Bouncing Balls is starting"),
             "{text}"
         );
-        let spline = text
+        let spline_index = text
             .find("[1/2] pill_spline")
             .expect("first module numbered 1");
-        let project = text
+        let project_index = text
             .find("[2/2] project")
             .expect("second module numbered 2");
-        assert!(spline < project, "{text}");
+        assert!(spline_index < project_index, "{text}");
     }
 
-    /// Planned builds are counted off once each, in the order they start;
-    /// anything else, and a second build of the same module, is left to the
-    /// caller. The plan ends when its last build starts.
+    /// Each planned build is announced once, in the order it starts. Any
+    /// other build, including a second build of the same module, is left to
+    /// the caller. The plan ends when its last build starts.
     #[test]
     fn planned_builds_are_announced_once_and_the_plan_then_ends() {
         announce_plan(
             "Test",
             vec![
-                planned("module_a", "extension"),
-                planned("module_b", "project"),
+                planned_build("module_a", "extension"),
+                planned_build("module_b", "project"),
             ],
         );
 

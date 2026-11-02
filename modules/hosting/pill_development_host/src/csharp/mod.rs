@@ -2,8 +2,9 @@
 //!
 //! # Responsibilities
 //!
-//! - Generates the C# mirrors for the components, value types and free
-//!   functions an extension exposes to managed code.
+//! - Generates the C# mirrors for the components, value types, object
+//!   classes, enums, resource markers and free functions an extension exposes
+//!   to managed code.
 //! - Recompiles the project in-process with Roslyn on a hot reload.
 //! - Pairs the bridge's [`CSharpRuntime`] with that compiler as the host's
 //!   managed project, [`CSharpProject`].
@@ -11,10 +12,11 @@
 //!
 //! # Design
 //!
-//! Running C# - hosting .NET, the ABI, components, systems and the reload
-//! poll - is the bridge's, and a C# shipping bundle links it without this
-//! crate. What stays here only exists while developing: generated mirrors and
-//! the compiler. The whole module is `hot_reload` only.
+//! The bridge owns everything needed to run C#: hosting .NET, the ABI,
+//! components, systems and the reload poll. A C# shipping bundle links the
+//! bridge without this crate. This module holds only what exists while
+//! developing: the generated mirrors and the compiler. The whole module is
+//! `hot_reload` only.
 
 // Standard library
 use std::path::Path;
@@ -32,7 +34,8 @@ use crate::watcher::SourceTrigger;
 
 /// Host-side generation of a module's `<module>_Components.g.cs` mirror file.
 mod codegen;
-/// In-process Roslyn compilation of the C# project, replacing MSBuild on reload.
+/// In-process Roslyn compilation of the C# project, which replaces MSBuild on
+/// a reload.
 mod fast_compile;
 /// The C# members, object classes, enums and resource markers generated from
 /// a module's mirror descriptors.
@@ -51,9 +54,9 @@ pub(crate) use pill_csharp_bridge::{
 /// Generates a module's `<module>_Components.g.cs` mirror file from the surface
 /// it exposes to managed code.
 pub(crate) use codegen::generate_module_components_csharp;
-/// What one in-process compile attempt produced, reported to the reload path.
+/// What one in-process compile attempt produced.
 pub(crate) use fast_compile::FastCompileOutcome;
-/// The in-process Roslyn compiler, shared with build threads and the
+/// The in-process Roslyn compiler, shared with the build thread and with the
 /// synchronous fallback build.
 pub(crate) use fast_compile::FastCompiler;
 
@@ -61,182 +64,203 @@ pub(crate) use fast_compile::FastCompiler;
 // CSharpProject
 // =============================================================================
 
-/// A running C# project in the reloading host: the bridge's runtime plus the
-/// in-process compiler that rebuilds its assembly.
+/// A running C# project in the reloading host, made of the bridge's runtime
+/// and the in-process compiler that rebuilds its assembly.
 pub(crate) struct CSharpProject {
     /// The managed runtime running the project's systems.
     runtime: CSharpRuntime,
     /// The in-process Roslyn compiler, when one could be loaded.
     ///
     /// `None` leaves every reload on the ordinary `dotnet build` path, the
-    /// fallback when the compiler cannot be built or loaded. Shared behind an
-    /// `Arc` because a reload hands it to a build thread; its own state is a
-    /// set of export addresses and paths, so it travels safely.
+    /// fallback when the compiler cannot be built or loaded. It is shared
+    /// behind an `Arc` because a reload hands a clone to a build thread. Its
+    /// own state is a set of export addresses and paths, so sharing it is
+    /// safe.
     fast_compiler: Option<Arc<fast_compile::FastCompiler>>,
     /// The assembly build running on its own thread, when one is.
     ///
-    /// The build compiles and writes the assembly; nothing else may run while
-    /// it does, because the captured source list includes the generated
-    /// mirror files a module reload rewrites. Collecting it is what swaps the
-    /// new assembly in.
-    build: Option<InFlightAssemblyBuild>,
+    /// The build compiles the sources and writes the assembly. No other reload
+    /// step may run while it does, because the build compiles the generated
+    /// mirror files that a module reload rewrites. The frame itself keeps
+    /// rendering and running systems. Collecting the build hands its outcome
+    /// to the reload path, which tells the loader and polls for the swap.
+    assembly_build: Option<InFlightAssemblyBuild>,
     /// Timing of the managed reload currently in flight, when one is armed.
     ///
-    /// Armed when the frame loop consumes the source signal that starts a
-    /// reload and finished when the loader swaps the new assembly in, so the
-    /// log can state the whole save-to-swap span instead of the compile
+    /// It is armed when the frame loop consumes the source signal that starts
+    /// a reload, and finished when the loader swaps the new assembly in. The
+    /// log can then report the whole save-to-swap span instead of the compile
     /// alone.
     reload_timing: Option<ManagedReloadTiming>,
 }
 
 impl CSharpProject {
-    /// Start the project through the bridge, loading the in-process compiler
-    /// into the same .NET runtime as soon as it boots.
+    /// Starts the project through the bridge and loads the in-process compiler
+    /// into the same .NET runtime as soon as it is running.
     ///
     /// The compiler is loaded before the project starts, not after, so its
-    /// background warmup overlaps startup; see [`CSharpRuntime::start`].
+    /// background warmup runs during startup; see [`CSharpRuntime::start`].
     ///
     /// # Errors
     ///
-    /// Returns what [`CSharpRuntime::start`] returns. A compiler that cannot be
-    /// loaded is not an error: it is logged, and reloads run a full build.
+    /// Returns the same errors as [`CSharpRuntime::start`]. A compiler that
+    /// cannot be built or loaded is not an error: the failure is logged once,
+    /// and reloads run a full `dotnet build`.
     pub(crate) fn start(
         engine: &mut Engine,
         workspace_root: &Path,
-        config: &pill_csharp_bridge::CSharpModuleConfig,
-        module_exposed: &[ModuleExposedComponent],
+        module_config: &pill_csharp_bridge::CSharpModuleConfig,
+        module_exposed_components: &[ModuleExposedComponent],
         mirror_methods: &[ResolvedMirrorMethod],
     ) -> Result<Self, CSharpError> {
         let mut fast_compiler = None;
         let runtime = CSharpRuntime::start(
             engine,
             workspace_root,
-            config,
-            module_exposed,
+            module_config,
+            module_exposed_components,
             mirror_methods,
             &mut |dotnet| {
-                fast_compiler = fast_compile::FastCompiler::try_new(dotnet, workspace_root, config)
-                    .map(Arc::new);
+                fast_compiler =
+                    fast_compile::FastCompiler::try_new(dotnet, workspace_root, module_config)
+                        .map(Arc::new);
             },
         )?;
         Ok(Self {
             runtime,
             fast_compiler,
-            build: None,
+            assembly_build: None,
             reload_timing: None,
         })
     }
 
-    /// Poll the collectible loader; see [`CSharpRuntime::poll_reload`].
+    /// Asks the managed loader whether it can swap in a rebuilt assembly; see
+    /// [`CSharpRuntime::poll_reload`].
     ///
     /// # Errors
     ///
-    /// Returns what [`CSharpRuntime::poll_reload`] returns.
+    /// Returns the same errors as [`CSharpRuntime::poll_reload`].
     pub(crate) fn poll_reload(&mut self, engine: &mut Engine) -> Result<u8, CSharpError> {
         self.runtime.poll_reload(engine)
     }
 
-    /// Arm reload timing for the reload this signal starts.
+    /// Arms reload timing for the reload this signal starts.
     ///
     /// `trigger` is the project watcher's record of the save that fired the
-    /// signal; `None` - a reload the pipeline queued itself, such as a module
-    /// swap that changed the mirror surface - times from now and reports no
-    /// detection delay, because there is no file save to attribute it to.
+    /// signal. `None` means the pipeline queued the reload itself, for example
+    /// because a module swap changed the mirror surface. That case times from
+    /// now and reports no detection delay, because there is no file save to
+    /// measure it from.
     pub(crate) fn arm_reload_timing(&mut self, trigger: Option<SourceTrigger>) {
         self.reload_timing = Some(ManagedReloadTiming {
             detected_at: trigger.map_or_else(Instant::now, |trigger| trigger.fired_at),
             detection_delay_ms: trigger.map_or(f64::NAN, |trigger| trigger.detection_delay_ms),
             triggered_at: Instant::now(),
-            rebuilt: None,
+            rebuilt_assembly: None,
         });
     }
 
-    /// Record an assembly rebuild that finished at `at`, and how it was
-    /// produced.
+    /// Records that an assembly rebuild finished at `finished_at`, and how it
+    /// was produced.
     ///
-    /// The worker-side build reports the instant it finished, so a build that
-    /// ran between frames still contributes its own duration to the total
-    /// rather than the frame wait that collected it.
-    pub(crate) fn record_assembly_rebuilt_at(&mut self, at: Instant, kind: &'static str) {
+    /// The build worker reports the instant it finished, so a build that ran
+    /// between two frames still adds its own duration to the total instead of
+    /// the wait before the frame collected it.
+    pub(crate) fn record_assembly_rebuilt_at(
+        &mut self,
+        finished_at: Instant,
+        build_kind: &'static str,
+    ) {
         if let Some(timing) = &mut self.reload_timing {
-            timing.rebuilt = Some(RebuiltAssembly { at, kind });
+            timing.rebuilt_assembly = Some(RebuiltAssembly {
+                finished_at,
+                build_kind,
+            });
         }
     }
 
-    /// Hand the in-process compiler to a build thread, or `None` when there is
-    /// none; the fallback `dotnet build` runs instead.
+    /// Returns a handle to the in-process compiler for one build, or `None`
+    /// when no compiler is loaded; that build then runs the full `dotnet build`
+    /// fallback.
     pub(crate) fn compiler_handle(&self) -> Option<Arc<fast_compile::FastCompiler>> {
         self.fast_compiler.clone()
     }
 
-    /// Store a build a worker thread has just started, so the frame loop can
-    /// collect its report and complete the reload.
+    /// Stores a build that a worker thread has just started, so the frame loop
+    /// can collect its report and complete the reload.
     pub(crate) fn track_build(&mut self, receiver: Receiver<BuildReport>, thread: JoinHandle<()>) {
-        self.build = Some(InFlightAssemblyBuild {
+        self.assembly_build = Some(InFlightAssemblyBuild {
             receiver,
             thread: Some(thread),
         });
     }
 
-    /// Whether an assembly build is running on its own thread right now.
+    /// Tells whether an assembly build is running on its own thread right now.
     pub(crate) fn build_in_flight(&self) -> bool {
-        self.build.is_some()
+        self.assembly_build.is_some()
     }
 
-    /// Try to collect a finished build report without waiting.
+    /// Tries to collect a finished build report without waiting.
     ///
-    /// A report collects the worker and clears the in-flight state; a worker
-    /// that stopped without one is reported as [`BuildCollection::Died`], so
-    /// the caller can fall back to building on the frame thread.
+    /// Collecting a report waits for the worker thread to end and clears the
+    /// in-flight state. A worker that stopped without a report is reported as
+    /// [`BuildCollection::Died`], so the caller can fall back to building on
+    /// the frame thread.
     pub(crate) fn collect_build(&mut self) -> BuildCollection {
-        let Some(in_flight) = self.build.as_mut() else {
+        let Some(in_flight) = self.assembly_build.as_mut() else {
             return BuildCollection::Pending;
         };
         match in_flight.receiver.try_recv() {
             Ok(report) => {
                 in_flight.join();
-                self.build = None;
+                self.assembly_build = None;
                 BuildCollection::Finished(report)
             }
             Err(TryRecvError::Empty) => BuildCollection::Pending,
             Err(TryRecvError::Disconnected) => {
                 in_flight.join();
-                self.build = None;
+                self.assembly_build = None;
                 BuildCollection::Died
             }
         }
     }
 
-    /// Collapse the managed loader's debounce after the in-process compiler
-    /// wrote a settled assembly; see [`CSharpRuntime::notify_assembly_replaced`].
+    /// Tells the managed loader that the in-process compiler has already
+    /// written a complete assembly. The loader's next poll can then skip its
+    /// debounce (the wait for the file to stop changing); see
+    /// [`CSharpRuntime::notify_assembly_replaced`].
     pub(crate) fn notify_assembly_replaced(&mut self) {
         self.runtime.notify_assembly_replaced();
     }
 
-    /// Drop an armed timing whose reload produced no swap.
+    /// Drops an armed timing whose reload produced no swap.
     ///
-    /// A failed or cancelled build replaces nothing; keeping the arm would
-    /// attribute a later swap - whichever attempt produced it - to this dead
+    /// A failed or cancelled build replaces nothing. Keeping the timing would
+    /// count a later swap, whichever build produced it, as caused by this
     /// signal.
     pub(crate) fn abandon_reload_timing(&mut self) {
         self.reload_timing = None;
     }
 
-    /// Finish an armed timing at the swap and hand back its breakdown.
+    /// Finishes an armed timing at the swap and returns its breakdown.
     ///
-    /// `None` when no timing was armed. A swap with no recorded build - the
-    /// loader picking up an assembly this host did not time - reports `NaN`
-    /// for the build phase rather than inventing one.
+    /// Returns `None` when no timing was armed. A swap with no recorded build,
+    /// such as the loader picking up an assembly this host did not time,
+    /// reports `NaN` for the build phase rather than a made-up number.
     pub(crate) fn finish_reload_timing(&mut self) -> Option<ManagedReloadSummary> {
         let timing = self.reload_timing.take()?;
         let swapped_at = Instant::now();
         let signal_ms = milliseconds(swapped_at.duration_since(timing.detected_at));
         let queue_ms = milliseconds(timing.triggered_at.duration_since(timing.detected_at));
-        let (build_ms, swap_ms, build_kind) = match timing.rebuilt {
-            Some(rebuilt) => (
-                milliseconds(rebuilt.at.duration_since(timing.triggered_at)),
-                milliseconds(swapped_at.duration_since(rebuilt.at)),
-                rebuilt.kind,
+        let (build_ms, swap_ms, build_kind) = match timing.rebuilt_assembly {
+            Some(rebuilt_assembly) => (
+                milliseconds(
+                    rebuilt_assembly
+                        .finished_at
+                        .duration_since(timing.triggered_at),
+                ),
+                milliseconds(swapped_at.duration_since(rebuilt_assembly.finished_at)),
+                rebuilt_assembly.build_kind,
             ),
             None => (
                 f64::NAN,
@@ -244,9 +268,9 @@ impl CSharpProject {
                 "unknown",
             ),
         };
-        // From the edited file's own timestamp when the watcher could read
-        // one, with the signal plus everything after it; the signal span alone
-        // is all that is measured when it could not.
+        // Measure from the edited file's own timestamp when the watcher could
+        // read one, and add the time since the signal. Without that delay,
+        // the signal span is all there is.
         let total_ms = if timing.detection_delay_ms.is_finite() {
             timing.detection_delay_ms + signal_ms
         } else {
@@ -271,40 +295,43 @@ impl CSharpProject {
 struct ManagedReloadTiming {
     /// Instant the project watcher fired the signal this reload came from.
     detected_at: Instant,
-    /// The save-to-signal delay the watcher measured, debounce included; `NaN`
-    /// when the trigger carried none.
+    /// How long the save waited before the watcher fired the signal, the
+    /// debounce wait included; `NaN` when there is no trigger to measure from.
+    /// A trigger also carries `NaN` when no file timestamp could be read.
     detection_delay_ms: f64,
     /// Instant the frame loop consumed the signal and armed this timing.
     triggered_at: Instant,
-    /// The finished assembly, once a build route recorded it.
-    rebuilt: Option<RebuiltAssembly>,
+    /// The rebuilt assembly, once a build recorded it.
+    rebuilt_assembly: Option<RebuiltAssembly>,
 }
 
 /// A finished assembly rebuild: when it was ready and what produced it.
 struct RebuiltAssembly {
     /// Instant the rebuild returned.
-    at: Instant,
+    finished_at: Instant,
     /// How the assembly was produced: `"roslyn"` in-process, `"msbuild"` the
     /// full `dotnet build` fallback.
-    kind: &'static str,
+    build_kind: &'static str,
 }
 
 /// A finished managed reload, broken down by phase, in milliseconds.
 pub(crate) struct ManagedReloadSummary {
     /// Save to swap: the whole operation. Measured from the edited file's own
-    /// timestamp when the watcher could read one, else from the signal - and
-    /// then `detect_ms` is `NaN`.
+    /// timestamp when the watcher could read one, and from the signal
+    /// otherwise; `detect_ms` is `NaN` in the second case.
     pub(crate) total_ms: f64,
-    /// Save to signal, debounce included; `NaN` when unmeasured.
+    /// Save to signal, the debounce wait included; `NaN` when the watcher
+    /// could not measure it.
     pub(crate) detect_ms: f64,
     /// Signal to the frame loop consuming it.
     pub(crate) queue_ms: f64,
-    /// Consume to rebuilt assembly; `NaN` when no rebuild was recorded.
+    /// Consume to rebuilt assembly; `NaN` when no build was recorded.
     pub(crate) build_ms: f64,
-    /// Rebuilt assembly to the loader's swap.
+    /// Rebuilt assembly to the loader's swap; measured from the signal when no
+    /// build was recorded.
     pub(crate) swap_ms: f64,
     /// What produced the assembly: `"roslyn"`, `"msbuild"`, or `"unknown"`
-    /// when no build route was recorded.
+    /// when no build was recorded.
     pub(crate) build_kind: &'static str,
 }
 
@@ -314,19 +341,20 @@ pub(crate) struct ManagedReloadSummary {
 
 /// One assembly build running on its own worker thread.
 ///
-/// The thread is joined when its report is collected, when the worker is
-/// found dead, and on teardown - a build that outlived its host would be a
-/// thread parked in code the host is about to drop.
+/// The thread is waited for when its report is collected, when the worker is
+/// found dead, and when this value is dropped. A build that outlived its host
+/// would keep calling the compiler's function pointers after the managed
+/// runtime that owns them was dropped.
 struct InFlightAssemblyBuild {
     /// The build's report, once the worker has one.
     receiver: Receiver<BuildReport>,
-    /// The worker, joined by [`Self::join`] or on drop.
+    /// The worker thread, waited for by [`Self::join`] or on drop.
     thread: Option<JoinHandle<()>>,
 }
 
 impl InFlightAssemblyBuild {
-    /// Join the worker. Returns immediately when it already finished, which
-    /// is the case whenever a report was received.
+    /// Waits for the worker thread to end. Returns at once when it already
+    /// finished, which is the case whenever a report was received.
     fn join(&mut self) {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -340,11 +368,11 @@ impl Drop for InFlightAssemblyBuild {
     }
 }
 
-/// What one worker-side build produced.
+/// What one managed assembly build produced.
 pub(crate) enum BuildOutcome {
     /// The in-process compiler rebuilt the assembly.
     Compiled {
-        /// Wall-clock cost of the compile, for the reload log.
+        /// How long the compile took, for the reload log.
         milliseconds: f64,
     },
     /// The project does not compile; the diagnostics say why.
@@ -352,26 +380,26 @@ pub(crate) enum BuildOutcome {
         /// Compiler and analyzer errors, already formatted the way csc prints them.
         diagnostics: String,
     },
-    /// The in-process compiler could not answer the reload - or was never
-    /// loaded - so the full `dotnet build` ran instead; `Err` carries that
+    /// The in-process compiler could not handle the reload, or was never
+    /// loaded, so the full `dotnet build` ran instead; `Err` carries that
     /// build's error text.
     Full(Result<(), String>),
 }
 
-/// A finished assembly build: what it produced, and when it finished on the
-/// worker's clock, so the reload log can span the build itself rather than
-/// the frame that collected it.
+/// A finished assembly build: what it produced, and when it finished, so the
+/// reload log can cover the build itself instead of the frame that collected
+/// it.
 pub(crate) struct BuildReport {
     /// What the build produced.
     pub(crate) outcome: BuildOutcome,
-    /// When the worker finished the build, on the same monotonic clock as the
-    /// frame thread.
+    /// When the build finished, on the same monotonic clock as the frame
+    /// thread.
     pub(crate) finished_at: Instant,
 }
 
 /// What one collection attempt found.
 pub(crate) enum BuildCollection {
-    /// The worker is still building; nothing was collected.
+    /// No report was available: a build is still running, or none was started.
     Pending,
     /// The worker stopped without a report; the caller falls back to building
     /// on the frame thread.
@@ -384,7 +412,7 @@ pub(crate) enum BuildCollection {
 // Free Functions
 // =============================================================================
 
-/// `duration` in milliseconds.
+/// Returns `duration` in milliseconds.
 fn milliseconds(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }

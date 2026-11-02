@@ -1,35 +1,38 @@
-//! Native project-library loading, export resolution and the temporary copies
-//! that outlive a reload.
+//! Loading native project and extension libraries, resolving their exports
+//! and keeping the temporary copies that outlive a reload.
 //!
-//! A module is staged under a unique per-generation path before it is opened,
-//! so a rebuilt DLL can replace the build output while an older generation
-//! stays mapped for the pointers and vtables compiled into it.
+//! Each module gets a file at a path of its own before it is opened: a hard
+//! link to the build output when the filesystem allows one, a copy otherwise.
+//! A rebuilt DLL can then replace the build output while an older generation
+//! stays mapped, because the raw pointers and vtables the engine holds still
+//! point into it.
 //!
 //! # Responsibilities
 //!
 //! - Load native libraries from unique temporary paths.
-//! - Validate the required exports, read the ABI revision and call the
+//! - Check the required exports, read the ABI revision and call the
 //!   registration entry point.
 //! - Explain a failed load from the artifact's own import tables.
 //! - Remove temporary copies left behind by earlier host processes.
 //!
 //! # Design
 //!
-//! The native ABI is a fixed export contract, and there is exactly one of it.
-//! A project and an extension are the same loadable artifact - same exports,
-//! same loader, same reload transaction, same graveyard - so the loader has
-//! nothing to parameterise:
+//! The native ABI is one fixed export contract. A project and an extension are
+//! the same kind of loadable artifact: same exports, same loader, same reload
+//! transaction, same way of being retired. The loader therefore has nothing to
+//! parameterise.
 //!
 //! - `pill_module_init(*const EngineApi) -> u32` - required: registers
 //!   components and systems before the first frame and returns zero on
-//!   success; any other status fails the load transaction, and the previous
-//!   generation is re-initialized.
-//! - `pill_module_abi_version() -> u32` - optional: read before anything else
-//!   is called, so an incompatible artifact is rejected rather than invoked.
+//!   success. Any other status fails the load transaction, and the previous
+//!   generation is initialized again.
+//! - `pill_module_abi_version() -> u32` - optional: read before any other
+//!   function is called, so an incompatible artifact is rejected instead of
+//!   invoked.
 //!
-//! Exports are cached at load time as raw function pointers, valid while the
-//! library handle keeps the image mapped; `pill_module_init` must be
-//! idempotent.
+//! Exports are cached at load time as raw function pointers, which stay valid
+//! while the library handle keeps the image mapped. `pill_module_init` must be
+//! safe to call more than once.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -57,14 +60,15 @@ use crate::csharp::{ResolvedFieldAccessor, ResolvedMirrorMethod};
 // =============================================================================
 
 /// The engine's shared libraries, by file stem: every module, project and
-/// patch imports them, and each exists once per process unless a module needs
-/// the isolated copies (see [`engine_dylib_needs_isolation`]).
+/// patch imports them, and each one exists once per process unless a module
+/// needs its own copies (see [`engine_dylib_needs_isolation`]).
 ///
-/// Every one is a type-identity boundary: the UI frame and draw data
-/// (`pill_ui_frame`), the in-game egui UI and its editor core
-/// (`pill_project_ui`, `pill_editor_core`), and the `Theme`/`Handle`s of
+/// Each has to stay a single instance in the process, so the types that cross
+/// the library boundary and the state they share are not duplicated: the UI
+/// frame and draw data (`pill_ui_frame`), the in-game egui UI and its editor
+/// core (`pill_project_ui`, `pill_editor_core`), and the `Theme`/`Handle`s of
 /// `pill_ui_theme`. A reload must find the same instance the host loaded, so
-/// all of them stage.
+/// the whole set is staged together.
 pub(crate) const ENGINE_DYLIB_STEMS: [&str; 6] = [
     "pill_core",
     "pill_engine_core",
@@ -81,24 +85,27 @@ const TEMPORARY_DIRECTORY: &str = "pill_standalone_temp";
 /// How long another process's staging directory is left alone after its last
 /// write.
 ///
-/// This is the liveness check, and it is deliberately a clock rather than a
-/// process probe. A running host stages a fresh copy of every DLL it loads and
-/// of every one it reloads, so its directory's modification time keeps moving;
-/// one that has not been written to for this long belonged to a process that
-/// is gone. The window is generous because the cost of waiting is a few
-/// megabytes of disk and the cost of being wrong is deleting the staging of a
-/// host that is still running - and on Windows that deletion half-succeeds,
-/// taking the files that are not mapped and leaving the ones that are.
+/// This is the liveness check. A running host stages a fresh copy of every DLL
+/// it loads or reloads, so its directory's modification time keeps moving. One
+/// that has not been written to for this long belonged to a process that is
+/// gone. [`process_is_alive`] answers exactly on Linux, where the probe needs
+/// no process-table walk; everywhere else it reports "not alive", and the
+/// clock decides.
+///
+/// The window is generous on purpose. Waiting costs a few megabytes of disk.
+/// Guessing wrong deletes the staging of a host that is still running, and on
+/// Windows that deletion only half-succeeds: it takes the files that are not
+/// mapped and leaves the ones that are.
 const STAGING_GRACE_PERIOD: Duration = Duration::from_secs(60 * 60);
 
 /// Maximum number of other processes' staging directories kept.
 ///
-/// The backstop for the grace period above: without it, a developer who starts
-/// many hosts in one hour accumulates one directory per host until the hour is
-/// up. Bounded the way the retired-image graveyard is bounded - keep N, evict
-/// the oldest, say so - and the oldest-first order is what makes it safe to
-/// apply to directories still inside the grace period, because a live host's
-/// directory is the most recently written of them all.
+/// This is the backstop for the grace period above. Without it, a developer who
+/// starts many hosts in one hour keeps one directory per host until the hour is
+/// up. The oldest directories are removed first. That order is also what makes
+/// the limit safe to apply inside the grace period: a live host's directory is
+/// the most recently written of them all, so it is the last one this limit
+/// would reach.
 const MAX_RETAINED_STAGING_DIRECTORIES: usize = 8;
 
 /// Monotonic suffix ensuring temporary copies never collide, even when the
@@ -114,10 +121,10 @@ const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 
 /// Required registration entry point of a loadable artifact.
 ///
-/// One name for both kinds. A project and an extension export the same
-/// symbols, load the same way, reload through the same transaction and retire
-/// into the same graveyard. The differences that are real - a project is
-/// singular where modules are an ordered list, a module's components are
+/// One name covers both kinds. A project and an extension export the same
+/// symbols, load the same way, reload through the same transaction and are
+/// retired the same way. The differences that are real - a project is
+/// singular where modules form an ordered list, and a module's components are
 /// mirrored to C# - are policy, and live in the config and the reload
 /// transaction rather than in the loader.
 const MODULE_INIT_SYMBOL: &[u8] = b"pill_module_init";
@@ -125,7 +132,7 @@ const MODULE_INIT_SYMBOL: &[u8] = b"pill_module_init";
 /// Optional ABI revision export, read at load time when present.
 const MODULE_ABI_VERSION_SYMBOL: &[u8] = b"pill_module_abi_version";
 
-/// Export a loadable artifact provides so a patch can reach its redirect slots.
+/// Export that lets a patch reach an artifact's redirect slots.
 #[cfg(feature = "hot_patch")]
 const PLAIN_FUNCTION_INSTALL_SYMBOL: &[u8] = b"pill_hot_resolve_install";
 
@@ -161,17 +168,17 @@ const FIELD_ACCESSOR_COUNT_SYMBOL: &[u8] = b"pill_field_accessor_descriptor_coun
 /// buffer.
 const FIELD_ACCESSOR_COPY_SYMBOL: &[u8] = b"pill_copy_field_accessor_descriptors";
 
-/// Whether a module build produced engine dylibs different from the ones the
-/// host has mapped, which means the module must load against its own copies.
+/// Whether a module build produced engine dylibs that differ from the host's
+/// copies, which means the module must load against its own.
 ///
-/// When every pair is byte-identical (a plain CLI host whose feature closure
-/// matches the module build) the module keeps loading the host's single
-/// instances; only a host whose graph unions different features onto the
-/// shared engine crates (a GUI frontend) needs the isolated copies. The set
-/// is staged together: a module's `pill_engine_core.dll` imports
-/// `pill_core.dll`, and the UI dylibs share type identity across the boundary,
-/// so a module resolving some of its engine dylibs from one build and the rest
-/// from another gets mismatched symbol hashes and two `Theme` types.
+/// When every pair is byte-identical (a plain CLI host whose feature set
+/// matches the module build), the module keeps loading the host's single
+/// instances. Only a host whose dependency graph adds different features to
+/// the shared engine crates (a GUI frontend) needs the isolated copies. The
+/// whole set is staged together: a module's `pill_engine_core.dll` imports
+/// `pill_core.dll`, and the UI dylibs share type identity across the boundary.
+/// A module that resolved some engine dylibs from one build and the rest from
+/// another would get mismatched symbol hashes and two `Theme` types.
 fn engine_dylib_needs_isolation(workspace_root: &Path) -> bool {
     first_engine_dylib_mismatch(workspace_root).is_some()
 }
@@ -185,8 +192,8 @@ fn first_engine_dylib_mismatch(workspace_root: &Path) -> Option<(PathBuf, PathBu
         let host_engine = workspace_root
             .join(crate::config::host_target_directory())
             .join(format!("{stem}.dll"));
-        let matches = host_engine.is_file() && files_equal(&module_engine, &host_engine);
-        (!matches).then_some((host_engine, module_engine))
+        let copies_match = host_engine.is_file() && files_equal(&module_engine, &host_engine);
+        (!copies_match).then_some((host_engine, module_engine))
     })
 }
 
@@ -221,15 +228,16 @@ enum LoadFailureExplanation {
 
 /// The explanation the gathered evidence supports.
 ///
-/// The named import wins in general: it names a symbol and a file. It yields
-/// to the engine-dylib story only when the import belongs to an engine dylib
-/// whose module-world copy demonstrably differs - that mismatch is then what
-/// makes the symbol unresolvable, and it names both builds. Pure, so the
-/// decision is unit-testable without files on disk.
+/// Usually the missing import wins, because it names both a symbol and a
+/// file. It gives way to the engine-dylib explanation only when the import
+/// belongs to an engine dylib whose module-world copy really differs; that
+/// mismatch is then what makes the symbol unresolvable, and the answer names
+/// both builds. The function is pure, so the decision can be unit-tested
+/// without files on disk.
 ///
-/// `unresolved_mismatch` is the mismatch pair for the unresolved import's
-/// own engine dylib, when it is one and differs; `fallback_mismatch` is the
-/// first differing engine pair, for the no-import case.
+/// `unresolved_mismatch` is the mismatch pair for the unresolved import's own
+/// engine dylib, when it is one and it differs. `fallback_mismatch` is the
+/// first differing engine pair, used when there is no unresolved import.
 fn choose_explanation(
     unresolved: Option<UnresolvedImport>,
     unresolved_mismatch: Option<(PathBuf, PathBuf)>,
@@ -277,14 +285,15 @@ fn explanation_error(
     }
 }
 
-/// The first named import of `artifact` that a copy of its DLL the loader
-/// would consider does not export.
+/// The first named import of `artifact` that a candidate copy of its DLL does
+/// not export.
 ///
-/// The copies checked are the ones the staging puts in reach: the host's own
-/// directory (a copy the process already maps wins by basename), beside the
-/// loaded module, and the staged hot directory the module builds write. A
-/// DLL with every candidate missing from disk is left alone - the loader's
-/// own answer is all there is.
+/// The candidates are the copies the loader would consider: the host's own
+/// directory (a DLL the process already mapped wins by file name), the
+/// directory holding the loaded module, and the staged hot directory that the
+/// module builds write. A DLL whose copies are all missing from disk is
+/// skipped, because then only the loader's own message can explain the
+/// failure.
 fn first_unresolved_import(artifact: &Path, workspace_root: &Path) -> Option<UnresolvedImport> {
     let inspection = crate::analytics::inspect_pe(artifact)?;
     for import in &inspection.imports {
@@ -299,11 +308,11 @@ fn first_unresolved_import(artifact: &Path, workspace_root: &Path) -> Option<Unr
             let Some(candidate_inspection) = crate::analytics::inspect_pe(&candidate) else {
                 continue;
             };
-            let missing = import
+            let missing_symbol = import
                 .symbols
                 .iter()
                 .find(|symbol| !candidate_inspection.exports.contains(symbol));
-            if let Some(symbol) = missing {
+            if let Some(symbol) = missing_symbol {
                 return Some(UnresolvedImport {
                     dll: import.dll.clone(),
                     symbol: symbol.clone(),
@@ -325,8 +334,8 @@ fn import_candidate_copies(dll: &str, artifact: &Path, workspace_root: &Path) ->
             .join(crate::config::host_target_directory())
             .join(dll),
     );
-    if let Some(directory) = artifact.parent() {
-        candidates.push(directory.join(dll));
+    if let Some(artifact_directory) = artifact.parent() {
+        candidates.push(artifact_directory.join(dll));
     }
     candidates.push(
         workspace_root
@@ -342,8 +351,10 @@ fn unresolved_engine_mismatch(
     unresolved: &UnresolvedImport,
     workspace_root: &Path,
 ) -> Option<(PathBuf, PathBuf)> {
-    let lowered = unresolved.dll.to_ascii_lowercase();
-    let stem = lowered.strip_suffix(".dll").unwrap_or(&lowered);
+    let lowercase_dll_name = unresolved.dll.to_ascii_lowercase();
+    let stem = lowercase_dll_name
+        .strip_suffix(".dll")
+        .unwrap_or(&lowercase_dll_name);
     if !ENGINE_DYLIB_STEMS.contains(&stem) {
         return None;
     }
@@ -351,25 +362,26 @@ fn unresolved_engine_mismatch(
     let host_engine = workspace_root
         .join(crate::config::host_target_directory())
         .join(format!("{stem}.dll"));
-    let matches = host_engine.is_file() && files_equal(&module_engine, &host_engine);
-    (!matches).then_some((host_engine, module_engine))
+    let copies_match = host_engine.is_file() && files_equal(&module_engine, &host_engine);
+    (!copies_match).then_some((host_engine, module_engine))
 }
 
-/// Explain a load failure with the best evidence available.
+/// Explains a load failure with the best evidence available.
 ///
-/// The module's own import tables are read first: a symbol that no candidate
-/// copy of its DLL exports is a concrete answer, naming both the DLL and the
-/// symbol where the loader only said "procedure could not be found". The
-/// engine-dylib mismatch story is kept for the cases it truly explains - the
-/// unresolved import belongs to the mismatching dylib, or nothing else does.
+/// The module's own import tables are read first. A symbol that no candidate
+/// copy of its DLL exports is a concrete answer that names both the DLL and
+/// the symbol, where the loader only said "procedure could not be found". The
+/// engine-dylib explanation is used only for the cases it truly covers: the
+/// unresolved import belongs to the mismatching dylib, or nothing else
+/// explains the failure.
 fn diagnose_load_failure(
     error: LibraryError,
     artifact: &Path,
     workspace_root: &Path,
     module_name: &str,
 ) -> LibraryError {
-    // Only a load failure can be this; a missing export or a failed copy has
-    // already said something specific and true.
+    // Only a load failure needs explaining. A missing export or a failed copy
+    // has already said something specific and true.
     if !matches!(error, LibraryError::LoadFailed { .. }) {
         return error;
     }
@@ -391,9 +403,9 @@ fn diagnose_load_failure(
             );
         }
         LoadFailureExplanation::EngineDylibMismatch { .. } => {
-            // Differing bytes are not proof: two builds of one graph can
-            // still differ, and then the real cause is in the loader's own
-            // message, which the returned error replaces.
+            // Differing bytes are not proof. Two builds of one graph can still
+            // differ, and then only the loader's own message says why. That
+            // message is logged here because the returned error replaces it.
             warn!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 module = module_name,
@@ -406,66 +418,72 @@ fn diagnose_load_failure(
     explanation_error(module_name, explanation).unwrap_or(error)
 }
 
-/// Copy the module-world engine dylibs into `directory` so a module loaded
-/// from there resolves them co-located instead of the host's copies.
-fn stage_module_engine_dylib(workspace_root: &Path, directory: &Path) {
-    if std::fs::create_dir_all(directory).is_err() {
+/// Copies the module-world engine dylibs into `generation_directory`, so a
+/// module loaded from there finds them next to itself instead of using the
+/// host's copies.
+fn stage_module_engine_dylib(workspace_root: &Path, generation_directory: &Path) {
+    if std::fs::create_dir_all(generation_directory).is_err() {
         return;
     }
     for stem in ENGINE_DYLIB_STEMS {
-        let Some(source) = module_world_engine_dylib(workspace_root, stem) else {
+        let Some(engine_dll_source) = module_world_engine_dylib(workspace_root, stem) else {
             continue;
         };
-        let _ = std::fs::copy(&source, directory.join(format!("{stem}.dll")));
+        let _ = std::fs::copy(
+            &engine_dll_source,
+            generation_directory.join(format!("{stem}.dll")),
+        );
 
-        // Cargo stages the engine DLL in `target/hot`, but keeps its PDB in the
-        // private module artifact directory alongside the other host-spawned
-        // outputs. Keep the engine's symbols beside the co-located DLL too.
-        let direct_symbol = source.with_extension("pdb");
-        let artifact_symbol = workspace_root
+        // The build stages the engine DLL in `target/hot`, but its PDB stays
+        // in the private module artifact directory beside the other
+        // host-spawned outputs. Keep the engine's symbols beside the DLL that
+        // was copied here too.
+        let direct_symbol_source = engine_dll_source.with_extension("pdb");
+        let artifact_symbol_source = workspace_root
             .join(crate::config::module_build_artifact_directory())
             .join(format!("{stem}.pdb"));
-        let symbol_source = if direct_symbol.is_file() {
-            direct_symbol
+        let symbol_source = if direct_symbol_source.is_file() {
+            direct_symbol_source
         } else {
-            artifact_symbol
+            artifact_symbol_source
         };
         if symbol_source.is_file() {
-            let symbol_target = directory.join(format!("{stem}.pdb"));
+            let symbol_target = generation_directory.join(format!("{stem}.pdb"));
             let _ = std::fs::hard_link(&symbol_source, &symbol_target)
                 .or_else(|_| std::fs::copy(symbol_source, symbol_target).map(|_| ()));
         }
     }
 }
 
-/// Locate the engine dylib `stem` the module build produced: the staged
+/// Locates the engine dylib `stem` that the module build produced: the staged
 /// hot-load copy when a build has run, otherwise the one still in the private
-/// build tree.
+/// build directory.
 fn module_world_engine_dylib(workspace_root: &Path, stem: &str) -> Option<PathBuf> {
     let file_name = format!("{stem}.dll");
-    let staged = workspace_root
+    let staged_dll_path = workspace_root
         .join(crate::build_runner::PROJECT_HOT_OUTPUT_SUBDIRECTORY)
         .join(&file_name);
-    if staged.is_file() {
-        return Some(staged);
+    if staged_dll_path.is_file() {
+        return Some(staged_dll_path);
     }
-    let built = workspace_root
+    let built_dll_path = workspace_root
         .join(crate::config::module_build_artifact_directory())
         .join(&file_name);
-    built.is_file().then_some(built)
+    built_dll_path.is_file().then_some(built_dll_path)
 }
 
 /// Byte equality for two DLL files.
 ///
-/// Gated on length first, because both files are multi-megabyte engine
-/// dylibs compared on every `load_copy` and a length mismatch is a proof of
-/// inequality. Everything else goes through [`files_equal_streaming`]:
-/// timestamps cannot answer either way - a copied file keeps or renews them
-/// while staying byte-identical, and two files can share a timestamp while
-/// differing - and this comparison decides whether a module shares the host's
-/// engine instance or gets its own staged copy. A false "different" would map
-/// `pill_core.dll` twice and break the one-instance contract the engine's raw
-/// pointers rely on, so only exact bytes may answer "equal".
+/// The length is checked first, because both files are multi-megabyte engine
+/// dylibs compared on every `load_copy`, and a length mismatch already proves
+/// inequality. Everything else goes through [`files_equal_streaming`].
+///
+/// Timestamps cannot decide: a copied file keeps or renews its timestamp while
+/// staying byte-identical, and two files can share one while differing. The
+/// answer decides whether a module shares the host's engine instance or gets
+/// its own staged copy. A wrong "different" would map `pill_core.dll` twice
+/// and break the one-instance contract the engine's raw pointers rely on, so
+/// only exact bytes may answer "equal".
 fn files_equal(left: &Path, right: &Path) -> bool {
     if let (Ok(left_metadata), Ok(right_metadata)) =
         (std::fs::metadata(left), std::fs::metadata(right))
@@ -474,8 +492,9 @@ fn files_equal(left: &Path, right: &Path) -> bool {
             return false;
         }
     }
-    // Unreadable metadata falls through rather than answering "different":
-    // the streaming compare still answers, a locked file included.
+    // Metadata that cannot be read is not an answer, so fall through instead
+    // of reporting "different": the streaming compare still answers, even for
+    // a file that is locked against writing.
     files_equal_streaming(left, right)
 }
 
@@ -633,6 +652,10 @@ impl TemporaryCopy {
     }
 
     /// The copied file, which the guard still owns.
+    ///
+    /// # Panics
+    ///
+    /// Panics once the guard has handed the file to the library.
     fn path(&self) -> &Path {
         self.path.as_deref().expect("the copy is disarmed")
     }
@@ -680,26 +703,26 @@ impl NativeLibrary {
             }
         })?;
 
-        let timestamp = std::time::SystemTime::now()
+        let timestamp_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        let counter = TEMPORARY_COPY_COUNTER.fetch_add(1, Ordering::Relaxed);
-        // One directory per generation rather than one uniquely named file in
+        let copy_counter = TEMPORARY_COPY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // One directory per generation, rather than one uniquely named file in
         // a directory shared by all of them.
         //
-        // The image names its PDB by bare file name, so a debugger resolves it
-        // against the directory the module was loaded from. Generations
-        // sharing a directory would therefore have to share one PDB file, and
-        // the reload after the first would find that file held open by the
-        // debugger and impossible to replace - leaving the new generation with
-        // the previous one's symbols, which do not match it.
+        // The image names its PDB by bare file name, so a debugger looks for
+        // it in the directory the module was loaded from. If generations
+        // shared one directory they would also have to share one PDB file,
+        // and the first reload would find that file held open by the debugger
+        // and impossible to replace. The new generation would then carry the
+        // previous one's symbols, which do not match it.
         //
-        // The module name still prefixes the directory so several modules,
+        // The module name still prefixes the directory, so several modules,
         // each reloading on its own schedule, never collide inside one process
         // directory.
         let generation_directory =
-            temporary_directory.join(format!("{module_name}_{timestamp}_{counter}"));
+            temporary_directory.join(format!("{module_name}_{timestamp_nanos}_{copy_counter}"));
         std::fs::create_dir_all(&generation_directory).map_err(|source| {
             LibraryError::TemporaryDirectory {
                 directory: generation_directory.display().to_string(),
@@ -715,35 +738,35 @@ impl NativeLibrary {
         );
 
         // Step 2: Give this generation its own handle on the built library.
-        // A hard link is preferred: both paths are under the workspace root,
-        // so it shares the file the staging already wrote - a fresh copy would
-        // pay the platform's first-access scan again on every load, link or
-        // not - and a later staging replaces the hot copy by rename, which
-        // leaves this generation's file intact. A cross-volume workspace falls
-        // back to the copy this always was.
-        let temporary = std::fs::hard_link(build_output, &temporary_path)
+        // A hard link is preferred. Both paths are under the workspace root, so
+        // the link shares the file the staging already wrote, and a later
+        // staging replaces the hot copy by rename, which leaves this
+        // generation's file intact. A fresh copy would pay the platform's
+        // first-access scan again on every load. A cross-volume workspace
+        // falls back to that copy.
+        let copy_staging_result = std::fs::hard_link(build_output, &temporary_path)
             .or_else(|_| std::fs::copy(build_output, &temporary_path).map(|_| ()));
-        temporary.map_err(|source| LibraryError::CopyFailed {
+        copy_staging_result.map_err(|source| LibraryError::CopyFailed {
             source_path: build_output.display().to_string(),
             target_path: temporary_path.display().to_string(),
             source,
         })?;
-        // Step 2a: Place the module's debug symbols beside the copy.
+        // Step 2a: Put the module's debug symbols beside the copy.
         //
-        // `rust-lld` records the PDB in the image as a bare file name rather
-        // than an absolute path, so a debugger resolves it against whatever
-        // directory the module was loaded from - this temporary one, not the
-        // build output it was copied from. Without this the loaded module has
-        // no symbols at all, and no breakpoint in module source can bind.
+        // `rust-lld` records the PDB in the image as a bare file name, not an
+        // absolute path, so a debugger looks for it in whatever directory the
+        // module was loaded from: this temporary one, not the build output it
+        // was copied from. Without this the loaded module has no symbols, and
+        // no breakpoint in module source can bind.
         //
-        // Hard linked rather than copied: a module PDB runs to tens of
+        // The PDB is hard linked rather than copied. It can run to tens of
         // megabytes and both paths are under the workspace root, so the link
-        // costs nothing while a copy would be paid on every reload of every
+        // costs nothing, while a copy would be paid on every reload of every
         // module.
         //
-        // Best effort by design. A build carrying no debug info has no PDB,
-        // and a link that cannot be made costs symbols rather than the module,
-        // so nothing here may fail the load.
+        // This is best effort by design. A build without debug info has no
+        // PDB, and a link that cannot be made costs symbols but not the
+        // module, so nothing here may fail the load.
         let direct_symbol_source = build_output.with_extension("pdb");
         let artifact_symbol_source = workspace_root
             .join(crate::config::module_build_artifact_directory())
@@ -764,9 +787,9 @@ impl NativeLibrary {
                 // from - this generation's own, so reloads never contend for
                 // one file the debugger may already hold open.
                 let symbol_target = generation_directory.join(symbol_name);
-                let staged = std::fs::hard_link(&symbol_source, &symbol_target)
+                let symbol_staging_result = std::fs::hard_link(&symbol_source, &symbol_target)
                     .or_else(|_| std::fs::copy(&symbol_source, &symbol_target).map(|_| ()));
-                match staged {
+                match symbol_staging_result {
                     Ok(()) => debug!(
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                         path = %symbol_target.display(),
@@ -792,25 +815,27 @@ impl NativeLibrary {
         );
 
         // Step 2b: Decide whether this module must load against its own engine
-        // dylib rather than the host's.
+        // dylibs instead of the host's.
         //
         // The host binary maps `pill_core.dll` from the regular target
         // directory. When the module build produced a different engine dylib
-        // than the host runs (a GUI frontend unions extra features onto shared
-        // crates), the module must resolve ITS copy or symbol lookup fails at
-        // load time. The matching copy is staged into the hot-load directory
-        // by the build; when the two copies are byte-identical (a plain CLI
-        // host) the module keeps loading the host's single instance.
+        // than the host runs (a GUI frontend adds extra features to shared
+        // crates), the module must resolve its own copy or symbol lookup fails
+        // at load time. The build stages the matching copy into the hot-load
+        // directory; when the two copies are byte-identical (a plain CLI host)
+        // the module keeps loading the host's single instance.
         //
-        // Staging is a best effort, not a guarantee, and Step 3 says so when it
-        // does not pay off: the loader resolves an already-mapped DLL by module
-        // name, so a second `pill_core.dll` only wins where the host has not
-        // mapped one - which on Windows is never.
-        // Staged beside the copy, in this generation's own directory: the
-        // altered search path starts at the directory of the library being
-        // loaded, so a copy anywhere else is never consulted - and a stem the
-        // host process has not mapped (the editor crates in a renderer host)
-        // has no other place to be found.
+        // Staging is best effort, not a guarantee. If it does not help, the
+        // load fails in Step 3 and the diagnosis names the engine mismatch.
+        // The loader resolves an already-mapped DLL by module name, so a
+        // second `pill_core.dll` only wins where the host has not mapped one,
+        // which on Windows is never.
+        //
+        // The copies go beside the library, in this generation's own
+        // directory, because the altered search path starts at the directory
+        // of the library being loaded. A copy anywhere else is never
+        // consulted, and a stem the host process has not mapped (the editor
+        // crates in a renderer host) has no other place to be found.
         let isolated_engine = engine_dylib_needs_isolation(workspace_root);
         if isolated_engine {
             stage_module_engine_dylib(workspace_root, &generation_directory);
@@ -818,9 +843,12 @@ impl NativeLibrary {
 
         // Step 3: Load the copy and validate its required exports.
         let load_started = Instant::now();
-        // SAFETY: `temporary_copy.path()` is a complete native module on disk -
-        // staged from the build output in step 2 - and `Self::load` validates
-        // the required `pill_module_init` export before returning.
+        // SAFETY: `Self::load` requires `path` to name a valid native library
+        // whose `pill_module_init` export uses the expected C ABI. The path is
+        // this function's copy of the build output, staged in step 2, so it is
+        // the module the build produced. A file that is not a loadable library
+        // only makes `load` return `LoadFailed`, because the mapping and the
+        // required export are both checked there.
         let native_library = unsafe {
             Self::load(
                 temporary_copy.path(),
@@ -874,24 +902,25 @@ impl NativeLibrary {
     fn fetch_descriptors<T: Clone>(
         &self,
         prototype: T,
-        count: Option<unsafe extern "C" fn() -> u32>,
-        copy: Option<unsafe extern "C" fn(*mut T, u32) -> u32>,
+        count_export: Option<unsafe extern "C" fn() -> u32>,
+        copy_export: Option<unsafe extern "C" fn(*mut T, u32) -> u32>,
     ) -> Vec<T> {
-        let (Some(count), Some(copy)) = (count, copy) else {
+        let (Some(count_export), Some(copy_export)) = (count_export, copy_export) else {
             return Vec::new();
         };
         // SAFETY: the count export takes no arguments and returns a plain
         // integer while the library is mapped.
-        let total = unsafe { count() } as usize;
-        if total == 0 {
+        let descriptor_count = unsafe { count_export() } as usize;
+        if descriptor_count == 0 {
             return Vec::new();
         }
-        let mut descriptors = vec![prototype; total];
+        let mut descriptors = vec![prototype; descriptor_count];
         // SAFETY: the copy export was validated to take a host-owned buffer of
-        // `total` slots; the slice's pointer and length satisfy that contract,
-        // and the library stays mapped for the call.
-        let copied = unsafe { copy(descriptors.as_mut_ptr(), total as u32) } as usize;
-        descriptors.truncate(copied.min(total));
+        // `descriptor_count` slots; the slice's pointer and length satisfy that
+        // contract, and the library stays mapped for the call.
+        let copied_count =
+            unsafe { copy_export(descriptors.as_mut_ptr(), descriptor_count as u32) } as usize;
+        descriptors.truncate(copied_count.min(descriptor_count));
         descriptors
     }
 
@@ -914,16 +943,16 @@ impl NativeLibrary {
         )
     }
 
-    /// Fetch the artifact's mirror descriptors - its mirrored functions and
-    /// the rows describing its mirrored types - each with the address of its
-    /// trampoline.
+    /// Fetches the artifact's mirror descriptors: its mirrored functions and
+    /// the rows that describe its mirrored types. Each function row carries the
+    /// address of the trampoline the artifact compiled for it.
     ///
-    /// The address comes from the descriptor itself, which the artifact
-    /// filled in with the trampoline it compiled, so nothing is resolved by
-    /// symbol. Empty when the artifact predates the exports or declares
-    /// nothing mirrored. A function row with no address is skipped, so a
-    /// broken descriptor can never hand C# a null callable; a type row with
-    /// none (an enum's, a resource's) is kept for the codegen.
+    /// Nothing is looked up by symbol, because the artifact fills the address
+    /// into the descriptor itself. The list is empty when the artifact was built
+    /// before these exports or mirrors nothing. A function row with no address
+    /// is skipped, so a broken descriptor never gives C# a callable that points
+    /// at nothing. A type row without an address (an enum's or a resource's) is
+    /// kept, because the codegen needs it.
     pub(crate) fn mirror_methods(&self) -> Vec<ResolvedMirrorMethod> {
         if self.library.is_none() {
             return Vec::new();
@@ -946,7 +975,7 @@ impl NativeLibrary {
             self.copy_mirror_methods,
         );
 
-        let mut resolved: Vec<ResolvedMirrorMethod> = Vec::new();
+        let mut resolved_methods: Vec<ResolvedMirrorMethod> = Vec::new();
         for descriptor in descriptors {
             // The trampoline lives in this library, which stays mapped for the
             // `NativeLibrary`'s lifetime.
@@ -954,7 +983,7 @@ impl NativeLibrary {
             if address == 0 && descriptor.name != pill_engine::component_registry::MIRROR_TYPE_ROW {
                 continue;
             }
-            resolved.push(ResolvedMirrorMethod {
+            resolved_methods.push(ResolvedMirrorMethod {
                 type_name: descriptor.type_name.to_string(),
                 method_name: descriptor.name.to_string(),
                 return_tag: descriptor.return_tag.to_string(),
@@ -975,18 +1004,19 @@ impl NativeLibrary {
                 owner_kind: descriptor.owner_kind.to_string(),
             });
         }
-        resolved
+        resolved_methods
     }
 
-    /// Fetch the artifact's heap-field accessor descriptors, each with the
-    /// exported addresses of its `#[no_mangle]` trampolines.
+    /// Fetches the artifact's heap-field accessor descriptors. Each returned
+    /// row carries the addresses of the `#[no_mangle]` trampolines for one
+    /// field.
     ///
-    /// Empty when the artifact predates the exports or declares no heap
-    /// fields. Each operation's trampoline resolves to `None` when the
-    /// artifact does not export it, and a descriptor whose every operation
-    /// failed to resolve is skipped entirely rather than surfaced as a row
-    /// nothing could call; which operations a mirror actually needs is
-    /// checked by the codegen, which knows the field's kind.
+    /// The list is empty when the artifact was built before these exports or
+    /// declares no heap fields. An operation whose trampoline the artifact does
+    /// not export is reported as `None`. A descriptor whose operations all
+    /// failed is skipped, so the host never publishes a row that cannot be
+    /// called. Checking which operations a mirror really needs is left to the
+    /// codegen, which knows the field's kind.
     pub(crate) fn field_accessors(&self) -> Vec<ResolvedFieldAccessor> {
         let Some(library) = self.library.as_ref() else {
             return Vec::new();
@@ -1012,14 +1042,16 @@ impl NativeLibrary {
             if symbol.is_empty() {
                 return None;
             }
-            // SAFETY: `library.get` maps the exported trampoline symbol; the
-            // module stays mapped for this `NativeLibrary`'s lifetime.
+            // SAFETY: `library.get` looks the exported trampoline up by name,
+            // and the symbol is read as its address, never called through this
+            // handle. The module stays mapped because `library` is borrowed
+            // from this `NativeLibrary`.
             unsafe { library.get::<usize>(symbol.as_bytes()) }
                 .ok()
                 .map(|symbol| *symbol)
         };
 
-        let mut resolved: Vec<ResolvedFieldAccessor> = Vec::new();
+        let mut resolved_accessors: Vec<ResolvedFieldAccessor> = Vec::new();
         for descriptor in descriptors {
             let view_address = resolve_optional(descriptor.view_symbol);
             let resize_address = resolve_optional(descriptor.resize_symbol);
@@ -1027,9 +1059,8 @@ impl NativeLibrary {
             let item_address = resolve_optional(descriptor.item_symbol);
             let set_item_address = resolve_optional(descriptor.set_item_symbol);
             let push_address = resolve_optional(descriptor.push_symbol);
-            // A descriptor whose every operation failed to resolve is not a
-            // usable accessor; publish nothing rather than a row nothing could
-            // call.
+            // Every operation failed, so there is nothing to call: skip the
+            // descriptor instead of handing out a row of empty addresses.
             let callable = view_address.is_some()
                 || resize_address.is_some()
                 || set_address.is_some()
@@ -1039,7 +1070,7 @@ impl NativeLibrary {
             if !callable {
                 continue;
             }
-            resolved.push(ResolvedFieldAccessor {
+            resolved_accessors.push(ResolvedFieldAccessor {
                 type_name: descriptor.type_name.to_string(),
                 field_name: descriptor.field_name.to_string(),
                 kind: descriptor.kind.to_string(),
@@ -1052,10 +1083,15 @@ impl NativeLibrary {
                 push_address,
             });
         }
-        resolved
+        resolved_accessors
     }
 
-    /// Load a module and verify its required exports.
+    /// Loads the staged module at `path` and resolves its required exports.
+    ///
+    /// `temporary_path` is that same file, kept so the returned `NativeLibrary`
+    /// can delete the copy when it drops. `module_name` labels the artifact in
+    /// errors. `isolated_engine` records whether the module loads against
+    /// engine dylibs staged beside it.
     ///
     /// # Safety
     ///
@@ -1069,24 +1105,24 @@ impl NativeLibrary {
     ) -> Result<Self, LibraryError> {
         // Step 1: Open the native library and map it into this process.
         // SAFETY: The `# Safety` contract of `load` guarantees `path` names a
-        // valid native library. Mapping runs the module's constructors; the
-        // returned handle keeps it mapped and is stored in the returned
-        // `NativeLibrary` for the module's whole lifetime.
+        // valid native library. Mapping runs the module's constructors, and the
+        // handle that comes back keeps the module mapped; it is stored in the
+        // returned `NativeLibrary`, so it lives as long as the module does.
         let library = if isolated_engine {
             // The module was compiled against an engine dylib that differs from
             // the host's; load with the module's own directory first in the
             // dependency search order so it resolves the copy staged beside it.
             #[cfg(windows)]
             {
-                // SAFETY: `path` is the complete native module on disk (staged
-                // by the caller immediately before this load), and the matching
-                // engine dylibs were copied into the same directory just above;
-                // the altered search path therefore only resolves known,
-                // self-owned DLLs.
+                // SAFETY: `path` is this process's own staged copy, written
+                // just before this load, and the matching engine dylibs are
+                // staged into the same directory whenever the host isolated
+                // this module. The altered search path therefore starts in a
+                // directory this process controls.
                 unsafe {
-                    // `load_with_flags` returns the platform-level handle; the
-                    // crate-root `Library` used by `NativeLibrary` is the safe
-                    // wrapper over it, which `From` provides.
+                    // `load_with_flags` returns the platform-level handle. The
+                    // crate-root `Library` that `NativeLibrary` stores is the
+                    // safe wrapper around it, and `From` performs that wrap.
                     Library::from(
                         windows_loader::Library::load_with_flags(
                             path,
@@ -1099,14 +1135,15 @@ impl NativeLibrary {
                     )
                 }
             }
-            // Non-Windows loaders do not pin dependency resolution the way
-            // Windows does; fall back to the default load, which resolves the
-            // module's dependencies through the platform's own search path.
+            // The other platforms' loaders do not take a search path for one
+            // library the way Windows does, so this falls back to the default
+            // load, which finds the module's dependencies through the
+            // platform's own search rules.
             #[cfg(not(windows))]
             {
-                // SAFETY: `path` names a complete native module on disk
-                // (validated by the caller), and the default load maps it
-                // without altering dependency resolution.
+                // SAFETY: the `# Safety` contract of `load` requires `path` to
+                // name a valid native module on disk, and the default load maps
+                // it without changing how its dependencies are found.
                 unsafe {
                     Library::new(path).map_err(|source| LibraryError::LoadFailed {
                         path: path.display().to_string(),
@@ -1115,10 +1152,10 @@ impl NativeLibrary {
                 }
             }
         } else {
-            // SAFETY: `path` names a complete native module on disk (validated
-            // by the caller), and the module was built against the engine dylib
-            // the host already has mapped, so the default search resolves that
-            // shared single instance.
+            // SAFETY: the `# Safety` contract of `load` requires `path` to name
+            // a valid native module on disk, and this module was built against
+            // the engine dylibs the host already has mapped, so the default
+            // search finds those single shared instances.
             unsafe {
                 Library::new(path).map_err(|source| LibraryError::LoadFailed {
                     path: path.display().to_string(),
@@ -1127,12 +1164,13 @@ impl NativeLibrary {
             }
         };
 
-        // Step 2: Resolve the required `pill_module_init` export. The subject
-        // travels with the refusal: a project and an extension export the same
-        // symbol, so the symbol alone does not say which artifact lacks it.
+        // Step 2: Resolve the required `pill_module_init` export. The error
+        // carries the module's name, because a project and an extension export
+        // the same symbol and the symbol alone does not say which artifact
+        // lacks it.
         // SAFETY: `pill_module_init` is a mandatory export of the native ABI
-        // contract, so every supported artifact provides it, and it is resolved
-        // here as a pointer with the statically known C ABI signature. The
+        // contract, so an artifact the host accepts provides it. It is resolved
+        // as a pointer with the statically known C ABI signature, and the
         // pointer stays valid because the `library` handle keeps the module
         // mapped for the lifetime of the returned `NativeLibrary`.
         let module_init: Symbol<ModuleInitFn> = unsafe {
@@ -1145,73 +1183,74 @@ impl NativeLibrary {
                 })?
         };
 
-        // Step 3: Read the optional ABI revision before any other call, so a
-        // caller can reject an incompatible module without ever handing it a
-        // pointer into engine memory.
-        // SAFETY: The export is optional; when present it is resolved with the
-        // statically known C ABI signature and called immediately while the
+        // Step 3: Read the optional ABI revision before anything else calls
+        // into the module, so a caller can reject an incompatible module
+        // without ever handing it a pointer into engine memory.
+        // SAFETY: The export is optional. When it is present it is read with the
+        // statically known C ABI signature and called at once, while the
         // library is mapped. It takes no arguments and returns a plain integer,
-        // so the call cannot touch host state.
+        // so no host value is passed into it.
         let abi_version: Option<u32> =
             unsafe { library.get::<ModuleAbiVersionFn>(MODULE_ABI_VERSION_SYMBOL) }
                 .ok()
                 .map(|symbol| unsafe { symbol() });
 
-        // Step 4: Resolve the optional value-type manifest exports. Optional,
-        // because the project contract predates them; a library that does not
-        // export them simply contributes no typed value types.
-        // SAFETY: `library.get` maps a function pointer from the loaded module
-        // with the statically known signature; the mapped module stays alive
-        // for as long as the `library` handle held by this `NativeLibrary`.
+        // Step 4: Resolve the optional value-type manifest exports. They are
+        // optional because a library built before them does not export them,
+        // and such a library simply contributes no value types.
+        // SAFETY: `library.get` reads a function pointer out of the loaded
+        // module using the statically known signature. The `library` handle
+        // keeps that module mapped for as long as this `NativeLibrary` lives.
         let value_type_count: Option<ValueTypeCountFn> =
             unsafe { library.get(VALUE_TYPE_COUNT_SYMBOL) }
                 .ok()
                 .map(|symbol| *symbol);
-        // SAFETY: same as above; `library.get` maps the copy export from the
-        // module that is kept mapped by the `library` handle.
+        // SAFETY: the copy export is read out of the module the `library`
+        // handle keeps mapped, with the statically known signature.
         let copy_value_types: Option<CopyValueTypesFn> =
             unsafe { library.get(VALUE_TYPE_COPY_SYMBOL) }
                 .ok()
                 .map(|symbol| *symbol);
-        // Step 5: Resolve the optional mirrored-method manifest exports.
-        // Optional, exactly like the value-type manifest: a library built
-        // before the exports simply contributes no mirrored methods.
-        // SAFETY: `library.get` maps each export with its statically known C
-        // ABI signature; the module stays mapped for the lifetime of the
-        // returned `NativeLibrary`.
+        // Step 5: Resolve the optional mirrored-method manifest exports. Like
+        // the value-type manifest, a library built before them exports none and
+        // simply contributes no mirrored methods.
+        // SAFETY: `library.get` reads each export with its statically known C
+        // ABI signature, from a module the `library` handle keeps mapped for the
+        // lifetime of the returned `NativeLibrary`.
         let mirror_method_count: Option<MirrorMethodCountFn> =
             unsafe { library.get(MIRROR_METHOD_COUNT_SYMBOL) }
                 .ok()
                 .map(|symbol| *symbol);
-        // SAFETY: `library.get` maps the copy export from the module that is
-        // kept mapped by the `library` handle; the descriptor array stays
-        // inside this artifact's static data for the artifact's lifetime.
+        // SAFETY: the copy export is read from the module the `library` handle
+        // keeps mapped, and the descriptor array it points at stays inside the
+        // artifact's static data for as long as the artifact is loaded.
         let copy_mirror_methods: Option<CopyMirrorMethodsFn> =
             unsafe { library.get(MIRROR_METHOD_COPY_SYMBOL) }
                 .ok()
                 .map(|symbol| *symbol);
 
-        // Step 6: Resolve the optional heap-field accessor exports. Optional
-        // like the manifests above: a library built before the exports simply
+        // Step 6: Resolve the optional heap-field accessor exports. Like the
+        // manifests above, a library built before them exports none and simply
         // contributes no container accessors.
-        // SAFETY: `library.get` maps each export with its statically known C
-        // ABI signature; the module stays mapped for the lifetime of the
-        // returned `NativeLibrary`.
+        // SAFETY: `library.get` reads each export with its statically known C
+        // ABI signature, from a module the `library` handle keeps mapped for the
+        // lifetime of the returned `NativeLibrary`.
         let field_accessor_count: Option<FieldAccessorCountFn> =
             unsafe { library.get(FIELD_ACCESSOR_COUNT_SYMBOL) }
                 .ok()
                 .map(|symbol| *symbol);
-        // SAFETY: same as above; the descriptor array stays inside this
-        // artifact's static data for the artifact's lifetime.
+        // SAFETY: the copy export is read from the module the `library` handle
+        // keeps mapped, and its descriptor array stays inside this artifact for
+        // as long as the artifact is loaded.
         let copy_field_accessors: Option<CopyFieldAccessorsFn> =
             unsafe { library.get(FIELD_ACCESSOR_COPY_SYMBOL) }
                 .ok()
                 .map(|symbol| *symbol);
 
-        // Step 7: Copy the resolved pointers out of the borrowed Symbol
-        // wrappers. The `library` field keeps the module mapped, so these raw
-        // pointers remain valid for the complete lifetime of the returned
-        // `NativeLibrary`.
+        // Step 7: Copy the `pill_module_init` pointer out of its borrowed
+        // `Symbol` wrapper. The `library` field keeps the module mapped, so this
+        // raw pointer and the optional ones above stay valid for the whole
+        // lifetime of the returned `NativeLibrary`.
         let module_init_pointer = *module_init;
         Ok(Self {
             library: Some(library),
@@ -1227,32 +1266,33 @@ impl NativeLibrary {
         })
     }
 
-    /// Call the module's registration entry point.
+    /// Calls the module's registration entry point.
     ///
-    /// Returns the module's status code: zero reports successful registration;
-    /// any non-zero value means the module failed to initialize and the
-    /// previous generation must remain active.
+    /// Returns the module's status code. Zero means registration succeeded.
+    /// Any other value means the module failed to initialize, so the caller
+    /// must keep the previous generation active.
     pub(crate) fn call_init(&self, api: &EngineApi) -> u32 {
-        // SAFETY: The init export was validated to exist and to use this C ABI
-        // signature when the library was loaded, and the `library` field
-        // keeps the module mapped for as long as this `NativeLibrary` lives.
-        // `api` is borrowed immutably for the whole call and outlives it
-        // because the host creates the engine API before loading the module.
+        // SAFETY: The init export was found at load time and is held with this
+        // C ABI signature, which is the signature the module ABI contract
+        // defines for it. The `library` field keeps the module mapped for as
+        // long as this `NativeLibrary` lives, and `api` is only borrowed for the
+        // duration of the call.
         unsafe { (self.module_init)(api as *const EngineApi) }
     }
 
-    /// Reject an artifact built against a different revision of the module ABI.
+    /// Rejects an artifact built against a different revision of the module ABI.
     ///
-    /// An artifact may export `pill_module_abi_version`; when it does, the
-    /// revision is compared before anything calls into it: a mismatch means
-    /// the two sides disagree about what the entry points expect, and
-    /// proceeding would call through a signature one never agreed to. No
-    /// export at all predates the versioned contract.
+    /// An artifact may export `pill_module_abi_version`. When it does, this
+    /// compares that revision with the host's before anything calls into it. A
+    /// mismatch means the two sides disagree about what the entry points
+    /// expect, and a call through them would use a shape one side never agreed
+    /// to. An artifact with no such export was built before the contract was
+    /// versioned.
     ///
     /// # Errors
     ///
-    /// Returns [`ModuleError::AbiVersionMismatch`] for a different revision and
-    /// [`ModuleError::AbiVersionMissing`] when the export is absent.
+    /// Returns [`ModuleError::AbiVersionMismatch`] when the revisions differ,
+    /// and [`ModuleError::AbiVersionMissing`] when the export is absent.
     pub(crate) fn check_module_abi(&self, module_name: &str) -> Result<(), ModuleError> {
         let host_version = pill_engine::module_abi::MODULE_ABI_VERSION;
         match self.abi_version() {
@@ -1268,13 +1308,14 @@ impl NativeLibrary {
         }
     }
 
-    /// Resolve an export only one kind of caller knows about, or `None` when
+    /// Finds an export that only one kind of caller knows about, or `None` when
     /// the library does not export it.
     ///
-    /// The loader caches the exports every artifact may have; an export that
-    /// belongs to one module's own contract - the renderer's attach and detach
-    /// entry points - is looked up here, once, by the caller that knows its
-    /// signature, rather than widening this type for every such module.
+    /// The loader keeps the exports every artifact may have. An export that
+    /// belongs to one module's own contract, such as the renderer's attach and
+    /// detach entry points or a shader reload function, is looked up here by
+    /// the caller that knows its signature. That keeps `NativeLibrary` from
+    /// growing a field for every such module.
     ///
     /// # Safety
     ///
@@ -1283,24 +1324,25 @@ impl NativeLibrary {
     #[cfg_attr(not(feature = "rendering"), allow(dead_code))]
     pub(crate) unsafe fn resolve_export<T: Copy>(&self, name: &[u8]) -> Option<T> {
         let library = self.library.as_ref()?;
-        // SAFETY: the caller states `T` is the export's type; the returned
-        // copy of the pointer is valid while `library` keeps the image mapped,
-        // which the caller's contract bounds its use to.
+        // SAFETY: the caller states that `T` is the export's type. The copy of
+        // the pointer that comes back stays valid while `library` keeps the
+        // image mapped, which is the limit the caller's contract puts on its
+        // use.
         unsafe { library.get::<T>(name) }.ok().map(|symbol| *symbol)
     }
 
-    /// Offer a replacement implementation to this artifact's copy of one
+    /// Offers a replacement implementation to this artifact's copy of one
     /// `#[pill_hot_fn]`.
     ///
-    /// A crate linked into several artifacts is compiled into each of them, so
-    /// one edited function has as many independent redirect slots as there are
-    /// artifacts linking it. The host therefore offers the same replacement to
-    /// every loaded library rather than assuming one of them owns the function.
+    /// A crate linked into several artifacts gets compiled into each of them,
+    /// so one edited function has an independent redirect slot in every artifact
+    /// that links it. The host therefore offers the same replacement to every
+    /// loaded library instead of assuming that one of them owns the function.
     ///
-    /// Returns `Ok(true)` when this artifact installed the replacement,
-    /// `Ok(false)` when it declares no such function (including when it exports
-    /// no resolver at all, as a library built before this ABI does), and `Err`
-    /// when it refused because the signature no longer matches.
+    /// Returns `Ok(true)` when this artifact installed the replacement. Returns
+    /// `Ok(false)` when the artifact declares no such function, which includes a
+    /// library built before this ABI that exports no resolver at all. Returns
+    /// `Err` when the artifact refused because the signature no longer matches.
     #[cfg(feature = "hot_patch")]
     pub(crate) fn install_plain_function(
         &self,
@@ -1311,9 +1353,9 @@ impl NativeLibrary {
         let Some(library) = self.library.as_ref() else {
             return Ok(false);
         };
-        // Resolved on demand rather than at load time: the export only exists
-        // on artifacts built from a crate that opted into hot patching, and a
-        // patch is rare enough that one lookup costs nothing.
+        // Looks the export up when it is needed instead of at load time. Only
+        // an artifact whose crate opted into hot patching exports it, and a
+        // patch is rare enough that the extra lookup costs nothing.
         //
         // SAFETY: the symbol is looked up by the name the `#[pill_module]` and
         // `#[pill_project]` macros generate, with the signature those macros
@@ -1331,8 +1373,8 @@ impl NativeLibrary {
             .map_err(|_| "the signature contains an interior NUL".to_string())?;
 
         // SAFETY: both strings are NUL-terminated and live until the call
-        // returns, and `address` points into a patch library the host keeps
-        // mapped for the process lifetime.
+        // returns, and `address` points into a patch image that the host never
+        // unloads.
         let status = unsafe { install(name.as_ptr(), address, signature_text.as_ptr()) };
         match status {
             0 => Ok(true),
@@ -1343,12 +1385,14 @@ impl NativeLibrary {
         }
     }
 
-    /// How many of this artifact's functions have a length the exception
-    /// directory records, and how many it declares in total.
+    /// Returns how many of this artifact's functions have a length that the
+    /// exception directory records, and how many it has in total, as
+    /// `(known, total)`.
     ///
-    /// Only a function with a known extent can be prologue-patched, so this
-    /// turns a refusal into a diagnosis: whether one function happens to be a
-    /// leaf, or the whole artifact is out of reach.
+    /// Only a function with a known length can be patched at its prologue, so
+    /// this turns a refusal into a diagnosis: it shows whether the one function
+    /// happens to be a leaf, or whether nothing in the artifact is reachable by
+    /// that route. Returns `None` when the artifact exports no such report.
     #[cfg(feature = "hot_patch")]
     pub(crate) fn extent_coverage(&self) -> Option<(usize, usize)> {
         let library = self.library.as_ref()?;
@@ -1361,18 +1405,18 @@ impl NativeLibrary {
         Some(((packed >> 32) as usize, (packed & 0xFFFF_FFFF) as usize))
     }
 
-    /// Report the address and recorded declaration of any function in this
-    /// artifact, from the build-script-generated inventory rather than an
-    /// attribute.
+    /// Returns the address of any function in this artifact, with the
+    /// declaration it was built with. Both come from the inventory the build
+    /// script writes, not from an attribute.
     ///
-    /// The declaration is the compatibility gate for the prologue route: it is
-    /// the only chance to refuse a reshaped function, because overwriting the
-    /// first bytes of a function can check nothing about what it jumps to. An
-    /// artifact whose inventory carries no declaration reports `None` for it,
-    /// which the gate refuses rather than exempts.
+    /// The declaration is the compatibility check for the prologue route, and
+    /// the only chance to refuse a reshaped function: overwriting a function's
+    /// first bytes cannot check what it jumps to. An artifact whose inventory
+    /// holds no declaration reports `None`, and the check refuses that case
+    /// rather than treating it as nothing to verify.
     ///
-    /// Returns `None` overall when this artifact exports no address resolver or
-    /// has no entry for the name.
+    /// Returns `None` when the artifact exports no address resolver or has no
+    /// entry for the name.
     #[cfg(feature = "hot_patch")]
     pub(crate) fn function_address(&self, qualified_name: &str) -> Option<(usize, Option<String>)> {
         let library = self.library.as_ref()?;
@@ -1404,14 +1448,14 @@ impl NativeLibrary {
         Some((address, signature))
     }
 
-    /// Return this artifact's copy of one `#[pill_hot_fn]` to its own body.
+    /// Returns this artifact's copy of one `#[pill_hot_fn]` to its own body.
     ///
-    /// The counterpart of [`Self::install_plain_function`], used to roll a patch
-    /// back to generation zero. Each artifact restores its own compiled-in code
-    /// rather than being handed an address that belongs to another.
+    /// This is the counterpart of [`Self::install_plain_function`], and it is
+    /// what a rollback uses: each artifact restores the code it was compiled
+    /// with, instead of being handed an address that belongs to another image.
     ///
-    /// Returns `Ok(true)` when this artifact emptied its slot and `Ok(false)`
-    /// when it declares no such function or exports no resolver.
+    /// Returns `Ok(true)` when this artifact emptied the slot. Returns
+    /// `Ok(false)` when it declares no such function or exports no resolver.
     #[cfg(feature = "hot_patch")]
     pub(crate) fn reset_plain_function(&self, qualified_name: &str) -> Result<bool, String> {
         let Some(library) = self.library.as_ref() else {
@@ -1436,16 +1480,16 @@ impl NativeLibrary {
 }
 
 impl Drop for NativeLibrary {
-    /// Unmap the module and delete its temporary copy with the directory it
-    /// was staged in.
+    /// Unmaps the module and deletes its temporary copy together with the
+    /// directory it was staged in.
     ///
-    /// The library handle is dropped explicitly before the file is removed
+    /// The library handle is dropped explicitly before the file is removed,
     /// because Windows refuses to delete a file that is still mapped into the
-    /// process. Cleanup failures are reported rather than swallowed.
+    /// process. A cleanup failure is logged as a warning rather than ignored.
     fn drop(&mut self) {
-        // This is the drop in which a stale call into already-freed code shows
-        // up, so the image is named before it goes: the last line printed is
-        // what identifies the image when the process dies inside this drop.
+        // A stale call into code that is about to be freed shows up as a crash
+        // in this drop, so the image is named before it is unmapped. The last
+        // line printed then identifies which image the process died in.
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             path = %self.temporary_path.display(),
@@ -1460,11 +1504,11 @@ impl Drop for NativeLibrary {
 // Free Functions
 // =============================================================================
 
-/// Delete one temporary copy and the generation directory it was staged in.
+/// Deletes one temporary copy and the generation directory it was staged in.
 ///
-/// Shared by [`NativeLibrary`]'s `Drop` and [`TemporaryCopy`]'s, which remove
-/// the same kind of file for the same reason and must say the same thing when
-/// the removal fails.
+/// Both [`NativeLibrary`]'s `Drop` and [`TemporaryCopy`]'s call this: they
+/// remove the same kind of file for the same reason, and a failure has to be
+/// reported in the same way from either one.
 fn remove_temporary_file(path: &Path) {
     if let Err(error) = std::fs::remove_file(path) {
         warn!(
@@ -1478,18 +1522,19 @@ fn remove_temporary_file(path: &Path) {
     }
 }
 
-/// Remove one generation's directory, keeping whatever the process still maps.
+/// Removes one generation's directory and keeps whatever the process still
+/// maps.
 ///
-/// The directory holds the copy, the module's PDB, and - with an isolated
-/// engine - copies of the engine dylibs: one directory per load, tens of
-/// megabytes if nothing takes it away. A mapped engine dylib cannot be deleted
-/// on any platform that locks its images, so whatever refuses to go is named at
-/// debug level rather than warned about; the startup sweep collects it once
-/// this process is gone.
+/// The directory holds the copy, the module's PDB and, when the engine was
+/// isolated, copies of the engine dylibs. That is one directory per load, and
+/// tens of megabytes if nothing takes it away. A mapped image cannot be deleted
+/// on a platform that locks its files, so whatever refuses to go is named at
+/// debug level instead of warned about, and a later start removes the directory
+/// once the grace period has passed.
 ///
-/// Only a `<staging>/<pid>/<module>_<stamp>_<n>` directory is touched, never
-/// the process directory itself, which holds hot-patch scratch images that
-/// outlive every module.
+/// Only a `<staging>/<pid>/<module>_<stamp>_<n>` directory is removed, never the
+/// process directory itself, which holds the generated hot-patch sources and
+/// images that stay for the life of the process.
 fn remove_generation_directory(directory: &Path) {
     let owned_by_a_process_directory = directory
         .parent()
@@ -1532,16 +1577,15 @@ pub(crate) fn process_temporary_directory(workspace_root: &Path) -> PathBuf {
 
 /// Whether a process with the given id is still running.
 ///
-/// An exact answer where one is cheap, and only there: Linux probes `/proc`
-/// directly, and every other platform answers "not alive" rather than paying
-/// for a process-table walk on a path that runs once at startup.
+/// The answer is exact only where an exact one is cheap: Linux checks `/proc`
+/// directly, and every other platform answers "not alive" rather than walking
+/// the process table on a call that happens once at startup.
 ///
-/// That is safe because it is not the only check. A negative answer here does
-/// not authorise a removal - it hands the decision to
-/// [`STAGING_GRACE_PERIOD`], which asks when the directory was last written to
-/// instead of who owns it. A live host writes to its staging on every load, so
-/// the clock recognises it on every platform; this function only lets Linux
-/// skip the wait.
+/// That is safe because this is not the only check. A negative answer does not
+/// allow a removal; it gives the decision to [`STAGING_GRACE_PERIOD`], which
+/// looks at when the directory was last written to instead of at who owns it.
+/// A live host stages on every load, so the clock recognises it on every
+/// platform. This function only lets Linux skip the wait.
 fn process_is_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -1554,16 +1598,20 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
-/// Remove temporary copies left by earlier runs of this host process.
+/// Removes the staging directories that earlier host processes left behind.
 ///
-/// Three rules, in order. This process's own directory always goes - a previous
-/// run under the same process id left it. Another process's directory goes once
-/// it has been quiet for [`STAGING_GRACE_PERIOD`], which is how a dead host is
-/// told from a live one without probing the process table. Whatever survives is
-/// capped at [`MAX_RETAINED_STAGING_DIRECTORIES`], oldest evicted first.
+/// Three rules apply, in this order:
 ///
-/// Removal failures are reported rather than swallowed: on Windows a live host
-/// keeps its mapped modules locked, so a refusal says the directory is in use.
+/// 1. This process's own directory always goes. A previous run under the same
+///    process id left it.
+/// 2. Another process's directory goes once it has been quiet for
+///    [`STAGING_GRACE_PERIOD`]. That wait is how a dead host is told from a live
+///    one.
+/// 3. Whatever survives is capped at [`MAX_RETAINED_STAGING_DIRECTORIES`], and
+///    the oldest go first.
+///
+/// Removal failures are reported rather than ignored: on Windows a live host
+/// keeps its mapped modules locked, so a refusal means the directory is in use.
 pub(crate) fn cleanup_temporary_files(workspace_root: &Path) {
     let temporary_root = workspace_root.join(TEMPORARY_DIRECTORY);
     let Ok(entries) = std::fs::read_dir(&temporary_root) else {
@@ -1588,8 +1636,8 @@ pub(crate) fn cleanup_temporary_files(workspace_root: &Path) {
             continue;
         }
 
-        // The Linux probe is exact and answers first; everywhere else it
-        // reports "not alive" by design and the clock decides instead.
+        // The Linux probe gives an exact answer and is asked first. Everywhere
+        // else it reports "not alive" by design, and the clock decides instead.
         if process_is_alive(pid) {
             continue;
         }
@@ -1597,33 +1645,33 @@ pub(crate) fn cleanup_temporary_files(workspace_root: &Path) {
         candidates.push((pid, staging_last_write(&path), path));
     }
 
-    let ages: Vec<(u32, SystemTime)> = candidates
+    let candidate_times: Vec<(u32, SystemTime)> = candidates
         .iter()
         .map(|(pid, modified, _)| (*pid, *modified))
         .collect();
-    for (index, reason) in staging_directories_to_evict(&ages, SystemTime::now()) {
+    for (index, reason) in staging_directories_to_evict(&candidate_times, SystemTime::now()) {
         let (pid, _, path) = &candidates[index];
         remove_staging_directory(path, *pid, reason);
     }
 }
 
-/// Choose which of the other processes' staging directories to remove.
+/// Chooses which of the other processes' staging directories to remove.
 ///
-/// Two rules. A directory quiet for at least [`STAGING_GRACE_PERIOD`] belonged
-/// to a process that is gone, so it goes. Whatever is left is capped at
-/// [`MAX_RETAINED_STAGING_DIRECTORIES`], least recently written first - which
-/// is both the least likely to belong to a running host and the one whose disk
-/// is most worth reclaiming.
+/// Two rules decide it. A directory that has been quiet for at least
+/// [`STAGING_GRACE_PERIOD`] belonged to a process that is gone, so it goes.
+/// Whatever is left is capped at [`MAX_RETAINED_STAGING_DIRECTORIES`], and the
+/// least recently written go first: they are the least likely to belong to a
+/// running host, and the ones whose disk is most worth reclaiming.
 ///
-/// Pure, and separated from the removal for that reason: the policy is the part
-/// worth pinning, and pinning it here needs neither a filesystem nor a second
-/// host process.
+/// Returns each directory's index in `candidates` with the reason to log. The
+/// function is pure and kept apart from the removal so it can be tested without
+/// a filesystem or a second host process.
 fn staging_directories_to_evict(
     candidates: &[(u32, SystemTime)],
     now: SystemTime,
 ) -> Vec<(usize, &'static str)> {
     let mut evictions: Vec<(usize, &'static str)> = Vec::new();
-    let mut retained: Vec<(SystemTime, usize)> = Vec::new();
+    let mut retained_candidates: Vec<(SystemTime, usize)> = Vec::new();
 
     for (index, (_, modified)) in candidates.iter().enumerate() {
         let quiet_for = now
@@ -1632,14 +1680,14 @@ fn staging_directories_to_evict(
         if quiet_for >= STAGING_GRACE_PERIOD {
             evictions.push((index, "stale"));
         } else {
-            retained.push((*modified, index));
+            retained_candidates.push((*modified, index));
         }
     }
 
-    if retained.len() > MAX_RETAINED_STAGING_DIRECTORIES {
-        retained.sort_by_key(|(modified, _)| *modified);
-        let excess = retained.len() - MAX_RETAINED_STAGING_DIRECTORIES;
-        for (_, index) in retained.iter().take(excess) {
+    if retained_candidates.len() > MAX_RETAINED_STAGING_DIRECTORIES {
+        retained_candidates.sort_by_key(|(modified, _)| *modified);
+        let excess_count = retained_candidates.len() - MAX_RETAINED_STAGING_DIRECTORIES;
+        for (_, index) in retained_candidates.iter().take(excess_count) {
             evictions.push((*index, "over the retained-staging bound"));
         }
     }
@@ -1647,23 +1695,23 @@ fn staging_directories_to_evict(
     evictions
 }
 
-/// When a staging directory was last written to.
+/// Returns when a staging directory was last written to.
 ///
-/// Falls back to the epoch when the timestamp cannot be read, which makes an
-/// unreadable directory look maximally stale: it is the one state in which
-/// leaving it forever is worse than attempting a removal that will simply fail
-/// if the files are in use.
+/// When the timestamp cannot be read this falls back to the epoch, which makes
+/// an unreadable directory look as old as possible. That is deliberate: leaving
+/// such a directory forever is worse than trying to remove it, and the attempt
+/// only fails if the files are still in use.
 fn staging_last_write(path: &Path) -> SystemTime {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
-/// Remove one staging directory, saying which one and why.
+/// Removes one staging directory and logs which one went and why.
 ///
-/// A failure for another process's directory is expected rather than
-/// exceptional - a live host holds its mapped modules - so it is reported as a
-/// note instead of an error.
+/// A failure on another process's directory is expected rather than
+/// exceptional, because a live host keeps its mapped modules locked. It is
+/// logged as a note, not as an error.
 fn remove_staging_directory(path: &Path, pid: u32, reason: &str) {
     match std::fs::remove_dir_all(path) {
         Ok(()) => {
@@ -1682,8 +1730,8 @@ fn remove_staging_directory(path: &Path, pid: u32, reason: &str) {
                     path.display()
                 );
             } else {
-                // On platforms without process probing the removal may fail
-                // simply because another live host holds the files.
+                // The removal can fail simply because another live host still
+                // holds the files. That is why it is logged as a note here.
                 info!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     "Temporary directory {} left in place (possibly still in use): {error}",
@@ -1710,10 +1758,10 @@ mod tests {
 
     use crate::scratch::ScratchDirectory;
 
-    /// A failing load: the artifact imports a symbol `pill_ui_frame` does not
-    /// export while `pill_core`'s copies differ. The message must name
-    /// `pill_ui_frame` and the symbol - the mismatch story must not win and bury
-    /// the real answer.
+    /// A failing load where the artifact imports a symbol that `pill_ui_frame`
+    /// does not export, while `pill_core`'s copies differ. The message must
+    /// name `pill_ui_frame` and the symbol, so the engine-dylib answer does not
+    /// win and hide the real one.
     #[test]
     fn a_missing_pill_ui_frame_import_wins_over_a_pill_core_mismatch() {
         let unresolved = UnresolvedImport {
@@ -1736,8 +1784,8 @@ mod tests {
         );
     }
 
-    /// A resolved feature-hash mismatch whose unresolved import belongs to
-    /// the mismatching dylib keeps the mismatch story, with both paths.
+    /// A feature-hash mismatch whose unresolved import belongs to the
+    /// mismatching dylib keeps the engine-dylib answer, with both paths.
     #[test]
     fn an_engine_import_keeps_the_mismatch_story_with_both_paths() {
         let unresolved = UnresolvedImport {
@@ -1761,8 +1809,8 @@ mod tests {
         assert!(text.contains("different engine dylib"), "{text}");
     }
 
-    /// Without an unresolved import the first differing pair still explains
-    /// the failure; without either, the loader's own words stand.
+    /// Without an unresolved import, the first differing pair still explains
+    /// the failure. Without either, the loader's own words stand.
     #[test]
     fn the_fallback_is_the_mismatch_then_the_loader_message() {
         let pair = (
@@ -1779,13 +1827,13 @@ mod tests {
         );
     }
 
-    /// A directory that has been quiet past the grace period is stale; one
-    /// written to recently is left alone.
+    /// A directory that has been quiet longer than the grace period is stale,
+    /// and one written to recently is left alone.
     ///
-    /// The grace period is the liveness check: a running host stages a copy on
-    /// every load and every reload, so a recent write is the evidence that its
-    /// process is still there. Deleting it would take whatever of its staging
-    /// is not currently mapped and leave the rest.
+    /// The grace period is what says whether that process is still alive. A
+    /// running host stages a copy on every load and every reload, so a recent
+    /// write is the evidence that it is there. Deleting a live host's directory
+    /// would take whatever it does not currently map and leave the rest.
     #[test]
     fn a_quiet_staging_directory_is_stale_and_a_recent_one_is_not() {
         let now = SystemTime::now();
@@ -1797,20 +1845,22 @@ mod tests {
         assert_eq!(evictions, vec![(0, "stale")]);
     }
 
-    /// Past the retained bound, the least recently written go first.
+    /// Past the retained bound, the least recently written directories go
+    /// first.
     ///
-    /// Oldest-first is what makes the bound safe to apply inside the grace
-    /// period at all: a live host's directory is the most recently written of
-    /// them, so it is the last one the bound would ever reach.
+    /// Removing the oldest first is what makes the bound safe to apply inside
+    /// the grace period. A live host writes to its directory on every load, so
+    /// it is the most recently written of them all and the last one the bound
+    /// would reach.
     #[test]
     fn the_retained_bound_evicts_the_least_recently_written_first() {
         let now = SystemTime::now();
         // Two more than the bound allows, all well inside the grace period,
         // each a second older than the next.
-        let count = MAX_RETAINED_STAGING_DIRECTORIES + 2;
-        let candidates: Vec<(u32, SystemTime)> = (0..count)
+        let candidate_count = MAX_RETAINED_STAGING_DIRECTORIES + 2;
+        let candidates: Vec<(u32, SystemTime)> = (0..candidate_count)
             .map(|index| {
-                let age = Duration::from_secs((count - index) as u64);
+                let age = Duration::from_secs((candidate_count - index) as u64);
                 (index as u32, now - age)
             })
             .collect();
@@ -1838,8 +1888,10 @@ mod tests {
         assert!(staging_directories_to_evict(&candidates, now).is_empty());
     }
 
-    /// Stamp one fixed modification time onto a file, so the metadata gate in
-    /// `files_equal` is decided by this test rather than by clock resolution.
+    /// Sets a fixed modification time on a file.
+    ///
+    /// Tests use it to control the timestamps exactly, so a comparison between
+    /// two files is decided by their bytes and never by when they were written.
     fn set_modified(path: &std::path::Path, stamp: SystemTime) {
         let file = std::fs::File::options()
             .write(true)
@@ -1848,9 +1900,9 @@ mod tests {
         file.set_modified(stamp).expect("set modification time");
     }
 
-    /// The length gate and the streaming compare answer one question: equal
-    /// bytes are equal, and both a length mismatch and a same-length
-    /// difference are not. Timestamps must not decide: the identical pair
+    /// The length check and the streaming compare answer one question: equal
+    /// bytes are equal, and neither a length mismatch nor a same-length
+    /// difference is. Timestamps must not decide it, so the identical pair
     /// below deliberately carries different modification times.
     #[test]
     fn files_equal_gates_length_and_compares_bytes() {
@@ -1863,8 +1915,8 @@ mod tests {
         std::fs::write(&first, b"engine bytes").expect("write first");
         std::fs::write(&second, b"engine bytes").expect("write second");
         set_modified(&first, stamp);
-        // A copied dylib keeps its bytes but not its timestamp; comparing the
-        // two as "different" would stage an isolated engine and map
+        // A copied dylib keeps its bytes but not its timestamp. Treating the
+        // two as different would stage an isolated engine and map
         // `pill_core.dll` twice.
         set_modified(&second, stamp + Duration::from_secs(1));
         assert!(
@@ -1872,8 +1924,8 @@ mod tests {
             "identical bytes compare equal regardless of timestamps"
         );
 
-        // Same length, one differing byte: the streaming compare must catch
-        // what the length gate cannot.
+        // Same length, one differing byte: the streaming compare has to catch
+        // what the length check cannot.
         std::fs::write(&second, b"engine ByteS").expect("write one differing byte");
         set_modified(&second, stamp);
         assert!(
@@ -1881,7 +1933,7 @@ mod tests {
             "same length but different bytes compare unequal"
         );
 
-        // Shorter file: the length gate answers.
+        // Shorter file: the length check answers.
         std::fs::write(&second, b"engine").expect("truncate second");
         set_modified(&second, stamp);
         assert!(
@@ -1898,25 +1950,25 @@ mod tests {
     fn an_abandoned_copy_is_removed() {
         let directory = ScratchDirectory::new("temporary_copy");
 
-        let abandoned = directory.join("abandoned.dll");
-        std::fs::write(&abandoned, b"copy").expect("write abandoned copy");
+        let abandoned_copy_path = directory.join("abandoned.dll");
+        std::fs::write(&abandoned_copy_path, b"copy").expect("write abandoned copy");
         {
-            let _guard = TemporaryCopy::new(abandoned.clone());
+            let _guard = TemporaryCopy::new(abandoned_copy_path.clone());
         }
         assert!(
-            !abandoned.exists(),
+            !abandoned_copy_path.exists(),
             "the guard removes the copy when the load never took it over"
         );
 
-        let kept = directory.join("kept.dll");
-        std::fs::write(&kept, b"copy").expect("write kept copy");
+        let kept_copy_path = directory.join("kept.dll");
+        std::fs::write(&kept_copy_path, b"copy").expect("write kept copy");
         {
-            let mut guard = TemporaryCopy::new(kept.clone());
+            let mut guard = TemporaryCopy::new(kept_copy_path.clone());
             let _ = guard.path();
             guard.disarm();
         }
         assert!(
-            kept.exists(),
+            kept_copy_path.exists(),
             "a disarmed guard leaves the file to the library that mapped it"
         );
 
@@ -1925,21 +1977,25 @@ mod tests {
 
     /// A rejected load must take its whole generation directory with it.
     ///
-    /// The copy is not the only thing in there: the module's PDB is staged
+    /// The copy is not the only thing in there. The module's PDB is staged
     /// beside it, and so are copies of the engine dylibs when the module needs
-    /// its own. Removing the copy alone would leave every one of those behind,
-    /// one directory per reload, for the life of the workspace.
+    /// its own. Removing only the copy would leave those behind, one directory
+    /// per reload, for the life of the workspace.
     #[test]
     fn a_rejected_load_leaves_no_generation_directory() {
         let workspace = ScratchDirectory::new("generation_directory");
         let build_output = workspace.join("garbage.dll");
         std::fs::write(&build_output, b"not a native library").expect("write the artifact");
 
-        let loaded = super::NativeLibrary::load_copy(&build_output, &workspace, "garbage_module");
-        assert!(loaded.is_err(), "a file that is not a library cannot load");
+        let load_attempt =
+            super::NativeLibrary::load_copy(&build_output, &workspace, "garbage_module");
+        assert!(
+            load_attempt.is_err(),
+            "a file that is not a library cannot load"
+        );
 
         let process_directory = super::process_temporary_directory(&workspace);
-        let leftover: Vec<String> = std::fs::read_dir(&process_directory)
+        let leftover_names: Vec<String> = std::fs::read_dir(&process_directory)
             .map(|entries| {
                 entries
                     .filter_map(Result::ok)
@@ -1948,8 +2004,8 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(
-            leftover.is_empty(),
-            "the generation directory outlived its copy: {leftover:?}"
+            leftover_names.is_empty(),
+            "the generation directory outlived its copy: {leftover_names:?}"
         );
     }
 }

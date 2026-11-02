@@ -4,25 +4,25 @@
 //!
 //! - Describes how the project module and each extension are built, watched
 //!   and loaded.
-//! - Infers the configuration from `PROJECT_PATH` and the project's own
+//! - Reads the configuration from `PROJECT_PATH` and the project's own
 //!   `project_settings.yaml`: backend, extensions, renderer, assets, logging
 //!   and startup scene.
-//! - Resolves the renderer's two crates and an editor host's editor crates,
-//!   and generates the workspace members that build the project and each
+//! - Finds the renderer's two crates and an editor host's editor crates, and
+//!   writes the generated workspace members that build the project and each
 //!   extension crate.
 //! - Reads the editor-only `editor_settings.yaml`.
-//! - Mirrors the host's cargo profile, target triple and dioxus-CLI wrapper
-//!   onto every build the host spawns.
+//! - Copies the host's cargo profile, target triple and dioxus-CLI wrapper
+//!   onto every build the host starts.
 //!
 //! # Design
 //!
-//! [`ProjectModuleConfig`] holds the project module's values; [`HostConfig`]
-//! adds the extension list and the posture switches. The backend (native Rust
-//! or managed C#) comes from the manifest in the project directory
-//! (`Cargo.toml` or `*.csproj`), and every path, command and assembly name is
-//! derived from it, so no project identity is compiled into the host binary.
-//! A missing or unreadable project fails fast with a [`ConfigError`] naming
-//! the offending path.
+//! [`ProjectModuleConfig`] holds the project module's values, and [`HostConfig`]
+//! adds the extension list and the switches that select the editor posture.
+//! The backend (native Rust or managed C#) comes from the manifest in the
+//! project directory (`Cargo.toml` or `*.csproj`). Every path, command and
+//! assembly name is derived from that manifest, so no project identity is
+//! compiled into the host binary. A missing or unreadable project fails at
+//! once with a [`ConfigError`] that names the offending path.
 
 // Standard library
 use std::collections::{BTreeMap, HashSet};
@@ -40,35 +40,35 @@ use toml_edit::{value, DocumentMut, Item, Table, Value};
 // Constants
 // =============================================================================
 
-/// The only variable the host reads: the project directory to run, relative
-/// to the workspace root (for example `../examples/project_rs`).
+/// The variable that selects the project to run: the project directory,
+/// relative to the workspace root (for example `../examples/local/project_rs`).
 const PROJECT_PATH_ENVIRONMENT_VARIABLE: &str = "PROJECT_PATH";
 
 /// Opt-in variable that adds cargo's `--timings` report to every host-driven
 /// build.
 ///
-/// Off by default: the report makes cargo write a timing HTML file and adds a
-/// per-build overhead, and only the analytics collector reads it - which a
-/// developer is not usually watching. Set the variable (to any value) when
-/// per-crate build times are wanted; the collector then reads the report this
-/// process's builds produce.
+/// Off by default. The report makes cargo write an HTML timing file and adds
+/// work to every build, and only automated build measurements read it, so a
+/// developer does not usually want it. Set the variable to any value when
+/// per-crate build times are needed; the measurements then read the report
+/// this process's builds produce.
 const CARGO_TIMINGS_ENVIRONMENT_VARIABLE: &str = "PILL_CARGO_TIMINGS";
 
 /// Assembly name of the bundled `csharp_runtime` collectible loader.
 const CSHARP_RUNTIME_ASSEMBLY_NAME: &str = "csharp_runtime";
 
-/// Workspace-root-relative directory of the bundled C# runtime project; its
-/// output lands under `bin/<configuration>/<framework>` inside it.
+/// Workspace-root-relative directory of the C# runtime project. Its build
+/// output appears under `bin/<configuration>/<framework>` inside it.
 const CSHARP_RUNTIME_PROJECT_SUBDIRECTORY: &str = "csharp/pill_csharp_runtime";
 
-/// Default target framework used for the managed project output path.
+/// Target framework the managed project and the runtime are built for.
 const CSHARP_TARGET_FRAMEWORK: &str = "net8.0";
 
 /// Opt-in variable selecting the MSBuild configuration of the managed project
 /// build: `Release` (the default) or `Debug`.
 ///
 /// `Debug` exists for the managed debugger. A `Release` build is optimized by
-/// Roslyn itself, so locals are gone from the IL and no JIT setting brings
+/// Roslyn, so local variables are gone from the IL and no JIT setting brings
 /// them back. The runtime is a `ProjectReference` of every gameplay project,
 /// so it is built in the same configuration and its output path follows.
 const CSHARP_CONFIGURATION_ENVIRONMENT_VARIABLE: &str = "PILL_CSHARP_CONFIGURATION";
@@ -79,9 +79,10 @@ const CSHARP_CONFIGURATIONS: [&str; 2] = ["Release", "Debug"];
 
 /// Workspace-relative manifest of the in-process C# compiler.
 ///
-/// Deliberately not a member of any managed project's reference graph: Roslyn
-/// is large and NativeAOT-hostile, so the compiler is built and loaded only in
-/// the hot-reload posture and never reaches a shipping bundle.
+/// The compiler is deliberately not referenced by any managed project. Roslyn
+/// is large and does not work well with NativeAOT, so the compiler is built
+/// and loaded only when the host enables hot reload, and never reaches a
+/// shipping bundle.
 #[cfg(feature = "hot_reload")]
 pub(crate) const CSHARP_COMPILER_MANIFEST: &str =
     "csharp/pill_csharp_compiler/pill_csharp_compiler.csproj";
@@ -103,63 +104,62 @@ pub(crate) const CSHARP_COMPILER_ARGUMENTS_TARGETS: &str =
 
 /// File the capture target writes inside a managed project's `obj` directory.
 ///
-/// Named here and in the targets file, which is the whole contract between
-/// them: MSBuild derives the directory from the project it is building, and the
-/// host derives the same path from the project's output directory.
+/// This name is the whole contract between the host and the targets file.
+/// MSBuild derives the directory from the project it builds, and the host
+/// derives the same path from the project's output directory.
 #[cfg(feature = "hot_reload")]
 pub(crate) const CSHARP_COMPILER_ARGUMENTS_FILE: &str = "pill_compiler_args.rsp";
 
 /// Workspace-relative directory holding one folder per extension.
 ///
 /// Each folder, `extensions/<extension>/`, holds that extension's crates
-/// (`extensions/<extension>/<crate>/`). The workspace manifest globs the
-/// folders, so a module is discovered by existing rather than by being listed
-/// anywhere.
+/// (`extensions/<extension>/<crate>/`). The workspace manifest globs
+/// `extensions/*/pill_*`, so a module is found by existing rather than by
+/// being listed anywhere.
 const EXTENSION_DIRECTORY: &str = "extensions";
 
 /// Folder, inside an extension's folder, holding the host-generated wrapper
 /// crates of that extension's crates.
 const GENERATED_DIRECTORY: &str = "generated";
 
-/// Suffix of an extension folder's editor crate: folder `<extension>` holds its
-/// editor part in `<extension>/<extension>_editor/`, which only an editor host
-/// loads (after the folder's runtime crates) and no other build ever sees.
+/// Suffix of an extension folder's editor crate. Folder `<extension>` holds
+/// its editor part in `<extension>/<extension>_editor/`; only an editor host
+/// loads it, after the folder's runtime crates, and no other build sees it.
 pub(crate) const EDITOR_CRATE_SUFFIX: &str = "_editor";
 
-/// The editor frontend name a configuration carries when its caller names
-/// none.
+/// The editor frontend name a configuration uses when its caller names none.
 ///
 /// `pill_editor` names `egui` explicitly through
-/// [`HostConfig::from_environment_for_editor_frontend`]; a crate tagged with
-/// another frontend loads only under that one.
+/// [`HostConfig::from_environment_for_editor_frontend`]. A crate that tags
+/// itself for another frontend loads only under that frontend.
 pub(crate) const DEFAULT_EDITOR_FRONTEND: &str = "egui";
 
-/// The editor frontend tag no host accepts: a crate that declares it is
-/// refused at resolution, because no host would ever load its editor part.
+/// The editor frontend tag no host accepts. A crate that declares it is
+/// refused during resolution, because no host would ever load its editor
+/// part.
 pub(crate) const RETIRED_EDITOR_FRONTEND: &str = "pill_ui";
 
 /// Workspace-relative directory holding the generated project member.
 ///
 /// Projects live outside the workspace, so the member that builds one as part
-/// of it is generated here; the `projects_generated/*` workspace glob discovers
+/// of it is generated here. The `projects_generated/*` workspace glob finds
 /// it without any entry in the workspace manifest.
 const PROJECT_MEMBER_DIRECTORY: &str = "projects_generated";
 
 /// Name prefix of the generated workspace member that builds a native project.
 ///
-/// The member lives under [`PROJECT_MEMBER_DIRECTORY`]; only the package name
-/// differs per project.
+/// The member lives under [`PROJECT_MEMBER_DIRECTORY`], and its package is
+/// `<prefix><project package name>`.
 pub(crate) const HOST_PROJECT_MEMBER_PREFIX: &str = "host_project_";
 
 /// Name prefix of the generated workspace member that builds one extension's
 /// loadable artifact.
 ///
-/// One wrapper is materialized per loaded extension crate, in the
-/// [`GENERATED_DIRECTORY`] of the extension folder holding that crate, so the
-/// `extensions/*/generated/*` glob discovers it. The wrapper is the `cdylib`;
-/// the extension itself stays a plain library inside it, which is what lets
-/// the module build and every project build compile one identical copy of the
-/// extension.
+/// The host writes one wrapper per loaded extension crate, into the
+/// [`GENERATED_DIRECTORY`] of the extension folder that holds the crate, so
+/// the `extensions/*/generated/*` glob finds it. The wrapper is the `cdylib`;
+/// the extension stays a plain library inside it. That is what lets the module
+/// build and every project build compile one identical copy of the extension.
 pub(crate) const HOST_MODULE_MEMBER_PREFIX: &str = "host_module_";
 
 /// Cargo profile directory this host was compiled into, recorded by `build.rs`.
@@ -171,14 +171,14 @@ const HOST_PROFILE_DIRECTORY: &str = env!("PILL_HOST_PROFILE_DIRECTORY");
 
 /// Target triple the host was compiled for, recorded by `build.rs`.
 ///
-/// Empty when the host was built natively (an ordinary `cargo build`/`cargo
-/// run` without `--target`), which is every host except one launched by the
-/// dioxus CLI (`dx serve`). dx always passes `--target <host-triple>` to
-/// cargo, and cargo folds the target into each crate's metadata hash - so a
-/// module built natively against a `--target` host gets different symbol
-/// names than the host's loaded engine dylibs export, and every module load
-/// dies with "The specified procedure could not be found" (os error 127).
-/// Host-spawned module builds mirror this triple so both sides agree.
+/// Empty when the host was built natively (an ordinary `cargo build` or
+/// `cargo run` without `--target`), which is every host except one launched by
+/// the dioxus CLI (`dx serve`). dx always passes `--target <host-triple>` to
+/// cargo, and cargo folds the target into each crate's metadata hash. A module
+/// built natively against a `--target` host would then get different symbol
+/// names than the engine dylibs the host loaded export, and every module load
+/// would fail with "The specified procedure could not be found" (os error
+/// 127). Host-spawned module builds pass the same triple so both sides agree.
 const HOST_TARGET_TRIPLE: &str = env!("PILL_HOST_TARGET_TRIPLE");
 
 /// Environment variable the dioxus CLI sets on every app it launches.
@@ -192,32 +192,31 @@ const DIOXUS_CLI_ENABLED_ENVIRONMENT: &str = "DIOXUS_CLI_ENABLED";
 ///
 /// Cargo wraps only workspace member crates through this executable and folds
 /// the executable's path into their `-C metadata` hash, which is how dx's
-/// build diverges from a plain cargo build. The value is deliberately kept as
-/// a constant here (not hard-coded) so the env name and the dx-specific
-/// `DX_RUSTC` sibling stay in one place.
+/// build diverges from a plain cargo build. The name is kept in this one
+/// constant so it and the dx-specific `DX_RUSTC` sibling stay together.
 const RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT: &str = "RUSTC_WORKSPACE_WRAPPER";
 
 /// Environment variable that makes dx's own binary act as a rustc wrapper.
 ///
-/// Without it dx treats a `dx <rustc> <args>` invocation as a normal CLI call
-/// and fails; with it, dx records the invocation into the directory named by
-/// this variable and then proxies the real `rustc`. Host-spawned builds that
-/// mirror dx's workspace wrapper must set both variables together.
+/// Without it, dx treats a `dx <rustc> <args>` invocation as a normal CLI call
+/// and fails. With it, dx records the invocation in the directory the variable
+/// names and then runs the real `rustc`. A host-spawned build that copies dx's
+/// workspace wrapper must set both variables together.
 const DX_RUSTC_WRAPPER_ENVIRONMENT: &str = "DX_RUSTC";
 
 /// Private build tree for every cargo build the host spawns.
 ///
 /// The running host binary maps the engine dylibs out of the regular target
-/// directory ([`host_target_directory`]). A GUI frontend like the editor
-/// unions extra features onto crates those dylibs depend on, so the engine the
-/// host runs can legitimately need different artifacts than a module build,
-/// and a module build rewriting the shared directory would make cargo delete a
-/// DLL the host has mapped (Windows refuses to replace a loaded image).
-/// Host-spawned builds write here instead; their engine artifacts are staged
-/// into the hot-load directory when the two worlds differ.
+/// directory ([`host_target_directory`]). A GUI frontend like the editor adds
+/// features to crates those dylibs depend on, so the engine the host runs can
+/// need different artifacts than a module build. A module build that rewrote
+/// the shared directory would make cargo delete a DLL the host has mapped, and
+/// Windows refuses to replace a loaded image. Host-spawned builds write here
+/// instead; their engine artifacts are copied into the hot-load directory when
+/// the two sets differ.
 ///
 /// With a `--target` host ([`HOST_TARGET_TRIPLE`]) the builds pass the same
-/// triple, so the subtree lands under `target/hot/build/<triple>/<profile>`.
+/// triple, so the subtree appears under `target/hot/build/<triple>/<profile>`.
 pub(crate) const MODULE_BUILD_TARGET_DIRECTORY: &str = "target/hot/build";
 
 /// Project configuration file name, resolved in the project root. A project
@@ -249,8 +248,8 @@ pub(crate) const RENDERER_DATA_SUFFIX: &str = "_data";
 /// Directory at a renderer data crate's root holding the shader sources it
 /// cooks, relative to the crate.
 ///
-/// The same name the crate's build script and the shader reload export use, so
-/// an edit lands where the watcher looks.
+/// The crate's build script and the shader reload code must name the same
+/// directory, or an edited shader changes a file that nothing rebuilds.
 pub(crate) const RENDERER_SHADER_SOURCES_DIRECTORY: &str = "shader_sources";
 
 /// Dependency tables whose entries link code into the build.
@@ -285,13 +284,12 @@ pub enum ProjectModuleBackend {
 /// Configuration for a hot-reloadable project module.
 ///
 /// Describes how to build the module, where to find its output, and which
-/// source directories to watch. The struct is assembled by
-/// [`Self::from_environment`] from the `PROJECT_PATH` variable plus the
-/// project's manifest, and owns every value, so no project identity is
-/// compiled into the host binary.
+/// source directories to watch. [`Self::from_environment`] builds it from the
+/// `PROJECT_PATH` variable plus the project's manifest, and it owns every
+/// value, so no project identity is compiled into the host binary.
 ///
-/// `#[non_exhaustive]` allows new fields to be added without breaking
-/// frontends; prefer [`Self::from_environment`] over struct literals.
+/// `#[non_exhaustive]` lets new fields be added without breaking frontends, so
+/// prefer [`Self::from_environment`] over struct literals.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ProjectModuleConfig {
@@ -307,7 +305,8 @@ pub struct ProjectModuleConfig {
     /// Directory to watch for source changes, relative to the workspace root.
     pub watch_directory: String,
 
-    /// Build command whose first element is the program and rest are arguments.
+    /// Build command: the first element is the program and the rest are
+    /// arguments.
     pub build_command: Vec<String>,
 
     /// Environment variables applied to the build process.
@@ -327,8 +326,8 @@ pub struct ProjectModuleConfig {
 /// ([`materialize_host_module_wrapper`]) whose `cdylib` carries the
 /// loadable-artifact entry points, with the extension itself compiled inside
 /// it as a plain library. Wrapper and extension share the workspace's
-/// lockfile and Cargo configuration, which is what lets them link the engine
-/// dynamically and share one copy of its statics with the host.
+/// lockfile and Cargo configuration. That shared setup is what lets them link
+/// the engine dynamically and share one copy of its statics with the host.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ExtensionConfig {
@@ -345,8 +344,8 @@ pub struct ExtensionConfig {
     pub is_editor_crate: bool,
 
     /// Library name of the artifact the host loads, which is the extension's
-    /// own name: the wrapper's DLL is staged under it, and the host addresses
-    /// the module by it in logs, analytics and the reload graveyard.
+    /// own name. The wrapper's DLL is staged under it, and the host names the
+    /// module by it in logs, analytics and the reload graveyard.
     pub library_name: String,
 
     /// Library name of the generated wrapper crate the build command selects;
@@ -356,38 +355,39 @@ pub struct ExtensionConfig {
     /// Directory to watch for source changes, relative to the workspace root.
     pub watch_directory: String,
 
-    /// Build command whose first element is the program and rest are arguments.
+    /// Build command: the first element is the program and the rest are
+    /// arguments.
     pub build_command: Vec<String>,
 
     /// Directory of the hot-load artifact, relative to the workspace root.
     ///
-    /// Cargo writes the freshly built standalone library into the shared
-    /// output slot first; the host stages it into this private directory and
-    /// loads from there, so a project build overwriting the shared slot
-    /// cannot corrupt the loaded module.
+    /// Cargo writes the freshly built library into the shared output slot
+    /// first. The host copies it into this private directory and loads it from
+    /// there, so a project build that overwrites the shared slot cannot
+    /// corrupt the loaded module.
     pub output_subdirectory: String,
 }
 
 impl ExtensionConfig {
-    /// Derive the configuration of an extension crate from its name and the
-    /// extension folder holding it.
+    /// Derives the configuration of an extension crate from its name and the
+    /// extension folder that holds it.
     ///
     /// The folder and crate name determine everything: sources in
     /// `extensions/<folder>/<name>/src`, the generated `host_module_<name>`
     /// wrapper carrying the loadable artifact, and the private `target/hot`
-    /// directory it is staged into. The workspace glob finds both, so a new
-    /// module needs no manifest edit.
+    /// directory it is copied into. Both are workspace members found by glob,
+    /// so a new module needs no manifest edit.
     ///
-    /// Building inside the workspace is required rather than convenient: it
-    /// makes the module resolve the identical dependency graph as the host,
-    /// keeping component type identities and the mangled symbol names of the
+    /// Building inside the workspace is required, not merely convenient: it
+    /// makes the module resolve the same dependency graph as the host. That
+    /// keeps component type identities and the mangled symbol names of the
     /// shared `pill_core` library in agreement.
     pub fn workspace_member(name: &str, folder: &str) -> Self {
         let wrapper_library_name = format!("{HOST_MODULE_MEMBER_PREFIX}{name}");
         // The wrapper's manifest enables the extension's own features on its
-        // dependency edge (`materialize_host_module_wrapper`); the command
-        // line only mirrors the hot-patch feature, which
-        // [`host_cargo_command`] applies for every host-spawned build.
+        // dependency edge (`materialize_host_module_wrapper`). The command
+        // line only mirrors the hot-patch feature, which [`host_cargo_command`]
+        // applies for every host-spawned build.
         let build_command = host_cargo_command(std::slice::from_ref(&wrapper_library_name));
 
         Self {
@@ -457,9 +457,9 @@ pub struct HostConfig {
     /// Whether this host loads extension editor crates: the editor posture.
     ///
     /// Only editor frontends set it, through
-    /// [`Self::from_environment_for_editor_frontend`]; every other build never
-    /// builds or loads an editor crate. When set, [`Self::extensions`] ends with
-    /// the editor crates of the loaded extensions' folders and of every
+    /// [`Self::from_environment_for_editor_frontend`]. Every other build never
+    /// builds or loads an editor crate. When set, [`Self::extensions`] ends
+    /// with the editor crates of the loaded extensions' folders and of every
     /// editor-only folder.
     pub load_editor_crates: bool,
 
@@ -548,24 +548,24 @@ impl ProjectLoggingSettings {
     /// Returns [`ConfigError::InvalidLoggingSettings`] naming the first level
     /// or target that does not read.
     pub fn validate(&self, path: &Path) -> Result<pill_player::LoggingSettings, ConfigError> {
-        let invalid = |details: String| ConfigError::InvalidLoggingSettings {
+        let invalid_logging_settings = |details: String| ConfigError::InvalidLoggingSettings {
             path: path.display().to_string(),
             details,
         };
-        let targets: Vec<(&str, &str)> = self
+        let target_levels: Vec<(&str, &str)> = self
             .targets
             .iter()
             .map(|(target, level)| (target.as_str(), level.as_str()))
             .collect();
-        // One conversion for both host tiers: the same text rules refuse a bad
-        // level or target here and in a shipping bundle.
+        // One conversion serves the development host and a shipping bundle
+        // alike, so the same text rules refuse a bad level or target in both.
         pill_player::LoggingSettings::from_text(
             self.level.as_deref(),
             self.timestamp.as_deref(),
             self.source_location,
-            &targets,
+            &target_levels,
         )
-        .map_err(invalid)
+        .map_err(invalid_logging_settings)
     }
 }
 
@@ -606,6 +606,10 @@ impl HostConfig {
     /// The configuration of either posture; `load_editor_crates` selects the
     /// editor one and `editor_frontend` names this host's editor frontend for
     /// the editor-crate tag convention (`resolve_editor_crates`).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same [`ConfigError`]s as [`Self::from_environment`].
     fn from_environment_in_posture(
         load_editor_crates: bool,
         editor_frontend: &str,
@@ -629,10 +633,10 @@ impl HostConfig {
         )?;
 
         // Step 3: Resolve the required project name and binary name. The name
-        // is the window title; the build binary name is the artifact file base
-        // and must be filename-safe (letters, digits, underscores only), so a
-        // settings file missing either is a configuration error rather than a
-        // silent default.
+        // is the window title. The build binary name is the artifact file base
+        // and must be filename-safe (letters, digits and underscores only). A
+        // settings file missing either is a configuration error, not a silent
+        // default.
         let project_name = project_settings
             .name
             .as_deref()
@@ -646,18 +650,18 @@ impl HostConfig {
             .build_binary_name
             .as_deref()
             .map(str::trim)
-            .filter(|value| is_valid_build_binary_name(value))
+            .filter(|binary_name| is_valid_build_binary_name(binary_name))
             .ok_or(ConfigError::InvalidBuildBinaryName {
                 path: settings_path.display().to_string(),
             })?
             .to_string();
 
-        // Step 4: Resolve the extensions, validating every name before
-        // it is interpolated into a watch path and a cargo selector. A
-        // traversal or duplicate entry, or a crate no extension folder under
-        // `extensions/` holds, is a configuration error here rather than a
-        // watch on an arbitrary directory, a malformed `--package`, or a second
-        // copy of a module already loading.
+        // Step 4: Resolve the extensions, checking every name before it is
+        // used in a watch path or a cargo selector. A traversal or duplicate
+        // entry, or a crate that no folder under `extensions/` holds, is a
+        // configuration error here. Otherwise the host would watch an
+        // arbitrary directory, pass a malformed `--package`, or load a second
+        // copy of a module.
         let extensions_root = workspace_root.join(EXTENSION_DIRECTORY);
         let renderer =
             Self::resolve_renderer(project_settings.renderer.as_deref(), &extensions_root)?;
@@ -677,13 +681,13 @@ impl HostConfig {
                     runtime_folders.push(folder);
                 }
             }
-            let (editor_crates, editor_only) =
+            let (editor_crates, editor_only_crate_names) =
                 Self::resolve_editor_crates(&runtime_folders, &extensions_root, editor_frontend)?;
             extensions.extend(editor_crates);
             // The editor-only modules may fail their first load without
             // taking the editor down; the embedder surfaces the errors and
             // offers a retry.
-            first_load_optional = editor_only;
+            first_load_optional = editor_only_crate_names;
         }
 
         // Step 5: Write every loaded extension crate's wrapper into its
@@ -736,35 +740,47 @@ impl HostConfig {
 
     /// The settings' `startup_scene:` value, checked to be a relative path to
     /// a `.scene` file below the asset directory.
+    ///
+    /// A blank value means no startup scene.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidStartupScene`] naming the settings file
+    /// and the reason when the value is absolute, climbs out of the asset
+    /// directory, or does not name a `.scene` file.
     fn validate_startup_scene(
         setting: Option<&str>,
         settings_path: &Path,
     ) -> Result<Option<String>, ConfigError> {
-        let Some(value) = setting else {
+        let Some(configured_path) = setting else {
             return Ok(None);
         };
-        let path = value.trim();
+        let path = configured_path.trim();
         if path.is_empty() {
             return Ok(None);
         }
-        let invalid = |details: &str| ConfigError::InvalidStartupScene {
+        let invalid_startup_scene = |details: &str| ConfigError::InvalidStartupScene {
             path: settings_path.display().to_string(),
             details: details.to_string(),
         };
         if !path.to_ascii_lowercase().ends_with(".scene") {
-            return Err(invalid("it does not name a .scene file"));
+            return Err(invalid_startup_scene("it does not name a .scene file"));
         }
         if path.starts_with('/') || path.starts_with('\\') || path.contains(':') {
-            return Err(invalid("it is not a relative path"));
+            return Err(invalid_startup_scene("it is not a relative path"));
         }
         if path
             .split(['/', '\\'])
             .any(|component| component == ".." || component == ".")
         {
-            return Err(invalid("it climbs out of the asset directory"));
+            return Err(invalid_startup_scene(
+                "it climbs out of the asset directory",
+            ));
         }
         if pill_engine::asset_metadata::checked_relative(path).is_err() {
-            return Err(invalid("it is not a plain path below the asset directory"));
+            return Err(invalid_startup_scene(
+                "it is not a plain path below the asset directory",
+            ));
         }
         Ok(Some(path.to_string()))
     }
@@ -776,28 +792,34 @@ impl HostConfig {
     /// `extensions/`: the GPU module `<renderer>` and the data crate
     /// `<renderer>_data`. A missing one is a configuration error here rather
     /// than a failed build later.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidExtensionName`] when the name is not a
+    /// usable directory name, and [`ConfigError::ExtensionDirectoryMissing`]
+    /// when either crate has no folder.
     fn resolve_renderer(
         setting: Option<&str>,
         extensions_root: &Path,
     ) -> Result<Option<String>, ConfigError> {
-        let name = setting.map(str::trim).unwrap_or(DEFAULT_RENDERER);
-        if name == NO_RENDERER {
+        let renderer_name = setting.map(str::trim).unwrap_or(DEFAULT_RENDERER);
+        if renderer_name == NO_RENDERER {
             return Ok(None);
         }
-        if !is_valid_module_directory_name(name) {
+        if !is_valid_module_directory_name(renderer_name) {
             return Err(ConfigError::InvalidExtensionName {
-                name: name.to_string(),
+                name: renderer_name.to_string(),
             });
         }
-        let data = format!("{name}{RENDERER_DATA_SUFFIX}");
-        for crate_name in [name, data.as_str()] {
+        let data_crate_name = format!("{renderer_name}{RENDERER_DATA_SUFFIX}");
+        for crate_name in [renderer_name, data_crate_name.as_str()] {
             if locate_extension_folder(extensions_root, crate_name).is_none() {
                 return Err(ConfigError::ExtensionDirectoryMissing {
                     name: crate_name.to_string(),
                 });
             }
         }
-        Ok(Some(name.to_string()))
+        Ok(Some(renderer_name.to_string()))
     }
 
     /// The module load order: the renderer's data crate first, when a renderer
@@ -805,34 +827,49 @@ impl HostConfig {
     ///
     /// First because extensions and the project may use its components. A
     /// project that also lists the data crate gets it once, not twice.
-    fn module_names_with_renderer_data(renderer: Option<&str>, modules: &[String]) -> Vec<String> {
+    fn module_names_with_renderer_data(
+        renderer: Option<&str>,
+        listed_module_names: &[String],
+    ) -> Vec<String> {
         let Some(renderer) = renderer else {
-            return modules.to_vec();
+            return listed_module_names.to_vec();
         };
-        let data = format!("{renderer}{RENDERER_DATA_SUFFIX}");
-        std::iter::once(data.clone())
-            .chain(modules.iter().filter(|name| name.trim() != data).cloned())
+        let data_crate_name = format!("{renderer}{RENDERER_DATA_SUFFIX}");
+        std::iter::once(data_crate_name.clone())
+            .chain(
+                listed_module_names
+                    .iter()
+                    .filter(|listed_name| listed_name.trim() != data_crate_name)
+                    .cloned(),
+            )
             .collect()
     }
 
-    /// Resolve the settings file's module names against the extension folders
+    /// Resolves the settings file's module names against the extension folders
     /// under `extensions/`.
     ///
     /// Split from [`Self::from_environment`] so the validation is testable
-    /// without moving the process's working directory, which no test in this
-    /// crate does and which would race the parallel test threads. The order
-    /// of the checks is the order the errors matter in: a name that is not a
-    /// crate directory is refused before anything is derived from it, a
-    /// repeat is refused before a second copy of the module could load, and
-    /// a folder holding the crate is required before the module is configured
-    /// at all.
+    /// without changing the process's working directory; no test in this crate
+    /// does that, and it would race the parallel test threads. The checks run
+    /// in the order their errors matter: a name that is not a crate directory
+    /// is refused before anything is derived from it, a repeat is refused
+    /// before a second copy of the module could load, and a folder holding the
+    /// crate is required before the module is configured at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidExtensionName`],
+    /// [`ConfigError::EditorCrateListed`] or
+    /// [`ConfigError::DuplicateExtensionName`] for a bad entry, and
+    /// [`ConfigError::ExtensionDirectoryMissing`] when no folder holds the
+    /// crate.
     fn resolve_extensions(
-        names: &[String],
+        module_names: &[String],
         extensions_root: &Path,
     ) -> Result<Vec<ExtensionConfig>, ConfigError> {
         let mut seen_names: HashSet<&str> = HashSet::new();
-        let mut modules = Vec::new();
-        for name in names {
+        let mut extension_configs = Vec::new();
+        for name in module_names {
             let name = name.trim();
             if !is_valid_module_directory_name(name) {
                 return Err(ConfigError::InvalidExtensionName {
@@ -854,24 +891,29 @@ impl HostConfig {
                     name: name.to_string(),
                 });
             };
-            let module = ExtensionConfig::workspace_member(name, &folder);
-            module.validate()?;
-            modules.push(module);
+            let extension = ExtensionConfig::workspace_member(name, &folder);
+            extension.validate()?;
+            extension_configs.push(extension);
         }
-        Ok(modules)
+        Ok(extension_configs)
     }
 
-    /// The editor crates an editor host loads, in load order, and the names
-    /// of the editor-only ones.
+    /// Returns the editor crates an editor host loads, in load order, and the
+    /// names of the editor-only ones.
     ///
     /// First the editor crate of each folder in `runtime_folders` that has one,
-    /// in that order (a folder loads its editor crate once, after its runtime
-    /// crates); then every editor-only folder - a folder whose only crate is its
+    /// in that order. A folder loads its editor crate once, after its runtime
+    /// crates. Then every editor-only folder - a folder whose only crate is its
     /// editor crate - in name order, loaded unconditionally. A folder without an
     /// editor crate contributes nothing, silently. Bookkeeping folders (`_...`)
-    /// and the old renderers (`rendering`) are never searched. The second half
-    /// of the return names the editor-only crates, which an editor host may
-    /// load tolerantly (`HostConfig::first_load_optional`).
+    /// and the older renderers folder (`rendering`) are never searched. The
+    /// second half of the return names the editor-only crates, which an editor
+    /// host may load tolerantly (`HostConfig::first_load_optional`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::RetiredEditorFrontend`] when an editor crate is
+    /// tagged for the retired `pill_ui` frontend.
     fn resolve_editor_crates(
         runtime_folders: &[String],
         extensions_root: &Path,
@@ -894,15 +936,15 @@ impl HostConfig {
                 if !in_pill_metadata {
                     continue;
                 }
-                let Some(rest) = trimmed.strip_prefix("editor_frontend") else {
+                let Some(after_key) = trimmed.strip_prefix("editor_frontend") else {
                     continue;
                 };
-                let value = rest.split_once('=')?.1.trim();
-                return Some(value.trim_matches('"').to_string());
+                let tag_value = after_key.split_once('=')?.1.trim();
+                return Some(tag_value.trim_matches('"').to_string());
             }
             None
         };
-        // A crate tagged for another editor frontend stays out; an untagged
+        // A crate tagged for another editor frontend is left out; an untagged
         // one loads under every editor frontend. The `pill_ui` tag is refused
         // rather than skipped: no host runs that frontend, so skipping the
         // crate would silently drop its editor part.
@@ -912,12 +954,12 @@ impl HostConfig {
                 return Ok(false);
             }
             match declared_frontend(&directory) {
-                Some(declared) if declared == RETIRED_EDITOR_FRONTEND => {
+                Some(frontend_tag) if frontend_tag == RETIRED_EDITOR_FRONTEND => {
                     Err(ConfigError::RetiredEditorFrontend {
                         name: editor_crate_of(folder),
                     })
                 }
-                Some(declared) => Ok(declared == editor_frontend),
+                Some(frontend_tag) => Ok(frontend_tag == editor_frontend),
                 None => Ok(true),
             }
         };
@@ -938,7 +980,7 @@ impl HostConfig {
             })
             .unwrap_or_default();
         all_folders.sort();
-        let mut editor_only: Vec<String> = Vec::new();
+        let mut editor_only_crate_names: Vec<String> = Vec::new();
         for folder in all_folders {
             if folder.starts_with('_') || folder == "rendering" || folders.contains(&folder) {
                 continue;
@@ -950,23 +992,23 @@ impl HostConfig {
             let holds_runtime_crate = std::fs::read_dir(extensions_root.join(&folder))
                 .map(|entries| {
                     entries.flatten().any(|entry| {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        name != editor_crate
-                            && name != GENERATED_DIRECTORY
+                        let entry_name = entry.file_name().to_string_lossy().to_string();
+                        entry_name != editor_crate
+                            && entry_name != GENERATED_DIRECTORY
                             && entry.path().join("Cargo.toml").is_file()
                     })
                 })
                 .unwrap_or(false);
             if !holds_runtime_crate {
                 folders.push(folder);
-                editor_only.push(editor_crate);
+                editor_only_crate_names.push(editor_crate);
             }
         }
-        let crates = folders
+        let editor_crate_configs = folders
             .iter()
             .map(|folder| ExtensionConfig::workspace_member(&editor_crate_of(folder), folder))
             .collect();
-        Ok((crates, editor_only))
+        Ok((editor_crate_configs, editor_only_crate_names))
     }
 }
 
@@ -994,10 +1036,10 @@ impl From<ProjectModuleConfig> for HostConfig {
 }
 
 impl ProjectModuleConfig {
-    /// Verify that the configuration is internally consistent.
+    /// Checks that the configuration is internally consistent.
     ///
-    /// Checks every field that must be non-empty and returns on the first
-    /// violation so callers can fix one problem at a time.
+    /// Every field that must be non-empty is checked, and the first violation
+    /// returns at once so callers can fix one problem at a time.
     ///
     /// # Errors
     ///
@@ -1034,12 +1076,12 @@ impl ProjectModuleConfig {
         Self::from_path(&project_path)
     }
 
-    /// Assemble the module configuration from an explicit workspace-relative
+    /// Assembles the module configuration from an explicit workspace-relative
     /// project path.
     ///
     /// Backend detection and path derivation are shared with
-    /// [`Self::from_environment`]; this is the entry point used by
-    /// [`HostConfig::from_environment`] to honour the `PROJECT_PATH` value.
+    /// [`Self::from_environment`]. [`HostConfig::from_environment`] uses this
+    /// entry point to apply the `PROJECT_PATH` value.
     ///
     /// # Errors
     ///
@@ -1047,10 +1089,10 @@ impl ProjectModuleConfig {
     /// supported manifest exists, or a manifest field cannot be read.
     fn from_path(project_path: &str) -> Result<Self, ConfigError> {
         // Step 1: Resolve the directory against the engine workspace root, not
-        // the working directory. A launcher that sets its own working
-        // directory (`dx serve` runs the editor from `pill_editor/`) would
-        // otherwise resolve the project and the `extensions/` directory it lives
-        // beside to directories that do not exist.
+        // the working directory. A launcher that sets its own working directory
+        // (`dx serve` runs the editor from `pill_editor/`) would otherwise
+        // resolve the project, and the `extensions/` directory beside it, to
+        // directories that do not exist.
         let workspace_root = engine_workspace_root()?;
         let project_root = workspace_root.join(project_path);
         if !project_root.is_dir() {
@@ -1069,6 +1111,13 @@ impl ProjectModuleConfig {
     }
 
     /// Derive a native shared-library configuration from a `Cargo.toml`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ProjectManifestReadFailed`] or
+    /// [`ConfigError::ProjectPackageNameMissing`], plus the errors
+    /// [`materialize_host_project_member`] reports while it writes the
+    /// generated member.
     fn native_from_manifest(
         workspace_root: &Path,
         project_path: &str,
@@ -1090,23 +1139,23 @@ impl ProjectModuleConfig {
         let library_name =
             manifest_string_value(&manifest, "lib", "name").unwrap_or_else(|| package_name.clone());
 
-        // Step 2: Materialize a workspace member for the project so it compiles
+        // Step 2: Write a workspace member for the project so it compiles
         // against the engine workspace (one Cargo.lock, one target directory,
-        // one crate-metadata set). This is what keeps `pill_spline::Spline` the
-        // same type in the project DLL and in the extension DLLs. The
-        // member is generated under `projects_generated/` and discovered by the
-        // `projects_generated/*` glob, so the workspace manifest never names the
-        // project.
+        // one crate-metadata set). This is what keeps `pill_spline::Spline`
+        // the same type in the project DLL and in the extension DLLs. The
+        // member is generated under `projects_generated/` and found by the
+        // `projects_generated/*` glob, so the workspace manifest never names
+        // the project.
         materialize_host_project_member(workspace_root, project_path, &package_name)?;
 
-        // Step 3: Derive the source watch directory and build output location.
-        // Sources are watched in place at the real project path, while the
-        // built artifact lands in the workspace target directory.
+        // Step 3: Derive the source watch directory and the build output
+        // location. Sources are watched in place at the real project path,
+        // while the built artifact appears in the workspace target directory.
         let watch_directory = format!("{project_path}/src");
-        // Where cargo will put it: the private build tree host-spawned builds
-        // write into (see [`module_build_artifact_directory`]), never the
-        // shared `target/<profile>` the host binary maps its engine dylibs
-        // from.
+        // The artifact goes into the private build tree host-spawned builds
+        // write into (see [`module_build_artifact_directory`]), never into the
+        // shared `target/<profile>` that holds the engine dylibs the host
+        // binary maps.
         let output_subdirectory = module_build_artifact_directory();
 
         // Step 4: Build the Cargo command. The project is a workspace member,
@@ -1116,11 +1165,11 @@ impl ProjectModuleConfig {
         // (and therefore one `TypeId`) only when every side is compiled with
         // the same inputs.
         //
-        // The generated member, not the project package it was copied from:
-        // the two are distinct packages so a shipping binary can link the
-        // project directly without colliding with this one. The mirrored
-        // engine features - the package-qualified hot-patch feature among
-        // them - are applied by [`host_cargo_command`].
+        // The command selects the generated member, not the project package it
+        // was copied from. The two are distinct packages so a shipping binary
+        // can link the project directly without colliding with this one. The
+        // mirrored engine features - the package-qualified hot-patch feature
+        // among them - are applied by [`host_cargo_command`].
         let build_command =
             host_cargo_command(&[format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}")]);
 
@@ -1138,6 +1187,14 @@ impl ProjectModuleConfig {
     }
 
     /// Derive a managed C# configuration from a `.csproj` manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ProjectManifestMissing`] when the file name has
+    /// no stem, [`ConfigError::InvalidEnvironmentVariable`] when the selected
+    /// configuration is not one of [`CSHARP_CONFIGURATIONS`], and
+    /// [`ConfigError::EngineWorkspaceRootUndetermined`] when the workspace
+    /// root cannot be derived.
     fn csharp_from_manifest(project_path: &str, csproj_path: &Path) -> Result<Self, ConfigError> {
         // Step 1: The assembly name follows the project file name.
         let project_assembly_name = csproj_path
@@ -1151,12 +1208,12 @@ impl ProjectModuleConfig {
         // Step 2: Derive the source watch directory, build command, and output.
         // The runtime and the project share one configuration because the
         // project build is what builds the runtime, as its project reference.
-        let configuration = csharp_build_configuration()?;
+        let build_configuration = csharp_build_configuration()?;
         let watch_directory = format!("{project_path}/src");
         let project_output_subdirectory =
-            format!("{project_path}/bin/{configuration}/{CSHARP_TARGET_FRAMEWORK}");
+            format!("{project_path}/bin/{build_configuration}/{CSHARP_TARGET_FRAMEWORK}");
         let runtime_output_subdirectory = format!(
-            "{CSHARP_RUNTIME_PROJECT_SUBDIRECTORY}/bin/{configuration}/{CSHARP_TARGET_FRAMEWORK}"
+            "{CSHARP_RUNTIME_PROJECT_SUBDIRECTORY}/bin/{build_configuration}/{CSHARP_TARGET_FRAMEWORK}"
         );
         // `PillEngineRoot` tells the project where the engine's shared C# build
         // (`csharp/Pill.CSharp.props`) is, so a project's location below the
@@ -1167,7 +1224,7 @@ impl ProjectModuleConfig {
             "build".to_string(),
             format!("{project_path}/{project_assembly_name}.csproj"),
             "-c".to_string(),
-            configuration.to_string(),
+            build_configuration.to_string(),
             format!(
                 "-p:PillEngineRoot={}/",
                 engine_root.display().to_string().replace('\\', "/")
@@ -1211,7 +1268,7 @@ struct EditorSettingsFile {
 /// Values declared by the project's own `project_settings.yaml`.
 ///
 /// `name` and `build_binary_name` are required (the display/window title and
-/// the artifact file base respectively); the rest is optional classic package
+/// the artifact file base respectively). The rest is optional package
 /// metadata.
 ///
 /// Unknown keys are refused rather than dropped, so `module:` instead of
@@ -1229,10 +1286,10 @@ struct ProjectSettingsFile {
     author: Option<String>,
     /// Optional one-line package description.
     description: Option<String>,
-    /// Extension crate names, in load order. The only source for this
-    /// list: there is no environment-variable override, so the file is always
-    /// the complete answer to "which modules load" - apart from the selected
-    /// renderer's data crate, which loads first by convention.
+    /// Extension crate names, in load order. This key is the only source for
+    /// the list: there is no environment-variable override, so the file is
+    /// always the complete answer to "which modules load". The one exception
+    /// is the selected renderer's data crate, which loads first by convention.
     modules: Vec<String>,
     /// The renderer the project draws with: the name of its GPU module under
     /// `extensions/` (`pill_master_renderer` when absent), or `none`. Its data
@@ -1258,14 +1315,14 @@ struct ProjectSettingsFile {
 /// Cargo profile *name* matching [`HOST_PROFILE_DIRECTORY`].
 ///
 /// Cargo names the default profile `dev` but writes it into `target/debug`;
-/// every other profile's directory is its own name. This is the only place the
-/// two vocabularies are reconciled.
+/// every other profile's directory is its own name. This is the only place
+/// the two vocabularies are reconciled.
 ///
 /// Module builds must use the host's profile. A host and a module compiled
-/// into different profiles resolve different crate-metadata hashes, so the
-/// module's exports do not match what the host looks up and `LoadLibrary`
-/// fails with "The specified procedure could not be found", naming nothing
-/// useful.
+/// with different profiles resolve different crate-metadata hashes, so the
+/// module's exports do not match what the host looks up, and `LoadLibrary`
+/// fails with "The specified procedure could not be found" without naming
+/// anything useful.
 pub(crate) fn host_profile_name() -> &'static str {
     profile_name_for_directory(HOST_PROFILE_DIRECTORY)
 }
@@ -1285,9 +1342,9 @@ pub(crate) fn host_target_triple() -> Option<&'static str> {
 /// Split out from [`host_profile_name`] so the mapping is testable without
 /// rebuilding the host under every profile.
 fn profile_name_for_directory(directory: &str) -> &str {
-    // The one profile whose directory and name differ. `test` and `bench` also
-    // build into `debug`, but the host is never compiled under those - they
-    // apply to test and benchmark targets, not to a dependency being built.
+    // The one profile whose directory and name differ. `test` and `bench`
+    // builds also write into `debug`, but those profiles apply to test and
+    // benchmark targets, never to the host executables this name is used for.
     if directory == "debug" {
         "dev"
     } else {
@@ -1300,11 +1357,11 @@ fn profile_name_for_directory(directory: &str) -> &str {
 ///
 /// rustc refuses `prefer-dynamic` combined with `lto = "fat"` outright
 /// ("cannot prefer dynamic linking when performing LTO"), so a host running
-/// under an LTO profile has to clear the flag for every build it spawns.
-/// Every other profile - `dev`, and launcher-injected dev-like profiles such
-/// as the dioxus CLI's `desktop-dev` - keeps `prefer-dynamic`, which is what
-/// makes modules dynamic (importing the one shared `pill_core.dll` instead of
-/// embedding a private engine copy).
+/// with an LTO profile has to clear the flag for every build it spawns. Every
+/// other profile - `dev`, and launcher-injected dev-like profiles such as the
+/// dioxus CLI's `desktop-dev` - keeps `prefer-dynamic`. That flag is what
+/// makes modules dynamic: they import the one shared `pill_core.dll` instead
+/// of embedding a private engine copy.
 fn profile_uses_lto(profile: &str) -> bool {
     // The workspace manifest sets `lto = "fat"` on `release` and everything
     // that inherits from it. Custom profiles that inherit `dev` (for example
@@ -1314,16 +1371,16 @@ fn profile_uses_lto(profile: &str) -> bool {
 
 /// Whether this host binary is running as an app launched by the dioxus CLI.
 ///
-/// `dx serve`/`dx run` set `DIOXUS_CLI_ENABLED` (plus `DIOXUS_BUILD_ID` and
-/// friends) on the environment of every app it builds and launches
-/// (dioxus-cli `build/builder.rs` `child_environment_variables`); a plain
+/// `dx serve` and `dx run` set `DIOXUS_CLI_ENABLED` (plus `DIOXUS_BUILD_ID`
+/// and friends) on the environment of every app they build and launch
+/// (dioxus-cli `build/builder.rs`, `child_environment_variables`); a plain
 /// `cargo run` never sets it. That is what separates the dx-built editor -
 /// whose engine dylibs carry dx's workspace-wrapper hash - from every other
-/// host. Also read by [`crate::build_runner::apply_cargo_host_overrides`],
-/// which keeps the cargo anchor for editor hosts and dx-launched hosts: the
-/// editor's renderer graph must be present when project modules are built, and
-/// its macro graph under dx unions features onto proc-macro units the engine
-/// manifests cannot enumerate.
+/// host. [`crate::build_runner::apply_cargo_host_overrides`] reads it too,
+/// because it keeps the cargo anchor for editor hosts and dx-launched hosts:
+/// the editor's renderer graph must be present when project modules are
+/// built, and under dx its macro graph adds features to proc-macro units that
+/// the engine manifests cannot list.
 pub(crate) fn running_under_dioxus_cli() -> bool {
     env::var_os(DIOXUS_CLI_ENABLED_ENVIRONMENT).is_some()
 }
@@ -1336,36 +1393,37 @@ pub(crate) fn running_under_dioxus_cli() -> bool {
 fn canonicalize_plain(path: &Path) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(path).ok()?;
     let text = canonical.to_string_lossy();
-    let plain = text.strip_prefix(r"\\?\").unwrap_or(&text);
-    Some(PathBuf::from(plain))
+    let plain_text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    Some(PathBuf::from(plain_text))
 }
 
 /// Canonical path of the `dx` executable that launched this host, if any.
 ///
 /// dx builds by setting `RUSTC_WORKSPACE_WRAPPER` to its own canonical
-/// executable path (dioxus-cli `build/request.rs` `cargo_build_command`), and
-/// cargo folds that exact path into the `-C metadata` hash of workspace
-/// member crates (cargo `compiler/build_runner/compilation_files.rs`
-/// `compute_metadata`). Host-spawned builds must mirror the SAME path string
-/// for their member crates to hash identically to the editor's, so this
-/// resolves dx the same way dx resolves itself: prefer an already-recorded
-/// wrapper value from the environment, otherwise look `dx` up on `PATH` and
-/// canonicalize. Cached because it is read for every spawned build.
+/// executable path (dioxus-cli `build/request.rs`, `cargo_build_command`),
+/// and cargo folds that exact path into the `-C metadata` hash of workspace
+/// member crates (cargo `compiler/build_runner/compilation_files.rs`,
+/// `compute_metadata`). Host-spawned builds must use the same path string for
+/// their member crates to hash identically to the editor's. This function
+/// therefore finds dx the same way dx finds itself: it prefers a wrapper value
+/// already recorded in the environment, and otherwise looks `dx` up on `PATH`
+/// and canonicalizes it. The result is cached because it is read for every
+/// spawned build.
 fn dioxus_executable_path() -> Option<&'static Path> {
     static DIOXUS_EXECUTABLE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIOXUS_EXECUTABLE_PATH
         .get_or_init(|| {
             // A launcher may already have set the wrapper (or dx may have left
             // it in the environment); reuse it rather than guessing on PATH.
-            if let Some(recorded) = env::var_os(RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT) {
-                let recorded_path = PathBuf::from(recorded);
+            if let Some(recorded_wrapper) = env::var_os(RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT) {
+                let recorded_path = PathBuf::from(recorded_wrapper);
                 return canonicalize_plain(&recorded_path).or(Some(recorded_path));
             }
             let executable_name = if cfg!(windows) { "dx.exe" } else { "dx" };
             for directory in env::split_paths(&env::var_os("PATH")?) {
-                let candidate = directory.join(executable_name);
-                if candidate.is_file() {
-                    return canonicalize_plain(&candidate);
+                let candidate_executable = directory.join(executable_name);
+                if candidate_executable.is_file() {
+                    return canonicalize_plain(&candidate_executable);
                 }
             }
             None
@@ -1375,31 +1433,32 @@ fn dioxus_executable_path() -> Option<&'static Path> {
 
 /// Directory dx's wrapper writes captured member rustc invocations into.
 ///
-/// dx only acts as a rustc wrapper when `DX_RUSTC` names a directory; it
-/// records one JSON file per member crate there (never read back by this
-/// host) and then proxies the real `rustc`. A private temp directory keeps
-/// these host-driven captures out of dx's own `target/dx/.captured-args`
-/// scope, which dx serve reads for its own thin-rebuild replay.
+/// dx acts as a rustc wrapper only when `DX_RUSTC` names a directory. It
+/// records one JSON file per member crate there (this host never reads them
+/// back) and then runs the real `rustc`. A private temp directory keeps these
+/// host-driven captures out of dx's own `target/dx/.captured-args` scope,
+/// which `dx serve` reads for its own thin-rebuild replay.
 fn dioxus_wrapper_args_directory() -> PathBuf {
     std::env::temp_dir().join("pill-host-dx-rustc-args")
 }
 
 /// Environment every host-spawned cargo build needs, on top of the host's own.
 ///
-/// Both entries keep the spawned build's crate-metadata universe byte-identical
-/// to the running host binary. `RUSTFLAGS` is cleared only for LTO profiles,
-/// where the workspace's `-C prefer-dynamic` cannot survive (rustc rejects the
-/// pairing); it is the only lever, because cargo MERGES `build.rustflags`
-/// arrays, so an explicit empty `RUSTFLAGS` wins. Under the dioxus CLI the
-/// build also mirrors dx's `RUSTC_WORKSPACE_WRAPPER`: dx wraps every member's
-/// rustc invocation through its own binary, cargo folds that path into the
-/// member crates' `-C metadata`, and registry crates are unaffected. dx
-/// intercepts linker-driver invocations only, and host builds link through
-/// `link.exe`, so member compiles are proxied to the real `rustc`.
+/// Both entries keep the spawned build's crate-metadata universe
+/// byte-identical to the running host binary. `RUSTFLAGS` is cleared for LTO
+/// profiles, where the workspace's `-C prefer-dynamic` cannot survive (rustc
+/// rejects the pairing), and as the fail-safe described below. It is the only
+/// lever, because cargo MERGES `build.rustflags` arrays, so an explicit empty
+/// `RUSTFLAGS` wins. Under the dioxus CLI the build also copies dx's
+/// `RUSTC_WORKSPACE_WRAPPER`: dx wraps every member's rustc invocation through
+/// its own binary, cargo folds that path into the member crates'
+/// `-C metadata`, and registry crates are unaffected. dx intercepts
+/// linker-driver invocations only, and host builds link through `link.exe`, so
+/// member compiles are passed through to the real `rustc`.
 ///
 /// Fail-safe: under dx with an unresolvable wrapper path, `prefer-dynamic` is
-/// dropped too and modules stay static, which load regardless of the wrapper
-/// hash where dynamic ones fail with os error 127.
+/// dropped too and modules stay static. A static module loads regardless of
+/// the wrapper hash, where a dynamic one fails with os error 127.
 pub(crate) fn spawned_build_environment() -> Vec<(String, String)> {
     let mut environment = Vec::new();
     let under_dioxus = running_under_dioxus_cli();
@@ -1408,10 +1467,10 @@ pub(crate) fn spawned_build_environment() -> Vec<(String, String)> {
         environment.push(("RUSTFLAGS".to_string(), String::new()));
     }
     if wrapper_mirrored {
-        if let Some(executable) = dioxus_executable_path() {
+        if let Some(executable_path) = dioxus_executable_path() {
             environment.push((
                 RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT.to_string(),
-                executable.display().to_string(),
+                executable_path.display().to_string(),
             ));
             environment.push((
                 DX_RUSTC_WRAPPER_ENVIRONMENT.to_string(),
@@ -1461,28 +1520,29 @@ fn required_environment(variable: &'static str) -> Result<String, ConfigError> {
 
 /// Whether host-driven cargo builds should emit a timing report.
 ///
-/// Read by [`host_cargo_command`] and by the analytics collector, so the flag
-/// cannot be set on one side and silently unread on the other.
+/// [`host_cargo_command`] reads the variable, and the analytics collector
+/// reads the report cargo then writes, so the flag cannot be set on one side
+/// and silently unread on the other.
 pub(crate) fn cargo_timings_enabled() -> bool {
     std::env::var_os(CARGO_TIMINGS_ENVIRONMENT_VARIABLE).is_some()
 }
 
-/// Build the host's cargo command for one or more selected packages.
+/// Builds the host's cargo command for one or more selected packages.
 ///
 /// Every host-spawned build - a single extension wrapper, the native project
-/// member, or the startup batch - assembles its command here, so the order -
+/// member, or the startup batch - assembles its command here. The order -
 /// package selections, `--offline`, the host's profile, the optional timings
-/// flag, the package-qualified hot-patch feature - cannot drift between a
-/// per-module build and the batch. `--offline` skirts the `~/.cargo` package
-/// cache lock rust-analyzer can hold; the profile is explicit because a release
-/// host loading a debug module fails inside `LoadLibrary` on mismatched
-/// crate-metadata hashes.
+/// flag, the package-qualified hot-patch feature - therefore cannot drift
+/// between a per-module build and the batch. `--offline` avoids the `~/.cargo`
+/// package cache lock rust-analyzer can hold. The profile is explicit because
+/// a release host loading a debug module fails inside `LoadLibrary` on
+/// mismatched crate-metadata hashes.
 ///
-/// The engine core's symbol names hash its features: a module built without
-/// `hot_patch` imports names `pill_engine_core.dll` does not export and its own
-/// `register_system` creates no dispatch slot, so every patch is refused with
-/// "no hot-patchable system registered". The feature is package-qualified
-/// because one invocation may select several packages; the host's other engine
+/// The engine core's symbol names hash its features. A module built without
+/// `hot_patch` imports names `pill_engine_core.dll` does not export, and its
+/// own `register_system` creates no dispatch slot, so every patch is refused
+/// with "no hot-patchable system registered". The feature is package-qualified
+/// because one invocation may select several packages. The host's other engine
 /// features travel through [`crate::build_runner::apply_cargo_host_overrides`].
 pub(crate) fn host_cargo_command(packages: &[String]) -> Vec<String> {
     let mut command = vec!["cargo".to_string(), "build".to_string()];
@@ -1506,24 +1566,26 @@ pub(crate) fn host_cargo_command(packages: &[String]) -> Vec<String> {
 /// MSBuild configuration the managed project is built in, from
 /// [`CSHARP_CONFIGURATION_ENVIRONMENT_VARIABLE`]; `Release` when it is unset.
 ///
-/// Matched without regard to case but returned in MSBuild's own spelling,
-/// because the result also names the output directory the host loads from.
+/// The value is matched without regard to case but returned in MSBuild's own
+/// spelling, because the result also names the output directory the host loads
+/// from.
 ///
 /// # Errors
 ///
 /// Returns [`ConfigError::InvalidEnvironmentVariable`] for any other value,
-/// rather than falling back: a mistyped `Debug` silently building `Release`
-/// would leave the debugger showing optimized-away locals with no hint why.
+/// rather than falling back. A mistyped `Debug` that silently built `Release`
+/// would leave the debugger showing optimized-away local variables with no
+/// hint why.
 fn csharp_build_configuration() -> Result<&'static str, ConfigError> {
-    let Ok(requested) = env::var(CSHARP_CONFIGURATION_ENVIRONMENT_VARIABLE) else {
+    let Ok(requested_configuration) = env::var(CSHARP_CONFIGURATION_ENVIRONMENT_VARIABLE) else {
         return Ok(CSHARP_CONFIGURATIONS[0]);
     };
     CSHARP_CONFIGURATIONS
         .into_iter()
-        .find(|configuration| configuration.eq_ignore_ascii_case(requested.trim()))
+        .find(|configuration| configuration.eq_ignore_ascii_case(requested_configuration.trim()))
         .ok_or(ConfigError::InvalidEnvironmentVariable {
             variable: CSHARP_CONFIGURATION_ENVIRONMENT_VARIABLE,
-            value: requested,
+            value: requested_configuration,
             expected: "Release or Debug",
         })
 }
@@ -1531,10 +1593,10 @@ fn csharp_build_configuration() -> Result<&'static str, ConfigError> {
 /// Directory holding the engine workspace: the base every stored relative path
 /// is resolved against.
 ///
-/// Derived from this crate's own build location, a compile-time fact, rather
-/// than from the process's working directory: the dioxus CLI runs the editor
-/// with `pill_editor/` as its working directory, which would otherwise resolve
-/// `extensions/` under the editor crate and fail with
+/// The value is taken from this crate's own build location, a compile-time
+/// fact, rather than from the process's working directory. The dioxus CLI runs
+/// the editor with `pill_editor/` as its working directory, which would
+/// otherwise resolve `extensions/` under the editor crate and fail with
 /// [`ConfigError::ExtensionDirectoryMissing`].
 ///
 /// # Errors
@@ -1551,7 +1613,9 @@ pub(crate) fn engine_workspace_root() -> Result<PathBuf, ConfigError> {
         .ok_or(ConfigError::EngineWorkspaceRootUndetermined)
 }
 
-/// Locate the single `.csproj` manifest inside a project directory.
+/// Finds a `.csproj` manifest inside a project directory.
+///
+/// Returns the first `.csproj` the directory lists.
 ///
 /// # Errors
 ///
@@ -1577,12 +1641,13 @@ fn find_csproj_manifest(project_root: &Path) -> Result<PathBuf, ConfigError> {
     })
 }
 
-/// Read a string value out of one section of a TOML manifest.
+/// Reads a string value out of one section of a TOML manifest.
 ///
 /// Used only for the handful of fields the host infers from a `Cargo.toml`
-/// (the package name and the library name), so a manifest that does not parse
-/// answers `None` here like a missing key; the same manifest is parsed again,
-/// with the error reported, when the workspace member is written.
+/// (the package name and the library name). A manifest that does not parse
+/// therefore answers `None`, exactly like a missing key. The same manifest is
+/// parsed again, with the error reported, when the workspace member is
+/// written.
 fn manifest_string_value(manifest: &str, section: &str, key: &str) -> Option<String> {
     let document = manifest.parse::<DocumentMut>().ok()?;
     document
@@ -1668,8 +1733,8 @@ fn declares_dependency(table: &Table, crate_name: &str) -> bool {
             return true;
         }
         match item {
-            Item::Value(Value::InlineTable(inline)) => {
-                inline.get("package").and_then(Value::as_str) == Some(crate_name)
+            Item::Value(Value::InlineTable(inline_table)) => {
+                inline_table.get("package").and_then(Value::as_str) == Some(crate_name)
             }
             Item::Table(sub_table) => {
                 sub_table.get("package").and_then(Item::as_str) == Some(crate_name)
@@ -1679,16 +1744,16 @@ fn declares_dependency(table: &Table, crate_name: &str) -> bool {
     })
 }
 
-/// Read the editor's settings file from the project root.
+/// Reads the editor's settings file from the project root.
 ///
-/// A project without the file is the normal case and an empty settings
-/// value. Unknown keys are refused rather than dropped, so a misspelled
-/// `editor_themes:` cannot quietly fall back to the default theme.
+/// A project usually has no such file; the settings are then empty. Unknown
+/// keys are refused instead of ignored, so a misspelled `editor_themes:` is
+/// reported and does not quietly fall back to the default theme.
 ///
 /// # Errors
 ///
-/// A message naming the file when it exists but cannot be read, is not
-/// valid YAML, or names an unknown key.
+/// Returns a message naming the file when it exists but cannot be read, is
+/// not valid YAML, or names an unknown key.
 pub fn read_editor_settings(project_directory: &Path) -> Result<EditorSettings, String> {
     let path = project_directory.join(EDITOR_SETTINGS_FILE);
     if !path.is_file() {
@@ -1699,19 +1764,24 @@ pub fn read_editor_settings(project_directory: &Path) -> Result<EditorSettings, 
     let file: EditorSettingsFile = serde_yaml::from_str(&text)
         .map_err(|error| format!("`{}` is not valid YAML: {error}", path.display()))?;
     Ok(EditorSettings {
-        editor_theme: file.editor_theme.filter(|value| !value.trim().is_empty()),
+        editor_theme: file
+            .editor_theme
+            .filter(|editor_theme| !editor_theme.trim().is_empty()),
     })
 }
 
-/// The project layer's theme path: the `editor_theme:` value when the file
-/// names one, otherwise `editor/editor.theme` when the project ships that
-/// file, otherwise none.
+/// Returns the theme path the project layer adds: the `editor_theme:` value
+/// when the file names one, `editor/editor.theme` when the project ships that
+/// file, and nothing otherwise.
 ///
-/// The path is below the project's `res` and is checked against the editor
-/// theme scope when it loads, not here, so a file naming `ui/x.theme` is
-/// refused at load rather than resolved.
-pub fn resolve_editor_theme(project_directory: &Path, settings: &EditorSettings) -> Option<String> {
-    if let Some(path) = settings.editor_theme.clone() {
+/// The path is relative to the project's `res`. It is checked against the
+/// editor theme scope when it loads, not here, so a file naming
+/// `ui/x.theme` is refused at load rather than resolved.
+pub fn resolve_editor_theme(
+    project_directory: &Path,
+    editor_settings: &EditorSettings,
+) -> Option<String> {
+    if let Some(path) = editor_settings.editor_theme.clone() {
         return Some(path);
     }
     project_directory
@@ -1722,36 +1792,43 @@ pub fn resolve_editor_theme(project_directory: &Path, settings: &EditorSettings)
         .then(|| DEFAULT_EDITOR_THEME.to_string())
 }
 
-/// Whether a value is a safe artifact file base: letters, digits, underscores.
-fn is_valid_build_binary_name(value: &str) -> bool {
-    !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+/// Whether `build_binary_name` is a safe artifact file base: letters, digits
+/// and underscores only.
+fn is_valid_build_binary_name(build_binary_name: &str) -> bool {
+    !build_binary_name.is_empty()
+        && build_binary_name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-/// Whether a value is a usable extension directory name.
+/// Whether `module_directory_name` is a usable extension folder name.
 ///
-/// The name is a path segment under `extensions/` and a cargo package selector,
-/// so it is checked harder than `build_binary_name`: a leading digit is
-/// refused (crate directories start with a letter), `-` is allowed because
-/// real crate directories use it, and every other character - path
-/// separators, spaces, dots - is rejected rather than interpolated into a
-/// watch path.
-fn is_valid_module_directory_name(value: &str) -> bool {
-    let mut characters = value.chars();
-    let Some(first) = characters.next() else {
+/// The name becomes a path segment under `extensions/` and a cargo package
+/// selector, so it is checked more strictly than `build_binary_name`:
+/// a leading digit is refused (crate folders start with a letter), `-` is
+/// allowed because real crate folders use it, and every other character -
+/// path separators, spaces and dots - is rejected instead of being placed
+/// into a watch path.
+fn is_valid_module_directory_name(module_directory_name: &str) -> bool {
+    let mut characters = module_directory_name.chars();
+    let Some(first_character) = characters.next() else {
         return false;
     };
-    first.is_ascii_alphabetic()
-        && characters.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    first_character.is_ascii_alphabetic()
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
 }
 
-/// The extension folder under `extensions_root` that holds the crate
-/// `crate_name`, as `extensions/<folder>/<crate_name>/Cargo.toml`.
+/// Returns the extension folder under `extensions_root` that holds
+/// `crate_name`, checked as `extensions/<folder>/<crate_name>/Cargo.toml`.
 ///
-/// The folder named like the crate is checked first, since most extensions
-/// hold one crate of their own name; otherwise every folder is scanned in
+/// The folder named like the crate is tried first, because most extensions
+/// hold one crate of their own name. Every other folder is then scanned in
 /// name order, because a folder may hold several crates (the master
-/// renderer's folder holds its data crate too). Folders starting with `_` are
-/// workspace bookkeeping, never extensions. `None` when no folder holds it.
+/// renderer's folder also holds its data crate). Folders starting with `_`
+/// are workspace bookkeeping, never extensions. Returns `None` when no folder
+/// holds the crate.
 pub(crate) fn locate_extension_folder(extensions_root: &Path, crate_name: &str) -> Option<String> {
     let holds_crate = |folder: &str| {
         extensions_root
@@ -1774,10 +1851,9 @@ pub(crate) fn locate_extension_folder(extensions_root: &Path, crate_name: &str) 
     folders.into_iter().find(|folder| holds_crate(folder))
 }
 
-/// The directory of the extension crate `crate_name`:
+/// Returns the directory of the extension crate `crate_name`: either
 /// `extensions/<folder>/<crate_name>` for the folder that holds it, or the
-/// conventional `extensions/<crate_name>/<crate_name>` when no folder does
-/// yet.
+/// usual `extensions/<crate_name>/<crate_name>` when no folder holds it yet.
 pub(crate) fn extension_crate_directory(workspace_root: &Path, crate_name: &str) -> PathBuf {
     let extensions_root = workspace_root.join(EXTENSION_DIRECTORY);
     let folder = locate_extension_folder(&extensions_root, crate_name)
@@ -1785,13 +1861,13 @@ pub(crate) fn extension_crate_directory(workspace_root: &Path, crate_name: &str)
     extensions_root.join(folder).join(crate_name)
 }
 
-/// Read the project's own settings file from the project root.
+/// Reads the project's own settings file from the project root.
 ///
-/// Returns `Ok(None)` when no file exists; the caller decides whether that is
-/// a missing-file error ([`HostConfig::from_environment`] treats it as one,
-/// because `name` and `build_binary_name` are required) or a no-op. A present
-/// but unreadable or malformed file is an error, so a typo cannot silently
-/// fall back to a different module set.
+/// Returns `Ok(None)` when no file exists. The caller decides whether that is
+/// a missing-file error (as [`HostConfig::from_environment`] treats it,
+/// because `name` and `build_binary_name` are required) or simply no
+/// settings. A file that exists but cannot be read or parsed is always an
+/// error, so a typo cannot silently select a different module set.
 ///
 /// # Errors
 ///
@@ -1818,18 +1894,19 @@ fn read_project_settings_file(
     })
 }
 
-/// Materialize a temporary workspace member for the native project.
+/// Writes the temporary workspace member that builds the native project.
 ///
-/// Cross-DLL type identity requires the project to compile as a member of the
-/// engine workspace: one Cargo.lock, one target directory, one crate-metadata
-/// set. The project source lives outside the workspace, so this writes a
-/// generated crate under `projects_generated/`, which the workspace glob
-/// discovers without a manifest entry.
+/// A type keeps one identity across DLLs only when the project compiles as a
+/// member of the engine workspace: one Cargo.lock, one target directory, one
+/// crate-metadata set. The project source lives outside the workspace, so
+/// this writes a generated crate under `projects_generated/`, where the
+/// workspace glob finds it without an entry in the workspace manifest.
 ///
-/// The generated `Cargo.toml` carries the project's own manifest with every
+/// The generated `Cargo.toml` carries the project's own manifest, with every
 /// `path` dependency made absolute and the `[lib]` `path` pointed at the real
 /// source, so edits keep triggering rebuilds through the normal watcher. The
-/// member is regenerated on every startup, so manifest changes always apply.
+/// member is rebuilt from the project manifest on every startup and written
+/// only when its content changed, so manifest changes always apply.
 ///
 /// # Errors
 ///
@@ -1859,25 +1936,24 @@ fn materialize_host_project_member(
             )?;
 
     // Step 1: Drop the project's own `[workspace]` tables. A standalone project
-    // declares itself a workspace root; as a member of the engine workspace
-    // that table would make Cargo report "multiple workspace roots found in the
-    // same workspace" and fail every rebuild. Removing the top-level table
-    // takes `[workspace.dependencies]` and every other nested workspace table
-    // with it.
+    // declares itself a workspace root. Inside the engine workspace that table
+    // makes Cargo report "multiple workspace roots found in the same workspace"
+    // and fail every rebuild. Removing the top-level table also removes
+    // `[workspace.dependencies]` and every other nested workspace table.
     document.remove("workspace");
 
     // Step 2: Give the generated member its own package name.
     //
-    // Keeping the project's would make two packages in one workspace claim the
-    // same name: this member, and the project crate itself for any build that
-    // links the project directly. Cargo rejects that outright ("package
-    // collision in the lockfile"), and a statically linked shipping binary has
-    // to link the project directly - that is the whole point of it.
+    // Keeping the project's name would make two packages in one workspace
+    // claim it: this member, and the project crate itself for any build that
+    // links the project directly. Cargo rejects that with "package collision
+    // in the lockfile", and a statically linked shipping binary has to link
+    // the project directly - that is the whole point of it.
     //
-    // The `[lib] name` set below keeps the built artifact called `project.dll`,
-    // so nothing downstream of the build changes; only the package cargo
-    // selects does. The build command is generated from the same prefix, so
-    // the two cannot drift.
+    // The `[lib] name` set below keeps the built artifact called
+    // `project.dll`, so nothing downstream of the build changes; only the
+    // package name cargo selects does. The build command is generated from
+    // the same prefix, so the two cannot drift.
     let member_package_name = format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}");
     if let Some(package) = document.get_mut("package").and_then(Item::as_table_mut) {
         package.insert("name", value(member_package_name.as_str()));
@@ -1889,21 +1965,22 @@ fn materialize_host_project_member(
     let mut rewritten_paths: Vec<(String, String)> = Vec::new();
     for_each_dependency_table_mut(document.as_table_mut(), &mut |table| {
         for (dependency, item) in table.iter_mut() {
-            if let Some(absolute) = resolve_dependency_path(project_root.as_path(), item) {
-                rewritten_paths.push((dependency.get().to_string(), absolute));
+            if let Some(resolved_path) = resolve_dependency_path(project_root.as_path(), item) {
+                rewritten_paths.push((dependency.get().to_string(), resolved_path));
             }
         }
     });
 
     // Step 3a: Refuse to write a member Cargo cannot load. The generated member
-    // is picked up by the `projects_generated/*` glob, so a single unresolvable path in
-    // it stops Cargo loading the workspace at all - which breaks every build,
-    // test and lint in the repository, including the build that would replace
-    // the member. Report the offending path instead, and clear any member an
-    // earlier run left behind so the workspace stays loadable either way.
+    // is picked up by the `projects_generated/*` glob, so one path that does
+    // not resolve stops Cargo from loading the workspace at all. That breaks
+    // every build, test and lint in the repository, including the build that
+    // would replace the member. Report the bad path instead, and remove any
+    // member an earlier run left behind, so the workspace stays loadable
+    // either way.
     if let Some((dependency, resolved_path)) = rewritten_paths
         .into_iter()
-        .find(|(_, absolute)| !Path::new(absolute).exists())
+        .find(|(_, resolved_path)| !Path::new(resolved_path).exists())
     {
         let member_directory = workspace_root
             .join(PROJECT_MEMBER_DIRECTORY)
@@ -1919,26 +1996,30 @@ fn materialize_host_project_member(
     // Step 3b: Point the generated member's library at the real source file so
     // the project compiles from its actual location, and pin the library name
     // so the artifact keeps the name the host looks for. A manifest without a
-    // `[lib]` section is left alone: Cargo's defaults then apply exactly as
-    // they did for the project itself.
+    // `[lib]` section is left alone; a project that builds a loadable library
+    // always declares one.
     let lib_source = project_root.join("src").join("lib.rs");
-    if let Some(lib) = document.get_mut("lib").and_then(Item::as_table_mut) {
-        if lib_source.is_file() && lib.get("path").is_none() {
-            lib.insert("path", value(render_manifest_path(&lib_source)));
+    if let Some(library_table) = document.get_mut("lib").and_then(Item::as_table_mut) {
+        if lib_source.is_file() && library_table.get("path").is_none() {
+            library_table.insert("path", value(render_manifest_path(&lib_source)));
         }
-        if lib.get("name").is_none() {
-            lib.insert("name", value(package_name));
+        if library_table.get("name").is_none() {
+            library_table.insert("name", value(package_name));
         }
         // Step 3c: Add an `rlib` artifact when the host can hot patch.
         //
-        // A generated patch does `use <project>::*` so it gets the SAME types
-        // the running world holds - identical layout and identical `TypeId` -
-        // and that needs the crate as an rlib. It is added here rather than in
-        // the project's own manifest because it slows every project rebuild,
-        // which no one should pay for a development feature they have not
-        // enabled. A `[lib]` without a `crate-type` list defaults to `rlib`.
+        // A generated patch does `use <project>::*`, so it gets the same types
+        // the running world holds, with the same layout and the same `TypeId`.
+        // That needs the crate as an rlib. The artifact is added here rather
+        // than in the project's own manifest because it slows every project
+        // rebuild, and nobody should pay that for a development feature they
+        // have not enabled. A `[lib]` without a `crate-type` list builds an
+        // rlib by default.
         #[cfg(feature = "hot_patch")]
-        if let Some(crate_types) = lib.get_mut("crate-type").and_then(Item::as_array_mut) {
+        if let Some(crate_types) = library_table
+            .get_mut("crate-type")
+            .and_then(Item::as_array_mut)
+        {
             if !crate_types
                 .iter()
                 .any(|entry| entry.as_str() == Some("rlib"))
@@ -1953,8 +2034,7 @@ fn materialize_host_project_member(
     // Step 4: Write the generated member, replacing any previous generation.
     //
     // When the generated content is unchanged the existing file is left
-    // untouched. Cargo fingerprints the manifest by content, so a rewrite
-    // would rebuild nothing, but skipping it also keeps the file's
+    // untouched. That avoids a pointless rewrite and keeps the file's
     // modification time stable for anything else watching the tree.
     let member_directory = workspace_root
         .join(PROJECT_MEMBER_DIRECTORY)
@@ -1982,31 +2062,31 @@ fn materialize_host_project_member(
     Ok(())
 }
 
-/// Rewrite one dependency entry's `path` to an absolute location, returning
+/// Rewrites one dependency entry's `path` to an absolute location and returns
 /// the resolved path.
 ///
 /// Handles both shapes a dependency takes in a `Cargo.toml`: an inline table
-/// and its own sub-table. An entry with no `path` - a registry dependency -
-/// is left alone and answers `None`.
-fn resolve_dependency_path(project_root: &Path, item: &mut Item) -> Option<String> {
-    match item {
-        Item::Value(Value::InlineTable(inline)) => {
-            let relative = inline.get("path").and_then(Value::as_str)?;
-            let absolute = absolute_manifest_path(project_root, relative);
-            inline.insert("path", Value::from(absolute.as_str()));
-            Some(absolute)
+/// and its own sub-table. An entry with no `path` (a registry dependency) is
+/// left alone and returns `None`.
+fn resolve_dependency_path(project_root: &Path, dependency_entry: &mut Item) -> Option<String> {
+    match dependency_entry {
+        Item::Value(Value::InlineTable(inline_table)) => {
+            let relative_path = inline_table.get("path").and_then(Value::as_str)?;
+            let resolved_path = absolute_manifest_path(project_root, relative_path);
+            inline_table.insert("path", Value::from(resolved_path.as_str()));
+            Some(resolved_path)
         }
         Item::Table(sub_table) => {
-            let relative = sub_table.get("path").and_then(Item::as_str)?;
-            let absolute = absolute_manifest_path(project_root, relative);
-            sub_table.insert("path", value(absolute.as_str()));
-            Some(absolute)
+            let relative_path = sub_table.get("path").and_then(Item::as_str)?;
+            let resolved_path = absolute_manifest_path(project_root, relative_path);
+            sub_table.insert("path", value(resolved_path.as_str()));
+            Some(resolved_path)
         }
         _ => None,
     }
 }
 
-/// Resolve one manifest `path` value against the project root, leaving an
+/// Resolves one manifest `path` value against the project root and leaves an
 /// already-absolute path as it is.
 fn absolute_manifest_path(project_root: &Path, path: &str) -> String {
     if Path::new(path).is_absolute() {
@@ -2016,16 +2096,17 @@ fn absolute_manifest_path(project_root: &Path, path: &str) -> String {
     }
 }
 
-/// Render a path for a TOML string: lossy text with forward slashes.
+/// Turns a path into the text stored in a TOML string: lossy, with forward
+/// slashes.
 fn render_manifest_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// Visit every dependency table a generated member must carry: the three
-/// linking tables at the top level, and the same three under each
+/// Visits every dependency table a generated member must carry: the three
+/// linking tables at the top level and the same three under each
 /// `[target.<cfg>]` table.
-fn for_each_dependency_table_mut(root: &mut Table, visit: &mut impl FnMut(&mut Table)) {
-    for (section, item) in root.iter_mut() {
+fn for_each_dependency_table_mut(manifest_table: &mut Table, visit: &mut impl FnMut(&mut Table)) {
+    for (section, item) in manifest_table.iter_mut() {
         match section.get() {
             "target" => {
                 let Some(targets) = item.as_table_mut() else {
@@ -2058,25 +2139,25 @@ fn for_each_dependency_table_mut(root: &mut Table, visit: &mut impl FnMut(&mut T
 /// Removes host-generated workspace members left behind by earlier runs.
 ///
 /// Every directory under `projects_generated/` whose name carries
-/// [`HOST_PROJECT_MEMBER_PREFIX`] was written by the host, so any one that
-/// is not the member being materialized now belongs to a project the host is no
-/// longer running. Leaving it is not harmless: the workspace glob still picks
-/// it up as a member, and its dependency paths point into the previous
-/// project's directory - once that moves or is deleted, Cargo fails to load the
-/// workspace and every build, test and lint in the repository stops.
+/// [`HOST_PROJECT_MEMBER_PREFIX`] was written by the host, so any one that is
+/// not the member built now belongs to a project the host no longer runs.
+/// Leaving it is not harmless: the workspace glob still picks it up as a
+/// member, and its dependency paths point into the previous project's folder.
+/// Once that folder moves or is deleted, Cargo cannot load the workspace, and
+/// every build, test and lint in the repository stops.
 ///
-/// Members an older host wrote straight into `extensions/` are removed too;
-/// nothing globs that location. Failures are ignored rather than propagated: a
-/// member the host cannot remove is a housekeeping problem, not a reason to
-/// refuse to start.
-fn prune_stale_host_project_members(workspace_root: &Path, keep: &Path) {
+/// Members written straight into `extensions/` are removed too; nothing globs
+/// that location. Failures are ignored rather than returned: a member the
+/// host cannot remove is a housekeeping problem, not a reason to refuse to
+/// start.
+fn prune_stale_host_project_members(workspace_root: &Path, kept_member_directory: &Path) {
     for directory in [PROJECT_MEMBER_DIRECTORY, EXTENSION_DIRECTORY] {
         let Ok(entries) = std::fs::read_dir(workspace_root.join(directory)) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path == keep || !path.is_dir() {
+            if path == kept_member_directory || !path.is_dir() {
                 continue;
             }
             let is_generated = path
@@ -2090,20 +2171,20 @@ fn prune_stale_host_project_members(workspace_root: &Path, keep: &Path) {
     }
 }
 
-/// Materialize the wrapper workspace member that builds one extension crate's
+/// Writes the wrapper workspace member that builds one extension crate's
 /// loadable artifact.
 ///
 /// The wrapper is a generated crate in the extension folder's `generated/`
-/// directory, found by the workspace glob; its `cdylib` is the artifact the
+/// directory, found by the workspace glob. Its `cdylib` is the artifact the
 /// host loads, staged and addressed under the extension's own name. The
 /// extension stays a plain library inside it, so one rlib serves the module
 /// build and every project build.
 ///
-/// The generated manifest enables every feature the extension declares, so its
-/// copy matches the copy projects link; the generated `lib.rs` expands the
-/// extension's entry-point macro - and, for the renderer module, its renderer
-/// ABI macro - because a crate linked into several artifacts cannot define the
-/// `#[no_mangle]` symbols itself.
+/// The generated manifest enables every feature the extension declares except
+/// `default`, so its copy matches the copy projects link. The generated
+/// `lib.rs` expands the extension's entry-point macro, and for the renderer
+/// module also its renderer ABI macro, because a crate linked into several
+/// artifacts cannot define the `#[no_mangle]` symbols itself.
 ///
 /// # Errors
 ///
@@ -2113,7 +2194,7 @@ fn materialize_host_module_wrapper(
     workspace_root: &Path,
     name: &str,
     folder: &str,
-    is_renderer: bool,
+    is_renderer_module: bool,
 ) -> Result<(), ConfigError> {
     let member_name = format!("{HOST_MODULE_MEMBER_PREFIX}{name}");
     let folder_directory = workspace_root.join(EXTENSION_DIRECTORY).join(folder);
@@ -2123,10 +2204,10 @@ fn materialize_host_module_wrapper(
     let extension_directory = folder_directory.join(name);
     let engine_directory = workspace_root.join("engine").join("pill_engine");
 
-    // Everything the extension declares except the `default` key. A wrapper
-    // that enabled fewer features than a project's dependency edge would
-    // compile a second, differently featured copy of the extension - the
-    // collision the wrapper exists to remove.
+    // Every feature the extension declares, except the `default` key. If the
+    // wrapper enabled fewer features than a project's dependency edge, it
+    // would compile a second copy of the extension with different features -
+    // the collision the wrapper exists to prevent.
     let mut features =
         crate::build_runner::declared_features(workspace_root, name).unwrap_or_default();
     features.retain(|feature| feature != "default");
@@ -2164,7 +2245,7 @@ fn materialize_host_module_wrapper(
     );
 
     let crate_name = name.replace('-', "_");
-    let renderer_bullet = if is_renderer {
+    let renderer_bullet = if is_renderer_module {
         format!(
             "//! - Also carries the renderer ABI (`pill_renderer_attach` and\n\
              //!   `pill_renderer_detach`) by expanding\n\
@@ -2173,7 +2254,7 @@ fn materialize_host_module_wrapper(
     } else {
         String::new()
     };
-    let renderer_entry = if is_renderer {
+    let renderer_entry = if is_renderer_module {
         format!("{crate_name}::__pill_renderer_entry_points!();\n")
     } else {
         String::new()
@@ -2226,16 +2307,16 @@ fn materialize_host_module_wrapper(
 ///
 /// Every directory in an extension folder's `generated/` whose name carries
 /// [`HOST_MODULE_MEMBER_PREFIX`] was written by
-/// [`materialize_host_module_wrapper`], so any one whose `(folder, crate)` is
-/// not in `keep` belongs to a project the host is no longer running, or to a
-/// crate that moved to another folder. The workspace glob would still pick it
-/// up as a member whose dependency paths may not resolve, and Cargo then fails
-/// to load the workspace at all; a wrapper an older host left flat in
-/// `extensions/` goes too.
+/// [`materialize_host_module_wrapper`]. Any one whose `(folder, crate)` pair
+/// is not in `kept_wrappers` belongs to a project the host no longer runs, or
+/// to a crate that moved to another folder. The workspace glob would still
+/// pick it up as a member whose dependency paths may not resolve, and Cargo
+/// then fails to load the workspace at all. A wrapper written straight into
+/// `extensions/` (an older layout) is removed too.
 ///
-/// Failures are ignored rather than propagated: a stale member the host cannot
+/// Failures are ignored rather than returned: a stale member the host cannot
 /// remove is a housekeeping problem, not a reason to refuse to start.
-fn prune_stale_host_module_wrappers(workspace_root: &Path, keep: &[(String, String)]) {
+fn prune_stale_host_module_wrappers(workspace_root: &Path, kept_wrappers: &[(String, String)]) {
     let extensions_root = workspace_root.join(EXTENSION_DIRECTORY);
     let Ok(folders) = std::fs::read_dir(&extensions_root) else {
         return;
@@ -2252,7 +2333,7 @@ fn prune_stale_host_module_wrappers(workspace_root: &Path, keep: &[(String, Stri
         if !folder_path.is_dir() {
             continue;
         }
-        // A wrapper left flat in `extensions/` by an older host.
+        // A wrapper an older host left directly in `extensions/`.
         if wrapped_crate(&folder_path).is_some() {
             let _ = std::fs::remove_dir_all(&folder_path);
             continue;
@@ -2268,7 +2349,7 @@ fn prune_stale_host_module_wrappers(workspace_root: &Path, keep: &[(String, Stri
             let Some(crate_name) = wrapped_crate(&wrapper_path) else {
                 continue;
             };
-            let kept = keep.iter().any(|(kept_folder, kept_crate)| {
+            let kept = kept_wrappers.iter().any(|(kept_folder, kept_crate)| {
                 *kept_folder == folder && *kept_crate == crate_name
             });
             if wrapper_path.is_dir() && !kept {
@@ -2390,25 +2471,26 @@ serde = { version = "1", features = ["derive"] }
     /// anything that would leave the asset directory.
     #[test]
     fn the_startup_scene_key_reads_a_relative_scene_path() {
-        let settings = temp_root().join("project_settings_startup_scene");
-        let here = settings.join("project_settings.yaml");
+        let settings_directory = temp_root().join("project_settings_startup_scene");
+        let settings_path = settings_directory.join("project_settings.yaml");
 
-        let accepted = HostConfig::validate_startup_scene(Some("scenes/start.scene"), &here)
-            .expect("a relative scene path is accepted");
+        let accepted =
+            HostConfig::validate_startup_scene(Some("scenes/start.scene"), &settings_path)
+                .expect("a relative scene path is accepted");
         assert_eq!(accepted.as_deref(), Some("scenes/start.scene"));
         assert_eq!(
-            HostConfig::validate_startup_scene(None, &here).unwrap(),
+            HostConfig::validate_startup_scene(None, &settings_path).unwrap(),
             None
         );
         assert_eq!(
-            HostConfig::validate_startup_scene(Some("   "), &here).unwrap(),
+            HostConfig::validate_startup_scene(Some("   "), &settings_path).unwrap(),
             None,
             "a blank value means no startup scene"
         );
 
         for refused in ["scenes/start.txt", "/scenes/start.scene", "..\\start.scene"] {
             assert!(
-                HostConfig::validate_startup_scene(Some(refused), &here).is_err(),
+                HostConfig::validate_startup_scene(Some(refused), &settings_path).is_err(),
                 "`{refused}` must be refused"
             );
         }
@@ -2452,9 +2534,9 @@ serde = { version = "1", features = ["derive"] }
             .validate(&path)
             .expect_err("an unknown level is refused");
         assert!(error.to_string().contains("loud"), "{error}");
-        // The message names the target whose level did not read, which is the
-        // same text a shipping bundle's bad target produces: both tiers come
-        // through one conversion.
+        // The message names the target whose level was rejected. A shipping
+        // bundle reports a bad target with the same text, because both builds
+        // use one conversion.
         assert!(error.to_string().contains("wgpu: "), "{error}");
 
         let time_only = read("logging:\n  timestamp: time\n")
@@ -2518,7 +2600,7 @@ serde = { version = "1", features = ["derive"] }
         assert!(error.to_string().contains("scan_on_startup"), "{error}");
     }
 
-    /// A missing project settings file selects no extensions.
+    /// A missing project settings file reads as absent, not as an error.
     #[test]
     fn missing_project_settings_file_selects_no_modules() {
         let directory = temp_root().join("project_settings_missing");
@@ -2531,8 +2613,8 @@ serde = { version = "1", features = ["derive"] }
     // editor settings file
     // =========================================================================
 
-    /// The editor's settings file is optional, names a theme and refuses a
-    /// misspelled key: the key the editor reads is the only one it accepts.
+    /// The editor's settings file is optional and names a theme. A misspelled
+    /// key is refused, because the theme key is the only one the editor reads.
     #[test]
     fn the_editor_settings_file_reads_the_theme_key() {
         let directory = temp_root().join("editor_settings");
@@ -2548,8 +2630,11 @@ serde = { version = "1", features = ["derive"] }
             "editor_theme: \"editor/alt.theme\"\n",
         )
         .unwrap();
-        let named = read_editor_settings(&directory).expect("the key parses");
-        assert_eq!(named.editor_theme.as_deref(), Some("editor/alt.theme"));
+        let named_settings = read_editor_settings(&directory).expect("the key parses");
+        assert_eq!(
+            named_settings.editor_theme.as_deref(),
+            Some("editor/alt.theme")
+        );
 
         std::fs::write(directory.join("editor_settings.yaml"), "editor_theme:\n").unwrap();
         assert_eq!(
@@ -2593,11 +2678,11 @@ serde = { version = "1", features = ["derive"] }
             Some("editor/editor.theme")
         );
 
-        let named = EditorSettings {
+        let named_settings = EditorSettings {
             editor_theme: Some("editor/alt.theme".to_string()),
         };
         assert_eq!(
-            resolve_editor_theme(&directory, &named).as_deref(),
+            resolve_editor_theme(&directory, &named_settings).as_deref(),
             Some("editor/alt.theme"),
             "the key names the layer even when the default file exists"
         );
@@ -2652,9 +2737,9 @@ serde = { version = "1", features = ["derive"] }
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The editor posture's crates: a loaded folder's editor crate, after the
-    /// runtime crates and in their folder order; editor-only folders always;
-    /// a folder without one contributes nothing; and an unloaded folder's
+    /// The editor posture's crates, in load order: each loaded folder's editor
+    /// crate after the runtime crates, then every editor-only folder. A folder
+    /// without an editor crate contributes nothing, and an unloaded folder's
     /// editor crate stays out.
     #[test]
     fn resolves_editor_crates_by_convention() {
@@ -2713,28 +2798,29 @@ serde = { version = "1", features = ["derive"] }
         let mut manifest = std::fs::read_to_string(&tagged).expect("seeded manifest");
         manifest.push_str("\n[package.metadata.pill]\neditor_frontend = \"egui\"\n");
         std::fs::write(&tagged, manifest).expect("tag the manifest");
-        let (untagged_frontend, untagged_optional) =
+        let (untagged_editor_crates, untagged_optional_names) =
             HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "legacy")
                 .expect("a seeded tree resolves");
-        assert!(untagged_frontend.is_empty());
-        assert!(untagged_optional.is_empty());
-        let (tagged_frontend, tagged_optional) =
+        assert!(untagged_editor_crates.is_empty());
+        assert!(untagged_optional_names.is_empty());
+        let (tagged_editor_crates, tagged_optional_names) =
             HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "egui")
                 .expect("a seeded tree resolves");
         assert_eq!(
-            tagged_frontend
+            tagged_editor_crates
                 .iter()
                 .map(|crate_config| crate_config.name.as_str())
                 .collect::<Vec<_>>(),
             ["pill_gadget_shell_editor"],
             "the tagged crate loads under its own frontend"
         );
-        assert_eq!(tagged_optional, ["pill_gadget_shell_editor"]);
+        assert_eq!(tagged_optional_names, ["pill_gadget_shell_editor"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A crate still tagged for the `pill_ui` editor is refused: no host runs
-    /// that frontend, so skipping it would silently drop its editor part.
+    /// A crate still tagged for the `pill_ui` editor is refused. No host runs
+    /// that frontend, so skipping the crate would silently drop its editor
+    /// part.
     #[test]
     fn refuses_the_retired_editor_frontend_tag() {
         let root = temp_root().join("retired_frontend");
@@ -2761,7 +2847,7 @@ serde = { version = "1", features = ["derive"] }
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// An editor crate named in `modules:` is refused: it loads with its
+    /// An editor crate named in `modules:` is refused. It loads with its
     /// extension in an editor host, never on its own.
     #[test]
     fn refuses_editor_crates_in_the_module_list() {
@@ -2882,14 +2968,14 @@ serde = { version = "1", features = ["derive"] }
         );
     }
 
-    /// Extension names are validated before they become a watch path
-    /// and a cargo selector.
+    /// Extension names are checked before they become a watch path and a
+    /// cargo selector.
     ///
-    /// `workspace_member` interpolates the name into both with no check of
-    /// its own, so unchecked, `../pill_spline` would point the watcher outside
-    /// `extensions/` and hand cargo a malformed `--package`. This drives the
-    /// resolution `from_environment` runs, so it needs no process-wide
-    /// working directory.
+    /// `workspace_member` places the name into both without checking it. Left
+    /// unchecked, `../pill_spline` would point the watcher outside
+    /// `extensions/` and hand cargo a malformed `--package`. The test drives
+    /// the same resolution `from_environment` runs, so it needs no
+    /// process-wide working directory.
     #[test]
     fn rejects_traversal_and_duplicate_module_names() {
         let root = temp_root().join("extension_names");
@@ -3400,27 +3486,33 @@ mod host_project_member_pruning_tests {
 
     use crate::scratch::ScratchDirectory;
 
-    /// Creates `<directory>/<name>/Cargo.toml` under `root` and returns its
-    /// directory, so a test can assert on the directory rather than the file.
-    fn seed_member_in(root: &std::path::Path, directory: &str, name: &str) -> std::path::PathBuf {
-        let directory = root.join(directory).join(name);
-        std::fs::create_dir_all(&directory).unwrap();
+    /// Creates `<member_directory_name>/<member_name>/Cargo.toml` under `root`
+    /// and returns its directory, so a test can assert on the directory rather
+    /// than the file.
+    fn seed_member_in(
+        root: &std::path::Path,
+        member_directory_name: &str,
+        member_name: &str,
+    ) -> std::path::PathBuf {
+        let member_directory = root.join(member_directory_name).join(member_name);
+        std::fs::create_dir_all(&member_directory).unwrap();
         std::fs::write(
-            directory.join("Cargo.toml"),
+            member_directory.join("Cargo.toml"),
             "[package]
 name = \"x\"
 ",
         )
         .unwrap();
-        directory
+        member_directory
     }
 
     /// A generated project member under `projects_generated/`.
-    fn seed_member(root: &std::path::Path, name: &str) -> std::path::PathBuf {
-        seed_member_in(root, PROJECT_MEMBER_DIRECTORY, name)
+    fn seed_member(root: &std::path::Path, member_name: &str) -> std::path::PathBuf {
+        seed_member_in(root, PROJECT_MEMBER_DIRECTORY, member_name)
     }
 
-    /// Builds an empty temporary workspace root, removed on drop.
+    /// Builds a temporary workspace root holding only `projects_generated/`,
+    /// removed on drop.
     fn workspace(test_name: &str) -> ScratchDirectory {
         let root = ScratchDirectory::new(test_name);
         std::fs::create_dir_all(root.join(PROJECT_MEMBER_DIRECTORY)).unwrap();
@@ -3430,33 +3522,36 @@ name = \"x\"
     #[test]
     fn removes_a_member_left_by_a_previous_project() {
         let root = workspace("previous");
-        let stale = seed_member(&root, "host_project_old");
-        let legacy = seed_member_in(&root, EXTENSION_DIRECTORY, "host_project_flat");
-        let keep = seed_member(&root, "host_project_current");
+        let stale_member = seed_member(&root, "host_project_old");
+        let legacy_member = seed_member_in(&root, EXTENSION_DIRECTORY, "host_project_flat");
+        let kept_member = seed_member(&root, "host_project_current");
 
-        prune_stale_host_project_members(&root, &keep);
+        prune_stale_host_project_members(&root, &kept_member);
 
         assert!(
-            !stale.exists(),
+            !stale_member.exists(),
             "the previous project's member must be gone"
         );
         assert!(
-            !legacy.exists(),
+            !legacy_member.exists(),
             "a member an older host left flat in extensions/ must be gone"
         );
-        assert!(keep.exists(), "the member being materialized must survive");
+        assert!(
+            kept_member.exists(),
+            "the member being materialized must survive"
+        );
     }
 
     #[test]
     fn leaves_real_extensions_alone() {
         let root = workspace("real_modules");
-        let module = seed_member_in(&root, EXTENSION_DIRECTORY, "pill_spline");
-        let keep = seed_member(&root, "host_project_current");
+        let real_module = seed_member_in(&root, EXTENSION_DIRECTORY, "pill_spline");
+        let kept_member = seed_member(&root, "host_project_current");
 
-        prune_stale_host_project_members(&root, &keep);
+        prune_stale_host_project_members(&root, &kept_member);
 
         assert!(
-            module.exists(),
+            real_module.exists(),
             "only host-generated members carry the prefix; a real module must not be deleted"
         );
     }
@@ -3465,9 +3560,9 @@ name = \"x\"
     fn tolerates_a_missing_extensions_directory() {
         let root = ScratchDirectory::new("prune_missing");
 
-        // Must not panic: a workspace with no `extensions/` directory yet is
-        // valid, and refusing to start over it would be worse than the stale
-        // member this function exists to clean up.
+        // This must not panic: a workspace with no `extensions/` folder yet is
+        // valid, and refusing to start because of that would be worse than the
+        // stale member this function exists to clean up.
         prune_stale_host_project_members(&root, &root.join("nothing"));
     }
 }
@@ -3517,28 +3612,32 @@ mod host_module_wrapper_pruning_tests {
 
     /// Creates `extensions/<folder>/generated/<wrapper>/Cargo.toml` under
     /// `root` and returns the wrapper's directory.
-    fn seed_wrapper(root: &std::path::Path, folder: &str, wrapper: &str) -> std::path::PathBuf {
+    fn seed_wrapper(
+        root: &std::path::Path,
+        folder: &str,
+        wrapper_name: &str,
+    ) -> std::path::PathBuf {
         let directory = root
             .join(EXTENSION_DIRECTORY)
             .join(folder)
             .join(GENERATED_DIRECTORY)
-            .join(wrapper);
+            .join(wrapper_name);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         directory
     }
 
-    /// A kept wrapper survives; a wrapper of a crate no longer loaded, one in
-    /// a folder the crate no longer lives in, and one an older host left flat
-    /// in `extensions/` are removed; real crates are never touched.
+    /// A kept wrapper survives. A wrapper of a crate no longer loaded, one in
+    /// a folder the crate no longer lives in, and one an older host left
+    /// directly in `extensions/` are removed. Real crates are never touched.
     #[test]
     fn keeps_only_the_wrappers_of_loaded_crates() {
         let root = ScratchDirectory::new("prune_wrappers");
-        let kept = seed_wrapper(&root, "pill_spline", "host_module_pill_spline");
-        let unloaded = seed_wrapper(&root, "pill_audio", "host_module_pill_audio");
-        let moved = seed_wrapper(&root, "pill_old_folder", "host_module_pill_spline");
-        let flat = root.join(EXTENSION_DIRECTORY).join("host_module_pill_test");
-        std::fs::create_dir_all(&flat).unwrap();
+        let kept_wrapper = seed_wrapper(&root, "pill_spline", "host_module_pill_spline");
+        let unloaded_wrapper = seed_wrapper(&root, "pill_audio", "host_module_pill_audio");
+        let moved_wrapper = seed_wrapper(&root, "pill_old_folder", "host_module_pill_spline");
+        let flat_wrapper = root.join(EXTENSION_DIRECTORY).join("host_module_pill_test");
+        std::fs::create_dir_all(&flat_wrapper).unwrap();
         let real_crate = root
             .join(EXTENSION_DIRECTORY)
             .join("pill_spline")
@@ -3550,17 +3649,20 @@ mod host_module_wrapper_pruning_tests {
             &[("pill_spline".to_string(), "pill_spline".to_string())],
         );
 
-        assert!(kept.exists(), "the loaded crate's wrapper must survive");
         assert!(
-            !unloaded.exists(),
+            kept_wrapper.exists(),
+            "the loaded crate's wrapper must survive"
+        );
+        assert!(
+            !unloaded_wrapper.exists(),
             "a wrapper of an unloaded crate must be gone"
         );
         assert!(
-            !moved.exists(),
+            !moved_wrapper.exists(),
             "a wrapper in the wrong folder must be gone"
         );
         assert!(
-            !flat.exists(),
+            !flat_wrapper.exists(),
             "a flat wrapper from an older host must be gone"
         );
         assert!(real_crate.exists(), "a real crate must never be removed");

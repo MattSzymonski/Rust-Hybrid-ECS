@@ -1,23 +1,24 @@
-//! The development host: a runtime whose project and modules are DLLs that
-//! reload while it runs.
+//! The development host: it runs a project and its extensions as DLLs, and
+//! reloads them while the game keeps running.
 //!
 //! # Responsibilities
 //!
 //! - Build and load the extensions and the project, and watch their sources.
-//! - Reload, patch and roll back at every frame boundary, around the frame the
-//!   wrapped [`pill_player::Runtime`] runs ([`run_frame`]).
+//! - Reload, patch and roll back at each frame boundary, just before the
+//!   wrapped [`pill_player::Runtime`] runs its frame ([`run_frame`]).
 //! - With `rendering`: load the renderer as a reloadable module, rebuild it
-//!   with its data crate, pause it on a layout it was not built against, and
-//!   deliver re-cooked shaders ([`RenderingHost`]).
+//!   when its data crate reloads, stop it while it would read a component
+//!   layout it was not built against, and pass on every shader the watcher
+//!   re-cooks ([`RenderingHost`]).
 //!
 //! # Design
 //!
 //! Compiled only with `hot_reload`. The engine, its frame and the renderer's
-//! window live in `pill_player`, which a shipping build runs directly; this
-//! module adds what developing needs around them. [`DevHost`] wraps the
-//! runtime for the headless path, [`RenderingHost`] adds the renderer module
-//! and the surfaces it draws on, and backend-specific loading stays behind
-//! [`LoadedProject`].
+//! window live in `pill_player`, which a shipping build runs directly. This
+//! module adds what developing needs around them: [`DevHost`] wraps the
+//! runtime for the headless path, and [`RenderingHost`] adds the renderer
+//! module and the surfaces it draws on. Loading that differs per backend
+//! stays behind [`LoadedProject`].
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -76,6 +77,30 @@ const SHADER_CHANGED_EXPORT: &str = "pill_render_data_shader_changed";
 #[cfg(feature = "rendering")]
 const SHADER_CHANGE_REFUSED: u32 = u32::MAX;
 
+/// File a developer or a script drops to drive live patching, relative to the
+/// workspace root.
+///
+/// A file is used rather than an environment variable because the request has
+/// to reach a process that is already running. It is a file rather than a
+/// console command because the standalone host has no input loop, and its
+/// stdout is routinely redirected.
+///
+/// One line, in one of these forms:
+///
+/// - `list`: print every generation this session installed.
+/// - `<function>@<generation>`: reinstall that generation.
+/// - `<function>@previous`: step back one from whatever is running.
+/// - `<function>@0`: the code the artifact was built with.
+///
+/// The file is removed before the request is acted on, so a request is
+/// honoured exactly once.
+#[cfg(feature = "hot_patch")]
+const ROLLBACK_REQUEST_FILE: &str = "target/hot/rollback.request";
+
+// =============================================================================
+// Types + Impls
+// =============================================================================
+
 /// Signature of [`SHADER_CHANGED_EXPORT`]: the world, the re-cooked file's
 /// path relative to the crate's `shader_sources/`, and its WGSL; returns how
 /// many shader assets changed.
@@ -88,25 +113,6 @@ type ShaderChangedFunction = unsafe extern "C" fn(
     wgsl_len: usize,
 ) -> u32;
 
-/// File a developer or a script drops to drive live patching, relative to the
-/// workspace root.
-///
-/// A file rather than an environment variable because the request has to reach a
-/// process that is already running, and rather than a console command because
-/// the standalone host has no input loop and its stdout is routinely redirected.
-///
-/// One line, either `list` (print every generation this session installed),
-/// `<function>@<generation>` (reinstall that generation), `<function>@previous`
-/// (step back one from whatever is running), or `<function>@0` (the code the
-/// artifact was built with). It is deleted as soon as it is read, so a request
-/// is honoured exactly once.
-#[cfg(feature = "hot_patch")]
-const ROLLBACK_REQUEST_FILE: &str = "target/hot/rollback.request";
-
-// =============================================================================
-// Types + Impls
-// =============================================================================
-
 /// An editor-only module whose tolerated first load failed.
 ///
 /// Kept with the owner tag and watcher counter its first load would have had,
@@ -117,51 +123,32 @@ struct PendingModule {
     config: crate::config::ExtensionConfig,
     /// The owner tag the module's systems register under once it loads.
     owner: pill_engine::SystemOwner,
-    /// The counter the module's source watcher bumps once one runs.
+    /// The counter the module's source watcher adds one to once it runs.
     source_edit_generation: Arc<AtomicU64>,
-}
-
-/// Debug assertion: every entry of `subjects` names a distinct owner.
-///
-/// The subjects are the things a reload, a pause or a stale-suspension resume
-/// can retire or reach: the extensions, the pending modules, the renderer and
-/// the project. One owner shared by two of them means one of them can clear or
-/// resume the other's systems.
-#[cfg(debug_assertions)]
-fn assert_unique_owners(subjects: &[(&str, SystemOwner)]) {
-    for (index, (subject, owner)) in subjects.iter().enumerate() {
-        let shared = subjects[index + 1..]
-            .iter()
-            .find(|(_, candidate)| candidate == owner);
-        if let Some((other, _)) = shared {
-            debug_assert!(
-                false,
-                "{subject} and {other} register under the same system owner {owner}"
-            );
-        }
-    }
 }
 
 /// The headless development host.
 ///
 /// It owns the runtime (the engine and its frame), the loaded project image and
 /// every extension slot, and reloads them at each frame boundary
-/// ([`run_frame`]). Bundling this state lets headless, windowed, and editor
-/// frontends share the same engine lifetime and hot-reload behavior.
+/// ([`run_frame`]). One struct holds all of it, so the headless, windowed and
+/// editor frontends get the same engine lifetime and the same hot reload.
 pub struct DevHost {
     /// The directory every spawned cargo build runs in and every artifact path
     /// is resolved against.
     workspace_root: PathBuf,
-    module_config: ProjectModuleConfig,
+    /// The project module's configuration: its backend, watched sources and
+    /// build command.
+    project_module_config: ProjectModuleConfig,
     /// The renderer GPU module a windowed build loads, from the project's
     /// `renderer:` setting; `None` when it selects no renderer. Its data crate
     /// is already among `extensions`.
     #[cfg(feature = "rendering")]
     renderer: Option<String>,
-    /// The engine and its frame. Declared before the loaded images, so the
-    /// world - whose values may call drop functions inside them - is gone
-    /// before any of them unmaps. The engine is boxed inside, so the raw
-    /// pointer in `engine_api` stays valid when the host moves.
+    /// The engine and its frame. Declared before the loaded images: the world
+    /// holds values whose drop functions live in those images, so it has to be
+    /// gone before any of them unmaps. The engine is boxed, so the raw pointer
+    /// in `engine_api` stays valid when the host moves.
     runtime: Runtime,
     /// The C-callable table a loaded artifact is handed at every entry point.
     engine_api: EngineApi,
@@ -172,26 +159,29 @@ pub struct DevHost {
     /// Tolerated editor-only modules whose first load failed: no slot and no
     /// watcher; [`DevHost::retry_extension`] is their only way in.
     pending_modules: Vec<PendingModule>,
-    /// Counter bumped by the project watcher on every relevant source save.
+    /// Counter the project watcher adds one to on every source save it cares
+    /// about.
     ///
-    /// One producer (the watcher) and two consumers: `try_project_fast_path`,
-    /// which consumes an edit its patch delivered, and the Step 5 reload
-    /// transaction, which rebuilds from it.
+    /// The watcher is the only producer. Two consumers read it:
+    /// `try_project_fast_path`, which marks a generation handled once its patch
+    /// has delivered the edit, and the Step 5 reload transaction, which
+    /// rebuilds from it.
     source_edit_generation: Arc<AtomicU64>,
     /// The `source_edit_generation` value the frame loop last acted on.
     last_processed_source_edit: u64,
-    /// Counter bumped by the reload pipeline itself when it owes the project a
-    /// rebuild: a reloaded module the project links directly, or a module swap
-    /// that changed the C# mirror surface.
+    /// Counter the reload pipeline adds one to when it owes the project a
+    /// rebuild: a module the project links directly reloaded, or a module swap
+    /// changed the C# mirror surface.
     ///
-    /// Separate from [`Self::source_edit_generation`] on purpose: "a source
-    /// save arrived" and "a rebuilt module crate must be re-embedded" are
-    /// different reasons to rebuild, and one counter carrying both lets a
-    /// fast-path patch of the project's own edit consume the cascade's bump
-    /// along with the edit, silently skipping the rebuild. No fast path
-    /// consumes this counter, so the rebuild stays owed until
-    /// `loaded_project.reload` runs. Written and read by the frame thread
-    /// alone, which is why it is a plain integer rather than an atomic.
+    /// It is separate from [`Self::source_edit_generation`] on purpose. "A
+    /// source save arrived" and "a rebuilt module has to be compiled into the
+    /// project again" are different reasons to rebuild. One counter for both
+    /// would let a fast-path patch of the project's own edit mark the cascade
+    /// handled too, and skip the rebuild without a word.
+    ///
+    /// No fast path reads this counter, so the rebuild stays owed until
+    /// `loaded_project.reload` runs. Only the frame thread writes and reads it,
+    /// which is why it is a plain integer and not an atomic.
     queued_reload_generation: u64,
     /// The `queued_reload_generation` value the frame loop last rebuilt for.
     last_processed_queued_reload: u64,
@@ -200,9 +190,9 @@ pub struct DevHost {
     ///
     /// The project's watcher is the only producer: the module and renderer
     /// watchers pass `None`, because nothing times a reload from their
-    /// signals. Entries are consumed by generation, so each signal times
-    /// exactly one reload.
-    source_triggers: Arc<crate::watcher::TriggerLog>,
+    /// signals. A reload takes the entries up to its generation, so each
+    /// signal times exactly one reload.
+    source_trigger_log: Arc<crate::watcher::TriggerLog>,
     /// Owners whose systems this host suspended because their binary was built
     /// against a shared component layout another reload has replaced.
     ///
@@ -213,8 +203,8 @@ pub struct DevHost {
     /// Per-function fast path, when the project opted in with `#[pill_hot]`.
     ///
     /// `None` when the feature is off, when no function is annotated, or when
-    /// the project does not also build an `rlib` - all of which simply leave the
-    /// existing whole-module reload as the only path.
+    /// the project does not also build an `rlib`. In all three cases the
+    /// existing whole-module reload stays the only path.
     #[cfg(feature = "hot_patch")]
     hot_patch: Option<crate::hot_patch::HotPatchSession>,
     /// Per-function fast path for each extension, positionally paired
@@ -234,10 +224,11 @@ pub struct DevHost {
     patch_attempt: Option<InFlightPatch>,
     /// Every patch library loaded in this process, newest last.
     ///
-    /// Process-wide rather than per-session on purpose: a patch links its own
-    /// copy of everything its body calls, so patching one crate has to redirect
-    /// the copies sitting inside another crate's patches too. Never unloaded - a
-    /// jump or a slot may point into any of them for the rest of the run.
+    /// They belong to the process, not to one session. A patch links its own
+    /// copy of everything its body calls, so patching one crate also has to
+    /// redirect the copies inside another crate's patches. They are never
+    /// unloaded, because a jump or a slot may point into any of them for the
+    /// rest of the run.
     #[cfg(feature = "hot_patch")]
     loaded_patches: Vec<crate::hot_patch::LoadedPatch>,
     /// Watches the project's `res` and queues the assets whose source or
@@ -250,11 +241,12 @@ pub struct DevHost {
     /// Whether every source asset is kept paired with a `.meta` file; see
     /// [`DevHost::set_ensure_asset_metadata`]. Off unless a frontend asks.
     ensure_asset_metadata: bool,
-    /// Monotonic counter of reload/rollback/patch events.
+    /// Counter of reload, rollback and patch events, only ever increased.
     ///
-    /// The editor keys its cached engine metadata on this. It is NOT how the
-    /// editor learns that entities changed - gameplay changes those every
-    /// frame without a reload - it only says "the set of loaded code changed".
+    /// The editor uses it as the key for its cached engine metadata. It is not
+    /// how the editor learns that entities changed: gameplay changes those
+    /// every frame without a reload. It only says that the set of loaded code
+    /// changed.
     editor_revision: u64,
 }
 
@@ -279,16 +271,18 @@ impl DevHost {
     /// Reinstall an earlier generation of one patched function.
     ///
     /// `generation` is one-based in the order patches were applied; zero
-    /// restores the code the running artifact was built with. This is a pointer
-    /// store per artifact - nothing is rebuilt, reloaded or unloaded - which is
-    /// what a dispatch slot buys over rewriting a function prologue. Call it
-    /// between frames: it borrows the host mutably.
+    /// restores the code the running artifact was built with. Nothing is
+    /// rebuilt, reloaded or unloaded. A generation delivered through a dispatch
+    /// slot is one pointer store per artifact, and a generation written over
+    /// the function's own code is patched back in place. Call it between frames:
+    /// it borrows the host mutably.
     ///
     /// # Errors
     ///
     /// Returns a message when no session has patched `function`, when the
-    /// generation does not exist, or when an artifact refuses the address; on
-    /// any error the running implementation is left in place.
+    /// generation does not exist, or when an artifact refuses the address. A
+    /// slot route leaves the running implementation in place; a prologue route
+    /// that fails partway leaves the copies it already rewrote as it put them.
     #[cfg(feature = "hot_patch")]
     pub fn rollback_patch(&mut self, function: &str, generation: u32) -> Result<(), String> {
         let DevHost {
@@ -338,7 +332,7 @@ impl DevHost {
     /// Advance the editor revision counter after a reload/rollback/patch.
     ///
     /// The increment itself is the editor's cache-invalidation signal; the
-    /// log line exists so integration suites can assert a bump happened
+    /// log line exists so integration suites can check that the counter moved
     /// without driving a GUI.
     fn bump_editor_revision(&mut self) {
         self.editor_revision = self.editor_revision.wrapping_add(1);
@@ -423,12 +417,16 @@ impl DevHost {
     /// Returns the failure text when the module still does not build, load
     /// or register; the notice queue carries the same failure for the
     /// embedder's error UI.
-    pub fn retry_extension(&mut self, name: &str) -> Result<(), String> {
-        if let Some(slot) = self.extensions.iter_mut().find(|slot| slot.name() == name) {
+    pub fn retry_extension(&mut self, module_name: &str) -> Result<(), String> {
+        if let Some(slot) = self
+            .extensions
+            .iter_mut()
+            .find(|slot| slot.name() == module_name)
+        {
             slot.request_reload();
             info!(
                 target: telemetry_target::HOT_RELOAD,
-                module = name,
+                module = module_name,
                 "module rebuild requested"
             );
             return Ok(());
@@ -436,9 +434,9 @@ impl DevHost {
         let Some(index) = self
             .pending_modules
             .iter()
-            .position(|pending| pending.config.name == name)
+            .position(|pending| pending.config.name == module_name)
         else {
-            return Err(format!("no module named `{name}` to retry"));
+            return Err(format!("no module named `{module_name}` to retry"));
         };
         let pending = self.pending_modules.remove(index);
         match ExtensionSlot::start(
@@ -448,18 +446,18 @@ impl DevHost {
             &pending.config,
             pending.owner,
             Arc::clone(&pending.source_edit_generation),
-            // A retry runs long after the project filled the world, so it must
-            // not take the world with it: `ClearWorld` replaces everything when
-            // the module fails to initialize, which is right for the first
-            // thing a host loads and catastrophic for a click on Retry.
+            // A retry runs long after the project has filled the world, so it
+            // must not take the world with it. `ClearWorld` throws everything
+            // away when the module fails to initialize: right for the first
+            // thing a host loads, and the last thing a click on Retry should
+            // do.
             //
-            // `ClearSystemsOnly` would keep the world but refuses a module that
-            // registers data, and this retry serves the editor's shell module,
-            // which registers components like any other - every retry would
-            // fail instead of loading. `ClearGenerationData` is the one that
-            // fits: it keeps the project's world, drops what the failed attempt
-            // registered, and parks the refused image so nothing it left points
-            // at unmapped code.
+            // `ClearSystemsOnly` keeps the world, but it refuses a module that
+            // registers data. The module this retry serves (the editor's
+            // shell) registers components like any other, so every retry would
+            // fail. `ClearGenerationData` fits: it keeps the project's world,
+            // drops what the failed attempt registered, and keeps the refused
+            // image loaded so nothing it left behind points at unmapped code.
             crate::reload::FirstLoadFailure::ClearGenerationData,
         ) {
             Ok(slot) => {
@@ -569,12 +567,14 @@ impl DevHost {
 
     /// Keep every source asset in `res` paired with a `.meta` file.
     ///
-    /// Turning it on writes the missing files at once: every source a
-    /// registered sourced type imports gets its type's default settings and a
-    /// guid, without being decoded or loaded. While it stays on, a `.meta`
-    /// deleted under a running host is written again - with the loaded asset's
-    /// guid when it is loaded - and a new source gets one when the watcher
-    /// imports it. The editor turns this on; a game run leaves it off.
+    /// Turning it on writes the missing files at once. Every source file that a
+    /// registered asset type imports gets that type's default settings and a
+    /// guid, without being decoded or loaded.
+    ///
+    /// While it stays on, a `.meta` deleted under a running host is written
+    /// again, using the loaded asset's guid when it is loaded. A new source
+    /// gets one when the watcher imports it. The editor turns this on; a game
+    /// run leaves it off.
     pub fn set_ensure_asset_metadata(&mut self, enabled: bool) {
         self.ensure_asset_metadata = enabled;
         if !enabled {
@@ -629,7 +629,7 @@ impl DevHost {
         &mut self,
         type_name: &str,
         folder: &str,
-        name: &str,
+        asset_name: &str,
     ) -> Result<String, String> {
         let directory = self
             .asset_directory
@@ -640,7 +640,7 @@ impl DevHost {
             &directory,
             type_name,
             folder,
-            name,
+            asset_name,
         )
     }
 
@@ -672,43 +672,6 @@ impl FrameDriver for DevHost {
     }
 }
 
-/// The development host with the engine renderer drawing on native surfaces.
-///
-/// Keeping the renderer beside [`DevHost`] makes its creation and lifetime part
-/// of host setup. Executable crates never construct or retain GPU resources.
-#[cfg(feature = "rendering")]
-pub struct RenderingHost {
-    host: DevHost,
-    /// The backend and the window it draws on; the backend drops first.
-    /// Declared before `renderer_module` so the backend is detached while the
-    /// module it lives in is still mapped.
-    display: AttachedRenderer,
-    /// The renderer module the backend lives in.
-    renderer_module: RendererModule,
-    /// Why rendering is paused, or `None` while it runs.
-    ///
-    /// Set when the renderer's data crate reloaded with a different component
-    /// layout and no renderer built against the new layout could take over:
-    /// the live renderer's `rendering` system and `render` would read the new
-    /// rows through the old field offsets. While paused, the renderer's owner
-    /// is disabled and `render` is skipped; the window keeps its last frame.
-    paused: Option<PauseReason>,
-    /// Whether the frontend last reported the scene quiet: with the project
-    /// also paused, a reload-free boundary and no renderer change, the frame
-    /// skips the render and the surfaces keep their last image.
-    scene_quiet: bool,
-    /// Whether the last frame drew the surfaces; the frontend clears its
-    /// scene-changed flag on the frames this is true.
-    scene_drawn: bool,
-    /// Watches the renderer data crate's `shader_sources/` tree and queues
-    /// what it re-cooks; `None` without a renderer, or when its data crate has
-    /// no shaders or the watch could not start.
-    shader_watcher: Option<crate::shader_watcher::ShaderWatcher>,
-    /// Set whenever a renderer backend attaches; the next frame then reports
-    /// the render data the renderer ignores, once per renderer generation.
-    unsupported_data_check_pending: bool,
-}
-
 /// Why a windowed host stopped rendering; see [`RenderingHost`]'s `paused`.
 #[cfg(feature = "rendering")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -733,6 +696,45 @@ enum RendererStep {
     Failed,
 }
 
+/// The development host with the engine renderer drawing on native surfaces.
+///
+/// Keeping the renderer beside [`DevHost`] makes its creation and lifetime part
+/// of host setup. Executable crates never construct or retain GPU resources.
+#[cfg(feature = "rendering")]
+pub struct RenderingHost {
+    /// The wrapped development host: the engine, the project and every
+    /// extension.
+    host: DevHost,
+    /// The backend and the window it draws on; the backend drops first.
+    /// Declared before `renderer_module` so the backend is detached while the
+    /// module it lives in is still mapped.
+    attached_renderer: AttachedRenderer,
+    /// The renderer module the backend lives in.
+    renderer_module: RendererModule,
+    /// Why rendering is paused, or `None` while it runs.
+    ///
+    /// Set when the renderer's data crate reloaded with a different component
+    /// layout, and no renderer built against the new layout could take over.
+    /// The live renderer's `rendering` system and `render` would read the new
+    /// rows through the old field offsets. While paused, the renderer's owner
+    /// is disabled and `render` is skipped, so the window keeps its last frame.
+    paused: Option<PauseReason>,
+    /// Whether the frontend last reported the scene quiet. With the project
+    /// also paused, a reload-free boundary and no renderer change, the frame
+    /// skips the render and the surfaces keep their last image.
+    scene_quiet: bool,
+    /// Whether the last frame drew the surfaces; the frontend clears its
+    /// scene-changed flag on the frames this is true.
+    scene_drawn_last_frame: bool,
+    /// Watches the renderer data crate's `shader_sources/` tree and queues
+    /// what it re-cooks. `None` without a renderer, or when its data crate has
+    /// no shaders or the watch could not start.
+    shader_watcher: Option<crate::shader_watcher::ShaderWatcher>,
+    /// Set whenever a renderer backend attaches; the next frame then reports
+    /// the render data the renderer ignores, once per renderer generation.
+    unsupported_data_check_pending: bool,
+}
+
 #[cfg(feature = "rendering")]
 impl RenderingHost {
     /// Move rendering to a newly created native window surface.
@@ -755,32 +757,35 @@ impl RenderingHost {
         W: RendererWindow + 'static,
     {
         let renderer_module = &self.renderer_module;
-        self.display.retarget(window, width, height, |window_data| {
-            attach_backend(renderer_module, window_data, width, height)
-        })
+        self.attached_renderer
+            .retarget(window, width, height, |window_data| {
+                attach_backend(renderer_module, window_data, width, height)
+            })
     }
 
     /// Forward a physical resize of surface `id` to the engine renderer.
     pub fn resize_surface(&mut self, id: pill_renderer_api::SurfaceId, width: u32, height: u32) {
-        self.display.resize_surface(id, width, height);
+        self.attached_renderer.resize_surface(id, width, height);
     }
 
     /// Reload the renderer module when its sources changed, and keep the
     /// window drawn by whichever generation is current afterwards.
     ///
-    /// The backend is built on the current module image, so it is detached in
-    /// the reload's `before_commit` hook - after the replacement has built and
-    /// loaded, and before the swap retires the old image - while that image is
-    /// still mapped. Until the attach below, the host draws nothing. After the
-    /// commit, the slot's current library is the new generation, or the old
-    /// one when the new `init` failed and the transaction rolled back; both
-    /// are attached the same way, and a failed build or load leaves the
-    /// backend as it was. A failed attach leaves the window undrawn and is
-    /// retried on the next source change.
+    /// The backend runs code inside the module image, so it is detached in the
+    /// reload's `before_commit` hook. That runs after the replacement has built
+    /// and loaded, and before the swap retires the old image. At that moment
+    /// the image the backend calls into is still mapped, and the host draws
+    /// nothing until the attach below.
+    ///
+    /// After the commit the slot holds the new generation, or the old one if
+    /// the new `init` failed and the transaction rolled back. Both are
+    /// attached the same way. A failed build or load leaves the backend as it
+    /// was, and a failed attach leaves the window undrawn until the next
+    /// source change.
     fn reload_renderer_if_changed(&mut self) -> RendererStep {
         let RenderingHost {
             host,
-            display,
+            attached_renderer,
             renderer_module,
             unsupported_data_check_pending,
             ..
@@ -795,7 +800,7 @@ impl RenderingHost {
             &mut || {
                 // Dropping the module's backend runs its detach export inside
                 // the image that is about to retire, while it is still mapped.
-                display.detach_backend();
+                attached_renderer.detach_backend();
                 detached = true;
             },
         );
@@ -818,10 +823,15 @@ impl RenderingHost {
             outcome,
             crate::renderer_module::RendererModuleChange::Reloaded(ReloadOutcome::Failed { .. })
         );
-        let (width, height) = display.surface_size();
-        match attach_backend(renderer_module, display.window_data(), width, height) {
+        let (width, height) = attached_renderer.surface_size();
+        match attach_backend(
+            renderer_module,
+            attached_renderer.window_data(),
+            width,
+            height,
+        ) {
             Ok(attached) => {
-                display.replace_backend(attached);
+                attached_renderer.replace_backend(attached);
                 // A new renderer generation: what it ignores is reported anew.
                 *unsupported_data_check_pending = true;
                 // Counted, not assumed: a generation whose system escaped its
@@ -857,15 +867,15 @@ impl RenderingHost {
     }
 
     /// The renderer step of one frame boundary, run between the host's reload
-    /// phase and its frame phase: reload the renderer when its own sources
-    /// changed, or when its data crate just reloaded, and pause or resume
+    /// phase and its frame phase. It reloads the renderer when its own sources
+    /// changed, or when its data crate just reloaded, then pauses or resumes
     /// rendering accordingly.
     ///
-    /// Module builds are synchronous, so a data reload and the renderer rebuild
-    /// it requests complete in the same boundary: in the normal case no frame
-    /// runs between the two swaps and nothing pauses. The pause covers the
-    /// rest: a layout change whose renderer could not be rebuilt, initialized
-    /// or attached.
+    /// Module builds are synchronous, so a data reload and the renderer
+    /// rebuild it requests complete in the same boundary. In the normal case
+    /// no frame runs between the two swaps and nothing pauses. The pause covers
+    /// the rest: a layout change whose renderer could not be rebuilt,
+    /// initialized or attached.
     fn renderer_step(
         &mut self,
         data_extension: Option<&str>,
@@ -929,12 +939,12 @@ impl RenderingHost {
     /// `pill_render_data_shader_changed`, which puts the WGSL into the shader
     /// assets built from it.
     ///
-    /// The export is resolved again on every delivery, from the data module
-    /// generation current at this frame boundary, so a shader edit made while
-    /// the data crate was rebuilding lands in the generation that replaced it.
-    /// A data crate without the export (a shipping build, where the shader
-    /// reload path is compiled out) leaves the edits undelivered, with a
-    /// warning.
+    /// The export is looked up again for every delivery, in the data module
+    /// generation that is current at this frame boundary. A shader edit made
+    /// while the data crate was rebuilding therefore reaches the generation
+    /// that replaced it. A data crate without the export (a shipping build,
+    /// where this path is compiled out) leaves the edits undelivered and logs
+    /// a warning.
     fn deliver_shader_changes(&mut self, data_extension: Option<&str>) -> bool {
         let Some(watcher) = &self.shader_watcher else {
             return false;
@@ -964,7 +974,7 @@ impl RenderingHost {
             return false;
         };
         // SAFETY: the data crate exports this name with exactly
-        // `ShaderChangedFunction`'s signature, and a function pointer and a data
+        // `ShaderChangedFunction`'s signature. A function pointer and a data
         // pointer have the same size on every target this engine builds for.
         let shader_changed =
             unsafe { std::mem::transmute_copy::<*const (), ShaderChangedFunction>(&address.0) };
@@ -997,26 +1007,31 @@ impl RenderingHost {
 
     /// Warn once about each render component the attached renderer ignores.
     ///
-    /// The candidates are the shared components the renderer's data crate
-    /// registered and at least one entity carries. Shared, because render data
-    /// has to be to reach the renderer module at all - its own copy of a type
-    /// only finds the world's column through the shared identity - while a
-    /// plain component the data crate registers along the way is not render
-    /// data. A candidate missing from the renderer's
-    /// `RenderCapabilities::consumed_components` draws nothing, and a project
-    /// should hear so rather than wonder why its directional light has no
-    /// effect.
+    /// Only shared components are candidates, and only those the data crate
+    /// registered and at least one entity carries. They have to be shared:
+    /// that is how render data reaches the renderer module at all. The
+    /// module's own copy of a type finds the world's column by the shared
+    /// identity. A plain component the data crate registers along the way is
+    /// not render data.
+    ///
+    /// A candidate the renderer's `RenderCapabilities::consumed_components`
+    /// does not name draws nothing, and the project should hear that rather
+    /// than wonder why its directional light has no effect.
     fn report_unsupported_render_data(&self, data_extension: Option<&str>) {
         let Some(slot) = data_extension
             .and_then(|data| self.host.extensions.iter().find(|slot| slot.name() == data))
         else {
             return;
         };
-        let consumed = self.display.renderer().capabilities().consumed_components;
+        let consumed_component_names = self
+            .attached_renderer
+            .renderer()
+            .capabilities()
+            .consumed_components;
         let ignored = unsupported_render_components(
             self.host.engine().world(),
             slot.exposed_component_names(),
-            &consumed,
+            &consumed_component_names,
         );
         for (component, entities) in ignored {
             warn!(
@@ -1039,13 +1054,13 @@ impl RenderingHost {
         id: pill_renderer_api::SurfaceId,
         viewport: Option<RenderViewport>,
     ) {
-        self.display.set_surface_viewport(id, viewport);
+        self.attached_renderer.set_surface_viewport(id, viewport);
     }
 
-    /// Tell the host the frontend has nothing for the scene surfaces to draw:
-    /// with the project also paused and nothing reloading, the next frame
-    /// skips the render and the surfaces keep their last image. The frontend
-    /// clears the hint on anything that changes them.
+    /// Tell the host the frontend has nothing for the scene surfaces to draw.
+    /// With the project also paused and nothing reloading, the next frame skips
+    /// the render and the surfaces keep their last image. The frontend clears
+    /// the hint on anything that changes them.
     pub fn set_scene_quiet(&mut self, quiet: bool) {
         self.scene_quiet = quiet;
     }
@@ -1053,7 +1068,7 @@ impl RenderingHost {
     /// Whether the last frame drew the surfaces; the frontend clears its
     /// scene-changed flag on the frames this is true.
     pub fn scene_drawn_last_frame(&self) -> bool {
-        self.scene_drawn
+        self.scene_drawn_last_frame
     }
 
     /// Execute one ECS frame and present its resulting world to the surface.
@@ -1082,7 +1097,7 @@ impl RenderingHost {
         });
 
         // Step 2: Extension and project reloads, then the renderer step, all
-        // before any system runs: the renderer this frame draws with is built
+        // before any system runs. The renderer this frame draws with is built
         // against the data this frame holds, or rendering is paused.
         let reloaded_extensions = run_reload_phase(&mut self.host);
         let renderer_step = self.renderer_step(
@@ -1099,13 +1114,14 @@ impl RenderingHost {
 
         // Step 4: While paused the live renderer must not read the world.
         if self.paused.is_some() {
-            self.scene_drawn = false;
+            self.scene_drawn_last_frame = false;
             return Ok(());
         }
-        // Step 5: An idle editor draws nothing. When the frontend reports its
-        // scene quiet, the project's systems are paused and nothing this
-        // boundary touched the renderer, the surfaces keep their last presented
-        // image: with the world not advancing, the image cannot be stale.
+        // Step 5: An idle editor draws nothing. The surfaces keep their last
+        // presented image when three things hold: the frontend reports its
+        // scene quiet, the project's systems are paused, and nothing in this
+        // boundary touched the renderer. With the world not advancing, that
+        // image cannot be stale.
         // Anything that can change the picture - input, commands, reloads, a
         // renderer rebuild, re-cooked shaders - clears the frontend's flag or
         // is checked here.
@@ -1115,7 +1131,7 @@ impl RenderingHost {
             && matches!(renderer_step, RendererStep::Unchanged)
             && !shaders_delivered
         {
-            self.scene_drawn = false;
+            self.scene_drawn_last_frame = false;
             return Ok(());
         }
         // After the frame's systems, so entities a startup system spawns are
@@ -1127,18 +1143,18 @@ impl RenderingHost {
         }
         // Draw, then hand back the answers the GPU finished: one call, so the
         // order cannot differ between the two windowed drivers.
-        self.display
+        self.attached_renderer
             .present(self.host.runtime.engine_mut().world_mut())?;
-        self.scene_drawn = true;
+        self.scene_drawn_last_frame = true;
         Ok(())
     }
 
     /// The wrapped development host.
     ///
     /// The editor and other embedded frontends reach the engine, assets and
-    /// diagnostics through this one accessor. A passthrough per call would be
-    /// a second surface to keep in step with `DevHost`'s, and the methods it
-    /// would mirror protect no invariant - they are straight calls.
+    /// diagnostics through this one accessor. One passthrough method per call
+    /// would be a second API to keep aligned with `DevHost`'s, and the methods
+    /// it would mirror protect no invariant - they are straight calls.
     pub fn host(&self) -> &DevHost {
         &self.host
     }
@@ -1168,7 +1184,7 @@ impl FrameDriver for RenderingHost {
 #[cfg(feature = "rendering")]
 impl pill_player::WindowedFrameDriver for RenderingHost {
     fn display_mut(&mut self) -> &mut AttachedRenderer {
-        &mut self.display
+        &mut self.attached_renderer
     }
 }
 
@@ -1176,10 +1192,31 @@ impl pill_player::WindowedFrameDriver for RenderingHost {
 // Free Functions
 // =============================================================================
 
+/// Debug assertion: every entry of `subjects` names a distinct owner.
+///
+/// The subjects are the things a reload, a pause or a stale-suspension resume
+/// can retire or reach: the extensions, the pending modules, the renderer and
+/// the project. One owner shared by two of them means one of them can clear or
+/// resume the other's systems.
+#[cfg(debug_assertions)]
+fn assert_unique_owners(subjects: &[(&str, SystemOwner)]) {
+    for (index, (subject, owner)) in subjects.iter().enumerate() {
+        let shared = subjects[index + 1..]
+            .iter()
+            .find(|(_, candidate)| candidate == owner);
+        if let Some((other, _)) = shared {
+            debug_assert!(
+                false,
+                "{subject} and {other} register under the same system owner {owner}"
+            );
+        }
+    }
+}
+
 /// Import every known source under `asset_directory` through the world's
 /// import registry, writing missing metadata files, and log what it did.
 ///
-/// A failed asset is logged and skipped rather than failing the startup: the
+/// A failed asset is logged and skipped rather than failing the startup. The
 /// scan is a convenience on top of the project's own loading code, which
 /// reports its own errors for the assets it actually needs.
 fn scan_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path) {
@@ -1223,8 +1260,9 @@ fn scan_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path)
 /// Build the world's [`pill_engine::AssetDatabase`] from the project's asset
 /// directory, replacing any earlier one, and log what it indexed.
 ///
-/// A guid two files claim is logged once per file: the second file needs a
-/// guid of its own, which is what a `.meta` copied with its source lacks.
+/// A guid two files claim is logged once per file. The second file needs a
+/// guid of its own, which a `.meta` copied along with its source does not
+/// have.
 fn index_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path) {
     let world = engine.world_mut();
     let registry = world
@@ -1254,7 +1292,7 @@ fn index_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path
 /// Report a setup failure and hand the error back to the caller.
 ///
 /// The host state built so far unwinds as soon as the error is returned, and
-/// what it owns is loaded module images: dropping one unmaps code the engine
+/// what it owns is loaded module images. Dropping one unmaps code the engine
 /// may still be running, and a fault in that unmap would destroy the only copy
 /// of this error. Reporting first is what keeps the failure legible when the
 /// unload then crashes.
@@ -1269,28 +1307,27 @@ fn report_setup_failure(error: HostError) -> HostError {
     error
 }
 
-/// Report a setup failure and tear the half-built host down world-first.
+/// Report a setup failure, then tear the half-built host down world-first.
 ///
-/// Locals unwind in reverse declaration order, which here means the loaded
-/// module images unmap while the world is still alive - and a resource a module
-/// inserted stores its drop function in that module's image, so the world's own
-/// teardown is what calls it. An unmapped call is an access violation, which is
-/// why a failed startup could end in a crash after printing the reason.
+/// Locals drop in reverse declaration order, so the loaded module images would
+/// unmap while the world is still alive. A resource a module inserted keeps its
+/// drop function in that module's image, so the world's teardown would call
+/// into unmapped code. That is an access violation, and it can crash a failed
+/// startup after it has already printed the reason.
 ///
-/// Dropping the world first makes every one of those drops happen while the
-/// images are still mapped; the slots then unmap with nothing pointing into
-/// them. The error is reported before either drop, so it survives whatever the
-/// teardown does.
+/// Dropping the world first runs those drops while the images are still
+/// mapped; the slots then unmap with nothing pointing into them. The error is
+/// reported before either drop, so it survives whatever the teardown does.
 fn fail_setup(runtime: Runtime, error: HostError) -> HostError {
     let reported = report_setup_failure(error);
     drop(runtime);
     reported
 }
 
-/// The text a tolerated first-load failure reports to the notice queue: the
-/// captured compiler output when the build itself failed (the editor's
-/// Problems rows parse `file:line` out of it), the error's own words
-/// otherwise.
+/// The text a tolerated first-load failure reports to the notice queue. It is
+/// the captured compiler output when the build itself failed, and the editor's
+/// Problems rows read `file:line` locations from it. Otherwise it is the
+/// error's own words.
 fn optional_failure_output(error: &HostError) -> String {
     match error {
         HostError::Build(_) => crate::build_runner::recent_build_output(),
@@ -1316,28 +1353,27 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
             "the project's logging settings were not applied: {error}"
         );
     }
-    let module_config = host_config.project;
-    module_config.validate()?;
+    let project_module_config = host_config.project;
+    project_module_config.validate()?;
     for module in &host_config.extensions {
         module.validate()?;
     }
 
-    // Step 2: Prepare the workspace: its root, the sweep of whatever an
-    // earlier run left behind, the engine, and the build of every native
-    // module.
+    // Step 2: Prepare the workspace. Find its root, delete what an earlier run
+    // left behind, create the engine, and build every native module.
     //
     // The engine owns this root (see [`crate::config::engine_workspace_root`]),
     // so it does not depend on the directory the process was launched from.
     let workspace_root = crate::config::engine_workspace_root()?;
 
-    print_startup_configuration(&workspace_root, &module_config);
+    print_startup_configuration(&workspace_root, &project_module_config);
 
-    // Sweep the staging an earlier run left, whatever backend this is.
+    // Delete what an earlier run staged, whichever backend this is.
     //
-    // The staging directory holds loaded module copies, the engine dylibs
-    // staged beside them, and the hot-patch scratch images - none of it any
-    // build's to keep. A C# host stages native copies for its extensions too,
-    // so the sweep cannot depend on the project's backend.
+    // The staging directory holds copies of loaded modules, the engine
+    // libraries staged beside them, and the hot-patch scratch images. None of
+    // it belongs to the build starting now. A C# host stages native copies
+    // for its extensions too, so the sweep cannot depend on the backend.
     cleanup_temporary_files(&workspace_root);
 
     // Construct the engine and its stable API table.
@@ -1345,8 +1381,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     // address does not change when the runtime moves.
     let mut runtime = Runtime::new();
     runtime.engine_mut().set_parallel_execution(true);
-    // The settings' startup scene is queued here, before any artifact loads:
-    // the project's entry point takes it between component registration and
+    // The settings' startup scene is queued here, before any artifact loads.
+    // The project's entry point takes it between component registration and
     // its own `init`, so a project that seeds its world finds the scene
     // already in it instead of duplicating it.
     if let Some(startup_scene) = host_config.startup_scene.as_deref() {
@@ -1359,7 +1395,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
 
     // Announce every module this start builds, in build order: the
     // extensions, the project, and - in a windowed host - the renderer's GPU
-    // module, which is built once the window opens.
+    // module, which loads once the window opens.
     let mut planned_builds: Vec<crate::build_progress::PlannedBuild> = host_config
         .extensions
         .iter()
@@ -1369,7 +1405,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         })
         .collect();
     planned_builds.push(crate::build_progress::PlannedBuild {
-        module: module_config.name.clone(),
+        module: project_module_config.name.clone(),
         kind: "project",
     });
     if cfg!(feature = "rendering") {
@@ -1382,18 +1418,17 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     }
     crate::build_progress::announce_plan(&host_config.name, planned_builds);
 
-    // Build every native module in ONE cargo invocation: the extensions, the
-    // project's member and - in a windowed host - the renderer's wrapper,
-    // which is an ordinary wrapper build whose load waits for the window.
-    // Each module built on its own otherwise pays cargo's fixed
-    // process-and-resolve cost again, so a start would scale linearly in cargo
-    // invocations; the batch shares it. Modules whose artifacts the batch
-    // validated skip their own build when they load below (Step 3) - an edit
-    // later still rebuilds a module on its own.
+    // Build every native module in one cargo invocation: the extensions, the
+    // project, and in a windowed host the renderer's wrapper, an ordinary
+    // wrapper build whose load waits for the window. Built one at a time, each
+    // module would pay cargo's start-up and dependency resolution again, so
+    // startup time would grow with the number of modules. A module the batch
+    // built skips its own build when it loads below (Step 3); a later edit
+    // still rebuilds it alone.
     crate::build_runner::build_extension_batch(
         &workspace_root,
         &host_config.extensions,
-        Some(&module_config),
+        Some(&project_module_config),
         if cfg!(feature = "rendering") {
             host_config.renderer.as_deref()
         } else {
@@ -1402,55 +1437,56 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     );
 
     // Step 3: Build, load and watch the extensions before the project.
-    // Modules are infrastructure: loading them first means the project can rely
-    // on whatever they register. The renderer's data crate, when the project
-    // selects a renderer, is the first of them (see `HostConfig::renderer`), so
-    // extensions and the project find its components registered and the C#
-    // bridge binds them like any extension's, headless included. Each gets its
-    // own owner tag and its own generation counter, so later reloads stay
-    // isolated from each other.
+    // They are infrastructure, so loading them first lets the project rely on
+    // whatever they register. When the project selects a renderer, its data
+    // crate is the first extension (see `HostConfig::renderer`). The project
+    // and the other extensions then find its components registered, and the C#
+    // bridge binds them like any extension's, headless included.
+    //
+    // Each module gets its own owner tag and its own generation counter, which
+    // is what keeps later reloads from affecting each other.
     let mut extensions = Vec::with_capacity(host_config.extensions.len());
     let mut pending_modules: Vec<PendingModule> = Vec::new();
     // One patch session per LOADED extension, index-aligned with
-    // `extensions` (the frame's fast path walks the two together); a module
-    // whose first load failed - or waits for a retry - has none until it
-    // loads.
+    // `extensions`, because the frame's fast path reads both lists by the same
+    // index. A module whose first load failed - or waits for a retry - has
+    // none until it loads.
     #[cfg(feature = "hot_patch")]
     let mut module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>> = Vec::new();
-    for (index, module_config) in host_config.extensions.iter().enumerate() {
+    for (index, extension_config) in host_config.extensions.iter().enumerate() {
         let module_generation = Arc::new(AtomicU64::new(0));
         let slot = match ExtensionSlot::start(
             runtime.engine_mut(),
             &engine_api,
             &workspace_root,
-            module_config,
+            extension_config,
             extension_owner(index),
             Arc::clone(&module_generation),
             crate::reload::FirstLoadFailure::ClearWorld,
         ) {
             Ok(slot) => slot,
             Err(error) => {
-                // An editor-only module the embedder asked to tolerate:
-                // report the failure the way a failed reload does and carry
-                // on; the editor's safe mode owns what happens next, and
+                // An editor-only module the embedder asked to tolerate. Report
+                // the failure the way a failed reload does and carry on: the
+                // editor's safe mode owns what happens next, and
                 // `DevHost::retry_extension` can build it again later.
                 if host_config
                     .first_load_optional
                     .iter()
-                    .any(|name| name == &module_config.name)
+                    .any(|name| name == &extension_config.name)
                 {
                     warn!(
                         target: telemetry_target::HOT_RELOAD,
-                        module = module_config.name.as_str(),
+                        module = extension_config.name.as_str(),
                         error = %error,
                         "optional module failed to load; the host continues without it"
                     );
                     notices::push(HostNotice::ModuleFailed {
-                        module: module_config.name.clone(),
+                        module: extension_config.name.clone(),
                         output: optional_failure_output(&error),
                     });
                     pending_modules.push(PendingModule {
-                        config: module_config.clone(),
+                        config: extension_config.clone(),
                         owner: extension_owner(index),
                         source_edit_generation: module_generation,
                     });
@@ -1461,8 +1497,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         };
         if let Err(error) = spawn_source_watcher(
             workspace_root.clone(),
-            &module_config.name,
-            &module_config.watch_directory,
+            &extension_config.name,
+            &extension_config.watch_directory,
             module_generation,
             None,
         ) {
@@ -1472,38 +1508,40 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         #[cfg(feature = "hot_patch")]
         module_hot_patch.push(crate::hot_patch::HotPatchSession::new(
             &workspace_root,
-            &module_config.name,
-            &module_config.watch_directory,
-            &module_config.output_subdirectory,
-            &module_config.build_command,
+            &extension_config.name,
+            &extension_config.watch_directory,
+            &extension_config.output_subdirectory,
+            &extension_config.build_command,
         ));
     }
-    // Every extension has declared the read-only roots it ships by now; check
-    // them outside the module-init `catch_unwind`, so a resource that went
-    // missing stops the host with the module and the path in the message
-    // instead of leaving a scene that quietly draws nothing.
+    // By now every extension has declared the read-only resource folders it
+    // ships. Check them here, not inside the module initialization, which runs
+    // under `catch_unwind`. A file that went missing then stops the host and
+    // names the module and the path, instead of leaving a scene that draws
+    // nothing and says nothing.
     pill_engine::asset_store::verify_module_roots();
-    // Step 4: Build and load the project module, then start its source
-    // watcher. Extensions load first, so the C# backend can be handed every
-    // native component the modules exposed to managed code: each module's
-    // registered type names resolve to its native components, and the
-    // C#-facing name is the Rust path with `::` replaced by `.` so a
-    // `project_cs` mirror struct reproduces the same stable identity.
-    // The generated C# mirror files must exist before the project build
-    // compiles `project_cs`, so write them here (managed backend only), one
-    // per extension that exposes components, derived from each module's
-    // real registered layout. Nothing is hand-written in the project.
+
+    // Step 4: Build and load the project module, then watch its sources.
+    // Extensions load first so the C# backend can be handed their native
+    // components. A module's registered type names become C# names by
+    // replacing `::` with `.`. That is the same stable identity a mirror
+    // struct in `project_cs` uses.
+    //
+    // Those mirror files have to exist before the project build compiles
+    // `project_cs`. Write them here, managed backend only, one per extension
+    // that exposes components. They come from each module's real registered
+    // layout; nothing in the project is written manually.
     let mut module_exposed_components: Vec<ModuleExposedComponent> = Vec::new();
     let mut all_mirror_methods: Vec<crate::csharp::ResolvedMirrorMethod> = Vec::new();
     // Which module's file carries which component, decided once over the whole
     // load order: a shared component appears in every linking module's log.
     let mirror_ownership = module_mirror_ownership(runtime.engine(), &extensions);
-    if let ProjectModuleBackend::CSharp(_) = &module_config.backend {
+    if let ProjectModuleBackend::CSharp(_) = &project_module_config.backend {
         for (index, slot) in extensions.iter().enumerate() {
             // Regenerate the module's C# mirror from its current generation.
-            // The returned change flag is ignored at startup (the mirror is
-            // always written before the project compiles); the reload path
-            // uses it to decide whether to queue a C# project rebuild.
+            // The returned change flag is ignored at startup, because the
+            // mirror is always written before the project compiles. The reload
+            // path uses it to decide whether to queue a C# project rebuild.
             let (exposed, methods, accessors, _changed) = regenerate_module_csharp_mirror(
                 &workspace_root,
                 slot,
@@ -1511,9 +1549,9 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
             )?;
             module_exposed_components.extend(exposed);
             all_mirror_methods.extend(methods);
-            // Container accessors ride the mirror-method table, so the managed
-            // runtime resolves them through the same lookup and the same
-            // per-reload refresh as value-type methods.
+            // Container accessors are appended to the mirror-method table, so
+            // the managed runtime resolves them through the same lookup and the
+            // same per-reload refresh as value-type methods.
             all_mirror_methods.extend(crate::csharp::accessor_rows(&accessors));
         }
     }
@@ -1521,7 +1559,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         runtime.engine_mut(),
         &engine_api,
         &workspace_root,
-        &module_config,
+        &project_module_config,
         &module_exposed_components,
         &all_mirror_methods,
     ) {
@@ -1530,13 +1568,13 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     };
 
     let source_edit_generation = Arc::new(AtomicU64::new(0));
-    let source_triggers = Arc::new(crate::watcher::TriggerLog::new());
+    let source_trigger_log = Arc::new(crate::watcher::TriggerLog::new());
     if let Err(error) = spawn_source_watcher(
         workspace_root.clone(),
-        &module_config.name,
-        &module_config.watch_directory,
+        &project_module_config.name,
+        &project_module_config.watch_directory,
         Arc::clone(&source_edit_generation),
-        Some(Arc::clone(&source_triggers)),
+        Some(Arc::clone(&source_trigger_log)),
     ) {
         return Err(fail_setup(runtime, error.into()));
     }
@@ -1565,7 +1603,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     info!(
         target: telemetry_target::ENGINE,
         "Entering project loop. Edit {}/**/* to hot-reload",
-        module_config.watch_directory
+        project_module_config.watch_directory
     );
 
     // Say how to drive rollback, once, next to where the fast path announces
@@ -1583,15 +1621,15 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     #[cfg(feature = "hot_patch")]
     let hot_patch = crate::hot_patch::HotPatchSession::new(
         &workspace_root,
-        &module_config.name,
-        &module_config.watch_directory,
+        &project_module_config.name,
+        &project_module_config.watch_directory,
         crate::build_runner::PROJECT_HOT_OUTPUT_SUBDIRECTORY,
-        &module_config.build_command,
+        &project_module_config.build_command,
     );
 
     // The per-extension fast path's sessions were built with the slots they
-    // mirror (see the load loop): the fast path reads `module_hot_patch`
-    // beside `extensions`, so the two stay index-aligned.
+    // mirror (see the load loop). The fast path reads `module_hot_patch` beside
+    // `extensions`, so the two stay index-aligned.
 
     // The project's asset directory is mounted before anything reads
     // through it: relative asset paths resolve below it first, and the
@@ -1603,7 +1641,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     }
     let host = DevHost {
         workspace_root,
-        module_config,
+        project_module_config,
         #[cfg(feature = "rendering")]
         renderer: host_config.renderer.clone(),
         runtime,
@@ -1615,7 +1653,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         last_processed_source_edit: 0,
         queued_reload_generation: 0,
         last_processed_queued_reload: 0,
-        source_triggers,
+        source_trigger_log,
         stale_suspended_owners: Vec::new(),
         #[cfg(feature = "hot_patch")]
         hot_patch,
@@ -1663,11 +1701,12 @@ where
 
 /// Whether rendering should be paused after one frame boundary.
 ///
-/// `paused` is the state before it; `data_layout_changed` says whether the
+/// `paused` is the state before it. `data_layout_changed` says whether the
 /// renderer's data crate reloaded this boundary with a different component
-/// layout; `step` is what the renderer step did. A renderer that attached
-/// successfully always resumes; a layout change without one pauses; anything
-/// else keeps the current state.
+/// layout. `step` is what the renderer step did.
+///
+/// A renderer that attached successfully always resumes. A layout change
+/// without one pauses, and anything else keeps the current state.
 #[cfg(feature = "rendering")]
 fn pause_after_boundary(
     paused: Option<PauseReason>,
@@ -1686,9 +1725,9 @@ fn pause_after_boundary(
 /// The structural hash of every component the named extension registered,
 /// by component name, or empty when no such extension is loaded.
 ///
-/// Taken before and after a reload of the renderer's data crate, to tell a
-/// layout change (the renderer must not read the rows until it is rebuilt)
-/// from a body-only one (it may).
+/// Taken before and after a reload of the renderer's data crate. It tells a
+/// layout change, where the renderer must not read the rows until it is
+/// rebuilt, from a body-only one, where it may.
 #[cfg(feature = "rendering")]
 fn component_schemas_of(host: &DevHost, extension: &str) -> Vec<(String, Option<u64>)> {
     let Some(slot) = host.extensions.iter().find(|slot| slot.name() == extension) else {
@@ -1714,24 +1753,25 @@ fn component_schemas_of(host: &DevHost, extension: &str) -> Vec<(String, Option<
     schemas
 }
 
-/// The shared components among `registered` that at least one entity in
-/// `world` carries and `consumed` does not name, each with its entity count,
-/// sorted by name and listed once.
+/// The components of `world` that at least one entity carries, that
+/// `registered_component_names` lists, and that `consumed_component_names` does
+/// not name. Each comes with its entity count, sorted by name and listed
+/// once.
 ///
 /// See [`RenderingHost::report_unsupported_render_data`] for why only shared
 /// components are candidates.
 #[cfg(feature = "rendering")]
 fn unsupported_render_components(
     world: &pill_engine::World,
-    registered: &[String],
-    consumed: &[String],
+    registered_component_names: &[String],
+    consumed_component_names: &[String],
 ) -> Vec<(String, usize)> {
-    let mut names: Vec<&String> = registered.iter().collect();
+    let mut names: Vec<&String> = registered_component_names.iter().collect();
     names.sort();
     names.dedup();
     names
         .into_iter()
-        .filter(|name| !consumed.contains(name))
+        .filter(|name| !consumed_component_names.contains(name))
         .filter_map(|name| {
             let component = world
                 .resolve_component_id_by_name_any(name)
@@ -1759,9 +1799,9 @@ fn start_shader_watcher(host: &DevHost) -> Option<crate::shader_watcher::ShaderW
         crate::config::RENDERER_DATA_SUFFIX
     );
     let slot = host.extensions.iter().find(|slot| slot.name() == data)?;
-    // The tree the data crate cooks from, at its crate root: the build script
-    // and the watcher have to name the same directory, or a shader edit lands
-    // where nothing is watching.
+    // The tree the data crate cooks from, at its crate root. The build script
+    // and the watcher have to name the same directory, or a shader edit
+    // changes a file that nothing rebuilds.
     let shaders_directory = host
         .workspace_root
         .join(slot.crate_directory())
@@ -1785,12 +1825,14 @@ type RendererModule = crate::renderer_module::RendererModule;
 
 /// Load the renderer module and attach it to `window`.
 ///
-/// The module registers under the engine's reserved renderer owner, so its
-/// `rendering` system is cleared and re-registered with it rather than living
-/// forever under the engine's owner, and no extension it shares a host with can
-/// alias it. A renderer that did not load, or loaded but could not attach,
-/// leaves the window blank rather than ending the host: the scene keeps running,
-/// and the next renderer edit loads and attaches again.
+/// The module registers under the engine's reserved renderer owner. Its
+/// `rendering` system is then cleared and registered again with the module
+/// instead of living forever under the engine's owner. No extension in the
+/// same host can share that owner.
+///
+/// A renderer that did not load, or loaded but could not attach, leaves the
+/// window blank instead of ending the host. The scene keeps running, and the
+/// next renderer edit loads and attaches again.
 ///
 /// # Errors
 ///
@@ -1810,15 +1852,16 @@ fn attach_renderer_module<W: RendererWindow>(
         &host.workspace_root,
         pill_player::registration::renderer_owner(),
     )?;
-    // The renderer is one more subject: its owner must be outside every
-    // extension's, including the ones a failed first load still holds in reserve.
+    // The renderer is one more subject. Its owner must be outside every
+    // extension's, including the ones a failed first load still holds in
+    // reserve.
     #[cfg(debug_assertions)]
     {
         let mut subjects = host.subject_owners();
         subjects.push(("the renderer", renderer_module.owner()));
         assert_unique_owners(&subjects);
     }
-    let display = AttachedRenderer::attach(window, width, height, |window_data| {
+    let attached_renderer = AttachedRenderer::attach(window, width, height, |window_data| {
         if renderer_module.slot().is_none() {
             // Already logged by the failed load.
             return Ok(Box::new(pill_renderer_api::HeadlessRenderer));
@@ -1835,7 +1878,7 @@ fn attach_renderer_module<W: RendererWindow>(
             ),
         )
     })?;
-    Ok((renderer_module, display))
+    Ok((renderer_module, attached_renderer))
 }
 
 /// Build a backend on `window_data` from the loaded renderer module.
@@ -1851,9 +1894,9 @@ fn attach_backend(
     height: u32,
 ) -> Result<Box<dyn PillRenderer>, RendererError> {
     // SAFETY: every caller stores the backend in the `AttachedRenderer` of a
-    // `RenderingHost`, which drops the backend before its window, and whose
-    // `display` field is declared before `renderer_module`: the backend drops
-    // while the window is alive and the module is mapped.
+    // `RenderingHost`, which drops the backend before its window. Its
+    // `attached_renderer` field is declared before `renderer_module`, so the
+    // backend drops while the window is alive and the module is mapped.
     unsafe {
         crate::renderer_module::attach_module_renderer(renderer_module, window_data, width, height)
     }
@@ -1863,9 +1906,8 @@ fn attach_backend(
 /// engine renderer to a supplied native window.
 ///
 /// Frontends that must finish project setup (building and loading the project
-/// module) before any window exists - for example the standalone runner - call
-/// [`setup`] first and this function once a window is available, so a slow
-/// first build never shows a blank surface.
+/// module) before any window exists call this after [`setup`], so a slow first
+/// build never shows a blank surface. The standalone runner is one.
 ///
 /// # Errors
 ///
@@ -1888,31 +1930,37 @@ where
         height,
         "attaching the engine renderer to the window surface"
     );
-    let (renderer_module, display) = attach_renderer_module(&mut host, window, width, height)?;
+    let (renderer_module, attached_renderer) =
+        attach_renderer_module(&mut host, window, width, height)?;
     let shader_watcher = start_shader_watcher(&host);
     Ok(RenderingHost {
         host,
-        display,
+        attached_renderer,
         renderer_module,
         paused: None,
         scene_quiet: false,
-        scene_drawn: true,
+        scene_drawn_last_frame: true,
         shader_watcher,
         unsupported_data_check_pending: true,
     })
 }
 
-/// Drop every recorded prologue address, because an image was just replaced.
+/// Forget the patch records a replaced image invalidated: the saved prologue
+/// bytes and every active generation.
 ///
-/// A prologue patch overwrote bytes inside a loaded artifact. When that artifact
-/// is replaced, the recorded addresses point into an image the graveyard will
-/// unmap, and writing saved bytes back to one is a write into retired, possibly
-/// re-used memory rather than a rollback.
+/// A prologue patch overwrote bytes inside a loaded artifact. Once that
+/// artifact is replaced, the recorded addresses point into an image the
+/// graveyard will unmap. Writing saved bytes back to one is then a write into
+/// freed, possibly reused memory, not a rollback.
 ///
-/// Every session is cleared, not only the one whose artifact reloaded: patches
-/// fan out across every loaded artifact, so a module's records include addresses
-/// inside the project image and cannot be cleared selectively. A partial restore
-/// would leave two copies of one function disagreeing. Idempotent.
+/// Every session is cleared, not only the one whose artifact reloaded. Patches
+/// fan out across every loaded artifact, so a module's records include
+/// addresses inside the project image and cannot be cleared one at a time. A
+/// partial restore would leave two copies of one function disagreeing.
+///
+/// The active generation of every function goes too. The rebuilt artifact
+/// ships its own body, and an entry left behind would name a generation that
+/// is not running. Calling it twice is safe.
 #[cfg(feature = "hot_patch")]
 fn forget_prologue_records(host: &mut DevHost) {
     if let Some(session) = host.hot_patch.as_mut() {
@@ -1955,18 +2003,18 @@ enum PatchSubject {
 ///
 /// The build compiles and maps the patch; installing it stays on the frame
 /// thread, which is what [`advance_patch_attempt`] does when the report
-/// arrives. The thread is joined on collection, on teardown, and nowhere
-/// else - a build that outlived its host would be a thread parked in code
-/// that is about to be unloaded.
+/// arrives. The thread is joined on collection, on teardown, and nowhere else -
+/// a build that outlived its host would be a thread still running code that is
+/// about to be unloaded.
 #[cfg(feature = "hot_patch")]
 struct InFlightPatch {
     /// Which session the build is for, and who consumes its pending
     /// generation once the patch is live.
     subject: PatchSubject,
     /// The generation counter captured when the build started. A save that
-    /// lands while it compiles advances the counter past this value and must
+    /// arrives while it compiles advances the counter past this value and must
     /// stay pending.
-    pending: u64,
+    pending_generation: u64,
     /// The build's report, once it has one.
     receiver: mpsc::Receiver<(
         crate::hot_patch::PatchAttempt,
@@ -1988,13 +2036,13 @@ impl Drop for InFlightPatch {
 /// Start a patch build on its own thread.
 ///
 /// The attempt travels through its own channel rather than the closure's
-/// capture, so a thread that cannot start leaves it here to build inline
-/// instead of losing it with the closure.
+/// capture. A thread that cannot start therefore leaves it here to build
+/// inline, instead of losing it with the closure.
 #[cfg(feature = "hot_patch")]
 fn start_patch_build(
     attempt: crate::hot_patch::PatchAttempt,
     subject: PatchSubject,
-    pending: u64,
+    pending_generation: u64,
 ) -> InFlightPatch {
     let (report_sender, receiver) = mpsc::channel();
     let fallback_sender = report_sender.clone();
@@ -2016,19 +2064,19 @@ fn start_patch_build(
             let _ = job_sender.send(attempt);
             InFlightPatch {
                 subject,
-                pending,
+                pending_generation,
                 receiver,
                 thread: Some(thread),
             }
         }
         Err(_) => {
-            // Building on this thread blocks the frame the way the old
-            // pipeline did, which is the safe direction for a spawn failure.
+            // Building on this thread blocks the frame, which is the safe
+            // direction for a spawn failure.
             let report = crate::hot_patch::build_attempt(attempt);
             let _ = fallback_sender.send(report);
             InFlightPatch {
                 subject,
-                pending,
+                pending_generation,
                 receiver,
                 thread: None,
             }
@@ -2038,19 +2086,19 @@ fn start_patch_build(
 
 /// Collect a finished patch build and install it at this frame boundary.
 ///
-/// Activation happens here rather than on the worker because a dispatch slot
-/// write belongs to the thread that owns the frame boundary; the worker only
-/// compiled and mapped the image. While the build runs nothing is consumed, so
-/// the pending generation keeps the reload the frame loop owes it.
+/// Activation happens here rather than on the worker, because a dispatch slot
+/// write belongs to the thread that owns the frame boundary. The worker only
+/// compiled and mapped the image. While the build runs, nothing marks the edit
+/// handled, so the frame loop still owes it a reload.
 ///
-/// Returns `true` when this frame must not start another attempt: a build that
+/// Returns `true` when this frame must not start another attempt. A build that
 /// came back without installing its patch leaves the edit for the reload path
 /// below, and without that a patch that cannot compile is retried forever. A
 /// collected success returns `false`, because a save that arrived while the
 /// build ran is a fresh edit the fast path may handle immediately.
 ///
 /// The second element is the attempt's own start, so this frame's analytics
-/// total can span the build; `None` when nothing was collected.
+/// total can span the build. It is `None` when nothing was collected.
 #[cfg(feature = "hot_patch")]
 fn advance_patch_attempt(host: &mut DevHost) -> (bool, Option<Instant>) {
     let Some(mut in_flight) = host.patch_attempt.take() else {
@@ -2064,10 +2112,10 @@ fn advance_patch_attempt(host: &mut DevHost) -> (bool, Option<Instant>) {
             return (false, None);
         }
         Err(mpsc::TryRecvError::Disconnected) => {
-            // The worker died without a report. Nothing is consumed, so the
-            // frame loop falls back to the reload path - the same place a
-            // refusal would have led - and it must not be raced by a fresh
-            // attempt this frame.
+            // The worker died without a report. Nothing has marked the edit
+            // handled, so the frame loop falls back to the reload path, where
+            // a refusal would have led. A fresh attempt must not race it this
+            // frame.
             warn!(
                 target: telemetry_target::HOT_RELOAD,
                 "the patch build stopped unexpectedly; falling back to a reload"
@@ -2116,18 +2164,18 @@ fn advance_patch_attempt(host: &mut DevHost) -> (bool, Option<Instant>) {
         patched = report_patch_outcome(outcome);
         if patched {
             // The generation this build was started for is handled now; a
-            // save that arrived while it compiled bumped the counter past it
+            // save that arrived while it compiled advanced the counter past it
             // and stays pending.
             if let PatchSubject::Module(index) = in_flight.subject {
                 if let Some(slot) = extensions.get_mut(index) {
-                    slot.consume_pending_reload(in_flight.pending);
+                    slot.consume_pending_reload(in_flight.pending_generation);
                 }
             }
         }
     }
     if patched {
         if matches!(in_flight.subject, PatchSubject::Project) {
-            host.last_processed_source_edit = in_flight.pending;
+            host.last_processed_source_edit = in_flight.pending_generation;
         }
         // A patch replaced live code; the editor must refresh its metadata.
         host.bump_editor_revision();
@@ -2182,10 +2230,10 @@ fn try_module_fast_path(host: &mut DevHost, may_start: bool) {
     } = &mut *host;
 
     for index in 0..module_hot_patch.len() {
-        // Captured before the attempt begins: a save that lands while it
+        // Captured before the attempt begins. A save that arrives while it
         // compiles advances the counter past this value and must stay
         // pending, because nothing has delivered it.
-        let Some(pending) = extensions[index].pending_reload_generation() else {
+        let Some(pending_generation) = extensions[index].pending_reload_generation() else {
             continue;
         };
         let Some(session) = module_hot_patch[index].as_mut() else {
@@ -2208,13 +2256,13 @@ fn try_module_fast_path(host: &mut DevHost, may_start: bool) {
                 });
             }
             BeginOutcome::Ready(attempt) => {
-                // The build runs on its own thread; the pending generation is
-                // consumed only once its replacement is installed, and every
-                // reload step waits for that outcome.
+                // The build runs on its own thread; the pending generation
+                // counts as handled only once its replacement is installed,
+                // and every reload step waits for that outcome.
                 *patch_attempt = Some(start_patch_build(
                     attempt,
                     PatchSubject::Module(index),
-                    pending,
+                    pending_generation,
                 ));
                 break;
             }
@@ -2228,19 +2276,19 @@ fn try_module_fast_path(_host: &mut DevHost, _may_start: bool) {}
 
 /// Try to deliver a pending project edit by patching, not rebuilding.
 ///
-/// This runs at a frame boundary: reloads are already processed here, before
+/// This runs at a frame boundary. Reloads are already processed here, before
 /// `process_frame`, so no system is executing while a dispatch slot is written.
-/// A successful patch consumes the pending generation, which is what skips the
-/// full rebuild; anything refused falls through to it.
+/// A successful patch marks the pending generation handled, which is what skips
+/// the full rebuild. Anything refused falls through to it.
 #[cfg(feature = "hot_patch")]
 fn try_project_fast_path(host: &mut DevHost, may_start: bool) {
-    // As in the module path: a frame that just collected a failed build lets
+    // As in the module path, a frame that just collected a failed build lets
     // the reload below deliver the edit instead of racing it.
     if !may_start || host.patch_attempt.is_some() {
         return;
     }
-    let pending = host.source_edit_generation.load(Ordering::Acquire);
-    if pending == host.last_processed_source_edit {
+    let pending_generation = host.source_edit_generation.load(Ordering::Acquire);
+    if pending_generation == host.last_processed_source_edit {
         return;
     }
 
@@ -2270,9 +2318,14 @@ fn try_project_fast_path(host: &mut DevHost, may_start: bool) {
             });
         }
         BeginOutcome::Ready(attempt) => {
-            // The edit is consumed only once the replacement is installed;
-            // that is what lets a save landing mid-build stay pending.
-            *patch_attempt = Some(start_patch_build(attempt, PatchSubject::Project, pending));
+            // The edit counts as handled only once the replacement is
+            // installed; that is what lets a save landing mid-build stay
+            // pending.
+            *patch_attempt = Some(start_patch_build(
+                attempt,
+                PatchSubject::Project,
+                pending_generation,
+            ));
         }
     }
 }
@@ -2281,26 +2334,33 @@ fn try_project_fast_path(host: &mut DevHost, may_start: bool) {
 #[cfg(not(feature = "hot_patch"))]
 fn try_project_fast_path(_host: &mut DevHost, _may_start: bool) {}
 
-/// Re-sync the patch baselines of every subject a reload has just rebuilt.
+/// Take a new baseline snapshot for every subject a reload has just rebuilt.
 ///
-/// `classify` decides "body-only" by diffing the file against a snapshot of
-/// what is running, and that snapshot only advances when a patch succeeds. A
-/// reload advances what is running without touching it, so an edit the fast
-/// path refused stays in the diff forever: the next edit is compared against a
-/// baseline two edits stale, reports a change outside a hot function body, and
-/// is refused - which reads as "live patching stopped working".
+/// The fast path decides whether an edit is "body-only" by comparing the file
+/// with a snapshot of the code that is running. That snapshot normally moves
+/// only when a patch is installed. A reload replaces the running code without
+/// touching the snapshot, so an edit the fast path refused would stay in the
+/// diff.
 ///
-/// Called after the reload, so a save that lands during the build is not folded
-/// into the baseline: it has advanced the generation counter, and the next
-/// frame gives it its own reload.
+/// Each later edit would then be compared against a baseline two edits old,
+/// and a change outside a hot function body would be refused again. That reads
+/// as "live patching stopped working".
+///
+/// Call this after the reload, so a save that arrives during the build is not
+/// folded into the baseline. That save has already increased the generation
+/// counter, and the next frame gives it its own reload.
 #[cfg(feature = "hot_patch")]
-fn resync_patch_baselines(host: &mut DevHost, project: bool, modules: &[usize]) {
-    if project {
+fn resync_patch_baselines(
+    host: &mut DevHost,
+    project_rebuilt: bool,
+    reloaded_module_indices: &[usize],
+) {
+    if project_rebuilt {
         if let Some(session) = host.hot_patch.as_mut() {
             session.refresh_snapshots();
         }
     }
-    for index in modules {
+    for index in reloaded_module_indices {
         if let Some(Some(session)) = host.module_hot_patch.get_mut(*index) {
             session.refresh_snapshots();
         }
@@ -2309,11 +2369,16 @@ fn resync_patch_baselines(host: &mut DevHost, project: bool, modules: &[usize]) 
 
 /// See the `hot_patch` version above; without the feature there is no baseline.
 #[cfg(not(feature = "hot_patch"))]
-fn resync_patch_baselines(_host: &mut DevHost, _project: bool, _modules: &[usize]) {}
+fn resync_patch_baselines(
+    _host: &mut DevHost,
+    _project_rebuilt: bool,
+    _reloaded_module_indices: &[usize],
+) {
+}
 
-/// What `regenerate_module_csharp_mirror` hands back: the exposed component
-/// bindings, the resolved mirror methods and heap-field accessors for the
-/// managed method table, and whether the mirror file on disk changed.
+/// What `regenerate_module_csharp_mirror` hands back. It carries the exposed
+/// component bindings, the resolved mirror methods and heap-field accessors
+/// for the managed method table, and whether the mirror file on disk changed.
 type RegeneratedMirror = (
     Vec<ModuleExposedComponent>,
     Vec<crate::csharp::ResolvedMirrorMethod>,
@@ -2321,16 +2386,14 @@ type RegeneratedMirror = (
     bool,
 );
 
-/// Compute the C#-exposed bindings for one extension's current
-/// generation and regenerate its `generated/<module>_Components.g.cs` mirror
-/// file from that generation's real registry, value types, and mirrored
-/// methods.
+/// Rewrite one extension's `generated/<module>_Components.g.cs` mirror file
+/// from the generation loaded right now.
 ///
-/// Returns the exposed component bindings (for the C# backend's native
-/// bindings), the resolved mirror methods and container accessors (for the
-/// managed method table), and whether the mirror file on disk actually
-/// changed. The change flag lets the reload path queue a C# project rebuild
-/// only when the C# surface moved.
+/// Returns what it was built from: the exposed component bindings for the C#
+/// backend, the resolved mirror methods, and the heap-field accessors the
+/// managed method table uses. It also reports whether the file on disk
+/// changed; the reload path uses that to queue a C# project rebuild only when
+/// what C# can see has moved.
 ///
 /// # Errors
 ///
@@ -2339,31 +2402,32 @@ type RegeneratedMirror = (
 fn regenerate_module_csharp_mirror(
     workspace_root: &Path,
     slot: &ExtensionSlot,
-    exposed: Vec<ModuleExposedComponent>,
+    exposed_components: Vec<ModuleExposedComponent>,
 ) -> Result<RegeneratedMirror, CSharpError> {
     let methods = slot.mirror_methods();
     let accessors = slot.field_accessors();
     let changed = crate::csharp::generate_module_components_csharp(
         workspace_root,
         slot.name(),
-        &exposed,
+        &exposed_components,
         &slot.value_type_descriptors(),
         &methods,
         &accessors,
     )
     .map_err(|message| CSharpError::CodegenFailed { message })?;
-    Ok((exposed, methods, accessors, changed))
+    Ok((exposed_components, methods, accessors, changed))
 }
 
 /// The components each loaded module's mirror file carries, by first-claim
 /// order.
 ///
-/// A component is mirrored once per process. A shared component is registered by
-/// every module that links it, so several modules' registration logs name it -
-/// and two generated files declaring the same C# `partial struct` collide on
-/// every member (`CS0102`, "already contains a definition for `Color0`"). The
-/// first module to expose a component in load order keeps it, which is stable
-/// because the module list is the project's own settings order.
+/// A component is mirrored once per process. A shared component is registered
+/// by every module that links it, so several modules' registration logs name
+/// it. Two generated files declaring the same C# `partial struct` then collide
+/// on every member (`CS0102`, "already contains a definition for `Color0`").
+///
+/// The first module to expose a component in load order keeps it. That is
+/// stable because the module list is the project's own settings order.
 fn module_mirror_ownership(
     engine: &Engine,
     extensions: &[ExtensionSlot],
@@ -2386,11 +2450,11 @@ fn module_mirror_ownership(
 /// Collect a finished C# assembly build and complete its reload at this frame
 /// boundary.
 ///
-/// The build ran on its own thread with the frame free; everything that
-/// touches the boundary - telling the managed loader the assembly settled,
-/// polling it for the swap, and the bookkeeping a replaced image invalidates -
-/// happens here. A worker that stopped without a report falls back to
-/// building on the frame thread.
+/// The build ran on its own thread with the frame free. Everything that
+/// touches the boundary happens here: telling the managed loader the compiled
+/// assembly is complete, polling it for the swap, and the bookkeeping a
+/// replaced image invalidates. A worker that stopped without a report falls
+/// back to building on the frame thread.
 fn advance_managed_build(host: &mut DevHost) {
     match host.loaded_project.collect_managed_build() {
         BuildCollection::Pending => {}
@@ -2400,9 +2464,11 @@ fn advance_managed_build(host: &mut DevHost) {
                 target: telemetry_target::HOT_RELOAD,
                 "the C# assembly build stopped unexpectedly; building on the frame thread instead"
             );
-            let report =
-                host.loaded_project
-                    .build_now(&host.workspace_root, &host.module_config, None);
+            let report = host.loaded_project.build_now(
+                &host.workspace_root,
+                &host.project_module_config,
+                None,
+            );
             if let Some(report) = report {
                 finish_managed_build(host, report);
             }
@@ -2412,17 +2478,17 @@ fn advance_managed_build(host: &mut DevHost) {
 
 /// Finish a managed reload whose assembly build reported.
 ///
-/// Reports the compile, collapses the loader's debounce, polls for the swap,
-/// and runs the bookkeeping a replaced image invalidates. A failed compile
-/// keeps the running assembly, abandons the armed timing, and still refreshes
-/// the editor revision.
+/// Reports the compile, shortens the loader's debounce (its wait for the
+/// assembly to stop changing), polls for the swap, and runs the bookkeeping a
+/// replaced image invalidates. A failed compile keeps the running assembly,
+/// abandons the armed timing, and still refreshes the editor revision.
 fn finish_managed_build(host: &mut DevHost, report: BuildReport) {
     let mut replaced = false;
     match report.outcome {
         BuildOutcome::Compiled { milliseconds } => {
             info!(
                 target: telemetry_target::HOT_RELOAD,
-                module = host.module_config.name.as_str(),
+                module = host.project_module_config.name.as_str(),
                 compile_ms = format!("{milliseconds:.1}").as_str(),
                 "C# compiled in-process"
             );
@@ -2451,7 +2517,7 @@ fn finish_managed_build(host: &mut DevHost, report: BuildReport) {
             // The managed compiler hands its diagnostics over directly, so
             // the Problems panel needs no capture ring for this path.
             notices::push(HostNotice::ModuleFailed {
-                module: host.module_config.name.clone(),
+                module: host.project_module_config.name.clone(),
                 output: diagnostics,
             });
             host.loaded_project.abandon_managed_reload_timing();
@@ -2474,7 +2540,7 @@ fn finish_managed_build(host: &mut DevHost, report: BuildReport) {
                 "C# build failed; keeping the currently loaded C# project assembly"
             );
             notices::push(HostNotice::ModuleFailed {
-                module: host.module_config.name.clone(),
+                module: host.project_module_config.name.clone(),
                 output: message,
             });
             host.loaded_project.abandon_managed_reload_timing();
@@ -2492,42 +2558,43 @@ fn finish_managed_build(host: &mut DevHost, report: BuildReport) {
 }
 
 /// Everything a replaced managed assembly invalidates, whichever site saw the
-/// swap: the recorded prologue addresses point into the retired image, the
+/// swap. The recorded prologue addresses point into the retired image, the
 /// patch classifier's baseline is stale, and the editor needs its toast and a
-/// revision bump to drop its caches.
+/// new revision to drop its caches.
 ///
-/// Both sites call this: the build completion, which collapses the loader's
+/// Both sites call this: the build completion, which shortens the loader's
 /// debounce and polls, and the frame-boundary poll that catches a swap whose
-/// debounce outlived Step 5.
+/// wait outlived Step 5.
 fn note_managed_swap(host: &mut DevHost) {
     forget_prologue_records(host);
     // The editor's side of the swap, mirroring the extension reload's: a
     // toast and a cleared problem list for the project.
     notices::push(HostNotice::Reloaded {
-        module: host.module_config.name.clone(),
+        module: host.project_module_config.name.clone(),
         build_ms: 0,
     });
     resync_patch_baselines(host, true, &[]);
     host.bump_editor_revision();
 }
 
-/// Every component type name the live subjects other than `exclude` declare.
+/// Every component type name the live subjects other than
+/// `excluded_extension_index` declare.
 ///
 /// Gathered from each slot's current generation rather than from the world's
-/// registration log, which is append-only: a name a module has stopped
+/// registration log, which is append-only. A name a module has stopped
 /// registering is still in that log, so it cannot answer whether any subject
 /// declares the name now. The project counts as a subject too - a shared
 /// identity is registered by every artifact linking the crate, and dropping it
 /// on a module reload would delete the project's rows.
 fn peer_component_names(
     extensions: &[ExtensionSlot],
-    exclude: Option<usize>,
+    excluded_extension_index: Option<usize>,
     project: &LoadedProject,
 ) -> Vec<String> {
     let mut names: Vec<String> = extensions
         .iter()
         .enumerate()
-        .filter(|(index, _)| Some(*index) != exclude)
+        .filter(|(index, _)| Some(*index) != excluded_extension_index)
         .flat_map(|(_, slot)| slot.exposed_component_names().iter().cloned())
         .collect();
     names.extend(project.component_names().iter().cloned());
@@ -2536,24 +2603,24 @@ fn peer_component_names(
     names
 }
 
-/// Run every reload step of one frame: the extensions' own reloads, the
-/// per-function fast paths, a pending project reload, the suspension of a
-/// subject left on a replaced component layout, and the analytics line that
-/// reports them.
+/// Run every reload step of one frame. That covers the extensions' own
+/// reloads, the per-function fast paths and a pending project reload. It also
+/// covers suspending a subject left on a replaced component layout, and the
+/// analytics line that reports all of it.
 ///
 /// Returns the names of the extensions that reloaded, in load order, for a
 /// windowed host's renderer step. A step that owes a background build leaves
 /// the rest to a later frame instead of blocking this one.
 fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
-    // Step 1: Reload any extension whose sources changed. Each module
-    // owns an independent generation counter and clears only its own systems,
-    // so editing one module never rebuilds another and never disturbs the
-    // project's systems, entities, or resources.
-    // The reload transaction begins here so the analytics total line spans
-    // the whole cascade (edited module + queued project reload), not just the
-    // last transaction. A collected patch transaction is the exception: its
-    // build ran between frames, so the mark moves back to the attempt's own
-    // start below.
+    // Step 1: Reload any extension whose sources changed. Each module has its
+    // own generation counter and clears only its own systems, so editing one
+    // module never rebuilds another and never touches the project's systems,
+    // entities or resources.
+    //
+    // The transaction is timed from here so the analytics total covers the
+    // whole cascade (the edited module plus the project reload it queued), not
+    // just its last step. A collected patch is the exception: its build ran
+    // between frames, so the start mark moves back to when that attempt began.
     let mut reload_started = Instant::now();
 
     // This is the thread that owns the frame boundary, and therefore the only
@@ -2561,18 +2628,19 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     arm_patching_thread();
 
     // Collect a background patch build that has finished. While one is still
-    // running, every step below defers: a reload rebuilds the rlibs the build
+    // running, every step below defers. A reload rebuilds the rlibs the build
     // links against, and a second attempt would race this one for the same
-    // pending edit. Rendering and systems continue; the build is collected on
-    // a later frame. A build that came back without installing its patch also
-    // blocks new attempts for this frame, so the reload below gets to deliver
-    // the edit.
+    // pending edit.
+    //
+    // Rendering and systems continue, and the build is collected on a later
+    // frame. A build that came back without installing its patch also blocks
+    // new attempts for this frame, so the reload below gets to deliver the
+    // edit.
     let (failed_attempt, collected_patch_started) = advance_patch_attempt(host);
     if let Some(started) = collected_patch_started {
-        // The collected build ran while earlier frames kept rendering; the
-        // transaction began when its attempt did, so the total spans the
-        // build instead of only the milliseconds this frame spent installing
-        // it.
+        // The collected build ran while earlier frames kept rendering. Its
+        // transaction began when the attempt did, so the total spans the build
+        // instead of only the milliseconds this frame spent installing it.
         if started < reload_started {
             reload_started = started;
         }
@@ -2582,10 +2650,10 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     }
 
     // Collect a background C# assembly build that has finished, and defer
-    // every step below while one is running: the compile reads the generated
+    // every step below while one is running. The compile reads the generated
     // mirror files a module reload rewrites, so nothing else may reload under
-    // it. Rendering and systems continue; the build is collected on a later
-    // frame.
+    // it. Rendering and systems continue, and the build is collected on a
+    // later frame.
     advance_managed_build(host);
     if host.loaded_project.managed_build_in_flight() {
         return Vec::new();
@@ -2614,22 +2682,23 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
         engine_api,
         workspace_root,
         queued_reload_generation,
-        module_config,
+        project_module_config,
         loaded_project,
         ..
     } = &mut *host;
     let engine = runtime.engine_mut();
     let mut any_module_reloaded = false;
-    // Which ones, not just whether any: each carries its own patch session, and
-    // only the sessions whose sources were rebuilt need a new baseline.
+    // The loop records which modules reloaded, not just whether any did. Each
+    // carries its own patch session, and only the sessions whose sources were
+    // rebuilt need a new baseline.
     let mut reloaded_modules: Vec<usize> = Vec::new();
     for index in 0..extensions.len() {
         if !extensions[index].has_pending_reload() {
             continue;
         }
         // The other live subjects' declarations, gathered before the mutable
-        // borrow of the slot being reloaded: a type only one of them names is
-        // not this module's to retire.
+        // borrow of the slot being reloaded. A type that only one of them names
+        // is not this module's to retire.
         let peers = peer_component_names(extensions, Some(index), loaded_project);
         let outcome =
             extensions[index].reload_if_changed(engine, engine_api, workspace_root, &peers);
@@ -2666,33 +2735,35 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
                     generation,
                     "extension reload processed"
                 );
-                // The editor's side of the reload: a toast, and the module's
-                // problem list clears. The wall time only exists when this
-                // reload ran a build (a shader-only change is a load).
+                // The editor sees a toast, and the module's problem list is
+                // cleared. The wall time only exists when this reload ran a
+                // build (a shader-only change is a load).
                 notices::push(HostNotice::Reloaded {
                     module: slot.name().to_string(),
                     build_ms: analytics::module_build_ms(slot.name()).unwrap_or(0),
                 });
-                // A module the project links directly is compiled into the project
-                // DLL as well as its own DLL, so after the module swaps, the
-                // project still runs the old embedded copy of that crate. Queue a
-                // project reload so the new code reaches the project too; the
-                // existing transaction below handles build, rollback, and schema
-                // migration. The check is cheap: one small manifest read.
-                if project_depends_on_crate(workspace_root, module_config, slot.name()) {
+                // A module the project links directly is compiled into the
+                // project DLL as well as its own. After the module swaps, the
+                // project still runs the old embedded copy of that crate. Queue
+                // a project reload so the new code reaches the project too. The
+                // existing transaction below handles build, rollback and schema
+                // migration.
+                //
+                // The check is cheap: one small manifest read.
+                if project_depends_on_crate(workspace_root, project_module_config, slot.name()) {
                     info!(
                         target: telemetry_target::HOT_RELOAD,
                         module = slot.name(),
                         "module is a direct dependency of the project; queuing a project reload"
                     );
                     // Owed on the pipeline's own counter, never the watcher's:
-                    // no fast path consumes this one, so a patch of the
-                    // project's own edit cannot swallow this rebuild.
+                    // no fast path marks this one handled, so a patch of the
+                    // project's own edit cannot make this rebuild be skipped.
                     *queued_reload_generation += 1;
                 }
             }
             ReloadOutcome::Failed { generation } => {
-                // The old generation is still current: its patches are still
+                // The old generation is still current. Its patches are still
                 // installed, its baselines are still accurate and its prologue
                 // records are still the rollback path, so none of the success
                 // bookkeeping below may run for it.
@@ -2717,16 +2788,21 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
         .map(|&index| extensions[index].name().to_owned())
         .collect();
 
-    // Step 3b: A reloaded module may have changed the C# mirror surface
-    // (component fields, value types, or mirrored methods), and even a
-    // body-only edit recompiles a module with mirrored methods onto a fresh
-    // base, moving every trampoline address C# calls. When the active project
-    // is managed, regenerate each affected module's mirror file and queue a C#
-    // project reload so `project_cs.dll` rebuilds and the collectible loader
-    // swaps it in — a mirrored method added (or edited) at runtime becomes
-    // callable without a host restart. Modules with no C#-visible content skip
-    // the rebuild entirely.
-    if matches!(&module_config.backend, ProjectModuleBackend::CSharp(_)) && any_module_reloaded {
+    // Step 3b: A reloaded module may have changed what C# can see: component
+    // fields, value types or mirrored methods. Even a body-only edit moves
+    // every trampoline address C# calls, because the module is recompiled onto
+    // a fresh base.
+    //
+    // For a managed project, write each affected module's mirror file again
+    // and queue a C# project reload. `project_cs.dll` is then rebuilt and the
+    // collectible loader swaps it in, so a mirrored method added or edited at
+    // runtime becomes callable without a host restart. A module with nothing
+    // C# can see skips the rebuild.
+    if matches!(
+        &project_module_config.backend,
+        ProjectModuleBackend::CSharp(_)
+    ) && any_module_reloaded
+    {
         let mut needs_csharp_reload = false;
         // Recomputed over the whole list so a reloaded module keeps exactly the
         // file it owned before the reload.
@@ -2739,7 +2815,7 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
             ) {
                 Ok((_exposed, methods, accessors, mirror_changed)) => {
                     // A mirror-content change (fields/value types/method set)
-                    // always rebuilds; a module exposing mirrored methods or
+                    // always rebuilds. A module exposing mirrored methods or
                     // heap-field accessors also rebuilds on any reload, because
                     // its trampolines live at new addresses and body edits
                     // should reach C#.
@@ -2796,13 +2872,13 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     }
 
     // Step 5: Process a pending project reload before running systems.
-    // Two counters feed this, one meaning each. The watcher's source-edit
-    // counter says an edit arrived and nothing has delivered it yet; the
-    // pipeline's queued-reload counter says a rebuilt module crate still has
-    // to be re-embedded into the project image. Setting a counter is how a
-    // producer states its reason, and recording the observed values after the
-    // reload is how the frame loop marks exactly those reasons handled - so a
-    // save that arrives mid-build stays pending instead of being swallowed.
+    //
+    // Two counters feed this. The watcher's source-edit counter says an edit
+    // arrived that nothing has delivered yet. The pipeline's queued-reload
+    // counter says a rebuilt module crate still has to be compiled into the
+    // project image again. A producer states its reason by increasing one of
+    // them; recording the values seen after the reload marks exactly those
+    // reasons handled, so a save that arrives mid-build stays pending.
     let source_edits = host.source_edit_generation.load(Ordering::Acquire);
     let queued_reloads = host.queued_reload_generation;
     if source_edits != host.last_processed_source_edit
@@ -2815,22 +2891,22 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
             "hot reload triggered"
         );
 
-        // Attribute the reload to the watcher signal that asked for it, so
-        // the managed backend can time the whole save-to-swap span. The entry
-        // is consumed here because it belongs to exactly this reload; a
+        // Count the reload as caused by the watcher signal that asked for it,
+        // so the managed backend can time the whole save-to-swap span. The
+        // entry is taken here because it belongs to exactly this reload; a
         // cascade the pipeline queued itself has no source trigger and times
         // from the frame instead.
         host.loaded_project
-            .arm_managed_reload_timing(host.source_triggers.take(source_edits));
+            .arm_managed_reload_timing(host.source_trigger_log.take(source_edits));
 
         // A managed project builds its assembly on a worker thread, so the
-        // frame keeps rendering while Roslyn runs; the build is collected at a
+        // frame keeps rendering while Roslyn runs. The build is collected at a
         // later boundary, which is where its poll and bookkeeping happen. A
-        // native project - or a worker thread that could not start - reloads
+        // native project, or a worker thread that could not start, reloads
         // right here.
         let start = host.loaded_project.start_managed_reload(
             &host.workspace_root,
-            &host.module_config,
+            &host.project_module_config,
             Some((Arc::clone(&host.source_edit_generation), source_edits)),
         );
         match start {
@@ -2840,34 +2916,35 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
             // A native project has no assembly to build: its reload owns the
             // DLL transaction on this thread.
             ManagedReloadStart::NotManaged => {
-                // A project image about to be replaced unmaps two generations later,
-                // so every recorded prologue address inside it goes stale the moment
-                // the swap commits - the same clear a module reload performs, gated
-                // the same way.
+                // A project image about to be replaced unmaps two generations
+                // later, so every recorded prologue address inside it goes stale
+                // the moment the swap commits. It is the same clear a module
+                // reload performs, gated the same way.
                 let peers = peer_component_names(&host.extensions, None, &host.loaded_project);
                 let replaced = host.loaded_project.reload(
                     host.runtime.engine_mut(),
                     &host.engine_api,
                     &host.workspace_root,
-                    &host.module_config,
+                    &host.project_module_config,
                     // A save during the build advances the generation beyond this
                     // baseline, which cancels the in-flight compilation; the next
                     // frame observes the newer generation and rebuilds.
                     Some((&host.source_edit_generation, source_edits)),
                     &peers,
                 );
-                // A failed or refused reload keeps the current image, whose patches
-                // are still installed and whose recorded prologues are still their
+                // A failed or refused reload keeps the current image. Its patches
+                // are still installed and its recorded prologues are still the
                 // rollback route, so the records are dropped only on a real swap.
                 if replaced {
                     forget_prologue_records(host);
-                    // The editor's side of the swap, mirroring the extension
-                    // reload's: a toast, and the project's problem list
-                    // clears. Without it a fixed compile error stayed in the
-                    // Problems panel until the next module reload.
+                    // The editor sees a toast and a cleared problem list, as
+                    // on an extension reload. Without it, a fixed compile
+                    // error would stay in the Problems panel until the next
+                    // module reload.
                     notices::push(HostNotice::Reloaded {
-                        module: host.module_config.name.clone(),
-                        build_ms: analytics::module_build_ms(&host.module_config.name).unwrap_or(0),
+                        module: host.project_module_config.name.clone(),
+                        build_ms: analytics::module_build_ms(&host.project_module_config.name)
+                            .unwrap_or(0),
                     });
                 }
                 // The project now runs the sources on disk, so the patch classifier's
@@ -2878,13 +2955,13 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
                 host.bump_editor_revision();
             }
             // The build worker could not start, so the build runs on this
-            // thread; its report goes through the same handler the worker's
-            // reports go through, so there is one outcome path with one set
-            // of log lines.
+            // thread. Its report goes through the same handler the worker's
+            // reports go through, so there is one outcome path with one set of
+            // log lines.
             ManagedReloadStart::Unavailable => {
                 let report = host.loaded_project.build_now(
                     &host.workspace_root,
-                    &host.module_config,
+                    &host.project_module_config,
                     // A save during the build advances the generation beyond this
                     // baseline, which cancels the in-flight compilation; the next
                     // frame observes the newer generation and rebuilds.
@@ -2895,28 +2972,31 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
                 }
             }
         }
-        // The baseline the reload ran against, not a fresh read. A save during
-        // the build advances the counter past it and cancels the compilation
-        // above; recording the newer value would mark that save as handled when
-        // the build it cancelled produced nothing, stranding the edit on disk.
-        // Recording the baseline is what lets the next frame observe it and
-        // rebuild - which is what the cancellation is for.
+        // Record the baseline the reload ran against, not a fresh read. A save
+        // that arrived during the build has already increased the counter and
+        // cancelled that compilation. Recording the newer value would mark the
+        // save as handled although the build it cancelled produced nothing,
+        // leaving the edit undelivered on disk. Recording the baseline lets
+        // the next frame see the save and rebuild, which is why it was
+        // cancelled.
         host.last_processed_source_edit = source_edits;
         // The rebuild the cascade asked for has happened; a later module swap
-        // bumps the counter again.
+        // adds one to the counter again.
         host.last_processed_queued_reload = queued_reloads;
     }
 
-    // Step 6: A reload above may have re-laid out a shared component other
-    // subjects registered too. Those still run code built against the old
-    // layout, so their systems stay suspended until a rebuild catches them up;
-    // the project normally does in Step 5 of this same boundary.
+    // Step 6: A reload above may have changed the layout of a shared component
+    // that other subjects registered too. Those subjects still run code built
+    // against the old layout, so their systems stay suspended until they are
+    // rebuilt. The project is normally rebuilt in Step 5 of this same
+    // boundary.
     suspend_stale_subjects(host);
 
-    // Print the analytics line for every reload completed this frame
-    // (extensions from Step 1, the project from Step 5), plus one aggregate
-    // total. The events were recorded with their build/stage/load/init/migrate
-    // breakdowns already populated, so this is a pure drain-and-print.
+    // Print the analytics line for every reload completed this frame: the
+    // extensions from Step 1, the project from Step 5. One aggregate total
+    // follows. Each event was recorded with its build, stage, load, init and
+    // migrate timings already filled in, so this only takes the recorded
+    // events and prints them.
     analytics::print_reload_events(reload_started);
     reloaded_extensions
 }
@@ -2924,13 +3004,13 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
 /// Suspend the systems of every subject built against a shared component
 /// layout a reload has since replaced, and resume the ones rebuilt since.
 ///
-/// A stale subject's queries are already refused by the declared schema check,
-/// but its systems can reach the type in other ways, such as spawning a value,
-/// which would write rows in the old layout. Suspending the owner stops all of
-/// it until the subject is rebuilt against the layout now registered.
+/// A stale subject's queries are already refused by the declared schema check.
+/// Its systems can still reach the type in other ways, such as spawning a
+/// value, which would write rows in the old layout. Suspending the owner stops
+/// all of it until the subject is rebuilt against the layout now registered.
 fn suspend_stale_subjects(host: &mut DevHost) {
     // Step 1: Every native subject that registers data, with what is stale in
-    // it. The renderer module is not among them: it holds no slot here, and a
+    // it. The renderer module is not among them. It holds no slot here, and a
     // renderer built against a replaced layout is covered by its own pause.
     let world = host.runtime.engine().world();
     let mut subjects: Vec<(String, pill_engine::SystemOwner, Vec<String>)> = host
@@ -2945,7 +3025,7 @@ fn suspend_stale_subjects(host: &mut DevHost) {
         })
         .collect();
     subjects.push((
-        host.module_config.name.clone(),
+        host.project_module_config.name.clone(),
         pill_engine::SystemOwner::PROJECT,
         host.loaded_project.stale_components(world),
     ));
@@ -2981,7 +3061,7 @@ fn suspend_stale_subjects(host: &mut DevHost) {
 /// Process hot reloads, execute one scheduler frame, and log the frame
 /// statistics when the reporting window elapses.
 ///
-/// The two phases back to back: a windowed host runs them itself, with its
+/// The two phases run back to back. A windowed host runs them itself, with its
 /// renderer step between them (see [`RenderingHost::run_frame`]).
 pub fn run_frame(host: &mut DevHost) {
     let frame_start = Instant::now();
@@ -3001,18 +3081,20 @@ pub(crate) fn run_reload_phase(host: &mut DevHost) -> Vec<String> {
     let reloaded_extensions = run_reload_steps(host);
 
     // Step 7: Poll the managed loader for an assembly swap.
-    // The managed loader watches the built assembly instead of source files.
-    // Only a reloading build has a managed loader to poll; this is the
-    // fallback half of the deliberate two-mechanism design described on the
-    // C# arm of `project_module::reload` (an in-process compile collapses the
-    // loader's poll interval through `NotifyAssemblyReplaced`).
+    //
+    // The managed loader watches the built assembly rather than source files,
+    // and only a reloading build has one to poll. This poll is the fallback
+    // half of the two-mechanism design described on
+    // `project_module::poll_managed_reload`. An in-process compile tells the
+    // loader to stop waiting through `NotifyAssemblyReplaced`. A build through
+    // `dotnet build` leaves no completion signal, so the loader is polled here.
     if host
         .loaded_project
         .poll_managed_reload(host.runtime.engine_mut())
     {
-        // The loader's debounce outlived Step 5, so the swap landed here. It
-        // is the same swap the build completion reports, so it runs the same
-        // bookkeeping - the editor's toast and revision bump included.
+        // The loader's debounce outlived Step 5, so the swap reaches this frame.
+        // It is the same swap the build completion reports, so it runs the same
+        // bookkeeping - the editor's toast and its new revision included.
         note_managed_swap(host);
     }
 
@@ -3026,9 +3108,9 @@ pub(crate) fn run_reload_phase(host: &mut DevHost) -> Vec<String> {
 /// or the watch cannot start (logged; the host runs on without it).
 ///
 /// A configured directory that does not exist yet is created before the watch
-/// starts: the editor imports dropped files into it, and a project that has
-/// never had a `res` would otherwise stay unwatched for the whole run while
-/// the same files sat there unimported.
+/// starts. The editor imports dropped files into it, and a project that never
+/// had a `res` would otherwise stay unwatched for the whole run, with files
+/// sitting there unimported.
 fn start_asset_watcher(
     asset_directory: Option<&Path>,
 ) -> Option<crate::asset_watcher::AssetWatcher> {
@@ -3067,13 +3149,15 @@ fn guid_text(guid: Option<AssetGuid>) -> String {
 /// Import or reimport every asset the watcher reported, through the world's
 /// import registry.
 ///
-/// A source moved together with its metadata file is followed: the loaded
+/// A source moved together with its metadata file is followed. The loaded
 /// asset takes the new name and keeps its handle and guid, and its old path's
 /// deletion is not reported. A new source is imported, writing its metadata
 /// file. A loaded one is decoded again into its slot, keeping its handle and
-/// guid. Nothing here ever removes an asset: a failed reimport leaves the
-/// loaded value in place, and a deleted source stays loaded until the next
-/// run, because components may still hold its handle.
+/// guid.
+///
+/// Nothing here ever removes an asset. A failed reimport leaves the loaded
+/// value in place, and a deleted source stays loaded until the next run,
+/// because components may still hold its handle.
 fn apply_asset_changes(host: &mut DevHost) {
     let Some(watcher) = &host.asset_watcher else {
         return;
@@ -3258,9 +3342,9 @@ pub(crate) fn run_frame_phase(host: &mut DevHost, frame_start: Instant) {
 
 /// Honour a pending request, if one was dropped.
 ///
-/// Called at the frame boundary, where no system is executing - the same
-/// guarantee a patch install relies on, and a requirement rather than a
-/// convenience for the prologue route, which rewrites live code.
+/// Called at the frame boundary, where no system is executing. That is the
+/// same guarantee a patch install relies on, and it is a requirement rather
+/// than a convenience for the prologue route, which rewrites live code.
 #[cfg(feature = "hot_patch")]
 fn process_rollback_request(host: &mut DevHost) {
     let request_path = host.workspace_root.join(ROLLBACK_REQUEST_FILE);
@@ -3269,15 +3353,17 @@ fn process_rollback_request(host: &mut DevHost) {
     };
     let request = request.trim();
 
-    // An empty read is almost always a partial write: this runs every frame, so
-    // it routinely observes the file between creation and the writer flushing.
-    // Leave it and look again next frame rather than reporting nonsense.
+    // An empty read usually means the file is only half written. This runs
+    // every frame, so it often reads the file between its creation and the
+    // writer finishing. Leave it for the next frame instead of reporting an
+    // error.
     if request.is_empty() {
         return;
     }
 
-    // Removed before acting, so a request that fails is not retried on every
-    // subsequent frame - and so a malformed one is reported exactly once.
+    // The file is removed before the request runs. A request that fails is
+    // therefore not retried every frame, and a malformed one is reported
+    // exactly once.
     let request = request.to_string();
     let _ = std::fs::remove_file(&request_path);
 
@@ -3286,7 +3372,7 @@ fn process_rollback_request(host: &mut DevHost) {
         return;
     }
 
-    let Some((function, wanted)) = request.rsplit_once('@') else {
+    let Some((function, requested_generation)) = request.rsplit_once('@') else {
         warn!(
             target: telemetry_target::HOT_RELOAD,
             "Patch rollback request `{request}` is malformed; expected \
@@ -3295,11 +3381,11 @@ fn process_rollback_request(host: &mut DevHost) {
         return;
     };
     let function = function.trim();
-    let wanted = wanted.trim();
+    let requested_generation = requested_generation.trim();
 
-    // `previous` saves a developer looking up numbers to undo the last edit,
-    // which is what a rollback is wanted for almost every time.
-    let generation = if wanted.eq_ignore_ascii_case("previous") {
+    // `previous` saves a developer from looking up numbers to undo the last
+    // edit, which is nearly always what a rollback is for.
+    let generation = if requested_generation.eq_ignore_ascii_case("previous") {
         match previous_patch_generation(host, function) {
             Some(previous) => previous,
             None => {
@@ -3312,12 +3398,12 @@ fn process_rollback_request(host: &mut DevHost) {
             }
         }
     } else {
-        match wanted.parse::<u32>() {
+        match requested_generation.parse::<u32>() {
             Ok(generation) => generation,
             Err(_) => {
                 warn!(
                     target: telemetry_target::HOT_RELOAD,
-                    "Patch rollback: `{wanted}` is not a generation number or `previous`"
+                    "Patch rollback: `{requested_generation}` is not a generation number or `previous`"
                 );
                 return;
             }
@@ -3364,15 +3450,17 @@ fn previous_patch_generation(host: &DevHost, function: &str) -> Option<u32> {
 
 /// Roll back a function whose patched body kept panicking.
 ///
-/// The engine's dispatch slot counts consecutive panicking invocations and
-/// queues one report when a function crosses the threshold; the rollback
-/// itself belongs here, at the frame boundary, where no system is executing -
-/// the same requirement the prologue route imposes on the requested rollback.
-/// Rolling back to the previous generation keeps the last working code, and a
+/// The engine's dispatch slot counts how often a patched function panics in a
+/// row and queues one report when the count crosses its threshold. The
+/// rollback happens here, at the frame boundary, where no system is running -
+/// the same requirement a requested rollback has, since the prologue route
+/// rewrites live code.
+///
+/// Rolling back to the previous generation keeps the last working code. A
 /// function that was patched only once rolls back to generation zero, which is
 /// the code the running artifact was built with. Nothing retries the rejected
-/// patch: the edit's signal was consumed when it was applied, so the function
-/// stays on the working generation until the next source edit.
+/// patch: the edit counted as handled when the patch was applied, so the
+/// function stays on the working generation until the next source edit.
 #[cfg(feature = "hot_patch")]
 fn process_patch_faults(host: &mut DevHost) {
     for report in pill_engine::hot_patch::take_fault_reports() {
@@ -3419,7 +3507,7 @@ fn process_patch_faults(_host: &mut DevHost) {}
 
 /// Print every generation this session has installed.
 ///
-/// Rollback is unusable without it: the request needs a number, and nothing
+/// Rollback is unusable without it. The request needs a number, and nothing
 /// else in the host ever reports which numbers exist.
 #[cfg(feature = "hot_patch")]
 fn print_patch_generations(host: &DevHost) {
@@ -3459,10 +3547,10 @@ fn print_patch_generations(host: &DevHost) {
 
 /// Every loaded artifact a plain-function patch must be offered to.
 ///
-/// One entry per currently loaded library: the project and each extension.
-/// A crate linked into several of them is compiled into each, so each holds
-/// an independent redirect slot for the same function and all of them have to
-/// be told about the replacement.
+/// One entry per currently loaded library: the project and each extension. A
+/// crate linked into several of them is compiled into each, so each holds an
+/// independent redirect slot for the same function. All of them have to be
+/// told about the replacement.
 ///
 /// Retired generations are deliberately left out. They stay mapped only so
 /// outstanding pointers into their code remain valid, and their systems have
@@ -3498,13 +3586,13 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
             routes,
             copies,
         } => {
-            // How the replacement was delivered, said out loud rather than left
-            // to the analytics line. A slot route is provable - the install is
-            // one atomic pointer store and every call that reaches the
-            // dispatcher runs the new code. The prologue route cannot make that
-            // promise: it overwrites a live function's first bytes, so a caller
-            // that inlined the body still runs the old one. A developer
-            // watching a change not take effect needs to know which they got.
+            // How the replacement was delivered, logged here rather than left to
+            // the analytics line. A slot route is provable - the install is one
+            // atomic pointer store and every call that reaches the dispatcher runs
+            // the new code. The prologue route cannot make that promise: it
+            // overwrites a live function's first bytes, so a caller that inlined
+            // the body still runs the old one. A developer watching a change not
+            // take effect needs to know which one they got.
             let delivery = routes
                 .iter()
                 .map(|route| route.label())
@@ -3594,17 +3682,21 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
 }
 
 /// Print the selected backend before any build output starts streaming.
-fn print_startup_configuration(workspace_root: &Path, module_config: &ProjectModuleConfig) {
+fn print_startup_configuration(workspace_root: &Path, project_module_config: &ProjectModuleConfig) {
     info!(
         target: telemetry_target::ENGINE,
         workspace = %workspace_root.display(),
-        module = module_config.name.as_str(),
-        backend = ?module_config.backend,
-        build_command = %module_config.build_command.join(" "),
-        watch_directory = module_config.watch_directory.as_str(),
+        module = project_module_config.name.as_str(),
+        backend = ?project_module_config.backend,
+        build_command = %project_module_config.build_command.join(" "),
+        watch_directory = project_module_config.watch_directory.as_str(),
         "ECS host starting"
     );
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(all(test, feature = "rendering"))]
 mod tests {
@@ -3693,8 +3785,8 @@ mod tests {
     }
 
     /// Every managed assembly swap runs the same bookkeeping, whether the
-    /// build completion saw it or the loader poll caught it after Step 5:
-    /// one helper holds the four steps and both sites call it.
+    /// build completion saw it or the loader poll caught it after Step 5.
+    /// One helper holds the four steps and both sites call it.
     ///
     /// Read from this file's own source, because a swap needs a loaded
     /// managed project and no unit test can build the host one runs on.

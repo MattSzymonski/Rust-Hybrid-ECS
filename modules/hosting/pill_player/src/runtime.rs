@@ -7,15 +7,14 @@
 //! - Mount a project's asset pack and index it ([`mount_asset_pack`]).
 //! - Run one frame: systems, deferred commands, failure reporting, frame
 //!   statistics ([`Runtime::run_frame_from`]).
-//! - Define [`FrameDriver`], what a frontend's loop needs from whatever runs
-//!   the game.
+//! - Define [`FrameDriver`], the interface a frontend's loop drives.
 //!
 //! # Design
 //!
 //! The development host wraps a [`Runtime`] and does its reload work around
-//! the frame; a shipping build uses it directly. Both reach the same frame
-//! code, so a shipped game runs its systems exactly as the game ran while it
-//! was developed.
+//! the frame; a shipping build runs one itself, or the runtime wrapped by the
+//! renderer when it draws. Both reach the same frame code, so a shipped game
+//! runs its systems the same way the game did while it was developed.
 
 // Standard library
 use std::any::Any;
@@ -42,7 +41,7 @@ use crate::StaticProject;
 /// Minimum interval between repeated frame-error reports.
 const FRAME_ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Length of the window frame statistics are reported over.
+/// How long one frame-statistics window lasts, in seconds.
 const FRAME_REPORT_INTERVAL_SECONDS: f64 = 3.0;
 
 // =============================================================================
@@ -51,42 +50,41 @@ const FRAME_REPORT_INTERVAL_SECONDS: f64 = 3.0;
 
 /// What a frontend's loop needs from whatever runs the game.
 ///
-/// Implemented by the [`Runtime`] a shipping build runs, by its windowed
-/// counterpart, and by the development host, so one frontend loop drives any
-/// of them.
+/// [`Runtime`] implements it for a shipping build, its windowed counterpart
+/// does too, and so does the development host. One frontend loop can therefore
+/// drive any of them.
 pub trait FrameDriver {
     /// What a frame can fail with; a headless runtime cannot fail at all.
     type Error: std::error::Error + 'static;
 
     /// Run one frame.
     ///
-    /// The frame statistics are logged by the driver itself, once per
-    /// reporting window, so no frontend has to carry them.
+    /// The driver logs the frame statistics itself, once per reporting window,
+    /// so no frontend has to carry them.
     ///
     /// # Errors
     ///
-    /// Returns the driver's error when the frame could not be completed (a
-    /// windowed driver: the renderer failed).
+    /// Returns the driver's error when the frame could not be completed. A
+    /// windowed driver returns its renderer's error.
     fn run_frame(&mut self) -> Result<(), Self::Error>;
 
     /// The engine this driver runs.
     ///
-    /// Required, and the one accessor the forwarders below are written in
-    /// terms of: a driver that reached its engine another way would have to
-    /// re-implement them, which is how four impls came to repeat the same five
-    /// bodies.
+    /// Required, because the default methods below are written in terms of it:
+    /// a driver that reached its engine another way would have to write them
+    /// all again.
     fn engine_mut(&mut self) -> &mut Engine;
 
     /// Queue an input event for the next frame.
     ///
-    /// Defaulted through [`Self::engine_mut`]: input reaches the engine the
-    /// same way in every driver, so a frontend cannot forget to forward it.
+    /// Implemented through [`Self::engine_mut`], so every driver delivers
+    /// input the same way and a frontend cannot forget to forward it.
     fn push_input(&mut self, event: InputEvent) {
         self.engine_mut().push_input_event(event);
     }
 
-    /// Take the rumble requests the last frame's systems queued, for the
-    /// frontend that owns the gamepads to play.
+    /// Take the rumble requests that last frame's systems queued, so the
+    /// frontend that owns the gamepads can play them.
     fn take_rumble_requests(&mut self) -> Vec<RumbleRequest> {
         self.engine_mut().take_rumble_requests()
     }
@@ -100,14 +98,15 @@ pub trait FrameDriver {
 
 /// What a frontend needs from a driver that draws through a renderer.
 ///
-/// Every surface method lives here rather than on [`FrameDriver`]: a headless
-/// driver has no surface to forward to, and a no-op default on the base trait
-/// would let a windowed frontend drop every resize without a word.
+/// The surface methods live here rather than on [`FrameDriver`] because a
+/// headless driver has no surface to forward to, and a default that did
+/// nothing on the base trait would let a windowed frontend drop every resize
+/// without a word.
 ///
-/// A sub-trait rather than a required method on [`FrameDriver`]: the display
-/// accessor has to be required, and gating a required method on
-/// `pill_player/rendering` is not possible in a crate that cannot see that
-/// feature.
+/// This is a sub-trait rather than a method on [`FrameDriver`] because the
+/// renderer accessor has to be required, and a required method cannot be gated
+/// on the `rendering` feature of this crate when the implementing crate cannot
+/// see that feature.
 #[cfg(feature = "rendering")]
 pub trait WindowedFrameDriver: FrameDriver {
     /// The renderer this driver draws through.
@@ -118,18 +117,19 @@ pub trait WindowedFrameDriver: FrameDriver {
     ///
     /// # Errors
     ///
-    /// Returns a [`RendererError`] when the window cannot give its handles or
-    /// the renderer refuses the surface.
+    /// Returns a [`RendererError`] when the window cannot give its handles, or
+    /// when the renderer fails to attach the surface. A renderer that does not
+    /// draw extra surfaces is not an error: the surface waits instead.
     fn attach_surface<W: crate::RendererWindow>(
         &mut self,
         id: SurfaceId,
         window: W,
         width: u32,
         height: u32,
-        options: SurfaceOptions,
+        surface_options: SurfaceOptions,
     ) -> Result<(), RendererError> {
         self.display_mut()
-            .attach_surface(id, window, width, height, options)
+            .attach_surface(id, window, width, height, surface_options)
     }
 
     /// Stop drawing into surface `id`, then release its window.
@@ -147,7 +147,7 @@ pub trait WindowedFrameDriver: FrameDriver {
         self.display_mut().set_surface_viewport(id, viewport);
     }
 
-    /// Whether surface `id` may present on the next frame; see
+    /// Mark whether surface `id` may present on the next frame; see
     /// [`crate::AttachedRenderer::set_surface_ready`].
     fn set_surface_ready(&mut self, id: SurfaceId, ready: bool) {
         self.display_mut().set_surface_ready(id, ready);
@@ -167,11 +167,11 @@ pub struct Runtime {
     /// gone. Declared after `engine`, so the engine - and every system the
     /// backend registered - drops first.
     _project_guard: Option<Box<dyn Any>>,
-    /// The renderer a windowed shipping build links, with the owner its
+    /// The renderer a windowed shipping build links, paired with the owner its
     /// `rendering` system registers under; `None` when there is none.
     #[cfg(feature = "rendering")]
     static_renderer: Option<(crate::StaticRenderer, pill_engine::SystemOwner)>,
-    /// Collapses repeated frame errors, one message at a time.
+    /// Collapses repeated frame errors, separately for each message.
     frame_errors: FrameErrorReporter,
     /// Frames per second, measured over a reporting window.
     statistics: FrameStatistics,
@@ -188,11 +188,15 @@ impl Default for Runtime {
 }
 
 impl Runtime {
-    /// A runtime around an empty engine, for a host that registers modules and
-    /// the project itself (the development host).
+    /// Creates a runtime around an empty engine.
+    ///
+    /// A host that registers modules and the project itself - the development
+    /// host - calls this directly; [`setup`] and [`setup_with_asset_database`]
+    /// start from it too.
     pub fn new() -> Self {
-        // Report detected system hardware so users can tune config.
-        crate::system_specs::print_machine_info();
+        // Report what machine the game is running on, so a user can see the
+        // CPU, memory, disks and OS it found.
+        crate::system_specs::report_machine_specs();
         Self {
             engine: Box::new(Engine::new()),
             _project_guard: None,
@@ -227,9 +231,9 @@ impl Runtime {
     /// Run one scheduler frame and its reporting: systems, deferred commands,
     /// failure reporting, then the frame statistics.
     ///
-    /// `frame_start` is when the caller's frame began; the frame-time metric
+    /// `frame_start` is when the caller's frame began. The frame-time metric
     /// measures from there, so a frontend that did work before the frame can
-    /// report it. A caller with nothing before the frame passes
+    /// report it, and a caller with nothing before the frame passes
     /// `Instant::now()`. The statistics are logged here, roughly every three
     /// seconds, so every frontend reports them the same way; the line is
     /// `N FPS | M entities`, which the devops suites wait for.
@@ -237,8 +241,8 @@ impl Runtime {
     pub fn run_frame_from(&mut self, frame_start: Instant) {
         // Step 1: Execute one scheduler frame and report its failures.
         if let Err(errors) = self.engine.process_frame() {
-            // Deferred command failures arrive as a batch; flatten them into one
-            // message, which the reporter then rate-limits like any other.
+            // Deferred command failures arrive as a batch, so join them into one
+            // message. The reporter then limits it like any other message.
             let summary = errors
                 .iter()
                 .map(EngineMessage::to_plain_message)
@@ -247,10 +251,10 @@ impl Runtime {
             self.report_frame_error(&summary);
         }
 
-        // Systems can also fail mid-frame. Each failure carries the system name
-        // and its semantic message, so the text is a stable key: the reporter
-        // collapses repeats of each one without letting a second failing system
-        // silence or flood the first.
+        // A system can fail in the middle of a frame too. The text of each
+        // failure names the system and its error, so the reporter can use it as
+        // a key: it collapses repeats of one message without letting a second
+        // failing system silence or flood the first.
         for failure in self.engine.drain_system_failures() {
             self.report_frame_error(&failure.to_plain_message());
         }
@@ -259,10 +263,10 @@ impl Runtime {
         let fps = match self.statistics.count_frame(Instant::now()) {
             Some(fps) => fps,
             None => {
-                // The same numbers flow through the shared `metrics` recorder,
-                // which forwards them to Tracy when a profiler is attached; the
-                // recorder keeps no copy, so the console report stays the
-                // printed record.
+                // The same numbers also go through the shared `metrics`
+                // recorder, which forwards them to Tracy when a profiler is
+                // attached. The recorder keeps no copy, so the printed line
+                // stays the only record.
                 #[cfg(feature = "metrics")]
                 self.record_frame_metrics(
                     frame_start.elapsed().as_secs_f64() * 1000.0,
@@ -287,10 +291,12 @@ impl Runtime {
         );
     }
 
-    /// The rate the current reporting window measures.
+    /// The rate the reporting window measures right now.
     ///
-    /// For a frontend that displays a live rate - the browser's editor canvas;
-    /// the console line is logged by [`Self::run_frame_from`] itself.
+    /// A frontend that displays a live rate calls this - the browser's editor
+    /// canvas does. The console line is logged by [`Self::run_frame_from`]
+    /// itself. While the current window has counted no frame yet, this is the
+    /// last completed window's rate.
     pub fn frames_per_second(&self) -> f64 {
         self.statistics.frames_per_second(Instant::now())
     }
@@ -304,13 +310,14 @@ impl Runtime {
 
     /// Record one frame's numerical state into the shared metrics recorder.
     ///
-    /// The span measured here is the caller's: `frame_start` is when the
-    /// frontend began the frame, so it covers whatever it drew after the systems
-    /// ran. The engine's own pass records its span as `ecs.frame_time_ms` from
-    /// inside `Engine::process_frame` - one name per span, so neither histogram
-    /// mixes two meanings. The entity count is the engine's to report, for the
-    /// same reason: it describes the world that pass produced, and the value is
-    /// the same.
+    /// The span measured here is the caller's: it runs from the `frame_start`
+    /// the frontend passed in to the end of this frame's systems, so work the
+    /// frontend did before the frame is part of it. The engine's own pass
+    /// records its span as `ecs.frame_time_ms` from inside
+    /// `Engine::process_frame`, so one name covers one span and neither
+    /// histogram mixes two meanings. The entity count is the engine's to
+    /// report, for the same reason: it describes the world that pass produced,
+    /// and the value is the same.
     #[cfg(feature = "metrics")]
     fn record_frame_metrics(&mut self, frame_time_ms: f64, fps: f64) {
         let handles = self
@@ -327,14 +334,15 @@ impl Runtime {
 
 /// The two `metrics` handles a frame records through, resolved once.
 ///
-/// A `metrics::histogram!(..)` or `metrics::gauge!(..)` call resolves the name
-/// in the global registry every time it runs - a key built and hashed per frame,
-/// for a handle that never changes. Both names are resolved on the first frame
-/// the `Runtime` runs, by which time a frontend has installed its recorder, and
-/// the handles are kept for the rest of its life.
+/// A `metrics::histogram!(..)` or `metrics::gauge!(..)` call looks its name up
+/// in the global registry, which builds and hashes a key every time it runs.
+/// That is wasted work per frame for a handle that never changes, so both names
+/// are resolved on the first frame the `Runtime` runs - by then a frontend has
+/// installed its recorder - and the handles are kept for the rest of its life.
 #[cfg(feature = "metrics")]
 struct FrameMetricHandles {
-    /// The frame the frontend owns, start to start.
+    /// The caller's frame time, from the start it passed in to the end of the
+    /// systems.
     frame_time: metrics::Histogram,
     /// The rate the reporting window measured.
     frames_per_second: metrics::Gauge,
@@ -360,11 +368,12 @@ impl FrameMetricHandles {
 /// A frame can report several failures - the scheduler pass and any number of
 /// failing systems - so the state is kept per message rather than per frame.
 /// Each distinct message reaches the log at most once per
-/// [`FRAME_ERROR_REPORT_INTERVAL`], carrying the repeats it swallowed, so one
-/// broken system can neither flood the terminal nor silence another. Only the
-/// messages reported within the last interval are remembered: an entry whose
-/// repeats stopped arriving is logged and dropped by the next report that
-/// arrives, because nothing else would ever report its count.
+/// [`FRAME_ERROR_REPORT_INTERVAL`], and its line carries the repeats it did not
+/// print, so one broken system can neither flood the terminal nor silence
+/// another. Only the messages reported within the last interval are remembered:
+/// an entry whose repeats stopped arriving is dropped by the next report that
+/// arrives, and printed first when it counted any repeats, because nothing else
+/// would ever report its count.
 struct FrameErrorReporter {
     /// One entry per message reported within the last interval.
     entries: HashMap<String, FrameErrorEntry>,
@@ -376,8 +385,8 @@ struct FrameErrorEntry {
     last_seen: Instant,
     /// When it last reached the log.
     printed_at: Instant,
-    /// Repeats swallowed since then.
-    suppressed: u64,
+    /// Repeats counted but not printed since then.
+    suppressed_repeat_count: u64,
 }
 
 impl FrameErrorReporter {
@@ -388,26 +397,27 @@ impl FrameErrorReporter {
         }
     }
 
-    /// Report `message`, returning the lines to log.
+    /// Reports one message and returns the lines to log.
     ///
-    /// A message that printed less than [`FRAME_ERROR_REPORT_INTERVAL`] ago only
-    /// counts its repeat and needs no allocation; a message that returns after
-    /// the interval prints once, with everything it swallowed, instead of once
-    /// for the old window and once for the new.
+    /// A message that printed less than [`FRAME_ERROR_REPORT_INTERVAL`] ago
+    /// only has its repeat counted, which allocates nothing. A message that
+    /// comes back after the interval prints once with every repeat counted
+    /// since its last line, instead of printing once for the old interval and
+    /// once for the new one.
     fn report(&mut self, message: &str, now: Instant) -> Vec<FrameErrorLine> {
-        // Step 1: the messages that went quiet reach the log first, with the
-        // repeats they swallowed.
+        // Step 1: Messages that went quiet print first, with the repeats they
+        // counted.
         let mut lines = self.flush_quiet_messages(message, now);
-        // Step 2: this message either collapses into its entry or prints.
+        // Step 2: This message either joins its existing entry or prints.
         if let Some(entry) = self.entries.get_mut(message) {
             entry.last_seen = now;
             if now.duration_since(entry.printed_at) < FRAME_ERROR_REPORT_INTERVAL {
-                entry.suppressed += 1;
+                entry.suppressed_repeat_count += 1;
                 return lines;
             }
-            let suppressed = std::mem::replace(&mut entry.suppressed, 0);
+            let suppressed_repeat_count = std::mem::replace(&mut entry.suppressed_repeat_count, 0);
             entry.printed_at = now;
-            lines.push(FrameErrorLine::new(message, suppressed));
+            lines.push(FrameErrorLine::new(message, suppressed_repeat_count));
             return lines;
         }
         self.entries.insert(
@@ -415,19 +425,20 @@ impl FrameErrorReporter {
             FrameErrorEntry {
                 last_seen: now,
                 printed_at: now,
-                suppressed: 0,
+                suppressed_repeat_count: 0,
             },
         );
         lines.push(FrameErrorLine::new(message, 0));
         lines
     }
 
-    /// Take the entries but `except` whose repeats stopped arriving at least
-    /// [`FRAME_ERROR_REPORT_INTERVAL`] ago, returning the lines their swallowed
-    /// counts still owe the log.
+    /// Drops every entry except `except` whose repeats stopped arriving at
+    /// least [`FRAME_ERROR_REPORT_INTERVAL`] ago, and returns the lines their
+    /// counted repeats still owe the log.
     fn flush_quiet_messages(&mut self, except: &str, now: Instant) -> Vec<FrameErrorLine> {
+        // Step 1: Find the entries that went quiet, and the lines they owe.
         let mut lines = Vec::new();
-        let mut quiet = Vec::new();
+        let mut quiet_messages = Vec::new();
         for (message, entry) in &self.entries {
             if message == except {
                 continue;
@@ -435,12 +446,13 @@ impl FrameErrorReporter {
             if now.duration_since(entry.last_seen) < FRAME_ERROR_REPORT_INTERVAL {
                 continue;
             }
-            quiet.push(message.clone());
-            if entry.suppressed > 0 {
-                lines.push(FrameErrorLine::new(message, entry.suppressed));
+            quiet_messages.push(message.clone());
+            if entry.suppressed_repeat_count > 0 {
+                lines.push(FrameErrorLine::new(message, entry.suppressed_repeat_count));
             }
         }
-        for message in quiet {
+        // Step 2: Forget them, so a later repeat counts as a first sighting.
+        for message in quiet_messages {
             self.entries.remove(&message);
         }
         lines
@@ -451,23 +463,24 @@ impl FrameErrorReporter {
 struct FrameErrorLine {
     /// The message, as the engine wrote it.
     message: String,
-    /// Repeats swallowed since it last printed; `0` for a first sighting.
-    suppressed: u64,
+    /// Repeats counted but not printed since it last printed; `0` for a first
+    /// sighting.
+    suppressed_repeat_count: u64,
 }
 
 impl FrameErrorLine {
-    /// A line for `message` that swallowed `suppressed` repeats.
-    fn new(message: &str, suppressed: u64) -> Self {
+    /// Builds a line for `message` with the number of repeats it did not print.
+    fn new(message: &str, suppressed_repeat_count: u64) -> Self {
         Self {
             message: message.to_owned(),
-            suppressed,
+            suppressed_repeat_count,
         }
     }
 
     /// Write the line: the text keeps the `frame error: <message>` shape, with
     /// the repeat count as a field only when there is one.
     fn log(&self) {
-        if self.suppressed == 0 {
+        if self.suppressed_repeat_count == 0 {
             error!(
                 target: telemetry_target::ENGINE,
                 "frame error: {}",
@@ -476,7 +489,7 @@ impl FrameErrorLine {
         } else {
             error!(
                 target: telemetry_target::ENGINE,
-                suppressed = self.suppressed,
+                suppressed = self.suppressed_repeat_count,
                 "frame error: {}",
                 self.message
             );
@@ -490,11 +503,11 @@ impl FrameErrorLine {
 
 /// The frame rate, measured over the window the frame loop reports at.
 ///
-/// The live rate a frontend displays and the line the loop logs come from the
-/// same three numbers, so the two cannot disagree.
+/// The live rate a frontend displays and the line the loop logs are both
+/// computed from these counters, so they measure the same thing.
 struct FrameStatistics {
     /// Frames counted since the window opened.
-    frames: u64,
+    frame_count: u64,
     /// When the window opened.
     window_started: Instant,
     /// The rate the last completed window measured.
@@ -505,7 +518,7 @@ impl FrameStatistics {
     /// Statistics whose first window opens now.
     fn new() -> Self {
         Self {
-            frames: 0,
+            frame_count: 0,
             window_started: Instant::now(),
             last_fps: 0.0,
         }
@@ -514,14 +527,14 @@ impl FrameStatistics {
     /// Count one frame; returns the finished window's rate, and opens the next
     /// window, once [`FRAME_REPORT_INTERVAL_SECONDS`] have passed.
     fn count_frame(&mut self, now: Instant) -> Option<f64> {
-        self.frames += 1;
-        let elapsed = now.duration_since(self.window_started).as_secs_f64();
-        if elapsed < FRAME_REPORT_INTERVAL_SECONDS {
+        self.frame_count += 1;
+        let elapsed_seconds = now.duration_since(self.window_started).as_secs_f64();
+        if elapsed_seconds < FRAME_REPORT_INTERVAL_SECONDS {
             return None;
         }
-        let fps = self.frames as f64 / elapsed;
+        let fps = self.frame_count as f64 / elapsed_seconds;
         self.last_fps = fps;
-        self.frames = 0;
+        self.frame_count = 0;
         self.window_started = now;
         Some(fps)
     }
@@ -529,11 +542,11 @@ impl FrameStatistics {
     /// The rate the current window measures so far, or the last completed rate
     /// while it has counted no frame yet.
     fn frames_per_second(&self, now: Instant) -> f64 {
-        let elapsed = now.duration_since(self.window_started).as_secs_f64();
-        if self.frames == 0 || elapsed <= f64::EPSILON {
+        let elapsed_seconds = now.duration_since(self.window_started).as_secs_f64();
+        if self.frame_count == 0 || elapsed_seconds <= f64::EPSILON {
             return self.last_fps;
         }
-        self.frames as f64 / elapsed
+        self.frame_count as f64 / elapsed_seconds
     }
 
     /// The rate the last completed window measured.
@@ -595,11 +608,11 @@ impl PackSource {
 // Free Functions
 // =============================================================================
 
-/// Write `binding` for surface `id` into the world's
+/// Writes `binding` for surface `id` into the world's
 /// [`pill_renderer_api::SurfaceCameras`], creating the resource on first use.
 ///
-/// Shared by every driver with a renderer, so the binding lives where the
-/// rendering system reads it.
+/// Every driver with a renderer goes through here, so the binding lives where
+/// the rendering system reads it.
 pub fn set_surface_camera(world: &mut World, id: SurfaceId, binding: Option<CameraBinding>) {
     if world.get_resource::<SurfaceCameras>().is_none() {
         world.insert_resource(SurfaceCameras::default());
@@ -630,9 +643,9 @@ pub fn insert_debug_resources(world: &mut World, debug_draw_enabled: bool) {
     }
 }
 
-/// Parse an asset pack and index every asset in it.
+/// Parses an asset pack and indexes every asset in it.
 ///
-/// Returns the database to insert as a resource: it holds every packed asset
+/// Returns the database to insert as a resource. It holds every packed asset
 /// by guid and by path, so a reference can find and load one that is not
 /// loaded yet. Parsing and mounting happen in one step because mounting
 /// consumes the pack.
@@ -669,7 +682,7 @@ pub fn mount_asset_pack(
         source.indexed_message()
     );
 
-    // Step 3: Mount the pack, then close the store to everything else: a
+    // Step 3: Mount the pack, then close the store to everything else. A
     // shipped build must not fall back to a file on the player's machine when
     // an asset is missing from the bundle.
     pill_engine::asset_store::mount_pack(pack);
@@ -757,8 +770,9 @@ pub fn setup_with_asset_database(
     // Step 3: Register every module, then the project, in the order and under
     // the owners the reloading host uses.
     runtime._project_guard = project.initialize(runtime.engine_mut())?;
-    // The renderer is registered when a window attaches it, like the loaded
-    // module; it takes the next owner after the modules, as that module does.
+    // The renderer registers when a window attaches it, like the loaded
+    // module. It takes the engine's reserved renderer owner, the same one the
+    // reloading host gives that module.
     #[cfg(feature = "rendering")]
     {
         runtime.static_renderer = project
@@ -787,8 +801,7 @@ mod tests {
     /// Held by every test that runs a frame.
     ///
     /// The metrics recorder is process-wide, so a test that counts what one
-    /// frame records needs the other frame-running tests to be between frames
-    /// while it does.
+    /// frame records must be the only test running a frame while it counts.
     static FRAME_LOCK: Mutex<()> = Mutex::new(());
 
     /// How often each metric was updated, keyed by its name.
@@ -806,7 +819,8 @@ mod tests {
         samples: MetricSamples,
     }
 
-    /// The handle one metric name gets: every update lands in the shared map.
+    /// A handle for one metric name. Every update is counted in the shared
+    /// map.
     #[cfg(feature = "metrics")]
     struct CountingHandle {
         name: String,
@@ -922,7 +936,7 @@ mod tests {
         }
     }
 
-    /// The installed counting recorder's map, installed on first use.
+    /// The counting recorder's map, installed on first use.
     #[cfg(feature = "metrics")]
     fn metric_samples() -> MetricSamples {
         static SAMPLES: OnceLock<MetricSamples> = OnceLock::new();
@@ -942,7 +956,7 @@ mod tests {
     }
 
     /// A project that registers nothing.
-    fn no_op(_engine: &mut Engine) -> u32 {
+    fn registers_nothing(_engine: &mut Engine) -> u32 {
         0
     }
 
@@ -992,16 +1006,18 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut runtime = setup(crate::static_project::test_project(
-            crate::StaticProjectBackend::Native { init: no_op },
+            crate::StaticProjectBackend::Native {
+                init: registers_nothing,
+            },
         ))
         .expect("it starts");
         runtime.run_frame_from(Instant::now());
         assert_eq!(runtime.engine().world().entity_count(), 0);
     }
 
-    /// A project whose pack was fetched gets the database the fetch mounted
-    /// inserted before it initializes, so an init that loads an asset finds
-    /// it - the browser path.
+    /// A project whose pack was fetched gets the database inserted before it
+    /// initializes, so an init that loads an asset finds it. This is the
+    /// browser path.
     #[test]
     fn a_fetched_pack_is_mounted_before_the_project_initializes() {
         let bytes = pack_of(&[("fetched/pack-probe.txt", b"from the pack")]);
@@ -1029,9 +1045,9 @@ mod tests {
     /// which span it measured.
     ///
     /// Two spans exist and they are not the same number: the engine's own pass,
-    /// measured inside `Engine::process_frame`, and the frame the frontend owns,
-    /// which also covers whatever it draws before the next one. One histogram
-    /// carrying both mixes two meanings into one series.
+    /// measured inside `Engine::process_frame`, and the caller's frame, which
+    /// also covers whatever the frontend did before handing the frame over.
+    /// One histogram carrying both mixes two meanings into one series.
     #[cfg(feature = "metrics")]
     #[test]
     fn a_frame_records_one_sample_per_metric() {
@@ -1108,20 +1124,17 @@ mod tests {
     }
 
     /// Two failing systems alternate their messages: each prints once per
-    /// interval and carries the repeats it swallowed, so neither floods the log
-    /// at frame rate and neither silences the other.
-    ///
-    /// The single-signature limiter this replaced printed both messages on
-    /// every frame, because each report reset the other's counter.
+    /// interval and carries the repeats counted since its last line, so
+    /// neither floods the log at frame rate and neither silences the other.
     #[test]
     fn alternating_frame_errors_print_once_each_per_interval() {
-        const FRAME: Duration = Duration::from_millis(16);
-        let started = Instant::now();
+        const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+        let started_at = Instant::now();
         let mut reporter = FrameErrorReporter::new();
         let mut lines = Vec::new();
         // Two and a half intervals of alternating messages, one report a frame.
         for frame in 0..160u32 {
-            let now = started + FRAME * frame;
+            let now = started_at + FRAME_INTERVAL * frame;
             let message = if frame % 2 == 0 {
                 "physics system failed: NaN transform"
             } else {
@@ -1136,7 +1149,7 @@ mod tests {
             let printed: Vec<u64> = lines
                 .iter()
                 .filter(|line| line.message == message)
-                .map(|line| line.suppressed)
+                .map(|line| line.suppressed_repeat_count)
                 .collect();
             assert_eq!(
                 printed.len(),
@@ -1152,46 +1165,49 @@ mod tests {
         }
     }
 
-    /// A message that goes quiet still reports the repeats it swallowed, and a
+    /// A message that goes quiet still reports the repeats it counted, and a
     /// message that returns after the interval prints once, not twice.
     #[test]
-    fn a_silenced_frame_error_reports_its_swallowed_repeats() {
-        let started = Instant::now();
+    fn a_silenced_frame_error_reports_its_suppressed_repeats() {
+        let started_at = Instant::now();
         let mut reporter = FrameErrorReporter::new();
-        let mut lines = reporter.report("flooding system failed", started);
+        let mut lines = reporter.report("flooding system failed", started_at);
         assert_eq!(lines.len(), 1, "a first sighting prints at once");
-        assert_eq!(lines[0].suppressed, 0);
+        assert_eq!(lines[0].suppressed_repeat_count, 0);
         // Four repeats inside the interval: counted, not printed.
         for frame in 1..5u32 {
             lines = reporter.report(
                 "flooding system failed",
-                started + Duration::from_millis(16 * u64::from(frame)),
+                started_at + Duration::from_millis(16 * u64::from(frame)),
             );
             assert!(lines.is_empty(), "a repeat inside the interval is silent");
         }
-        // Another system's failure arrives once the flooding one has been silent
-        // for a whole interval: its count is flushed before the new line prints.
-        let later = started
+        // Another system's failure arrives after the flooding one has been
+        // silent for a whole interval, so its count prints before the new line.
+        let later_at = started_at
             + Duration::from_millis(64)
             + FRAME_ERROR_REPORT_INTERVAL
             + Duration::from_millis(50);
-        let lines = reporter.report("another system failed", later);
+        let lines = reporter.report("another system failed", later_at);
         assert_eq!(lines.len(), 2, "the quiet count and the new message print");
         assert_eq!(lines[0].message, "flooding system failed");
-        assert_eq!(lines[0].suppressed, 4, "the four repeats it swallowed");
+        assert_eq!(
+            lines[0].suppressed_repeat_count, 4,
+            "the four repeats it counted"
+        );
         assert_eq!(lines[1].message, "another system failed");
-        assert_eq!(lines[1].suppressed, 0);
+        assert_eq!(lines[1].suppressed_repeat_count, 0);
         // The flushed message is forgotten; if it comes back it prints once.
         let again = reporter.report(
             "flooding system failed",
-            later + FRAME_ERROR_REPORT_INTERVAL + Duration::from_millis(50),
+            later_at + FRAME_ERROR_REPORT_INTERVAL + Duration::from_millis(50),
         );
         assert_eq!(again.len(), 1, "a returning message prints once");
-        assert_eq!(again[0].suppressed, 0);
+        assert_eq!(again[0].suppressed_repeat_count, 0);
     }
 
-    /// Input pushed through the frame driver is what the next frame's systems
-    /// read, and the rumble they request comes back out of it.
+    /// Input pushed through the frame driver reaches the next frame's systems,
+    /// and the rumble they request comes back out through the driver.
     #[test]
     fn input_reaches_the_next_frame_and_rumble_comes_back() {
         use pill_engine::{ButtonState, Input, KeyCode, PlayerId, ResMut, SystemError};
@@ -1229,7 +1245,8 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].player, PlayerId::Player1);
 
-        // The press was an edge: the next frame sees the key held, not pressed.
+        // The press was an edge event, so the next frame sees the key held,
+        // not pressed.
         FrameDriver::run_frame(&mut runtime).expect("a headless frame cannot fail");
         assert!(FrameDriver::take_rumble_requests(&mut runtime).is_empty());
         let input = runtime

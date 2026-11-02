@@ -2,14 +2,18 @@
 //!
 //! # Responsibilities
 //!
-//! - Exercises patch classification, install and bookkeeping rules
-//!   that would otherwise need a live host to reach.
+//! - Checks which edits classification accepts as body-only, and why it
+//!   refuses the rest.
+//! - Checks patch naming, the staged rlib refresh and the rollback
+//!   refusals.
+//! - Checks what a reload does to the baseline snapshot and to the patch
+//!   history.
 //!
 //! # Design
 //!
-//! Kept beside the code they exercise rather than inside it, so the
-//! implementation half of the module reads as implementation.
-//! Private items stay reachable through `use super::*`.
+//! The tests live beside the code they exercise, so the implementation half
+//! of the module stays free of test scaffolding. They reach the module's
+//! private items through `use super::*`.
 
 // External crates
 use libloading::Library;
@@ -22,7 +26,7 @@ use crate::scratch::ScratchDirectory;
 // Constants
 // =============================================================================
 
-/// A source tree with one `#[pill_hot_fn]` free function whose body returns
+/// Source text with one `#[pill_hot_fn]` free function whose body returns
 /// `133.0`, so an edit to that number is a one-token body change.
 const PLAIN_SOURCE: &str = r#"
 use pill_engine::pill_hot_fn;
@@ -51,8 +55,8 @@ value - 1.0
 "#;
 
 /// One `#[pill_hot]` function beside an un-annotated `helper` and a
-/// `const SPEED`, so an edit can land inside an annotated body, inside a plain
-/// one, or outside every body.
+/// `const SPEED`, so one edit can change an annotated body, a plain body, or
+/// code outside every body.
 const HOT_SOURCE: &str = r#"
 use pill_engine::*;
 
@@ -68,7 +72,8 @@ value + 1.0
 }
 "#;
 
-/// One file declaring `draw` twice, in two `impl` blocks.
+/// One file declaring `draw` twice, in two `impl` blocks, with the attribute
+/// on the first.
 const DUPLICATE_NAME_SOURCE: &str = r#"
 use pill_engine::*;
 
@@ -98,7 +103,7 @@ fn draw(&self) -> f32 {
 // Free functions
 // =============================================================================
 
-/// A `#[pill_hot]` system declaration, as classification would report it.
+/// Builds the `#[pill_hot]` system declaration that classification reports.
 fn system_declaration(name: &str) -> source::HotFunction {
     source::HotFunction {
         name: name.to_string(),
@@ -114,7 +119,8 @@ fn system_declaration(name: &str) -> source::HotFunction {
     }
 }
 
-/// A `#[pill_hot_fn]` free-function declaration.
+/// Builds the `#[pill_hot_fn]` free-function declaration that classification
+/// reports.
 fn plain_declaration(name: &str) -> source::HotFunction {
     source::HotFunction {
         name: name.to_string(),
@@ -130,20 +136,25 @@ fn plain_declaration(name: &str) -> source::HotFunction {
     }
 }
 
-/// Write a file, creating parent directories as needed.
-fn fs_write(path: &Path, contents: &str) {
+/// Writes `file_contents` to `path`, creating the parent directories first.
+///
+/// # Panics
+///
+/// Panics when the directories cannot be created or the file cannot be
+/// written.
+fn fs_write(path: &Path, file_contents: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create parent");
     }
-    std::fs::write(path, contents).expect("write file");
+    std::fs::write(path, file_contents).expect("write file");
 }
 
-/// A session over a throwaway source tree, so classification can be driven
+/// Builds a session over a throwaway source tree, so classification can run
 /// against real files without a project or a compiler.
-fn session_over(directory: &Path, contents: &str) -> HotPatchSession {
+fn session_over(directory: &Path, source_text: &str) -> HotPatchSession {
     std::fs::create_dir_all(directory).expect("create source dir");
     let file = directory.join("lib.rs");
-    std::fs::write(&file, contents).expect("write source");
+    std::fs::write(&file, source_text).expect("write source");
 
     let mut session = HotPatchSession {
         workspace_root: directory.to_path_buf(),
@@ -161,21 +172,20 @@ fn session_over(directory: &Path, contents: &str) -> HotPatchSession {
     };
     session.refresh_snapshots();
 
-    // Put the recorded modification time firmly in the past before the
-    // caller edits the file.
+    // Move the recorded modification time into the past before the caller
+    // edits the file.
     //
     // `classify` skips a file whose modification time still equals the one
     // recorded when it was read. Filesystem timestamps are coarse, so a test
-    // that writes its edit within the same tick as this snapshot produces a
-    // file that looks unchanged - and the test then fails intermittently,
-    // reporting "no change detected" for an edit that is plainly there. The
-    // parallel harness makes that more likely, because the write lands sooner.
+    // that writes its edit in the same tick as this snapshot leaves a file
+    // that looks unchanged, and the test then fails now and then with "no
+    // change detected" for an edit that is plainly there. Running the tests
+    // in parallel makes that more likely, because the write follows sooner.
     //
-    // The gate's imprecision is harmless in production: a missed edit falls
-    // through to a full reload, which still delivers it. It is only a
-    // problem for a test that asserts on classification itself, so the wait
-    // lives here, once for every session a test builds, rather than in each
-    // test.
+    // Production is unaffected: a missed edit leaves the change pending and
+    // the normal reload picks it up. Only a test that asserts on
+    // classification itself can see the problem, so the wait lives here once
+    // for every session a test builds, rather than in each test.
     std::thread::sleep(std::time::Duration::from_millis(20));
     session
 }
@@ -184,14 +194,16 @@ fn session_over(directory: &Path, contents: &str) -> HotPatchSession {
 // Tests
 // =============================================================================
 
-/// A fan-out that reaches no copy is reported rather than treated as
-/// success, and the image parked in the graveyard is untouched by the
-/// refusal - which is what keeps a refusal from unmapping an image another
-/// artifact may already jump into.
+/// A fan-out that reaches no copy reports an error instead of succeeding,
+/// and the refusal leaves the loaded patch image in the graveyard.
+///
+/// That is what stops a refusal from unmapping an image another artifact
+/// may already jump into.
 #[test]
 fn a_fan_out_that_reaches_nothing_keeps_the_patch_image_owned() {
-    // SAFETY: a system library with no relationship to this crate, loaded
-    // only so the graveyard holds a real image.
+    // SAFETY: `kernel32.dll` is a system library unrelated to this crate, so
+    // loading it runs no code of ours; it is loaded only so the graveyard
+    // holds a real image.
     let library = unsafe { Library::new("kernel32.dll") }.expect("kernel32.dll loads");
     let patches = vec![LoadedPatch {
         function: String::from("demo::function"),
@@ -214,18 +226,18 @@ fn a_fan_out_that_reaches_nothing_keeps_the_patch_image_owned() {
     );
 }
 
-/// An image whose resolver export cannot be resolved is an error, not an
-/// artifact that links nothing.
+/// An image whose resolver export cannot be found reports an error, not
+/// "this image does not link the crate".
 ///
-/// `Ok(false)` means "asked, and this image does not carry the crate", and
-/// every caller skips those. Folding an image that cannot be interrogated
-/// into that answer would leave a copy running old code while the console
-/// reports a provable install, so the error makes the caller fall back to
-/// a reload.
+/// `Ok(false)` means the image was asked and does not carry the crate, and
+/// every caller skips those images. An image that cannot be asked must not
+/// be folded into that answer: a copy would keep running old code while the
+/// console reported a successful install, so the error instead makes the
+/// caller reload.
 #[test]
 fn patch_without_its_resolver_export_is_an_error() {
-    // SAFETY: a system library with no relationship to this crate, loaded
-    // only so the patch holds a real image with no resolver export.
+    // SAFETY: `kernel32.dll` is a system library unrelated to this crate, and
+    // loading it only gives the test a real image that exports no resolver.
     let library = unsafe { Library::new("kernel32.dll") }.expect("kernel32.dll loads");
     let patch = LoadedPatch {
         function: String::from("demo::function"),
@@ -233,26 +245,29 @@ fn patch_without_its_resolver_export_is_an_error() {
         library,
     };
 
-    let install = patch
+    let install_refusal = patch
         .install_plain_function("demo::function", 0, "fn()")
         .expect_err("an image that cannot be interrogated cannot answer `not here`");
     assert!(
-        install.contains("pill_patch_resolve_install") && install.contains("demo::function"),
-        "the refusal names the export and the patch it was missing from: {install}"
+        install_refusal.contains("pill_patch_resolve_install")
+            && install_refusal.contains("demo::function"),
+        "the refusal names the export and the patch it was missing from: {install_refusal}"
     );
 
-    let reset = patch
+    let reset_refusal = patch
         .reset_plain_function("demo::function")
         .expect_err("a rollback must not treat an un-interrogable image as declaring nothing");
     assert!(
-        reset.contains("pill_patch_resolve_reset"),
-        "the refusal names the export the reset needs: {reset}"
+        reset_refusal.contains("pill_patch_resolve_reset"),
+        "the refusal names the export the reset needs: {reset_refusal}"
     );
 }
 
-/// The generated source must carry the prefixed name and the distinct
-/// resolver export, because both prevent a silent collision with the copy
-/// of the project the patch necessarily links.
+/// The generated source carries the prefixed name and its own resolver
+/// export.
+///
+/// Both keep it from silently colliding with the copy of the project that
+/// the patch links.
 #[test]
 fn generated_source_namespaces_the_entry_and_the_export() {
     let session = HotPatchSession {
@@ -270,37 +285,37 @@ fn generated_source_namespaces_the_entry_and_the_export() {
         counter: 0,
     };
 
-    let contents =
+    let source_contents =
         "use pill_engine::*;\n\n#[pill_hot]\nfn movement(value: i32) -> i32 { value * 2 }\n";
-    let generated = session
+    let generated_source = session
         .generate(
-            contents,
+            source_contents,
             &system_declaration("movement"),
             "project::movement",
         )
         .expect("generated");
 
-    assert!(generated.contains("name = \"pill_patch::project::movement\""));
-    assert!(generated.contains("pill_hot_resolver!(pill_patch_resolve)"));
-    assert!(generated.contains("use pill_engine::*;"));
-    assert!(generated.contains("use project::*;"));
+    assert!(generated_source.contains("name = \"pill_patch::project::movement\""));
+    assert!(generated_source.contains("pill_hot_resolver!(pill_patch_resolve)"));
+    assert!(generated_source.contains("use pill_engine::*;"));
+    assert!(generated_source.contains("use project::*;"));
     // The function is copied verbatim, body included.
-    assert!(generated.contains("fn movement(value: i32) -> i32 { value * 2 }"));
-    // The source carries attributes at all, and exactly one `name` override:
-    // the original attribute must not be duplicated beside the generated one.
-    assert!(generated.contains("#["));
-    assert_eq!(generated.matches("pill_hot(name").count(), 1);
+    assert!(generated_source.contains("fn movement(value: i32) -> i32 { value * 2 }"));
+    // The source carries attributes, with exactly one `name` override: the
+    // original attribute must not be duplicated next to the generated one.
+    assert!(generated_source.contains("#["));
+    assert_eq!(generated_source.matches("pill_hot(name").count(), 1);
 }
 
-/// A plain function is generated with its own attribute and no registry
-/// override, because it is redirected through per-artifact slots rather
-/// than through the engine's registry.
+/// A plain function keeps its own attribute and gets no `name` override,
+/// because it is redirected through per-artifact slots rather than through
+/// the engine's registry.
 #[test]
 fn a_plain_function_keeps_its_own_attribute() {
     let directory = ScratchDirectory::new("generate_plain");
     let session = session_over(&directory, PLAIN_SOURCE);
 
-    let generated = session
+    let generated_source = session
         .generate(
             PLAIN_SOURCE,
             &plain_declaration("get_color_a"),
@@ -308,18 +323,18 @@ fn a_plain_function_keeps_its_own_attribute() {
         )
         .expect("a plain function must generate");
 
-    assert!(generated.contains("#[::pill_engine::pill_hot_fn]"));
+    assert!(generated_source.contains("#[::pill_engine::pill_hot_fn]"));
     // A `name` override belongs to the system path only: a plain function
     // is found under the patch crate's own unique name.
-    assert!(!generated.contains("pill_hot(name"));
-    assert!(generated.contains("pill_hot_resolver!(pill_patch_resolve)"));
-    assert!(generated.contains("133.0"));
+    assert!(!generated_source.contains("pill_hot(name"));
+    assert!(generated_source.contains("pill_hot_resolver!(pill_patch_resolve)"));
+    assert!(generated_source.contains("133.0"));
 
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// Classification must report which attribute marked the changed function,
-/// because the two are installed through entirely different machinery.
+/// Classification must report the function kind, because systems and plain
+/// functions are installed through entirely different machinery.
 #[test]
 fn classify_reports_the_plain_function_kind() {
     let directory = ScratchDirectory::new("classify_plain");
@@ -340,36 +355,40 @@ fn classify_reports_the_plain_function_kind() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// The name a function is keyed by follows the file tree, so a function in
-/// a submodule must not be looked up under the crate root's name.
+/// The name a function is registered under follows the file tree, so a
+/// function in a submodule must not be looked up under the crate root's
+/// name.
 #[test]
 fn qualified_names_follow_the_source_tree() {
     let directory = ScratchDirectory::new("qualified_names");
     let session = session_over(&directory, PLAIN_SOURCE);
-    let free = plain_declaration("get_color_a");
+    let free_function_declaration = plain_declaration("get_color_a");
 
     assert_eq!(
-        session.qualified_name(&directory.join("lib.rs"), &free),
+        session.qualified_name(&directory.join("lib.rs"), &free_function_declaration),
         "project::get_color_a"
     );
     assert_eq!(
-        session.qualified_name(&directory.join("color.rs"), &free),
+        session.qualified_name(&directory.join("color.rs"), &free_function_declaration),
         "project::color::get_color_a"
     );
     assert_eq!(
-        session.qualified_name(&directory.join("color").join("mod.rs"), &free),
+        session.qualified_name(
+            &directory.join("color").join("mod.rs"),
+            &free_function_declaration,
+        ),
         "project::color::get_color_a"
     );
 
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// A method's canonical name carries its type, because that is what a build
-/// script registers - it can read the `impl` block.
+/// The name a method is registered under includes its type, because the
+/// build script can read the `impl` block when it records the name.
 ///
-/// The host has to ask for that same name: `pill_dummy_color::Tint::mix`, not
-/// `pill_dummy_color::mix`. The bare form misses every method, and the refusal
-/// then blames the build script instead.
+/// The host has to ask for that same name: `pill_dummy_color::Tint::mix`,
+/// not `pill_dummy_color::mix`. The bare form finds no method at all, and the
+/// refusal then blames the build script.
 #[test]
 fn a_method_is_named_through_its_type() {
     let directory = ScratchDirectory::new("method_naming");
@@ -403,7 +422,8 @@ fn a_method_is_named_through_its_type() {
 /// neither alone identifies it.
 ///
 /// A type may carry an inherent `draw` beside a trait `draw`, and two traits
-/// may each define `draw` for it. `Type::draw` names all of them.
+/// may each define `draw` for it. A name that carries only the type therefore
+/// cannot say which of them is meant.
 #[test]
 fn a_trait_method_is_named_through_its_trait() {
     let directory = ScratchDirectory::new("trait_method_naming");
@@ -448,11 +468,15 @@ fn a_trait_method_is_named_through_its_trait() {
 #[test]
 fn classify_accepts_a_trait_method_body() {
     let directory = ScratchDirectory::new("classify_trait_method");
-    let source = "pub struct Spline(u32);\n\nimpl Shape for Spline {
+    let source_text = "pub struct Spline(u32);\n\nimpl Shape for Spline {
 fn size(&self) -> u32 { 1 }\n}\n";
-    let mut session = session_over(&directory, source);
+    let mut session = session_over(&directory, source_text);
 
-    std::fs::write(directory.join("lib.rs"), source.replace("{ 1 }", "{ 2 }")).expect("write edit");
+    std::fs::write(
+        directory.join("lib.rs"),
+        source_text.replace("{ 1 }", "{ 2 }"),
+    )
+    .expect("write edit");
 
     let edit = session
         .classify()
@@ -470,20 +494,20 @@ fn size(&self) -> u32 { 1 }\n}\n";
 /// A receiver-less associated function is refused at classification.
 ///
 /// `fn default() -> Self` has no receiver to carry, so the generated patch
-/// would emit the body at the top level, where `Self` cannot be named - a
-/// doomed compile that cost a patch failure plus a full reload. The refusal
-/// names the trait and the type, because either alone leaves the reader
-/// hunting for which `impl` block was meant.
+/// would emit the body at the top level, where `Self` cannot be named. That
+/// compile would fail and cost a patch failure plus a full reload. The
+/// refusal names the trait and the type, so the reader knows which `impl`
+/// block was meant.
 #[test]
 fn classify_refuses_a_receiverless_trait_function() {
     let directory = ScratchDirectory::new("classify_receiverless");
-    let source = "pub struct Spline(u32);\n\nimpl Default for Spline {
+    let source_text = "pub struct Spline(u32);\n\nimpl Default for Spline {
 fn default() -> Self { Spline(1) }\n}\n";
-    let mut session = session_over(&directory, source);
+    let mut session = session_over(&directory, source_text);
 
     std::fs::write(
         directory.join("lib.rs"),
-        source.replace("Spline(1)", "Spline(2)"),
+        source_text.replace("Spline(1)", "Spline(2)"),
     )
     .expect("write edit");
 
@@ -507,20 +531,20 @@ fn default() -> Self { Spline(1) }\n}\n";
 
 /// The generated patch carries the body from the right `impl` block.
 ///
-/// Two types implementing one trait method is what makes a bare-name search
-/// unsafe: it would compile the first `fn size` in the file and install it
-/// for whichever type was patched.
+/// With two types implementing the same trait method, a search by bare name
+/// would compile the first `fn size` in the file and install it for
+/// whichever type was patched.
 #[test]
 fn a_generated_trait_patch_carries_the_right_body() {
     let directory = ScratchDirectory::new("generate_trait_method");
-    let source = "pub struct Alpha(u32);\npub struct Beta(u32);\n
+    let source_text = "pub struct Alpha(u32);\npub struct Beta(u32);\n
 impl Shape for Alpha {
 fn size(&self) -> u32 { 111 }\n}\n
 impl Shape for Beta {
 fn size(&self) -> u32 { 222 }\n}\n";
-    let session = session_over(&directory, source);
+    let session = session_over(&directory, source_text);
 
-    let beta = source::HotFunction {
+    let beta_declaration = source::HotFunction {
         name: "size".to_string(),
         kind: source::HotFunctionKind::PlainFunction,
         self_type: Some("Beta".to_string()),
@@ -532,31 +556,35 @@ fn size(&self) -> u32 { 222 }\n}\n";
         abi_entry_point: false,
         annotated: false,
     };
-    let generated = session
-        .generate(source, &beta, "project::<Beta as Shape>::size")
+    let generated_source = session
+        .generate(
+            source_text,
+            &beta_declaration,
+            "project::<Beta as Shape>::size",
+        )
         .expect("a trait method generates a patch");
 
     assert!(
-        generated.contains("222"),
-        "the patch must carry Beta's body, not Alpha's:\n{generated}"
+        generated_source.contains("222"),
+        "the patch must carry Beta's body, not Alpha's:\n{generated_source}"
     );
     assert!(
-        !generated.contains("111"),
-        "Alpha's body must not appear:\n{generated}"
+        !generated_source.contains("111"),
+        "Alpha's body must not appear:\n{generated_source}"
     );
-    // The body keeps `self`, so it is carried into a local trait implemented
-    // for the concrete type - exactly as an inherent method is.
-    assert!(generated.contains("impl PillHotMethodPatch for Beta"));
+    // The body keeps `self`, so it goes into a local trait implemented for the
+    // concrete type, the same way an inherent method does.
+    assert!(generated_source.contains("impl PillHotMethodPatch for Beta"));
 
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// A dispatch slot for a method is registered WITHOUT its type, so the slot
-/// route has to ask under the degraded name.
+/// A dispatch slot for a method is registered without its type, so the slot
+/// route asks under the shorter name.
 ///
-/// Not a preference: the descriptor is an item, and items may not name
-/// `Self` (`error[E0401]`), so `#[pill_hot_fn]` on a method has no way to
-/// learn the type. The two forms are therefore expected to differ.
+/// The language forces this: the descriptor is an item, and an item may not
+/// name `Self` (`error[E0401]`), so `#[pill_hot_fn]` on a method cannot
+/// learn the type. The two names are therefore expected to differ.
 #[test]
 fn a_slot_lookup_omits_the_type_the_macro_cannot_see() {
     let directory = ScratchDirectory::new("slot_naming");
@@ -596,67 +624,72 @@ fn a_slot_lookup_omits_the_type_the_macro_cannot_see() {
 /// refuses, and that module can never be patched again in that session.
 #[test]
 fn patch_artifact_names_do_not_collide_across_sessions() {
-    let first = ScratchDirectory::new("names_first");
-    let second = ScratchDirectory::new("names_second");
+    let color_directory = ScratchDirectory::new("names_first");
+    let spline_directory = ScratchDirectory::new("names_second");
 
-    let mut colour = session_over(&first, PLAIN_SOURCE);
-    colour.package = "pill_dummy_color".to_string();
-    let mut spline = session_over(&second, PLAIN_SOURCE);
-    spline.package = "pill_spline".to_string();
+    let mut color_session = session_over(&color_directory, PLAIN_SOURCE);
+    color_session.package = "pill_dummy_color".to_string();
+    let mut spline_session = session_over(&spline_directory, PLAIN_SOURCE);
+    spline_session.package = "pill_spline".to_string();
 
-    colour.counter += 1;
-    spline.counter += 1;
-    let colour_name = format!("pill_hotpatch_{}_{}", colour.package, colour.counter);
-    let spline_name = format!("pill_hotpatch_{}_{}", spline.package, spline.counter);
+    color_session.counter += 1;
+    spline_session.counter += 1;
+    let color_patch_name = format!(
+        "pill_hotpatch_{}_{}",
+        color_session.package, color_session.counter
+    );
+    let spline_patch_name = format!(
+        "pill_hotpatch_{}_{}",
+        spline_session.package, spline_session.counter
+    );
     assert_ne!(
-        colour_name, spline_name,
+        color_patch_name, spline_patch_name,
         "each module's first patch must claim its own artifact"
     );
 
-    let _ = std::fs::remove_dir_all(&first);
-    let _ = std::fs::remove_dir_all(&second);
+    let _ = std::fs::remove_dir_all(&color_directory);
+    let _ = std::fs::remove_dir_all(&spline_directory);
 }
 
-/// An untouched file is not re-read, so classification costs what the edit
-/// costs rather than what the crate weighs.
+/// An untouched file is not re-read, so classification takes time in
+/// proportion to the edit rather than to the size of the crate.
 ///
-/// The gate compares the file's modification time against the one recorded
-/// when it was read - filesystem time against filesystem time. Comparing
-/// against `SystemTime::now()` is not sound on Windows, where file times come
-/// from the coarse system clock and a file written after a snapshot can
-/// report an earlier time, so every classification would miss.
+/// The gate compares the file's modification time with the one recorded when
+/// it was read, filesystem time against filesystem time. Comparing against
+/// `SystemTime::now()` is not sound on Windows: file times come from the
+/// coarse system clock and can lag the clock, so a file written just after a
+/// snapshot can report an earlier time and every classification would miss.
 #[test]
 fn an_untouched_file_is_not_re_read() {
     let directory = ScratchDirectory::new("classify_mtime_gate");
     let mut session = session_over(&directory, HOT_SOURCE);
 
     // A second file that never changes.
-    let untouched = directory.join("untouched.rs");
-    fs_write(&untouched, "pub fn stable() {}\n");
+    let untouched_path = directory.join("untouched.rs");
+    fs_write(&untouched_path, "pub fn stable() {}\n");
     session.refresh_snapshots();
     assert!(
-        session.snapshots[&untouched].modified.is_some(),
+        session.snapshots[&untouched_path].modified.is_some(),
         "the snapshot must record when it was read"
     );
 
-    // Its recorded contents are then replaced with a different set of
-    // functions, without touching the file. Nothing on disk changed, so the
-    // gate must skip it - and if it does not, the re-read sees a renamed
-    // function, which is a structural change and refuses the whole
-    // classification. That makes the skip observable rather than asserted.
-    // The recorded time is kept, so the gate still sees the file as
-    // unchanged; only the contents are made to disagree.
-    let recorded = session.snapshots[&untouched].modified;
+    // The snapshot's recorded contents are then replaced with a different set
+    // of functions, without touching the file. Nothing on disk changed, so the
+    // gate must skip the file. If it does not, the re-read finds a renamed
+    // function and refuses the whole classification, which makes the skip
+    // visible instead of merely asserted. The recorded time is kept, so the
+    // gate still sees the file as unchanged; only the contents disagree.
+    let recorded_modification_time = session.snapshots[&untouched_path].modified;
     session.snapshots.insert(
-        untouched.clone(),
+        untouched_path.clone(),
         Snapshot {
             contents: "pub fn renamed_since_the_snapshot() {}\n".to_string(),
-            modified: recorded,
+            modified: recorded_modification_time,
         },
     );
 
-    // Only the edited file is re-read, so the classification succeeds and
-    // names it.
+    // Only the edited file is re-read, so classification succeeds and names
+    // it.
     let edited = HOT_SOURCE.replace("value * SPEED", "value * SPEED * 3.0");
     std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
@@ -669,7 +702,7 @@ fn an_untouched_file_is_not_re_read() {
 
     // And the stale snapshot is still there: proof the file was never read.
     assert!(
-        session.snapshots[&untouched]
+        session.snapshots[&untouched_path]
             .contents
             .contains("renamed_since_the_snapshot"),
         "the untouched file was re-read despite an unchanged modification time"
@@ -685,9 +718,8 @@ fn a_touched_file_is_re_read() {
     let directory = ScratchDirectory::new("classify_mtime_touch");
     let mut session = session_over(&directory, PLAIN_SOURCE);
 
-    // Sleep past the filesystem's timestamp granularity, so the write is
-    // guaranteed to produce a different modification time rather than
-    // relying on it.
+    // Wait past the filesystem's timestamp granularity, so the write is
+    // guaranteed to get a different modification time.
     std::thread::sleep(std::time::Duration::from_millis(20));
     let edited = PLAIN_SOURCE.replace("133.0", "144.0");
     std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
@@ -702,19 +734,21 @@ fn a_touched_file_is_re_read() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// Classification hands on the modification time it read WITH the contents.
+/// Classification returns the modification time together with the contents
+/// it read.
 ///
-/// The pair is what `activate_attempt` stores as the new snapshot. Re-statting
-/// the file after installing the patch would pair older contents with a newer
-/// time - so a save made during the compile would be recorded as already
-/// delivered and then skipped by the modification-time gate.
+/// The pair is what `activate_attempt` stores as the new snapshot. Reading
+/// the file's time again after installing the patch would pair older
+/// contents with a newer time, and a save made during the compile would be
+/// recorded as already delivered and then skipped by the modification-time
+/// gate.
 #[test]
 fn classify_returns_the_time_of_the_contents_it_read() {
     let directory = ScratchDirectory::new("classify_modified_pair");
     let mut session = session_over(&directory, PLAIN_SOURCE);
 
-    // Same coarse-timestamp guard as the other re-read tests: a write
-    // landing in the recorded tick would look unchanged.
+    // The same coarse-timestamp guard as the other re-read tests: a write
+    // that happens in the recorded tick would look unchanged.
     std::thread::sleep(std::time::Duration::from_millis(20));
     let edited = PLAIN_SOURCE.replace("133.0", "144.0");
     std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
@@ -723,38 +757,41 @@ fn classify_returns_the_time_of_the_contents_it_read() {
         .classify()
         .expect("a body-only edit is in scope")
         .expect("the change must be reported");
-    let on_disk = std::fs::metadata(directory.join("lib.rs"))
+    let on_disk_modification_time = std::fs::metadata(directory.join("lib.rs"))
         .and_then(|metadata| metadata.modified())
         .ok();
     assert_eq!(
-        edit.modified, on_disk,
+        edit.modified, on_disk_modification_time,
         "the time must describe the contents that were read"
     );
     assert!(edit.new_contents.contains("144.0"));
 
-    // Replayed as the snapshot a successful patch stores: current against
-    // its own moment, and stale against a later touch - which is what makes
-    // a save during the patch re-readable rather than silently shipped.
-    let recorded = edit.modified.expect("a temp directory reports a time");
-    let replayed = Snapshot {
+    // Build the snapshot a successful patch stores from the same pair. It
+    // matches its own modification time and does not match a later one,
+    // which is what makes a save during the patch readable again instead of
+    // being missed.
+    let recorded_modification_time = edit.modified.expect("a temp directory reports a time");
+    let replayed_snapshot = Snapshot {
         contents: edit.new_contents,
         modified: edit.modified,
     };
-    assert!(replayed.is_current(Some(recorded)));
+    assert!(replayed_snapshot.is_current(Some(recorded_modification_time)));
     assert!(
-        !replayed.is_current(Some(recorded + std::time::Duration::from_secs(1))),
+        !replayed_snapshot.is_current(Some(
+            recorded_modification_time + std::time::Duration::from_secs(1)
+        )),
         "a touch after the read must not count as delivered"
     );
 
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// The staged rlib is brought back in step with cargo's output before a
-/// patch is compiled, so the two halves of the link closure agree.
+/// The staged rlib is copied again from cargo's output before a patch is
+/// compiled, so the crate and the dependencies it links agree.
 ///
 /// Without this the compile fails with `error[E0463]: can't find crate for
-/// <the crate being patched>` whenever one of its dependencies was rebuilt
-/// after it was staged - a message that names the wrong crate entirely.
+/// <the crate being patched>` once cargo has rebuilt the crate against newer
+/// dependencies - a message that names the wrong crate entirely.
 #[test]
 fn a_stale_staged_rlib_is_refreshed_before_compiling() {
     let directory = ScratchDirectory::new("restage_rlib");
@@ -762,10 +799,13 @@ fn a_stale_staged_rlib_is_refreshed_before_compiling() {
 
     // What cargo produced (in the private module build tree under the
     // host profile directory), and the older copy the host staged from it.
-    let built = directory
+    let cargo_built_rlib_path = directory
         .join(crate::config::module_build_artifact_directory())
         .join("libproject.rlib");
-    fs_write(&built, "rebuilt against the current dependencies");
+    fs_write(
+        &cargo_built_rlib_path,
+        "rebuilt against the current dependencies",
+    );
     fs_write(&session.package_rlib, "stale");
 
     session
@@ -780,17 +820,21 @@ fn a_stale_staged_rlib_is_refreshed_before_compiling() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// An already-current staged copy is left alone, so the common path costs
-/// two metadata reads rather than a file copy.
+/// A staged copy that is already current is left as it is.
+///
+/// The staged file has the same length and a later modification time than
+/// cargo's output, which is the pair `staged_copy_is_current` compares. The
+/// contents are equal either way, so the assertion checks that the refresh
+/// leaves the file in place.
 #[test]
 fn a_current_staged_rlib_is_left_alone() {
     let directory = ScratchDirectory::new("restage_current");
     let session = session_over(&directory, PLAIN_SOURCE);
 
-    let built = directory
+    let cargo_built_rlib_path = directory
         .join(crate::config::module_build_artifact_directory())
         .join("libproject.rlib");
-    fs_write(&built, "same length!!");
+    fs_write(&cargo_built_rlib_path, "same length!!");
     std::thread::sleep(std::time::Duration::from_millis(20));
     fs_write(&session.package_rlib, "same length!!");
 
@@ -822,8 +866,8 @@ fn refreshing_without_a_cargo_artifact_keeps_the_staged_copy() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// The headline classification: a body-only edit of an annotated function
-/// is identified, and names the right function.
+/// The basic classification case: a body-only edit of an annotated function
+/// is accepted and reported against the right function.
 #[test]
 fn classify_accepts_a_body_only_edit() {
     let directory = ScratchDirectory::new("classify_accepts");
@@ -842,8 +886,8 @@ fn classify_accepts_a_body_only_edit() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// A source tree that has not changed classifies as no edit to report, so an
-/// untouched file does not wake the patch path.
+/// A source tree that has not changed reports no edit, so an unchanged file
+/// does not start a patch.
 #[test]
 fn classify_reports_no_change_when_nothing_moved() {
     let directory = ScratchDirectory::new("classify_unchanged");
@@ -854,12 +898,14 @@ fn classify_reports_no_change_when_nothing_moved() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// Everything outside an annotated body must be refused, with a reason.
-/// Each of these would otherwise compile a patch against a layout or a
-/// signature the running world no longer has.
+/// Everything outside an annotated body is refused, with a reason.
+///
+/// A patch replaces function bodies only, so a changed constant, signature or
+/// import is invisible to it: the patch compiles against the code the running
+/// world was built with.
 #[test]
 fn classify_refuses_everything_outside_a_hot_body() {
-    let cases: &[(&str, &str, &str)] = &[
+    let edit_cases: &[(&str, &str, &str)] = &[
         (
             "constant",
             "const SPEED: f32 = 1.0;",
@@ -873,13 +919,13 @@ fn classify_refuses_everything_outside_a_hot_body() {
         ("import", "use pill_engine::*;", "use pill_engine::Engine;"),
     ];
 
-    for (label, from, to) in cases {
+    for (label, from_text, to_text) in edit_cases {
         let directory =
             std::env::temp_dir().join(format!("pill_classify_{}", label.replace(' ', "_")));
         let _ = std::fs::remove_dir_all(&directory);
         let mut session = session_over(&directory, HOT_SOURCE);
 
-        let edited = HOT_SOURCE.replace(from, to);
+        let edited = HOT_SOURCE.replace(from_text, to_text);
         assert_ne!(edited, HOT_SOURCE, "{label}: the fixture edit must apply");
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
@@ -899,14 +945,14 @@ fn classify_refuses_everything_outside_a_hot_body() {
 
 /// A refused edit must not disable patching for the rest of the session.
 ///
-/// `classify` diffs against a snapshot of what is running, and only a
-/// *successful* patch advances it. A refusal is followed by a full reload,
-/// which picks the edit up without telling the session - so without the re-sync
-/// the refused change stays in every later diff, and each subsequent body-only
-/// edit is refused for a change that has already shipped.
+/// `classify` compares against a snapshot of what is running, and only a
+/// successful patch updates it. A refusal is followed by a full reload, which
+/// picks the edit up without telling the session. Without the re-sync, the
+/// refused change stays in every later comparison, and each later body-only
+/// edit is refused because of a change the reload already delivered.
 ///
-/// `refresh_snapshots` is what the frame loop calls after a reload to close
-/// that gap; this test pins the behaviour that depends on it.
+/// The host calls `refresh_snapshots` after a reload to close that gap; this
+/// test pins the behaviour that depends on it.
 #[test]
 fn a_reload_resyncs_the_baseline_so_later_body_edits_still_patch() {
     let directory = ScratchDirectory::new("classify_resync_after_reload");
@@ -926,9 +972,9 @@ fn a_reload_resyncs_the_baseline_so_later_body_edits_still_patch() {
     // it. Without this call the assertion below fails with OUTSIDE_HOT_BODY,
     // because the constant change is still in the diff.
     session.refresh_snapshots();
-    // Re-stamping the snapshots restarts the same coarse-timestamp race
-    // `session_over` documents, so the edit below needs the same guard: a
-    // write landing in the recorded modification time's tick looks
+    // The snapshots are stamped again, which restarts the coarse-timestamp
+    // race `session_over` documents, so the edit below needs the same guard: a
+    // write that happens in the recorded modification time's tick looks
     // unchanged and `classify` skips the file.
     std::thread::sleep(std::time::Duration::from_millis(20));
 
@@ -955,7 +1001,7 @@ fn a_reload_resyncs_the_baseline_so_later_body_edits_still_patch() {
 /// Two bodies changed in one save are both reported, in a stable order.
 ///
 /// Each body is an independent replacement, so the only cost of taking both is
-/// one compile apiece - cheaper than a full reload, and the world is never torn
+/// one compile each - cheaper than a full reload, and the world is never torn
 /// down.
 #[test]
 fn classify_reports_every_changed_body() {
@@ -971,13 +1017,13 @@ fn classify_reports_every_changed_body() {
         .classify()
         .expect("two body-only edits are in scope")
         .expect("a change must be reported");
-    let names: Vec<&str> = edit
+    let changed_body_names: Vec<&str> = edit
         .declarations
         .iter()
         .map(|declaration| declaration.name.as_str())
         .collect();
     assert_eq!(
-        names,
+        changed_body_names,
         vec!["movement", "other_movement"],
         "both bodies, sorted so the order does not depend on scan order"
     );
@@ -987,17 +1033,17 @@ fn classify_reports_every_changed_body() {
 
 /// Stage timings add up across the bodies of one save.
 ///
-/// `install_body` runs once per changed body with the same accumulator, and the
-/// total it reports spans all of them: writing instead of adding would make the
-/// breakdown describe the last body alone, exactly when a slow multi-body save
-/// is the one being diagnosed.
+/// `install_body` runs once per changed body with the same accumulator, so
+/// the total it reports covers all of them. Writing instead of adding would
+/// make the breakdown describe the last body alone, which is exactly the case
+/// being diagnosed in a slow multi-body save.
 #[test]
 fn stage_timings_accumulate_across_bodies() {
-    let mut total = PatchStages {
+    let mut accumulated_stages = PatchStages {
         classify: 1.0,
         ..PatchStages::default()
     };
-    let first = PatchStages {
+    let first_body_stages = PatchStages {
         generate: 2.0,
         flags: 3.0,
         compile: 4.0,
@@ -1005,7 +1051,7 @@ fn stage_timings_accumulate_across_bodies() {
         activate: 6.0,
         ..PatchStages::default()
     };
-    let second = PatchStages {
+    let second_body_stages = PatchStages {
         generate: 7.0,
         flags: 8.0,
         compile: 9.0,
@@ -1014,18 +1060,18 @@ fn stage_timings_accumulate_across_bodies() {
         ..PatchStages::default()
     };
 
-    total.merge(&first);
-    total.merge(&second);
+    accumulated_stages.merge(&first_body_stages);
+    accumulated_stages.merge(&second_body_stages);
 
     assert_eq!(
-        total.classify, 1.0,
+        accumulated_stages.classify, 1.0,
         "classify is measured once per save, not per body"
     );
-    assert_eq!(total.generate, 9.0);
-    assert_eq!(total.flags, 11.0);
-    assert_eq!(total.compile, 13.0);
-    assert_eq!(total.load, 15.0);
-    assert_eq!(total.activate, 17.0);
+    assert_eq!(accumulated_stages.generate, 9.0);
+    assert_eq!(accumulated_stages.flags, 11.0);
+    assert_eq!(accumulated_stages.compile, 13.0);
+    assert_eq!(accumulated_stages.load, 15.0);
+    assert_eq!(accumulated_stages.activate, 17.0);
 }
 
 /// Two changed files in one edit are refused with their own code.
@@ -1037,9 +1083,9 @@ fn classify_refuses_two_changed_files() {
     // an edit rather than a new file.
     std::fs::write(directory.join("other.rs"), HOT_SOURCE).expect("write second file");
     session.refresh_snapshots();
-    // Re-stamping the snapshots restarts the same coarse-timestamp race
-    // `session_over` documents, so the edit below needs the same guard: a
-    // write landing in the recorded modification time's tick looks
+    // The snapshots are stamped again, which restarts the coarse-timestamp
+    // race `session_over` documents, so the edits below need the same guard: a
+    // write that happens in the recorded modification time's tick looks
     // unchanged and `classify` skips the file.
     std::thread::sleep(std::time::Duration::from_millis(20));
 
@@ -1088,8 +1134,8 @@ fn duplicate_bare_names_are_refused() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// A file that was not in the baseline is a structural change by
-/// definition, and says so with its own code.
+/// A file that was not in the baseline is always a structural change, and
+/// says so with its own code.
 #[test]
 fn classify_refuses_a_new_source_file() {
     let directory = ScratchDirectory::new("classify_new_file");
@@ -1108,9 +1154,12 @@ fn classify_refuses_a_new_source_file() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// A session that never patched a function knows no active generation and no
-/// history for it, which is what makes a rollback of that function refuse
-/// rather than write nowhere.
+/// A session that never patched a function records no active generation and
+/// no history for it.
+///
+/// That is the state a rollback checks first, and it is why a rollback of an
+/// unknown function refuses instead of writing nowhere. This test pins the
+/// state itself; the refusal is covered by the reload tests below.
 #[test]
 fn rollback_refuses_an_unknown_function() {
     let directory = ScratchDirectory::new("rollback_unknown");
@@ -1161,10 +1210,10 @@ fn a_prologue_generation_a_reload_invalidated_says_so() {
     assert!(session.generations[0].prologue_history_dropped);
     assert!(session.generations[0].prologue_restores.is_empty());
 
-    // Patching the same function again is what makes generation 1 reachable
-    // for a rollback at all: the reload cleared the active entry, and the
-    // new generation restores it. This is the sequence the refusal is for -
-    // edit, reload, edit, then ask for the generation from before.
+    // Patching the same function again makes generation 1 reachable for a
+    // rollback: the reload cleared the active entry, and the new generation
+    // puts one back. The refusal is for the sequence edit, reload, edit, then
+    // ask for the generation from before.
     session.generations.push(Generation {
         function: "project::ordinary".to_string(),
         number: 2,
@@ -1186,12 +1235,12 @@ fn a_prologue_generation_a_reload_invalidated_says_so() {
         .insert("project::ordinary".to_string(), 2);
 
     let mut engine = Engine::new();
-    let detail = session
+    let refusal_detail = session
         .rollback(&mut engine, &[], &[], "project::ordinary", 1)
         .expect_err("an invalidated generation cannot be rolled back to");
     assert!(
-        detail.contains("a reload has replaced that code"),
-        "the refusal must name the reload, not a missing crate: {detail}"
+        refusal_detail.contains("a reload has replaced that code"),
+        "the refusal must name the reload, not a missing crate: {refusal_detail}"
     );
 
     let _ = std::fs::remove_dir_all(&directory);
@@ -1227,7 +1276,7 @@ fn a_reload_forgets_slot_generations() {
         .insert("project::movement".to_string(), 1);
     assert_eq!(session.active_generation("project::movement"), 1);
 
-    // The reload.
+    // The reload that follows the edit.
     session.forget_prologue_patches();
 
     assert_eq!(
@@ -1240,12 +1289,12 @@ fn a_reload_forgets_slot_generations() {
     // Rolling back to the pre-reload generation must be refused rather
     // than re-installing a body from a previous revision.
     let mut engine = Engine::new();
-    let detail = session
+    let refusal_detail = session
         .rollback(&mut engine, &[], &[], "project::movement", 1)
         .expect_err("a generation from before the reload cannot be re-installed");
     assert!(
-        detail.contains("has not been patched in this session"),
-        "the refusal says there is no history to roll back to: {detail}"
+        refusal_detail.contains("has not been patched in this session"),
+        "the refusal says there is no history to roll back to: {refusal_detail}"
     );
 
     let _ = std::fs::remove_dir_all(&directory);
@@ -1260,8 +1309,8 @@ fn a_reload_forgets_slot_generations() {
 #[test]
 fn classify_accepts_an_un_annotated_function() {
     let directory = ScratchDirectory::new("classify_unannotated");
-    let plain = "fn ordinary(value: f32) -> f32 { value }\n";
-    let mut session = session_over(&directory, plain);
+    let un_annotated_source = "fn ordinary(value: f32) -> f32 { value }\n";
+    let mut session = session_over(&directory, un_annotated_source);
 
     std::fs::write(
         directory.join("lib.rs"),
@@ -1283,8 +1332,8 @@ fn classify_accepts_an_un_annotated_function() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// A file with no addressable function at all is still refused, so an edit
-/// to something the host could never reach says so.
+/// A file with no addressable function is still refused, so an edit to code
+/// the host could never reach reports why.
 #[test]
 fn classify_refuses_a_file_with_no_functions() {
     let directory = ScratchDirectory::new("classify_no_functions");
@@ -1298,7 +1347,7 @@ fn classify_refuses_a_file_with_no_functions() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// Editing a second function's body is a patch of THAT function, not a
+/// Editing a second function's body is a patch of that function, not a
 /// structural change.
 #[test]
 fn classify_reports_whichever_body_changed() {

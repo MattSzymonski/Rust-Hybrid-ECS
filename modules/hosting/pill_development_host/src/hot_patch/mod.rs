@@ -10,26 +10,27 @@
 //!
 //! # Design
 //!
-//! This never replaces the whole-module reload: it runs first, and everything
-//! it refuses falls through to [`LoadedProject::reload`](crate::project_module).
+//! This never replaces the whole-module reload. It tries first, and every
+//! change it refuses goes to [`LoadedProject::reload`](crate::project_module).
 //!
-//! The classification is deliberately conservative: it strips the addressable
-//! functions' bodies from the old and new revisions and compares what is left,
-//! so a body-only edit vanishes while signatures, types, constants, imports and
-//! other functions survive it. A false negative costs one reload; a false
-//! positive would install code compiled against a layout this world no longer
-//! has, so the gate errs toward refusing.
+//! The check is deliberately careful. It removes the bodies of the functions
+//! the host can reach from both the old and the new source, then compares the
+//! rest. A body-only edit of those functions leaves the two versions equal; a
+//! changed signature, type, constant, import or other function keeps them
+//! different. Refusing a patch only costs one reload. Accepting one by mistake
+//! would install code built for a memory layout the running world no longer
+//! has, so the check prefers to refuse.
 //!
-//! Patch libraries are never unloaded: a slot may hold an address inside one
-//! for the rest of the process.
+//! Patch libraries are never unloaded: a dispatch slot may point into one for
+//! the rest of the process.
 
 // A development-only facility, refused at compile time in an optimized build.
 //
-// Hot patching shells out to `rustc`, writes DLLs into the temp directory and
-// loads them into the running process, and every annotated function pays an
-// indirection. None of that belongs in a shipped binary, and the failure mode
-// of shipping it by accident is silent rather than loud - so the build stops
-// here instead. Enable it only in a debug profile.
+// Hot patching runs `rustc`, writes DLLs into the temp directory and loads
+// them into the running process, and every annotated function pays an
+// indirection. None of that belongs in a shipped binary, and shipping it by
+// accident would fail quietly instead of loudly - so the build stops here.
+// Enable it only in a debug profile.
 #[cfg(not(debug_assertions))]
 compile_error!(
     "the `hot_patch` feature is a development facility and cannot be built with \
@@ -50,20 +51,20 @@ use pill_engine::Engine;
 // Current crate
 /// Patch compilation: the rustc invocation and its artifacts.
 pub(crate) mod compile;
-/// Patch generations: the history a route can lead back through.
+/// Patch generations: each function's patch history, which a rollback reads.
 pub(crate) mod generations;
 /// Patch routes: where a body is installed and how calls reach it.
 pub(crate) mod routes;
 /// The source scanner, shared with every crate's build script.
 ///
 /// The implementation lives in `pill_hot_scan` because the host and the build
-/// scripts must agree byte for byte about where a function starts and what its
-/// declaration says. Two scanners that disagree - one naming a method through
-/// its type while the other does not - silently fail to patch every method they
-/// disagree about.
+/// scripts must find exactly the same function start and read exactly the same
+/// declaration. If the two scanners disagreed - for example, if one named a
+/// method through its type and the other did not - every method they disagreed
+/// about would quietly stop being patchable.
 ///
-/// Re-exported under this name so `source::` call sites read as what they are:
-/// a question about source text, not about the scanning crate.
+/// Re-exported under this name so `source::` call sites say they are asking
+/// about source text, not about the scanning crate.
 pub(crate) mod source {
     pub use pill_hot_scan::*;
 }
@@ -72,9 +73,9 @@ mod worker;
 
 pub(crate) use compile::CargoRustcLine;
 
-// The captured compiler line and its cache, re-exported for the build runner:
-// a module build harvests the same line this pipeline would otherwise pay a
-// second `cargo build -v` to discover.
+// The captured compiler line and its cache, re-exported for the build runner.
+// A module build reads the same line from here, so it does not have to run a
+// second `cargo build -v` to find it.
 pub(crate) use compile::{flags_cache_path, parse_rustc_line};
 
 // A function's patch history and the routes back through it.
@@ -113,14 +114,14 @@ pub(super) const PATCH_RESOLVER_EXPORT: &[u8] = b"pill_patch_resolve";
 /// distinct from the crate's own `pill_hot_resolve_plain` for the same reason.
 pub(super) const PATCH_PLAIN_EXPORT: &[u8] = b"pill_patch_resolve_plain";
 
-/// Prefix that namespaces a patch's registry entry.
+/// Prefix that separates a patch's registry entry from the crate's own.
 ///
-/// Also not optional. Linking the project's rlib pulls in that crate's
-/// `#[pill_hot]` descriptors too, so a patch DLL contains BOTH the old and the
-/// new entry for the same function. Asking for the bare name resolves whichever
-/// the linker happened to order first, which can be the OLD address with a
-/// matching signature hash - a patch that installs silently and changes
-/// nothing.
+/// It is required. A patch links the project's rlib, which already carries that
+/// crate's `#[pill_hot]` descriptors, so the patch library contains both the
+/// old and the new entry for the same function. Asking for the bare name
+/// returns whichever one the linker put first, which can be the old address
+/// with a matching signature hash: the patch then installs without error and
+/// changes nothing.
 const PATCH_NAME_PREFIX: &str = "pill_patch::";
 
 // =============================================================================
@@ -162,7 +163,7 @@ pub(crate) mod refusal_code {
     pub const OUTSIDE_HOT_BODY: &str = "outside-hot-body";
     /// More than one source file changed in the same edit.
     pub const MULTIPLE_FILES: &str = "multiple-files";
-    /// The edit landed before this session took its baseline snapshot.
+    /// The edit happened before this session took its baseline snapshot.
     pub const EDITED_BEFORE_ARMING: &str = "edited-before-arming";
     /// A method was edited whose `impl` block names no simple receiver type.
     pub const UNRESOLVED_RECEIVER: &str = "unresolved-receiver";
@@ -202,7 +203,8 @@ pub(crate) enum PatchOutcome {
         /// Which generation this became; generation zero is the original code
         /// the running artifact was built with.
         generation: u32,
-        /// Wall time from noticing the change to the slot being installed.
+        /// Wall time from starting the attempt to the replacement being
+        /// installed.
         elapsed_milliseconds: f64,
         /// Per-stage breakdown, so the dominant cost is visible rather than
         /// guessed at. Without this a slow patch is just a number.
@@ -299,13 +301,13 @@ impl PatchStages {
     ///
     /// `classify` is measured once per save rather than once per body, so the
     /// per-body structs leave it at zero and adding it changes nothing.
-    pub fn merge(&mut self, other: &PatchStages) {
-        self.classify += other.classify;
-        self.generate += other.generate;
-        self.flags += other.flags;
-        self.compile += other.compile;
-        self.load += other.load;
-        self.activate += other.activate;
+    pub fn merge(&mut self, other_stages: &PatchStages) {
+        self.classify += other_stages.classify;
+        self.generate += other_stages.generate;
+        self.flags += other_stages.flags;
+        self.compile += other_stages.compile;
+        self.load += other_stages.load;
+        self.activate += other_stages.activate;
     }
 }
 
@@ -341,17 +343,17 @@ struct ApplyResult {
 struct Snapshot {
     /// The file's contents at the moment it was read.
     contents: String,
-    /// The file's modification time then, or `None` when the filesystem would
-    /// not report one.
+    /// The file's modification time at that read, or `None` when the
+    /// filesystem does not report one.
     ///
-    /// `None` means "always re-read", which is the safe direction: a redundant
-    /// read costs microseconds, a missed edit costs a reload.
+    /// `None` means "read the file again every time". That is the safe choice:
+    /// a repeated read is cheap, while a missed edit costs a full reload.
     ///
-    /// Compared against the file's *current* modification time, never against a
-    /// clock read at check time. Both sides are filesystem timestamps, which
-    /// matters: on Windows file times come from the coarse system clock and can
-    /// lag `now()` by a scheduler tick, so a file written just after a snapshot
-    /// can report an earlier time and the edit is then missed.
+    /// The check compares this value with the file's current modification time,
+    /// not with the clock time. Both are file timestamps, and that matters:
+    /// Windows file times come from the coarse system clock and can lag `now()`
+    /// by a scheduler tick. A file written just after a snapshot could then
+    /// report an earlier time, and the edit would be missed.
     modified: Option<SystemTime>,
 }
 
@@ -376,13 +378,12 @@ impl Snapshot {
     }
 }
 
-/// One file's in-scope edit, with every field the steps after classification
-/// need.
+/// One file's in-scope edit, with every field the later steps need.
 ///
-/// The four fields travel together for the same reason [`Snapshot`] is one
-/// value: the modification time is when *these* contents were read. A step that
-/// re-derives either half from a later stat pairs one observation's bytes with
-/// another's timestamp - which records a save made during the patch as already
+/// The four fields belong together for the same reason [`Snapshot`] is one
+/// value: the modification time says when these contents were read. If a later
+/// step looked the file's time up again, it would pair these bytes with a newer
+/// timestamp, and a save made during the patch would be recorded as already
 /// delivered.
 #[derive(Debug)]
 struct ClassifiedEdit {
@@ -423,7 +424,7 @@ pub(crate) struct HotPatchSession {
     /// When those contents were read.
     ///
     /// Used to tell two very different "nothing changed" cases apart: a reload
-    /// this session did not cause, and an edit that landed before the session
+    /// this session did not cause, and an edit that happened before the session
     /// armed and was therefore captured as the baseline. The second one looks
     /// exactly like a broken watcher from outside.
     snapshot_taken_at: SystemTime,
@@ -492,17 +493,17 @@ impl HotPatchSession {
         // Every function the host could address, not just the annotated ones.
         // An attribute chooses the mechanism, not whether patching is possible,
         // so a crate with no annotations at all is still armed - and a crate
-        // whose build script emits no address inventory gets a clear refusal on
-        // its first edit rather than an unexplained fall back to a full reload.
-        let addressable: usize = session
+        // whose build script records no addresses reports a clear failure on
+        // its first edit instead of quietly falling back to a full reload.
+        let addressable_function_count: usize = session
             .snapshots
             .values()
             .map(|snapshot| source::all_functions(&snapshot.contents).len())
             .sum();
-        if addressable == 0 {
+        if addressable_function_count == 0 {
             return None;
         }
-        let annotated: usize = session
+        let annotated_function_count: usize = session
             .snapshots
             .values()
             .map(|snapshot| source::hot_function_names(&snapshot.contents).len())
@@ -528,8 +529,8 @@ impl HotPatchSession {
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             module = package,
-            functions = addressable,
-            hot_functions = annotated,
+            functions = addressable_function_count,
+            hot_functions = annotated_function_count,
             "per-function hot patching armed"
         );
         Some(session)
@@ -537,13 +538,14 @@ impl HotPatchSession {
 
     /// Re-read every `.rs` file under the source root into the snapshot map.
     ///
-    /// The snapshot is the baseline [`classify`](Self::classify) diffs against,
-    /// so it must always describe **what is currently running**. Two things make
-    /// that true: a successful patch records the new contents itself, and a full
-    /// reload re-syncs through this method. Without the second, one unpatchable
-    /// edit pins the baseline forever - every later edit is then diffed against
-    /// stale contents, reports changes outside a hot body, and is refused for a
-    /// change the reload already absorbed.
+    /// The snapshot is the baseline that [`classify`](Self::classify) compares
+    /// against, so it must always describe **what is currently running**. Two
+    /// things keep it honest: a successful patch records the new contents
+    /// itself, and a full reload refreshes it through this method. Without the
+    /// second, one edit that could not be patched would leave the baseline
+    /// stale forever. Every later edit would then be compared against old
+    /// contents, reported as a change outside a function body, and refused,
+    /// even though the reload had already applied it.
     pub(crate) fn refresh_snapshots(&mut self) {
         for path in rust_sources(&self.source_root) {
             if let Some(snapshot) = Snapshot::read(&path) {
@@ -557,26 +559,26 @@ impl HotPatchSession {
 
     /// Prepare a build for a pending source change, without compiling it.
     ///
-    /// Everything here stays on the calling thread and touches only this
-    /// session and the filesystem: classification, source generation, the
-    /// staged rlib, the replayed compiler line. None of it touches the engine
-    /// or a loaded artifact, which is what lets the caller hand the result to
-    /// another thread and install it at a later frame boundary.
+    /// Everything here runs on the calling thread and touches only this session
+    /// and the filesystem: classifying the edit, generating the patch source,
+    /// staging the rlib and obtaining the compiler line to replay. Nothing here
+    /// touches the engine or a loaded artifact, so the caller can hand the
+    /// result to another thread and install it at a later frame boundary.
     ///
-    /// The expensive half - `rustc` and `LoadLibrary` - is
-    /// [`worker::build_attempt`]'s job; the product is installed by
+    /// The expensive half, `rustc` and `LoadLibrary`, belongs to
+    /// [`worker::build_attempt`]. The finished patch is installed by
     /// [`Self::activate_attempt`].
     pub(crate) fn begin_attempt(&mut self) -> BeginOutcome {
-        let started = Instant::now();
+        let started_at = Instant::now();
         let mut stages = PatchStages::default();
 
         // Step 1: Find which functions' bodies changed, if the edit is
         // body-only and nothing else moved.
-        let classify_started = Instant::now();
-        let classified = self.classify();
-        stages.classify = classify_started.elapsed().as_secs_f64() * 1000.0;
+        let classify_started_at = Instant::now();
+        let classified_edit = self.classify();
+        stages.classify = classify_started_at.elapsed().as_secs_f64() * 1000.0;
 
-        let edit = match classified {
+        let edit = match classified_edit {
             Ok(Some(found)) => found,
             Ok(None) => return BeginOutcome::Unchanged,
             Err(refusal) => return BeginOutcome::NotPatchable { refusal },
@@ -584,14 +586,14 @@ impl HotPatchSession {
         let path = edit.path;
 
         // Step 2: Generate each changed body's source and collect its build
-        // inputs. A failure here leaves nothing of this attempt live - the
-        // running implementation is untouched - so the caller reloads.
+        // inputs. A failure here leaves nothing installed: the running
+        // implementation is untouched, so the caller reloads.
         let mut bodies = Vec::with_capacity(edit.declarations.len());
         for declaration in edit.declarations {
-            // The path the running artifact recorded for this function, which
-            // is what the engine registry is keyed by. Derived from the file's
-            // position under the source root, so a function in a submodule
-            // resolves as `crate::module::function`.
+            // The name the running artifact recorded for this function, which
+            // is the key the engine registry uses. It is built from the file's
+            // position under the source root, so a function in a submodule gets
+            // the module's path in its name.
             let qualified = self.qualified_name(&path, &declaration);
             // The slot route asks under a different name; see
             // `slot_lookup_name`.
@@ -623,7 +625,7 @@ impl HotPatchSession {
             modified: edit.modified,
             bodies,
             stages,
-            started,
+            started: started_at,
         })
     }
 
@@ -643,10 +645,12 @@ impl HotPatchSession {
     /// a new source file, a file declaring no function the host can address, a
     /// change outside the hot bodies, a second changed file, an unresolvable
     /// receiver type, a receiver-less associated function, a duplicate bare
-    /// name, or an edit that landed before the baseline was taken.
+    /// name, or an edit that happened before the baseline was taken.
     fn classify(&mut self) -> Result<Option<ClassifiedEdit>, PatchRefusal> {
         let mut result: Option<ClassifiedEdit> = None;
 
+        // Step 1: Find the source files that changed since the baseline.
+        //
         // One directory walk, reused below: re-reading every file in the crate
         // on every attempt would make classification proportional to crate size
         // rather than to the edit.
@@ -688,17 +692,19 @@ impl HotPatchSession {
                 continue;
             }
 
+            // Step 2: Check the edit only changed function bodies.
+            //
             // Every function the host could address, annotated or not. An
             // attribute is not the opt-in: a crate whose build script emits the
             // address inventory makes all of its functions patchable, and the
             // attribute only chooses which mechanism delivers the replacement.
             let functions = source::all_functions(&new_contents);
-            // Two declarations sharing a bare name cannot be told apart by
-            // the machinery below: the map keeps the *last* declaration while
-            // `function_bodies` keeps the *first*, so an edit to the first
-            // would install the second's body under the first's address. The
-            // scanner returns both deliberately rather than deduplicating by
-            // bare name, which is why the collision is refused here.
+            // Two declarations in one file that share a bare name cannot be
+            // told apart below. The name map keeps the last declaration, while
+            // `function_bodies` keeps the first, so an edit to the first would
+            // install the second's body at the first one's address. The scanner
+            // returns both on purpose instead of dropping one, which is why the
+            // collision is refused here.
             {
                 let mut seen: std::collections::HashSet<&str> =
                     std::collections::HashSet::with_capacity(functions.len());
@@ -746,9 +752,11 @@ impl HotPatchSession {
                 ));
             }
 
-            // Both revisions are scanned once for every body at a time rather
-            // than once per function: asking about each function separately
-            // rebuilds the file's code mask on every question, which costs tens
+            // Step 3: Find which bodies changed.
+            //
+            // Both revisions are scanned once with all body names at hand, not
+            // once per function. Asking about each function separately would
+            // rebuild the mask of the file's code every time, which costs tens
             // of milliseconds on a large file at every save.
             let old_bodies = source::function_bodies(old_contents, &hot_names);
             let new_bodies = source::function_bodies(&new_contents, &hot_names);
@@ -768,6 +776,8 @@ impl HotPatchSession {
                 ));
             }
 
+            // Step 4: Check every changed body can be patched.
+            //
             // Several bodies in one save are patched in sequence rather than
             // refused. Each is an independent replacement, so the cost is one
             // compile apiece - still cheaper than the full reload it replaces,
@@ -777,11 +787,11 @@ impl HotPatchSession {
             for function in changed {
                 let declaration = hot[&function].clone();
 
-                // A method needs its receiver type to be patchable: the
-                // generated replacement is a trait implementation for that
-                // concrete type. A generic or trait `impl` block has no single
-                // type to name, so it is refused rather than producing a patch
-                // that cannot compile.
+                // A method needs its receiver type to be patched: the generated
+                // replacement is a trait implementation for that concrete type.
+                // A generic `impl` block, or one whose header does not name a
+                // single type, has no type to give it, so the edit is refused
+                // instead of producing a patch that cannot compile.
                 if declaration.takes_receiver && declaration.self_type.is_none() {
                     return Err(PatchRefusal::new(
                         refusal_code::UNRESOLVED_RECEIVER,
@@ -792,11 +802,11 @@ impl HotPatchSession {
                         ),
                     ));
                 }
-                // A receiver-less associated function has no `Self` to carry:
-                // the generated patch emits the body at the top level, where
-                // `Self` cannot be named, so the compile is doomed. Refused
-                // here the outcome is a cheap `NotPatchable` instead of a patch
-                // failure plus a full reload.
+                // An associated function without a receiver has no `Self` to
+                // carry. The generated patch copies the body to the top level,
+                // where `Self` cannot be named, so the compile would fail.
+                // Refusing it here costs one cheap `NotPatchable` answer
+                // instead of a patch failure followed by a full reload.
                 if !declaration.takes_receiver
                     && (declaration.self_type.is_some() || declaration.trait_name.is_some())
                 {
@@ -826,12 +836,12 @@ impl HotPatchSession {
             });
         }
 
-        // Nothing changed - but if a watched file is newer than the baseline,
-        // the edit was already in it. That happens when a file is saved while
-        // the host is still starting up, and it is worth saying out loud: the
-        // change is real, it simply reached the snapshot before the snapshot
-        // was taken, so the fast path has nothing to compare against and the
-        // edit falls through to a full reload in silence.
+        // Nothing changed, but a watched file may be newer than the baseline.
+        // That happens when a file is saved while the host is still starting
+        // up: the edit was already in the file when the snapshot was taken, so
+        // the fast path has nothing to compare against. The change is real, so
+        // it is reported as a refusal and the full reload that follows picks
+        // it up.
         if result.is_none() && any_newer_than_snapshot {
             return Err(PatchRefusal::new(
                 refusal_code::EDITED_BEFORE_ARMING,
@@ -850,47 +860,57 @@ impl HotPatchSession {
     // Generation, compilation, activation
     // -------------------------------------------------------------------------
 
-    /// Generate one body's patch source and collect everything its build
-    /// needs, up to but not including running `rustc`.
+    /// Generate one body's patch source and collect everything its build needs,
+    /// up to but not including running `rustc`.
     ///
-    /// `slot_name` is carried, not read: activation files the slot route
-    /// under it. `totals` receives this body's timings once preparation
+    /// `slot_name` is carried, not read here: activation files the slot route
+    /// under it. `save_stages` receives this body's timings once preparation
     /// succeeds, so a failed body's partial cost stays out of the report.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal code and message for the first step that cannot
+    /// complete: generating the patch source, creating or writing in the
+    /// scratch directory, refreshing the staged rlib, or capturing the
+    /// compiler flags.
     fn prepare_body(
         &mut self,
         new_contents: &str,
         declaration: &source::HotFunction,
-        qualified: &str,
+        qualified_name: &str,
         slot_name: &str,
-        totals: &mut PatchStages,
+        save_stages: &mut PatchStages,
     ) -> Result<worker::PreparedBody, PatchRefusal> {
         let mut stages = PatchStages::default();
         self.counter += 1;
-        // The package name is part of it because every session counts from one
-        // and patch libraries are never unloaded. Without it, the first patch of
-        // a second module tries to write a `.dll` the first module still has
-        // mapped, and Windows refuses - so patching one module would stop every
-        // other module from ever being patched again in that session.
+        // The package name is part of the patch crate's name because every
+        // session counts from one and patch libraries are never unloaded.
+        // Without it, the first patch of a second module would try to write a
+        // `.dll` the first module still has mapped. Windows refuses that
+        // write, so one module's patch would stop every other module from
+        // being patched for the rest of the session.
         let crate_name = format!("pill_hotpatch_{}_{}", self.package, self.counter);
 
-        // Generate.
+        // Step 1: Generate the patch source.
         let generate_started = Instant::now();
         let generated = self
-            .generate(new_contents, declaration, qualified)
+            .generate(new_contents, declaration, qualified_name)
             .map_err(|detail| PatchRefusal::new(failure_code::GENERATE, detail))?;
-        // Written into the per-process temporary directory rather than the
-        // system one, because that directory already has a cleanup path: a later
-        // run sweeps the directories of processes that have exited. Patch images
-        // are never unloaded, so without this they accumulated on disk for every
-        // edit of every session, forever.
-        let scratch = crate::native_library::process_temporary_directory(&self.workspace_root);
-        if let Err(error) = std::fs::create_dir_all(&scratch) {
+        // Step 2: Write the generated source into the scratch directory.
+        // The directory is per process rather than the system temporary one,
+        // because it already has a cleanup path: a later run removes the
+        // directories of processes that have exited. Patch images are never
+        // unloaded, so without that cleanup they would accumulate on disk for
+        // every edit of every session.
+        let scratch_directory =
+            crate::native_library::process_temporary_directory(&self.workspace_root);
+        if let Err(error) = std::fs::create_dir_all(&scratch_directory) {
             return Err(PatchRefusal::new(
                 failure_code::PREPARE,
                 format!("cannot create the patch scratch directory: {error}"),
             ));
         }
-        let source_path = scratch.join(format!("{crate_name}.rs"));
+        let source_path = scratch_directory.join(format!("{crate_name}.rs"));
         std::fs::write(&source_path, generated.as_bytes()).map_err(|error| {
             PatchRefusal::new(
                 failure_code::PREPARE,
@@ -899,54 +919,55 @@ impl HotPatchSession {
         })?;
         stages.generate = generate_started.elapsed().as_secs_f64() * 1000.0;
 
-        // Keep the crate's own rlib in step with the dependency rlibs the
-        // replayed line names, so the two halves of the link closure agree.
+        // Step 3: Refresh the staged rlib so it matches the dependency rlibs
+        // the replayed line names, and the two halves of the link closure agree.
         self.refresh_staged_rlib()
             .map_err(|detail| PatchRefusal::new(failure_code::PREPARE, detail))?;
         let package = self.package.clone();
 
-        let artifact_path = scratch.join(format!("{crate_name}.dll"));
+        let artifact_path = scratch_directory.join(format!("{crate_name}.dll"));
         let extra_externs = vec![format!("{}={}", self.package, self.package_rlib.display())];
-        // Dependency rlibs staged when the host last built this package, which
-        // is the only set guaranteed to match the module rlib being linked. The
-        // shared `deps` slots they were copied from are overwritten by any build
-        // of the same crate name, a differently-featured one included.
+        // Step 4: Collect the dependency rlibs and capture the compiler flags.
+        // The staged set dates from the host's last build of this package,
+        // which is the only set guaranteed to match the module rlib being
+        // linked. The shared `deps` slots they were copied from are
+        // overwritten by any build of the same crate name, including one with
+        // different features.
         let staged_dependencies = self
             .workspace_root
             .join(crate::build_runner::STAGED_DEPENDENCY_SUBDIRECTORY);
         let flags_started = Instant::now();
-        // Cloned out of the cache rather than borrowed: the build that replays
-        // it runs on another thread, which cannot hold a borrow of this
-        // session.
-        let line = self
+        // The line is cloned rather than borrowed because the worker thread
+        // that replays it cannot borrow the session.
+        let compiler_line = self
             .rustc_line()
             .map_err(|detail| PatchRefusal::new(failure_code::PREPARE, detail))?
             .clone();
         stages.flags = flags_started.elapsed().as_secs_f64() * 1000.0;
-        totals.merge(&stages);
+        save_stages.merge(&stages);
 
         Ok(worker::PreparedBody {
             declaration: declaration.clone(),
-            qualified: qualified.to_string(),
+            qualified: qualified_name.to_string(),
             slot_name: slot_name.to_string(),
             crate_name,
             source_path,
             artifact_path,
             extra_externs,
             staged_dependencies,
-            line,
+            line: compiler_line,
             package,
         })
     }
 
     /// Install a finished build at the frame boundary.
     ///
-    /// The compile and the load ran on another thread; `outcomes` is its
-    /// report, one entry per body in order, stopping at the first failure.
-    /// Everything that touches the engine, the loaded artifacts or a dispatch
-    /// slot happens here, on the thread that owns the frame boundary - a
-    /// requirement rather than a preference, because the prologue route
-    /// rewrites live code.
+    /// The compile and the load happened before this call, usually on a worker
+    /// thread. `outcomes` is the build's report, one entry per body it
+    /// attempted, in order; the list stops at the first failure. Everything
+    /// that touches the engine, a loaded artifact or a dispatch slot happens
+    /// here, on the thread that owns the frame boundary: the prologue route
+    /// rewrites live code, so this is a requirement rather than a preference.
     pub(crate) fn activate_attempt(
         &mut self,
         engine: &mut Engine,
@@ -963,22 +984,22 @@ impl HotPatchSession {
             mut stages,
             started,
         } = attempt;
-        let mut last: Option<ApplyResult> = None;
+        let mut last_installation: Option<ApplyResult> = None;
         let mut patched_names: Vec<String> = Vec::new();
-        // Several bodies in one file are patched in sequence and need not share
-        // a route: an annotated and an un-annotated function in the same save
-        // take different ones. Both are reported, because an edit is only as
-        // provable as its weakest body.
-        let mut routes: Vec<crate::analytics::PatchRoute> = Vec::new();
-        let mut copies = 0usize;
+        // Several bodies in one file are patched in sequence and can take
+        // different routes: an annotated and an un-annotated function in the
+        // same save use different ones. Every route is reported, so the
+        // analytics line describes all the mechanisms that ran.
+        let mut patch_routes: Vec<crate::analytics::PatchRoute> = Vec::new();
+        let mut copy_count = 0usize;
         for (body, outcome) in bodies.into_iter().zip(outcomes) {
-            let installed = match outcome {
+            let installation = match outcome {
                 worker::BodyOutcome::Built(built) => {
                     match self.install_body(engine, targets, patches, &body, built, &mut stages) {
-                        Ok(installed) => installed,
-                        // The running implementation is untouched, so the
-                        // console reports which generation is still executing
-                        // rather than only what failed.
+                        Ok(installation) => installation,
+                        // The running implementation is unchanged, so the
+                        // console can name the generation that still executes
+                        // instead of reporting only the failure.
                         Err(failure) => {
                             return PatchOutcome::Failed {
                                 active_generation: self.active_generation(&body.qualified),
@@ -997,22 +1018,23 @@ impl HotPatchSession {
                 }
             };
             patched_names.push(body.qualified);
-            if !routes.contains(&installed.route) {
-                routes.push(installed.route);
+            if !patch_routes.contains(&installation.route) {
+                patch_routes.push(installation.route);
             }
-            copies += installed.copies;
-            last = Some(installed);
+            copy_count += installation.copies;
+            last_installation = Some(installation);
         }
 
-        let Some(installed) = last else {
+        let Some(installation) = last_installation else {
             return PatchOutcome::Unchanged;
         };
 
-        // Only record the new contents once every body is live, so a partial
-        // failure is retried on the next change rather than treated as done.
-        // The time recorded is the one read WITH these contents, never a fresh
-        // stat: a save that landed during the compile must leave the snapshot
-        // stale, or the next attempt skips it as already delivered.
+        // Record the new contents only after every body is live, so a partial
+        // failure is retried on the next change instead of being treated as
+        // done. The time recorded is the one read with these contents, never a
+        // fresh stat: a save that happened during the compile must leave the
+        // snapshot stale, or the next attempt would skip it as already
+        // delivered.
         self.snapshots.insert(
             path,
             Snapshot {
@@ -1022,60 +1044,61 @@ impl HotPatchSession {
         );
         PatchOutcome::Patched {
             function: patched_names.join(", "),
-            generation: installed.generation,
+            generation: installation.generation,
             elapsed_milliseconds: started.elapsed().as_secs_f64() * 1000.0,
             stages,
-            artifact_bytes: installed.artifact_bytes,
-            routes,
-            copies,
+            artifact_bytes: installation.artifact_bytes,
+            routes: patch_routes,
+            copies: copy_count,
         }
     }
 
-    /// Install one built patch: park the image, resolve the replacement and
-    /// write it into the running artifact(s).
+    /// Install one built patch: keep its image loaded, resolve the replacement
+    /// and write it into the running copies.
     ///
-    /// The compile, the load and the artifact inspection already happened on a
-    /// worker thread; what runs here is exactly the part that must happen at
-    /// the frame boundary.
+    /// The compile, the load and the artifact file read happened before this
+    /// call, usually on a worker thread; what runs here is exactly the part
+    /// that must happen at the frame boundary.
     ///
     /// # Errors
     ///
     /// Returns `resolve` when the patch does not report the replacement this
-    /// route asked for, and `install` when a running artifact refuses it -
-    /// typically because the function's signature no longer matches.
+    /// route asked for, and `install` when a running copy refuses it, usually
+    /// because the function's signature no longer matches.
     fn install_body(
         &mut self,
         engine: &mut Engine,
         targets: &[(&str, &NativeLibrary)],
         patches: &mut Vec<LoadedPatch>,
         body: &worker::PreparedBody,
-        built: worker::BuiltBody,
-        totals: &mut PatchStages,
+        built_body: worker::BuiltBody,
+        save_stages: &mut PatchStages,
     ) -> Result<ApplyResult, PatchRefusal> {
         let declaration = &body.declaration;
         let function = declaration.name.as_str();
-        let kind = declaration.kind;
+        let function_kind = declaration.kind;
         let qualified = body.qualified.as_str();
         let slot_name = body.slot_name.as_str();
         let crate_name = body.crate_name.as_str();
         let mut stages = PatchStages::default();
         let activate_started = Instant::now();
 
-        // Filled in by whichever route runs below, and recorded on the
-        // generation so a rollback can reinstall exactly this address without
+        // One of the route arms below fills this in. It is saved on the
+        // generation, so a rollback can reinstall the same address without
         // recompiling anything.
-        let address;
+        let replacement_address;
         let mut signature_hash = 0u64;
-        let mut signature = String::new();
+        let mut signature_text = String::new();
         let mut prologue_restores: Vec<PrologueRestore> = Vec::new();
-        // Both are set by whichever arm of the install below runs; the compiler
-        // proves that, so there is no placeholder value to get wrong.
-        let route: crate::analytics::PatchRoute;
-        let copies: usize;
+        // Both values are set by whichever install arm runs below. The compiler
+        // checks that every arm sets them, so there is no placeholder that
+        // could hide a missing assignment.
+        let patch_route: crate::analytics::PatchRoute;
+        let copy_count: usize;
 
-        // One past the highest number this function already carries, so each
-        // function is numbered independently and a rollback does not renumber
-        // the history it rolled back over.
+        // The next number is one above the highest this function already has.
+        // Each function therefore counts on its own, and a later patch keeps
+        // counting after a rollback rather than reusing old numbers.
         let generation = self
             .generations
             .iter()
@@ -1084,94 +1107,94 @@ impl HotPatchSession {
             .max()
             .unwrap_or(0)
             + 1;
-        // Park the image before a single byte is written. `Library` unmaps on
-        // drop, and both routes below can refuse early - a stub already written
-        // into another artifact names an address inside this image, so a
-        // refusal must leave it owned rather than free it. The image is
-        // process-wide, not owned by this session: a later patch of a
-        // different crate has to reach the copies inside it. The routes below
-        // see the graveyard *without* this entry, so a patch image is never
+        // Keep the image loaded before anything is written. `Library` unmaps on
+        // drop, and any address this install writes into a slot or a function
+        // prologue points into this image for the rest of the process. The
+        // image is shared by the whole process, not owned by this session: a
+        // later patch must also reach the copies inside it. The routes below
+        // receive the patch list *without* this entry, so an image is never
         // offered its own replacement.
         patches.push(LoadedPatch {
             function: qualified.to_string(),
             generation,
-            library: built.library,
+            library: built_body.library,
         });
         let library = &patches[patches.len() - 1].library;
         let existing_patches = &patches[..patches.len() - 1];
 
-        // Install at the frame boundary. Both routes refuse a signature that no
-        // longer matches, so a reshaped function can never be applied behind a
+        // Install at the frame boundary. The routes check the signature before
+        // writing anything, so a reshaped function is never applied behind a
         // call site compiled for the old shape.
         //
-        // What the function is running now, for the fan-out below to return its
-        // copies to if one of them refuses the replacement.
-        let previous = self.previous_install(qualified);
-        match kind {
-            // A system is dispatched through the engine's own registry, which
-            // lives once in this process because the engine is one shared
-            // library. One install reaches every caller.
+        // This is what the function runs now. The fan-out below puts its
+        // copies back on it if one copy refuses the replacement.
+        let previous_installation = self.previous_install(qualified);
+        match function_kind {
+            // A system is dispatched through the engine's own registry. The
+            // engine is one shared library, so the registry lives once per
+            // process and one install reaches every caller.
             source::HotFunctionKind::System => {
                 let lookup_name = format!("{PATCH_NAME_PREFIX}{qualified}");
-                let (found, hash) = resolve_in(library, &lookup_name)
+                let (found_address, found_signature_hash) = resolve_in(library, &lookup_name)
                     .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
                 engine
-                    .hot_patch(qualified, found, hash)
+                    .hot_patch(qualified, found_address, found_signature_hash)
                     .map_err(|error| PatchRefusal::new(failure_code::INSTALL, error.to_string()))?;
-                address = found;
-                signature_hash = hash;
-                // The registry lives once per process, so this single install
-                // is every caller.
-                route = crate::analytics::PatchRoute::EngineSlot;
-                copies = 1;
+                replacement_address = found_address;
+                signature_hash = found_signature_hash;
+                // The registry is process-wide, so the fan-out count here is
+                // one copy.
+                patch_route = crate::analytics::PatchRoute::EngineSlot;
+                copy_count = 1;
             }
-            // A plain function has no registry: its redirect slot is a static
-            // compiled into each artifact that links the crate. The project DLL
-            // embeds its own copy of a module it depends on, and so does every
-            // other module linking it, so the same replacement is offered to all
-            // of them - which is exactly what makes the cascading project reload
-            // this edit would otherwise trigger unnecessary.
+            // This arm handles a plain function with no attribute, so no slot
+            // exists to install into. Its running copies are redirected by
+            // overwriting their first bytes.
             //
-            // No attribute, so no slot exists to install into: the running
-            // copies are redirected by overwriting their first bytes.
+            // The annotated case, handled below, has no central registry
+            // either. Its redirect slot is a static compiled into each artifact
+            // that links the crate: the project DLL embeds its own copy of a
+            // module it depends on, and so does every other module that links
+            // it. Offering the replacement to all of them is what avoids the
+            // cascading project reload this edit would otherwise trigger.
             source::HotFunctionKind::PlainFunction if !declaration.annotated => {
-                let found = resolve_patch_address(library)
+                let found_address = resolve_patch_address(library)
                     .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
                 prologue_restores = prologue_patch_everywhere(
                     targets,
                     existing_patches,
                     qualified,
-                    found,
+                    found_address,
                     &declaration.signature,
                 )
                 .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
-                address = found;
-                route = crate::analytics::PatchRoute::Prologue;
-                copies = prologue_restores.len();
+                replacement_address = found_address;
+                patch_route = crate::analytics::PatchRoute::Prologue;
+                copy_count = prologue_restores.len();
             }
             source::HotFunctionKind::PlainFunction => {
-                // A method patch is filed under the prefixed running name,
-                // because its body lives in a local trait rather than under the
+                // A method patch registers under the prefixed running name,
+                // because its body lives in a local trait instead of at the
                 // patch crate's own module path.
                 let lookup_name = if declaration.takes_receiver {
                     format!("{PATCH_NAME_PREFIX}{qualified}")
                 } else {
                     format!("{crate_name}::{function}")
                 };
-                let (found, found_signature) = resolve_plain_in(library, &lookup_name)
+                let (found_address, found_signature_text) = resolve_plain_in(library, &lookup_name)
                     .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
-                copies = install_everywhere(
+                copy_count = install_everywhere(
                     targets,
                     existing_patches,
                     slot_name,
-                    found,
-                    &found_signature,
-                    previous,
+                    found_address,
+                    &found_signature_text,
+                    previous_installation,
                 )
                 .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
-                address = found;
-                signature = found_signature;
-                route = crate::analytics::PatchRoute::ArtifactSlot;
+                replacement_address = found_address;
+                signature_text = found_signature_text;
+                patch_route = crate::analytics::PatchRoute::ArtifactSlot;
             }
         }
         stages.activate = activate_started.elapsed().as_secs_f64() * 1000.0;
@@ -1179,19 +1202,19 @@ impl HotPatchSession {
         self.generations.push(Generation {
             prologue_history_dropped: false,
             function: qualified.to_string(),
-            // Whichever form the route that delivered this generation looks up,
-            // so a rollback asks the same question the install did.
-            lookup_name: match kind {
+            // The form the delivering route looks up, so a rollback asks the
+            // same question the install did.
+            lookup_name: match function_kind {
                 source::HotFunctionKind::PlainFunction if declaration.annotated => {
                     slot_name.to_string()
                 }
                 _ => qualified.to_string(),
             },
             number: generation,
-            address,
-            kind,
+            address: replacement_address,
+            kind: function_kind,
             signature_hash,
-            signature,
+            signature: signature_text,
             prologue_restores,
             installed_at: Instant::now(),
         });
@@ -1204,27 +1227,26 @@ impl HotPatchSession {
             generations = self.generations.len(),
             "patch generation installed"
         );
-        totals.merge(&stages);
+        save_stages.merge(&stages);
 
         Ok(ApplyResult {
             generation,
-            artifact_bytes: built.artifact_bytes,
-            route,
-            copies,
+            artifact_bytes: built_body.artifact_bytes,
+            route: patch_route,
+            copies: copy_count,
         })
     }
 
-    /// Produce the patch source for one edited function.
+    /// Produces the patch source for one edited function.
     ///
-    /// The function is copied verbatim, so its new body compiles exactly as
-    /// written. Everything it names comes from the SAME artifacts the running
-    /// module linked, which is what keeps type layout and `TypeId` identical
-    /// across the boundary.
+    /// The function is copied as written, and everything it names comes from
+    /// the same artifacts the running module linked. That is what keeps type
+    /// layout and `TypeId` identical across the boundary.
     ///
     /// # Errors
     ///
     /// Returns the reason the source cannot be produced: the function is not in
-    /// the changed source, a receiver-taking body has no known receiver type,
+    /// the changed source, a body with a receiver has no known receiver type,
     /// or its signature text cannot be read.
     fn generate(
         &self,
@@ -1233,12 +1255,13 @@ impl HotPatchSession {
         qualified: &str,
     ) -> Result<String, String> {
         let function = declaration.name.as_str();
-        let kind = declaration.kind;
-        // A method is located through its own `impl` block, not by bare name.
-        // Two types may each implement `Default::default`, and a type may carry
-        // an inherent `draw` beside a trait `draw`; taking the first `fn draw`
-        // in the file would compile the wrong body and install it silently.
-        let found = match (&declaration.self_type, declaration.takes_receiver) {
+        let function_kind = declaration.kind;
+        // A method is found through its own `impl` block, not by bare name.
+        // Two types may each implement `Default::default`, and one type may
+        // have an inherent `draw` beside a trait `draw`. Taking the first
+        // `fn draw` in the file would compile the wrong body and install it
+        // without warning.
+        let located_function = match (&declaration.self_type, declaration.takes_receiver) {
             (Some(self_type), true) => source::find_method(
                 new_contents,
                 function,
@@ -1257,9 +1280,9 @@ impl HotPatchSession {
         let imports = source::top_level_use_statements(new_contents).join("\n");
         let package = &self.package;
 
-        // An un-annotated function, redirected by overwriting its prologue.
+        // An un-annotated function is redirected by overwriting its prologue.
         // Nothing in the running artifact was prepared for this, so the patch
-        // needs no slot, no descriptor and no signature text: it exports one
+        // needs no slot, no descriptor and no signature text. It exports one
         // address, and the host writes a jump to it. A method still goes into a
         // local trait so its body can keep using `self`.
         if !declaration.annotated {
@@ -1268,7 +1291,7 @@ impl HotPatchSession {
                     .self_type
                     .as_deref()
                     .ok_or_else(|| format!("`{function}` has no known receiver type"))?;
-                let signature = found
+                let signature = located_function
                     .text
                     .split_once('{')
                     .map(|(head, _)| head.trim().to_string())
@@ -1277,12 +1300,12 @@ impl HotPatchSession {
                     format!(
                         "trait PillHotMethodPatch {{ {signature}; }}\n\
                          impl PillHotMethodPatch for {self_type} {{ {body} }}",
-                        body = found.text
+                        body = located_function.text
                     ),
                     format!("<{self_type} as PillHotMethodPatch>::{function}"),
                 )
             } else {
-                (found.text.clone(), function.to_string())
+                (located_function.text.clone(), function.to_string())
             };
             return Ok(format!(
                 "// GENERATED by pill_development_host hot patching - do not edit.\n\
@@ -1312,13 +1335,13 @@ impl HotPatchSession {
             ));
         }
 
-        // An inherent method. Its body names `self`, so it cannot be copied
-        // into a free function - the attribute is told the receiver type and
-        // carries the body into a local trait implemented for it instead. The
-        // signature text is computed by the same macro the running artifact
-        // used, so the two are comparable by construction rather than by the
-        // host reproducing a string.
-        if kind == source::HotFunctionKind::PlainFunction && declaration.takes_receiver {
+        // A method with a receiver. Its body names `self`, so it cannot be
+        // copied into a free function. The attribute is given the receiver type
+        // and carries the body into a local trait implemented for that type
+        // instead. The same macro generates the signature text on both sides,
+        // so the two always match instead of depending on the host rebuilding
+        // the string.
+        if function_kind == source::HotFunctionKind::PlainFunction && declaration.takes_receiver {
             let self_type = declaration
                 .self_type
                 .as_deref()
@@ -1344,15 +1367,16 @@ impl HotPatchSession {
                  // A distinct export name: the linked rlib already provides\n\
                  // `pill_hot_resolve`.\n\
                  ::pill_engine::pill_hot_resolver!(pill_patch_resolve);\n",
-                body = found.text
+                body = located_function.text
             ));
         }
 
-        // A plain function needs no registry entry, so it keeps the attribute
-        // it already carries and is looked up under the patch crate's own name.
-        // That name is unique per patch, so it cannot be confused with the copy
-        // of the same function the linked rlib also contributes.
-        if kind == source::HotFunctionKind::PlainFunction {
+        // A plain function needs no registry entry. The generated source adds
+        // `#[pill_hot_fn]` again, and the function is looked up under the patch
+        // crate's own name. That name is unique per patch, so it cannot be
+        // confused with the copy of the same function the linked rlib also
+        // contributes.
+        if function_kind == source::HotFunctionKind::PlainFunction {
             return Ok(format!(
                 "// GENERATED by pill_development_host hot patching - do not edit.\n\
                  //\n\
@@ -1372,7 +1396,7 @@ impl HotPatchSession {
                  // A distinct export name: the linked rlib already provides\n\
                  // `pill_hot_resolve`.\n\
                  ::pill_engine::pill_hot_resolver!(pill_patch_resolve);\n",
-                body = found.text
+                body = located_function.text
             ));
         }
 
@@ -1394,106 +1418,104 @@ impl HotPatchSession {
              // A distinct export name: the linked rlib already provides\n\
              // `pill_hot_resolve`.\n\
              ::pill_engine::pill_hot_resolver!(pill_patch_resolve);\n",
-            body = found.text
+            body = located_function.text
         ))
     }
 
-    /// Module path of a source file, as the crate sees it.
+    /// Returns the module path of a source file, with the package name first.
     ///
-    /// `module_path!()` inside the crate follows the file tree, so a function in
-    /// `src/lib.rs` sits at `crate`, and one in `src/color.rs` at
-    /// `crate::color`.
+    /// The first segment is the package name, which takes the place of `crate`
+    /// in `module_path!()`. A function in the crate root therefore sits at
+    /// `<package>`, and one in `src/color.rs` at `<package>::color`.
     ///
-    /// The crate root contributes no segment whatever it is named: a manifest
-    /// may point `[lib] path` at a file other than `lib.rs`, and treating that
-    /// file as a module would name every function in the crate one segment too
-    /// deep.
+    /// The crate root contributes no extra segment whatever it is named: a
+    /// manifest may point `[lib] path` at a file other than `lib.rs`, and
+    /// treating that file as a module would name every function in the crate
+    /// one segment too deep.
     fn module_segments(&self, path: &Path) -> Vec<String> {
-        let mut segments = vec![self.package.clone()];
+        let mut path_segments = vec![self.package.clone()];
         if path == self.crate_root {
-            return segments;
+            return path_segments;
         }
         let Ok(relative) = path.strip_prefix(&self.source_root) else {
-            return segments;
+            return path_segments;
         };
         let components: Vec<_> = relative.components().collect();
         for (index, component) in components.iter().enumerate() {
             let name = component.as_os_str().to_string_lossy();
-            let last = index + 1 == components.len();
-            let name = if last {
+            let is_last = index + 1 == components.len();
+            let name = if is_last {
                 name.strip_suffix(".rs").unwrap_or(&name).to_string()
             } else {
                 name.into_owned()
             };
-            // `lib.rs` and `mod.rs` name the module their location already
-            // implies, so they contribute no segment of their own.
+            // `lib.rs` and `mod.rs` stand for the module their folder already
+            // names, so they add no segment of their own.
             if name == "lib" || name == "mod" {
                 continue;
             }
-            segments.push(name);
+            path_segments.push(name);
         }
-        segments
+        path_segments
     }
 
-    /// The canonical path of a declaration: module path, type, function.
+    /// The full name of a declaration: module path, type, function.
     ///
     /// This is what a build script registers, because it can see the enclosing
-    /// `impl` block - so it is the name the prologue route looks up, and the one
+    /// `impl` block. It is the name the prologue route looks up and the one
     /// used for display and generation bookkeeping.
     fn qualified_name(&self, path: &Path, declaration: &source::HotFunction) -> String {
-        let segments = self.module_segments(path);
-        // Built by the scanner rather than here, so the host asks for exactly
-        // the name the build script recorded. Two hand-written implementations
-        // disagree: an inherent method is named through its receiver type, and
-        // a trait method - whose name carries both the type and the trait - has
-        // more to disagree about, not less.
-        source::inventory_name(&self.package, &segments[1..], declaration)
+        let path_segments = self.module_segments(path);
+        // The scanner builds the name so the host asks for exactly the one the
+        // build script recorded. A hand-written version would drift: an
+        // inherent method is named through its receiver type, and a trait
+        // method carries both the type and the trait in its name.
+        source::inventory_name(&self.package, &path_segments[1..], declaration)
     }
 
-    /// The path a dispatch slot is registered under, which omits the type.
+    /// The path a dispatch slot is registered under, which leaves out the type.
     ///
-    /// Deliberately different from [`Self::qualified_name`], and the difference
-    /// is forced rather than chosen. A slot's descriptor is an item, and every
-    /// item inside a method body is barred from naming `Self` (`error[E0401]`),
-    /// so `#[pill_hot_fn]` on a method can only register
-    /// `module_path!() + "::" + name`. A build script has no such limit, having
-    /// read the `impl` block directly.
+    /// It is deliberately different from [`Self::qualified_name`], and the
+    /// difference is forced rather than chosen. A slot's descriptor is an item,
+    /// and an item inside a method body cannot name `Self` (`error[E0401]`). A
+    /// `#[pill_hot_fn]` on a method can therefore only register
+    /// `module_path!() + "::" + name`, while a build script that read the
+    /// `impl` block directly has no such limit.
     ///
-    /// Two hot methods sharing a name in one module therefore collide on the
-    /// slot route. The scanner sees both and refuses the edit rather than
-    /// installing into whichever registered first.
+    /// Two hot methods that share a name in one module collide on the slot
+    /// route. The scanner sees both and refuses the edit instead of installing
+    /// into whichever registered first.
     fn slot_lookup_name(&self, path: &Path, declaration: &source::HotFunction) -> String {
-        let mut segments = self.module_segments(path);
-        segments.push(declaration.name.clone());
-        segments.join("::")
+        let mut lookup_segments = self.module_segments(path);
+        lookup_segments.push(declaration.name.clone());
+        lookup_segments.join("::")
     }
 
-    /// Bring the staged rlib back in step with cargo's own output.
+    /// Brings the staged rlib back in step with cargo's own output.
     ///
-    /// A patch links a half-frozen closure: the crate's own rlib comes from the
-    /// staged copy, while its dependencies' `--extern` entries come from the
-    /// replayed cargo line and point into the module build tree. Let those drift
-    /// apart and the compile fails with `error[E0463]: can't find crate for
-    /// <this crate>` - naming the wrong crate, and saying nothing about
-    /// staleness.
+    /// A patch links two kinds of rlib: the crate's own comes from the staged
+    /// copy, while its dependencies' `--extern` entries come from the replayed
+    /// cargo line and point into the module build tree. If the two drift apart,
+    /// the compile fails with `error[E0463]: can't find crate for <this
+    /// crate>`, which names the wrong crate. The build worker adds a hint that
+    /// the staged rlib no longer matches its dependencies.
     ///
-    /// The source of truth is the private module build tree under the host's
-    /// profile directory ([`crate::config::module_build_artifact_directory`]);
-    /// a bare `target/debug` holds nothing the host built. The staged copy is
-    /// still what the host *loads*, so a wrong-featured rlib copied here can
-    /// only make this one patch fail to compile, and the next real build
-    /// restages it.
+    /// The source is the private module build tree under the host's profile
+    /// directory ([`crate::config::module_build_artifact_directory`]); a bare
+    /// `target/debug` holds nothing the host built. The host loads the module
+    /// DLL, not this rlib, so a wrong-featured copy here can make this one
+    /// patch fail; the next real build replaces it.
     ///
     /// # Errors
     ///
-    /// Returns the error text when a freshly built rlib is there but cannot be
+    /// Returns the error text when a freshly built rlib exists but cannot be
     /// copied over the staged copy.
     fn refresh_staged_rlib(&self) -> Result<(), String> {
         // A wrapper build compiles the extension as a dependency, so the
-        // newest rlib under the build's `deps` directory is the one that
-        // build produced; a direct build leaves an unhashed copy the same
+        // newest rlib under the build's `deps` directory is the one that build
+        // produced. A direct build also leaves an unhashed copy that the same
         // helper finds.
-        let Some(built) = crate::build_runner::newest_extension_rlib(
+        let Some(newest_rlib) = crate::build_runner::newest_extension_rlib(
             &self
                 .workspace_root
                 .join(crate::config::module_build_artifact_directory()),
@@ -1502,118 +1524,121 @@ impl HotPatchSession {
             // Cargo has not produced one; the staged copy is all there is.
             return Ok(());
         };
-        if std::fs::metadata(&built).is_err() {
+        if std::fs::metadata(&newest_rlib).is_err() {
             return Ok(());
         }
-        // The same "same size and not older" rule the shared-rlib staging
-        // applies, so a staged copy either path leaves behind satisfies the
-        // other.
-        if crate::build_runner::staged_copy_is_current(&built, &self.package_rlib) {
+        // This is the same size and not-older rule the shared-rlib staging
+        // uses, so a staged copy left by either path satisfies the other.
+        if crate::build_runner::staged_copy_is_current(&newest_rlib, &self.package_rlib) {
             return Ok(());
         }
 
-        std::fs::copy(&built, &self.package_rlib).map_err(|error| {
+        std::fs::copy(&newest_rlib, &self.package_rlib).map_err(|error| {
             format!(
                 "cannot refresh the staged rlib from {}: {error}",
-                built.display()
+                newest_rlib.display()
             )
         })?;
         debug!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             package = self.package.as_str(),
-            source = %built.display(),
+            source = %newest_rlib.display(),
             "restaged the rlib so the patch links a consistent closure"
         );
         Ok(())
     }
 
-    /// The captured compiler flags, asking cargo on first use.
+    /// Captures the compiler flags, asking cargo on first use.
     ///
     /// # Errors
     ///
     /// Returns the error text when the line has to be captured and cargo cannot
-    /// run, the build fails, or it prints no invocation for this package.
+    /// run, the build fails, the crate root cannot be touched, or cargo prints
+    /// no invocation for this package.
     fn rustc_line(&mut self) -> Result<&CargoRustcLine, String> {
         if self.rustc_line.is_none() {
-            let cache = compile::flags_cache_path(&self.workspace_root, &self.package);
-            // Deliberately NOT the crate root: the flags describe the dependency
-            // graph and feature set, and the crate root is the very file being
-            // edited, so including it would invalidate the cache on every patch
-            // and re-run a full `cargo build -v` for flags that were correct.
+            let cache_path = compile::flags_cache_path(&self.workspace_root, &self.package);
+            // The crate root is deliberately NOT a freshness input. The flags
+            // describe the dependency graph and feature set, and editing source
+            // text does not change either. Including a source file would
+            // invalidate the cache on every patch and re-run a full
+            // `cargo build -v` for flags that were still correct.
             //
-            // The crate's own staged rlib IS included: the flags describe the
-            // closure this crate links, which changes exactly when the crate is
-            // rebuilt - at startup, on a module reload, or when the engine's
-            // feature set changes. A cache captured against one feature set goes
-            // silently stale against another, and rustc then reports
-            // `error[E0463]` when the patch links the fresh rlib against the old
-            // externs.
+            // The crate's own staged rlib IS included. The flags describe the
+            // closure this crate links, which changes when the crate is rebuilt:
+            // at startup, on a module reload, or when the engine's feature set
+            // changes. A cache captured against one feature set goes stale
+            // silently against another, and rustc then reports `error[E0463]`
+            // when the patch links the fresh rlib against the old externs.
             //
-            // The staged copy, not a build-tree path: a wrapper build leaves the
-            // extension's rlib under a hashed name the session cannot know, and
-            // the staged file is refreshed from it right before this runs - it
-            // is also what the patch actually links.
-            let mut freshness = vec![
+            // The staged copy is named rather than a build-tree path because a
+            // wrapper build leaves the extension's rlib under a hashed name the
+            // session cannot know. The refresh above brings the staged file up
+            // to date, and the patch links it.
+            let mut freshness_inputs = vec![
                 self.workspace_root.join("Cargo.toml"),
                 self.workspace_root.join("Cargo.lock"),
             ];
-            freshness.push(self.package_rlib.clone());
-            // The cargo configuration and the pinned toolchain decide the same
-            // flags from outside the manifest: a wrapper, a target directory
-            // override, or a toolchain switch changes what a replayed line
-            // means without moving `Cargo.toml` or the lockfile. Added only
-            // when they exist, because `load_if_fresh` refuses an unreadable
-            // input and an unconditional push would disable the cache in
-            // workspaces that have neither file.
+            freshness_inputs.push(self.package_rlib.clone());
+            // The cargo configuration and the pinned toolchain also decide the
+            // flags from outside the manifest. A wrapper, a target-directory
+            // override or a toolchain switch changes what a replayed line means
+            // without changing `Cargo.toml` or the lockfile. They are added only
+            // when they exist: `load_if_fresh` returns no cached line for an
+            // input it cannot read, so an unconditional push would disable the
+            // cache in a workspace that has neither file.
             for relative in [".cargo/config.toml", "rust-toolchain.toml"] {
                 let input = self.workspace_root.join(relative);
                 if input.exists() {
-                    freshness.push(input);
+                    freshness_inputs.push(input);
                 }
             }
-            let line = match CargoRustcLine::load_if_fresh(&cache, &freshness, &self.build_command)
-            {
+            let compiler_line = match CargoRustcLine::load_if_fresh(
+                &cache_path,
+                &freshness_inputs,
+                &self.build_command,
+            ) {
                 Some(cached) => cached,
                 None => {
-                    let captured = CargoRustcLine::capture(
+                    let captured_line = CargoRustcLine::capture(
                         &self.workspace_root,
                         &self.package,
                         &self.crate_root,
                         &self.build_command,
                     )?;
-                    let _ = captured.save(&cache, &self.build_command);
-                    captured
+                    let _ = captured_line.save(&cache_path, &self.build_command);
+                    captured_line
                 }
             };
-            self.rustc_line = Some(line);
+            self.rustc_line = Some(compiler_line);
         }
         Ok(self.rustc_line.as_ref().expect("just populated"))
     }
 }
 
 // =============================================================================
-// Free functions
+// Free Functions
 // =============================================================================
 
 /// Every `.rs` file under `root`, in stable order.
 fn rust_sources(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(directory) = stack.pop() {
+    let mut source_paths = Vec::new();
+    let mut directories_to_visit = vec![root.to_path_buf()];
+    while let Some(directory) = directories_to_visit.pop() {
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                stack.push(path);
+                directories_to_visit.push(path);
             } else if path.extension().is_some_and(|extension| extension == "rs") {
-                found.push(path);
+                source_paths.push(path);
             }
         }
     }
-    found.sort();
-    found
+    source_paths.sort();
+    source_paths
 }
 
 /// A path shortened to its file name, for console messages.

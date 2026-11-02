@@ -1,25 +1,27 @@
-//! Watch the configured source tree for file changes and signal reloads to
-//! the main thread.
+//! Watch the configured source tree for file changes and tell the main
+//! thread to reload.
 //!
 //! # Responsibilities
 //!
-//! - Spawn a worker thread that monitors the source tree for changes.
-//! - Classify file events and paths so only real source edits trigger reloads.
-//! - Bump a reload generation counter when relevant file events are
-//!   detected, letting the main thread perform a hot reload.
-//! - Record when each signal fired, so the frame loop can time the reload it
-//!   starts from the save that caused it.
-//! - Report which files changed so reloads are debuggable.
-//! - Handle cross-platform file notification differences through `notify`.
+//! - Spawn a worker thread that watches the source tree for changes.
+//! - Decide which file events and paths count as a source edit, so only a
+//!   real edit starts a reload.
+//! - Bump a reload generation counter when a relevant event arrives;
+//!   the main thread reloads when it sees a generation it has not handled.
+//! - Record when each signal fired, so the frame loop can time a reload from
+//!   the save that caused it.
+//! - Report which files changed, so a reload can be traced back to a save.
+//! - Let `notify` handle the differences between the platforms' file
+//!   notifications.
 //!
 //! # Design
 //!
-//! The file watcher runs in a separate thread to avoid blocking the main loop.
-//! A debounce window coalesces multiple file events into a single reload signal,
-//! and the changed paths collected during that window are reported to the
-//! console. The main thread compares a generation counter against the last
-//! processed value each loop, so events arriving during a reload are never
-//! lost.
+//! The watcher runs on its own thread, so watching never blocks the main
+//! loop. Several notifications for one save are joined into one signal: the
+//! worker waits out the debounce window, collects the paths it saw and
+//! reports them. The main thread compares the generation counter against the
+//! last value it handled on every loop, so a save that arrives during a
+//! reload is never lost.
 
 // Standard library
 use std::collections::HashSet;
@@ -40,15 +42,15 @@ use pill_core::{error, info};
 // Constants
 // =============================================================================
 
-/// File events arriving within this window are coalesced into one reload.
+/// File events that arrive within this window are joined into one reload.
 ///
-/// This is pure latency: it is spent sleeping, on every edit, before any work
-/// starts. It exists because one save produces several notifications - editors
-/// write, rename and touch metadata - and each would otherwise start its own
-/// rebuild. The window only has to outlast that burst, which is a few
-/// milliseconds, so it stays far below anything a developer would notice.
-/// Override with `PILL_WATCH_DEBOUNCE_MS` when an editor's save pattern needs
-/// more room.
+/// The wait is pure delay: every edit sleeps for this long before any work
+/// starts. It is needed because one save produces several notifications -
+/// editors write, rename and touch metadata - and without the wait each one
+/// would start its own rebuild. A burst lasts a few milliseconds, so the
+/// window only has to outlast that, and it stays far below what a developer
+/// would notice. Override it with `PILL_WATCH_DEBOUNCE_MS` when an editor's
+/// save pattern needs more room.
 const DEFAULT_DEBOUNCE_MILLISECONDS: u64 = 60;
 
 /// Environment variable overriding the debounce window.
@@ -60,7 +62,7 @@ const IGNORED_DIRECTORY_NAMES: [&str; 3] = ["target", "bin", "obj"];
 /// Suffixes editors use for temporary and swap files written around saves.
 const EDITOR_TEMPORARY_FILE_SUFFIXES: [&str; 3] = ["~", ".swp", ".swx"];
 
-/// Prefix shared by hidden files, which never contain source code.
+/// A file whose name starts with this is hidden, and never holds source code.
 const HIDDEN_FILE_PREFIX: &str = ".";
 
 /// Maximum number of changed paths printed per reload report.
@@ -76,8 +78,8 @@ const TRIGGER_LOG_CAPACITY: usize = 16;
 // Types
 // =============================================================================
 
-/// One debounce window's outcome: when its signal fired and how long the save
-/// had already sat before it did.
+/// What one debounce window produced: when its signal fired, and how long the
+/// save had waited before that.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SourceTrigger {
     /// The generation this trigger published, which is the value the frame
@@ -92,11 +94,11 @@ pub(crate) struct SourceTrigger {
 
 /// The project watcher's most recent triggers.
 ///
-/// Lets the frame loop measure a reload from the save that caused it: the
-/// signal's instant bounds the pipeline, and the modification-time delay the
-/// watcher already reports bounds the wait before the signal even fired.
-/// Only the project watcher publishes here; the module and renderer watchers
-/// pass `None`, because nothing times a reload from their signals.
+/// This is what lets the frame loop measure a reload from the save that caused
+/// it: the signal's instant marks the end of the wait, and the delay from the
+/// file's modification time marks the start. Only the project watcher records
+/// here; the module and renderer watchers pass `None`, because nothing times a
+/// reload from their signals.
 pub(crate) struct TriggerLog {
     /// Newest last. Guarded because the watcher thread writes while the frame
     /// thread reads.
@@ -125,8 +127,8 @@ impl TriggerLog {
 
     /// Take the trigger that published `generation`, if it is still logged.
     ///
-    /// Taken rather than read, so one signal is attributed to exactly one
-    /// reload - the reload that consumed its generation.
+    /// The entry is taken out rather than read, so one signal is counted
+    /// against exactly one reload: the reload that handled its generation.
     pub(crate) fn take(&self, generation: u64) -> Option<SourceTrigger> {
         let mut entries = self
             .entries
@@ -143,8 +145,8 @@ impl TriggerLog {
 // Free Functions
 // =============================================================================
 
-/// Returns how long a burst of file events is coalesced for, resolved once per
-/// process.
+/// Returns how long a burst of file events is joined into one signal, read
+/// once per process.
 pub(crate) fn debounce_duration() -> Duration {
     static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(|| {
@@ -156,13 +158,13 @@ pub(crate) fn debounce_duration() -> Duration {
     })
 }
 
-/// Whether an event kind represents a source change worth rebuilding for.
+/// Whether an event kind is a source change worth rebuilding for.
 ///
-/// Content changes, file creations, and file deletions all matter. Renames
-/// surface as a remove/create pair or a name modification depending on the
-/// platform, so they are covered by the same three kinds. Every `Modify` kind
-/// counts, metadata-only included, because an editor's save can surface as
-/// one; access notifications never do.
+/// Content changes, file creations and file deletions all matter. A rename
+/// arrives as a remove/create pair or as a name modification, depending on the
+/// platform, so the same three kinds cover it. Every `Modify` kind counts,
+/// metadata-only included, because an editor's save can arrive as one. Access
+/// notifications never do.
 pub(crate) fn is_relevant_event(kind: &EventKind) -> bool {
     matches!(
         kind,
@@ -170,14 +172,14 @@ pub(crate) fn is_relevant_event(kind: &EventKind) -> bool {
     )
 }
 
-/// Whether a changed absolute path should trigger a rebuild.
+/// Whether a changed absolute path should start a rebuild.
 ///
-/// Both sides are canonicalized so symlinked directories cannot smuggle
-/// events from outside the watch tree, and the remaining policy is applied
-/// to the resulting relative path. Deleted paths resolve through their
-/// nearest surviving ancestor (see
-/// [`canonicalize_through_existing_ancestor`]) because a file that was just
-/// removed cannot be canonicalized at all.
+/// Both sides are turned into their real paths first, so a symlinked directory
+/// cannot pass events from outside the watch tree. The remaining rules are
+/// then applied to the relative path. A deleted path resolves through its
+/// nearest ancestor that still exists (see
+/// [`canonicalize_through_existing_ancestor`]), because a file that was just
+/// removed cannot be resolved at all.
 fn is_relevant_path(path: &Path, watch_root: &Path) -> bool {
     let Ok(canonical_root) = watch_root.canonicalize() else {
         return false;
@@ -190,20 +192,20 @@ fn is_relevant_path(path: &Path, watch_root: &Path) -> bool {
     }
     // The `starts_with` check above already verified the prefix, so this
     // strip cannot fail.
-    let relative = canonical_path.strip_prefix(&canonical_root).unwrap();
-    is_relevant_relative_path(relative)
+    let relative_path = canonical_path.strip_prefix(&canonical_root).unwrap();
+    is_relevant_relative_path(relative_path)
 }
 
-/// Canonicalize a path that may no longer exist.
+/// Resolve a path that may no longer exist.
 ///
-/// `Path::canonicalize` needs every component to exist, which a just-deleted
-/// file cannot satisfy. This walks `Path::ancestors` to the first level that
-/// canonicalizes and re-joins the missing tail lexically, so a path that does
-/// exist resolves exactly as `canonicalize` would and a removed one still
-/// resolves to the place it occupied. A `..` in the missing tail is refused:
-/// the ancestor walk already resolved the directory structure, and letting a
-/// component climb back out of it would hand the watch-root check a path it
-/// would then trust.
+/// `Path::canonicalize` needs every part of the path to exist, and a file that
+/// was just deleted cannot meet that. This walks up through the path's
+/// ancestors to the first one that resolves, then puts the missing parts back
+/// as plain names. A path that still exists resolves exactly as `canonicalize`
+/// would, and a removed one still resolves to the place it used to occupy. A
+/// `..` among the missing parts is refused: the walk up already resolved the
+/// directory, and a component that climbed back out of it would hand the
+/// watch-root check a path it would then trust.
 fn canonicalize_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let mut missing_tail: Vec<&OsStr> = Vec::new();
     for ancestor in path.ancestors() {
@@ -223,17 +225,15 @@ fn canonicalize_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Whether a path relative to the canonical watch root should trigger a
-/// rebuild.
+/// Whether a path relative to the watch root should start a rebuild.
 ///
-/// Build output directories are ignored only at the top level of the watch
-/// tree; deeper directories may legitimately use the same names. Hidden
-/// files and directories and editor temporary files are excluded at any
-/// depth.
-fn is_relevant_relative_path(relative: &Path) -> bool {
+/// A build output directory is ignored only at the top of the watch tree;
+/// deeper directories may legitimately use the same names. Hidden files and
+/// directories, and editor temporary files, are excluded at any depth.
+fn is_relevant_relative_path(relative_path: &Path) -> bool {
     // Build outputs are anchored to the watch root: `target/...` directly
     // beneath it is compiler output, while `src/target_logic/` is source.
-    if let Some(first) = relative.components().next() {
+    if let Some(first) = relative_path.components().next() {
         if let Some(name) = first.as_os_str().to_str() {
             if IGNORED_DIRECTORY_NAMES.contains(&name) {
                 return false;
@@ -242,7 +242,7 @@ fn is_relevant_relative_path(relative: &Path) -> bool {
     }
 
     // Hidden entries are excluded at any depth.
-    for component in relative.components() {
+    for component in relative_path.components() {
         if let Some(name) = component.as_os_str().to_str() {
             if name.starts_with(HIDDEN_FILE_PREFIX) {
                 return false;
@@ -251,10 +251,10 @@ fn is_relevant_relative_path(relative: &Path) -> bool {
     }
 
     // Editor temporary files appear and disappear around every save and
-    // would otherwise trigger a rebuild of half-written content. Non-UTF-8
-    // file names are treated as relevant: they cannot match any ignore
-    // suffix, and filtering them out would silently stop hot reload.
-    match relative.file_name().and_then(|name| name.to_str()) {
+    // would otherwise start a rebuild of half-written content. A file name
+    // that is not valid UTF-8 counts as relevant: it cannot match any ignore
+    // suffix, and filtering it out would stop hot reload without a word.
+    match relative_path.file_name().and_then(|name| name.to_str()) {
         Some(name) => !EDITOR_TEMPORARY_FILE_SUFFIXES
             .iter()
             .any(|suffix| name.ends_with(suffix)),
@@ -262,15 +262,15 @@ fn is_relevant_relative_path(relative: &Path) -> bool {
     }
 }
 
-/// Spawn the notify watcher + debounce worker skeleton shared by the source,
-/// asset and shader watchers.
+/// Spawn the notify watcher and its debounce worker, the part the source,
+/// asset and shader watchers share.
 ///
-/// The callback forwards every path `path_accepts` keeps out of every event
-/// `event_accepts` accepts; the worker settles a burst with the debounce
-/// window, collects the paths it produced and hands them to `settle`, which
-/// returns whether the worker should keep running. The watcher itself moves
-/// into the worker, so its OS handles stay registered exactly as long as the
-/// worker lives. `callback_error_message` is the message reported when the
+/// The callback keeps every path that `accepts_path` allows out of every event
+/// that `accepts_event` allows. The worker waits out the debounce window,
+/// collects the paths the burst produced and hands them to `on_settled_burst`,
+/// which returns whether the worker should keep running. The watcher itself
+/// moves into the worker, so its OS handles stay registered exactly as long as
+/// the worker lives. `callback_error_message` is the message logged when the
 /// backend hands the callback an error; watching must never panic inside it,
 /// because some backends run it on their own threads.
 ///
@@ -283,9 +283,9 @@ pub(crate) fn spawn_settled_watcher<F>(
     root: PathBuf,
     thread_name: &str,
     callback_error_message: &'static str,
-    event_accepts: impl Fn(&EventKind) -> bool + Send + 'static,
-    path_accepts: impl Fn(&Path) -> bool + Send + 'static,
-    mut settle: F,
+    accepts_event: impl Fn(&EventKind) -> bool + Send + 'static,
+    accepts_path: impl Fn(&Path) -> bool + Send + 'static,
+    mut on_settled_burst: F,
 ) -> Result<(), WatcherError>
 where
     F: FnMut(&Path, Vec<PathBuf>) -> bool + Send + 'static,
@@ -296,19 +296,18 @@ where
     let mut watcher = RecommendedWatcher::new(
         move |result: Result<Event, notify::Error>| match result {
             Ok(event) => {
-                if event_accepts(&event.kind) {
+                if accepts_event(&event.kind) {
                     for path in event.paths {
-                        if path_accepts(&path) {
-                            // Failure only means the receiving thread has
-                            // shut down, so there is no recovery work for the
-                            // callback to perform.
+                        if accepts_path(&path) {
+                            // A failed send only means the worker has shut
+                            // down, and the callback can do nothing about it.
                             let _ = path_sender.send(path);
                         }
                     }
                 }
             }
-            // Never panic inside the callback, which some backends run on
-            // their own threads; report and continue.
+            // Never panic inside the callback: some backends run it on their
+            // own threads. Log the error and carry on.
             Err(error) => {
                 error!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -324,8 +323,8 @@ where
         source: Box::new(source),
     })?;
 
-    // Step 2: Register a recursive watch, which covers nested trees without
-    // requiring every caller to enumerate its own directory structure.
+    // Step 2: Register the watch as recursive, which covers the whole tree
+    // without every caller listing its own directories.
     watcher
         .watch(&root, RecursiveMode::Recursive)
         .map_err(|source| WatcherError::RegistrationFailed {
@@ -344,12 +343,12 @@ where
             let _watcher = watcher;
             while let Ok(first_path) = paths.recv() {
                 // One save can produce several notifications for the same
-                // file; let the burst settle, then collect it.
+                // file, so wait for the burst to stop before collecting it.
                 std::thread::sleep(debounce_duration());
-                let mut touched = vec![first_path];
-                touched.extend(paths.try_iter());
-                if !settle(&root, touched) {
-                    // The host dropped the watcher: stop.
+                let mut touched_paths = vec![first_path];
+                touched_paths.extend(paths.try_iter());
+                if !on_settled_burst(&root, touched_paths) {
+                    // The callback asked the worker to stop, so it ends.
                     return;
                 }
             }
@@ -360,13 +359,14 @@ where
     Ok(())
 }
 
-/// Watch the configured source tree and signal reloads from a worker thread.
+/// Watch the configured source tree and ask for a reload from a worker
+/// thread.
 ///
 /// # Errors
 ///
 /// Returns [`WatcherError::WatchDirectoryMissing`] when the joined watch path
 /// does not exist, and otherwise the failures [`spawn_settled_watcher`]
-/// reports: watcher or worker creation and watch registration.
+/// reports: creating the watcher or the worker, and registering the watch.
 pub(crate) fn spawn_source_watcher(
     workspace_root: PathBuf,
     module_name: &str,
@@ -379,8 +379,9 @@ pub(crate) fn spawn_source_watcher(
     // configuration works regardless of the process's current directory.
     let watch_path = workspace_root.join(watch_directory);
 
-    // Fail during host setup instead of silently running without hot reload
-    // when a module configuration contains an outdated source path.
+    // Fail during host setup instead of running the whole session without hot
+    // reload when a module configuration names a source path that no longer
+    // exists.
     if !watch_path.exists() {
         return Err(WatcherError::WatchDirectoryMissing {
             path: watch_path.display().to_string(),
@@ -390,16 +391,16 @@ pub(crate) fn spawn_source_watcher(
     info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         module = module_name,
-        // The configured, workspace-relative form: shorter than the joined
-        // absolute path, and free of its mixed separators.
+        // The configured form, relative to the workspace: shorter than the
+        // joined absolute path, and with one kind of separator.
         watch_directory = %watch_directory.replace('\\', "/"),
         "watching for source changes"
     );
 
-    // Step 2: Spawn the shared watcher worker with the source-specific
-    // acceptance (canonicalized under the watch root, relevant relative
-    // paths) and the source-specific settling: report, log, bump the reload
-    // generation and record the trigger.
+    // Step 2: Spawn the shared watcher worker with the filters this watcher
+    // needs (paths resolved under the watch root, relative paths that matter)
+    // and the handler for one settled burst: report the paths, log the change,
+    // add one to the reload generation and record the trigger.
     let accept_root = watch_path.clone();
     let report_root = watch_path.clone();
     spawn_settled_watcher(
@@ -408,14 +409,14 @@ pub(crate) fn spawn_source_watcher(
         "file watcher error",
         is_relevant_event,
         move |path| is_relevant_path(path, &accept_root),
-        move |_root, touched| {
+        move |_root, touched_paths| {
             // One source save can produce several notifications for the same
             // file, so the burst is deduplicated before it is reported.
-            let changed_paths: HashSet<PathBuf> = touched.into_iter().collect();
+            let changed_paths: HashSet<PathBuf> = touched_paths.into_iter().collect();
 
-            // Prepare a short report of the changed paths for the console.
-            // Paths are printed relative to the watch directory.
-            let mut report: String = changed_paths
+            // Build a short report of the changed paths for the console. Paths
+            // are printed relative to the watched directory.
+            let mut changed_path_report: String = changed_paths
                 .iter()
                 .take(REPORTED_PATH_LIMIT)
                 .map(|path| {
@@ -427,19 +428,19 @@ pub(crate) fn spawn_source_watcher(
                 .collect::<Vec<_>>()
                 .join(", ");
             if changed_paths.len() > REPORTED_PATH_LIMIT {
-                report.push_str(&format!(
+                changed_path_report.push_str(&format!(
                     " (+{} more)",
                     changed_paths.len() - REPORTED_PATH_LIMIT
                 ));
             }
-            // How long the edit sat before this thread saw it, measured from
-            // the file's own modification time. Reported at INFO because a
-            // slow save-to-live is dominated by this number rather than by
-            // the patch that follows it, and nothing outside this process can
-            // measure it without timing the whole span.
+            // How long the edit waited before this thread saw it, measured from
+            // the file's own modification time. Logged at INFO because a slow
+            // save-to-live is dominated by this number rather than by the patch
+            // that follows it, and nothing outside this process can measure it
+            // without timing the whole span.
             //
-            // The debounce window above is part of it by construction, so a
-            // healthy reading is a little over that window, not zero.
+            // The debounce window above is part of the number, so a healthy
+            // reading is a little over that window, not zero.
             let detection_delay_ms = changed_paths
                 .iter()
                 .filter_map(|path| std::fs::metadata(path).ok())
@@ -450,20 +451,20 @@ pub(crate) fn spawn_source_watcher(
                 .unwrap_or(f64::NAN);
             info!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                changed_paths = %report,
+                changed_paths = %changed_path_report,
                 detection_delay_ms = format!("{detection_delay_ms:.0}").as_str(),
                 debounce_ms = debounce_duration().as_millis() as u64,
                 "source change detected"
             );
 
-            // Bump the reload generation. The main loop compares it against
-            // the last processed value, so signals are never overwritten.
+            // Add one to the reload generation. The main loop compares the
+            // value against the last one it handled, so a signal is never lost.
             // Release publishing makes every earlier write on this thread
             // visible to the Acquire read on the frame loop.
             let generation = reload_generation.fetch_add(1, Ordering::Release) + 1;
             // Publish the signal's instant beside the counter, so the frame
-            // loop can attribute the reload it starts to this save rather
-            // than to the frame it noticed it on.
+            // loop can count the reload it starts as caused by this save rather
+            // than by the frame that noticed the save.
             if let Some(triggers) = triggers.as_ref() {
                 triggers.record(SourceTrigger {
                     generation,
@@ -491,15 +492,15 @@ mod tests {
         AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode,
     };
 
-    /// Verifies that content, creation, and removal events trigger a rebuild
-    /// while access and other events are ignored.
+    /// Checks that content, creation and removal events count as a source
+    /// change, while access and other events do not.
     #[test]
     fn relevant_events_cover_changes_and_exclude_noise() {
         assert!(is_relevant_event(&EventKind::Create(CreateKind::File)));
         assert!(is_relevant_event(&EventKind::Modify(ModifyKind::Data(
             DataChange::Any
         ))));
-        // Renames surface as name modifications on some platforms.
+        // A rename arrives as a name modification on some platforms.
         assert!(is_relevant_event(&EventKind::Modify(ModifyKind::Name(
             RenameMode::Both
         ))));
@@ -510,9 +511,9 @@ mod tests {
         assert!(!is_relevant_event(&EventKind::Other));
     }
 
-    /// Verifies that build output directories are filtered out only at the
-    /// top level of the watch tree while deeper source directories using the
-    /// same names stay relevant.
+    /// Checks that a build output directory is skipped only at the top of the
+    /// watch tree, while a deeper source directory with the same name still
+    /// counts.
     #[test]
     fn build_output_directories_are_filtered_only_at_the_watch_root() {
         assert!(!is_relevant_relative_path(Path::new(
@@ -524,7 +525,7 @@ mod tests {
         assert!(!is_relevant_relative_path(Path::new(
             "obj/x64/project.cache"
         )));
-        // Deeper directories may legitimately use these names.
+        // A deeper directory may legitimately use one of these names.
         assert!(is_relevant_relative_path(Path::new(
             "src/target_logic/module.rs"
         )));
@@ -533,7 +534,7 @@ mod tests {
         assert!(is_relevant_relative_path(Path::new("Bird.cs")));
     }
 
-    /// Verifies that hidden files and directories are excluded at any depth.
+    /// Checks that a hidden file or directory is skipped at any depth.
     #[test]
     fn hidden_files_and_directories_are_filtered_out() {
         assert!(!is_relevant_relative_path(Path::new(".hidden_file")));
@@ -542,7 +543,7 @@ mod tests {
         )));
     }
 
-    /// Verifies that editor temporary and swap files never trigger a rebuild.
+    /// Checks that an editor's temporary and swap files never start a rebuild.
     #[test]
     fn editor_temporary_and_swap_files_are_filtered_out() {
         assert!(!is_relevant_relative_path(Path::new("src/main.rs~")));
@@ -550,9 +551,9 @@ mod tests {
         assert!(!is_relevant_relative_path(Path::new("src/main.rs.swx")));
     }
 
-    /// Verifies that deleting a source file inside the watch tree stays
-    /// relevant, which a plain `canonicalize` cannot express, while deletion
-    /// of editor noise and of files outside the root stays irrelevant.
+    /// Checks that deleting a source file inside the watch tree still counts as
+    /// a change, which a plain `canonicalize` cannot express, while deleting
+    /// editor noise or a file outside the root does not.
     #[test]
     fn deleted_source_files_stay_relevant() {
         let base = std::env::temp_dir().join(format!("pill_watcher_delete_{}", std::process::id()));
@@ -576,8 +577,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Verifies that paths outside the watch root are rejected, which also
-    /// closes the symlink-escape hatch.
+    /// Checks that a file outside the watch root is rejected and one inside it
+    /// is accepted. Both sides are resolved to their real paths before the
+    /// comparison, which is also what stops a symlink from leading out of the
+    /// tree.
     #[test]
     fn paths_outside_the_watch_root_are_filtered_out() {
         let base = std::env::temp_dir().join(format!("pill_watcher_test_{}", std::process::id()));
@@ -597,8 +600,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Verifies that the trigger log hands each generation back exactly once
-    /// and stays bounded when a caller never reads it.
+    /// Checks that the trigger log hands each generation back exactly once,
+    /// and that it stays within its bound when nobody reads it.
     #[test]
     fn trigger_log_takes_each_generation_once_and_stays_bounded() {
         let log = TriggerLog::new();
@@ -629,9 +632,9 @@ mod tests {
         assert!(log.take(TRIGGER_LOG_CAPACITY as u64 + 4).is_some());
     }
 
-    /// Verifies that non-UTF-8 file names stay relevant instead of being
-    /// silently filtered out. Unix-only because non-UTF-8 `OsStr` literals are
-    /// not constructible through stable APIs on Windows.
+    /// Checks that a file name that is not valid UTF-8 still counts, instead of
+    /// being dropped without a word. Unix-only, because a non-UTF-8 `OsStr`
+    /// cannot be built through stable APIs on Windows.
     #[cfg(unix)]
     #[test]
     fn non_utf8_file_names_stay_relevant() {

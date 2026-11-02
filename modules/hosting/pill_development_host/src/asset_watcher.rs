@@ -1,28 +1,34 @@
-//! Development asset reload: watch the project's `res`, and turn edits into
-//! the source paths whose assets need importing again.
+//! Development asset reload: watch the project's `res` folder and report which
+//! source assets an edit affects.
 //!
 //! # Responsibilities
 //!
-//! - Watch the project's asset directory recursively, debounce edits like
-//!   source edits, and map each edited file to the source asset it concerns:
-//!   a source is itself, a metadata file (`a.png.meta`) is its source.
+//! - Watch the project's asset directory recursively and group a burst of
+//!   events into one batch (debounce), the same way source edits are grouped.
+//!   Each edited file maps to the source asset it belongs to: an asset file is
+//!   its own source, and a metadata file (`a.png.meta`) belongs to the source
+//!   named before `.meta`.
 //! - Queue each change as an [`AssetChange`] for the main thread, which
 //!   imports or reimports it through the world's
 //!   [`ImportRegistry`](pill_engine::ImportRegistry).
 //!
 //! # Design
 //!
-//! The worker thread runs only host code: it never calls into a module image,
-//! so a reload can swap any image at any time without a thread running inside
-//! the one being retired. The main thread applies the queue at the frame
-//! boundary, after the reloads, through the registrations current at that
-//! moment - the same split the shader watcher uses. The watcher reports paths,
-//! not decisions: whether a path is an asset at all, whether it is loaded, and
-//! what to do about a deleted source are the main thread's to decide, where
-//! the registry and the asset store are.
+//! The worker thread runs only host code and never calls into a module. A
+//! reload can therefore unload a module at any moment and never leave a thread
+//! running inside code that is going away. The main thread applies the queue
+//! at the frame boundary, after the reloads, using the import registrations
+//! that are current at that moment. The shader watcher splits the work the
+//! same way.
 //!
-//! Dot-files are ignored: a metadata write goes through a temporary sibling
-//! named `.<file>.<pid>-<n>.tmp`, and the file it produces is what counts.
+//! The watcher reports paths, not decisions. Whether a changed path is an
+//! asset at all, whether it is loaded, and what to do about a deleted source
+//! are all decided on the main thread, where the registry and the asset store
+//! live.
+//!
+//! Dot-files are ignored. A metadata write goes through a temporary sibling
+//! named `.<file name>.<pid>-<n>.tmp`, and the file it produces is what
+//! counts.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -48,7 +54,7 @@ const METADATA_SUFFIX: &str = ".meta";
 // Types
 // =============================================================================
 
-/// What happened to one source asset, as far as the files say.
+/// One source asset's change, worked out from the files on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AssetChange {
     /// The source or its metadata file was created or edited: import it, or
@@ -71,15 +77,15 @@ pub(crate) enum AssetChange {
     },
 }
 
-/// A running asset watcher; dropping it stops the worker at its next settled
-/// burst.
+/// A running asset watcher. Dropping it makes the worker stop when it next
+/// reports a batch.
 pub(crate) struct AssetWatcher {
-    /// Changes, oldest first, one per source per debounce window.
+    /// Queued changes, oldest first; at most one per source per batch.
     changes: Receiver<AssetChange>,
 }
 
 impl AssetWatcher {
-    /// Watch `asset_directory` and queue what changes in it.
+    /// Watches `asset_directory` and queues every change in it.
     ///
     /// Returns `Ok(None)` when the directory does not exist: a project without
     /// `res` has nothing to reload.
@@ -101,11 +107,11 @@ impl AssetWatcher {
             "[assets] watching the project's assets for edits"
         );
 
-        // Step 2: Register the shared watcher worker with the asset
-        // acceptance: every relevant event plus any rename side, which a
-        // backend may report as a name modification rather than as a create
-        // and a remove. Paths pass unfiltered: which of them are assets is the
-        // main thread's decision.
+        // Step 2: Start the shared watcher worker. It accepts every relevant
+        // event and any rename event: some backends report a rename as a name
+        // change rather than as a create and a remove. All paths pass
+        // through, because deciding which of them are assets is the main
+        // thread's job.
         spawn_settled_watcher(
             asset_directory,
             "pill asset watcher",
@@ -113,7 +119,7 @@ impl AssetWatcher {
             |kind: &EventKind| is_relevant_event(kind) || is_rename(kind),
             |_path: &Path| true,
             move |root, touched| {
-                for change in classify(root, &touched) {
+                for change in classify_touched_paths(root, &touched) {
                     if change_sender.send(change).is_err() {
                         // The host dropped the watcher: stop.
                         return false;
@@ -136,8 +142,8 @@ impl AssetWatcher {
 // Free Functions
 // =============================================================================
 
-/// Whether the event is one side of a rename, which some backends report as
-/// neither a create nor a remove.
+/// Returns whether the event is one side of a rename. Some backends report a
+/// rename this way instead of as a create and a remove.
 fn is_rename(kind: &EventKind) -> bool {
     matches!(
         kind,
@@ -147,26 +153,28 @@ fn is_rename(kind: &EventKind) -> bool {
     )
 }
 
-/// One change per source among `touched`, decided by what is on disk now.
+/// Turns the paths of one batch into one change per source, based on what is
+/// on disk now.
 ///
-/// What exists after the debounce is what counts, not the event kinds: an
-/// editor saving through a temporary file reports a remove and a create for
-/// one save, and the file being there is what says it was an edit.
-fn classify(asset_directory: &Path, touched: &[PathBuf]) -> Vec<AssetChange> {
-    // Keyed by source, so several events for one asset within a window - the
-    // source and its metadata, or one save reported three times - become one.
-    let mut by_source: BTreeMap<String, AssetChange> = BTreeMap::new();
+/// What exists after the debounce is what counts, not the event kinds. When an
+/// editor saves through a temporary file, one save shows up as a remove and a
+/// create; the source file still being there is what makes it an edit.
+fn classify_touched_paths(asset_directory: &Path, touched: &[PathBuf]) -> Vec<AssetChange> {
+    // One entry per source, so several events for the same asset in one batch
+    // (the source and its metadata, or one save reported three times) collapse
+    // into a single change.
+    let mut changes_by_source: BTreeMap<String, AssetChange> = BTreeMap::new();
     for path in touched {
-        let Some(relative) = relative_to(asset_directory, path) else {
+        let Some(relative_path) = relative_to(asset_directory, path) else {
             continue;
         };
-        let file_name = relative.rsplit('/').next().unwrap_or(&relative);
+        let file_name = relative_path.rsplit('/').next().unwrap_or(&relative_path);
         if file_name.starts_with('.') || path.is_dir() {
             continue;
         }
-        let (source, through_metadata) = match relative.strip_suffix(METADATA_SUFFIX) {
+        let (source, through_metadata) = match relative_path.strip_suffix(METADATA_SUFFIX) {
             Some(source) if !source.is_empty() => (source.to_owned(), true),
-            _ => (relative.clone(), false),
+            _ => (relative_path.clone(), false),
         };
         let source_exists = asset_directory.join(&source).is_file();
         let change = if !source_exists {
@@ -183,11 +191,11 @@ fn classify(asset_directory: &Path, touched: &[PathBuf]) -> Vec<AssetChange> {
                 through_metadata,
             }
         };
-        // A source edit outranks a metadata event for the same asset in one
-        // window: both mean "decode again", and the source edit is the more
-        // informative of the two in the log.
-        let keep_existing = matches!(
-            (by_source.get(&source), &change),
+        // A source edit wins over a metadata edit for the same asset in one
+        // batch. Both mean the asset must be read again, but only the source
+        // edit also imports it when nothing has loaded it yet.
+        let should_keep_existing = matches!(
+            (changes_by_source.get(&source), &change),
             (
                 Some(AssetChange::Edited {
                     through_metadata: false,
@@ -196,19 +204,20 @@ fn classify(asset_directory: &Path, touched: &[PathBuf]) -> Vec<AssetChange> {
                 AssetChange::Edited { .. }
             )
         );
-        if !keep_existing {
-            by_source.insert(source, change);
+        if !should_keep_existing {
+            changes_by_source.insert(source, change);
         }
     }
-    by_source.into_values().collect()
+    changes_by_source.into_values().collect()
 }
 
-/// `path` relative to `root` with `/` separators, or `None` when it lies
-/// outside `root`, equals it, or is not UTF-8.
-fn relative_to(root: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(root).ok()?;
-    let text = relative.to_str()?.replace('\\', "/");
-    (!text.is_empty()).then_some(text)
+/// Returns `path` relative to `asset_directory`, with `/` separators. Returns
+/// `None` when the path is outside `asset_directory`, is that directory itself,
+/// or is not UTF-8.
+fn relative_to(asset_directory: &Path, path: &Path) -> Option<String> {
+    let relative_path = path.strip_prefix(asset_directory).ok()?;
+    let slash_separated_path = relative_path.to_str()?.replace('\\', "/");
+    (!slash_separated_path.is_empty()).then_some(slash_separated_path)
 }
 
 // =============================================================================
@@ -231,8 +240,8 @@ mod tests {
             Self(root)
         }
 
-        fn write(&self, relative: &str) -> PathBuf {
-            let path = self.0.join(relative);
+        fn write(&self, relative_path: &str) -> PathBuf {
+            let path = self.0.join(relative_path);
             std::fs::write(&path, b"x").unwrap();
             path
         }
@@ -251,7 +260,7 @@ mod tests {
         let metadata = scratch.write("textures/a.png.meta");
 
         assert_eq!(
-            classify(&scratch.0, &[metadata]),
+            classify_touched_paths(&scratch.0, &[metadata]),
             [AssetChange::Edited {
                 source: "textures/a.png".to_owned(),
                 through_metadata: true,
@@ -266,7 +275,7 @@ mod tests {
         let metadata = scratch.write("textures/a.png.meta");
 
         assert_eq!(
-            classify(&scratch.0, &[source.clone(), metadata, source]),
+            classify_touched_paths(&scratch.0, &[source.clone(), metadata, source]),
             [AssetChange::Edited {
                 source: "textures/a.png".to_owned(),
                 through_metadata: false,
@@ -279,7 +288,7 @@ mod tests {
         let scratch = Scratch::new("removed");
         scratch.write("textures/kept.png");
 
-        let changes = classify(
+        let changes = classify_touched_paths(
             &scratch.0,
             &[
                 scratch.0.join("textures/gone.png"),
@@ -305,7 +314,7 @@ mod tests {
         let scratch = Scratch::new("ignored");
         let temporary = scratch.write("textures/.a.png.meta.12-0.tmp");
 
-        let changes = classify(
+        let changes = classify_touched_paths(
             &scratch.0,
             &[
                 temporary,
