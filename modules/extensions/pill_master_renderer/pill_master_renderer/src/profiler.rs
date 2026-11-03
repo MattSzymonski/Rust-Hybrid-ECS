@@ -7,14 +7,15 @@
 //!
 //! # Design
 //!
-//! Query sets are allocated once with a per-frame cap; each frame resolves into
-//! one slot of an eight-deep ring (`FRAMES_IN_FLIGHT`), and a later frame
-//! collects a slot once the GPU has finished writing it, so a readback never
-//! waits on the frame being recorded. A slot still waiting costs its frame the
-//! queries rather than overwriting results nobody has read. Every capability is
-//! optional: a device without the timestamp or pipeline statistics features
-//! gets `None` where a query set would be, and occlusion queries need no
-//! feature at all.
+//! Each query set is created once with a per-frame cap. A frame records its
+//! queries into one slot of an eight-slot ring (`FRAMES_IN_FLIGHT`), and a
+//! later frame reads that slot back once the GPU has finished with it, so no
+//! frame waits for a readback. A slot that is still waiting makes its frame
+//! record no queries, rather than overwrite results nobody has read yet.
+//!
+//! Every capability is optional. A device without the timestamp or pipeline
+//! statistics features gets `None` where a query set would be, and occlusion
+//! queries need no feature at all.
 
 // Standard library
 use std::cell::Cell;
@@ -49,34 +50,36 @@ The three query kinds, and what each number answers:
   fragments that ran the fragment shader (per sample with MSAA).
 */
 
-/// Environment variable that turns GPU profiling on (`PILL_GPU_PROFILE=1`).
-const GPU_PROFILE_VARIABLE: &str = "PILL_GPU_PROFILE";
+// =============================================================================
+// Constants
+// =============================================================================
 
 /// The device features GPU profiling needs: timestamps written between
-/// passes, and pipeline statistics counted inside them.
+/// passes, and pipeline statistics queried inside a pass.
 pub(crate) const GPU_PROFILE_FEATURES: Features = Features::TIMESTAMP_QUERY
     .union(Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
     .union(Features::PIPELINE_STATISTICS_QUERY);
 
-/// Whether `PILL_GPU_PROFILE` asks for GPU profiling. Off by default: the
-/// queries cost GPU time on every frame that records them.
-pub(crate) fn gpu_profiling_requested() -> bool {
-    std::env::var(GPU_PROFILE_VARIABLE).is_ok_and(|value| value != "0" && !value.is_empty())
-}
+/// Environment variable that turns GPU profiling on (`PILL_GPU_PROFILE=1`).
+const GPU_PROFILE_ENVIRONMENT_VARIABLE: &str = "PILL_GPU_PROFILE";
 
-/// How many frames' results can wait for their readback at once.
+/// How many frames can be waiting for their results at once.
 ///
-/// A frame whose ring slot is still waiting records no queries, so the ring
-/// has to be deeper than the GPU runs behind: too shallow a ring drops results
-/// whenever the GPU is a few frames late. The slots are a few hundred bytes
-/// each.
+/// The ring must be deeper than the GPU can fall behind the CPU. A frame whose
+/// slot is still waiting records no queries, so too shallow a ring loses that
+/// frame's measurements whenever the GPU is a few frames late. A slot holds
+/// only resolved values, so the ring stays small.
 const FRAMES_IN_FLIGHT: usize = 8;
 
-/// GPU-side profiling using wgpu query sets.
+// =============================================================================
+// Profiler
+// =============================================================================
+
+/// GPU profiling through wgpu query sets.
 ///
-/// Owns one query set per category (timestamps, occlusion and pipeline
-/// statistics) plus a ring of resolve buffers per category, so a readback can
-/// map one slot while a later frame still records into another.
+/// Holds one query set per category (timestamps, occlusion and pipeline
+/// statistics), plus a ring of resolve buffers per category. That lets a
+/// readback map one slot while a later frame still records into another.
 pub struct Profiler {
     timestamp_query_set: Option<QuerySet>,
     // One name per timestamp recorded this frame, in query index order.
@@ -85,33 +88,33 @@ pub struct Profiler {
     pipeline_statistics_types: PipelineStatisticsTypes,
     occlusion_query_set: Option<QuerySet>,
 
-    // Per-frame caps, as passed to [`Profiler::new`].
+    // Per-frame caps, as passed to `Profiler::new`.
     max_timestamp_queries: u32,
     max_pipeline_statistics_queries: u32,
     max_occlusion_queries: u32,
 
-    // Rolling per-frame indices
+    // Query counters, reset at the start of each frame.
     current_timestamp_query: Cell<u32>,
     current_pipeline_statistics_query: Cell<u32>,
     current_occlusion_query: Cell<u32>,
 
-    // Resolve buffers (ring) for readback, one per in-flight frame
+    // One resolve slot per in-flight frame, used for readback.
     timestamp_buffers: Vec<Option<ResolveSlot>>,
-    pipeline_buffers: Vec<Option<ResolveSlot>>,
+    pipeline_statistics_buffers: Vec<Option<ResolveSlot>>,
     occlusion_buffers: Vec<Option<ResolveSlot>>,
 
-    // Bytes per query result set
-    timestamp_queries_result_bytes: u64,
-    pipeline_statistics_queries_result_bytes: u64,
+    // Bytes per query result entry
+    timestamp_query_result_bytes: u64,
+    pipeline_statistics_query_result_bytes: u64,
 
     // Frame index for the ring
     frame_index: usize,
 
     // Conversion period (nanoseconds per timestamp tick)
-    timestamp_period_ns: f32,
+    timestamp_period_nanoseconds: f32,
 
-    // Tracy's GPU timeline, while a profiler is connected (see
-    // `attach_timeline`), and the API it is labelled with once asked for.
+    // Tracy's GPU timeline, which exists while a profiler is connected (see
+    // `attach_timeline`), and the API label it was created with.
     timeline: Option<GpuTimeline>,
     timeline_api: Option<GpuApi>,
     // Counts the timelines created, one per profiler connection, so a
@@ -129,70 +132,20 @@ pub struct Profiler {
     latest_occlusion: Vec<u64>,
 }
 
-/// What one ring slot's frame recorded, kept until its results are read
-/// back without blocking.
-#[derive(Default)]
-struct FrameRecord {
-    /// One per timestamp pair: the Tracy zone its timestamps time, or
-    /// `None` when Tracy had no zone to give.
-    spans: Vec<Option<GpuTimelineSpan>>,
-    /// The timeline generation the zones began on.
-    timeline_generation: u64,
-    timestamp_names: Vec<String>,
-    timestamp_count: u32,
-    statistics_count: u32,
-    occlusion_count: u32,
-    /// The timestamp, statistics and occlusion readbacks in flight.
-    timestamp_map: Option<MapState>,
-    statistics_map: Option<MapState>,
-    occlusion_map: Option<MapState>,
-}
-
-impl FrameRecord {
-    /// Whether a readback was asked for and every one asked for finished.
-    fn is_ready(&self) -> bool {
-        let finished = |map: &Option<MapState>| map.as_ref().is_none_or(MapState::finished);
-        self.is_waiting()
-            && finished(&self.timestamp_map)
-            && finished(&self.statistics_map)
-            && finished(&self.occlusion_map)
-    }
-
-    /// Whether this slot still waits for a readback.
-    fn is_waiting(&self) -> bool {
-        self.timestamp_map.is_some()
-            || self.statistics_map.is_some()
-            || self.occlusion_map.is_some()
-    }
-}
-
-/// The first `count` values of a mapped readback's bytes.
-fn first_values(bytes: &[u8], count: usize) -> Vec<u64> {
-    let values: &[u64] = bytemuck::cast_slice(bytes);
-    values[..count.min(values.len())].to_vec()
-}
-
-/// Says that a kind of measurement never arrived, so a profiling run reports
-/// why it has no numbers instead of reporting nothing.
-fn warn_readback(kind: &str) {
-    warn!(
-        target: pill_core::telemetry::telemetry_target::RENDERING,
-        "PILL_GPU_PROFILE: the {kind} readback could not be read, so this frame reports none"
-    );
-}
-
 impl Profiler {
-    /// Creates a profiler against `device` and `queue`.
+    /// Creates a profiler for `device` and `queue`.
     ///
-    /// The `max_*` arguments are per-frame caps: a recording past its
-    /// cap is refused with a printed notice rather than overwriting an
-    /// earlier query of the same kind. Query sets for the feature-gated
-    /// categories are only created for the features the device was created
-    /// with (an adapter offering one is not enough: the device has to have
-    /// requested it, see [`GPU_PROFILE_FEATURES`]), so on a device without
-    /// timestamp or pipeline statistics support the matching readers always
-    /// answer `None`. Occlusion queries are core in wgpu and need no feature,
-    /// so only the cap decides whether that set exists.
+    /// Each `max_*` argument is a per-frame cap. Recording past a cap is
+    /// refused with a warning in the log instead of overwriting an earlier
+    /// query of the same kind.
+    ///
+    /// A query set for a feature-gated category is created only when the
+    /// device was created with that feature. An adapter that offers a feature
+    /// is not enough, because the device has to request it (see
+    /// [`GPU_PROFILE_FEATURES`]). On a device without the timestamp or
+    /// pipeline statistics features, the matching readers always answer
+    /// `None`. Occlusion queries need no feature in wgpu, so only the cap
+    /// decides whether that set exists.
     pub fn new(
         device: &Device,
         queue: &Queue,
@@ -201,13 +154,15 @@ impl Profiler {
         pipeline_statistics_types: PipelineStatisticsTypes, // Type of pipeline statistics to collect
         max_occlusion_queries: u32, // Number of occlusion queries per frame (one per geometry pass)
     ) -> Self {
-        let features = device.features();
+        // Step 1: Check which profiling features the device was created with.
         // `write_timestamp` on an encoder is what this profiler calls, so the
         // inside-encoders bit is required, not just the query feature.
+        let features = device.features();
         let has_timestamps = features
             .contains(Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         let has_pipeline_statistics = features.contains(Features::PIPELINE_STATISTICS_QUERY);
 
+        // Step 2: Create one query set per category the device supports.
         let timestamp_query_set = if has_timestamps && max_timestamp_queries > 0 {
             Some(device.create_query_set(&QuerySetDescriptor {
                 label: Some("gpu_profiler.timestamp_query_set"),
@@ -229,9 +184,9 @@ impl Profiler {
                 None
             };
 
-        // Occlusion query set: one query per geometry pass counts the samples
-        // that survived its depth and stencil tests. Core in wgpu, so no
-        // feature check - only the cap can leave it out.
+        // Occlusion queries are core in wgpu, so they need no feature. One
+        // query per geometry pass counts the samples that survived its depth
+        // and stencil tests, and only the cap can leave the set out.
         let occlusion_query_set = if max_occlusion_queries > 0 {
             Some(device.create_query_set(&QuerySetDescriptor {
                 label: Some("gpu_profiler.occlusion_query_set"),
@@ -242,22 +197,21 @@ impl Profiler {
             None
         };
 
-        // Bytes per query result entry
-        let timestamp_queries_result_bytes = std::mem::size_of::<u64>() as u64;
+        // Step 3: Size one result entry for each category.
+        let timestamp_query_result_bytes = std::mem::size_of::<u64>() as u64;
         let pipeline_statistics_fields = pipeline_statistics_types.bits().count_ones() as u64;
-        let pipeline_statistics_queries_result_bytes = if pipeline_statistics_fields == 0 {
+        let pipeline_statistics_query_result_bytes = if pipeline_statistics_fields == 0 {
             0
         } else {
             pipeline_statistics_fields * std::mem::size_of::<u64>() as u64
         };
 
-        // Resolve buffers ring (created lazily on first use)
+        // Step 4: Start every ring slot empty and read the timestamp period.
         let timestamp_buffers = (0..FRAMES_IN_FLIGHT).map(|_| None).collect();
-        let pipeline_buffers = (0..FRAMES_IN_FLIGHT).map(|_| None).collect();
+        let pipeline_statistics_buffers = (0..FRAMES_IN_FLIGHT).map(|_| None).collect();
         let occlusion_buffers = (0..FRAMES_IN_FLIGHT).map(|_| None).collect();
 
-        // Timestamp period
-        let timestamp_period_ns = if has_timestamps {
+        let timestamp_period_nanoseconds = if has_timestamps {
             queue.get_timestamp_period()
         } else {
             0.0
@@ -279,14 +233,14 @@ impl Profiler {
             current_occlusion_query: Cell::new(0),
 
             timestamp_buffers,
-            pipeline_buffers,
+            pipeline_statistics_buffers,
             occlusion_buffers,
 
-            timestamp_queries_result_bytes,
-            pipeline_statistics_queries_result_bytes,
+            timestamp_query_result_bytes,
+            pipeline_statistics_query_result_bytes,
 
             frame_index: 0,
-            timestamp_period_ns,
+            timestamp_period_nanoseconds,
 
             timeline: None,
             timeline_api: None,
@@ -301,31 +255,34 @@ impl Profiler {
         }
     }
 
-    /// Shows the timestamps in Tracy, on a GPU timeline labelled `api`.
+    /// Sets the API that Tracy labels the GPU timeline with.
     ///
-    /// The timeline exists while a profiler is connected: Tracy drops every
-    /// event until one connects, so a timeline created before that would
-    /// never be announced, and the profiler would be sent zones of a
-    /// timeline it does not know. [`Self::follow_profiler_connection`]
-    /// creates it.
+    /// The timeline is created later, when a profiler connects. Tracy drops
+    /// every event until one connects, so a timeline created earlier would
+    /// never be announced, and Tracy would receive zones for a timeline it
+    /// does not know. [`Self::follow_profiler_connection`] creates it.
+    ///
+    /// Does nothing when the device has no timestamp queries.
     pub fn attach_timeline(&mut self, api: GpuApi) {
         if self.timestamp_query_set.is_some() {
             self.timeline_api = Some(api);
         }
     }
 
-    /// Creates the timeline when a profiler connects and drops it when the
-    /// profiler goes, so every connection gets a timeline of its own.
+    /// Creates the GPU timeline when a profiler connects, and drops it when
+    /// the profiler disconnects, so every connection gets its own timeline.
     ///
-    /// Tracy aligns GPU time with CPU time from one timestamp taken as the
-    /// timeline is created, so creating one records a timestamp, submits
-    /// it and waits for it: one stall per connection.
+    /// Tracy aligns GPU time with CPU time using one timestamp taken when the
+    /// timeline is created. Creating it therefore records one timestamp,
+    /// submits it and waits for it, which stalls once per connection.
     fn follow_profiler_connection(&mut self, device: &Device, queue: &Queue) {
+        // Step 1: Drop the timeline once no profiler is connected any more.
         let connected = pill_core::profiling::profiler_connected();
         if !connected && self.timeline.is_some() {
             self.forget_pending_spans();
             self.timeline = None;
         }
+        // Step 2: Create a timeline when a profiler connects and none exists.
         let (true, None, Some(api), Some(query_set)) = (
             connected,
             &self.timeline,
@@ -334,20 +291,25 @@ impl Profiler {
         ) else {
             return;
         };
-        let Some(now) = read_current_timestamp(device, queue, query_set) else {
+        let Some(now_ticks) = read_current_timestamp(device, queue, query_set) else {
             warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: could not read a starting timestamp, so Tracy shows no GPU timeline");
             self.timeline_api = None;
             return;
         };
         // Zones still waiting belong to the previous connection.
         self.forget_pending_spans();
-        self.timeline = GpuTimeline::new("GPU", api, now as i64, self.timestamp_period_ns);
+        self.timeline = GpuTimeline::new(
+            "GPU",
+            api,
+            now_ticks as i64,
+            self.timestamp_period_nanoseconds,
+        );
         self.timeline_generation += 1;
     }
 
-    /// Lets go of every zone still waiting for its timestamps without
-    /// telling Tracy: they began on a timeline the profiler no longer
-    /// knows, and dropping one would send its end there.
+    /// Releases every zone that is still waiting for its timestamps, without
+    /// telling Tracy. These zones belong to a timeline the profiler no longer
+    /// knows, so sending their end there would point at nothing.
     fn forget_pending_spans(&mut self) {
         for record in &mut self.frames {
             for span in record.spans.drain(..).flatten() {
@@ -356,17 +318,21 @@ impl Profiler {
         }
     }
 
-    /// Call once at the start of frame.
+    /// Starts a frame: collects the results of earlier frames that are ready,
+    /// then resets this frame's query counters.
     ///
-    /// Hands the results earlier frames have finished reading back to Tracy
-    /// first. When this frame's ring slot still waits for its readback (the
-    /// GPU is more frames behind than the ring is deep), the frame records
-    /// no queries rather than overwrite results not read yet.
+    /// When this frame's ring slot is still waiting for its readback, the GPU
+    /// is further behind than the ring is deep. The frame then records no
+    /// queries, rather than overwrite results nobody has read yet.
     pub fn begin_frame(&mut self, device: &Device, queue: &Queue) {
-        // Runs the map callbacks of whatever the GPU finished, without waiting.
+        // Step 1: Run the map callbacks for whatever the GPU finished, without
+        // waiting, and collect the results that are ready.
         let _ = device.poll(PollType::Poll);
         self.collect_finished_frames();
+        // Step 2: Create or drop the Tracy timeline to match the connection.
         self.follow_profiler_connection(device, queue);
+        // Step 3: Reset this frame's counters, and skip the frame when its ring
+        // slot is still waiting.
         self.skipping_frame = self.frames[self.frame_index].is_waiting();
         self.current_timestamp_query.set(0);
         self.current_pipeline_statistics_query.set(0);
@@ -374,27 +340,29 @@ impl Profiler {
         self.timestamp_query_names.clear();
     }
 
-    /// Call once at the end of frame, after the frame was submitted.
+    /// Ends the frame once it was submitted, and moves the ring on.
     ///
-    /// Starts reading this frame's results back without waiting for them;
-    /// a later [`Self::begin_frame`] collects them once the GPU is done. Then
-    /// advances the ring, so the next frame resolves into another slot.
+    /// When the frame recorded queries, this starts their readbacks without
+    /// waiting for them. A later [`Self::begin_frame`] collects the results
+    /// once the GPU is done. The ring then advances, so the next frame
+    /// resolves into another slot.
     pub fn end_frame(&mut self) {
+        // Step 1: Start a readback for each category the frame recorded.
         if !self.skipping_frame {
-            let slot = self.frame_index;
+            let slot_index = self.frame_index;
             let timestamp_count = self.current_timestamp_query.get();
             let statistics_count = self.current_pipeline_statistics_query.get();
             let occlusion_count = self.current_occlusion_query.get();
-            let timestamp_buffer = self.timestamp_buffers[slot]
+            let timestamp_buffer = self.timestamp_buffers[slot_index]
                 .as_ref()
-                .map(|buffers| &buffers.readback);
-            let statistics_buffer = self.pipeline_buffers[slot]
+                .map(|resolve_slot| &resolve_slot.readback);
+            let statistics_buffer = self.pipeline_statistics_buffers[slot_index]
                 .as_ref()
-                .map(|buffers| &buffers.readback);
-            let occlusion_buffer = self.occlusion_buffers[slot]
+                .map(|resolve_slot| &resolve_slot.readback);
+            let occlusion_buffer = self.occlusion_buffers[slot_index]
                 .as_ref()
-                .map(|buffers| &buffers.readback);
-            let record = &mut self.frames[slot];
+                .map(|resolve_slot| &resolve_slot.readback);
+            let record = &mut self.frames[slot_index];
             record.timestamp_names = self.timestamp_query_names.clone();
             record.timestamp_count = timestamp_count;
             record.statistics_count = statistics_count;
@@ -409,29 +377,30 @@ impl Profiler {
                 .filter(|_| occlusion_count > 0)
                 .map(MapState::start);
         }
+        // Step 2: Move the ring on, so the next frame uses another slot.
         self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT;
     }
 
-    /// Reads back every ring slot whose results arrived: uploads its
-    /// timestamps to its Tracy zones, plots its statistics, and keeps the
-    /// timings, statistics and occlusion counts for [`Self::log_latest`].
+    /// Collects every ring slot whose readbacks are done. It uploads the
+    /// slot's timestamps to their Tracy zones, plots its statistics, and keeps
+    /// the timings, statistics and occlusion counts for [`Self::log_latest`].
     fn collect_finished_frames(&mut self) {
-        for slot in 0..FRAMES_IN_FLIGHT {
-            if !self.frames[slot].is_ready() {
+        for slot_index in 0..FRAMES_IN_FLIGHT {
+            if !self.frames[slot_index].is_ready() {
                 continue;
             }
-            let mut record = std::mem::take(&mut self.frames[slot]);
+            let mut record = std::mem::take(&mut self.frames[slot_index]);
             if record.timeline_generation != self.timeline_generation || self.timeline.is_none() {
                 for span in record.spans.drain(..).flatten() {
                     span.discard();
                 }
             }
 
-            if let (Some(state), Some(buffers)) =
-                (&record.timestamp_map, &self.timestamp_buffers[slot])
+            if let (Some(map_state), Some(resolve_slot)) =
+                (&record.timestamp_map, &self.timestamp_buffers[slot_index])
             {
-                let ticks = match state.poll(&buffers.readback, |bytes| {
-                    first_values(bytes, record.timestamp_count as usize)
+                let ticks = match map_state.poll(&resolve_slot.readback, |bytes| {
+                    first_u64_values(bytes, record.timestamp_count as usize)
                 }) {
                     Readback::Done(ticks) => ticks,
                     Readback::Pending | Readback::Failed => Vec::new(),
@@ -459,42 +428,45 @@ impl Profiler {
                 }
             }
 
-            if let (Some(state), Some(buffers)) =
-                (&record.statistics_map, &self.pipeline_buffers[slot])
-            {
+            if let (Some(map_state), Some(resolve_slot)) = (
+                &record.statistics_map,
+                &self.pipeline_statistics_buffers[slot_index],
+            ) {
                 let stride = self.pipeline_statistics_types.bits().count_ones() as usize;
-                let values = match state.poll(&buffers.readback, |bytes| {
-                    first_values(bytes, record.statistics_count as usize * stride)
+                let statistic_values = match map_state.poll(&resolve_slot.readback, |bytes| {
+                    first_u64_values(bytes, record.statistics_count as usize * stride)
                 }) {
-                    Readback::Done(values) => values,
+                    Readback::Done(statistic_values) => statistic_values,
                     Readback::Pending | Readback::Failed => Vec::new(),
                 };
-                if values.is_empty() && record.statistics_count > 0 {
+                if statistic_values.is_empty() && record.statistics_count > 0 {
                     warn_readback("pipeline statistics");
                 }
-                let statistics: Vec<GpuStatistics> = values
+                let statistics: Vec<GpuStatistics> = statistic_values
                     .chunks_exact(stride.max(1))
-                    .map(|query| statistics_of(self.pipeline_statistics_types, query))
+                    .map(|query_values| statistics_of(self.pipeline_statistics_types, query_values))
                     .collect();
                 if !statistics.is_empty() {
-                    // The plots show the frame: every geometry pass together.
+                    // Plot the whole frame as one sample: every geometry pass
+                    // added up.
                     let mut frame_total = GpuStatistics::default();
-                    for pass in &statistics {
-                        frame_total.vertex_invocations += pass.vertex_invocations;
-                        frame_total.clipper_invocations += pass.clipper_invocations;
-                        frame_total.clipper_primitives_out += pass.clipper_primitives_out;
-                        frame_total.fragment_invocations += pass.fragment_invocations;
+                    for query_statistics in &statistics {
+                        frame_total.vertex_invocations += query_statistics.vertex_invocations;
+                        frame_total.clipper_invocations += query_statistics.clipper_invocations;
+                        frame_total.clipper_primitives_out +=
+                            query_statistics.clipper_primitives_out;
+                        frame_total.fragment_invocations += query_statistics.fragment_invocations;
                     }
                     pill_core::profiling::plot_gpu_statistics(frame_total);
                     self.latest_statistics = statistics;
                 }
             }
 
-            if let (Some(state), Some(buffers)) =
-                (&record.occlusion_map, &self.occlusion_buffers[slot])
+            if let (Some(map_state), Some(resolve_slot)) =
+                (&record.occlusion_map, &self.occlusion_buffers[slot_index])
             {
-                let samples = match state.poll(&buffers.readback, |bytes| {
-                    first_values(bytes, record.occlusion_count as usize)
+                let samples = match map_state.poll(&resolve_slot.readback, |bytes| {
+                    first_u64_values(bytes, record.occlusion_count as usize)
                 }) {
                     Readback::Done(samples) => samples,
                     Readback::Pending | Readback::Failed => Vec::new(),
@@ -506,22 +478,23 @@ impl Profiler {
                     self.latest_occlusion = samples;
                 }
             }
-            // The record's zones drop here, every one uploaded.
+            // The record is dropped at the end of this step. Dropping a span
+            // hands its zone to Tracy.
         }
     }
 
-    /// Logs the most recent pass timings, occlusion samples and pipeline
-    /// statistics read back, without waiting for the GPU.
+    /// Logs the latest timings, occlusion samples and pipeline statistics that
+    /// were read back, without waiting for the GPU.
     ///
-    /// `viewport_pixels` is the frame's drawable area in pixels; the occlusion
-    /// block reports each geometry pass's samples against it. Pass `0` to
-    /// report the raw counts without a percentage.
+    /// `viewport_pixels` is the drawable area of the frame in pixels. The
+    /// occlusion block reports its total visible samples as a share of it.
+    /// Pass `0` to report raw counts without a percentage.
     pub fn log_latest(&self, viewport_pixels: u64) {
         if !self.latest_timings.is_empty() {
             let lines = self
                 .latest_timings
                 .iter()
-                .map(|(label, ms)| format!("{label:<24}: {ms:6.3} ms"));
+                .map(|(label, milliseconds)| format!("{label:<24}: {milliseconds:6.3} ms"));
             info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU timestamps", lines));
         }
         if !self.latest_occlusion.is_empty() {
@@ -538,31 +511,37 @@ impl Profiler {
                 .latest_occlusion
                 .iter()
                 .enumerate()
-                .map(|(pass, samples)| format!("{:<24}: {samples} samples", format!("pass {pass}")))
+                .map(|(pass_index, samples)| {
+                    format!("{:<24}: {samples} samples", format!("pass {pass_index}"))
+                })
                 .collect();
             lines.push(format!("{:<24}: {total} samples ({coverage})", "visible"));
             info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU occlusion", lines));
         }
         if !self.latest_statistics.is_empty() {
-            let lines = self
-                .latest_statistics
-                .iter()
-                .enumerate()
-                .flat_map(|(query, pass)| {
+            let lines = self.latest_statistics.iter().enumerate().flat_map(
+                |(query_index, query_statistics)| {
                     [
-                        format!("query {query}:"),
-                        format!("  {:>24}: {}", "VS invocations", pass.vertex_invocations),
+                        format!("query {query_index}:"),
                         format!(
                             "  {:>24}: {}",
-                            "Clipper invocations", pass.clipper_invocations
+                            "VS invocations", query_statistics.vertex_invocations
                         ),
                         format!(
                             "  {:>24}: {}",
-                            "Clipper primitives out", pass.clipper_primitives_out
+                            "Clipper invocations", query_statistics.clipper_invocations
                         ),
-                        format!("  {:>24}: {}", "FS invocations", pass.fragment_invocations),
+                        format!(
+                            "  {:>24}: {}",
+                            "Clipper primitives out", query_statistics.clipper_primitives_out
+                        ),
+                        format!(
+                            "  {:>24}: {}",
+                            "FS invocations", query_statistics.fragment_invocations
+                        ),
                     ]
-                });
+                },
+            );
             info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU pipeline statistics", lines));
         }
     }
@@ -572,23 +551,25 @@ impl Profiler {
     /// Returns the timestamp query set, or `None` when the device was created
     /// without the timestamp features or the cap was zero.
     ///
-    /// For callers that want to write timestamps themselves; prefer
-    /// [`Self::write_timestamp`], which keeps the index and name bookkeeping
-    /// the summaries rely on.
+    /// For a caller that writes timestamps itself. Prefer
+    /// [`Self::write_timestamp`], which also keeps the query indices and names
+    /// that the summaries use.
     pub fn get_timestamp_query_set(&self) -> Option<&QuerySet> {
         self.timestamp_query_set.as_ref()
     }
 
-    /// Writes a timestamp and returns its query index.
+    /// Writes a timestamp for the region called `name` and returns its query
+    /// index.
     ///
-    /// Called twice around a region to time: the pair's ticks are the region's
-    /// GPU time, and the pair shares the name given to the first call.
+    /// Call it twice around the region to time. The pair's ticks are the
+    /// region's GPU time, and the pair is reported under the name given to the
+    /// first call.
     pub fn write_timestamp(&mut self, encoder: &mut CommandEncoder, name: &str) -> Option<u32> {
         if self.skipping_frame {
             return None;
         }
         if let Some(query_set) = &self.timestamp_query_set {
-            // Check if there is space for another timestamp
+            // Refuse the timestamp once this frame's cap is reached.
             if self.current_timestamp_query.get() >= self.max_timestamp_queries {
                 warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: timestamp queries are full for this frame");
                 return None;
@@ -598,11 +579,11 @@ impl Profiler {
             self.current_timestamp_query.set(index + 1);
             encoder.write_timestamp(query_set, index);
 
-            // Store the name in parallel with the timestamp index
+            // Keep the name at the same index as the timestamp.
             self.timestamp_query_names.push(name.to_string());
 
-            // Timestamps come in pairs around a region: the first opens its
-            // Tracy zone, now, on this thread; the second ends it.
+            // Timestamps come in pairs around a region. The first opens the
+            // pair's Tracy zone now, on this thread; the second closes it.
             let record = &mut self.frames[self.frame_index];
             record.timeline_generation = self.timeline_generation;
             if index.is_multiple_of(2) {
@@ -632,10 +613,10 @@ impl Profiler {
             if count == 0 {
                 return;
             }
-            let byte_len = self.timestamp_queries_result_bytes * count as u64;
+            let byte_len = self.timestamp_query_result_bytes * count as u64;
 
-            let index = self.frame_index;
-            let slot = &mut self.timestamp_buffers[index];
+            let slot_index = self.frame_index;
+            let slot = &mut self.timestamp_buffers[slot_index];
             let buffers = ensure_buffer_slot(
                 device,
                 slot,
@@ -645,7 +626,8 @@ impl Profiler {
 
             encoder.resolve_query_set(query_set, 0..count, &buffers.resolve, 0);
 
-            // Resolved results are not mappable; copied into the buffer that is.
+            // Resolved results cannot be mapped, so they are copied into the
+            // readback buffer.
 
             encoder.copy_buffer_to_buffer(&buffers.resolve, 0, &buffers.readback, 0, byte_len);
         }
@@ -653,13 +635,14 @@ impl Profiler {
 
     /// Converts a delta of timestamp ticks to milliseconds.
     pub fn timestamp_ticks_to_ms(&self, delta_ticks: u64) -> f32 {
-        (delta_ticks as f32 * self.timestamp_period_ns) / 1_000_000.0
+        (delta_ticks as f32 * self.timestamp_period_nanoseconds) / 1_000_000.0
     }
 
     // --- Pipeline statistics ---
 
-    /// Exposes the pipeline statistics query set beside its type mask, for a
-    /// caller that begins and ends the queries itself.
+    /// Returns the pipeline statistics query set together with the statistics
+    /// types it was created for, for a caller that begins and ends the queries
+    /// itself.
     pub fn pipeline_statistics_query_set(&self) -> Option<(&QuerySet, PipelineStatisticsTypes)> {
         self.pipeline_statistics_query_set
             .as_ref()
@@ -676,7 +659,7 @@ impl Profiler {
             return None;
         }
         if let Some(query_set) = &self.pipeline_statistics_query_set {
-            // Check if there is space for another pipeline statistics query
+            // Refuse the query once this frame's cap is reached.
             if self.current_pipeline_statistics_query.get() >= self.max_pipeline_statistics_queries
             {
                 warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: pipeline statistics queries are full for this frame");
@@ -695,18 +678,18 @@ impl Profiler {
     /// Ends the pipeline statistics query most recently begun in
     /// `render_pass`.
     ///
-    /// Pairs with [`Self::begin_pipeline_statistics_query`]; the counters
-    /// become readable once the frame's queries are resolved.
+    /// Pairs with [`Self::begin_pipeline_statistics_query`]. The counters can
+    /// be read once the frame's queries are resolved.
     pub fn end_pipeline_statistics_query(&self, render_pass: &mut wgpu::RenderPass<'_>) {
         render_pass.end_pipeline_statistics_query();
     }
 
-    /// Resolves the pipeline statistics recorded this frame into the current
-    /// ring slot.
+    /// Resolves this frame's pipeline statistics queries into the current ring
+    /// slot.
     ///
-    /// A no-op when the feature is unsupported or no query was begun this
-    /// frame, so a frame with nothing to resolve leaves its ring slot at
-    /// whatever the previous resolve put there.
+    /// Does nothing when the feature is unsupported or no query was begun this
+    /// frame. In that case the slot keeps whatever the previous resolve put
+    /// there.
     pub fn resolve_pipeline_statistics_queries(
         &mut self,
         device: &Device,
@@ -717,10 +700,10 @@ impl Profiler {
             if count == 0 {
                 return;
             }
-            let byte_len = self.pipeline_statistics_queries_result_bytes * count as u64;
+            let byte_len = self.pipeline_statistics_query_result_bytes * count as u64;
 
-            let index = self.frame_index;
-            let slot = &mut self.pipeline_buffers[index];
+            let slot_index = self.frame_index;
+            let slot = &mut self.pipeline_statistics_buffers[slot_index];
             let buffers = ensure_buffer_slot(
                 device,
                 slot,
@@ -730,7 +713,8 @@ impl Profiler {
 
             encoder.resolve_query_set(query_set, 0..count, &buffers.resolve, 0);
 
-            // Resolved results are not mappable; copied into the buffer that is.
+            // Resolved results cannot be mapped, so they are copied into the
+            // readback buffer.
 
             encoder.copy_buffer_to_buffer(&buffers.resolve, 0, &buffers.readback, 0, byte_len);
         }
@@ -741,14 +725,14 @@ impl Profiler {
     /// Exposes the occlusion query set for a geometry pass's
     /// `RenderPassDescriptor.occlusion_query_set`.
     ///
-    /// `None` when the cap was zero. A pass only begins queries through
-    /// [`Self::begin_occlusion_query`], which is also what refuses during a
-    /// skipped frame.
+    /// `None` when the cap was zero. A pass begins its queries through
+    /// [`Self::begin_occlusion_query`], which also refuses during a skipped
+    /// frame.
     pub fn get_occlusion_query_set(&self) -> Option<&QuerySet> {
         self.occlusion_query_set.as_ref()
     }
 
-    /// Begins the next occlusion query in `render_pass`; returns its index.
+    /// Begins the next occlusion query in `render_pass` and returns its index.
     ///
     /// One query per geometry pass counts the samples that passed the depth
     /// and stencil tests while it was open, so the pass's visible coverage is
@@ -769,17 +753,16 @@ impl Profiler {
 
     /// Ends the occlusion query most recently begun in `render_pass`.
     ///
-    /// Pairs with [`Self::begin_occlusion_query`]; the sample counts become
-    /// readable once the frame's queries are resolved.
+    /// Pairs with [`Self::begin_occlusion_query`]. The sample counts can be
+    /// read once the frame's queries are resolved.
     pub fn end_occlusion_query(&self, render_pass: &mut wgpu::RenderPass<'_>) {
         render_pass.end_occlusion_query();
     }
 
-    /// Resolves the occlusion queries recorded this frame into the current
-    /// ring slot.
+    /// Resolves this frame's occlusion queries into the current ring slot.
     ///
-    /// A no-op when no query set exists or no query was begun this frame,
-    /// mirroring [`Self::resolve_pipeline_statistics_queries`].
+    /// Does nothing when no query set exists or no query was begun this frame,
+    /// like [`Self::resolve_pipeline_statistics_queries`].
     pub fn resolve_occlusion_queries(&mut self, device: &Device, encoder: &mut CommandEncoder) {
         if let Some(query_set) = &self.occlusion_query_set {
             let count = self.current_occlusion_query.get();
@@ -789,8 +772,8 @@ impl Profiler {
             // One u64 per occlusion query.
             let byte_len = std::mem::size_of::<u64>() as u64 * count as u64;
 
-            let index = self.frame_index;
-            let slot = &mut self.occlusion_buffers[index];
+            let slot_index = self.frame_index;
+            let slot = &mut self.occlusion_buffers[slot_index];
             let buffers = ensure_buffer_slot(
                 device,
                 slot,
@@ -800,27 +783,99 @@ impl Profiler {
 
             encoder.resolve_query_set(query_set, 0..count, &buffers.resolve, 0);
 
-            // Resolved results are not mappable; copied into the buffer that is.
+            // Resolved results cannot be mapped, so they are copied into the
+            // readback buffer.
 
             encoder.copy_buffer_to_buffer(&buffers.resolve, 0, &buffers.readback, 0, byte_len);
         }
     }
 }
 
-/// One ring slot's buffers: queries resolve into `resolve`, which is copied
-/// into `readback` for the CPU to map. wgpu only lets a mappable buffer be a
-/// copy destination, so a query cannot resolve straight into one.
+// =============================================================================
+// Frame Record
+// =============================================================================
+
+/// What one ring slot's frame recorded. It is kept until its results are
+/// collected without blocking the frame.
+#[derive(Default)]
+struct FrameRecord {
+    /// The Tracy zone for each timestamp pair, or `None` when no timeline was
+    /// attached when the pair began.
+    spans: Vec<Option<GpuTimelineSpan>>,
+    /// The timeline generation the zones began on.
+    timeline_generation: u64,
+    timestamp_names: Vec<String>,
+    timestamp_count: u32,
+    statistics_count: u32,
+    occlusion_count: u32,
+    /// The timestamp, statistics and occlusion readbacks in flight.
+    timestamp_map: Option<MapState>,
+    statistics_map: Option<MapState>,
+    occlusion_map: Option<MapState>,
+}
+
+impl FrameRecord {
+    /// Whether at least one readback was asked for, and all of them finished.
+    fn is_ready(&self) -> bool {
+        let is_finished =
+            |map_state: &Option<MapState>| map_state.as_ref().is_none_or(MapState::finished);
+        self.is_waiting()
+            && is_finished(&self.timestamp_map)
+            && is_finished(&self.statistics_map)
+            && is_finished(&self.occlusion_map)
+    }
+
+    /// Whether this slot still waits for a readback.
+    fn is_waiting(&self) -> bool {
+        self.timestamp_map.is_some()
+            || self.statistics_map.is_some()
+            || self.occlusion_map.is_some()
+    }
+}
+
+// =============================================================================
+// Resolve Slot
+// =============================================================================
+
+/// One ring slot's buffers. Queries resolve into `resolve`, which is then
+/// copied into `readback` for the CPU to map. wgpu only allows a mappable
+/// buffer as a copy destination, so a query cannot resolve into one directly.
 struct ResolveSlot {
     resolve: Buffer,
     readback: Buffer,
 }
 
-/// Returns the ring slot's buffers, creating or replacing them when they
-/// cannot already hold `size` bytes.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Whether `PILL_GPU_PROFILE` asks for GPU profiling. Off by default: the
+/// queries cost GPU time on every frame that records them.
+pub(crate) fn gpu_profiling_requested() -> bool {
+    std::env::var(GPU_PROFILE_ENVIRONMENT_VARIABLE)
+        .is_ok_and(|value| value != "0" && !value.is_empty())
+}
+
+/// The first `count` 64-bit values of a mapped readback's bytes.
+fn first_u64_values(bytes: &[u8], count: usize) -> Vec<u64> {
+    let values: &[u64] = bytemuck::cast_slice(bytes);
+    values[..count.min(values.len())].to_vec()
+}
+
+/// Reports that one kind of measurement never arrived, so a profiling run
+/// explains why it has no numbers instead of staying silent.
+fn warn_readback(measurement: &str) {
+    warn!(
+        target: pill_core::telemetry::telemetry_target::RENDERING,
+        "PILL_GPU_PROFILE: the {measurement} readback could not be read, so this frame reports none"
+    );
+}
+
+/// Returns the slot's buffers, creating them when they cannot hold `size`
+/// bytes.
 ///
-/// A slot only ever grows: once a frame with many queries has asked for a
-/// large buffer, later smaller frames reuse that allocation instead of
-/// shrinking it.
+/// A slot only grows. Once a frame with many queries has asked for a large
+/// buffer, later smaller frames reuse that allocation instead of shrinking it.
 #[inline]
 fn ensure_buffer_slot<'a>(
     device: &wgpu::Device,
@@ -828,12 +883,12 @@ fn ensure_buffer_slot<'a>(
     size: u64,
     label: &str,
 ) -> &'a ResolveSlot {
-    let need_new = slot
+    let needs_new_buffer = slot
         .as_ref()
-        .map(|buffers| buffers.resolve.size() < size)
+        .map(|resolve_slot| resolve_slot.resolve.size() < size)
         .unwrap_or(true);
-    if need_new {
-        let buffer = |usage: BufferUsages| {
+    if needs_new_buffer {
+        let create_buffer = |usage: BufferUsages| {
             device.create_buffer(&BufferDescriptor {
                 label: Some(label),
                 size,
@@ -842,20 +897,20 @@ fn ensure_buffer_slot<'a>(
             })
         };
         *slot = Some(ResolveSlot {
-            resolve: buffer(BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC),
-            readback: buffer(BufferUsages::MAP_READ | BufferUsages::COPY_DST),
+            resolve: create_buffer(BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC),
+            readback: create_buffer(BufferUsages::MAP_READ | BufferUsages::COPY_DST),
         });
     }
     slot.as_ref().unwrap()
 }
 
-/// One query's pipeline statistics, read in the order wgpu writes them: one
-/// value per statistic `types` asked for, lowest flag first.
-fn statistics_of(types: PipelineStatisticsTypes, query: &[u64]) -> GpuStatistics {
+/// Reads one query's pipeline statistics in the order wgpu writes them: one
+/// value per statistic in `types`, lowest flag first.
+fn statistics_of(types: PipelineStatisticsTypes, query_values: &[u64]) -> GpuStatistics {
     let mut statistics = GpuStatistics::default();
-    let mut values = query.iter().copied();
+    let mut remaining_values = query_values.iter().copied();
     for flag in types.iter() {
-        let value = values.next().unwrap_or(0);
+        let value = remaining_values.next().unwrap_or(0);
         if flag == PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS {
             statistics.vertex_invocations = value;
         } else if flag == PipelineStatisticsTypes::CLIPPER_INVOCATIONS {
@@ -869,11 +924,13 @@ fn statistics_of(types: PipelineStatisticsTypes, query: &[u64]) -> GpuStatistics
     statistics
 }
 
-/// The GPU's clock now, in timestamp ticks: one timestamp written, submitted
-/// and waited for. `None` when the readback fails.
+/// Reads the GPU's clock now, in timestamp ticks.
+///
+/// This writes one timestamp, submits it and waits for its readback, so the
+/// caller stalls. Returns `None` when the device poll or the readback fails.
 fn read_current_timestamp(device: &Device, queue: &Queue, query_set: &QuerySet) -> Option<u64> {
     let size = std::mem::size_of::<u64>() as u64;
-    let buffer = |usage: BufferUsages| {
+    let create_buffer = |usage: BufferUsages| {
         device.create_buffer(&BufferDescriptor {
             label: Some("gpu_profiler.calibration"),
             size,
@@ -881,8 +938,8 @@ fn read_current_timestamp(device: &Device, queue: &Queue, query_set: &QuerySet) 
             mapped_at_creation: false,
         })
     };
-    let resolve = buffer(BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC);
-    let readback = buffer(BufferUsages::MAP_READ | BufferUsages::COPY_DST);
+    let resolve = create_buffer(BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC);
+    let readback = create_buffer(BufferUsages::MAP_READ | BufferUsages::COPY_DST);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("gpu_profiler.calibration"),
@@ -892,18 +949,22 @@ fn read_current_timestamp(device: &Device, queue: &Queue, query_set: &QuerySet) 
     encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    let state = MapState::start(&readback);
+    let map_state = MapState::start(&readback);
     device
         .poll(PollType::Wait {
             submission_index: None,
             timeout: None,
         })
         .ok()?;
-    match state.poll(&readback, |bytes| first_values(bytes, 1)) {
+    match map_state.poll(&readback, |bytes| first_u64_values(bytes, 1)) {
         Readback::Done(values) => values.first().copied(),
         Readback::Pending | Readback::Failed => None,
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -1,31 +1,33 @@
-//! Development shader reload, data half: re-cooked WGSL in, shader assets out.
+//! Development shader reload, data half: writes a re-cooked WGSL file into the
+//! shader assets built from it.
 //!
 //! # Responsibilities
 //!
-//! - Map one re-cooked WGSL file back to the shader assets built from it,
-//!   through the same table the pipelines embed their WGSL from.
-//! - Put the new text into those assets, which moves their content version, so
-//!   the GPU module rebuilds exactly those shaders on its next sync.
+//! - Map one re-cooked WGSL file back to the shader assets built from it, using
+//!   the table each pipeline publishes ([`all_shader_sources`]).
+//! - Write the new text into those assets. That raises their content version,
+//!   so the GPU module rebuilds only those shaders on its next sync.
 //! - Offer that as `pill_render_data_shader_changed`, a named C-ABI export the
 //!   development host calls.
 //!
 //! # Design
 //!
-//! Watching and cooking are the host's: a worker thread there cooks the crate's
-//! HLSL sources with `pill_assets::cook_shader_tree` - the routine this crate's
-//! build script runs - and hands each re-cooked file to the main thread, which
-//! calls this export from the data module generation that is current at that
-//! moment. The data crate stays free of `notify` and of the cooker, and a reload
-//! of it never leaves a watcher thread running code in a retired image.
+//! Watching and cooking belong to the host: a worker thread there cooks the
+//! crate's HLSL sources with `pill_assets::cook_shader_tree`, the routine this
+//! crate's build script also runs, and passes each re-cooked file to the main
+//! thread. That thread calls this export on whichever data module generation
+//! is current at that moment. The data crate uses neither `notify` nor the
+//! cooker at run time, so reloading it cannot leave a watcher thread running
+//! code from a retired image.
 //!
-//! A shader edit is an asset edit. The renderer's pipelines store their shaders
+//! A shader edit is an asset edit. The renderer's pipelines keep their shaders
 //! as `Shader` assets, and the GPU module rebuilds any asset whose content
-//! version moved, so nothing here touches a device, a pipeline or a bind group.
-//! An asset is only rewritten when the new text differs from what it holds, so
+//! version went up. Nothing here touches a device, a pipeline or a bind group.
+//! An asset is rewritten only when the new text differs from what it holds, so
 //! a save that changes nothing costs no GPU work.
 //!
-//! Compiled into native development builds and the tests: a shipping build has
-//! no sources to watch and no host to deliver edits.
+//! This module is compiled into native debug builds and the tests. A shipping
+//! build has no sources to watch and no host to deliver edits.
 
 // Standard library
 use std::slice;
@@ -37,40 +39,51 @@ use pill_engine::{AssetManager, World};
 use crate::assets::Shader;
 use crate::config::{all_shader_sources, ShaderSourceRecord};
 
-/// What [`pill_render_data_shader_changed`] returns when it could not look at
-/// the assets at all: a null world, a world without an `AssetManager`, a null
-/// buffer whose length is not zero, or a path or text that is not UTF-8.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// What [`pill_render_data_shader_changed`] returns when it cannot reach the
+/// shader assets at all.
+///
+/// That is a null world, a world without an `AssetManager`, a null buffer with
+/// a non-zero length, or a path or text that is not UTF-8.
 pub const SHADER_CHANGE_REFUSED: u32 = u32::MAX;
 
-/// Replace one stage's WGSL in every recorded shader asset built from
-/// `relative_path`, and return the names of the assets whose text changed.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Replaces one stage's WGSL in every recorded shader asset built from
+/// `relative_path` and returns the names of the assets whose text changed.
 ///
-/// `relative_path` is relative to the crate's `shader_sources/`, with `/`
-/// separators, as the records spell it. A record whose asset is not in the store
-/// - a pipeline this project never installed - is skipped.
+/// `relative_path` is relative to the crate's `shader_sources/` and uses `/`
+/// separators, which is how the records spell it. A record whose asset is not
+/// in the store is skipped, which happens for a pipeline this project never
+/// installed (the opt-in simple pipeline, for example).
 pub fn apply_shader_source<'a>(
     assets: &mut AssetManager,
     relative_path: &str,
     wgsl: &str,
-    records: impl IntoIterator<Item = &'a ShaderSourceRecord>,
+    shader_source_records: impl IntoIterator<Item = &'a ShaderSourceRecord>,
 ) -> Vec<&'static str> {
-    let mut updated = Vec::new();
-    for record in records {
+    let mut changed_shader_asset_names = Vec::new();
+    for record in shader_source_records {
         let feeds_vertex = record.vertex_path == relative_path;
         let feeds_fragment = record.fragment_path == relative_path;
         if !feeds_vertex && !feeds_fragment {
             continue;
         }
-        let Some(current) = assets.get_by_name::<Shader>(record.shader_asset_name) else {
+        let Some(stored_shader) = assets.get_by_name::<Shader>(record.shader_asset_name) else {
             continue;
         };
-        let unchanged = (!feeds_vertex || current.vertex_wgsl == wgsl)
-            && (!feeds_fragment || current.fragment_wgsl == wgsl);
+        let unchanged = (!feeds_vertex || stored_shader.vertex_wgsl == wgsl)
+            && (!feeds_fragment || stored_shader.fragment_wgsl == wgsl);
         if unchanged {
             continue;
         }
-        // The mutable borrow is what moves the asset's content version, so it
-        // is taken only for a shader whose text really changed.
+        // Borrowing the asset mutably is what raises its content version, so
+        // the borrow is taken only for a shader whose text changed.
         if let Some(shader) = assets.get_by_name_mut::<Shader>(record.shader_asset_name) {
             if feeds_vertex {
                 shader.vertex_wgsl = wgsl.to_owned();
@@ -78,24 +91,26 @@ pub fn apply_shader_source<'a>(
             if feeds_fragment {
                 shader.fragment_wgsl = wgsl.to_owned();
             }
-            updated.push(record.shader_asset_name);
+            changed_shader_asset_names.push(record.shader_asset_name);
         }
     }
-    updated
+    changed_shader_asset_names
 }
 
-/// Put one re-cooked WGSL file into the shader assets built from it, in
+/// Writes one re-cooked WGSL file into the shader assets built from it, in
 /// `world`'s `AssetManager`.
 ///
-/// `path` is the cooked file relative to the crate's `shader_sources/`, with `/`
-/// separators (`pbr_pipeline/shaders/pbr_fragment.wgsl`); `wgsl` is its text.
-/// Returns how many shader assets changed, or [`SHADER_CHANGE_REFUSED`].
+/// `path` is the cooked file's path relative to the crate's `shader_sources/`,
+/// with `/` separators (for example
+/// `pbr_pipeline/shaders/pbr_fragment.wgsl`), and `wgsl` is its text. The
+/// return value is the number of shader assets that changed, or
+/// [`SHADER_CHANGE_REFUSED`].
 ///
 /// # Safety
 ///
-/// `world` must be null or point at a live `World` no one else is using for
-/// the call's duration. `path`/`wgsl` must reference their declared lengths in
-/// readable memory, unless the matching length is zero.
+/// `world` must be null or point at a live `World` that nothing else uses for
+/// the duration of the call. `path` and `wgsl` must each point at their
+/// declared number of readable bytes, unless that length is zero.
 #[no_mangle]
 pub unsafe extern "C" fn pill_render_data_shader_changed(
     world: *mut World,
@@ -104,34 +119,44 @@ pub unsafe extern "C" fn pill_render_data_shader_changed(
     wgsl: *const u8,
     wgsl_len: usize,
 ) -> u32 {
-    // SAFETY: forwarded from the caller's contract.
+    // Step 1: Read both buffers as UTF-8 text.
+    // SAFETY: the caller guarantees that each buffer is readable for the length
+    // it passes, which is what `read_text` requires.
     let (Some(path), Some(wgsl)) = (unsafe { read_text(path, path_len) }, unsafe {
         read_text(wgsl, wgsl_len)
     }) else {
         return SHADER_CHANGE_REFUSED;
     };
-    // SAFETY: the caller guarantees `world` is null or live and unshared.
+    // Step 2: Find the asset store the world holds.
+    // SAFETY: the caller guarantees `world` is null or a live world nothing
+    // else uses.
     let Some(world) = (unsafe { world.as_mut() }) else {
         return SHADER_CHANGE_REFUSED;
     };
     let Some(assets) = world.get_resource_mut::<AssetManager>() else {
         return SHADER_CHANGE_REFUSED;
     };
-    let updated = apply_shader_source(assets, path, wgsl, all_shader_sources());
+    // Step 3: Write the text into the assets built from it.
+    let changed_shader_asset_names = apply_shader_source(assets, path, wgsl, all_shader_sources());
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         path,
-        shaders = ?updated,
+        shaders = ?changed_shader_asset_names,
         "shader source applied"
     );
-    updated.len() as u32
+    changed_shader_asset_names.len() as u32
 }
 
-/// Borrow `length` bytes at `pointer` as UTF-8 text; `None` when they are not.
+/// Borrows `length` bytes at `pointer` as UTF-8 text.
+///
+/// Returns `None` when those bytes are not valid UTF-8, or when `pointer` is
+/// null and `length` is not zero. A zero length always yields empty text.
 ///
 /// # Safety
 ///
-/// `pointer` must reference `length` readable bytes, unless `length` is zero.
+/// `pointer` must point at `length` readable bytes, unless `length` is zero.
+/// The returned text borrows those bytes, so whoever holds it must keep them
+/// alive and unmodified for as long as it is used.
 unsafe fn read_text<'a>(pointer: *const u8, length: usize) -> Option<&'a str> {
     if length == 0 {
         return Some("");
@@ -144,6 +169,10 @@ unsafe fn read_text<'a>(pointer: *const u8, length: usize) -> Option<&'a str> {
     std::str::from_utf8(bytes).ok()
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,11 +184,12 @@ mod tests {
         fragment_path: "test/test_fragment.wgsl",
     };
 
-    /// The text `RECORD`'s stages were built from.
+    /// The vertex text the test shader is built from.
     const RECORD_VERTEX: &str = "vertex one";
+    /// The fragment text the test shader is built from.
     const RECORD_FRAGMENT: &str = "fragment one";
 
-    /// A store holding `test.shader`, built from that text.
+    /// A store holding `test.shader`, built from the two texts above.
     fn store_with_shader() -> (AssetManager, pill_engine::Handle<Shader>) {
         let mut assets = AssetManager::new();
         let shader = Shader::new("test")
@@ -177,14 +207,14 @@ mod tests {
         let (mut assets, handle) = store_with_shader();
         let before = assets.content_version(handle);
 
-        let updated = apply_shader_source(
+        let changed_shader_asset_names = apply_shader_source(
             &mut assets,
             "test/test_fragment.wgsl",
             "fragment two",
             [&RECORD],
         );
 
-        assert_eq!(updated, ["test.shader"]);
+        assert_eq!(changed_shader_asset_names, ["test.shader"]);
         let shader = assets.get(handle).expect("still live");
         assert_eq!(shader.fragment_wgsl, "fragment two");
         assert_eq!(shader.vertex_wgsl, RECORD_VERTEX);
@@ -196,14 +226,14 @@ mod tests {
         let (mut assets, handle) = store_with_shader();
         let before = assets.content_version(handle);
 
-        let updated = apply_shader_source(
+        let changed_shader_asset_names = apply_shader_source(
             &mut assets,
             "test/test_vertex.wgsl",
             RECORD_VERTEX,
             [&RECORD],
         );
 
-        assert!(updated.is_empty());
+        assert!(changed_shader_asset_names.is_empty());
         assert_eq!(assets.content_version(handle), before);
     }
 
@@ -212,9 +242,10 @@ mod tests {
         let (mut assets, handle) = store_with_shader();
         let before = assets.content_version(handle);
 
-        let updated = apply_shader_source(&mut assets, "other/other.wgsl", "text", [&RECORD]);
+        let changed_shader_asset_names =
+            apply_shader_source(&mut assets, "other/other.wgsl", "text", [&RECORD]);
 
-        assert!(updated.is_empty());
+        assert!(changed_shader_asset_names.is_empty());
         assert_eq!(assets.content_version(handle), before);
     }
 

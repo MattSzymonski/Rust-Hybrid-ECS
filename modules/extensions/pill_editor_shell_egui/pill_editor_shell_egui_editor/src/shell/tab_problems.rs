@@ -1,34 +1,47 @@
-//! The Problems tab: build errors and warnings, grouped by module.
+//! The Problems tab: one row per problem, grouped by the module or function
+//! that reported it.
 //!
 //! # Responsibilities
 //!
-//! - Draw one row per diagnostic the executable collected from a module build
-//!   or a patch, grouped under the module that reported it.
-//! - Turn a row click into an open request for the executable, which knows the
-//!   `code_editor_command` preference and may spawn a process.
+//! - Draw one row per problem the executable collected from a failed build, a
+//!   failed patch or a rollback, grouped under the module or function that
+//!   reported it.
+//! - Turn a click on a row that names a file into an open request for the
+//!   executable, which knows the `code_editor_command` preference and may
+//!   spawn a process.
 //!
 //! # Design
 //!
-//! The rows arrive in the frame's snapshot (`EditorSnapshot.problems`), which
-//! the executable fills from the same notices the build-failed toasts use, so
-//! a row and its toast can never disagree. The tab is read-only apart from the
-//! request it leaves in the session.
+//! The rows arrive in the frame's snapshot (`EditorSnapshot.problems`). The
+//! executable builds both the rows and the toasts that report a failed build
+//! from the same host notices, so a row and its toast never say different
+//! things. The tab is read-only apart from the request it leaves in the
+//! session.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
-// Deliberately unused in this compilation: a patch crate replays this
-// file's opening, and the first sibling this body names resolves through it.
+// Deliberately unused in this compilation. A patch crate repeats this file's
+// top-level `use` lines, so a name the body takes from a sibling module still
+// resolves in the patch crate.
 #[allow(unused_imports)]
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The Problems tab: the diagnostics grouped by the module that reported them.
+/// Draws the Problems tab: one section per module or function, each with its
+/// rows.
+///
+/// `request` is set to the index of the row the user clicked in
+/// `snapshot.problems`, when that row names a file. It is left as it was
+/// otherwise. The executable turns the index into the location it opens in
+/// the code editor.
 pub fn problems_tab(ui: &mut egui::Ui, snapshot: &EditorSnapshot, request: &mut Option<usize>) {
+    // Step 1: Show a note when the executable reported nothing.
     if snapshot.problems.is_empty() {
         ui.weak("No problems");
         return;
     }
-    // Groups keep the order the executable reported the rows in; a module
-    // that fails again has its old rows dropped and its new ones appended.
+    // Step 2: Group the rows by the module or function that reported them,
+    // keeping the order the rows have in the snapshot. A module that fails
+    // again drops its old rows and gets its new ones at the end.
     let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
     for (index, row) in snapshot.problems.iter().enumerate() {
         match groups.iter_mut().find(|(module, _)| *module == row.module) {
@@ -36,6 +49,8 @@ pub fn problems_tab(ui: &mut egui::Ui, snapshot: &EditorSnapshot, request: &mut 
             None => groups.push((row.module.as_str(), vec![index])),
         }
     }
+    // Step 3: Draw one section per group, with the name and row count on a
+    // heading line and the rows below it.
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -49,8 +64,10 @@ pub fn problems_tab(ui: &mut egui::Ui, snapshot: &EditorSnapshot, request: &mut 
                 });
                 for index in indices {
                     let row = &snapshot.problems[index];
-                    // `<file>:<line>` is the clickable part; a diagnostic
-                    // without a location still reads, it just cannot open.
+                    // Show `file:line` when the compiler named both, the file
+                    // alone when it named no line, and `-` when it named no
+                    // file. Clicking a row without a file cannot open
+                    // anything, so only a row with a file leaves a request.
                     let location = match (&row.problem.file, row.problem.line) {
                         (Some(file), Some(line)) => format!("{file}:{line}"),
                         (Some(file), None) => file.clone(),

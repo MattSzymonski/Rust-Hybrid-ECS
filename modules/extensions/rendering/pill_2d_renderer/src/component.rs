@@ -7,7 +7,8 @@
 //! - Publishes their editor field layouts through [`register_components`], so a
 //!   world that registers them exposes their fields to the inspector.
 //! - Defines [`RenderViewport`] and [`VirtualResolution`], the pure-data
-//!   description of where sprites are drawn and in what coordinate space.
+//!   description of the area sprites are drawn into and the space they are
+//!   placed in.
 //! - Collects a world's drawable entities into [`SpriteInstance`] records
 //!   through [`sprite_instances`].
 //!
@@ -18,10 +19,10 @@
 //! `bytemuck` upload record separate and asserts the two layouts agree.
 //!
 //! The components live here, with the renderer that draws them, because a
-//! sprite is a renderer concept the ECS core has no business defining. They are
-//! a shared ABI: a hot-loaded project and the host assign different `TypeId`s
-//! to the same type, so collection resolves their columns by stable type name
-//! and verified `repr(C)` size instead of by a host-typed query.
+//! sprite is a renderer concept. They are also a contract between binaries: a
+//! hot-loaded project and the host give the same type different `TypeId`s, so
+//! collection finds their columns by registered type name and size instead of
+//! by a host-typed query.
 
 // External crates
 use pill_engine::component::Component;
@@ -32,11 +33,12 @@ use pill_engine::PillLayout;
 // Components
 // =============================================================================
 
-/// World-space position of an entity's draw origin, in pixels.
+/// Position of an entity's draw origin, in pixels, measured from the viewport's
+/// top-left corner.
 ///
-/// Plain `repr(C)` float pairs: a sprite's placement is the renderer's own
+/// A plain `repr(C)` pair of floats. A sprite's placement is the renderer's own
 /// concern, so the type lives beside the pipeline that draws it rather than in
-/// the ECS core. Its byte layout is what another binary binds against, since a
+/// the ECS core. Another binary binds against its byte layout, because a
 /// `TypeId` is computed per compilation unit.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, PillLayout)]
@@ -48,10 +50,11 @@ pub struct Position {
 }
 impl Component for Position {}
 
-/// Plain RGBA color, backend-agnostic (0.0-1.0 per channel).
+/// Plain RGBA color, with no backend type in it. Each channel is a float,
+/// normally between 0.0 and 1.0.
 ///
-/// `#[repr(C)]` with normalized float channels, so a colour written by a
-/// project and read by the pipeline agrees byte for byte.
+/// `#[repr(C)]` with float channels, so a color a project writes and the
+/// pipeline reads agrees byte for byte.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, PillLayout)]
 pub struct Color {
@@ -71,7 +74,7 @@ pub struct Color {
 impl Component for Color {}
 
 impl Color {
-    /// Opaque white, and what [`Default`] returns for a colour.
+    /// Opaque white. This is also the value [`Default`] returns.
     pub const WHITE: Color = Color {
         r: 1.0,
         g: 1.0,
@@ -79,7 +82,7 @@ impl Color {
         a: 1.0,
     };
 
-    /// Construct a color from its red, green, blue, and alpha channels.
+    /// Constructs a color from its red, green, blue and alpha channels.
     pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
         Self { r, g, b, a }
     }
@@ -117,18 +120,18 @@ impl Default for Sprite {
     }
 }
 
-/// Register [`Position`], [`Color`] and [`Sprite`] with their editor layouts.
+/// Registers [`Position`], [`Color`] and [`Sprite`] with their editor layouts.
 ///
-/// The one call a project makes to opt into sprite rendering. Registration is
-/// idempotent, so a hot reload re-running `init` is safe, and it goes through
-/// `register_component_with_layout` so the components arrive field-editable in
-/// the inspector rather than as opaque blobs.
+/// This is the one call a project makes to opt into sprite rendering. Running
+/// it twice is safe, which is what a hot reload does when it re-runs `init`. It
+/// uses `register_component_with_layout`, so the inspector shows each field as
+/// an editable row instead of one opaque value.
 ///
-/// `Sprite`'s layout comes from `#[derive(PillLayout)]` - one `color` row the
-/// world expands into one scalar row per channel, which the inspector draws as
-/// a colour group. The engine's transform is registered first, so an entity
-/// carries both the pixel placement this renderer reads and the scene placement
-/// a 3D renderer would.
+/// `Sprite`'s layout comes from `#[derive(PillLayout)]`: one `color` row, which
+/// the world expands into one scalar row per channel and the inspector draws as
+/// a color group. The engine's transform is registered first, so an entity can
+/// carry both the pixel placement this renderer reads and the scene placement a
+/// 3D renderer would.
 pub fn register_components(world: &mut World) {
     pill_engine::register_transform_component(world);
     world.register_component_with_layout::<Position>(Position::FIELD_LAYOUT);
@@ -140,11 +143,11 @@ pub fn register_components(world: &mut World) {
 // Viewport
 // =============================================================================
 
-/// Physical-pixel rectangle within a render target.
+/// A rectangle inside a render target, measured in physical pixels.
 ///
-/// Sprite positions are interpreted relative to this rectangle's top-left
-/// corner. The GPU viewport maps their local coordinates into the rectangle,
-/// while a matching scissor prevents drawing outside it.
+/// Sprite positions are relative to this rectangle's top-left corner. The GPU
+/// viewport scales that local space into the rectangle, and a matching scissor
+/// rectangle stops any pixel from being drawn outside it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderViewport {
     /// Left edge of the rectangle, in physical pixels.
@@ -158,7 +161,7 @@ pub struct RenderViewport {
 }
 
 impl RenderViewport {
-    /// Construct a physical-pixel viewport rectangle.
+    /// Constructs a physical-pixel viewport rectangle.
     pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
         Self {
             x,
@@ -168,12 +171,13 @@ impl RenderViewport {
         }
     }
 
-    /// Construct a viewport covering an entire render target.
+    /// Constructs a viewport covering an entire render target.
     pub const fn full(width: u32, height: u32) -> Self {
         Self::new(0, 0, width, height)
     }
 
-    /// Clamp this rectangle to a render target, returning `None` when empty.
+    /// Clamps this rectangle to a render target and returns `None` when the
+    /// result would be empty.
     pub fn clamped_to(self, target_width: u32, target_height: u32) -> Option<Self> {
         let x = self.x.min(target_width);
         let y = self.y.min(target_height);
@@ -184,26 +188,26 @@ impl RenderViewport {
     }
 }
 
-/// Logical coordinate space mapped into a physical [`RenderViewport`].
+/// A logical coordinate space that is scaled into a physical [`RenderViewport`].
 ///
-/// Keeping this separate from the swapchain dimensions lets a caller keep a
-/// stable coordinate system while the viewport it fills is resized. The GPU
-/// viewport performs the final scaling into the rectangle.
+/// Keeping it separate from the swapchain size lets a caller keep one
+/// coordinate system while the rectangle it fills is resized. The GPU viewport
+/// does the final scaling into the rectangle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VirtualResolution {
-    /// Horizontal extent of the project coordinate space.
+    /// Horizontal extent of the logical space.
     pub width: f32,
-    /// Vertical extent of the project coordinate space.
+    /// Vertical extent of the logical space.
     pub height: f32,
 }
 
 impl VirtualResolution {
-    /// Construct a logical scene resolution.
+    /// Constructs a logical resolution.
     pub const fn new(width: f32, height: f32) -> Self {
         Self { width, height }
     }
 
-    /// Return whether both dimensions can safely be used by the projection.
+    /// Returns whether both dimensions can safely be used by the projection.
     pub fn is_valid(self) -> bool {
         self.width.is_finite() && self.height.is_finite() && self.width > 0.0 && self.height > 0.0
     }
@@ -213,11 +217,11 @@ impl VirtualResolution {
 // Instance data
 // =============================================================================
 
-/// One drawable entity, flattened for the renderer.
+/// One drawable entity, flattened into the form the renderer uploads.
 ///
-/// Plain `repr(C)` data with no GPU dependency: [`crate::sprite`] keeps its own
-/// layout-identical `bytemuck` mirror for the actual upload, so this side of
-/// the split needs no `bytemuck` derive of its own.
+/// Plain `repr(C)` data with no GPU dependency. [`crate::sprite`] keeps a
+/// matching `bytemuck` mirror of this record for the upload and checks that the
+/// two layouts agree, so this type needs no `bytemuck` derive.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpriteInstance {
@@ -230,54 +234,56 @@ pub struct SpriteInstance {
 }
 
 // =============================================================================
-// Shared-ABI collection
+// Collection across binaries
 // =============================================================================
 
 /// Every drawable entity in `world`, flattened for a renderer.
 ///
-/// A hot-loaded Rust project and the host executable can assign different
-/// `TypeId` values to the same renderer type. These components are a
-/// deliberately shared ABI, so columns are resolved by stable type name and
-/// verified C layout instead of by a host-typed ECS query.
+/// A hot-loaded Rust project and the host executable can give the same renderer
+/// type different `TypeId` values. These components are a deliberate shared
+/// contract, so the columns are found by registered type name and size instead
+/// of by a host-typed ECS query.
 pub fn sprite_instances(world: &World) -> Vec<SpriteInstance> {
-    sprite_instances_named(
+    sprite_instances_by_type_name(
         world,
         std::any::type_name::<Position>(),
         std::any::type_name::<Sprite>(),
     )
 }
 
-/// Type-erased implementation separated from the public renderer names so its
-/// cross-`TypeId` behavior can be covered by an ordinary unit test.
-fn sprite_instances_named(
+/// The type-erased implementation behind [`sprite_instances`].
+///
+/// It takes the component type names as arguments, so a unit test can pass the
+/// names of stand-in types and exercise the cross-`TypeId` path.
+fn sprite_instances_by_type_name(
     world: &World,
-    position_name: &str,
-    sprite_name: &str,
+    position_type_name: &str,
+    sprite_type_name: &str,
 ) -> Vec<SpriteInstance> {
-    let registry = world.component_registry();
+    let component_registry = world.component_registry();
     let mut instances = Vec::new();
 
     for archetype in world.archetypes_iter() {
-        // Step 1: Resolve each column among the components actually present in
-        // this archetype by shared type name and size. This also supports
-        // entities retained from older DLL generations whose component IDs
-        // differ from the current module.
+        // Step 1: Find the position and sprite columns in this archetype by
+        // registered type name and size. This also covers entities created by
+        // an older DLL generation, whose ids point at that image's copy of the
+        // types.
         let position_id = archetype.component_types.iter().copied().find(|id| {
-            registry.get_name(id) == Some(position_name)
-                && registry.get_size(id) == Some(std::mem::size_of::<Position>())
+            component_registry.get_name(id) == Some(position_type_name)
+                && component_registry.get_size(id) == Some(std::mem::size_of::<Position>())
         });
         let sprite_id = archetype.component_types.iter().copied().find(|id| {
-            registry.get_name(id) == Some(sprite_name)
-                && registry.get_size(id) == Some(std::mem::size_of::<Sprite>())
+            component_registry.get_name(id) == Some(sprite_type_name)
+                && component_registry.get_size(id) == Some(std::mem::size_of::<Sprite>())
         });
         let (Some(position_id), Some(sprite_id)) = (position_id, sprite_id) else {
             continue;
         };
 
-        // Step 2: Fetch the type-erased column backing each resolved component
-        // so rows can be read without a host-typed query. The columns are keyed
-        // by component id, so a component whose rows were created by another
-        // binary is reached the same way as one of this crate's own.
+        // Step 2: Fetch the type-erased column behind each component, so rows
+        // can be read without a host-typed query. Columns are keyed by
+        // component id, so a column filled by another binary is reached exactly
+        // like one of this crate's own.
         if !position_id.is_native_storage() || !sprite_id.is_native_storage() {
             continue;
         }
@@ -288,34 +294,33 @@ fn sprite_instances_named(
             continue;
         };
 
-        // Step 3: Copy each row's layout-validated component data into an
-        // instance record for the GPU.
+        // Step 3: Copy each row's component data into an instance record for
+        // the GPU.
         //
-        // SAFETY: Both shared types are `#[repr(C)]` and `Copy`, and their
-        // sizes were verified against this crate's `Position`/`Sprite` above,
-        // so each read from the type-erased trait storage yields a valid value
-        // of the target type even when its native TypeId originated in another
-        // DLL. `row_count` caps the loop at every storage length, keeping the
-        // `row_ptr(row)` accesses in bounds.
+        // SAFETY: `Position` and `Sprite` are `#[repr(C)]` and `Copy`, their
+        // sizes were checked against this crate's types above, and every field
+        // of both is an `f32`, so any bytes of that size form a valid value
+        // even when the row was written by another DLL's copy of the type.
+        // `row_count` caps the loop at every storage length, which keeps the
+        // `row_ptr` accesses in bounds.
         let row_count = archetype
             .entity_count()
             .min(position_storage.len())
             .min(sprite_storage.len());
-        for row in 0..row_count {
-            // SAFETY: `read_shared_component` dereferences the type-erased
-            // storage pointer; `row_count` is capped at every storage length
-            // and the layout checks above guarantee the value is a valid
-            // `Position` for every row in this loop.
-            let (Some(position_row), Some(sprite_row)) =
-                (position_storage.row_ptr(row), sprite_storage.row_ptr(row))
-            else {
+        for row_index in 0..row_count {
+            let (Some(position_row), Some(sprite_row)) = (
+                position_storage.row_ptr(row_index),
+                sprite_storage.row_ptr(row_index),
+            ) else {
                 continue;
             };
-            // SAFETY: `row_ptr` returned an in-range row of the validated
-            // shared column, so the bytes are a `Position` by the name and
-            // layout checks above.
+            // SAFETY: `row_ptr` returned a row inside the checked column, so
+            // `position_row` points at `size_of::<Position>()` readable bytes,
+            // and any bytes of that size form a valid `Position` because all
+            // its fields are `f32`.
             let position = unsafe { read_shared_component::<Position>(position_row) };
-            // SAFETY: as for the `Position` read directly above, for `Sprite`.
+            // SAFETY: the same argument as the `Position` read above, for the
+            // sprite row.
             let sprite = unsafe { read_shared_component::<Sprite>(sprite_row) };
             instances.push(SpriteInstance {
                 position: [position.x, position.y],
@@ -333,19 +338,19 @@ fn sprite_instances_named(
     instances
 }
 
-/// Copy one layout-validated shared component out of type-erased storage.
+/// Copies one component row out of type-erased storage.
 ///
 /// # Safety
 ///
-/// `row` must point to a value with the same `repr(C)` layout and size as `T`.
-/// Callers establish this through the shared component name and size, which is
-/// also why the row arrives as bytes: a shared component is identified by its
-/// layout, so there is no `TypeId` for a typed accessor to check against.
-unsafe fn read_shared_component<T: Copy>(row: *const u8) -> T {
-    let data = row.cast::<T>();
-    // SAFETY: Guaranteed by the caller. `read_unaligned` also avoids relying
-    // on alignment information that is not present in ComponentRegistry.
-    unsafe { data.read_unaligned() }
+/// `row_bytes` must point to at least `size_of::<T>()` readable bytes that form
+/// a valid `T`. Callers establish this from the row's registered type name and
+/// size, which is also why the row arrives as bytes: the same component carries
+/// a different `TypeId` in each binary, so no typed accessor can check it.
+unsafe fn read_shared_component<T: Copy>(row_bytes: *const u8) -> T {
+    let typed_row = row_bytes.cast::<T>();
+    // SAFETY: The caller guarantees the bytes at `row_bytes`. `read_unaligned`
+    // also means the registry does not have to record the row's alignment.
+    unsafe { typed_row.read_unaligned() }
 }
 
 // =============================================================================
@@ -353,12 +358,12 @@ unsafe fn read_shared_component<T: Copy>(row: *const u8) -> T {
 // =============================================================================
 
 #[cfg(test)]
-mod shared_component_tests {
+mod tests {
     use super::*;
     use pill_engine::component::ComponentId;
     use pill_engine::component_registry::ComponentFieldDescriptor;
 
-    /// Layout-compatible stand-in with a different TypeId than Position.
+    /// Layout-compatible stand-in with a different `TypeId` than `Position`.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct ForeignPosition {
@@ -368,7 +373,7 @@ mod shared_component_tests {
 
     impl Component for ForeignPosition {}
 
-    /// Layout-compatible stand-in with a different TypeId than Sprite.
+    /// Layout-compatible stand-in with a different `TypeId` than `Sprite`.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct ForeignSprite {
@@ -379,8 +384,8 @@ mod shared_component_tests {
 
     impl Component for ForeignSprite {}
 
-    /// Shared renderer layouts can be read even when their native TypeIds
-    /// originate from a different compilation unit.
+    /// Renderer layouts can be read even when their native `TypeId`s come from
+    /// a different compilation unit.
     #[test]
     fn collects_layout_compatible_components_with_foreign_type_ids() {
         let mut world = World::new();
@@ -397,7 +402,7 @@ mod shared_component_tests {
             .build()
             .unwrap();
 
-        let instances = sprite_instances_named(
+        let instances = sprite_instances_by_type_name(
             &world,
             std::any::type_name::<ForeignPosition>(),
             std::any::type_name::<ForeignSprite>(),
@@ -418,19 +423,18 @@ mod shared_component_tests {
         assert!(!VirtualResolution::new(f32::INFINITY, 600.0).is_valid());
     }
 
-    /// The derive generates one row per field, and `register_components`
-    /// attaches the layout with `color` expanded into channel rows, so the
-    /// renderer components are field-editable in the inspector without any
-    /// hand-written descriptors.
+    /// The derive generates one row per field. `register_components` attaches
+    /// that layout to the world, with `color` expanded into channel rows, so the
+    /// inspector can edit the fields without any hand-written descriptors.
     #[test]
     fn the_sprite_layout_matches_its_struct_and_attaches_on_registration() {
-        // Channel order and byte sizes come straight from the compiler.
+        // Field offsets and byte sizes come from the compiler.
         assert_eq!(std::mem::size_of::<Position>(), 8);
         assert_eq!(std::mem::size_of::<Color>(), 16);
         assert_eq!(std::mem::size_of::<Sprite>(), 24);
 
-        // The derive's own layout is one row per declared field; `color` is
-        // still the nested struct here and the world flattens it below.
+        // The derive's own layout has one row per declared field. `color` is
+        // still the nested struct here; the world flattens it further down.
         assert_eq!(Sprite::FIELD_LAYOUT.len(), 3);
         let color_row = &Sprite::FIELD_LAYOUT[2];
         assert_eq!(color_row.name, "color");
@@ -438,21 +442,21 @@ mod shared_component_tests {
         assert_eq!(color_row.offset, std::mem::offset_of!(Sprite, color));
         assert_eq!(color_row.size, std::mem::size_of::<Color>());
 
-        let assert_matches = |fields: &[ComponentFieldDescriptor],
-                              expected: &[(&str, usize, usize)]| {
-            assert_eq!(fields.len(), expected.len());
-            for (field, (name, offset, size)) in fields.iter().zip(expected) {
-                assert_eq!(field.name, *name, "descriptor name for {name}");
-                assert_eq!(field.type_tag, "f32", "descriptor tag for {name}");
-                assert_eq!(field.offset, *offset, "descriptor offset for {name}");
-                assert_eq!(field.size, *size, "descriptor size for {name}");
-                assert_eq!(field.align, 4, "descriptor align for {name}");
-                assert_eq!(field.element_count, 0);
-            }
-        };
+        let assert_field_descriptors =
+            |fields: &[ComponentFieldDescriptor], expected: &[(&str, usize, usize)]| {
+                assert_eq!(fields.len(), expected.len());
+                for (field, (name, offset, size)) in fields.iter().zip(expected) {
+                    assert_eq!(field.name, *name, "descriptor name for {name}");
+                    assert_eq!(field.type_tag, "f32", "descriptor tag for {name}");
+                    assert_eq!(field.offset, *offset, "descriptor offset for {name}");
+                    assert_eq!(field.size, *size, "descriptor size for {name}");
+                    assert_eq!(field.align, 4, "descriptor align for {name}");
+                    assert_eq!(field.element_count, 0);
+                }
+            };
 
-        // `register_components` is what makes them editable: it routes through
-        // `register_component_with_layout` rather than the plain path.
+        // `register_components` is what makes the fields editable. It uses
+        // `register_component_with_layout`, not the plain registration path.
         let mut world = World::new();
         register_components(&mut world);
         let position = world
@@ -465,13 +469,13 @@ mod shared_component_tests {
         assert_eq!(color.len(), 4);
 
         // The world's copy of the Sprite layout has `color` expanded into one
-        // scalar row per channel at composed offsets, which is what the
-        // inspector renders as one colour group.
+        // scalar row per channel, at offsets added up from the struct's own.
+        // The inspector draws those rows as one color group.
         let sprite = world
             .component_field_layout(ComponentId::of::<Sprite>())
             .expect("Sprite registered with a layout");
         let color_offset = std::mem::offset_of!(Sprite, color);
-        assert_matches(
+        assert_field_descriptors(
             sprite,
             &[
                 ("width", std::mem::offset_of!(Sprite, width), 4),
@@ -485,7 +489,8 @@ mod shared_component_tests {
         assert_eq!(sprite.len(), 6);
     }
 
-    /// Registration is idempotent, because a hot reload re-runs every `init`.
+    /// Registering twice is safe, which is what a hot reload does when it
+    /// re-runs `init`.
     #[test]
     fn register_components_is_idempotent() {
         let mut world = World::new();

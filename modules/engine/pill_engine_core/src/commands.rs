@@ -128,14 +128,15 @@ impl<T: Component + Send> ComponentAdder for TypedComponentAdder<T> {
 /// Type-erased component adder that writes raw bytes into a native column.
 ///
 /// Lets a caller that holds only a component id and its ABI bytes - the C#
-/// backend, the editor's command batches - create or add a component without
-/// naming the concrete Rust type. The payload must match the component's ABI
-/// layout exactly; the queuing caller validates the size before it is queued.
+/// backend, the editor's command batches, the scene loader - create or add a
+/// component without naming the concrete Rust type. The payload must match the
+/// component's ABI layout exactly; the queuing caller validates the size before
+/// it is queued.
 pub struct ByteComponentAdder {
     /// Native component identity the bytes belong to.
     component_id: ComponentId,
     /// Serialized component value in its native ABI layout.
-    bytes: Vec<u8>,
+    component_bytes: Vec<u8>,
 }
 
 impl ComponentAdder for ByteComponentAdder {
@@ -159,7 +160,7 @@ impl ComponentAdder for ByteComponentAdder {
         // The refusal cannot be dropped: the destination archetype already has
         // the entity's row in every other column, so a column left short shifts
         // every later row of this component onto another entity's value.
-        column.push_bytes(&self.bytes)
+        column.push_bytes(&self.component_bytes)
     }
 }
 
@@ -168,7 +169,7 @@ impl ByteComponentAdder {
     pub fn new(component_id: ComponentId, bytes: Vec<u8>) -> Self {
         Self {
             component_id,
-            bytes,
+            component_bytes: bytes,
         }
     }
 }
@@ -359,23 +360,24 @@ impl CommandQueue {
         exit_on_error: bool,
     ) -> Result<(), Vec<CommandError>> {
         // Step 1: Record the pending count for diagnostics and open the profiling scope.
-        let pending = self.commands.len();
-        world.commands_executed_this_frame = pending;
+        let pending_command_count = self.commands.len();
+        world.commands_executed_this_frame = pending_command_count;
         let zone = crate::profile_scope!(
             "execute commands",
-            [("Deferred commands to execute: {}", pending)]
+            [("Deferred commands to execute: {}", pending_command_count)]
         );
 
         // Step 2: Drain the queue and dispatch each command to its executor.
         let mut errors = Vec::new();
-        let mut succeeded = 0usize;
+        let mut succeeded_command_count = 0usize;
 
         for command in self.commands.drain(..) {
             // Every executor reports failure by appending to `errors`; a
             // command that appended nothing succeeded. Counting from the
             // vector length keeps one source of truth - an unconditional
-            // `succeeded += 1` would count the create arms' failures too.
-            let errors_before = errors.len();
+            // `succeeded_command_count += 1` would count the create arms'
+            // failures too.
+            let error_count_before = errors.len();
             match command {
                 DeferredCommand::CreateEntity {
                     entity,
@@ -428,15 +430,15 @@ impl CommandQueue {
                     Self::execute_destroy_entity(world, entity, &mut errors);
                 }
             }
-            if errors.len() == errors_before {
-                succeeded += 1;
+            if errors.len() == error_count_before {
+                succeeded_command_count += 1;
             }
         }
 
         // Step 3: Report success/failure totals to the profiler.
         zone.text(format_args!(
             "{} succeeded, {} errors",
-            succeeded,
+            succeeded_command_count,
             errors.len(),
         ));
 
@@ -667,7 +669,7 @@ impl CommandQueue {
 
     /// Classifies a structural edit's world-level failure as a command error.
     ///
-    /// The two structural executors share this because they now share one
+    /// The two structural executors share this because they share one
     /// implementation: a rule that refuses the edit reaches the same
     /// classification whichever command queued it.
     fn command_error_of(
@@ -763,7 +765,7 @@ impl<'a> Commands<'a> {
         DeferredEntityBuilder {
             command_queue: self.command_queue,
             allocated_entity: entity,
-            components: Vec::with_capacity(
+            component_adders: Vec::with_capacity(
                 crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY,
             ),
         }
@@ -807,7 +809,7 @@ pub struct DeferredEntityBuilder<'a> {
     /// The entity handle allocated from the free list at construction time.
     allocated_entity: Entity,
     /// Native components accumulated via [`with`](Self::with).
-    components: Vec<Box<dyn ComponentAdder>>,
+    component_adders: Vec<Box<dyn ComponentAdder>>,
 }
 
 impl<'a> DeferredEntityBuilder<'a> {
@@ -820,7 +822,7 @@ impl<'a> DeferredEntityBuilder<'a> {
         Self {
             command_queue,
             allocated_entity: world.allocate_entity(),
-            components: Vec::with_capacity(
+            component_adders: Vec::with_capacity(
                 crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY,
             ),
         }
@@ -831,7 +833,7 @@ impl<'a> DeferredEntityBuilder<'a> {
     where
         T: Component + Send,
     {
-        self.components
+        self.component_adders
             .push(Box::new(TypedComponentAdder { component }));
         self
     }
@@ -844,7 +846,7 @@ impl<'a> DeferredEntityBuilder<'a> {
     /// use.
     pub fn build(self) -> Entity {
         let entity = self.allocated_entity;
-        self.command_queue.create_entity(entity, self.components);
+        self.command_queue.create_entity(entity, self.component_adders);
         entity
     }
 }
@@ -853,10 +855,12 @@ impl<'a> DeferredEntityBuilder<'a> {
 // Free Functions
 // =============================================================================
 
-/// Preserve a native component's concrete Rust type in a type-erased command.
+/// Box a component into a type-erased [`ComponentAdder`] that keeps `T`.
 ///
-/// Foreign-language adapters use this after validating and decoding an ABI
-/// component blob against an explicitly shared native component binding.
+/// The typed adder behind it is private, so this is how a caller builds the
+/// list [`CommandQueue::create_mixed_entity`] takes, or the single adder
+/// [`CommandQueue::add_component_adder_to_entity`] takes. The adder reports
+/// `ComponentId::of::<T>()` and moves the value into its column.
 pub fn boxed_component_adder<T>(component: T) -> Box<dyn ComponentAdder>
 where
     T: Component + Send,
@@ -903,19 +907,19 @@ mod tests {
     /// distinguishable from a bitwise one by more than a counter.
     #[derive(Debug)]
     struct OwningComponent {
-        payload: Vec<u32>,
+        owned_values: Vec<u32>,
     }
 
     impl OwningComponent {
-        fn new(payload: Vec<u32>) -> Self {
+        fn new(owned_values: Vec<u32>) -> Self {
             OWNING_COMPONENTS_ALIVE.fetch_add(1, Ordering::SeqCst);
-            Self { payload }
+            Self { owned_values }
         }
     }
 
     impl Clone for OwningComponent {
         fn clone(&self) -> Self {
-            Self::new(self.payload.clone())
+            Self::new(self.owned_values.clone())
         }
     }
 
@@ -938,7 +942,6 @@ mod tests {
         let mut queue = CommandQueue::new();
         let mut commands = Commands::new(&mut queue, &mut world);
 
-        // Queue creating a new entity
         commands
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
@@ -951,7 +954,6 @@ mod tests {
             "Entity should not exist yet"
         );
 
-        // Execute commands
         queue.execute_queued_commands(&mut world, false).unwrap();
 
         assert_eq!(world.entity_locations.len(), 1, "Entity should be created");
@@ -980,7 +982,6 @@ mod tests {
         let mut queue = CommandQueue::new();
         let mut commands = Commands::new(&mut queue, &mut world);
 
-        // Queue creating a new entity
         commands
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
@@ -993,7 +994,6 @@ mod tests {
             "Entity should not exist yet"
         );
 
-        // Execute commands
         queue.execute_queued_commands(&mut world, false).unwrap();
 
         assert_eq!(world.entity_locations.len(), 1, "Entity should be created");
@@ -1105,7 +1105,7 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Position>();
         let entity = world.reserve_entity();
-        let archetypes_before = world.archetypes.len();
+        let archetype_count_before = world.archetypes.len();
 
         let mut queue = CommandQueue::new();
         queue.create_mixed_entity(
@@ -1129,7 +1129,7 @@ mod tests {
         );
         assert_eq!(
             world.archetypes.len(),
-            archetypes_before,
+            archetype_count_before,
             "no archetype was created for the refused set"
         );
     }
@@ -1172,7 +1172,7 @@ mod tests {
             world
                 .get_component::<OwningComponent>(entity)
                 .expect("the component came across")
-                .payload,
+                .owned_values,
             vec![7, 8, 9],
             "the moved row still owns its allocation"
         );
@@ -1241,7 +1241,6 @@ mod tests {
 
         let mut queue = CommandQueue::new();
 
-        // Queue creating a new entity
         {
             let mut commands = Commands::new(&mut queue, &mut world);
             commands
@@ -1257,7 +1256,6 @@ mod tests {
             "Entity should not exist yet"
         );
 
-        // Execute commands
         queue.execute_queued_commands(&mut world, false).unwrap();
 
         assert_eq!(world.entity_locations.len(), 1, "Entity should be created");
@@ -1275,7 +1273,6 @@ mod tests {
             "Archetype should contain Velocity component"
         );
 
-        // Get the entity and queue remove component command
         let entity = *world.entity_locations.keys().next().unwrap();
         {
             let mut commands = Commands::new(&mut queue, &mut world);
@@ -1307,7 +1304,6 @@ mod tests {
         let mut queue = CommandQueue::new();
         let mut commands = Commands::new(&mut queue, &mut world);
 
-        // Queue creating multiple entities
         commands
             .create_entity()
             .with(Position { x: 1.0, y: 2.0 })
@@ -1324,7 +1320,6 @@ mod tests {
             .with(Velocity { x: 2.0, y: 3.0 })
             .build();
 
-        // Execute commands
         queue.execute_queued_commands(&mut world, false).unwrap();
 
         assert_eq!(world.entity_locations.len(), 3, "Should have 3 entities");

@@ -1,12 +1,14 @@
-//! What the renderer draws over the chain's picture on every surface: debug
-//! lines, gizmo handles, selection outlines, and the pick buffer - plus the
-//! debug labels, which it lays out for the UI painter to draw.
+//! Everything the renderer draws over what the chain rendered: the debug lines
+//! on every surface, the editor's chrome (selection outlines, gizmo handles and
+//! the scene grid) on the surfaces the frame marks as editor views, the pick
+//! buffer for the surfaces that ask for a pick, and the debug labels, which it
+//! lays out for the UI painter to draw.
 //!
 //! # Responsibilities
 //!
 //! - Build the overlay's pipelines once, beside the chain's ([`Overlay::new`]).
 //! - Record a surface's overlay after its chain: the outline mask and edge,
-//!   the depth-tested and on-top debug lines and the gizmos
+//!   the scene grid, the depth-tested and on-top debug lines and the gizmos
 //!   ([`Overlay::record`]).
 //! - Lay the debug labels out as a `pill_ui_frame` list over the bitmap font
 //!   ([`label_list`], [`font::texture_set`]); the UI painter draws it, since
@@ -19,8 +21,8 @@
 //! None of this goes through the chain: a project's chain decides how its
 //! scene looks, and an outline or a debug line has to look the same whatever
 //! the chain is. The overlay draws after the chain into the same surface view,
-//! reading the depth buffer the chain's geometry passes left so a
-//! depth-tested line hides behind what it is behind. The mask and pick passes
+//! reading the depth buffer the chain's geometry passes left, so geometry in
+//! front of a depth-tested line hides it. The mask and pick passes
 //! draw the frame's instances straight from the instance buffer the chain
 //! already uploaded, so a queue position is an instance index in both.
 //!
@@ -59,58 +61,66 @@ use crate::{
 pub(crate) mod font;
 mod picking;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// Width of a selection outline, in pixels.
 const OUTLINE_WIDTH: f32 = 2.0;
 /// Format of the outline mask.
-const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+const OUTLINE_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// Format of the pick buffer: one id per pixel.
-const PICK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
+const PICK_BUFFER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 /// Format of the pick buffer's own depth: the same one every depth-tested
 /// pipeline in the module declares.
-const PICK_DEPTH_FORMAT: wgpu::TextureFormat = RendererTexture::DEPTH_FORMAT;
-/// The shadow under a label, so it reads over any background.
-const LABEL_SHADOW: [f32; 4] = [0.0, 0.0, 0.0, 0.85];
-/// The distance from the camera, in view units, at which a primitive loses
-/// its screen position and is clipped away.
+const PICK_BUFFER_DEPTH_FORMAT: wgpu::TextureFormat = RendererTexture::DEPTH_FORMAT;
+/// The colour of the shadow under a label, so it reads over any background.
+const LABEL_SHADOW_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.85];
+/// The view-space distance from the camera below which a point counts as
+/// behind it and is clipped away.
 const NEAR_CLIP_DEPTH: f32 = 1e-3;
 /// The half width of a drawn overlay line, in pixels.
 const LINE_HALF_WIDTH: f32 = 1.0;
-/// How far past its half width a line's anti-aliasing fades, in pixels.
+/// How many pixels past the line's half width the anti-aliasing fade reaches.
 const LINE_FEATHER: f32 = 0.5;
 /// The half width of a gizmo line's quad in the pick buffer, in pixels.
 ///
-/// Wider than the drawn line so the pick covers the band the editor's hover
-/// test accepts as a handle (a radius that follows the handle's length, which
-/// keeps a roughly constant screen size), so a handle presses where it
-/// highlights.
+/// Wider than the drawn line, so a click counts anywhere inside the band the
+/// editor's hover test treats as the handle. That radius follows the handle's
+/// length, which keeps it a roughly constant size on screen, so a handle
+/// responds where it is highlighted.
 const PICK_LINE_HALF_WIDTH: f32 = 7.0;
 /// Which side of its line each of a quad's six corners sits on, in order.
 const LINE_QUAD_SIDES: [f32; 6] = [1.0, -1.0, 1.0, 1.0, -1.0, -1.0];
 /// How far a gizmo triangle's corners are pushed out, in pixels, so its
 /// anti-aliasing has a band to fade in.
 const TRIANGLE_FEATHER: f32 = 1.0;
-/// The smallest sine of a corner's half-angle the expansion trusts: sharper
-/// corners would push the vertex out without bound.
+/// The smallest sine of a corner's half-angle the expansion accepts. At a
+/// sharper corner the vertex would be pushed out without limit.
 const MINIMUM_MITER_SINE: f32 = 0.02;
 
+// =============================================================================
+// Vertex and Uniform Types
+// =============================================================================
+
 /// A line vertex after projection: the corner of the line's quad, its colour,
-/// and how many pixels from the line's centre it sits - negative on the other
-/// side - which the fragment shader turns into coverage.
+/// and how far in pixels it sits from the line's centre (negative on the other
+/// side). The fragment shader turns that distance into coverage.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct LineVertex {
-    clip: [f32; 4],
+    clip_position: [f32; 4],
     color: [f32; 4],
-    across: f32,
+    across_pixels: f32,
 }
 
 /// A gizmo-triangle vertex after projection: the corner pushed out by the
-/// feather, its colour, and the barycentric corner it stands for, which the
-/// fragment shader turns into edge coverage.
+/// feather, its colour, and the barycentric coordinate of the corner it stands
+/// for. The fragment shader turns that coordinate into edge coverage.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct TriangleVertex {
-    clip: [f32; 4],
+    clip_position: [f32; 4],
     color: [f32; 4],
     barycentric: [f32; 3],
 }
@@ -120,8 +130,8 @@ struct TriangleVertex {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct HandleLineVertex {
-    clip: [f32; 4],
-    value: u32,
+    clip_position: [f32; 4],
+    handle_value: u32,
 }
 
 /// A gizmo triangle vertex in the pick buffer: world position and handle
@@ -129,46 +139,59 @@ struct HandleLineVertex {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct HandleVertex {
-    position: [f32; 3],
-    value: u32,
+    world_position: [f32; 3],
+    handle_value: u32,
 }
 
-/// The outline uniform: colour, and the width in `settings[0]`.
+/// The outline uniform: colour, and the width in `outline_settings[0]`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct OutlineParameters {
     color: [f32; 4],
-    settings: [f32; 4],
+    outline_settings: [f32; 4],
 }
 
-/// The grid uniform: the cell size in `cell[0]`, and the drawing region in
-/// pixels in `viewport` - the fragment shader turns the pixel position back
-/// into a clip-space ray through it.
+/// The grid uniform: the cell size in `cell_size[0]`, and the drawing region in
+/// `viewport`, in pixels. The fragment shader turns each pixel back into a
+/// clip-space ray through that region.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct GridParameters {
-    cell: [f32; 4],
+    cell_size: [f32; 4],
     viewport: [f32; 4],
 }
+
+/// A vertex on its way to the screen: its clip-space position and the corner
+/// of the shape it belongs to, carried through clipping.
+type ClipVertex = ([f32; 4], [f32; 3]);
+
+// =============================================================================
+// Overlay Targets
+// =============================================================================
 
 /// The targets one surface's overlay draws into.
 ///
 /// Owned by the surface they are sized to, beside its depth buffer and
-/// offscreen targets, and rebuilt with them on a resize: an outline mask is a
-/// surface-sized GPU object like any other, and a cache keyed by size would
-/// make two surfaces share one and evict each other's.
+/// offscreen targets, and rebuilt with them on a resize. An outline mask is a
+/// surface-sized GPU object like any other; a cache keyed by size would make
+/// two surfaces share one and evict each other's.
 ///
 /// The pick buffer and its depth are the exception: a surface that never picks
 /// never allocates them.
 pub(crate) struct OverlayTargets {
     width: u32,
     height: u32,
-    /// The outlined meshes' silhouettes, and the edge pass reading it.
+    /// The silhouettes of the outlined meshes, drawn here and read by the edge
+    /// pass.
     mask_view: wgpu::TextureView,
     outline_bind_group: wgpu::BindGroup,
     /// The pick buffer and its depth, made the first time a pick asks.
-    pick: Option<(wgpu::Texture, wgpu::TextureView, wgpu::TextureView)>,
+    pick_targets: Option<(wgpu::Texture, wgpu::TextureView, wgpu::TextureView)>,
 }
+
+// =============================================================================
+// Overlay Frame
+// =============================================================================
 
 /// One surface's frame, as the overlay needs it.
 pub(crate) struct OverlayFrame<'a> {
@@ -192,6 +215,10 @@ pub(crate) struct OverlayFrame<'a> {
     pub storage: &'a RendererResourceStorage,
 }
 
+// =============================================================================
+// Overlay
+// =============================================================================
+
 /// The overlay's pipelines and the buffers they read.
 ///
 /// One overlay serves every surface; what it draws into is made per surface
@@ -209,7 +236,7 @@ pub(crate) struct Overlay {
     grid_pipeline: wgpu::RenderPipeline,
     grid_parameters_buffer: wgpu::Buffer,
     grid_bind_group: wgpu::BindGroup,
-    outline_layout: wgpu::BindGroupLayout,
+    outline_bind_group_layout: wgpu::BindGroupLayout,
     outline_parameters_buffer: wgpu::Buffer,
     tested_lines_buffer: StreamBuffer,
     on_top_lines_buffer: StreamBuffer,
@@ -227,8 +254,9 @@ macro_rules! attributes {
 }
 
 impl Overlay {
-    /// Build every overlay pipeline for a surface drawn in `color_format`
-    /// whose geometry writes `depth_format`.
+    /// Creates every overlay pipeline, for a surface drawn in `color_format`
+    /// whose geometry writes `depth_format`. Every pipeline that reads the
+    /// camera binds `camera_bind_group_layout` at group 0.
     ///
     /// # Errors
     ///
@@ -237,10 +265,10 @@ impl Overlay {
         device: &wgpu::Device,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
-        camera_layout: &wgpu::BindGroupLayout,
+        camera_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Result<Self> {
         capturing_validation(device, || {
-            Self::create(device, color_format, depth_format, camera_layout)
+            Self::create(device, color_format, depth_format, camera_bind_group_layout)
         })
         .map_err(|detail| RendererError::Other {
             detail: format!("overlay pipelines: {detail}"),
@@ -251,8 +279,9 @@ impl Overlay {
         device: &wgpu::Device,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
-        camera_layout: &wgpu::BindGroupLayout,
+        camera_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Self {
+        // Step 1: Create the three shader modules.
         let world_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("overlay_world"),
             source: wgpu::ShaderSource::Wgsl(include_str!("world.wgsl").into()),
@@ -266,32 +295,35 @@ impl Overlay {
             source: wgpu::ShaderSource::Wgsl(include_str!("grid.wgsl").into()),
         });
 
+        // Step 2: Create the bind group layouts and the uniform buffers and
+        // groups behind them.
         // The outline edge pass reads the mask texel by texel.
-        let outline_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("overlay_outline"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+        let outline_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("overlay_outline"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
         let outline_parameters_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("overlay_outline"),
             size: std::mem::size_of::<OutlineParameters>() as u64,
@@ -301,19 +333,20 @@ impl Overlay {
 
         // The grid's own uniform: the cell size and the drawing region, so
         // one fullscreen triangle can turn any pixel into a world ray.
-        let grid_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("overlay_grid"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let grid_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("overlay_grid"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
         let grid_parameters_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("overlay_grid"),
             size: std::mem::size_of::<GridParameters>() as u64,
@@ -322,23 +355,29 @@ impl Overlay {
         });
         let grid_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("overlay_grid"),
-            layout: &grid_layout,
+            layout: &grid_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: grid_parameters_buffer.as_entire_binding(),
             }],
         });
 
-        let layout = |label: &str, groups: &[&wgpu::BindGroupLayout]| {
+        // Step 3: Build the pipeline layouts, the vertex layouts and the render
+        // states every pipeline shares.
+        let pipeline_layout = |label: &str, groups: &[&wgpu::BindGroupLayout]| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
                 bind_group_layouts: &groups.iter().map(|group| Some(*group)).collect::<Vec<_>>(),
                 immediate_size: 0,
             })
         };
-        let camera_pipeline_layout = layout("overlay_camera", &[camera_layout]);
-        let outline_pipeline_layout = layout("overlay_outline", &[&outline_layout]);
-        let grid_pipeline_layout = layout("overlay_grid", &[camera_layout, &grid_layout]);
+        let camera_pipeline_layout = pipeline_layout("overlay_camera", &[camera_bind_group_layout]);
+        let outline_pipeline_layout =
+            pipeline_layout("overlay_outline", &[&outline_bind_group_layout]);
+        let grid_pipeline_layout = pipeline_layout(
+            "overlay_grid",
+            &[camera_bind_group_layout, &grid_bind_group_layout],
+        );
 
         let line_vertex = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<LineVertex>() as u64,
@@ -375,66 +414,77 @@ impl Overlay {
             write_mask: wgpu::ColorWrites::ALL,
         });
         let value_target = Some(wgpu::ColorTargetState {
-            format: PICK_FORMAT,
+            format: PICK_BUFFER_FORMAT,
             blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         });
         let mask_target = Some(wgpu::ColorTargetState {
-            format: MASK_FORMAT,
+            format: OUTLINE_MASK_FORMAT,
             blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         });
         let tested = depth_state(depth_format, wgpu::CompareFunction::LessEqual, false);
         let on_top = depth_state(depth_format, wgpu::CompareFunction::Always, false);
-        let pick_on_top = depth_state(PICK_DEPTH_FORMAT, wgpu::CompareFunction::Always, false);
-        let pick_mesh = depth_state(PICK_DEPTH_FORMAT, wgpu::CompareFunction::Less, true);
+        let pick_on_top = depth_state(
+            PICK_BUFFER_DEPTH_FORMAT,
+            wgpu::CompareFunction::Always,
+            false,
+        );
+        let pick_mesh = depth_state(PICK_BUFFER_DEPTH_FORMAT, wgpu::CompareFunction::Less, true);
         // The grid is pinned to the far plane, so its own compare keeps it
         // behind the chain's geometry and lets it show everywhere else.
         let grid_depth = depth_state(depth_format, wgpu::CompareFunction::LessEqual, false);
         let grid_target = blended.clone();
 
+        // Step 4: Create one pipeline per draw the overlay records, then the
+        // buffers it streams the vertices through.
         let pipeline = |description: PipelineDescription| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(description.label),
-                layout: Some(description.layout),
+                layout: Some(description.pipeline_layout),
                 vertex: wgpu::VertexState {
-                    module: description.module,
-                    entry_point: Some(description.vertex),
+                    module: description.shader_module,
+                    entry_point: Some(description.vertex_entry_point),
                     buffers: &description
-                        .buffers
+                        .vertex_buffers
                         .iter()
                         .map(|buffer| Some((*buffer).clone()))
                         .collect::<Vec<_>>(),
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module: description.module,
-                    entry_point: Some(description.fragment),
-                    targets: std::slice::from_ref(&description.target),
+                    module: description.shader_module,
+                    entry_point: Some(description.fragment_entry_point),
+                    targets: std::slice::from_ref(&description.color_target),
                     compilation_options: Default::default(),
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology: description.topology,
                     ..Default::default()
                 },
-                depth_stencil: description.depth,
+                depth_stencil: description.depth_stencil,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
                 cache: None,
             })
         };
-        let world =
-            |label, vertex, fragment, buffers, topology, target, depth| PipelineDescription {
-                label,
-                layout: &camera_pipeline_layout,
-                module: &world_module,
-                vertex,
-                fragment,
-                buffers,
-                topology,
-                target,
-                depth,
-            };
+        let world = |label,
+                     vertex_entry_point,
+                     fragment_entry_point,
+                     vertex_buffers,
+                     topology,
+                     color_target,
+                     depth_stencil| PipelineDescription {
+            label,
+            pipeline_layout: &camera_pipeline_layout,
+            shader_module: &world_module,
+            vertex_entry_point,
+            fragment_entry_point,
+            vertex_buffers,
+            topology,
+            color_target,
+            depth_stencil,
+        };
         let line_buffers = std::slice::from_ref(&line_vertex);
         let triangle_buffers = std::slice::from_ref(&triangle_vertex);
         let handle_buffers = std::slice::from_ref(&handle_vertex);
@@ -469,25 +519,25 @@ impl Overlay {
             )),
             outline_edge_pipeline: pipeline(PipelineDescription {
                 label: "overlay_outline_edge",
-                layout: &outline_pipeline_layout,
-                module: &outline_module,
-                vertex: "fullscreen_vertex",
-                fragment: "outline_fragment",
-                buffers: &[],
+                pipeline_layout: &outline_pipeline_layout,
+                shader_module: &outline_module,
+                vertex_entry_point: "fullscreen_vertex",
+                fragment_entry_point: "outline_fragment",
+                vertex_buffers: &[],
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                target: blended,
-                depth: Some(on_top),
+                color_target: blended,
+                depth_stencil: Some(on_top),
             }),
             grid_pipeline: pipeline(PipelineDescription {
                 label: "overlay_grid",
-                layout: &grid_pipeline_layout,
-                module: &grid_module,
-                vertex: "grid_vertex",
-                fragment: "grid_fragment",
-                buffers: &[],
+                pipeline_layout: &grid_pipeline_layout,
+                shader_module: &grid_module,
+                vertex_entry_point: "grid_vertex",
+                fragment_entry_point: "grid_fragment",
+                vertex_buffers: &[],
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                target: grid_target,
-                depth: Some(grid_depth),
+                color_target: grid_target,
+                depth_stencil: Some(grid_depth),
             }),
             outline_mask_pipeline: pipeline(world(
                 "overlay_outline_mask",
@@ -527,7 +577,7 @@ impl Overlay {
             )),
             grid_parameters_buffer,
             grid_bind_group,
-            outline_layout,
+            outline_bind_group_layout,
             outline_parameters_buffer,
             tested_lines_buffer: StreamBuffer::new(
                 "overlay_lines_tested",
@@ -550,10 +600,12 @@ impl Overlay {
         }
     }
 
-    /// The targets a surface of `size` draws its overlay into.
+    /// Creates the targets a surface of `width` by `height` draws its overlay
+    /// into.
     ///
-    /// Made when the surface is attached or resized, so the overlay's targets
-    /// follow the surface they are sized to rather than a cache keyed by size.
+    /// They are made when the surface is attached or resized, so the overlay's
+    /// targets follow the surface they are sized to rather than a cache keyed
+    /// by size.
     pub(crate) fn new_targets(
         &self,
         device: &wgpu::Device,
@@ -561,18 +613,18 @@ impl Overlay {
     ) -> OverlayTargets {
         let width = width.max(1);
         let height = height.max(1);
-        let mask = create_target(
+        let mask = create_target_texture(
             device,
             "overlay_outline_mask",
             width,
             height,
-            MASK_FORMAT,
+            OUTLINE_MASK_FORMAT,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let mask_view = mask.create_view(&wgpu::TextureViewDescriptor::default());
         let outline_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("overlay_outline"),
-            layout: &self.outline_layout,
+            layout: &self.outline_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -589,56 +641,64 @@ impl Overlay {
             height,
             mask_view,
             outline_bind_group,
-            pick: None,
+            pick_targets: None,
         }
     }
 
-    /// Record the overlay of one surface after its chain: outlines, debug
-    /// lines and gizmos into the surface, and the pick buffer when
-    /// picks on this surface are waiting.
+    /// Records one surface's overlay after its chain: the outlines, the scene
+    /// grid, the debug lines and the gizmos into the surface, and the pick
+    /// buffer when this surface has picks waiting.
     pub fn record(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         targets: &mut OverlayTargets,
-        input: OverlayFrame,
+        overlay_frame: OverlayFrame,
     ) {
-        let frame = input.frame;
+        // Step 1: Work out what this surface draws.
+        let frame = overlay_frame.frame;
         let picks: Vec<PickRequest> = frame
             .pick_requests
             .iter()
-            .filter(|request| request.surface.0 == input.surface)
+            .filter(|request| request.surface.0 == overlay_frame.surface)
             .copied()
             .collect();
-        // The editor's chrome - outlines, gizmo handles and their picks -
-        // belongs on the surfaces the frame marks as editor views:
-        // the game's own window draws the game and nothing else. The project's
-        // own debug lines are not chrome and draw everywhere.
+        // The editor's chrome (outlines, gizmo handles and their picks) belongs
+        // only on the surfaces the frame marks as editor views; the game's own
+        // window draws the game and nothing else. The project's own debug lines
+        // are not chrome, so they draw on every surface.
         let editor_view = frame
             .editor_views
-            .contains(&pill_renderer_api::SurfaceId(input.surface));
-        let outlined = if editor_view {
-            outlined_positions(frame, input.render_queue)
+            .contains(&pill_renderer_api::SurfaceId(overlay_frame.surface));
+        let outlined_positions = if editor_view {
+            outlined_queue_positions(frame, overlay_frame.render_queue)
         } else {
             Vec::new()
         };
-        // The scene grid, when the frame asked for one on this surface: the
-        // editor's view-bound viewports draw it, a game's surface never does.
+        // The scene grid, when the frame asked for one on this surface. The
+        // editor draws it on the viewports bound to a view; a game's surface
+        // never draws one.
         let grid = if editor_view {
             frame.grid_cell_size
         } else {
             None
         };
-        if frame.debug.is_empty() && outlined.is_empty() && picks.is_empty() && grid.is_none() {
+        if frame.debug.is_empty()
+            && outlined_positions.is_empty()
+            && picks.is_empty()
+            && grid.is_none()
+        {
             return;
         }
 
-        if !outlined.is_empty() {
-            self.record_outline_mask(encoder, targets, &input, &outlined);
+        // Step 2: Prepare the pass inputs: the outline mask, the outline and
+        // grid uniforms, and the vertex buffers.
+        if !outlined_positions.is_empty() {
+            self.record_outline_mask(encoder, targets, &overlay_frame, &outlined_positions);
             let parameters = OutlineParameters {
                 color: frame.outlines.color,
-                settings: [OUTLINE_WIDTH, 0.0, 0.0, 0.0],
+                outline_settings: [OUTLINE_WIDTH, 0.0, 0.0, 0.0],
             };
             queue.write_buffer(
                 &self.outline_parameters_buffer,
@@ -648,10 +708,10 @@ impl Overlay {
         }
 
         // Everything drawn into the surface, uploaded before the pass opens.
-        let view_projection = &input.camera.parameters_data.view_projection_matrix;
+        let view_projection = &overlay_frame.camera.parameters_data.view_projection_matrix;
         let viewport_size = (
-            input.viewport.width.max(1) as f32,
-            input.viewport.height.max(1) as f32,
+            overlay_frame.viewport.width.max(1) as f32,
+            overlay_frame.viewport.height.max(1) as f32,
         );
         let (tested, on_top) =
             line_vertices(&frame.debug, view_projection, viewport_size, editor_view);
@@ -673,19 +733,19 @@ impl Overlay {
             .write(device, queue, bytemuck::cast_slice(&triangles))
             .cloned();
 
-        let draws_into_surface = !outlined.is_empty()
+        let draws_into_surface = !outlined_positions.is_empty()
             || tested_buffer.is_some()
             || on_top_buffer.is_some()
             || triangles_buffer.is_some()
             || grid.is_some();
-        if let Some(cell_size) = grid {
+        if let Some(grid_cell_size) = grid {
             let parameters = GridParameters {
-                cell: [cell_size, 0.0, 0.0, 0.0],
+                cell_size: [grid_cell_size, 0.0, 0.0, 0.0],
                 viewport: [
-                    input.viewport.x as f32,
-                    input.viewport.y as f32,
-                    input.viewport.width.max(1) as f32,
-                    input.viewport.height.max(1) as f32,
+                    overlay_frame.viewport.x as f32,
+                    overlay_frame.viewport.y as f32,
+                    overlay_frame.viewport.width.max(1) as f32,
+                    overlay_frame.viewport.height.max(1) as f32,
                 ],
             };
             queue.write_buffer(
@@ -694,11 +754,12 @@ impl Overlay {
                 bytemuck::bytes_of(&parameters),
             );
         }
+        // Step 3: Draw the overlay into the surface.
         if draws_into_surface {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: input.color_view,
+                    view: overlay_frame.color_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -707,7 +768,7 @@ impl Overlay {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: input.depth_view,
+                    view: overlay_frame.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
@@ -718,23 +779,23 @@ impl Overlay {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            set_viewport(&mut pass, input.viewport);
-            // The grid first: it is the scene's floor, and everything the
-            // overlay draws above it belongs over it.
+            set_viewport(&mut pass, overlay_frame.viewport);
+            // The grid first: it is the scene's floor, and every other overlay
+            // primitive is drawn over it.
             if grid.is_some() {
                 pass.set_pipeline(&self.grid_pipeline);
-                pass.set_bind_group(0, &input.camera.bind_group, &[]);
+                pass.set_bind_group(0, &overlay_frame.camera.bind_group, &[]);
                 pass.set_bind_group(1, &self.grid_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
             // Outlines first, so a debug line drawn over a selected entity
             // stays visible.
-            if !outlined.is_empty() {
+            if !outlined_positions.is_empty() {
                 pass.set_pipeline(&self.outline_edge_pipeline);
                 pass.set_bind_group(0, &targets.outline_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
-            pass.set_bind_group(0, &input.camera.bind_group, &[]);
+            pass.set_bind_group(0, &overlay_frame.camera.bind_group, &[]);
             let world_draws = [
                 (
                     &self.depth_tested_lines_pipeline,
@@ -757,18 +818,29 @@ impl Overlay {
             }
         }
 
+        // Step 4: Draw the pick buffer.
         if !picks.is_empty() {
-            self.record_picks(device, queue, encoder, targets, &input, picks, editor_view);
+            self.record_picks(
+                device,
+                queue,
+                encoder,
+                targets,
+                &overlay_frame,
+                picks,
+                editor_view,
+            );
         }
     }
 
-    /// Start reading back the picks the frame just submitted recorded.
+    /// Starts reading back the picks recorded by the frame that was just
+    /// submitted.
     pub fn after_submit(&mut self) {
         self.readback.start_mapping();
     }
 
-    /// Answer, with nothing, every request whose surface was not drawn this
-    /// frame: its pixel was never drawn, and it must not wait forever.
+    /// Answers with nothing every request whose surface was not drawn this
+    /// frame. Its pixel was never drawn, so the caller must not keep waiting
+    /// for it.
     pub fn answer_undrawn(&mut self, requests: &[PickRequest], drawn_surfaces: &[u32]) {
         for request in requests {
             if !drawn_surfaces.contains(&request.surface.0) {
@@ -777,7 +849,7 @@ impl Overlay {
         }
     }
 
-    /// Every pick answer that has arrived since the last call.
+    /// Returns every pick answer that has arrived since the last call.
     pub fn take_results(&mut self, device: &wgpu::Device) -> Vec<PickResult> {
         self.readback.collect(device)
     }
@@ -787,8 +859,8 @@ impl Overlay {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         targets: &OverlayTargets,
-        input: &OverlayFrame,
-        outlined: &[u32],
+        overlay_frame: &OverlayFrame,
+        outlined_queue_positions: &[u32],
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("overlay_outline_mask"),
@@ -806,17 +878,22 @@ impl Overlay {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        set_viewport(&mut pass, input.viewport);
+        set_viewport(&mut pass, overlay_frame.viewport);
         pass.set_pipeline(&self.outline_mask_pipeline);
-        pass.set_bind_group(0, &input.camera.bind_group, &[]);
-        pass.set_vertex_buffer(1, input.instance_buffer.slice(..));
-        draw_queue_positions(&mut pass, input, outlined.iter().copied());
+        pass.set_bind_group(0, &overlay_frame.camera.bind_group, &[]);
+        pass.set_vertex_buffer(1, overlay_frame.instance_buffer.slice(..));
+        draw_queue_positions(
+            &mut pass,
+            overlay_frame,
+            outlined_queue_positions.iter().copied(),
+        );
     }
 
-    /// Draw the pick buffer and record the copies of the requested pixels.
+    /// Draws the pick buffer and records the copies of the requested pixels.
     ///
     /// A surface that is not an editor view draws no handles into its pick
-    /// buffer: the gizmo is not there, so nothing may pick it there.
+    /// buffer, because the gizmo is not there and nothing can pick a handle on
+    /// it.
     #[allow(clippy::too_many_arguments)]
     fn record_picks(
         &mut self,
@@ -824,44 +901,48 @@ impl Overlay {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         targets: &mut OverlayTargets,
-        input: &OverlayFrame,
+        overlay_frame: &OverlayFrame,
         picks: Vec<PickRequest>,
         editor_view: bool,
     ) {
         let (width, height) = (targets.width, targets.height);
-        let pick = targets.pick.get_or_insert_with(|| {
-            let texture = create_target(
+        // Step 1: Create the pick buffer and its depth the first time a pick
+        // asks for them.
+        let pick_targets = targets.pick_targets.get_or_insert_with(|| {
+            let texture = create_target_texture(
                 device,
                 "overlay_pick",
                 width,
                 height,
-                PICK_FORMAT,
+                PICK_BUFFER_FORMAT,
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             );
-            let depth = create_target(
+            let depth = create_target_texture(
                 device,
                 "overlay_pick_depth",
                 width,
                 height,
-                PICK_DEPTH_FORMAT,
+                PICK_BUFFER_DEPTH_FORMAT,
                 wgpu::TextureUsages::RENDER_ATTACHMENT,
             );
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
             (texture, view, depth_view)
         });
-        let view_projection = &input.camera.parameters_data.view_projection_matrix;
+        // Step 2: Upload the handle quads and triangles this surface picks
+        // through.
+        let view_projection = &overlay_frame.camera.parameters_data.view_projection_matrix;
         let viewport_size = (
-            input.viewport.width.max(1) as f32,
-            input.viewport.height.max(1) as f32,
+            overlay_frame.viewport.width.max(1) as f32,
+            overlay_frame.viewport.height.max(1) as f32,
         );
         let handle_lines = if editor_view {
-            handle_line_vertices(&input.frame.debug, view_projection, viewport_size)
+            handle_line_vertices(&overlay_frame.frame.debug, view_projection, viewport_size)
         } else {
             Vec::new()
         };
         let handle_triangles = if editor_view {
-            handle_triangle_vertices(&input.frame.debug)
+            handle_triangle_vertices(&overlay_frame.frame.debug)
         } else {
             Vec::new()
         };
@@ -875,11 +956,13 @@ impl Overlay {
             .handle_triangles_buffer
             .write(device, queue, bytemuck::cast_slice(&handle_triangles))
             .cloned();
+        // Step 3: Draw the meshes into the pick buffer, then the handles over
+        // them.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("overlay_pick"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &pick.1,
+                    view: &pick_targets.1,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -888,7 +971,7 @@ impl Overlay {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &pick.2,
+                    view: &pick_targets.2,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -899,13 +982,17 @@ impl Overlay {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            set_viewport(&mut pass, input.viewport);
-            pass.set_bind_group(0, &input.camera.bind_group, &[]);
+            set_viewport(&mut pass, overlay_frame.viewport);
+            pass.set_bind_group(0, &overlay_frame.camera.bind_group, &[]);
             pass.set_pipeline(&self.mesh_pick_pipeline);
-            pass.set_vertex_buffer(1, input.instance_buffer.slice(..));
-            draw_queue_positions(&mut pass, input, 0..input.render_queue.len() as u32);
-            // Handles over the meshes: a handle in front of an entity is what
-            // a click on it means.
+            pass.set_vertex_buffer(1, overlay_frame.instance_buffer.slice(..));
+            draw_queue_positions(
+                &mut pass,
+                overlay_frame,
+                0..overlay_frame.render_queue.len() as u32,
+            );
+            // The handles are drawn over the meshes, so a handle that sits in
+            // front of an entity is what a click there picks.
             let handle_draws = [
                 (
                     &self.handle_lines_pick_pipeline,
@@ -926,28 +1013,37 @@ impl Overlay {
                 }
             }
         }
-        let entities: Vec<Entity> = input
+        // Step 4: Record the copies of the requested pixels.
+        let entities: Vec<Entity> = overlay_frame
             .render_queue
             .iter()
-            .map(|item| input.frame.instances[item.frame_instance_index as usize].entity)
+            .map(|item| overlay_frame.frame.instances[item.frame_instance_index as usize].entity)
             .collect();
         self.readback
-            .copy_requested_pixels(device, encoder, &pick.0, picks, entities);
+            .copy_requested_pixels(device, encoder, &pick_targets.0, picks, entities);
     }
 }
+
+// =============================================================================
+// Pipeline Description
+// =============================================================================
 
 /// The settings one overlay pipeline differs in.
 struct PipelineDescription<'a> {
     label: &'a str,
-    layout: &'a wgpu::PipelineLayout,
-    module: &'a wgpu::ShaderModule,
-    vertex: &'a str,
-    fragment: &'a str,
-    buffers: &'a [wgpu::VertexBufferLayout<'a>],
+    pipeline_layout: &'a wgpu::PipelineLayout,
+    shader_module: &'a wgpu::ShaderModule,
+    vertex_entry_point: &'a str,
+    fragment_entry_point: &'a str,
+    vertex_buffers: &'a [wgpu::VertexBufferLayout<'a>],
     topology: wgpu::PrimitiveTopology,
-    target: Option<wgpu::ColorTargetState>,
-    depth: Option<wgpu::DepthStencilState>,
+    color_target: Option<wgpu::ColorTargetState>,
+    depth_stencil: Option<wgpu::DepthStencilState>,
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// A depth state that reads `format` with `compare`, writing when `write`.
 fn depth_state(
@@ -965,7 +1061,7 @@ fn depth_state(
 }
 
 /// A single-sample 2D texture sized `width` by `height`.
-fn create_target(
+fn create_target_texture(
     device: &wgpu::Device,
     label: &str,
     width: u32,
@@ -1003,11 +1099,11 @@ fn set_viewport(pass: &mut wgpu::RenderPass, viewport: RenderViewport) {
 }
 
 /// The queue positions of the instances whose entity is outlined.
-fn outlined_positions(frame: &RenderFrame, render_queue: &[RenderQueueItem]) -> Vec<u32> {
+fn outlined_queue_positions(frame: &RenderFrame, render_queue: &[RenderQueueItem]) -> Vec<u32> {
     if frame.outlines.entities.is_empty() {
         return Vec::new();
     }
-    let outlined: HashSet<Entity> = frame.outlines.entities.iter().copied().collect();
+    let outlined_entities: HashSet<Entity> = frame.outlines.entities.iter().copied().collect();
     render_queue
         .iter()
         .enumerate()
@@ -1015,7 +1111,7 @@ fn outlined_positions(frame: &RenderFrame, render_queue: &[RenderQueueItem]) -> 
             frame
                 .instances
                 .get(item.frame_instance_index as usize)
-                .is_some_and(|instance| outlined.contains(&instance.entity))
+                .is_some_and(|instance| outlined_entities.contains(&instance.entity))
         })
         .map(|(position, _)| position as u32)
         .collect()
@@ -1025,80 +1121,77 @@ fn outlined_positions(frame: &RenderFrame, render_queue: &[RenderQueueItem]) -> 
 /// consecutive positions sharing a mesh become one draw.
 fn draw_queue_positions(
     pass: &mut wgpu::RenderPass,
-    input: &OverlayFrame,
+    overlay_frame: &OverlayFrame,
     positions: impl Iterator<Item = u32>,
 ) {
     let mut bound_mesh: Option<(RendererMeshHandle, u32)> = None;
-    let mut run: Option<std::ops::Range<u32>> = None;
+    let mut queue_position_run: Option<std::ops::Range<u32>> = None;
     for position in positions {
-        let Some(item) = input.render_queue.get(position as usize) else {
+        let Some(item) = overlay_frame.render_queue.get(position as usize) else {
             continue;
         };
-        let handle = item.mesh;
-        let continues = bound_mesh.is_some_and(|(bound, _)| bound == handle)
-            && run.as_ref().is_some_and(|run| run.end == position);
+        let mesh_handle = item.mesh;
+        let continues = bound_mesh.is_some_and(|(bound, _)| bound == mesh_handle)
+            && queue_position_run
+                .as_ref()
+                .is_some_and(|run| run.end == position);
         if continues {
-            if let Some(run) = &mut run {
+            if let Some(run) = &mut queue_position_run {
                 run.end += 1;
             }
             continue;
         }
-        if let (Some((_, index_count)), Some(run)) = (bound_mesh, run.take()) {
+        if let (Some((_, index_count)), Some(run)) = (bound_mesh, queue_position_run.take()) {
             pass.draw_indexed(0..index_count, 0, run);
         }
-        if bound_mesh.is_none_or(|(bound, _)| bound != handle) {
-            let Some(mesh) = input.storage.meshes.get(handle) else {
+        if bound_mesh.is_none_or(|(bound, _)| bound != mesh_handle) {
+            let Some(mesh) = overlay_frame.storage.meshes.get(mesh_handle) else {
                 bound_mesh = None;
                 continue;
             };
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            bound_mesh = Some((handle, mesh.index_count));
+            bound_mesh = Some((mesh_handle, mesh.index_count));
         }
-        run = Some(position..position + 1);
+        queue_position_run = Some(position..position + 1);
     }
-    if let (Some((_, index_count)), Some(run)) = (bound_mesh, run) {
+    if let (Some((_, index_count)), Some(run)) = (bound_mesh, queue_position_run) {
         pass.draw_indexed(0..index_count, 0, run);
     }
 }
 
-/// A vertex on its way to the screen: its clip-space position and the corner
-/// of the shape it belongs to, carried through clipping.
-type ClipVertex = ([f32; 4], [f32; 3]);
-
-/// The frame's debug lines and gizmo lines as screen-space quads: those
-/// tested against the scene's depth, and those drawn on top.
+/// The frame's debug lines and gizmo lines as screen-space quads, split into
+/// the lines tested against the scene's depth and the lines drawn on top.
 ///
-/// Each quad is the segment widened by the line's half width plus its
-/// feather on each side, with every corner carrying its distance from the
-/// line's centre, so the fragment shader can fade the edge. Widening happens
-/// in screen space after projection, which keeps a line the same width at any
-/// depth. `editor_view` is the editor-view switch: the project's own debug lines
-/// always draw, the editor's chrome - its drag guides and its gizmo handles -
-/// only on an editor view.
+/// Each quad is the segment widened by the line's half width plus its feather
+/// on each side. Every corner carries its distance from the line's centre, so
+/// the fragment shader can fade the edge. The widening happens in screen space
+/// after projection, so a line keeps the same width at any depth. When
+/// `editor_view` is false, the project's own debug lines still draw but the
+/// editor's chrome (its drag guides and its gizmo handles) does not.
 fn line_vertices(
-    debug: &DebugFrame,
+    debug_frame: &DebugFrame,
     view_projection: &pill_core::math::Matrix4f,
-    size: (f32, f32),
+    viewport_size: (f32, f32),
     editor_view: bool,
 ) -> (Vec<LineVertex>, Vec<LineVertex>) {
     let offset = LINE_HALF_WIDTH + LINE_FEATHER;
     let push_line =
         |output: &mut Vec<LineVertex>, start: [f32; 3], end: [f32; 3], color: [f32; 4]| {
-            let Some(quad) = line_quad(start, end, view_projection, size, offset) else {
+            let Some(quad) = line_quad(start, end, view_projection, viewport_size, offset) else {
                 return;
             };
-            for (clip, side) in quad.into_iter().zip(LINE_QUAD_SIDES) {
+            for (clip_position, side) in quad.into_iter().zip(LINE_QUAD_SIDES) {
                 output.push(LineVertex {
-                    clip,
+                    clip_position,
                     color,
-                    across: side * offset,
+                    across_pixels: side * offset,
                 });
             }
         };
     let mut tested = Vec::new();
     let mut on_top = Vec::new();
-    for line in &debug.lines {
+    for line in &debug_frame.lines {
         if line.chrome && !editor_view {
             continue;
         }
@@ -1108,7 +1201,7 @@ fn line_vertices(
             push_line(&mut on_top, line.start, line.end, line.color);
         }
     }
-    for line in &debug.gizmo_lines {
+    for line in &debug_frame.gizmo_lines {
         if editor_view {
             push_line(&mut on_top, line.start, line.end, line.color);
         }
@@ -1117,34 +1210,37 @@ fn line_vertices(
 }
 
 /// The six clip-space corners of the quad covering `start`-`end`, widened by
-/// `offset` pixels on each side, or `None` when the segment is behind the
+/// `offset` pixels on each side. Returns `None` when the segment is behind the
 /// camera or shorter than a pixel on screen.
 fn line_quad(
     start: [f32; 3],
     end: [f32; 3],
     view_projection: &pill_core::math::Matrix4f,
-    size: (f32, f32),
+    viewport_size: (f32, f32),
     offset: f32,
 ) -> Option<[[f32; 4]; 6]> {
     let project = |position: [f32; 3]| {
         (*view_projection * glam::Vec4::new(position[0], position[1], position[2], 1.0)).to_array()
     };
     let (start, end) = clip_segment_to_near(project(start), project(end))?;
-    let (start_pixel, end_pixel) = (to_pixels(start, size), to_pixels(end, size));
+    let (start_pixel, end_pixel) = (
+        to_pixels(start, viewport_size),
+        to_pixels(end, viewport_size),
+    );
     let along = [end_pixel.0 - start_pixel.0, end_pixel.1 - start_pixel.1];
     let length = (along[0] * along[0] + along[1] * along[1]).sqrt();
     if length < 1.0 {
         return None;
     }
     let normal = [-along[1] / length * offset, along[0] / length * offset];
-    let corners = |clip: [f32; 4]| {
-        let pixel = to_pixels(clip, size);
+    let corners = |clip_position: [f32; 4]| {
+        let pixel = to_pixels(clip_position, viewport_size);
         [1.0, -1.0].map(|side| {
             from_pixels(
                 (pixel.0 + normal[0] * side, pixel.1 + normal[1] * side),
-                size,
-                clip[2],
-                clip[3],
+                viewport_size,
+                clip_position[2],
+                clip_position[3],
             )
         })
     };
@@ -1166,8 +1262,11 @@ fn clip_segment_to_near(start: [f32; 4], end: [f32; 4]) -> Option<([f32; 4], [f3
     match (start[3] >= NEAR_CLIP_DEPTH, end[3] >= NEAR_CLIP_DEPTH) {
         (false, false) => None,
         (true, true) => Some((start, end)),
-        (false, true) => Some((lerp4(start, end, crossing(start[3], end[3])), end)),
-        (true, false) => Some((start, lerp4(end, start, crossing(end[3], start[3])))),
+        (false, true) => Some((lerp4(start, end, near_side_crossing(start[3], end[3])), end)),
+        (true, false) => Some((
+            start,
+            lerp4(end, start, near_side_crossing(end[3], start[3])),
+        )),
     }
 }
 
@@ -1182,7 +1281,7 @@ fn clip_polygon_to_near(polygon: &[ClipVertex]) -> Vec<ClipVertex> {
             clipped.push(*current);
         }
         if current_inside != (next.0[3] >= NEAR_CLIP_DEPTH) {
-            let t = crossing(current.0[3], next.0[3]);
+            let t = near_side_crossing(current.0[3], next.0[3]);
             clipped.push((lerp4(current.0, next.0, t), lerp3(current.1, next.1, t)));
         }
     }
@@ -1191,7 +1290,7 @@ fn clip_polygon_to_near(polygon: &[ClipVertex]) -> Vec<ClipVertex> {
 
 /// How far along the way from a point at `start_depth` to one at `end_depth`
 /// the camera's near side lies.
-fn crossing(start_depth: f32, end_depth: f32) -> f32 {
+fn near_side_crossing(start_depth: f32, end_depth: f32) -> f32 {
     (NEAR_CLIP_DEPTH - start_depth) / (end_depth - start_depth)
 }
 
@@ -1206,70 +1305,71 @@ fn lerp3(start: [f32; 3], end: [f32; 3], t: f32) -> [f32; 3] {
 }
 
 /// A clip-space position in pixels from the centre of the drawn region.
-fn to_pixels(clip: [f32; 4], size: (f32, f32)) -> (f32, f32) {
-    let inverse = 1.0 / clip[3];
+fn to_pixels(clip_position: [f32; 4], viewport_size: (f32, f32)) -> (f32, f32) {
+    let inverse = 1.0 / clip_position[3];
     (
-        clip[0] * inverse * 0.5 * size.0,
-        clip[1] * inverse * 0.5 * size.1,
+        clip_position[0] * inverse * 0.5 * viewport_size.0,
+        clip_position[1] * inverse * 0.5 * viewport_size.1,
     )
 }
 
 /// The clip-space position a pixel position maps back to at `depth`.
-fn from_pixels(point: (f32, f32), size: (f32, f32), depth: f32, w: f32) -> [f32; 4] {
+fn from_pixels(point: (f32, f32), viewport_size: (f32, f32), depth: f32, w: f32) -> [f32; 4] {
     [
-        point.0 * 2.0 / size.0 * w,
-        point.1 * 2.0 / size.1 * w,
+        point.0 * 2.0 / viewport_size.0 * w,
+        point.1 * 2.0 / viewport_size.1 * w,
         depth,
         w,
     ]
 }
 
-/// Scales `vector` to a unit-length direction, or `None` when it has no
-/// direction to scale.
-fn unit(vector: [f32; 2]) -> Option<[f32; 2]> {
-    let length = (vector[0] * vector[0] + vector[1] * vector[1]).sqrt();
+/// Scales `direction` to unit length, or returns `None` when it is too short
+/// to have one.
+fn unit_direction(direction: [f32; 2]) -> Option<[f32; 2]> {
+    let length = (direction[0] * direction[0] + direction[1] * direction[1]).sqrt();
     if length < 1e-6 {
         return None;
     }
-    Some([vector[0] / length, vector[1] / length])
+    Some([direction[0] / length, direction[1] / length])
 }
 
 /// The frame's gizmo triangles as screen-space triangles whose corners are
-/// pushed `TRIANGLE_FEATHER` pixels out, which the fragment shader feathers
-/// back down to the silhouette the triangles really have. `editor_view` is the
-/// editor-view switch, as in [`line_vertices`].
+/// pushed `TRIANGLE_FEATHER` pixels out, and which the fragment shader feathers
+/// back down to the silhouette the triangles really have. Returns an empty list
+/// when `editor_view` is false; see [`line_vertices`].
 fn triangle_vertices(
-    debug: &DebugFrame,
+    debug_frame: &DebugFrame,
     view_projection: &pill_core::math::Matrix4f,
-    size: (f32, f32),
+    viewport_size: (f32, f32),
     editor_view: bool,
 ) -> Vec<TriangleVertex> {
     if !editor_view {
         return Vec::new();
     }
     let mut vertices = Vec::new();
-    for triangle in &debug.gizmo_triangles {
+    for triangle in &debug_frame.gizmo_triangles {
         let corners = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let polygon: Vec<ClipVertex> = triangle
             .corners
             .iter()
             .zip(corners)
             .map(|(corner, barycentric)| {
-                let clip = (*view_projection
+                let clip_position = (*view_projection
                     * glam::Vec4::new(corner[0], corner[1], corner[2], 1.0))
                 .to_array();
-                (clip, barycentric)
+                (clip_position, barycentric)
             })
             .collect();
         let polygon = clip_polygon_to_near(&polygon);
         if polygon.len() < 3 {
             continue;
         }
-        let expanded = expand_polygon(&polygon, size, TRIANGLE_FEATHER);
+        let expanded = expand_polygon(&polygon, viewport_size, TRIANGLE_FEATHER);
         for index in 1..expanded.len() - 1 {
-            for (clip, barycentric) in [expanded[0], expanded[index], expanded[index + 1]] {
+            for (clip_position, barycentric) in [expanded[0], expanded[index], expanded[index + 1]]
+            {
                 vertices.push(TriangleVertex {
-                    clip,
+                    clip_position,
                     color: triangle.color,
                     barycentric,
                 });
@@ -1279,16 +1379,22 @@ fn triangle_vertices(
     vertices
 }
 
-/// Push every vertex of a projected polygon `offset` pixels out from its two
-/// edges: along the edge normal at a straight corner, farther at a sharp one
-/// so both edges clear the original by `offset` and the feathered band has no
-/// gaps at the joins.
-fn expand_polygon(polygon: &[ClipVertex], size: (f32, f32), offset: f32) -> Vec<ClipVertex> {
+/// Moves every vertex of a projected polygon `offset` pixels away from its two
+/// edges. A straight corner moves along the edge normal; a sharp corner moves
+/// farther, so both edges clear the original shape by `offset` and the
+/// feathered band has no gaps at the joins.
+fn expand_polygon(
+    polygon: &[ClipVertex],
+    viewport_size: (f32, f32),
+    offset: f32,
+) -> Vec<ClipVertex> {
     let points: Vec<(f32, f32)> = polygon
         .iter()
-        .map(|vertex| to_pixels(vertex.0, size))
+        .map(|vertex| to_pixels(vertex.0, viewport_size))
         .collect();
     let count = points.len();
+    // Step 1: Find which way the polygon winds, so every edge normal can point
+    // outwards.
     let double_area: f32 = (0..count)
         .map(|index| {
             let current = points[index];
@@ -1297,13 +1403,14 @@ fn expand_polygon(polygon: &[ClipVertex], size: (f32, f32), offset: f32) -> Vec<
         })
         .sum();
     let orientation = if double_area < 0.0 { -1.0 } else { 1.0 };
+    // Step 2: Move each corner outwards along the bisector of its two edges.
     let mut expanded = Vec::with_capacity(count);
     for index in 0..count {
         let current = points[index];
         let previous = points[(index + count - 1) % count];
         let next = points[(index + 1) % count];
-        let incoming = unit([current.0 - previous.0, current.1 - previous.1]);
-        let outgoing = unit([next.0 - current.0, next.1 - current.1]);
+        let incoming = unit_direction([current.0 - previous.0, current.1 - previous.1]);
+        let outgoing = unit_direction([next.0 - current.0, next.1 - current.1]);
         let vertex = polygon[index];
         let moved = match (incoming, outgoing) {
             (Some(incoming), Some(outgoing)) => {
@@ -1314,7 +1421,10 @@ fn expand_polygon(polygon: &[ClipVertex], size: (f32, f32), offset: f32) -> Vec<
                     incoming_normal[0] + outgoing_normal[0],
                     incoming_normal[1] + outgoing_normal[1],
                 ];
-                match (turn * orientation > 0.0).then(|| unit(bisector)).flatten() {
+                match (turn * orientation > 0.0)
+                    .then(|| unit_direction(bisector))
+                    .flatten()
+                {
                     Some(direction) => {
                         let along = (direction[0] * outgoing_normal[0]
                             + direction[1] * outgoing_normal[1])
@@ -1332,71 +1442,78 @@ fn expand_polygon(polygon: &[ClipVertex], size: (f32, f32), offset: f32) -> Vec<
             }
             _ => current,
         };
-        expanded.push((from_pixels(moved, size, vertex.0[2], vertex.0[3]), vertex.1));
+        expanded.push((
+            from_pixels(moved, viewport_size, vertex.0[2], vertex.0[3]),
+            vertex.1,
+        ));
     }
     expanded
 }
 
-/// The gizmo lines as the pick buffer draws them: the same quads as the drawn
-/// lines, widened to the band the editor's hover test accepts, so
-/// picking covers the handle the pointer highlights.
+/// The gizmo lines as the pick buffer draws them. Each is the same quad as the
+/// drawn line, widened to the band the editor's hover test accepts, so a pick
+/// covers the handle the pointer highlights.
 fn handle_line_vertices(
-    debug: &DebugFrame,
+    debug_frame: &DebugFrame,
     view_projection: &pill_core::math::Matrix4f,
-    size: (f32, f32),
+    viewport_size: (f32, f32),
 ) -> Vec<HandleLineVertex> {
     let mut vertices = Vec::new();
-    for line in &debug.gizmo_lines {
+    for line in &debug_frame.gizmo_lines {
         let value = PICK_HANDLE_BIT | line.handle;
         let Some(quad) = line_quad(
             line.start,
             line.end,
             view_projection,
-            size,
+            viewport_size,
             PICK_LINE_HALF_WIDTH,
         ) else {
             continue;
         };
-        vertices.extend(quad.map(|clip| HandleLineVertex { clip, value }));
+        vertices.extend(quad.map(|clip_position| HandleLineVertex {
+            clip_position,
+            handle_value: value,
+        }));
     }
     vertices
 }
 
 /// The frame's gizmo triangles as the pick buffer draws them, three
 /// world-space vertices each.
-fn handle_triangle_vertices(debug: &DebugFrame) -> Vec<HandleVertex> {
-    debug
+fn handle_triangle_vertices(debug_frame: &DebugFrame) -> Vec<HandleVertex> {
+    debug_frame
         .gizmo_triangles
         .iter()
         .flat_map(|triangle| {
             let value = PICK_HANDLE_BIT | triangle.handle;
-            triangle
-                .corners
-                .map(|position| HandleVertex { position, value })
+            triangle.corners.map(|position| HandleVertex {
+                world_position: position,
+                handle_value: value,
+            })
         })
         .collect()
 }
 
 /// The frame's labels as a `pill_ui_frame` list in surface pixels: glyph quads
-/// over the bitmap font texture, each over a shadow one glyph pixel down and
-/// right. The UI painter draws it after the overlay, so text stays readable
+/// over the bitmap font texture, each drawn over a shadow one glyph pixel down
+/// and right. The UI painter draws it after the overlay, so text stays readable
 /// over everything the overlay drew.
 ///
 /// Debug colours are linear and the painter decodes sRGB vertex colours, so
-/// each colour is encoded on the way in and lands unchanged.
+/// each colour is converted on the way in and reaches the screen unchanged.
 pub(crate) fn label_list(
-    debug: &DebugFrame,
+    debug_frame: &DebugFrame,
     view_projection: &pill_core::math::Matrix4f,
     viewport: RenderViewport,
 ) -> DrawList {
-    let mut list = DrawList::new();
+    let mut draw_list = DrawList::new();
     let (atlas_width, atlas_height) = font::atlas_size();
     let (atlas_width, atlas_height) = (atlas_width as f32, atlas_height as f32);
-    for label in &debug.labels {
+    for label in &debug_frame.labels {
         let Some((x, y)) = label_origin(label.anchor, view_projection, viewport) else {
             continue;
         };
-        for (offset, color) in [(font::GLYPH_SCALE, LABEL_SHADOW), (0.0, label.color)] {
+        for (offset, color) in [(font::GLYPH_SCALE, LABEL_SHADOW_COLOR), (0.0, label.color)] {
             let color = Color::rgba(
                 linear_to_srgb(color[0]),
                 linear_to_srgb(color[1]),
@@ -1416,11 +1533,11 @@ pub(crate) fn label_list(
                     (quad.atlas_origin[0] + font::GLYPH_WIDTH) as f32 / atlas_width,
                     (quad.atlas_origin[1] + font::GLYPH_HEIGHT) as f32 / atlas_height,
                 );
-                list.push_quad(font::FONT_TEXTURE, rect, uv_min, uv_max, color);
+                draw_list.push_quad(font::FONT_TEXTURE, rect, uv_min, uv_max, color);
             }
         }
     }
-    list
+    draw_list
 }
 
 /// Where a label's text starts, in surface pixels: a screen anchor as given,
@@ -1449,13 +1566,17 @@ fn label_origin(
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ui::UiRenderer;
 
-    /// A world point straight ahead lands in the middle of the viewport, and
-    /// one behind the camera is not drawn.
+    /// A world point straight ahead is drawn in the middle of the viewport,
+    /// and one behind the camera is not drawn.
     #[test]
     fn world_labels_project_into_the_viewport() {
         let projection = glam::camera::rh::proj::directx::perspective(1.0, 2.0, 0.1, 100.0);
@@ -1475,7 +1596,7 @@ mod tests {
         );
     }
 
-    /// Whatever the debug lines ask, gizmo lines draw on top; every line
+    /// Gizmo lines draw on top whatever their depth test says. Every line
     /// becomes a six-vertex quad, and the pick quad carries the handle.
     #[test]
     fn lines_split_by_depth_test() {
@@ -1498,13 +1619,13 @@ mod tests {
         assert_eq!(on_top.len(), 18 - tested.len());
         let handle_lines = handle_line_vertices(&frame, &projection, (100.0, 100.0));
         assert_eq!(handle_lines.len(), 6);
-        assert_eq!(handle_lines[0].value, PICK_HANDLE_BIT | 5);
+        assert_eq!(handle_lines[0].handle_value, PICK_HANDLE_BIT | 5);
     }
 
     /// A surface that is not an editor view draws the project's own debug
-    /// lines and no editor chrome: no gizmo lines, no gizmo triangles, and none
-    /// of the editor's chrome lines - the drag guides it draws as plain debug
-    /// lines but marks as its own.
+    /// lines and no editor chrome. The editor's chrome lines (the drag guides
+    /// it draws as plain debug lines but marks as its own), its gizmo lines and
+    /// its gizmo triangles are all left out.
     #[test]
     fn a_game_surface_draws_its_debug_lines_without_the_editor_chrome() {
         let mut draw = pill_engine::DebugDraw::new(true);
@@ -1571,7 +1692,7 @@ mod tests {
     }
 
     /// A gizmo triangle's corners move out past their projection, so the
-    /// feather has a band to fade in, and keep their barycentric corners so
+    /// feather has a band to fade in. They keep their barycentric corners, so
     /// the coverage still measures the true edge.
     #[test]
     fn gizmo_triangles_expand_for_antialiasing() {
@@ -1592,7 +1713,7 @@ mod tests {
         let clip = (projection * glam::Vec4::new(corners[0][0], corners[0][1], corners[0][2], 1.0))
             .to_array();
         let (raw_x, raw_y) = to_pixels(clip, (100.0, 100.0));
-        let (moved_x, moved_y) = to_pixels(vertices[0].clip, (100.0, 100.0));
+        let (moved_x, moved_y) = to_pixels(vertices[0].clip_position, (100.0, 100.0));
         assert!(
             moved_x < raw_x && moved_y < raw_y,
             "{moved_x} {moved_y} vs {raw_x} {raw_y}"
@@ -1608,9 +1729,9 @@ mod tests {
         assert!(triangle_vertices(&behind, &projection, (100.0, 100.0), true).is_empty());
     }
 
-    /// A device and queue without a surface, preferring the platform's
-    /// software adapter (WARP on Windows) so the test runs without a GPU;
-    /// `None` when the machine offers no adapter at all.
+    /// A device and queue without a surface, forcing the platform's fallback
+    /// adapter (WARP on Windows) so the test runs without a GPU. Returns `None`
+    /// when the machine offers no adapter at all.
     async fn windowless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
@@ -1640,16 +1761,16 @@ mod tests {
             .ok()
     }
 
-    /// Draw `list` with `painter` into a transparent sRGB target of `size`
+    /// Draw `draw_list` with `painter` into a transparent sRGB target of `size`
     /// and read its pixels back as tightly packed RGBA8 rows.
     fn render_pixels(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         painter: &mut UiRenderer,
         size: (u32, u32),
-        list: &DrawList,
+        draw_list: &DrawList,
     ) -> Vec<u8> {
-        let target = device.create_texture(&wgpu::TextureDescriptor {
+        let target_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("overlay label test target"),
             size: wgpu::Extent3d {
                 width: size.0,
@@ -1663,7 +1784,7 @@ mod tests {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
         // A texture-to-buffer copy pads every row to the copy alignment.
         let row_bytes = size.0 as usize * 4;
         let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
@@ -1677,10 +1798,17 @@ mod tests {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("overlay label test encoder"),
         });
-        painter.render(device, queue, &mut encoder, &view, size, &[(list, 1.0)]);
+        painter.render(
+            device,
+            queue,
+            &mut encoder,
+            &view,
+            size,
+            &[(draw_list, 1.0)],
+        );
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &target,
+                texture: &target_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -1725,10 +1853,10 @@ mod tests {
         pixels
     }
 
-    /// A debug label drawn through the UI painter lands in its linear debug
-    /// colour, encoded into the sRGB target, only where its glyph is lit, over
-    /// its shadow one glyph pixel down and right. Skipped on a machine with no
-    /// adapter at all.
+    /// A debug label drawn through the UI painter shows its linear debug
+    /// colour, encoded into the sRGB target, only where its glyph is lit, and
+    /// over its shadow one glyph pixel down and right. The test is skipped on a
+    /// machine with no adapter at all.
     #[test]
     fn labels_draw_through_the_painter_in_their_linear_colour() {
         let Some((device, queue)) = pill_core::platform::futures::block_on(windowless_device())
@@ -1745,13 +1873,13 @@ mod tests {
         let style = pill_engine::DebugStyle::colored([0.5, 0.25, 1.0, 1.0]);
         draw.label_screen(0.0, 0.0, "|", style);
         let frame = draw.collect_frame(0.016);
-        let list = label_list(
+        let label_draw_list = label_list(
             &frame,
             &pill_core::math::Matrix4f::IDENTITY,
             RenderViewport::new(0, 0, 32, 32),
         );
         let size = (32u32, 32u32);
-        let pixels = render_pixels(&device, &queue, &mut painter, size, &list);
+        let pixels = render_pixels(&device, &queue, &mut painter, size, &label_draw_list);
         let pixel = |x: u32, y: u32| {
             let start = ((y * size.0 + x) * 4) as usize;
             [

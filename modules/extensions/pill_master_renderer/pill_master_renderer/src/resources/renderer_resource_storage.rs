@@ -2,7 +2,7 @@
 //!
 //! # Responsibilities
 //!
-//! - Own the slot map behind every GPU resource handle the renderer hands out.
+//! - Own the slot maps that every GPU resource handle points into.
 //! - Install the stand-in textures a shader slot falls back to when a material
 //!   or pass binds nothing.
 //!
@@ -11,8 +11,8 @@
 //! One struct carries all five maps and the engine parameters, so asset sync,
 //! pass building, and drawing reach every GPU resource through the same
 //! reference. The stand-in textures are created at construction and their
-//! handles kept, so a slot that binds nothing falls back to the same white,
-//! flat-normal, or black environment texture.
+//! handles stay in this struct, so a slot that binds nothing falls back to the
+//! same white, flat-normal, or black environment texture.
 
 // External crates
 use pill_core::slot_map::SlotMap;
@@ -28,10 +28,14 @@ use crate::{
     },
 };
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// Starting capacity of the shader slot map.
 ///
-/// A capacity hint for the underlying vector, not a limit: the map grows past
-/// it when a project registers more.
+/// The map starts with room for this many entries and grows when more
+/// resources are added; this is not a limit.
 pub const INITIAL_SHADER_CAPACITY: usize = 10;
 /// Starting capacity of the texture slot map.
 pub const INITIAL_TEXTURE_CAPACITY: usize = 10;
@@ -42,12 +46,16 @@ pub const INITIAL_MESH_CAPACITY: usize = 10;
 /// Starting capacity of the camera slot map.
 pub const INITIAL_CAMERA_CAPACITY: usize = 10;
 
+// =============================================================================
+// RendererResourceStorage
+// =============================================================================
+
 /// Every GPU resource the renderer holds, keyed by the handles it hands out.
 ///
 /// One storage carries all five maps plus the engine parameters, so asset
 /// sync, pass building, and drawing reach any resource through the same
 /// borrow. The stand-in handles sit beside the maps that own their textures,
-/// so a slot that binds nothing still resolves to one.
+/// so a slot that binds nothing still finds one.
 pub struct RendererResourceStorage {
     /// Shader pipelines and their bind group layouts, one per shader handle.
     pub(crate) shaders: SlotMap<RendererShaderHandle, RendererShader>,
@@ -66,7 +74,8 @@ pub struct RendererResourceStorage {
     /// The stand-in bound when a normal texture slot binds nothing.
     pub(crate) default_normal_texture: RendererTextureHandle,
     /// The stand-in bound when an equirect slot binds nothing: one black texel,
-    /// so an unset sky is black rather than a white glare.
+    /// so a sky with no environment map renders black instead of glaring
+    /// white.
     pub(crate) default_equirect_texture: RendererTextureHandle,
     /// The stand-in bound when a cubemap slot binds nothing: six black faces.
     pub(crate) default_cubemap_texture: RendererTextureHandle,
@@ -74,15 +83,18 @@ pub struct RendererResourceStorage {
 
 impl RendererResourceStorage {
     /// Creates the storage with each map sized to its starting capacity, and
-    /// installs the stand-in textures every texture slot can fall back to.
+    /// installs the colour, normal, equirect and cubemap stand-in textures.
     ///
     /// # Errors
     ///
     /// Returns [`crate::error::RendererError::Other`] naming the stand-in when
     /// the driver refuses its texture, upload, or sampler: `default_color`,
-    /// `default_normal`, `default_equirect` or `default_cubemap`. Everything
-    /// else the constructor touches only records work and cannot fail.
+    /// `default_normal`, `default_equirect` or `default_cubemap`. Nothing else
+    /// in the constructor returns an error.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self> {
+        // Step 1: Build each slot map at its starting capacity. The four
+        // stand-in handles are placeholders that Step 2 replaces with the
+        // textures it creates.
         let mut storage = RendererResourceStorage {
             shaders: SlotMap::<RendererShaderHandle, RendererShader>::with_capacity_and_key(
                 INITIAL_SHADER_CAPACITY,
@@ -117,12 +129,15 @@ impl RendererResourceStorage {
                 std::num::NonZeroU32::new(1).unwrap(),
             ),
         };
+
+        // Step 2: Create the stand-in textures and point the handles at them.
         storage.install_default_textures(device, queue)?;
         Ok(storage)
     }
 
-    /// The stand-in a slot of `kind` falls back to when it binds nothing, or
-    /// `None` for depth, which only a pass's own input can supply.
+    /// Returns the stand-in texture a slot of `kind` falls back to when it
+    /// binds nothing. Returns `None` for a depth slot, because only a pass's
+    /// own input can supply one.
     pub(crate) fn default_texture_for(
         &self,
         kind: ShaderTextureKind,
@@ -140,17 +155,19 @@ impl RendererResourceStorage {
     /// slots, black for equirect and cubemap slots.
     ///
     /// The colour and normal stand-ins are files the data module ships, read
-    /// through its store; one that cannot be read falls back to the single
-    /// texel built here, because a window without a colour texture is worse
-    /// than a white one.
+    /// through its store. A file that cannot be read falls back to the texel
+    /// built here, so a missing file cannot stop the renderer from starting.
     ///
-    /// Fails only when the driver refuses one of the textures.
+    /// # Errors
+    ///
+    /// Returns the error from [`RendererTexture::new_texture`] when the driver
+    /// refuses one of the textures.
     fn install_default_textures(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Result<()> {
-        self.default_color_texture = self.textures.insert(Self::stand_in(
+        self.default_color_texture = self.textures.insert(Self::create_stand_in_texture(
             device,
             queue,
             "default_color",
@@ -158,7 +175,7 @@ impl RendererResourceStorage {
             TextureType::Color,
             &[255, 255, 255, 255],
         )?);
-        self.default_normal_texture = self.textures.insert(Self::stand_in(
+        self.default_normal_texture = self.textures.insert(Self::create_stand_in_texture(
             device,
             queue,
             "default_normal",
@@ -166,10 +183,10 @@ impl RendererResourceStorage {
             TextureType::Normal,
             &[128, 128, 255, 255],
         )?);
-        // Half-float zeros are zero bytes: one black texel, and six of them for
-        // the cube's faces. Neither has a file form an importer reads, so the
-        // two environment stand-ins stay texels built here.
-        self.default_equirect_texture = self.textures.insert(Self::stand_in(
+        // Half-float zero is stored as zero bytes: one black texel, and six of
+        // them for the cube's faces. The data module ships no environment
+        // stand-in file, so these two are built here.
+        self.default_equirect_texture = self.textures.insert(Self::create_stand_in_texture(
             device,
             queue,
             "default_equirect",
@@ -177,7 +194,7 @@ impl RendererResourceStorage {
             TextureType::Equirect,
             &[0; 8],
         )?);
-        self.default_cubemap_texture = self.textures.insert(Self::stand_in(
+        self.default_cubemap_texture = self.textures.insert(Self::create_stand_in_texture(
             device,
             queue,
             "default_cubemap",
@@ -188,15 +205,24 @@ impl RendererResourceStorage {
         Ok(())
     }
 
-    /// One stand-in: the file the module ships when `path` names one it can
-    /// read, else a single texel of `texel`.
-    fn stand_in(
+    /// Creates one stand-in texture.
+    ///
+    /// `name` labels the texture and names it in any error. When `path` names a
+    /// file the module ships and the file can be read, the texture is built
+    /// from it; otherwise it is a 1x1 texture built from `texel_bytes`. A file
+    /// that cannot be read is logged and replaced by that built-in texel.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from [`RendererTexture::new_texture`] when the driver
+    /// refuses the texture, the upload, or the sampler.
+    fn create_stand_in_texture(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         name: &str,
         path: Option<&str>,
         texture_type: TextureType,
-        texel: &[u8],
+        texel_bytes: &[u8],
     ) -> Result<RendererTexture> {
         if let Some(path) = path {
             match pill_master_renderer_data::load_shipped_texture(path, texture_type) {
@@ -217,6 +243,6 @@ impl RendererResourceStorage {
                 ),
             }
         }
-        RendererTexture::new_texture(device, queue, Some(name), texel, 1, 1, texture_type)
+        RendererTexture::new_texture(device, queue, Some(name), texel_bytes, 1, 1, texture_type)
     }
 }

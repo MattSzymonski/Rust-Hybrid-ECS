@@ -5,16 +5,17 @@
 //! - Turns queued [`AudioLoadQueue`] bytes into [`Sound`] assets.
 //! - Places the active listener's ears.
 //! - Carries out each source's pending [`AudioCommand`].
-//! - Follows spatial sources with their emitter, and reclaims finished sinks.
+//! - Moves each playing spatial source's emitter to its entity, and returns
+//!   sinks whose sound has ended to the pool.
 //!
 //! # Design
 //!
-//! Takes its state as ordinary system parameters rather than `&mut Engine`,
-//! so the scheduler derives the access pattern from the signature and
-//! serialises this against anything else touching the same resources.
+//! Takes its state as ordinary system parameters instead of `&mut Engine`.
+//! The scheduler reads the access pattern from the signature, so it never
+//! runs this system at the same time as another one that touches the same
+//! resources.
 
 // External crates
-use crate::AudioLoadQueue;
 use pill_engine::{AssetManager, Query, ResMut, SystemError, TransformComponent};
 
 // Current crate
@@ -25,6 +26,7 @@ use crate::audio_source_component::{AudioSourceComponent, NO_SINK};
 use crate::listener_geometry::ear_positions;
 use crate::sound::Sound;
 use crate::sound_type::SoundType;
+use crate::AudioLoadQueue;
 
 // =============================================================================
 // audio_system
@@ -32,36 +34,42 @@ use crate::sound_type::SoundType;
 
 /// Drives every [`AudioSourceComponent`] once per frame.
 ///
-/// Queued sound loads are turned into assets first, then four things happen,
-/// in this order:
+/// Queued sound loads become [`Sound`] assets first. Then four steps run, in
+/// this order:
 ///
-/// 1. the active listener's ears are placed, so panning reflects this frame;
+/// 1. the active listener's ears are placed, so panning matches this frame;
 /// 2. each source's pending [`AudioCommand`] is carried out;
 /// 3. each playing spatial source's emitter is moved to its entity;
 /// 4. sinks whose sound has finished are returned to the pool.
 ///
-/// Step 4 is what makes a fixed pool workable: without it a sound that ended
-/// would hold its sink until the entity was destroyed.
+/// Step 4 is what makes a fixed pool workable. Without it, a source would keep
+/// its sink after its sound ended, and the pool would run out of voices.
 ///
-/// Does nothing but drain the load queue when no [`AudioManager`] is
-/// installed, which is the headless case; see [`AudioManager::new`].
+/// With no [`AudioManager`] installed the function only drains the load
+/// queue, which is the headless case. See [`AudioManager::new`].
+///
+/// # Errors
+///
+/// Returns [`SystemError::Failure`] when the asset store refuses to store a
+/// queued sound under its name. The name is checked first, so this is not
+/// expected to happen.
 pub fn audio_system(
-    mut manager: ResMut<AudioManager>,
-    mut assets: ResMut<AssetManager>,
-    mut loads: ResMut<AudioLoadQueue>,
+    mut audio_manager: ResMut<AudioManager>,
+    mut asset_manager: ResMut<AssetManager>,
+    mut load_queue: ResMut<AudioLoadQueue>,
     mut listeners: Query<(&AudioListenerComponent, &TransformComponent)>,
     mut sources: Query<(&mut AudioSourceComponent, &TransformComponent)>,
 ) -> Result<(), SystemError> {
-    let Some(mut assets) = assets.get_mut() else {
+    let Some(mut asset_manager) = asset_manager.get_mut() else {
         return Ok(());
     };
-    if let Some(mut loads) = loads.get_mut() {
-        for (name, bytes) in std::mem::take(&mut loads.sounds) {
-            if assets.get_by_name::<Sound>(&name).is_none() {
+    if let Some(mut load_queue) = load_queue.get_mut() {
+        for (name, bytes) in std::mem::take(&mut load_queue.sounds) {
+            if asset_manager.get_by_name::<Sound>(&name).is_none() {
                 let sound = Sound::from_bytes(std::path::Path::new(&name), bytes);
-                // The guard above rules a name clash out, so report rather
-                // than drop a failure the store still reports.
-                assets
+                // The check above rules a name clash out, so this error is
+                // passed on to the engine instead of being dropped.
+                asset_manager
                     .add_named(name, sound)
                     .map_err(|error| SystemError::Failure {
                         message: error.to_string(),
@@ -69,8 +77,8 @@ pub fn audio_system(
             }
         }
     }
-    // Step 1: find the active listener. One pair of ears, so the first enabled
-    // listener wins and the rest are ignored.
+    // Step 1: find the active listener. There is one pair of ears, so the
+    // first enabled listener wins and the rest are ignored.
     let mut ears = None;
     for (listener, transform) in listeners.iter_mut() {
         if listener.enabled {
@@ -82,20 +90,20 @@ pub fn audio_system(
         }
     }
 
-    // Absent on a machine with no audio device; the components still exist and
-    // their commands simply go unserviced.
-    let Some(mut manager) = manager.get_mut() else {
+    // There is no manager on a machine without an audio device. The components
+    // still exist, and their commands simply stay pending.
+    let Some(mut audio_manager) = audio_manager.get_mut() else {
         return Ok(());
     };
 
     if let Some((left, right)) = ears {
-        manager.set_ears(left, right);
+        audio_manager.set_ears(left, right);
     }
 
     for (mut source, transform) in sources.iter_mut() {
-        // `play_on_awake` is a one-shot: clearing it here means a reload,
-        // which re-runs registration but keeps components, does not restart
-        // every sound in the world.
+        // `play_on_awake` is consumed once. Clearing it here stops a reload
+        // from restarting every sound, because a reload runs registration
+        // again but keeps the world's components.
         if source.play_on_awake {
             source.play_on_awake = false;
             if source.command == AudioCommand::None {
@@ -109,22 +117,24 @@ pub fn audio_system(
         // Step 2: carry out the pending command.
         match command {
             AudioCommand::Play => {
-                // A source already holding a sink is restarted rather than
-                // layered: two decoders on one sink play back to back.
+                // A source that already holds a sink is restarted. The sink is
+                // released first, because a second decoder appended to it
+                // would play after the first sound instead of replacing it.
                 if source.has_sink() {
-                    manager.release(sound_type, source.sink);
+                    audio_manager.release(sound_type, source.sink);
                     source.sink = NO_SINK;
                 }
-                let sound = assets.get::<Sound>(source.sound);
+                let sound = asset_manager.get::<Sound>(source.sound);
                 if let Some(sound) = sound {
-                    if let Some(sink) = manager.acquire(sound_type) {
-                        if manager.start(sound_type, sink, sound, source.volume) {
-                            source.sink = sink;
+                    if let Some(sink_index) = audio_manager.acquire(sound_type) {
+                        if audio_manager.start(sound_type, sink_index, sound, source.volume) {
+                            source.sink = sink_index;
                             source.is_playing = true;
                         } else {
-                            // Undecodable bytes: give the sink straight back
-                            // rather than holding one that plays nothing.
-                            manager.release(sound_type, sink);
+                            // The bytes could not be decoded, so the sink goes
+                            // straight back to the pool instead of being held
+                            // while it plays nothing.
+                            audio_manager.release(sound_type, sink_index);
                             source.is_playing = false;
                         }
                     }
@@ -132,13 +142,13 @@ pub fn audio_system(
             }
             AudioCommand::Pause => {
                 if source.has_sink() {
-                    manager.pause(sound_type, source.sink);
+                    audio_manager.pause(sound_type, source.sink);
                     source.is_playing = false;
                 }
             }
             AudioCommand::Stop => {
                 if source.has_sink() {
-                    manager.release(sound_type, source.sink);
+                    audio_manager.release(sound_type, source.sink);
                     source.sink = NO_SINK;
                     source.is_playing = false;
                 }
@@ -146,17 +156,22 @@ pub fn audio_system(
             AudioCommand::None => {}
         }
 
-        // Step 3: follow the entity with the emitter.
+        // Step 3: move a playing spatial source's emitter to its entity and
+        // copy the source's volume onto its sink.
         if source.has_sink() && source.is_playing {
             if sound_type == SoundType::Spatial {
-                manager.set_emitter(source.sink, transform.translation);
+                audio_manager.set_emitter(source.sink, transform.translation);
             }
-            manager.set_volume(sound_type, source.sink, source.volume);
+            audio_manager.set_volume(sound_type, source.sink, source.volume);
         }
 
-        // Step 4: reclaim a sink whose sound has ended.
-        if source.has_sink() && source.is_playing && manager.is_finished(sound_type, source.sink) {
-            manager.release(sound_type, source.sink);
+        // Step 4: return the sink of a playing source to the pool once its
+        // sound has ended.
+        if source.has_sink()
+            && source.is_playing
+            && audio_manager.is_finished(sound_type, source.sink)
+        {
+            audio_manager.release(sound_type, source.sink);
             source.sink = NO_SINK;
             source.is_playing = false;
         }

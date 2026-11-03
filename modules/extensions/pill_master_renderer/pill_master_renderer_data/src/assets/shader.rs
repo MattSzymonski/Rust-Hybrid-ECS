@@ -4,22 +4,23 @@
 //!
 //! - Carry a shader's two WGSL stages plus the uniform and texture slots its
 //!   source declares, under the names the source gives them.
-//! - Keep those slots in declaration order: that order is the order their
-//!   values pack into the uniform buffer, and reordering them would leave the
-//!   packed layout disagreeing with the shader's own declarations.
-//! - Offer both ways in: [`ShaderBuilder::with_vertex_source`] reads the stages
-//!   from files when the shader is built, and [`ShaderBuilder::with_wgsl`] takes
-//!   sources already in memory, which is how a chain embeds the stages it ships
-//!   and how the C# bridge hands over stages a project supplies.
+//! - Keep the slots in the order the source declares them. Where a parameter
+//!   slot sits in that order decides where its value lands in the uniform
+//!   buffer, so reordering the slots would leave the packed buffer disagreeing
+//!   with the shader's own declarations.
+//! - Offer both ways in: [`ShaderBuilder::with_vertex_source`] and
+//!   [`ShaderBuilder::with_fragment_source`] name files to read when the shader
+//!   is built, and [`ShaderBuilder::with_wgsl`] takes both stages already in
+//!   memory.
 //!
 //! # Design
 //!
 //! [`ShaderBuilder`] exists because reading the sources is the one step that
-//! can fail: the builder collects the parts in any order and
+//! can fail: the builder collects the parts in any order, and
 //! [`ShaderBuilder::build`] reads the two stages, so a half-built shader is
-//! never alive. The slots are the meeting point with the material side of the
-//! renderer, which walks them in declaration order, by name, to size the
-//! uniform buffer and place each value.
+//! never alive. The slots are where the shader meets the material and pass side
+//! of the renderer: that side walks them by name, in declaration order, to size
+//! the uniform buffer and place each value.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -35,29 +36,38 @@ use serde::{Deserialize, Serialize};
 // Current crate
 use super::TextureType;
 
+// =============================================================================
+// ShaderParameterType
+// =============================================================================
+
 /// The kind of value a uniform parameter carries.
 ///
-/// The renderer writes a slot's bytes by this kind rather than by the kind of
-/// value it was handed, so the two have to agree or the value packs as zero.
+/// The renderer packs a slot's bytes according to this kind, not according to
+/// the kind of value it was given. A value whose kind does not match its slot
+/// is ignored, and that slot packs as zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PillMirror)]
 #[repr(u8)]
 pub enum ShaderParameterType {
     /// A single float.
     Scalar,
-    /// A flag, written as the integer it converts to.
+    /// A flag, packed as the integer `1` or `0`.
     Bool,
     /// An RGB color.
     Color,
 }
 
+// =============================================================================
+// ShaderParameterSlot
+// =============================================================================
+
 /// One uniform a shader declares, under the name its source gives it.
 ///
-/// Slots are how a value finds the uniform meant for it: a material carries
-/// its parameters by name, and the shader's slots say which names it accepts
-/// and what the matching value packs as.
+/// A slot is how a value finds the uniform meant for it. A material or a pass
+/// carries its parameters by name, and the shader's slots say which names it
+/// accepts and how each matching value packs.
 ///
-/// This is also the type a `.hlsl.meta` declares its uniforms with: one type,
-/// one serialized shape, so a new slot attribute is added here only.
+/// This is also the type a `.hlsl.meta` declares its uniforms with: one type
+/// means one serialized shape, so a new slot attribute is added only here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[pill_mirror_object]
 pub struct ShaderParameterSlot {
@@ -80,21 +90,25 @@ impl ShaderParameterSlot {
     }
 }
 
+// =============================================================================
+// ShaderTextureKind
+// =============================================================================
+
 /// What a shader texture slot reads: a texture asset's texels, or a depth
 /// buffer.
 ///
-/// A depth buffer is no asset - no file decodes to one - so it has no place in
-/// [`TextureType`], the texel layout a texture asset carries. A slot names both
-/// because both are things a shader can bind, and the kind is what decides the
+/// A depth buffer is not an asset - no file decodes to one - so it is not a
+/// [`TextureType`], which is the texel layout a texture asset carries. A slot
+/// names both kinds because a shader can bind either, and the kind decides the
 /// binding wgpu accepts: a depth texture cannot be bound where a filterable
 /// colour texture is expected.
 ///
 /// Serialized by variant name, so a `.hlsl.meta` writes `"type": "Color"` or
-/// `"type": "Depth"` and reads every file it wrote before the split.
+/// `"type": "Depth"`, and renaming a variant changes that file format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PillMirror)]
 #[repr(u8)]
 pub enum ShaderTextureKind {
-    /// A colour image, sampled as sRGB light.
+    /// A colour image, uploaded as sRGB, so a sample arrives as linear light.
     Color,
     /// A normal map, whose bytes are directions.
     Normal,
@@ -131,8 +145,12 @@ impl From<TextureType> for ShaderTextureKind {
     }
 }
 
-/// One texture a shader declares, under the name its source gives it, with the
-/// bindings it declares it at.
+// =============================================================================
+// ShaderTextureSlot
+// =============================================================================
+
+/// One texture a shader declares, under the name its source gives it, at the
+/// texture and sampler bindings the shader declares.
 ///
 /// This is also the type a `.hlsl.meta` declares its textures with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,7 +158,8 @@ impl From<TextureType> for ShaderTextureKind {
 pub struct ShaderTextureSlot {
     /// The name the source binds the texture under.
     pub name: String,
-    /// What the slot reads.
+    /// The kind of texture the slot binds, which decides the binding wgpu
+    /// accepts.
     #[serde(rename = "type")]
     pub kind: ShaderTextureKind,
     /// The binding the shader declares the texture at.
@@ -152,7 +171,7 @@ pub struct ShaderTextureSlot {
 #[pill_mirror_impl]
 impl ShaderTextureSlot {
     /// A slot for `name`, reading `kind`, at the texture and sampler bindings
-    /// the shader declares it at.
+    /// the shader uses.
     #[pill_mirror_method]
     pub fn new(name: impl Into<String>, kind: ShaderTextureKind, bindings: (u32, u32)) -> Self {
         Self {
@@ -164,7 +183,14 @@ impl ShaderTextureSlot {
     }
 }
 
-/// A slot under the name its source gives it: what keying either kind needs.
+// =============================================================================
+// SlotName
+// =============================================================================
+
+/// A slot that carries the name its source binds it under.
+///
+/// Both slot kinds are keyed by this name, so [`slots_by_name`] accepts either
+/// of them.
 pub trait SlotName {
     /// The name the source binds the slot under.
     fn slot_name(&self) -> &str;
@@ -182,40 +208,15 @@ impl SlotName for ShaderTextureSlot {
     }
 }
 
-/// Key a list of slots by the names they carry, keeping the list's order.
-///
-/// The shader stores its slots this way: a name answers which slot, and the
-/// order is the order the source declares them in - the order a parameter's
-/// values pack into the uniform buffer. A name declared twice keeps its first
-/// declaration and reports the later one: collapsing the pair silently would
-/// leave the packed layout disagreeing with the shader's own declarations.
-///
-/// `declared` names the slot kind in that warning - "parameter" or "texture".
-pub fn slots_by_name<S: SlotName>(
-    shader_name: &str,
-    declared: &'static str,
-    slots: impl IntoIterator<Item = S>,
-) -> IndexMap<String, S> {
-    let mut keyed = IndexMap::new();
-    for slot in slots {
-        if keyed.contains_key(slot.slot_name()) {
-            pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
-                "shader `{shader_name}` declares {declared} slot `{}` twice; the later declaration is ignored",
-                slot.slot_name()
-            );
-            continue;
-        }
-        keyed.insert(slot.slot_name().to_owned(), slot);
-    }
-    keyed
-}
+// =============================================================================
+// Shader
+// =============================================================================
 
 /// A shader asset: its two WGSL stages plus the slots the source declares.
 ///
-/// The slots travel with the sources because they describe the same shader:
-/// the sources go to the pipeline, and the slots say how the uniform buffer
-/// and the texture bindings have to be laid out for that pipeline.
+/// The slots travel with the sources because both describe the same shader:
+/// the sources go to the pipeline, and the slots say how that pipeline's
+/// uniform buffer and texture bindings must be laid out.
 #[derive(Clone, Debug)]
 #[pill_mirror_object(asset, shared = "pill_master_renderer::assets::Shader")]
 pub struct Shader {
@@ -237,9 +238,12 @@ pub struct Shader {
 
 #[pill_mirror_impl]
 impl Shader {
-    /// Start a shader with its name, the way [`RenderPass::new`](crate::RenderPass::new)
-    /// starts a pass: name first, then the parts, and [`ShaderBuilder::build`]
-    /// reads the sources and hands the asset back.
+    /// Starts a shader with its name and returns the builder that collects the
+    /// rest.
+    ///
+    /// [`RenderPass::new`](crate::RenderPass::new) starts a pass the same way:
+    /// the name comes first, then the parts, and [`ShaderBuilder::build`] reads
+    /// the sources and hands the asset back.
     // `clippy::new_ret_no_self`: the chain returns the builder, not the shader,
     // because reading the sources is the one step that can fail.
     #[allow(clippy::new_ret_no_self)]
@@ -256,6 +260,10 @@ impl Shader {
         }
     }
 }
+
+// =============================================================================
+// ShaderBuilder
+// =============================================================================
 
 /// A [`Shader`] under construction, started by [`Shader::new`].
 ///
@@ -296,12 +304,13 @@ impl ShaderBuilder {
         self
     }
 
-    /// The two WGSL stages, already in hand.
+    /// Sets both WGSL stages from text already in hand.
     ///
-    /// For sources that are not files: `include_str!` gives a `&'static str`,
-    /// and the host bridge has whatever a C# project handed it. Nothing is
-    /// resolved or read, so [`Self::build`] has the stages already - where
-    /// [`Self::with_vertex_source`] has a path that may turn out not to exist.
+    /// For stages that are not files: `include_str!` gives a `&'static str`,
+    /// and a C# project can pass the text it holds, because the builder is
+    /// mirrored to C#. Nothing is resolved or read, so [`Self::build`] already
+    /// has both stages, where [`Self::with_vertex_source`] holds a path that
+    /// may turn out not to exist.
     #[pill_mirror_method]
     pub fn with_wgsl(mut self, vertex: impl Into<String>, fragment: impl Into<String>) -> Self {
         self.vertex_source = Some(AssetLoader::Bytes(vertex.into().into_bytes().into()));
@@ -345,17 +354,18 @@ impl ShaderBuilder {
         self
     }
 
-    /// Read the sources and produce the shader.
+    /// Reads both sources and produces the shader.
     ///
     /// # Errors
     ///
-    /// Fails when one of the sources was never set, or when reading one of
-    /// them fails: a path that does not resolve, an I/O error, or bytes that
-    /// are not UTF-8 text.
+    /// Returns [`AssetLoadError::Decode`] when one of the sources was never
+    /// set. Reading one of them can also fail: the path does not resolve, the
+    /// read fails, or the bytes are not UTF-8 text.
     #[pill_mirror_method]
     pub fn build(self) -> AssetLoadResult<Shader> {
-        // A source that was never set is a mistake in the chain, not a missing
-        // file, and is refused rather than read from a default path.
+        // Step 1: Refuse a builder that never named a source. That is a mistake
+        // in the chain, not a missing file, so it is refused rather than read
+        // from a default path.
         let vertex_source = self.vertex_source.ok_or_else(|| AssetLoadError::Decode {
             label: format!("shader `{}`", self.name),
             detail: "it was built without a vertex source".to_owned(),
@@ -365,6 +375,8 @@ impl ShaderBuilder {
             detail: "it was built without a fragment source".to_owned(),
         })?;
 
+        // Step 2: Key the slots by name, so a repeated name is reported before
+        // the stages are read.
         let name = self.name;
         let parameter_slots = slots_by_name(&name, "parameter", self.parameter_slots);
         let texture_slots = slots_by_name(&name, "texture", self.texture_slots);
@@ -380,22 +392,28 @@ impl ShaderBuilder {
     }
 }
 
-/// How to build a shader from its `.hlsl` source: what its `.hlsl.meta` holds.
+// =============================================================================
+// ShaderImportSettings
+// =============================================================================
+
+/// How to build a shader from its `.hlsl` source: the settings its `.hlsl.meta`
+/// holds.
 ///
-/// Every field is part of the metadata file format, so a rename breaks
-/// existing files; `#[serde(default)]` lets a file written before a field
+/// Every field is part of the metadata file format, so renaming one breaks
+/// existing files. `#[serde(default)]` lets a file written before a field
 /// existed still load.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShaderImportSettings {
     /// The vertex stage, by path relative to the same root as the source.
     ///
-    /// One `.hlsl` holds one stage and a shader is two, so the meta says which
-    /// vertex stage this source pairs with.
+    /// One `.hlsl` file holds one stage and a shader needs two, so the meta
+    /// says which vertex stage this source pairs with.
     pub vertex: String,
     /// The uniforms the shader declares, in the order their values pack.
     pub parameters: Vec<ShaderParameterSlot>,
-    /// The textures the shader declares, with the bindings it uses them at.
+    /// The textures the shader declares, each with its texture and sampler
+    /// bindings.
     pub textures: Vec<ShaderTextureSlot>,
     /// Whether the shader reads the engine's parameters, at set 0.
     pub engine_parameters: bool,
@@ -414,19 +432,20 @@ impl ImportedAsset for Shader {
         _source_bytes: &[u8],
         settings: &ShaderImportSettings,
     ) -> AssetLoadResult<Self> {
+        // Step 1: Refuse a meta that names no vertex stage - a shader is two
+        // stages, and the meta is what supplies this one.
         if settings.vertex.is_empty() {
             return Err(AssetLoadError::Decode {
                 label: name.to_owned(),
                 detail: "its `.hlsl.meta` names no vertex stage".to_owned(),
             });
         }
-        // The source bytes are the HLSL: what a shader is built from is the
-        // WGSL the build script cooks beside it, and the vertex stage its meta
-        // names.
-        let fragment = cooked_beside(name)?;
+        // Step 2: Build from the WGSL cooked beside this source and the vertex
+        // stage the meta names. The HLSL bytes themselves are not read.
+        let fragment_path = cooked_wgsl_beside(name)?;
         Shader::new(name.to_owned())
             .with_vertex_source(AssetLoader::Path(settings.vertex.clone().into()))
-            .with_fragment_source(AssetLoader::Path(fragment))
+            .with_fragment_source(AssetLoader::Path(fragment_path))
             .with_parameter_slots(settings.parameters.iter().cloned())
             .with_texture_slots(settings.textures.iter().cloned())
             .with_engine_parameters(settings.engine_parameters)
@@ -435,26 +454,69 @@ impl ImportedAsset for Shader {
     }
 }
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Key a list of slots by the names they carry, keeping the list's order.
+///
+/// The shader stores its slots this way: a name says which slot, and the order
+/// stays the order the source declares, which is the order a parameter's value
+/// packs into the uniform buffer.
+///
+/// A name declared twice keeps its first declaration and logs a warning naming
+/// the later one. Keeping both would give the uniform buffer more slots than
+/// the shader declares.
+///
+/// `declared` names the slot kind in that warning - "parameter" or "texture".
+pub fn slots_by_name<S: SlotName>(
+    shader_name: &str,
+    declared: &'static str,
+    slots: impl IntoIterator<Item = S>,
+) -> IndexMap<String, S> {
+    let mut keyed = IndexMap::new();
+    for slot in slots {
+        if keyed.contains_key(slot.slot_name()) {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                "shader `{shader_name}` declares {declared} slot `{}` twice; the later declaration is ignored",
+                slot.slot_name()
+            );
+            continue;
+        }
+        keyed.insert(slot.slot_name().to_owned(), slot);
+    }
+    keyed
+}
+
 /// The WGSL file this crate's build script cooked beside a shader source.
-fn cooked_beside(source: &str) -> AssetLoadResult<PathBuf> {
-    let path = Path::new(source);
-    let cooked = path.with_extension("wgsl");
-    if cooked.file_name().is_none() {
+///
+/// # Errors
+///
+/// Returns [`AssetLoadError::Decode`] when the source names no file, so there
+/// is nothing to cook beside.
+fn cooked_wgsl_beside(source_path: &str) -> AssetLoadResult<PathBuf> {
+    let path = Path::new(source_path);
+    let cooked_path = path.with_extension("wgsl");
+    if cooked_path.file_name().is_none() {
         return Err(AssetLoadError::Decode {
-            label: source.to_owned(),
+            label: source_path.to_owned(),
             detail: "it names no file to cook".to_owned(),
         });
     }
-    Ok(cooked)
+    Ok(cooked_path)
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// A `.hlsl.meta` declares its slots as the slot types themselves, by
-    /// variant name: the shape every committed meta is written in, depth
-    /// included.
+    /// variant name, and a depth texture slot loads the same way.
     #[test]
     fn a_meta_declares_its_slots_as_the_slot_types() {
         let settings: ShaderImportSettings = serde_json::from_str(
@@ -489,8 +551,8 @@ mod tests {
         );
     }
 
-    /// A slot serializes under the spelling a meta reads: the kind's name in
-    /// `type`, so a file this build writes loads in the next.
+    /// A slot serializes with the name a meta reads it by: the kind's name in
+    /// `type`, so a file this build writes loads in the next build.
     #[test]
     fn a_texture_slot_serializes_as_the_name_it_is_read_by() {
         let slot = ShaderTextureSlot::new("sky", ShaderTextureKind::Cubemap, (0, 1));
@@ -505,7 +567,8 @@ mod tests {
         );
     }
 
-    /// Every texel layout an asset can carry names one slot kind and back.
+    /// Every texel layout an asset can carry maps to a slot kind, and back
+    /// again.
     #[test]
     fn every_texture_type_names_its_slot_kind() {
         for texture_type in [
@@ -521,8 +584,8 @@ mod tests {
         }
     }
 
-    /// Keying a slot list keeps the source's order and the first declaration
-    /// of a repeated name, so the packed layout agrees with the shader.
+    /// Keying a slot list keeps the source's order, and a repeated name keeps
+    /// its first declaration, so the packed layout agrees with the shader.
     #[test]
     fn slots_keep_their_order_and_the_first_of_a_repeated_name() {
         let keyed = slots_by_name(

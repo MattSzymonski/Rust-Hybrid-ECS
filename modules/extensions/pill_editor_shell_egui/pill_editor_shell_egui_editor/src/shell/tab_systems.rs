@@ -8,11 +8,11 @@
 //!
 //! # Design
 //!
-//! A patch crate is this file's top-level `use` lines plus the crate's own
-//! glob, so the two openings below are the whole rule: `shell::prelude::*`
-//! reaches the shared model's vocabulary (icons, systems, the snapshot types)
-//! and `shell::*` reaches the sibling modules this crate declares. A body that
-//! names either by bare name compiles as a patch only while both are here.
+//! A patch of this file replays its top-level `use` lines and adds the crate's
+//! glob, so the two imports below are the whole rule. `shell::prelude::*`
+//! brings in the shared model's names (icons, systems, the snapshot types) and
+//! `shell::*` the sibling modules. A body that names one of them by bare name
+//! compiles as a patch only while both are here.
 
 // External crates
 use pill_engine::pill_hot_fn;
@@ -21,9 +21,10 @@ use pill_engine::pill_hot_fn;
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The Systems tab: the engine's pause and single-step controls in a header
-/// row, then one row per registered system - its name and owner, and a state
-/// button (`on`/`off`) that queues the recorded, undoable system toggle.
+/// Draws the Systems tab: the Pause/Resume and Step buttons and the count of
+/// enabled systems, then one row per registered system. A row shows the
+/// system's name and the module that owns it, with an `on`/`off` button that
+/// queues the recorded, undoable toggle.
 #[pill_hot_fn]
 pub fn systems_tab(
     ui: &mut egui::Ui,
@@ -43,6 +44,8 @@ pub fn systems_tab(
             ))
             .clicked()
         {
+            // Queue the pause toggle unrecorded: it changes the engine's pause
+            // flag but never becomes an undo entry.
             pending.push(vec![systems::pause_toggle_command(snapshot.paused)]);
         }
         if ui
@@ -51,23 +54,28 @@ pub fn systems_tab(
         {
             pending.push(vec![EditorCommand::StepOnce]);
         }
-        let enabled = snapshot.systems.iter().filter(|row| row.enabled).count();
+        let enabled_system_count = snapshot.systems.iter().filter(|row| row.enabled).count();
         ui.label(
-            egui::RichText::new(format!("{}/{} enabled", enabled, snapshot.systems.len())).weak(),
+            egui::RichText::new(format!(
+                "{}/{} enabled",
+                enabled_system_count,
+                snapshot.systems.len()
+            ))
+            .weak(),
         );
     });
     ui.separator();
     egui::ScrollArea::vertical().show(ui, |ui| {
         for system in &snapshot.systems {
-            // A system's own row label carries the module it belongs to, so a
-            // long crate name is the one label the wide column can truncate;
-            // the tooltip keeps the whole of it reachable.
-            let name = systems::system_row_label(system);
+            // The row label is `name (owner)`, and the owner label can be
+            // long. The label column cuts text that does not fit, so the full
+            // label is passed as a tooltip too.
+            let row_label = systems::system_row_label(system);
             row_in(
                 ui,
                 WIDE_ROW_LABEL_WIDTH,
-                &name,
-                Some(name.as_str()),
+                &row_label,
+                Some(row_label.as_str()),
                 &mut |ui| {
                     if ui
                         .add(icons::IconButton::new(

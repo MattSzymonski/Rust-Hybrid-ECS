@@ -2,19 +2,23 @@
 //!
 //! # Responsibilities
 //!
-//! - The scene viewport's menu: the gizmo tools, snapping, the space and the scene grid.
+//! - The scene viewport's menu: the gizmo tools, snapping, the two spaces
+//!   and the scene grid.
 //! - The Inspector's component menu: remove one component, or add any addable
 //!   one the entity does not carry.
 //!
-//! The globs below are absolute paths, so a patch crate resolves them too.
+//! Both imports below use absolute paths, so a patch crate can resolve them
+//! too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The component menu: detach the heading's component, and attach any
-/// registered one the entity does not carry yet - both recorded through the
-/// shared builders, labelled `add {short}` / `remove {short}`.
+/// Draws the component menu. When `current` names the heading's component, a
+/// Remove row detaches it. The Add Component submenu lists every registered
+/// component marked addable that the entity does not carry. Both picks go
+/// through the shared `inspector` builders and are labelled `add {short}` /
+/// `remove {short}`.
 pub fn component_menu_items(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
@@ -22,6 +26,7 @@ pub fn component_menu_items(
     current: Option<&str>,
     pending: &mut PendingEditorCommands,
 ) {
+    // Step 1: the Remove row, when the menu was opened on a component heading.
     if let Some(component) = current {
         let label = format!("Remove {}", inspector::short_component_name(component));
         if ui
@@ -34,12 +39,14 @@ pub fn component_menu_items(
         }
         ui.separator();
     }
+    // Step 2: the Add Component submenu.
     ui.menu_button(
         icons::rich(icons::Icon::PlusCircle, "Add Component"),
         |ui| {
-            // The same list the Inspector's Add popup offers: one rule decides
-            // what is addable, so the menu and the popup cannot disagree about
-            // a component the entity carries.
+            // This is the same list the Inspector's Add popup shows. Both call
+            // `addable_components`, so a single rule decides what can be added.
+            // The menu and the popup cannot disagree about a component the
+            // entity already carries.
             for type_name in addable_components(snapshot, detail) {
                 let short = inspector::short_component_name(type_name);
                 if ui
@@ -55,10 +62,10 @@ pub fn component_menu_items(
     );
 }
 
-/// The scene viewport's menu: the transform tools, snapping, the space and the
-/// scene grid, checked against the snapshot's settings. The tool, space and
-/// snapping items queue the same `SetGizmoTool` edit the shortcuts queue; the
-/// Grid item queues `SetGrid`.
+/// Draws the scene viewport's context menu: the three transform tools,
+/// snapping, the two spaces and the scene grid. A row shows as active when the
+/// snapshot's settings say so. A click queues a `SetGizmoTool` edit for a tool,
+/// a space or snapping, and a `SetGrid` edit for the grid.
 #[pill_hot_fn]
 pub fn scene_context_menu(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui) {
     let settings = viewer.snapshot.gizmo;
@@ -69,8 +76,10 @@ pub fn scene_context_menu(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui) {
     let pending = &mut viewer.pending;
     let response = ui.allocate_response(ui.available_size_before_wrap(), egui::Sense::click());
     context_menu("scene", &response, &mut viewer.overlay_regions, &mut |ui| {
-        // The rows are the toolbox's own, so a tool, a toggle or a space cannot
-        // be labelled or enabled one way here and another way on the panel.
+        // Step 1: the three tool rows. They come from the toolbox's own list,
+        // so a row here and on the panel share their icon, their active state
+        // and the command a click queues. Each label comes from `menu_label`,
+        // which holds the menu's own wording where it differs.
         for item in toolbox::TOOL_ROWS {
             let button = icons::IconButton::new(item.icon(&state), item.menu_label())
                 .active(item.active(&state));
@@ -80,6 +89,7 @@ pub fn scene_context_menu(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui) {
             }
         }
         ui.separator();
+        // Step 2: the snapping row.
         let snapping = icons::IconButton::new(
             toolbox::ToolboxItem::Snap.icon(&state),
             toolbox::ToolboxItem::Snap.menu_label(),
@@ -89,6 +99,7 @@ pub fn scene_context_menu(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui) {
             pending.push(vec![toolbox::ToolboxItem::Snap.command(&state)]);
             ui.close();
         }
+        // Step 3: the two space rows.
         for row in toolbox::SPACE_ROWS {
             let button =
                 icons::IconButton::new(row.icon, row.menu).active(settings.space == row.space);
@@ -98,6 +109,7 @@ pub fn scene_context_menu(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui) {
             }
         }
         ui.separator();
+        // Step 4: the scene grid's switch.
         let grid = icons::IconButton::new(
             toolbox::ToolboxItem::Grid.icon(&state),
             toolbox::ToolboxItem::Grid.menu_label(),

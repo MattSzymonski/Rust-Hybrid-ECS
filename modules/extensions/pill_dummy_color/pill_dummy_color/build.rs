@@ -1,19 +1,21 @@
-//! This crate's build script: emits its function-address inventory.
+//! This crate's build script: generates the function-address inventory the host
+//! needs to patch this crate's functions.
 //!
 //! # Responsibilities
 //!
-//! - Emit the crate's function-address inventory so the host can redirect any
-//!   of its functions with nothing annotated in the source.
-//! - Keep the work in `pill_hot_scan`, so both sides agree byte for byte.
+//! - Generate the function inventory: a Rust file that records, for every
+//!   function a patch can reach, its qualified path and its address. The host
+//!   uses them to point calls at a patched function, although nothing in the
+//!   source marks a function as patchable.
+//! - Leave the scanning to `pill_hot_scan`, which the host also runs to decide
+//!   what it may patch, so both sides work from the same list of functions.
 //
 // REQUIREMENTS
-//   Rust (stable). Run by Cargo as this crate's build script.
+//   Rust (stable). Cargo runs it as this crate's build script.
 //
 // DESCRIPTION
-//   Emits this crate's function-address inventory so the host can redirect any
-//   of its functions with nothing in the source annotated. The work lives in
-//   `pill_hot_scan`, which the host also uses to decide what is patchable - the
-//   two must agree byte for byte, so there is exactly one implementation.
+//   Generates the crate's function-address inventory into
+//   `$OUT_DIR/function_inventory.rs`.
 //
 // USAGE
 //   cargo build -p pill_dummy_color

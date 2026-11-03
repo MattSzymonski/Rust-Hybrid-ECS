@@ -1,9 +1,10 @@
-//! Frame-producing renderer for display-controller targets.
+//! Draws engine frames into an RGB565 pixel buffer for display-controller
+//! targets.
 //!
 //! # Responsibilities
 //!
 //! - Owns the framebuffer and the software rasterizer ([`Renderer`]).
-//! - Resizes the framebuffer when the target display changes.
+//! - Resizes the framebuffer when the caller reports a new display size.
 //! - Draws one frame from the current [`Engine`] ([`Renderer::render`]).
 //! - Hands the finished frame to the caller as RGB565 bytes
 //!   ([`Renderer::frame_rgb565`]).
@@ -20,8 +21,8 @@
 //! display.draw(renderer.frame_rgb565())?;
 //! ```
 //!
-//! Keeping the driver out is what lets this crate compile and unit-test on any
-//! host rather than only on the machine wired to a panel.
+//! Because the driver stays outside, the crate compiles and its tests run on
+//! any machine, not only on one wired to a panel.
 
 // External crates
 use pill_engine::engine::Engine;
@@ -37,26 +38,28 @@ use crate::rasterizer::SpriteRasterizer;
 
 /// Draws the engine world into an RGB565 framebuffer on the CPU.
 ///
-/// Holds the pixel buffer, the rasterizer, and the optional viewport and
-/// logical-resolution overrides a frontend installs.
+/// Holds the pixel buffer, the rasterizer, and the two overrides a frontend
+/// can install: the viewport and the virtual resolution.
 pub struct Renderer {
     /// Pixel buffer the world is drawn into each frame.
     framebuffer: Framebuffer,
     /// Turns sprite instances into pixels.
     rasterizer: SpriteRasterizer,
-    /// Physical-pixel crop rectangle, or `None` for the whole framebuffer.
+    /// Rectangle to draw in, in physical pixels, or `None` for the whole
+    /// framebuffer.
     viewport: Option<RenderViewport>,
-    /// Logical scene size filling the viewport, or `None` for one-to-one pixels.
+    /// Logical scene size that fills the viewport, or `None` for one project
+    /// unit per pixel.
     virtual_resolution: Option<VirtualResolution>,
 }
 
 impl Renderer {
-    /// Create a renderer targeting a display of `width` by `height` pixels.
+    /// Create a renderer for a display `width` by `height` pixels in size.
     ///
-    /// For a 240x280 ST7789 panel that is `Renderer::new(240, 280)`. Zero
-    /// dimensions are promoted to one pixel rather than rejected: there is no
-    /// fallible step here, and a degenerate size is better surfaced as an
-    /// obviously wrong frame than as an error the caller cannot act on.
+    /// A 240x280 ST7789 panel is `Renderer::new(240, 280)`. A zero dimension is
+    /// raised to one pixel instead of being rejected. Nothing in this call can
+    /// fail, and an obviously wrong frame tells the caller about a bad size
+    /// more clearly than an error it has no way to fix.
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             framebuffer: Framebuffer::new(width, height),
@@ -68,7 +71,9 @@ impl Renderer {
 
     /// Resize the framebuffer to a new display size.
     ///
-    /// Contents are discarded; the next [`Self::render`] repaints everything.
+    /// When the size changes, the old contents are dropped and the next
+    /// [`Self::render`] repaints every pixel. A zero dimension is raised to one
+    /// pixel.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.framebuffer.resize(width, height);
     }
@@ -98,9 +103,9 @@ impl Renderer {
 
     /// Draw every `(Position, Sprite)` entity in the engine world.
     ///
-    /// Infallible: there is no device to lose and no frame to acquire, so
-    /// unlike the wgpu backend there is nothing to report. The result is
-    /// retrieved with [`Self::frame_rgb565`].
+    /// This cannot fail: there is no device to lose and no frame to acquire,
+    /// so unlike the wgpu backend there is nothing to report. Read the finished
+    /// pixels with [`Self::frame_rgb565`].
     ///
     /// # Examples
     ///
@@ -111,6 +116,8 @@ impl Renderer {
     /// display.draw(renderer.frame_rgb565())?;
     /// ```
     pub fn render(&mut self, engine: &mut Engine) {
+        // Step 1: Work out where to draw: the installed viewport clamped to the
+        // framebuffer, and the project resolution mapped onto it.
         let (width, height) = (self.framebuffer.width(), self.framebuffer.height());
         let viewport = self
             .viewport
@@ -119,6 +126,7 @@ impl Renderer {
             .unwrap_or_default();
         let virtual_resolution = resolve_virtual_resolution(self.virtual_resolution, viewport);
 
+        // Step 2: Rasterize the world into that rectangle.
         self.rasterizer.render_in_viewport_with_resolution(
             engine.world(),
             &mut self.framebuffer,
@@ -129,13 +137,17 @@ impl Renderer {
 
     /// The last rendered frame as little-endian RGB565 bytes.
     ///
-    /// `width * height * 2` bytes, row-major and top-down - the layout an
-    /// ST7789 `draw(&[u8])` expects. Valid until the next `render` or `resize`.
+    /// The slice is `width * height * 2` bytes, row-major and top-down, which
+    /// is the layout an ST7789 `draw(&[u8])` expects. It stays current until
+    /// the next `render` or `resize`. The call takes `&mut self` because it
+    /// fills a byte buffer kept from the previous frame instead of allocating
+    /// a new one.
     pub fn frame_rgb565(&mut self) -> &[u8] {
         self.framebuffer.as_rgb565_le()
     }
 
-    /// Read-only access to the framebuffer, for callers needing packed pixels.
+    /// Read-only access to the framebuffer, for callers that need the packed
+    /// pixels.
     pub fn framebuffer(&self) -> &Framebuffer {
         &self.framebuffer
     }
@@ -145,15 +157,16 @@ impl Renderer {
 // Free Functions
 // =============================================================================
 
-/// Resolve the logical projection without coupling it to display dimensions.
+/// Return the project resolution to draw into, given the viewport's size.
 ///
-/// Identical to the wgpu backend's rule, so a project renders the same on both:
-/// a valid configured resolution wins, otherwise the viewport maps one-to-one.
+/// The rule is the same as the wgpu backend's, so a project looks the same on
+/// both: a configured resolution that is valid wins, and otherwise every
+/// viewport pixel holds one project unit.
 fn resolve_virtual_resolution(
-    configured: Option<VirtualResolution>,
+    configured_resolution: Option<VirtualResolution>,
     viewport: RenderViewport,
 ) -> VirtualResolution {
-    configured
+    configured_resolution
         .filter(|resolution| resolution.is_valid())
         .unwrap_or_else(|| {
             VirtualResolution::new(viewport.width.max(1) as f32, viewport.height.max(1) as f32)
@@ -206,14 +219,18 @@ mod tests {
         );
     }
 
-    /// A configured project space stays fixed as the display changes.
+    /// A configured project resolution stays the same as the display size
+    /// changes.
     #[test]
     fn virtual_resolution_is_independent_of_physical_viewport_size() {
-        let configured = VirtualResolution::new(800.0, 600.0);
+        let configured_resolution = VirtualResolution::new(800.0, 600.0);
 
         assert_eq!(
-            resolve_virtual_resolution(Some(configured), RenderViewport::new(240, 80, 517, 463)),
-            configured
+            resolve_virtual_resolution(
+                Some(configured_resolution),
+                RenderViewport::new(240, 80, 517, 463)
+            ),
+            configured_resolution
         );
         assert_eq!(
             resolve_virtual_resolution(None, RenderViewport::new(240, 80, 517, 463)),

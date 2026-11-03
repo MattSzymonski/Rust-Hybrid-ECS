@@ -1,30 +1,105 @@
-//! The Inspector's field rows: the decorators a component declares and the
-//! control each row draws.
+//! The Inspector's field rows: one row of a component section, with the
+//! decorators and separators that row draws.
 //!
 //! # Responsibilities
 //!
-//! - `inspector_field_row`: one component field's row, with the decorators a component declares (`[Header]`, `[Space]`, `[Tooltip]`, `[Range]`, `[Min]`, the multi-line boxes, `[HideInInspector]`) applied to it.
-//! - `inspector_row` and `is_scalar_field`: which control a field gets.
-//! - `inspector_asset_row` and `inspector_entity_row`: a reference row - the
-//!   named target, its picker, its clear button and a drop target for an
-//!   asset or entity dragged out of another tab.
-//! - `field_widget_name` and the row's `RowLogged` memory: the once-per-row
-//!   logging the suite asserts on.
-//! - `remember_asset_row_text`, `remember_asset_row_rect` and the entity row's
-//!   twins: a row's current text (logged per change) and its rectangle (logged
-//!   per placement), which the editor suite waits on.
+//! - `inspector_field_row`: draws one row the Inspector's row model produced -
+//!   a `[Header]` or `[Space]` separator, one field with the widget its
+//!   `[Tooltip]`, `[Range]` or `[Min]` asked for, a vector row, a colour row,
+//!   or a value shown read-only.
+//! - `inspector_asset_row` and `inspector_entity_row`: a reference row. It
+//!   names the target it points at and offers a picker, a clear button and a
+//!   drop target for an asset or entity dragged out of another tab.
+//!   `AssetRowInput` and `EntityRowInput` carry what those rows draw from.
+//! - `queue_field_edit` and `queue_element_edit`: the one recorded step a row's
+//!   edit becomes, for every selected entity that carries the component.
+//! - `inspector_row` and `is_scalar_field`: the shared label/control row, and
+//!   whether a value has a widget of its own.
+//! - `field_widget_name` and the row's `RowLogged` memory: the once-per-row log
+//!   line the suites assert on.
+//! - `remember_asset_row_text`, `remember_asset_row_rect` and their entity
+//!   twins: a row's current text (logged when it changes) and its rectangle
+//!   (logged once per placement), which the editor suite waits on.
+//! - `record_row_placement`: the once-per-placement rule those rectangles share
+//!   with the asset-settings rows.
 //!
-//! The globs below are absolute paths, so a patch crate resolves them too.
+//! The two globs below spell the whole path, so a patch crate resolves them
+//! too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// Log one drawn Inspector row's line once per subject.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Width of the small clear button beside a reference row's button.
+pub const ASSET_ROW_CLEAR_WIDTH: f32 = 24.0;
+
+/// Height an asset or entity picker's list scrolls within.
+pub const ASSET_PICKER_HEIGHT: f32 = 180.0;
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/// What one asset reference row draws from: the field, its component and
+/// the selection it writes to, and the project's assets the picker offers.
+pub struct AssetRowInput<'a> {
+    /// The primary entity the row describes.
+    pub entity: Entity,
+    /// The component section the row belongs to.
+    pub component: &'a ComponentView,
+    /// The field's position in the component's field list.
+    pub index: usize,
+    /// The field's registered name.
+    pub field: &'a str,
+    /// The registered asset type the field references, when recorded.
+    pub asset_type: Option<&'a str>,
+    /// The field's `[Tooltip]`, if it declared one.
+    pub tooltip: Option<&'a str>,
+    /// Every entity the edit reaches (the primary first).
+    pub targets: &'a [Entity],
+    /// The selected entities' details, for the mixed-value marker.
+    pub details: &'a [EntityDetail],
+    /// The project's assets, as the Assets tab lists them.
+    pub assets: &'a [AssetListing],
+    /// The store's own assets that no file backs: what the picker offers beside
+    /// the listing's rows, badged as the engine's.
+    pub engine_assets: &'a [EngineAsset],
+}
+
+/// What one entity reference row draws from: the field, its component and the
+/// selection it writes to, and the scene's entities the picker offers.
+pub struct EntityRowInput<'a> {
+    /// The primary entity the row describes.
+    pub entity: Entity,
+    /// The component section the row belongs to.
+    pub component: &'a ComponentView,
+    /// The field's position in the component's field list.
+    pub index: usize,
+    /// The field's registered name.
+    pub field: &'a str,
+    /// The field's `[Tooltip]`, if it declared one.
+    pub tooltip: Option<&'a str>,
+    /// Every entity the edit reaches (the primary first).
+    pub targets: &'a [Entity],
+    /// The selected entities' details, for the mixed-value marker.
+    pub details: &'a [EntityDetail],
+    /// The scene's entities, as the Entities tab lists them.
+    pub scene: &'a [EntityListEntry],
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Logs one drawn Inspector row's line, once per row.
 ///
-/// The gate is the row's own memory: its position in the session's cached
-/// model is its identity, so no key is rebuilt and nothing is allocated. A
-/// macro rather than a function because the log's fields are typed - a
+/// The row's own memory is the gate: its place in the session's cached model
+/// already identifies it, so nothing has to be keyed or allocated. It is a
+/// macro rather than a function because the log fields are typed, and a
 /// `pixels` number and a `text` string must reach the log as themselves.
 macro_rules! log_row_once {
     ($logged:expr, $flag:expr, $type_name:expr, $kind:literal, $($field:tt)*) => {
@@ -41,13 +116,15 @@ macro_rules! log_row_once {
     };
 }
 
-// The parameters are the borrows one row draws from; a grouping struct would
-// have to be rebuilt for every row of every component.
+// The parameters are the borrows one row draws from. A struct grouping them
+// would have to be built again for every row of every component.
 #[allow(clippy::too_many_arguments)]
-/// One row of a component section, drawn from the Inspector's row model: a
-/// separator line or gap a field's decorators declared, a single widget, a
-/// vector row (side-by-side fields with axis labels in the gizmo's colours),
-/// or a read-only value.
+/// Draws one row of a component section.
+///
+/// The row comes from the Inspector's row model: a separator line or gap a
+/// field's decorators declared, one field with its widget, a vector row
+/// (side-by-side fields with axis labels in the gizmo's colours), or a value
+/// shown read-only.
 pub fn inspector_field_row(
     ui: &mut egui::Ui,
     entity: Entity,
@@ -197,18 +274,18 @@ pub fn inspector_field_row(
                 field = field.as_str(),
                 tooltip = tooltip.as_deref().unwrap_or_default(),
             );
-            // One row that wraps: a wide panel shows X/Y/Z side by side, a
-            // narrow dock moves the overflowing fields to the next line
-            // instead of clipping them past the panel's edge.
+            // Draw the fields on one line that wraps: a wide panel shows X, Y
+            // and Z side by side, while a narrow dock moves the fields that do
+            // not fit to the next line instead of clipping them.
             ui.horizontal_wrapped(|ui| {
                 label_cell_in(ui, ROW_LABEL_WIDTH, field, tooltip.as_deref());
                 label_gap(ui);
                 for (element_index, element) in values.iter().take(*elements).enumerate() {
-                    // One axis letter with its field as a unit, so a wrap
-                    // never separates a label from its widget. The letter's
-                    // slot and the field's width are both fixed, so a long
-                    // value is cropped inside its field instead of widening
-                    // the row and shifting its neighbours.
+                    // Keep one axis letter with its field, so a wrap never
+                    // separates a label from its widget. Both the letter's
+                    // slot and the field's width are fixed, so a long value is
+                    // cropped inside its field instead of widening the row and
+                    // pushing its neighbours along.
                     ui.allocate_ui_with_layout(
                         egui::vec2(INSPECTOR_VECTOR_FIELD_WIDTH, INSPECTOR_VECTOR_FIELD_HEIGHT),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -248,16 +325,16 @@ pub fn inspector_field_row(
             );
             inspector_row(ui, field, tooltip.as_deref(), &mut |ui| {
                 let Some(mut channels) = color_channels(&values) else {
-                    // Channels the picker cannot read (integer kinds) stay
-                    // editable one by one rather than becoming uneditable.
-                    for (axis, value) in values.iter().enumerate() {
+                    // The picker only reads floats. A colour held as integers is
+                    // drawn one channel at a time, so it can still be edited.
+                    for (axis_index, value) in values.iter().enumerate() {
                         ui.label(
-                            egui::RichText::new(inspector::axis_label(axis))
-                                .color(inspector::axis_color(axis))
+                            egui::RichText::new(inspector::axis_label(axis_index))
+                                .color(inspector::axis_color(axis_index))
                                 .small(),
                         );
                         if let Some(edited) = scalar_edit(ui, value) {
-                            let leaf = &leaves[axis];
+                            let leaf = &leaves[axis_index];
                             match leaf.element {
                                 Some(element) => queue_element_edit(
                                     pending,
@@ -281,8 +358,8 @@ pub fn inspector_field_row(
                     }
                     return;
                 };
-                // The picker writes linear channels, which is what the value
-                // holds, so no conversion stands between the two.
+                // The picker edits linear channels, and that is what the field
+                // holds, so no colour conversion happens here.
                 let response = ui.color_edit_button_rgba_unmultiplied(&mut channels);
                 if response.changed() {
                     let edited: Vec<FieldValue> = leaves
@@ -293,9 +370,9 @@ pub fn inspector_field_row(
                             _ => FieldValue::F32(channel),
                         })
                         .collect();
-                    let (commands, label, key) =
+                    let (commands, label, coalesce_key) =
                         inspector::selection_leaf_edit(targets, entity, type_name, leaves, &edited);
-                    pending.push_recorded(commands, label, Some(key));
+                    pending.push_recorded(commands, label, Some(coalesce_key));
                 }
             });
         }
@@ -305,8 +382,8 @@ pub fn inspector_field_row(
             field,
             tooltip,
         } => {
-            // The row's own memory keeps the grouped and ungrouped shapes
-            // apart: they are two rows, so each logs its own line.
+            // A grouped vector and a `[f32; 3]` field are two rows, and each
+            // cached row carries its own logged flags, so both log a line.
             log_row_once!(
                 logged,
                 inspector::RowLogged::ROW,
@@ -316,12 +393,12 @@ pub fn inspector_field_row(
                 axes = leaves.len(),
                 tooltip = tooltip.as_deref().unwrap_or_default(),
             );
-            // The same row a `[f32; 3]` field draws, assembled from leaves
-            // that live in fields of their own.
+            // This draws the same row as a `[f32; 3]` field, but the three
+            // values come from three scalar fields of their own.
             ui.horizontal_wrapped(|ui| {
                 label_cell_in(ui, ROW_LABEL_WIDTH, field, tooltip.as_deref());
                 label_gap(ui);
-                for (axis, leaf) in leaves.iter().enumerate() {
+                for (axis_index, leaf) in leaves.iter().enumerate() {
                     let Some(value) = component.values.get(leaf.index) else {
                         continue;
                     };
@@ -329,7 +406,7 @@ pub fn inspector_field_row(
                         egui::vec2(INSPECTOR_VECTOR_FIELD_WIDTH, INSPECTOR_VECTOR_FIELD_HEIGHT),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            axis_slot(ui, axis);
+                            axis_slot(ui, axis_index);
                             if let Some(edited) = fixed_width_field(ui, value, Some(widget)) {
                                 queue_field_edit(
                                     pending,
@@ -416,92 +493,79 @@ pub fn inspector_field_row(
     }
 }
 
-/// What one asset reference row draws from: the field, its component and
-/// the selection it writes to, and the project's assets the picker offers.
-pub struct AssetRowInput<'a> {
-    /// The primary entity the row describes.
-    pub entity: Entity,
-    /// The component section the row belongs to.
-    pub component: &'a ComponentView,
-    /// The field's position in the component's field list.
-    pub index: usize,
-    /// The field's registered name.
-    pub field: &'a str,
-    /// The registered asset type the field references, when recorded.
-    pub asset_type: Option<&'a str>,
-    /// The field's `[Tooltip]`, if it declared one.
-    pub tooltip: Option<&'a str>,
-    /// Every entity the edit reaches (the primary first).
-    pub targets: &'a [Entity],
-    /// The selected entities' details, for the mixed-value marker.
-    pub details: &'a [EntityDetail],
-    /// The project's assets, as the Assets tab lists them.
-    pub assets: &'a [AssetListing],
-    /// The store's own assets that no file backs: what the picker offers beside
-    /// the listing's rows, badged as the engine's.
-    pub engine_assets: &'a [EngineAsset],
-}
-
-/// One asset reference row: a button naming the referenced asset,
-/// which opens a picker of every asset of the field's type, a clear button,
-/// and a drop target that takes an asset dragged from the Assets tab.
+/// Draws one asset reference row.
 ///
-/// Every choice queues one recorded `SetFieldAsset` step for the whole
-/// selection; an unloaded asset is loaded when the step is applied.
+/// The row is a button naming the referenced asset, which opens a picker of
+/// every asset of the field's type, a clear button, and a drop target for an
+/// asset dragged out of the Assets tab.
+///
+/// Every choice becomes one recorded `SetFieldAsset` step for the whole
+/// selection. An asset that is not loaded yet is loaded when the step is
+/// applied.
 pub fn inspector_asset_row(
     ui: &mut egui::Ui,
-    input: AssetRowInput<'_>,
+    row_input: AssetRowInput<'_>,
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
     overlay_regions: &mut Vec<ShellRect>,
 ) {
-    let type_name = input.component.type_name.as_str();
-    let label = input
+    let type_name = row_input.component.type_name.as_str();
+    let label = row_input
         .component
         .asset_labels
-        .get(input.index)
+        .get(row_input.index)
         .cloned()
         .flatten()
         .unwrap_or(AssetReferenceLabel::Missing);
     let text = label.text().to_owned();
-    // One line per row and text: the row reports the asset it draws on its
-    // first draw and on every change, so a suite can wait for a pick to show
-    // up - and for the previous asset to show up again after an undo. The
-    // entity is part of the key: two entities holding one asset are two rows.
-    let key = format!("{}.{type_name}.{}", input.entity, input.field);
+    // Step 1: log the asset this row draws, once per row and text.
+    //
+    // A suite can then wait for a pick to show up, and for the previous asset
+    // to come back after an undo. The entity is part of the key: two entities
+    // that hold the same asset are two rows.
+    let key = format!("{}.{type_name}.{}", row_input.entity, row_input.field);
     if remember_asset_row_text(session, &key, &text) {
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
-            entity = %input.entity,
+            entity = %row_input.entity,
             component = type_name,
-            field = input.field,
-            asset_type = input.asset_type.unwrap_or_default(),
+            field = row_input.field,
+            asset_type = row_input.asset_type.unwrap_or_default(),
             asset = text.as_str(),
             "[editor] inspector row kind=asset"
         );
     }
 
-    // `Some(None)` clears the reference, `Some(Some(path))` points it at an
-    // asset; collected while drawing and queued once afterwards.
+    // Step 2: draw the row and collect the reference it picks.
+    //
+    // `Some(None)` clears the reference and `Some(Some(path))` points it at an
+    // asset. The choice is queued once, after the row has drawn.
     let mut chosen: Option<Option<String>> = None;
-    let mut button_rect = None;
-    let row_label = match input.component.values.get(input.index) {
-        Some(value) => row_label(input.field, input.details, type_name, input.index, value),
-        None => input.field.to_owned(),
+    let mut button_rects = None;
+    let row_label_text = match row_input.component.values.get(row_input.index) {
+        Some(value) => row_label(
+            row_input.field,
+            row_input.details,
+            type_name,
+            row_input.index,
+            value,
+        ),
+        None => row_input.field.to_owned(),
     };
-    inspector_row(ui, &row_label, input.tooltip, &mut |ui| {
+    inspector_row(ui, &row_label_text, row_input.tooltip, &mut |ui| {
         let width = (ui.available_width() - ASSET_ROW_CLEAR_WIDTH).max(40.0);
         let color = match label {
             AssetReferenceLabel::Named(_) => style::text(),
             _ => style::text_muted(),
         };
-        let icon = assets_tiles::asset_type_icon(input.asset_type.unwrap_or_default());
+        let icon = assets_tiles::asset_type_icon(row_input.asset_type.unwrap_or_default());
         let response = ui.add_sized(
             egui::vec2(width, 18.0),
             egui::Button::new(icons::rich(icon, &text).color(color)).truncate(),
         );
-        // A file dragged from the Assets tab lands here; hovering one marks
-        // the row so the drop is visibly accepted.
+        // A file dragged out of the Assets tab can be dropped on this button.
+        // While one hovers there, the row is outlined so the drop looks
+        // accepted.
         if response.dnd_hover_payload::<String>().is_some() {
             ui.painter().rect_stroke(
                 response.rect,
@@ -520,7 +584,7 @@ pub fn inspector_asset_row(
             };
             session.asset_search.clear();
         }
-        button_rect = Some((response.rect, response.interact_rect));
+        button_rects = Some((response.rect, response.interact_rect));
         if ui
             .add_enabled(
                 !matches!(label, AssetReferenceLabel::Unset),
@@ -532,15 +596,15 @@ pub fn inspector_asset_row(
             chosen = Some(None);
         }
     });
-    if let Some((rect, interact)) = button_rect {
-        remember_asset_row_rect(session, &key, rect, interact.contains(rect.center()));
+    if let Some((rect, interact_rect)) = button_rects {
+        remember_asset_row_rect(session, &key, rect, interact_rect.contains(rect.center()));
     }
 
-    // The picker opens under its row: a search box, then the field's
-    // candidates, with `None` first. It floats over the rows below and claims
-    // its rectangle, so a click in it is the picker's.
+    // Step 3: draw the picker while it is open. It holds a search box and the
+    // field's candidates, with `None` first. It floats over the rows below and
+    // claims its rectangle, so a click in it is the picker's, not the scene's.
     if session.asset_picker.as_deref() == Some(key.as_str()) {
-        if let Some((rect, _)) = button_rect {
+        if let Some((rect, _)) = button_rects {
             let picker_id = egui::Id::new(("pill_editor_shell_egui.asset_picker", key.as_str()));
             let popup =
                 floating_popup(
@@ -557,9 +621,9 @@ pub fn inspector_asset_row(
                         );
                         let search = session.asset_search.to_lowercase();
                         let (files, built) = inspector::picker_candidates(
-                            input.assets,
-                            input.engine_assets,
-                            input.asset_type,
+                            row_input.assets,
+                            row_input.engine_assets,
+                            row_input.asset_type,
                         );
                         egui::ScrollArea::vertical()
                             .max_height(ASSET_PICKER_HEIGHT)
@@ -573,10 +637,11 @@ pub fn inspector_asset_row(
                                     let current = matches!(&label, AssetReferenceLabel::Named(name)
                                     if *name == candidate.path);
                                     ui.horizontal(|ui| {
-                                        // A row under a module root is the engine's
-                                        // own file, not the project's: the badge is
-                                        // what tells the two apart, since the path
-                                        // of a module's resource reads like any other.
+                                        // A row under a module root is a file the
+                                        // engine ships, not one of the project's.
+                                        // The badge is the only sign of that: a
+                                        // module's resource path reads like any
+                                        // other path.
                                         let from_module = !candidate.root.is_empty();
                                         if from_module {
                                             engine_badge(ui);
@@ -591,11 +656,10 @@ pub fn inspector_asset_row(
                                         if row.clicked() {
                                             chosen = Some(Some(candidate.path.clone()));
                                         }
-                                        // The focus affordance the asset-settings
-                                        // picker carries: showing a candidate in the
-                                        // Assets panel keeps the picker open, so
-                                        // looking one up does not throw the edit
-                                        // away.
+                                        // The same "show in the Assets panel" button
+                                        // the asset-settings picker offers. The
+                                        // picker stays open, so looking an asset up
+                                        // does not throw the edit away.
                                         if ui
                                             .small_button("o")
                                             .on_hover_text("Show this asset in the Assets panel")
@@ -605,11 +669,11 @@ pub fn inspector_asset_row(
                                         }
                                     });
                                 }
-                                // The store's own assets: the ones built in code,
-                                // which no directory walk finds. A row is picked by
-                                // its guid when it has one and by the name it was
-                                // added under otherwise, which the field write
-                                // resolves through the store.
+                                // The store's own assets, built in code, which no
+                                // folder walk finds. A row is picked by its guid
+                                // when it has one, and otherwise by the name it was
+                                // added under; the field write resolves either one
+                                // through the store.
                                 for candidate in built.into_iter().filter(|candidate| {
                                     candidate.name.to_lowercase().contains(&search)
                                 }) {
@@ -630,101 +694,88 @@ pub fn inspector_asset_row(
                             });
                     },
                 );
-            // The row's own picker closes on a press outside it, the rule the
-            // helper states; the press that opened it landed on the row.
+            // A press outside the picker closes it, a rule the popup helper
+            // applies to every picker. The press that opened this one landed on
+            // the row, so it does not close it again.
             if popup.pressed_outside {
                 session.asset_picker = None;
             }
         }
     }
 
+    // Step 4: queue the reference the row chose, as one recorded step.
     if let Some(reference) = chosen {
         session.asset_picker = None;
-        let (commands, label, coalesce) = inspector::selection_asset_edit(
-            input.targets,
-            input.entity,
+        let (commands, label, coalesce_key) = inspector::selection_asset_edit(
+            row_input.targets,
+            row_input.entity,
             type_name,
-            input.field,
+            row_input.field,
             reference,
         );
-        pending.push_recorded(commands, label, Some(coalesce));
+        pending.push_recorded(commands, label, Some(coalesce_key));
     }
 }
 
-/// Width the clear button takes beside an asset row's button.
-pub const ASSET_ROW_CLEAR_WIDTH: f32 = 24.0;
-
-/// Height an asset or entity picker's list scrolls within.
-pub const ASSET_PICKER_HEIGHT: f32 = 180.0;
-
-/// What one entity reference row draws from: the field, its component and the
-/// selection it writes to, and the scene's entities the picker offers.
-pub struct EntityRowInput<'a> {
-    /// The primary entity the row describes.
-    pub entity: Entity,
-    /// The component section the row belongs to.
-    pub component: &'a ComponentView,
-    /// The field's position in the component's field list.
-    pub index: usize,
-    /// The field's registered name.
-    pub field: &'a str,
-    /// The field's `[Tooltip]`, if it declared one.
-    pub tooltip: Option<&'a str>,
-    /// Every entity the edit reaches (the primary first).
-    pub targets: &'a [Entity],
-    /// The selected entities' details, for the mixed-value marker.
-    pub details: &'a [EntityDetail],
-    /// The scene's entities, as the Entities tab lists them.
-    pub scene: &'a [EntityListEntry],
-}
-
-/// One entity reference row: a button naming the referenced
-/// entity, which opens a picker over the scene, a target button that arms a
-/// scene click, a clear button, and a drop target that takes an entity dragged
-/// from the Entities tab.
+/// Draws one entity reference row.
 ///
-/// Every choice queues one recorded `SetFieldEntity` step for the whole
+/// The row is a button naming the referenced entity, which opens a picker over
+/// the scene, a target button that arms a scene click, a clear button, and a
+/// drop target for an entity dragged out of the Entities tab.
+///
+/// Every choice becomes one recorded `SetFieldEntity` step for the whole
 /// selection. A reference whose entity is gone reads `(missing)` rather than
-/// disappearing: the field still holds the handle, and hiding that would leave
-/// the row looking unset while the row's bytes say otherwise.
+/// disappearing: the field still holds the handle, and hiding it would leave
+/// the row looking unset while the stored bytes say otherwise.
 pub fn inspector_entity_row(
     ui: &mut egui::Ui,
-    input: EntityRowInput<'_>,
+    row_input: EntityRowInput<'_>,
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
     overlay_regions: &mut Vec<ShellRect>,
 ) {
-    let type_name = input.component.type_name.as_str();
-    let label = input
+    let type_name = row_input.component.type_name.as_str();
+    let label = row_input
         .component
         .entity_labels
-        .get(input.index)
+        .get(row_input.index)
         .cloned()
         .flatten()
         .unwrap_or(EntityReferenceLabel::Unset);
     let text = label.text().to_owned();
-    let key = format!("{}.{type_name}.{}", input.entity, input.field);
+    // Step 1: log the entity this row draws, once per row and text, so a suite
+    // can wait for a pick to show up and for an undo to restore the previous
+    // one.
+    let key = format!("{}.{type_name}.{}", row_input.entity, row_input.field);
     if remember_entity_row_text(session, &key, &text) {
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
-            entity = %input.entity,
+            entity = %row_input.entity,
             component = type_name,
-            field = input.field,
+            field = row_input.field,
             reference = text.as_str(),
             "[editor] inspector row kind=entity"
         );
     }
 
-    // `Some(None)` clears the reference, `Some(Some(entity))` points it at one;
-    // collected while drawing and queued once afterwards.
+    // Step 2: draw the row and collect the reference it picks.
+    //
+    // `Some(None)` clears the reference and `Some(Some(entity))` points it at
+    // one. The choice is queued once, after the row has drawn.
     let mut chosen: Option<Option<Entity>> = None;
-    let mut armed = false;
-    let mut button_rect = None;
-    let row_label = match input.component.values.get(input.index) {
-        Some(value) => row_label(input.field, input.details, type_name, input.index, value),
-        None => input.field.to_owned(),
+    let mut scene_pick_armed = false;
+    let mut button_rects = None;
+    let row_label_text = match row_input.component.values.get(row_input.index) {
+        Some(value) => row_label(
+            row_input.field,
+            row_input.details,
+            type_name,
+            row_input.index,
+            value,
+        ),
+        None => row_input.field.to_owned(),
     };
-    inspector_row(ui, &row_label, input.tooltip, &mut |ui| {
+    inspector_row(ui, &row_label_text, row_input.tooltip, &mut |ui| {
         let width = (ui.available_width() - 2.0 * ASSET_ROW_CLEAR_WIDTH).max(40.0);
         let color = match label {
             EntityReferenceLabel::Live(_) => style::text(),
@@ -753,13 +804,13 @@ pub fn inspector_entity_row(
             };
             session.entity_search.clear();
         }
-        button_rect = Some((response.rect, response.interact_rect));
+        button_rects = Some((response.rect, response.interact_rect));
         if ui
             .add(egui::Button::new("+").small())
             .on_hover_text("Pick the reference by clicking it in the scene")
             .clicked()
         {
-            armed = true;
+            scene_pick_armed = true;
         }
         if ui
             .add_enabled(
@@ -772,12 +823,14 @@ pub fn inspector_entity_row(
             chosen = Some(None);
         }
     });
-    if let Some((rect, interact)) = button_rect {
-        remember_entity_row_rect(session, &key, rect, interact.contains(rect.center()));
+    if let Some((rect, interact_rect)) = button_rects {
+        remember_entity_row_rect(session, &key, rect, interact_rect.contains(rect.center()));
     }
 
+    // Step 3: draw the picker while it is open: a search box over the scene's
+    // entities, with `None` first.
     if session.entity_picker.as_deref() == Some(key.as_str()) {
-        if let Some((rect, _)) = button_rect {
+        if let Some((rect, _)) = button_rects {
             let picker_id = egui::Id::new(("pill_editor_shell_egui.entity_picker", key.as_str()));
             let popup = floating_popup(
                 ui,
@@ -798,7 +851,7 @@ pub fn inspector_entity_row(
                             if ui.selectable_label(false, "None").clicked() {
                                 chosen = Some(None);
                             }
-                            for candidate in inspector::entity_candidates(input.scene) {
+                            for candidate in inspector::entity_candidates(row_input.scene) {
                                 if !candidate.display.to_lowercase().contains(&search) {
                                     continue;
                                 }
@@ -811,52 +864,53 @@ pub fn inspector_entity_row(
                         });
                 },
             );
-            // The entity picker had no dismissal at all: it stayed over the
-            // inspector until it was picked from. Its asset twin is 245 lines
-            // above and the rule is the helper's now, so both close on a press
-            // outside.
+            // A press outside the picker closes it, the rule the popup helper
+            // applies. The press that opened this one landed on the row.
             if popup.pressed_outside {
                 session.entity_picker = None;
             }
         }
     }
 
-    if armed {
-        // The scene's own click names the reference, so the request rides the
-        // command queue to the executable that reads scene picks: the shell
-        // draws rows, it does not own the scene.
+    // Step 4: queue what the row asked for. A press on the target button arms
+    // a scene click first; a reference the picker or a drop chose is queued
+    // after it.
+    if scene_pick_armed {
+        // The scene's own click names the reference, so the request goes
+        // through the command queue to the executable that reads scene picks.
+        // The shell only draws rows; it does not own the scene.
         pending.push(vec![EditorCommand::ArmEntityPick {
-            entity: input.entity,
+            entity: row_input.entity,
             component: type_name.to_owned(),
-            field: input.field.to_owned(),
+            field: row_input.field.to_owned(),
         }]);
     }
 
     if let Some(reference) = chosen {
         session.entity_picker = None;
-        let (commands, label, coalesce) = inspector::selection_entity_edit(
-            input.targets,
-            input.entity,
+        let (commands, label, coalesce_key) = inspector::selection_entity_edit(
+            row_input.targets,
+            row_input.entity,
             type_name,
-            input.field,
+            row_input.field,
             reference,
         );
-        pending.push_recorded(commands, label, Some(coalesce));
+        pending.push_recorded(commands, label, Some(coalesce_key));
     }
 }
 
-/// Record the entity an entity row draws, returning whether it changed since
+/// Records the text an entity row draws and answers whether it changed since
 /// the last frame that drew the row.
 pub fn remember_entity_row_text(session: &mut InspectorSession, key: &str, text: &str) -> bool {
     session.entity_row_texts.remember(key.to_owned(), text)
 }
 
-/// Log an entity row's rectangle once per placement, keyed by
+/// Logs an entity row's rectangle once per placement, keyed by
 /// `entity.component.field`, so a suite can drop an entity onto it.
 ///
-/// The placement is recorded either way - the shell's own tests read it - but
-/// the line is a scripted run's: it is there to aim a drop, and a person's
-/// console gains nothing from it.
+/// The placement is recorded whether or not the line is logged, and the line
+/// goes out only when the session logs rectangles. It exists to aim a scripted
+/// drop and adds nothing to a person's console.
 pub fn remember_entity_row_rect(
     session: &mut InspectorSession,
     key: &str,
@@ -883,13 +937,14 @@ pub fn remember_entity_row_rect(
     );
 }
 
-/// Record `rect` as `key`'s placement, returning it when that is a placement
-/// the log has not named yet.
+/// Records `rect` as `key`'s placement and returns it when the log has not
+/// named that placement yet.
 ///
-/// The comparison is [`LoggedRects`]'s, so a row and a section header cannot
-/// disagree about what counts as moved. A row that leaves the visible area
-/// keeps its last placement, so it does not log again when it scrolls back to
-/// where it was.
+/// The comparison is [`LoggedRects::remember`]'s, which rounds to whole
+/// points, and the returned rectangle is rounded the same way. The numbers in
+/// the log are therefore the ones that were compared. A row that leaves the
+/// visible area keeps its last placement, so scrolling back to it does not log
+/// again.
 pub fn record_row_placement(
     logged: &mut LoggedRects<String>,
     key: &str,
@@ -903,21 +958,22 @@ pub fn record_row_placement(
     })
 }
 
-/// Record the asset an asset row draws, returning whether it changed since
-/// the last frame that drew the row: the row logs its current asset on its
-/// first draw and on every change, so a suite can wait for a pick to show up
-/// and for an undo to bring the previous asset back.
+/// Records the text an asset row draws and answers whether it changed since
+/// the last frame that drew the row.
+///
+/// The row logs its current asset on its first draw and on every change, so a
+/// suite can wait for a pick to show up and for an undo to bring the previous
+/// asset back.
 pub fn remember_asset_row_text(session: &mut InspectorSession, key: &str, text: &str) -> bool {
     session.asset_row_texts.remember(key.to_owned(), text)
 }
 
-/// Log an asset row's rectangle once per placement, keyed by
+/// Logs an asset row's rectangle once per placement, keyed by
 /// `entity.component.field`, so a suite can drop an asset onto it.
 ///
-/// Only a row whose centre is inside its visible area is drawn at all: a row
-/// scrolled out of the panel cannot be clicked or dropped on, so a visible row
-/// is the one whose rectangle reaches the log. The line itself is a scripted
-/// run's.
+/// Only a row whose centre is inside its visible area reaches the log: a row
+/// scrolled out of the panel cannot be clicked or dropped on. The line itself
+/// belongs to a scripted run.
 pub fn remember_asset_row_rect(
     session: &mut InspectorSession,
     key: &str,
@@ -944,8 +1000,8 @@ pub fn remember_asset_row_rect(
     );
 }
 
-/// The current values of a grouped row's leaves, in the row's own order: a
-/// leaf inside an array value reads its element.
+/// Returns the current value of each leaf of a grouped row, in the row's own
+/// order. A leaf inside an array value reads that element.
 pub fn leaf_values(component: &ComponentView, leaves: &[inspector::RowLeaf]) -> Vec<FieldValue> {
     leaves
         .iter()
@@ -959,11 +1015,11 @@ pub fn leaf_values(component: &ComponentView, leaves: &[inspector::RowLeaf]) -> 
         .collect()
 }
 
-/// The channels a colour row's values hold, as the picker's unmultiplied
-/// linear floats, or `None` when a value is not a float.
+/// Returns the channels a colour row's values hold, as the unmultiplied linear
+/// floats the picker takes, or `None` when a value is not a float.
 ///
-/// Three channels stay opaque; four carry their alpha. A colour of any other
-/// length is not one the picker draws.
+/// Three channels stay opaque and four carry their alpha. Any other length is
+/// not a colour the picker can draw.
 pub fn color_channels(values: &[FieldValue]) -> Option<[f32; 4]> {
     if !(3..=4).contains(&values.len()) {
         return None;
@@ -979,29 +1035,30 @@ pub fn color_channels(values: &[FieldValue]) -> Option<[f32; 4]> {
     Some(channels)
 }
 
-/// The label a row draws, marked when the selection disagrees on its value.
+/// Returns the label a row draws, with a `(mixed)` mark when the selection
+/// disagrees on its value.
 pub fn row_label(
     field: &str,
     details: &[EntityDetail],
-    component: &str,
+    type_name: &str,
     index: usize,
     value: &FieldValue,
 ) -> String {
-    if row_is_mixed(details, component, index, value) {
+    if row_is_mixed(details, type_name, index, value) {
         format!("{field} (mixed)")
     } else {
         field.to_string()
     }
 }
 
-/// Queue one field edit for **every** selected entity the component exists on,
-/// as one recorded step.
+/// Queues one field edit for **every** selected entity that carries the
+/// component, as one recorded step.
 ///
 /// `targets` is [`super::tab_inspector::inspector_targets`]'s answer: the
-/// primary first, then the other selected entities carrying the component. One
-/// batch means one undo step however many entities the row wrote, and the
-/// coalesce key is the primary's, so a drag across a multi-selection still
-/// collapses into the same single step.
+/// primary entity first, then the other selected entities that carry the
+/// component. One batch is one undo step however many entities the row wrote,
+/// and the coalesce key comes from the primary, so a drag across a
+/// multi-selection still collapses into a single step.
 pub fn queue_field_edit(
     pending: &mut PendingEditorCommands,
     targets: &[Entity],
@@ -1010,12 +1067,12 @@ pub fn queue_field_edit(
     field: &str,
     value: FieldValue,
 ) {
-    let (commands, label, key) =
+    let (commands, label, coalesce_key) =
         inspector::selection_field_edit(targets, entity, type_name, field, value);
-    pending.push_recorded(commands, label, Some(key));
+    pending.push_recorded(commands, label, Some(coalesce_key));
 }
 
-/// Queue one array-element edit for every target, as one recorded step.
+/// Queues one array-element edit for every target, as one recorded step.
 pub fn queue_element_edit(
     pending: &mut PendingEditorCommands,
     targets: &[Entity],
@@ -1025,15 +1082,15 @@ pub fn queue_element_edit(
     index: usize,
     value: FieldValue,
 ) {
-    let (commands, label, key) =
+    let (commands, label, coalesce_key) =
         inspector::selection_element_edit(targets, entity, type_name, field, index, value);
-    pending.push_recorded(commands, label, Some(key));
+    pending.push_recorded(commands, label, Some(coalesce_key));
 }
 
-/// Whether the selected entities disagree on this row's value.
+/// Returns whether the selected entities disagree on this row's value.
 pub fn row_is_mixed(
     details: &[EntityDetail],
-    component: &str,
+    type_name: &str,
     index: usize,
     value: &FieldValue,
 ) -> bool {
@@ -1041,14 +1098,14 @@ pub fn row_is_mixed(
         detail
             .components
             .iter()
-            .find(|view| view.type_name == component)
+            .find(|view| view.type_name == type_name)
             .and_then(|view| view.values.get(index))
             .is_some_and(|other| other != value)
     })
 }
 
-/// The wire name a row's widget logs under, so suites can assert what the
-/// model chose without reading pixels.
+/// Returns the name a row's widget logs under, so a suite can assert which
+/// widget the model chose without reading pixels.
 pub fn field_widget_name(widget: &inspector::FieldWidget) -> &'static str {
     match widget {
         inspector::FieldWidget::Checkbox => "checkbox",
@@ -1064,9 +1121,9 @@ pub fn field_widget_name(widget: &inspector::FieldWidget) -> &'static str {
     }
 }
 
-/// The Inspector's field row: the shared label/control row ([`row`]), with
-/// the field's label on the left and its widget in the control column. A
-/// decorator's tooltip shows while the pointer rests on the label.
+/// Draws the Inspector's field row: the shared label/control row ([`row`]),
+/// with the field's label on the left and its widget in the control column. A
+/// `[Tooltip]` shows while the pointer rests on the label.
 pub fn inspector_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -1076,7 +1133,7 @@ pub fn inspector_row(
     row(ui, label, tooltip, widget);
 }
 
-/// Whether a value has its own widget kind.
+/// Returns whether a value has a widget kind of its own.
 pub fn is_scalar_field(value: &FieldValue) -> bool {
     matches!(
         value,

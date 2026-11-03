@@ -5,8 +5,7 @@
 //!
 //! - Install the half of the frame that draws geometry ([`install`]): the lit
 //!   pass, the shader it draws through, the offscreen target it writes, and the
-//!   neutral material for geometry nobody gave one - which is a file this crate
-//!   ships ([`DEFAULT_MATERIAL_PATH`]), not a value built in code.
+//!   neutral material the chain ships as a file ([`DEFAULT_MATERIAL_PATH`]).
 //! - Compose that pass with the post-processing half
 //!   ([`super::post_processing`]) into one pipeline asset, with a skybox pass
 //!   between them that a project turns on by giving it a sky material
@@ -16,9 +15,9 @@
 //!
 //! A frame written as data, exactly as a project would write it: the lit pass is
 //! a `RenderPass` asset and the chain is a `RenderingPipeline` asset, so nothing
-//! here needs an API a project cannot reach. What the crate adds is only that
-//! these exist without anyone declaring them, and that the renderer points its
-//! manager at the result.
+//! here needs an API a project cannot reach. The crate adds only this: the
+//! assets exist without anyone declaring them, and the renderer's manager is
+//! pointed at the result.
 //!
 //! ```text
 //! pill.pbr.pass.opaque   geometry → hdr    the lit surface, in the range lighting produces
@@ -26,13 +25,15 @@
 //! ─── the four post-processing passes, declared in `super::post_processing` ───
 //! ```
 //!
-//! The shaders are cooked from HLSL into this crate at build time and embedded,
-//! so installing the chain reads no shader file. The geometry fragment stage
-//! sits in `shader_sources/pbr_pipeline/shaders/` and `#include`s the crate's
-//! shared header; relative to that directory, the post-processing stages are
-//! under `../../post_processing/shaders/`, and the vertex stage is the shared
-//! `../../common_shaders/default_vertex.wgsl`, because every lit pass in the
-//! crate starts from the same instance layout.
+//! The shaders are cooked from HLSL to WGSL at build time and embedded, and
+//! installing the chain still imports each one from its `.hlsl` source through
+//! the store, the way a project's shader is imported. The geometry fragment
+//! stage is `pbr_fragment.hlsl`, under `shader_sources/pbr_pipeline/shaders/`,
+//! and includes the crate's shared header. The vertex stage is the shared
+//! `common_shaders/default_vertex.wgsl`, named from the `shader_sources` root by
+//! each shader's `.hlsl.meta`, because every lit pass in the crate starts from
+//! the same instance layout. The four post-processing stages are under
+//! `shader_sources/post_processing/shaders/`.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -50,11 +51,9 @@ use crate::{
     config::{ShaderSourceRecord, DEFAULT_VERTEX},
 };
 
-config_shader_file!(
-    /// The geometry pass's fragment stage, cooked from `pbr_fragment.hlsl` and
-    /// embedded for the development reload table.
-    PBR_FRAGMENT, "pbr_pipeline/shaders/pbr_fragment.wgsl"
-);
+// =============================================================================
+// Constants
+// =============================================================================
 
 /// The shader assets [`install`] creates, and the files each is built from.
 pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[ShaderSourceRecord {
@@ -67,37 +66,52 @@ pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[ShaderSourceRecord {
 pub const PIPELINE_NAME: &str = "pill.pbr.pipeline";
 
 /// The shader the geometry pass draws through: the path its `.hlsl` source is
-/// imported under, because an imported asset is named by the path it came from.
+/// imported under. An imported asset is named by the path it came from.
 pub const SHADER_PATH: &str = "pbr_pipeline/shaders/pbr_fragment.hlsl";
 
-/// The literal every material file names the PBR shader by, and the one the
-/// shader's `.hlsl.meta` carries as its guid.
-///
-/// Derived from this string rather than drawn at random: every checkout and
-/// every run must give the shader the same guid, and the shipped default
-/// material plus the examples' materials already name it.
-const SHADER_GUID_SOURCE: &str = "pill.pbr.shader";
-
 /// The guid the PBR shader is stored under, so a material file can name it.
-pub const SHADER_GUID: AssetGuid = AssetGuid::from_name(SHADER_GUID_SOURCE);
+pub const SHADER_GUID: AssetGuid = AssetGuid::from_name(SHADER_GUID_NAME);
 
 /// The material file the chain's default material is imported from, relative
 /// to this module's `res`.
 ///
-/// The chain's default material is content, not code: the file is the one
-/// definition of it, the editor lists it read-only under the `extensions` root,
-/// and it is imported like any other standalone `.material` - named by this
-/// path and keyed by the guid in its own header, so a reference to it survives
-/// the file being renamed.
+/// The chain's default material is content, not code: this file is its one
+/// definition. The editor lists it read-only under the `extensions` root, and it
+/// is imported like any other standalone `.material` - named by this path and
+/// keyed by the guid in its own header, so a reference to it survives the file
+/// being renamed.
 pub const DEFAULT_MATERIAL_PATH: &str = "defaults/pill.pbr.material";
+
+/// Asset name of the skybox pass, which [`set_skybox`] gives a material.
+pub const SKYBOX_PASS: &str = "pill.pbr.pass.skybox";
+
+config_shader_file!(
+    /// The geometry pass's fragment stage, cooked from `pbr_fragment.hlsl` and
+    /// embedded with its path, so the shader reload can find the file again.
+    PBR_FRAGMENT, "pbr_pipeline/shaders/pbr_fragment.wgsl"
+);
+
+/// The name the PBR shader's guid is derived from.
+///
+/// The guid comes from this string instead of being drawn at random, so every
+/// checkout and every run gives the shader the same one. The shader's
+/// `.hlsl.meta` carries that guid, and the shipped default material and the
+/// examples' materials name it.
+const SHADER_GUID_NAME: &str = "pill.pbr.shader";
+
+/// Asset name of the lit pass.
+const OPAQUE_PASS: &str = "pill.pbr.pass.opaque";
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// The PBR shader's parameters at their neutral values, by slot name.
 ///
-/// The factors multiply the maps, so at these values what a mesh shows is its
-/// own albedo, roughness and metalness - and with no map bound, the
-/// renderer's default texture for each slot. Used by the chain's own default
-/// material and by every newly created material file, so both start out the
-/// same.
+/// Each factor multiplies the map bound to its slot, so these values leave a
+/// bound map unchanged. A slot with no map bound falls back to the renderer's
+/// default texture for the slot's type. The chain's default material and every
+/// newly created `.material` start from this set, so the two start out the same.
 pub fn neutral_parameters() -> BTreeMap<String, MaterialParameter> {
     BTreeMap::from([
         (
@@ -113,18 +127,12 @@ pub fn neutral_parameters() -> BTreeMap<String, MaterialParameter> {
     ])
 }
 
-/// Asset name of the lit pass.
-const OPAQUE_PASS: &str = "pill.pbr.pass.opaque";
-
-/// Asset name of the skybox pass, which [`set_skybox`] gives a material.
-pub const SKYBOX_PASS: &str = "pill.pbr.pass.skybox";
-
-/// The sky pass: a fullscreen triangle at the far plane, into the lit target,
-/// with no material.
+/// Builds the sky pass: a fullscreen triangle at the far plane, into the lit
+/// target, with no material.
 ///
-/// Behind the lit surface and into the same target, so it reads the depth the
-/// lit pass left. A pass with no material cannot be drawn, so it starts
-/// disabled until [`set_skybox`] gives it one.
+/// It draws into the same target as the lit pass so it can read the depth that
+/// pass left behind. A pass with no material cannot be drawn, so this one starts
+/// disabled until [`set_skybox`] gives it a material.
 fn default_sky_pass() -> RenderPass {
     skybox::skybox_pass(
         SKYBOX_PASS,
@@ -134,55 +142,70 @@ fn default_sky_pass() -> RenderPass {
     )
 }
 
-/// Import the chain's shader from its source, or hand back the one a store
+/// Imports the chain's shader from its source, or returns the one the store
 /// already holds.
 ///
-/// The source lives in this module's `shader_sources` root, which `register`
-/// declares; its `.hlsl.meta` carries the guid every material file names and
-/// the slots the pass reads.
+/// The source lives under this module's `shader_sources` root, which
+/// [`register`](crate::register) declares. The `.hlsl.meta` beside it carries
+/// the guid every material file names and the slots the pass reads.
+///
+/// # Errors
+///
+/// Returns the store's import error when the source or its `.hlsl.meta` will not
+/// load.
+///
+/// # Panics
+///
+/// Panics when the imported shader does not carry [`SHADER_GUID`], which happens
+/// when the meta is missing or names another guid.
 fn install_pbr_shader(
     assets: &mut AssetManager,
 ) -> Result<Handle<Shader>, Box<dyn std::error::Error>> {
     crate::config::import_shader(assets, SHADER_PATH, SHADER_GUID)
 }
 
-/// Install the PBR chain, and return the pipeline asset.
+/// Installs the PBR chain, and returns the pipeline asset.
 ///
 /// The shader the geometry pass draws through is stored under [`SHADER_PATH`],
-/// which is how a caller that wants it finds it - the pass carries the same
+/// which is how a caller that wants it finds it: the pass carries the same
 /// handle, and the store is the index for the name.
 ///
 /// Idempotent: a store that already holds the chain gets the same handle back
-/// rather than a second copy of it, so this is safe to call once per generation
-/// - which is what [`register`](crate::register) does.
+/// rather than a second copy of it, so this is safe to call once per generation,
+/// which is what [`register`](crate::register) does.
 ///
 /// # Errors
 ///
-/// Returns an error when a name this owns is already taken by an asset of a
-/// different type, when the default material's file will not parse, or when one
-/// of the chain's shaders fails to build.
+/// Returns an error when a name this chain owns is already taken by an asset of
+/// another type, when a shader's source or `.hlsl.meta` will not load, or when
+/// the default material's file will not parse.
+///
+/// # Panics
+///
+/// Panics when one of the chain's shaders does not carry the guid its module
+/// declares; see `install_pbr_shader`.
 pub fn install(
     assets: &mut AssetManager,
 ) -> Result<Handle<RenderingPipeline>, Box<dyn std::error::Error>> {
-    // Before the early return: a sky material file names these shaders by guid,
-    // so they have to exist in a store that already holds the chain.
+    // Step 1: Install the sky shaders, then hand back the chain when the store
+    // already holds it. The shaders come first because a sky material file names
+    // them by guid and can load before this call.
     skybox::install_shaders(assets)?;
     if let Some(pipeline) = assets.handle_by_name::<RenderingPipeline>(PIPELINE_NAME) {
         return Ok(pipeline);
     }
 
-    // The geometry pass's shader: the `.hlsl` this crate cooks, imported with
-    // its `.hlsl.meta` beside it. The meta declares the four maps it reads and
-    // the two groups every shader in the engine may bind, and holds the guid
-    // every material file names.
-    let pbr = install_pbr_shader(assets)?;
+    // Step 2: Import the pass's shader. It is the `.hlsl` this crate cooks,
+    // imported with the `.hlsl.meta` beside it; the meta declares the four maps
+    // the shader reads, the engine and camera groups it binds, and the guid every
+    // material file names.
+    let pbr_shader = install_pbr_shader(assets)?;
 
-    // The maps carry the look; these factors are neutral, so what a mesh shows is
-    // its own albedo, roughness and metalness. A slot left unbound falls back to
-    // the renderer's own default texture, which is what lets this material exist
-    // before anyone has supplied a map. Imported like every other `.material`, it
-    // is named by its path and keyed by the guid in its header; a project that
-    // wants it asks the store for that path.
+    // Step 3: Import the default material, the way every other `.material` is
+    // imported: named by its path and keyed by the guid in its header. Each
+    // neutral factor leaves a bound map unchanged, and a slot left unbound falls
+    // back to the renderer's default texture, so the material works before anyone
+    // has supplied a map. A project that wants it asks the store for that path.
     assets
         .import_standalone::<Material>(Path::new(DEFAULT_MATERIAL_PATH))
         .map_err(|error| {
@@ -192,27 +215,31 @@ pub fn install(
             )
         })?;
 
-    // The lit geometry, into a target that can hold what the lighting produces.
-    let opaque = RenderPass::new(OPAQUE_PASS)
-        .with_shader(pbr)
+    // Step 4: Build the passes and store the chain. The lit pass writes a target
+    // that can hold the range the lighting produces.
+    let opaque_pass = RenderPass::new(OPAQUE_PASS)
+        .with_shader(pbr_shader)
         .with_kind(PassKind::Geometry)
         .with_target(PassTarget::Offscreen(HDR_TARGET.to_owned()))
         .with_order(0);
-    let opaque = assets.add_named_with_guid(
+    let opaque_pass = assets.add_named_with_guid(
         OPAQUE_PASS,
         pill_engine::AssetGuid::from_name(OPAQUE_PASS),
-        opaque,
+        opaque_pass,
     )?;
 
-    // The sky, behind the lit surface and into the same target, so it reads the
-    // depth the lit pass left. Off until a project gives it a material.
-    let sky = assets.add_named(SKYBOX_PASS, default_sky_pass())?;
+    // The sky draws behind the lit surface and into the same target, so it reads
+    // the depth the lit pass left. It stays off until a project gives it a
+    // material.
+    let sky_pass = assets.add_named(SKYBOX_PASS, default_sky_pass())?;
 
-    // The other half of the frame, which reads the target this one just wrote.
-    let post = post_processing::install(assets)?;
+    // The other half of the frame reads the target this one just wrote.
+    let post_processing_passes = post_processing::install(assets)?;
 
-    let mut pipeline = RenderingPipeline::new().with_pass(opaque).with_pass(sky);
-    for pass in post {
+    let mut pipeline = RenderingPipeline::new()
+        .with_pass(opaque_pass)
+        .with_pass(sky_pass);
+    for pass in post_processing_passes {
         pipeline.add(pass);
     }
     let pipeline = assets.add_named(PIPELINE_NAME, pipeline)?;
@@ -220,19 +247,24 @@ pub fn install(
     Ok(pipeline)
 }
 
-/// Draw `material` as the sky behind the PBR chain's lit surface, or turn the
-/// sky off with `None`; returns the skybox pass.
+/// Sets `material` as the sky drawn behind the PBR chain's lit surface, or turns
+/// the sky off with `None`, and returns the skybox pass.
 ///
 /// The material is a sky material: one of the [`skybox`] shaders with its `sky`
-/// slot bound. Installs the chain when it is missing, and adds the skybox pass
-/// right after the lit pass when the chain does not hold it. Writes only what
-/// differs, so calling this on every reload does not make the renderer rebuild
-/// an unchanged chain.
+/// slot bound. This installs the chain when the store does not hold it, and adds
+/// the skybox pass right after the lit pass when the chain does not hold it.
+/// Only what differs is written, so calling this on every reload does not make
+/// the renderer rebuild an unchanged chain.
 ///
 /// # Errors
 ///
 /// Returns an error when the chain does not install, or when the pass's name is
 /// taken by an asset of another type.
+///
+/// # Panics
+///
+/// Panics when one of the chain's shaders does not carry the guid its module
+/// declares; see [`install`].
 #[pill_engine::pill_mirror_fn]
 pub fn set_skybox(
     assets: &mut AssetManager,
@@ -240,39 +272,48 @@ pub fn set_skybox(
 ) -> Result<Handle<RenderPass>, Box<dyn std::error::Error>> {
     let pipeline = install(assets)?;
     let material = material.unwrap_or(Handle::INVALID);
-    let pass = match assets.handle_by_name::<RenderPass>(SKYBOX_PASS) {
-        Some(pass) => pass,
+    let sky_pass = match assets.handle_by_name::<RenderPass>(SKYBOX_PASS) {
+        Some(sky_pass) => sky_pass,
         None => assets.add_named(SKYBOX_PASS, default_sky_pass())?,
     };
     // A chain that does not hold the pass yet gets it right after the lit pass,
     // whose depth it tests against.
     let in_chain = assets
         .get(pipeline)
-        .is_some_and(|chain| chain.passes.iter().any(|entry| entry.pass == pass));
+        .is_some_and(|chain| chain.passes.iter().any(|entry| entry.pass == sky_pass));
     if !in_chain {
-        let opaque = assets.handle_by_name::<RenderPass>(OPAQUE_PASS);
+        let opaque_pass_handle = assets.handle_by_name::<RenderPass>(OPAQUE_PASS);
         if let Some(chain) = assets.get_mut(pipeline) {
-            let index = opaque
-                .and_then(|opaque| chain.passes.iter().position(|entry| entry.pass == opaque))
+            let index = opaque_pass_handle
+                .and_then(|opaque_pass| {
+                    chain
+                        .passes
+                        .iter()
+                        .position(|entry| entry.pass == opaque_pass)
+                })
                 .map_or(0, |position| position + 1);
             chain
                 .passes
-                .insert(index, crate::assets::PipelinePass::new(pass));
+                .insert(index, crate::assets::PipelinePass::new(sky_pass));
         }
     }
 
     let enabled = material != Handle::INVALID;
     let unchanged = assets
-        .get(pass)
+        .get(sky_pass)
         .is_some_and(|sky| sky.material == material && sky.enabled == enabled);
     if !unchanged {
-        if let Some(sky) = assets.get_mut(pass) {
+        if let Some(sky) = assets.get_mut(sky_pass) {
             sky.material = material;
             sky.enabled = enabled;
         }
     }
-    Ok(pass)
+    Ok(sky_pass)
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -280,10 +321,9 @@ mod tests {
     use crate::assets::MaterialDocument;
     use pill_engine::Engine;
 
-    /// The material the chain draws with is the file this crate ships: its
-    /// shader is the one `install` stores, its parameters are the neutral set,
-    /// and nothing is bound - so a mesh with no material of its own draws with
-    /// exactly what a newly created `.material` starts from.
+    /// The file this crate ships is the neutral default material: its shader is
+    /// the one `install` stores, its parameters are the neutral set, and nothing
+    /// is bound - the same state a newly created `.material` starts from.
     #[test]
     fn the_shipped_file_is_the_neutral_default_material() {
         let source = std::fs::read_to_string(
@@ -292,9 +332,9 @@ mod tests {
                 .join(DEFAULT_MATERIAL_PATH),
         )
         .expect("the shipped file is in the crate);");
-        let file: serde_json::Value =
+        let file_json: serde_json::Value =
             serde_json::from_str(&source).expect("the shipped file parses");
-        let file_document: MaterialDocument = serde_json::from_value(file["asset"].clone())
+        let file_document: MaterialDocument = serde_json::from_value(file_json["asset"].clone())
             .expect("the shipped file carries a document");
         let mut assets = AssetManager::new();
         crate::declare_crate_roots();
@@ -328,14 +368,16 @@ mod tests {
             .get_resource_mut::<AssetManager>()
             .expect("the engine inserts the store");
 
-        let pbr = install(assets).expect("a free name");
+        let pipeline_handle = install(assets).expect("a free name");
         let opaque = assets
             .handle_by_name::<RenderPass>(OPAQUE_PASS)
             .expect("the lit pass");
         let sky = assets
             .handle_by_name::<RenderPass>(SKYBOX_PASS)
             .expect("the skybox pass");
-        let pipeline = assets.get(pbr).expect("the pipeline it just added");
+        let pipeline = assets
+            .get(pipeline_handle)
+            .expect("the pipeline it just added");
 
         assert_eq!(
             pipeline.passes.len(),
@@ -360,14 +402,14 @@ mod tests {
                 .join(format!("{SHADER_PATH}.meta")),
         )
         .expect("the shipped meta is in the crate");
-        let file: serde_json::Value = serde_json::from_str(&source).expect("the meta parses");
+        let file_json: serde_json::Value = serde_json::from_str(&source).expect("the meta parses");
         assert_eq!(
-            file["guid"].as_str(),
+            file_json["guid"].as_str(),
             Some(SHADER_GUID.to_string().as_str()),
             "`{SHADER_PATH}.meta` must carry the guid every material names"
         );
         assert_eq!(
-            file["asset_type"].as_str(),
+            file_json["asset_type"].as_str(),
             Some(<Shader as pill_engine::ImportedAsset>::metadata_type_name()),
             "the meta must describe a shader"
         );

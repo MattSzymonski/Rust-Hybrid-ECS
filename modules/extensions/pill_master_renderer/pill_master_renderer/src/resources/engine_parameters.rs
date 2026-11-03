@@ -2,36 +2,37 @@
 //!
 //! # Responsibilities
 //!
-//! - Define the layout the GPU sees ([`EngineParametersData`]) and keep the
-//!   CPU-side copy the renderer writes each frame in step with it.
+//! - Define the layout the GPU reads ([`EngineParametersData`]) and hold the
+//!   CPU-side copy the renderer updates every frame, so both carry the same
+//!   values.
 //! - Own the uniform buffer that carries those values, together with its bind
 //!   group layout and bind group ([`EngineParameters`]).
 //!
 //! # Design
 //!
-//! One instance lives on the renderer and is refilled per frame:
-//! [`EngineParameters::update`] rewrites the whole buffer, so the CPU-side
-//! copy and the GPU copy stay in step without anyone tracking dirty fields.
-//! The fog pair leads the block because the HLSL `EngineParams` in
-//! `shader_sources/common_shaders/include/common.hlsl` declares it at those
-//! offsets; the frame size and time follow as the engine side's extension,
-//! which no shipped shader reads.
+//! One instance lives on the renderer and is refilled once for each surface
+//! frame: [`EngineParameters::update`] rewrites the whole buffer, so the CPU
+//! copy and the GPU buffer always match and no code has to track which fields
+//! changed. The fog values come first because the HLSL `EngineParams` in
+//! `pill_master_renderer_data/shader_sources/common_shaders/include/common.hlsl`
+//! declares them at the same offsets. The frame size and time follow; the
+//! engine adds them, and no shipped shader declares them.
 
 // External crates
 use wgpu::util::DeviceExt;
 
 /// The engine-wide uniform block a pass may read, in its GPU layout.
 ///
-/// Fog and the frame's size and time are frame state rather than pass state,
-/// so every pass reads the same buffer instead of carrying copies that could
-/// disagree within one frame.
+/// Fog, the frame size and the frame time describe the frame, not one pass.
+/// Every pass reads the same buffer, so no two passes can hold copies that
+/// disagree.
 ///
 /// The first 16 bytes must match the HLSL `EngineParams` in
-/// `shader_sources/common_shaders/include/common.hlsl`, which declares the
-/// fog pair and nothing after it. The tail is the engine side's own
-/// extension, which no shipped shader declares: `frame_size` at offset 16
+/// `pill_master_renderer_data/shader_sources/common_shaders/include/common.hlsl`,
+/// which declares the fog pair and nothing after it. The rest is the engine's
+/// own addition, and no shipped shader declares it: `frame_size` at offset 16
 /// (xy = pixels, zw = their reciprocal) and `time` at offset 32 (x = seconds,
-/// y = delta, z = frame). The struct totals 48 bytes.
+/// y = delta, z = frame). The struct is 48 bytes in total.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct EngineParametersData {
@@ -39,14 +40,15 @@ pub struct EngineParametersData {
     pub fog_color: [f32; 3],
     /// Fog thickness: how quickly the colour builds up with distance.
     pub fog_density: f32,
-    /// The surface size in pixels, and its reciprocal.
+    /// The surface size in pixels, followed by the reciprocal of each
+    /// dimension.
     ///
-    /// For a pass that samples the frame at a texel offset. No shipped shader
-    /// reads it yet. Taken from the buffer rather than a pass parameter, so a
-    /// resize cannot leave it stale.
+    /// It exists for a pass that samples the frame at a texel offset; no
+    /// shipped shader reads it. The value comes from the buffer rather than a
+    /// pass parameter, so a resize cannot leave it stale.
     pub frame_size: [f32; 4],
-    /// x = seconds since the first frame, y = this frame's duration, z = the
-    /// frame's sequence number. w is unused.
+    /// x = seconds since the frame loop started, y = this frame's duration,
+    /// z = the frame's sequence number. w is unused.
     pub time: [f32; 4],
 }
 
@@ -59,8 +61,8 @@ impl Default for EngineParametersData {
 impl EngineParametersData {
     /// Creates an all-zero set of parameters.
     ///
-    /// The uniform buffer is created from these values, so this is what every
-    /// shader reads until the first frame's `update_data` call replaces them.
+    /// The uniform buffer is created from these values, so every shader reads
+    /// zeros until the first frame's `update_data` call replaces them.
     pub fn new() -> Self {
         Self {
             fog_color: [0.0; 3],
@@ -73,12 +75,11 @@ impl EngineParametersData {
     /// Writes one frame's values into the buffer data, converting the surface
     /// size on the way in.
     ///
-    /// The size arrives as pixel dimensions and leaves as pixels plus the
-    /// reciprocal, which is the form the layout declares and the form a shader
-    /// sampling at a texel offset wants. Both reciprocals are taken over a
-    /// dimension clamped to at least one pixel, so a minimized or
-    /// not-yet-sized surface cannot leave an infinity in the buffer for a
-    /// shader to read back per pixel.
+    /// The size comes in as pixel dimensions and is stored as pixels plus
+    /// their reciprocal. That is the form the layout declares and the form a
+    /// shader sampling at a texel offset wants. Each dimension is clamped to
+    /// at least one pixel before the division, so a minimized or
+    /// not-yet-sized surface cannot put an infinity into the buffer.
     pub fn update_data(
         &mut self,
         fog_density: f32,
@@ -98,21 +99,24 @@ impl EngineParametersData {
     }
 }
 
-// --- Engine Parameters ---
+// =============================================================================
+// Engine Parameters
+// =============================================================================
 
 /// The engine parameters as the renderer owns them: the values, the buffer
 /// they are uploaded to, and the bindings that expose them.
 ///
-/// Built once when the renderer starts and refilled per frame through
+/// Built once when the renderer starts and refilled every frame through
 /// [`update`](EngineParameters::update). Every pass that reads engine
-/// parameters binds this one group, so all of them necessarily see the same
-/// fog and frame state.
+/// parameters binds this one group, so all of them see the same fog and frame
+/// state.
 #[derive(Debug)]
 pub struct EngineParameters {
     /// The values currently held in the buffer, kept CPU-side so `update` can
     /// rewrite the buffer.
     pub parameters_data: EngineParametersData,
-    /// Uniform buffer at binding 0 holding one [`EngineParametersData`].
+    /// Uniform buffer holding one [`EngineParametersData`], bound at binding 0
+    /// of the group below.
     pub parameters_uniform_buffer: wgpu::Buffer,
     /// Layout a pipeline declares for the engine group, so the one bind group
     /// below works for every pass that reads these values.
@@ -122,8 +126,8 @@ pub struct EngineParameters {
 }
 
 impl EngineParameters {
-    /// Creates the uniform buffer and its bindings that carry the engine
-    /// parameters to every shader, with the values zeroed.
+    /// Creates the uniform buffer, its layout and its bind group, all holding
+    /// the engine parameters at their zero values.
     ///
     /// A pipeline that reads engine parameters must be built against
     /// [`bind_group_layout`](EngineParameters::bind_group_layout), which is
@@ -169,12 +173,12 @@ impl EngineParameters {
         }
     }
 
-    /// Refills the buffer with a frame's values.
+    /// Refills the buffer with one frame's values.
     ///
-    /// The surface size arrives as pixels; `update_data` stores it in the form
-    /// the shaders read, and the write is queued before any command buffer
-    /// submitted afterwards, so every pass recorded later in the frame sees
-    /// the new values.
+    /// The surface size comes in as pixels, and `update_data` stores it in the
+    /// form the shaders read. The write is queued before any command buffer
+    /// submitted after it, so every pass recorded later in the frame sees the
+    /// new values.
     pub fn update(
         &mut self,
         queue: &wgpu::Queue,

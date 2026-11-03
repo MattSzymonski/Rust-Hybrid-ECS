@@ -9,19 +9,20 @@
 //!
 //! # Design
 //!
-//! This is the CPU counterpart of the wgpu backend's shader and render pass.
-//! What that backend's vertex shader does per vertex - scaling a unit quad by
-//! `size`, offsetting by `position`, mapping the result into the target - is
-//! done here once per sprite, in [`project_span`], because an axis-aligned
-//! rectangle needs no per-pixel interpolation at all.
+//! This is the CPU counterpart of `pill_2d_renderer`'s shader and render pass.
+//! That backend's vertex shader scales a unit quad by `size`, offsets it by
+//! `position` and maps the result into the target, once for every corner.
+//! Here the same mapping runs once per sprite, in [`project_span`], because an
+//! axis-aligned rectangle needs no interpolation between its corners.
 //!
-//! Sprites are opaque far more often than not, so the inner loop splits: an
-//! opaque sprite becomes a `fill` of packed pixels, and only a translucent one
-//! pays for unpack-blend-repack per pixel.
+//! An opaque sprite needs no blending: each row is filled with one packed
+//! colour. Only a translucent sprite pays for unpacking, blending and
+//! repacking every pixel.
 //!
 //! There is no depth buffer and no sorting. Sprites paint in the order the ECS
-//! reports them, which is archetype order - the same order the wgpu backend
-//! submits its instances in, so the two agree on overlap.
+//! reports them, which is archetype order. `pill_2d_renderer` submits its
+//! instances in that same order, so the two agree on which sprite covers
+//! another.
 
 // External crates
 use pill_engine::world::World;
@@ -36,12 +37,12 @@ use crate::framebuffer::{pack_rgb565, Framebuffer};
 
 /// Viewport background, as sRGB channel values in the 0.0-1.0 range.
 ///
-/// A dark desaturated blue-grey (roughly `#23282F`), the same colour the wgpu
-/// backend clears to, so a project looks the same on a display as on a window.
+/// The dark blue-grey `#23282F`, the same colour `pill_2d_renderer` clears to,
+/// so a project looks the same on a panel as in a window.
 ///
-/// No sRGB-to-linear conversion happens here, unlike in the wgpu backend: this
+/// Unlike `pill_2d_renderer`, nothing is converted to linear here. This
 /// renderer writes RGB565 straight to a display controller that expects sRGB
-/// values, so converting would wash the background out.
+/// values, and converting would wash the background out.
 const VIEWPORT_BACKGROUND_SRGB: [f32; 3] = [35.0 / 255.0, 40.0 / 255.0, 47.0 / 255.0];
 
 /// Alpha at or below which a sprite contributes nothing and is skipped.
@@ -60,13 +61,12 @@ const ALPHA_OPAQUE: f32 = 0.998;
 
 /// Draws sprite instances into a [`Framebuffer`] on the CPU.
 ///
-/// Holds only a reusable instance scratch buffer: the framebuffer is owned by
-/// the caller, which is what lets one rasterizer serve several targets.
+/// The framebuffer belongs to the caller, so one rasterizer can draw into
+/// several of them. Its only state is the list of instances it collects.
 #[derive(Default)]
 pub struct SpriteRasterizer {
-    /// Instances collected from the world, reused across frames.
-    ///
-    /// Kept as a field purely to avoid reallocating the vector every frame.
+    /// Instances collected from the world, kept between calls so the vector is
+    /// not allocated again every frame.
     instances: Vec<SpriteInstance>,
 }
 
@@ -80,9 +80,15 @@ impl SpriteRasterizer {
     ///
     /// `viewport` is the physical-pixel rectangle to draw inside, and
     /// `virtual_resolution` is the project coordinate space mapped onto it.
-    /// The whole framebuffer is cleared first - the wgpu backend clears its
-    /// entire target too, so a viewport smaller than the display leaves the
-    /// background colour around it rather than stale pixels.
+    /// The whole framebuffer is cleared first, just as `pill_2d_renderer`
+    /// clears its whole target, so a viewport smaller than the display leaves
+    /// background colour around it instead of stale pixels.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics when `virtual_resolution` has a zero, negative
+    /// or non-finite dimension. A release build clears the frame and draws
+    /// nothing.
     pub fn render_in_viewport_with_resolution(
         &mut self,
         world: &World,
@@ -116,10 +122,10 @@ impl SpriteRasterizer {
 
         // Step 4: Rasterize each sprite into the viewport.
         //
-        // The scale converts project units to physical pixels on each axis
-        // independently, which is what lets a fixed project resolution fill a
-        // display of a different aspect ratio - the same stretch the GPU
-        // viewport transform performs in the wgpu backend.
+        // Each axis has its own scale from project units to physical pixels.
+        // That is what lets a fixed project resolution fill a display of a
+        // different aspect ratio, the same stretch `pill_2d_renderer` gets from
+        // its GPU viewport transform.
         let scale_x = viewport.width as f32 / virtual_resolution.width;
         let scale_y = viewport.height as f32 / virtual_resolution.height;
         for instance in &self.instances {
@@ -142,9 +148,9 @@ fn draw_sprite(
 ) {
     let [red, green, blue, alpha] = instance.color;
 
-    // A fully transparent sprite contributes nothing; skip before any maths.
-    // Spelled as `is_nan || <=` rather than `!(alpha > ALPHA_TRANSPARENT)` so the
-    // NaN case is explicit: a NaN alpha must skip, not fall through.
+    // A fully transparent sprite draws nothing, so it is skipped before any
+    // maths. NaN is tested on its own line because every comparison with it is
+    // false; a NaN alpha has to skip, not fall through to the drawing code.
     if alpha.is_nan() || alpha <= ALPHA_TRANSPARENT {
         return;
     }
@@ -169,8 +175,8 @@ fn draw_sprite(
         return;
     };
 
-    // Opaque sprites take the fill path: one packed colour written straight
-    // into the row, with no read-modify-write per pixel.
+    // Opaque sprites take the fill path: each row gets one packed colour,
+    // with no per-pixel read-modify-write.
     if alpha >= ALPHA_OPAQUE {
         let pixel = pack_rgb565(red, green, blue);
         for y in y_start..y_end {
@@ -186,13 +192,13 @@ fn draw_sprite(
 
 /// Project one axis of a sprite into a clipped half-open pixel range.
 ///
-/// `origin` and `extent` are in project units; the result is in physical
-/// pixels, offset by `viewport_start` and clipped to `viewport_end`. Returns
-/// `None` when the sprite falls outside the viewport or rounds away to nothing.
+/// `origin` and `extent` are in project units, and `scale` converts them to
+/// physical pixels. The result is offset by `viewport_start` and clipped to
+/// `viewport_end`, as a half-open range. Returns `None` when the sprite falls
+/// outside the viewport or rounds away to nothing.
 ///
-/// Edges are floored rather than rounded, and the range is half-open, so
-/// neighbouring sprites that share an edge in project space tile without
-/// overlapping or leaving a seam.
+/// Edges are floored rather than rounded, so neighbouring sprites that share
+/// an edge in project space tile without overlapping or leaving a seam.
 fn project_span(
     origin: f32,
     extent: f32,
@@ -200,10 +206,9 @@ fn project_span(
     viewport_start: u32,
     viewport_end: u32,
 ) -> Option<(u32, u32)> {
-    // A non-finite or non-positive extent has no pixels to cover. Checking
-    // `extent > 0.0` also rejects NaN, which would otherwise survive the
-    // comparisons below and produce a garbage range - `is_nan || <= 0.0` spells
-    // that out rather than negating the positive test.
+    // A NaN or non-positive extent covers no pixels, and a non-finite origin
+    // or scale cannot give a pixel coordinate. NaN needs its own test: every
+    // comparison with it is false, so `extent <= 0.0` would let it through.
     if extent.is_nan() || extent <= 0.0 || !origin.is_finite() || !scale.is_finite() {
         return None;
     }
@@ -211,9 +216,10 @@ fn project_span(
     let start = origin * scale;
     let end = (origin + extent) * scale;
 
-    // Clip in float space before casting: a sprite far off-screen can exceed
-    // u32 range entirely, and `as` saturates rather than wrapping, which would
-    // silently clamp it to the viewport edge instead of discarding it.
+    // Clip in float space, before the cast to `u32`. A sprite far off-screen
+    // can fall outside `u32` range, and the cast saturates instead of rejecting
+    // it. Clipping here keeps the returned range inside the viewport and
+    // discards a sprite that starts past its end.
     let viewport_extent = viewport_end.saturating_sub(viewport_start) as f32;
     if end <= 0.0 || start >= viewport_extent {
         return None;
@@ -252,7 +258,7 @@ mod tests {
         pack_rgb565(red, green, blue)
     }
 
-    /// A unit-scale sprite lands on exactly the pixels it covers.
+    /// At unit scale a sprite covers exactly the pixels of its rectangle.
     #[test]
     fn sprite_covers_its_own_rectangle_only() {
         let mut framebuffer = Framebuffer::new(8, 8);
@@ -288,7 +294,8 @@ mod tests {
         framebuffer.clear(background());
         let viewport = RenderViewport::new(4, 4, 2, 2);
 
-        // Four project units wide, but the viewport is only two pixels.
+        // The sprite is four project units wide, but the viewport is only two
+        // pixels across.
         draw_sprite(
             &mut framebuffer,
             viewport,
@@ -404,15 +411,16 @@ mod tests {
         );
     }
 
-    /// A project space smaller than the viewport scales up to fill it.
+    /// A sprite drawn at twice the scale covers twice as many pixels on each
+    /// axis.
     #[test]
-    fn virtual_resolution_scales_sprites_onto_the_viewport() {
+    fn sprite_scaled_by_two_covers_four_by_four_pixels() {
         let mut framebuffer = Framebuffer::new(8, 8);
         framebuffer.clear(background());
         let viewport = RenderViewport::full(8, 8);
 
-        // Project space is 4x4 mapped onto 8x8, so scale is 2 on both axes:
-        // a 2x2 sprite at the origin must cover the top-left 4x4 pixels.
+        // Scale 2 on both axes: a 2x2 project-unit sprite at the origin must
+        // cover the top-left 4x4 pixels.
         draw_sprite(
             &mut framebuffer,
             viewport,

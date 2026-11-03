@@ -14,10 +14,13 @@
 //! # Design
 //!
 //! One type serves uploaded assets, offscreen passes, and depth because every
-//! consumer needs the same three handles, and the constructors differ only in
-//! how the texture is described. Every driver call is captured, so a refusal
-//! arrives as an error naming the resource instead of a panic through wgpu's
-//! uncaptured-error handler.
+//! consumer needs the same three handles. The three constructors differ only
+//! in how they describe the texture and its sampler; uploading an asset's
+//! texels is the one extra step. The calls wgpu validates - creating the
+//! texture, the upload and creating the sampler - go through
+//! `capturing_validation`, so a refusal it can wait for comes back as an error
+//! the caller reports against this resource, instead of a log line from the
+//! device's uncaptured-error handler.
 
 // Current crate
 use crate::{
@@ -25,25 +28,32 @@ use crate::{
     error::{capturing_validation, Result},
 };
 
-// --- Handle ---
+// =============================================================================
+// Handle
+// =============================================================================
 
 pill_core::define_slot_key!(RendererTextureHandle);
 
-// --- Texture ---
+// =============================================================================
+// RendererTexture
+// =============================================================================
 
 /// A texture together with the view and sampler that make it usable.
 ///
-/// One type covers every texture the renderer holds - uploaded assets,
-/// offscreen colour targets, and depth - so a single handle carries all three
-/// GPU objects a consumer needs: the view for binding, the sampler for
-/// reading, and the texture the other two belong to.
+/// One type covers every texture the renderer holds: uploaded assets,
+/// offscreen colour targets, and depth.
 pub struct RendererTexture {
+    /// The texture the view and the sampler belong to.
     pub texture: wgpu::Texture,
+    /// The view a pass binds the texture through.
     pub texture_view: wgpu::TextureView,
+    /// How a shader reads a texel: the filter and address modes in use.
     pub sampler: wgpu::Sampler,
-    /// How the view is shaped: a 2D image, or a cube. A texture slot declares
-    /// the same, and binding one to the other is refused by name rather than
-    /// left to wgpu's validation message.
+    /// The shape the view was created with: a 2D image, or a cube.
+    ///
+    /// A texture slot declares the same shape. Binding a texture to a slot
+    /// that wants the other shape is refused with both names, instead of
+    /// failing later in wgpu's own validation message.
     pub view_dimension: wgpu::TextureViewDimension,
 }
 
@@ -57,59 +67,61 @@ impl RendererTexture {
 
     /// Creates a texture, view, and sampler from decoded texels.
     ///
-    /// The bytes are laid out as the texture asset's are for `texture_type`,
-    /// and `name` labels the texture and the errors that mention it.
+    /// `texel_bytes` holds the texels the way the texture asset stores them
+    /// for `texture_type`. `name` labels the texture and appears in every
+    /// error that mentions it.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::RendererError::Other`] naming the asset when the
-    /// bytes do not match the size and type, or when the driver refuses the
-    /// texture, the upload, or the sampler.
+    /// Returns [`crate::error::RendererError::Other`] naming the asset when
+    /// `texel_bytes` does not match the declared size and type, or when the
+    /// driver refuses the texture, the upload, or the sampler.
     pub fn new_texture(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         name: Option<&str>,
-        rgba: &[u8],
+        texel_bytes: &[u8],
         width: u32,
         height: u32,
         texture_type: TextureType,
     ) -> Result<Self> {
-        // A buffer that does not match the declared extent makes
-        // `write_texture` fail validation, which would reach the
-        // uncaptured-error handler as a panic instead of naming the asset;
-        // check it here, where the name is still at hand.
-        let layers = texture_type.layer_count();
+        // Step 1: Check that the bytes match the declared size and type.
+        // `write_texture` fails validation when they do not, with a report
+        // about the copy itself; this check names the asset and gives the
+        // expected byte count instead.
+        let layer_count = texture_type.layer_count();
         let bytes_per_texel = texture_type.bytes_per_texel() as u32;
         let expected_bytes =
-            width as usize * height as usize * bytes_per_texel as usize * layers as usize;
-        if rgba.len() != expected_bytes {
+            width as usize * height as usize * bytes_per_texel as usize * layer_count as usize;
+        if texel_bytes.len() != expected_bytes {
             return Err(crate::error::RendererError::Other {
                 detail: format!(
                     "texture `{}` declares {width}x{height} {texture_type:?} but carries {} bytes (expected {expected_bytes})",
                     name.unwrap_or("<unnamed>"),
-                    rgba.len()
+                    texel_bytes.len()
                 ),
             });
         }
 
-        // Get size: a cubemap is six layers of one square face.
+        // Step 2: Describe the texture. A cubemap is six layers of one square
+        // face.
         let size = wgpu::Extent3d {
             width,
             height,
-            depth_or_array_layers: layers,
+            depth_or_array_layers: layer_count,
         };
 
         let format = match texture_type {
             TextureType::Color => wgpu::TextureFormat::Rgba8UnormSrgb,
             TextureType::Normal => wgpu::TextureFormat::Rgba8Unorm,
-            // Half floats: an environment's range runs well past 1.0, and this
-            // is the widest float format every backend filters.
+            // An environment's range runs well past 1.0, and a half float is
+            // the widest format every backend can filter.
             TextureType::Equirect | TextureType::Cubemap => wgpu::TextureFormat::Rgba16Float,
         };
 
-        // Create texture. Scoped: a driver refusal must arrive as a message
-        // naming the asset, not as a panic through the uncaptured-error
-        // handler.
+        // Step 3: Create the texture and upload its texels. Both calls run
+        // inside an error scope, so a refusal comes back as an error naming
+        // this texture instead of a log line from the device's error handler.
         let texture = capturing_validation(device, || {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: name,
@@ -132,7 +144,7 @@ impl RendererTexture {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                rgba,
+                texel_bytes,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(bytes_per_texel * width),
@@ -143,7 +155,8 @@ impl RendererTexture {
         })
         .map_err(|detail| texture_failure(name, "upload", detail))?;
 
-        // Create texture view: a cubemap's six layers are one cube to a shader.
+        // Step 4: Create the view. A cubemap's six layers are one cube to a
+        // shader.
         let view_dimension = match texture_type {
             TextureType::Cubemap => wgpu::TextureViewDimension::Cube,
             _ => wgpu::TextureViewDimension::D2,
@@ -153,12 +166,12 @@ impl RendererTexture {
             ..Default::default()
         });
 
-        // Create sampler. Filtering is consistent in both directions and the
-        // texture carries no mip levels, so nearest and linear only differ in
-        // how a minified texel is chosen; linear is what magnification uses.
-        // Images tile; a panorama wraps around its seam but stops at its poles;
-        // a cube's faces stop at their own edges, where the hardware crosses to
-        // the next face.
+        // Step 5: Create the sampler. Magnification and minification both
+        // filter linearly, so a texel is blended in either direction. The
+        // texture has no mip levels, so the mipmap filter never applies.
+        // Images tile in both directions; a panorama repeats around its seam
+        // and stops at its poles; a cube's faces stop at their own edges,
+        // where the hardware crosses to the next face.
         let (address_u, address_v) = match texture_type {
             TextureType::Equirect => (wgpu::AddressMode::Repeat, wgpu::AddressMode::ClampToEdge),
             TextureType::Cubemap => (
@@ -194,10 +207,10 @@ impl RendererTexture {
 
     /// An offscreen colour target: written by one pass, read by the next.
     ///
-    /// The caller picks the format for the same reason the surface format is
-    /// picked from what the adapter offers: a chain that ends in tonemapping has
-    /// to carry the range the scene produced between its steps, and a format
-    /// that cannot hold it clips the picture on the way through.
+    /// The caller picks the format because a chain that ends in tonemapping
+    /// has to carry the range the scene produced until its last step. A
+    /// format that cannot hold that range clips the picture on the way
+    /// through.
     ///
     /// # Errors
     ///
@@ -210,12 +223,15 @@ impl RendererTexture {
         height: u32,
         format: wgpu::TextureFormat,
     ) -> Result<Self> {
+        // Step 1: Describe the target. It is one layer, in the caller's
+        // format.
         let size = wgpu::Extent3d {
             width,
             height,
             depth_or_array_layers: 1,
         };
 
+        // Step 2: Create the texture.
         let texture = capturing_validation(device, || {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -233,11 +249,12 @@ impl RendererTexture {
             detail: format!("offscreen target `{label}` texture: {detail}"),
         })?;
 
+        // Step 3: Create the view the passes bind.
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Clamped and filtered: a post pass samples the frame it was handed at
-        // whatever uv its own shader asks for, and wrapping there would fold the
-        // opposite edge of the picture back into it.
+        // Step 4: Create the sampler. A post pass samples the frame it is
+        // handed at whatever uv its own shader asks for, and wrapping there
+        // would fold the opposite edge of the picture back into it.
         let sampler = capturing_validation(device, || {
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some(label),
@@ -265,7 +282,7 @@ impl RendererTexture {
     /// Creates the surface-sized depth buffer, with a sampler for reading it.
     ///
     /// Taking the surface configuration rather than a size keeps the buffer
-    /// and the swapchain in step: the renderer rebuilds the depth texture on
+    /// and the swapchain in step. The renderer rebuilds the depth texture on
     /// every resize by passing the new configuration through here.
     ///
     /// # Errors
@@ -277,13 +294,15 @@ impl RendererTexture {
         surface_configuration: &wgpu::SurfaceConfiguration,
         label: &str,
     ) -> Result<Self> {
+        // Step 1: Match the surface's size, so the buffer follows the
+        // swapchain through every resize.
         let size = wgpu::Extent3d {
-            // Depth texture needs to be the same size as window
             width: surface_configuration.width,
             height: surface_configuration.height,
             depth_or_array_layers: 1,
         };
 
+        // Step 2: Create the texture at the depth format.
         let texture = capturing_validation(device, || {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -301,12 +320,14 @@ impl RendererTexture {
             detail: format!("depth texture `{label}`: {detail}"),
         })?;
 
+        // Step 3: Create the view a pass binds.
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // A read sampler, not a comparison one: the pass path binds depth under
-        // a `TextureSampleType::Depth` layout, and wgpu refuses a comparison
-        // sampler for that. Clamped and nearest, so a lookup reads the depth of
-        // the texel under the uv rather than blending across a depth edge.
+        // Step 4: Create a sampler that reads depth values. It is a read
+        // sampler, not a comparison one: the depth slot's layout declares a
+        // non-filtering sampler, so a comparison sampler could not bind. A
+        // lookup reads the depth of the texel under the uv instead of blending
+        // across a depth edge.
         let sampler = capturing_validation(device, || {
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("depth_read_sampler"),
@@ -334,7 +355,12 @@ impl RendererTexture {
     }
 }
 
-/// Attribute a captured wgpu failure to the texture that caused it.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Turns a captured wgpu failure into an error naming the texture and the
+/// stage of its creation that failed.
 fn texture_failure(name: Option<&str>, stage: &str, detail: String) -> crate::error::RendererError {
     crate::error::RendererError::Other {
         detail: format!(

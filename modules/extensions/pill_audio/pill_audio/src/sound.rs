@@ -1,26 +1,27 @@
-//! The [`Sound`] asset: an audio file held as its undecoded bytes.
+//! The [`Sound`] asset: an audio file kept as its encoded bytes.
 //!
 //! # Responsibilities
 //!
 //! - Declares [`Sound`], stored in the
 //!   [`AssetManager`](pill_engine::AssetManager) and addressed by
 //!   `Handle<Sound>`.
-//! - Validates an audio file's format and reads it through the asset store
+//! - Checks a file's extension and reads its bytes through the asset store
 //!   ([`Sound::load`]), so a packed sound loads like one on disk.
 //! - Imports a sound through its `.meta` file
 //!   ([`ImportedAsset`](pill_engine::ImportedAsset), with
 //!   [`SoundImportSettings`]), which gives it a stable guid.
-//! - Hands the playback path a fresh decoder over those bytes.
+//! - Gives the playback code a new decoder over those bytes.
 //!
 //! # Design
 //!
 //! A sound is an asset rather than a resource because a world holds many of
-//! them and the type alone names none - the distinction `pill_engine` draws
-//! between [`Resource`](pill_engine::Resource) and [`Asset`](pill_engine::Asset).
+//! them, and the type alone does not say which one is meant - the distinction
+//! `pill_engine` draws between [`Resource`](pill_engine::Resource) and
+//! [`Asset`](pill_engine::Asset).
 //!
-//! The bytes stay encoded. A decoder is a one-shot cursor, so two entities
-//! playing one sound need two of them, and holding decoded PCM instead would
-//! cost roughly an order of magnitude more memory per sound.
+//! The bytes stay encoded. A decoder can be used for one playback only, so
+//! two entities that play one sound need two decoders. Holding decoded PCM
+//! instead would take roughly ten times more memory per sound.
 
 // External crates
 use pill_core::utils::AssetPathError;
@@ -31,22 +32,23 @@ use serde::{Deserialize, Serialize};
 // Constants
 // =============================================================================
 
-/// Audio container formats [`Sound::load`] accepts.
+/// Audio container formats [`Sound::load`] accepts, lowercase and without the
+/// leading dot.
 ///
-/// Checked before any bytes are read, so a typo in a path fails with the path
-/// and the allowed list rather than as a decoder error thousands of samples
-/// later.
+/// A path's extension is checked before any bytes are read. An unsupported
+/// extension is reported with the extension and this list, and a path with no
+/// extension is reported with the path, so neither reaches the decoder.
 pub const SUPPORTED_AUDIO_FORMATS: &[&str] = &["mp3", "wav", "ogg", "flac"];
 
 // =============================================================================
 // Sound
 // =============================================================================
 
-/// One loaded audio file, held as its undecoded bytes.
+/// One loaded audio file, kept as its encoded bytes.
 ///
 /// Stored in the [`AssetManager`](pill_engine::AssetManager) and addressed by
-/// `Handle<Sound>`; the bytes are decoded afresh for each playback, so two
-/// entities can play one sound at once.
+/// `Handle<Sound>`. A new decoder is built for each playback, so two entities
+/// can play the same sound at once.
 ///
 /// # Examples
 ///
@@ -59,23 +61,29 @@ pub const SUPPORTED_AUDIO_FORMATS: &[&str] = &["mp3", "wav", "ogg", "flac"];
 /// # }
 /// ```
 ///
-/// `Debug` prints the path and the byte count rather than the bytes.
+/// `Debug` prints the path and the byte count instead of the bytes.
 ///
 /// Mirrored to C# as `pill_audio.Sound`: a managed project imports one with
 /// `assets.Import<Sound>(path, ...)` and builds one with `Sound.Load` or
 /// `Sound.FromBytes`.
-// One asset column for the module DLL and every project that links this crate:
-// without the pinned name, a `Handle<Sound>` a project issued would address a
-// column the module's playback system never reads. Keep this string and
-// `metadata_type_name` in step: the `.meta` files name the type by the same
-// string, so moving the type does not orphan them.
+// Pins the asset type's shared name, so the module DLL and every project that
+// links this crate use one asset column: a `Handle<Sound>` issued by a project
+// has to find the column the module's playback system reads. The `.meta` files
+// record the same spelling, because `metadata_type_name` defaults to this
+// name, so keeping the two equal also stops a move of the type from orphaning
+// them.
 #[pill_engine::pill_mirror_object(asset, import, shared = "pill_audio::Sound")]
 pub struct Sound {
-    /// Path the bytes were read from, kept for diagnostics and reloading.
+    /// Path the bytes were read from, or the label [`Sound::from_bytes`] was
+    /// given.
     path: std::path::PathBuf,
-    /// The file's bytes, exactly as they were on disk.
+    /// The encoded bytes, as they were read or handed over.
     bytes: std::sync::Arc<[u8]>,
 }
+
+// Registers `Sound` with the type-erased asset columns. Every `AssetManager`
+// method needs it, so without this line a `Sound` could be loaded but never
+// stored or looked up through a `Handle<Sound>`.
 trait_type_map::impl_trait_accessible!(dyn Asset; Sound);
 
 impl std::fmt::Debug for Sound {
@@ -88,22 +96,89 @@ impl std::fmt::Debug for Sound {
     }
 }
 
-/// How a sound file is read, as stored in its `.meta` file.
-///
-/// Empty for now: a sound's bytes say everything about it. It exists so that
-/// sound files get metadata files, and with them a guid that survives a
-/// rename. A field added later must have a default, so existing files still
-/// read.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SoundImportSettings {}
+#[pill_engine::pill_mirror_impl]
+impl Sound {
+    /// Read an audio file into memory.
+    ///
+    /// The path is read through [`asset_store`](pill_engine::asset_store) like
+    /// every other asset: a relative path is looked up in a mounted pack first
+    /// (a shipping or web build), then below the project's `res` directory.
+    /// The extension is checked against [`SUPPORTED_AUDIO_FORMATS`] before any
+    /// bytes are read.
+    ///
+    /// # Errors
+    ///
+    /// [`SoundLoadError::InvalidPath`] when the extension is not supported or
+    /// no mount has the path, and [`SoundLoadError::Unreadable`] when the file
+    /// was found but could not be read.
+    #[pill_engine::pill_mirror_method]
+    pub fn load(path: &std::path::Path) -> Result<Self, SoundLoadError> {
+        // Step 1: Reject an unknown extension before any bytes are read.
+        let path = path.to_path_buf();
+        validate_format(&path).map_err(SoundLoadError::InvalidPath)?;
+
+        // Step 2: Read the bytes through the asset store. A path no mount has
+        // is reported as an invalid path; a file that is found but cannot be
+        // read keeps its IO error.
+        let bytes = pill_engine::asset_store::read(&path).map_err(|error| match error {
+            AssetLoadError::Read { path, source } => SoundLoadError::Unreadable { path, source },
+            // `read` fails only as not found or unreadable; anything else is
+            // reported as a path no mount could serve, too.
+            _ => SoundLoadError::InvalidPath(AssetPathError::InvalidPath {
+                path: path.display().to_string(),
+            }),
+        })?;
+
+        Ok(Self {
+            path,
+            bytes: bytes.into(),
+        })
+    }
+
+    /// Build a sound from bytes already in memory.
+    ///
+    /// The path is kept for diagnostics only and is not checked, which is what
+    /// an embedded asset (`include_bytes!`) or a cooked one needs.
+    #[pill_engine::pill_mirror_method]
+    pub fn from_bytes(path: &std::path::Path, bytes: Vec<u8>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            bytes: bytes.into(),
+        }
+    }
+
+    /// The path the bytes were read from, or the label [`Sound::from_bytes`]
+    /// was given.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// The encoded bytes, unchanged since they were read or handed over.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Build a decoder that plays this sound once.
+    ///
+    /// A decoder reads its bytes straight through, so it is used up by one
+    /// playback and a second entity playing the same sound needs its own. It
+    /// reuses the sound's bytes instead of copying them, since building one
+    /// clones the `Arc` - a reference-count bump that costs the same for a
+    /// large file as for a small one.
+    ///
+    /// Returns `None` when rodio cannot decode the bytes. [`Sound::load`]
+    /// cannot rule that out, because it checks only the extension.
+    pub fn decoder(&self) -> Option<rodio::Decoder<std::io::Cursor<ArcBytes>>> {
+        rodio::Decoder::new(std::io::Cursor::new(ArcBytes(self.bytes.clone()))).ok()
+    }
+}
 
 impl pill_engine::ImportedAsset for Sound {
     type ImportSettings = SoundImportSettings;
     const SOURCE_EXTENSIONS: &'static [&'static str] = SUPPORTED_AUDIO_FORMATS;
 
-    // No `metadata_type_name` override: the default prefers the shared name
-    // above, which is the pinned spelling a `.meta` file records.
+    // No `metadata_type_name` override: the default uses the shared name above,
+    // which is the spelling a `.meta` file records.
 
     fn import(
         name: &str,
@@ -119,16 +194,35 @@ impl pill_engine::ImportedAsset for Sound {
     }
 }
 
+// =============================================================================
+// SoundImportSettings
+// =============================================================================
+
+/// How a sound file is read, as stored in its `.meta` file.
+///
+/// It has no fields, because a sound's bytes say everything about the sound.
+/// The type exists so sound files get metadata files, and with them a guid
+/// that survives a rename of the file. A field added later must have a
+/// default, so files written before it existed still read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoundImportSettings {}
+
+// =============================================================================
+// SoundLoadError
+// =============================================================================
+
 /// Why [`Sound::load`] could not produce a sound.
 #[derive(Debug)]
 pub enum SoundLoadError {
-    /// No mount has the path, or its extension is not a supported format.
+    /// No mount holds the path, or its extension is not one of
+    /// [`SUPPORTED_AUDIO_FORMATS`].
     InvalidPath(pill_core::utils::AssetPathError),
-    /// The file exists but could not be read.
+    /// The file was found but could not be read.
     Unreadable {
-        /// The path that failed.
+        /// The path of the file that could not be read.
         path: std::path::PathBuf,
-        /// The underlying IO failure.
+        /// The error the read returned.
         source: std::io::Error,
     },
 }
@@ -153,81 +247,32 @@ impl std::error::Error for SoundLoadError {
     }
 }
 
-#[pill_engine::pill_mirror_impl]
-impl Sound {
-    /// Read an audio file into memory.
-    ///
-    /// The path is read through [`asset_store`](pill_engine::asset_store),
-    /// like every other asset: a relative path is found in a mounted pack
-    /// first (a shipping or web build), then below the project's `res`.
-    /// Its extension is checked against [`SUPPORTED_AUDIO_FORMATS`] before
-    /// anything is read, so an unsupported format is reported as such rather
-    /// than as a decode failure.
-    ///
-    /// # Errors
-    ///
-    /// [`SoundLoadError::InvalidPath`] when the format is not supported or no
-    /// mount has the path, and [`SoundLoadError::Unreadable`] when the file
-    /// was found but cannot be read.
-    #[pill_engine::pill_mirror_method]
-    pub fn load(path: &std::path::Path) -> Result<Self, SoundLoadError> {
-        let path = path.to_path_buf();
-        validate_format(&path).map_err(SoundLoadError::InvalidPath)?;
+// =============================================================================
+// ArcBytes
+// =============================================================================
 
-        let bytes = pill_engine::asset_store::read(&path).map_err(|error| match error {
-            AssetLoadError::Read { path, source } => SoundLoadError::Unreadable { path, source },
-            // `read` fails only as not found or unreadable; anything else is
-            // reported as a path no mount could serve, too.
-            _ => SoundLoadError::InvalidPath(AssetPathError::InvalidPath {
-                path: path.display().to_string(),
-            }),
-        })?;
+/// A byte buffer shared through an `Arc`, which a decoder can read as a slice.
+///
+/// This is what lets a decoder read the sound's existing bytes instead of
+/// copying them. Creating one clones the `Arc` (a reference-count bump, the
+/// same cost for a large file and a small one), and the cursor then reads
+/// through the shared buffer.
+pub struct ArcBytes(std::sync::Arc<[u8]>);
 
-        Ok(Self {
-            path,
-            bytes: bytes.into(),
-        })
-    }
-
-    /// Build a sound from bytes already in memory.
-    ///
-    /// For an embedded asset (`include_bytes!`) or one produced by a cooking
-    /// step, where there is no path to validate.
-    #[pill_engine::pill_mirror_method]
-    pub fn from_bytes(path: &std::path::Path, bytes: Vec<u8>) -> Self {
-        Self {
-            path: path.to_path_buf(),
-            bytes: bytes.into(),
-        }
-    }
-
-    /// The path these bytes were read from.
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-
-    /// The encoded bytes.
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// Build a fresh decoder over this sound's bytes.
-    ///
-    /// One decoder is one playback: it is consumed as a sink drains it, so a
-    /// second concurrent play needs a second call. The `Arc` is cloned rather
-    /// than the bytes, so the copy is a refcount bump regardless of file size.
-    ///
-    /// Returns `None` when the bytes are not a format rodio can decode - which
-    /// [`Sound::load`] cannot rule out, since it checks only the extension.
-    pub fn decoder(&self) -> Option<rodio::Decoder<std::io::Cursor<ArcBytes>>> {
-        rodio::Decoder::new(std::io::Cursor::new(ArcBytes(self.bytes.clone()))).ok()
+impl AsRef<[u8]> for ArcBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 
-/// Check that `path` names a format in [`SUPPORTED_AUDIO_FORMATS`].
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Check that the extension of `path` is one of [`SUPPORTED_AUDIO_FORMATS`].
 ///
-/// Only the extension is checked, never whether a file exists: a packed sound
-/// has no file on disk. Whether the path exists is answered by the read.
+/// Only the extension is checked, never whether the file exists, because a
+/// packed sound has no file on disk. Reading the path answers that question.
 pub(crate) fn validate_format(path: &std::path::Path) -> Result<(), AssetPathError> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some(extension) if SUPPORTED_AUDIO_FORMATS.contains(&extension) => Ok(()),
@@ -241,19 +286,6 @@ pub(crate) fn validate_format(path: &std::path::Path) -> Result<(), AssetPathErr
     }
 }
 
-/// `Arc<[u8]>` exposed as a byte slice, so a decoder reads the sound's shared
-/// bytes instead of a copy.
-///
-/// Building a decoder clones the `Arc` - a refcount bump regardless of file
-/// size - and the cursor then reads through the shared buffer.
-pub struct ArcBytes(std::sync::Arc<[u8]>);
-
-impl AsRef<[u8]> for ArcBytes {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -264,22 +296,22 @@ mod tests {
     use pill_engine::asset_store::AssetPack;
     use pill_engine::{AssetImport, AssetManager, ImportedAsset, MetadataPolicy, MetadataSource};
 
-    /// A missing file is reported as an invalid path, before any read.
+    /// A missing file is reported as an invalid path, not as a read failure.
     #[test]
     fn loading_a_missing_file_fails_with_the_path() {
         let error = Sound::load(std::path::Path::new("definitely/not/here.wav")).unwrap_err();
         assert!(matches!(error, SoundLoadError::InvalidPath(_)));
     }
 
-    /// An unsupported extension is rejected as a format problem rather than
-    /// surfacing later as a decode failure, even for a file that exists.
+    /// An unsupported extension is rejected as a format problem, not later as
+    /// a decode failure, even for a file that exists.
     #[test]
     fn loading_an_unsupported_format_is_rejected() {
-        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let existing = manifest.join("Cargo.toml");
-        assert!(existing.exists(), "the crate manifest should exist");
+        let crate_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest_path = crate_directory.join("Cargo.toml");
+        assert!(manifest_path.exists(), "the crate manifest should exist");
 
-        match Sound::load(&existing).unwrap_err() {
+        match Sound::load(&manifest_path).unwrap_err() {
             SoundLoadError::InvalidPath(pill_core::utils::AssetPathError::InvalidFormat {
                 extension,
                 ..
@@ -288,7 +320,7 @@ mod tests {
         }
     }
 
-    /// A file on the filesystem loads, given as an absolute path.
+    /// A file given as an absolute path is read from the filesystem.
     #[test]
     fn a_sound_on_disk_loads() {
         let directory =
@@ -302,14 +334,15 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    /// A sound that exists only in a mounted pack loads, which is how a
-    /// shipping or web build reads it: nothing is on disk at that path.
+    /// A sound that exists only in a mounted pack loads. That is how a
+    /// shipping or web build reads assets: no file is on disk at that path.
     #[test]
     fn a_sound_found_only_in_a_mounted_pack_loads() {
-        // The path is unique to this test, so the pack, which stays mounted
-        // for the rest of the process, cannot shadow another test's file.
+        // The path is unique to this test. The pack stays mounted for the rest
+        // of the process, so a shared path could hide another test's file.
         let packed_path = "pill_audio_pack_test/only_in_pack.wav";
-        let pack = AssetPack::parse(pack_of(&[(packed_path, &[9, 8, 7])])).expect("a valid pack");
+        let pack =
+            AssetPack::parse(asset_pack_bytes(&[(packed_path, &[9, 8, 7])])).expect("a valid pack");
         pill_engine::asset_store::mount_pack(pack);
 
         let path = std::path::Path::new(packed_path);
@@ -319,10 +352,11 @@ mod tests {
         assert_eq!(sound.path(), path);
     }
 
-    /// A version 1 pack of `files`, in the layout `asset_store` documents.
-    fn pack_of(files: &[(&str, &[u8])]) -> Vec<u8> {
-        let index_length: usize = files.iter().map(|(path, _)| 4 + path.len() + 16).sum();
-        let mut offset = (8 + 4 + 4 + index_length) as u64;
+    /// Build a version 1 asset pack holding `files`, in the layout
+    /// [`asset_store`](pill_engine::asset_store) documents.
+    fn asset_pack_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let index_length_bytes: usize = files.iter().map(|(path, _)| 4 + path.len() + 16).sum();
+        let mut byte_offset = (8 + 4 + 4 + index_length_bytes) as u64;
         let mut pack = Vec::new();
         pack.extend_from_slice(pill_engine::asset_store::ASSET_PACK_MAGIC);
         pack.extend_from_slice(&pill_engine::asset_store::ASSET_PACK_VERSION.to_le_bytes());
@@ -330,9 +364,9 @@ mod tests {
         for (path, bytes) in files {
             pack.extend_from_slice(&(path.len() as u32).to_le_bytes());
             pack.extend_from_slice(path.as_bytes());
-            pack.extend_from_slice(&offset.to_le_bytes());
+            pack.extend_from_slice(&byte_offset.to_le_bytes());
             pack.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            offset += bytes.len() as u64;
+            byte_offset += bytes.len() as u64;
         }
         for (_, bytes) in files {
             pack.extend_from_slice(bytes);
@@ -340,12 +374,12 @@ mod tests {
         pack
     }
 
-    /// Importing a sound with `CreateIfMissing` writes its `.meta`; a later
-    /// run reads the same guid back, and importing again in the same run (a
-    /// project reload) returns the loaded handle.
+    /// Importing a sound with `CreateIfMissing` writes its `.meta` file. A
+    /// later run reads the same guid from it, and importing again in the same
+    /// run (a project reload) returns the handle that is already loaded.
     ///
-    /// The only test in this crate that mounts a directory, so it needs no
-    /// lock against another test replacing the mount.
+    /// This is the only test in the crate that mounts a directory, so it needs
+    /// no lock against another test replacing the mount.
     #[test]
     fn importing_a_sound_writes_its_metadata_and_keeps_its_guid() {
         let root = std::env::temp_dir().join(format!("pill_audio_import_{}", std::process::id()));
@@ -370,25 +404,25 @@ mod tests {
         assert_eq!(reloaded.handle, created.handle);
 
         let mut second_run = AssetManager::new();
-        let read = second_run.import(request()).expect("the metadata exists");
-        assert_eq!(read.metadata, MetadataSource::ReadFromFile);
-        assert_eq!(read.guid, created.guid);
+        let read_from_file = second_run.import(request()).expect("the metadata exists");
+        assert_eq!(read_from_file.metadata, MetadataSource::ReadFromFile);
+        assert_eq!(read_from_file.guid, created.guid);
 
-        // The same file, by extension through the registry the module's
-        // registration fills, without naming `Sound`.
+        // The same file again, reached by its extension through the registry
+        // the module fills, with no mention of `Sound`.
         let mut world = pill_engine::World::new();
         world.register_imported_asset::<Sound>();
-        let registry = world.get_resource::<pill_engine::ImportRegistry>().unwrap();
-        let erased = registry
+        let import_registry = world.get_resource::<pill_engine::ImportRegistry>().unwrap();
+        let erased_import = import_registry
             .import(
                 &mut second_run,
                 std::path::Path::new("sounds/click.mp3"),
                 MetadataPolicy::ReadIfPresent,
             )
             .expect("`.mp3` maps to Sound");
-        assert_eq!(erased.type_name, "pill_audio::Sound");
-        assert!(erased.previously_loaded());
-        assert_eq!(erased.guid, created.guid);
+        assert_eq!(erased_import.type_name, "pill_audio::Sound");
+        assert!(erased_import.previously_loaded());
+        assert_eq!(erased_import.guid, created.guid);
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -404,8 +438,8 @@ mod tests {
         );
     }
 
-    /// Bytes already in memory skip path validation, which is what an embedded
-    /// or cooked asset needs.
+    /// Bytes already in memory skip path validation. An embedded or cooked
+    /// asset needs exactly that.
     #[test]
     fn sound_can_be_built_from_bytes() {
         let sound = Sound::from_bytes(std::path::Path::new("embedded.wav"), vec![1, 2, 3]);
@@ -413,8 +447,8 @@ mod tests {
         assert_eq!(sound.path(), std::path::Path::new("embedded.wav"));
     }
 
-    /// A sound is an asset, so it is stored many-per-type and reached by
-    /// handle, with its name as the store's second index.
+    /// A sound is an asset, so a manager holds many of them and each is
+    /// reached by handle, with its name as a second way to look it up.
     #[test]
     fn sounds_are_stored_as_assets() {
         let mut assets = AssetManager::new();
@@ -433,8 +467,8 @@ mod tests {
         assert_eq!(assets.len::<Sound>(), 1);
     }
 
-    /// Unloading a sound leaves a source's handle resolving to nothing, so no
-    /// component has to clear itself.
+    /// Removing a sound leaves a handle to it resolving to nothing, so a
+    /// component that holds one does not have to be told about the removal.
     #[test]
     fn unloading_a_sound_leaves_its_handle_unresolvable() {
         let mut assets = AssetManager::new();

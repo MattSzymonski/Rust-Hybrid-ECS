@@ -1,16 +1,34 @@
-//! The Assets tab's tiles, their menu and the asset dialog.
+//! The Assets tab's tiles: what a tile draws, the menus it offers and the
+//! create and rename dialog.
 //!
 //! # Responsibilities
 //!
-//! - `asset_tile` and `asset_icon`: one file's tile, its icon, its two-line name and its drag source.
-//! - `asset_menu_items`: the tile's context menu.
-//! - `asset_dialog_window`: the create and rename dialogs.
+//! - [`asset_tile`]: one grid tile - its preview or icon, its wrapped name, the
+//!   highlight behind a selected or hovered tile, and the clicks, menu and
+//!   drags it answers.
+//! - [`asset_icon`], [`asset_type_icon`] and [`tile_name_job`]: the icon a row
+//!   draws and the layout of its name.
+//! - [`asset_menu_items`] and [`asset_container_menu`]: the menus a file tile
+//!   and a container offer.
+//! - [`asset_dialog_window`]: the create and rename dialogs.
+//! - [`remember_tile_rect`], [`remember_tree_row_rect`] and
+//!   [`remember_pane_rect`]: the rectangles a test suite aims a drag or a
+//!   right-click at.
+//! - [`AssetTileWrites`]: the handles a tile writes through.
+//! - The tile metrics: the cell padding, the name band, the icon inset, the
+//!   highlight's corner radius, the name's row count and the preview's badge.
+//!
+//! # Design
 //!
 //! The globs below are absolute paths, so a patch crate resolves them too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
+
+// =============================================================================
+// Constants
+// =============================================================================
 
 /// The horizontal padding inside a tile's cell, in points.
 pub const ASSETS_TILE_GAP: f32 = 8.0;
@@ -24,20 +42,27 @@ pub const ASSETS_TILE_LABEL_GAP: f32 = 2.0;
 /// The inset between a tile's cell edge and its icon, in points.
 pub const ASSETS_TILE_ICON_INSET: f32 = 6.0;
 
-/// The corner radius of a selected or hovered tile's wash, in points.
+/// The corner radius of the highlight behind a selected or hovered tile, in
+/// points.
 pub const ASSETS_TILE_CORNER_RADIUS: f32 = 4.0;
 
-/// The rows a tile's name may wrap to before it elides, like Unity's two.
+/// The rows a tile's name may wrap to before it gets an ellipsis; Unity's tiles
+/// use two.
 pub const ASSETS_TILE_LABEL_ROWS: usize = 2;
 
-/// The side of the type icon a finished preview keeps in its bottom-left
-/// corner, in points.
+/// The width and height of the type icon a finished preview keeps in its
+/// bottom-left corner, in points.
 pub const ASSETS_TILE_BADGE_SIZE: f32 = 14.0;
 
+// =============================================================================
+// Types
+// =============================================================================
+
 /// The handles a grid tile writes through: the selection a click moves, the
-/// dialog a menu entry opens, the commands it queues and the overlay regions
-/// an open menu marks as the UI's. One bundle keeps `asset_tile`'s signature
-/// readable and within clippy's argument budget.
+/// dialog a menu entry opens, the commands it queues, the regions an open menu
+/// marks as the UI's, the path a drag out reports and the previews it draws.
+/// One bundle keeps [`asset_tile`]'s signature short enough for clippy's
+/// argument budget.
 pub struct AssetTileWrites<'a> {
     /// The shared selection the tile's clicks move.
     pub selection: &'a mut EditorSelection,
@@ -47,17 +72,22 @@ pub struct AssetTileWrites<'a> {
     pub pending: &'a mut PendingEditorCommands,
     /// The regions an open menu marks so a click inside is never a scene pick.
     pub overlay_regions: &'a mut Vec<ShellRect>,
-    /// The asset path a drag handed to the OS: the shell
-    /// reports it, the executable starts the OLE drag.
+    /// The asset path a drag just took out of the window: the shell writes it
+    /// once and the executable starts the system's drag with it.
     pub drag_out: &'a mut Option<String>,
-    /// The asset tiles' previews: a tile draws the texture it finds and keeps
-    /// its icon otherwise, and records itself as drawn so the executable asks
-    /// only for what is on screen.
+    /// The preview state of every tile. A tile draws a texture when one exists
+    /// and its type icon otherwise, and records itself as drawn so the
+    /// executable asks only for the previews that are on screen.
     pub previews: &'a mut pill_editor_core::session::PreviewStates,
 }
 
-/// Log a tile's rectangle once per placement, so a suite can drag a file onto
-/// a drop target (an Inspector asset row, a folder) without reading pixels.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Logs a tile's rectangle each time it moves, so a test suite can drag a file
+/// onto a drop target (an Inspector asset row, a folder) without reading
+/// pixels.
 pub fn remember_tile_rect(browser: &mut ProjectBrowser, path: &str, rect: egui::Rect) {
     let corners = [rect.min.x, rect.min.y, rect.max.x, rect.max.y];
     if let Some((_, logged)) = browser
@@ -83,8 +113,8 @@ pub fn remember_tile_rect(browser: &mut ProjectBrowser, path: &str, rect: egui::
     );
 }
 
-/// Log a folder tree row's rectangle once per placement, keyed by the folder,
-/// so a suite can right-click the row without reading pixels.
+/// Logs a folder tree row's rectangle each time it moves, keyed by the folder,
+/// so a test suite can right-click the row without reading pixels.
 pub fn remember_tree_row_rect(browser: &mut ProjectBrowser, path: &str, rect: egui::Rect) {
     let corners = [rect.min.x, rect.min.y, rect.max.x, rect.max.y];
     if let Some((_, logged)) = browser
@@ -110,8 +140,8 @@ pub fn remember_tree_row_rect(browser: &mut ProjectBrowser, path: &str, rect: eg
     );
 }
 
-/// Log the grid pane's rectangle once per placement: the area a right-click on
-/// empty space opens the container menu in.
+/// Logs the grid pane's rectangle each time it moves: the area where a
+/// right-click on empty space opens the container menu.
 pub fn remember_pane_rect(browser: &mut ProjectBrowser, rect: egui::Rect) {
     let corners = [rect.min.x, rect.min.y, rect.max.x, rect.max.y];
     if browser.pane_rect == Some(corners) {
@@ -128,9 +158,9 @@ pub fn remember_pane_rect(browser: &mut ProjectBrowser, rect: egui::Rect) {
     );
 }
 
-/// One grid tile: the row's duotone icon and its name, the selection and
-/// hover washes, the double-click that opens a folder, the drag a tile
-/// carries and the menu the right-click opens.
+/// Draws one grid tile: its preview or type icon, its wrapped name, the
+/// highlight behind a selected or hovered tile, and the clicks, menu and drags
+/// it answers. A double click opens a folder, or a scene in the editor.
 pub fn asset_tile(
     ui: &mut egui::Ui,
     row: &AssetListing,
@@ -139,6 +169,8 @@ pub fn asset_tile(
     snapshot: &EditorSnapshot,
     writes: &mut AssetTileWrites<'_>,
 ) {
+    // Step 1: claim the cell, remember its rectangle, and paint the highlight
+    // a selected or hovered tile gets.
     let (rect, response) = ui.allocate_exact_size(cell, egui::Sense::click_and_drag());
     let key = row.key();
     remember_tile_rect(browser, &key, rect);
@@ -153,6 +185,8 @@ pub fn asset_tile(
         ui.painter()
             .rect_filled(rect, ASSETS_TILE_CORNER_RADIUS, fill);
     }
+    // Step 2: draw the preview image, or the type icon alone, then the name
+    // under it.
     let icon_side = (cell.x - ASSETS_TILE_GAP - ASSETS_TILE_ICON_INSET * 2.0).max(8.0);
     let icon_rect = egui::Rect::from_min_size(
         egui::pos2(
@@ -166,9 +200,9 @@ pub fn asset_tile(
     } else {
         visuals.text_color()
     };
-    // A finished preview takes the tile's picture area; the type icon stays in
-    // the picture's bottom-left corner, so a person still reads what the file
-    // is. Until one exists the icon alone stands.
+    // A finished preview fills the tile's picture area. The type icon stays in
+    // the preview's bottom-left corner, so a person still sees what the file
+    // is; until a preview exists, the icon alone is drawn.
     let preview = writes.previews.ready(&key).cloned();
     writes.previews.push_visible(&key);
     match preview {
@@ -204,15 +238,16 @@ pub fn asset_tile(
     );
     ui.painter()
         .galley(label_origin, label, visuals.text_color());
+    // Step 3: answer the clicks - select the row, open a folder, open a scene.
     if response.clicked() {
         select_asset(writes.selection, &key);
     }
     if response.double_clicked() && browser::is_folder(row) {
         browser.open(&key);
     }
-    // A scene tile opens on the second click, the way a document does
-    // everywhere else; the command is the File menu's, so both reach one
-    // implementation.
+    // A scene tile opens on the second click, like a document elsewhere. It
+    // queues the File menu's Open Scene command, so a click and the menu share
+    // one implementation.
     if response.double_clicked()
         && !browser::is_folder(row)
         && row.path.to_ascii_lowercase().ends_with(".scene")
@@ -222,12 +257,13 @@ pub fn asset_tile(
         };
         writes.pending.push(vec![command]);
     }
+    // Step 4: select the tile on a right-click, then open its menu. A folder
+    // tile offers the container's menu; a file tile offers rename and delete. A
+    // module's file opens no menu at all: its contents may not be written, and
+    // it is no folder to open.
     if response.secondary_clicked() {
         select_asset(writes.selection, &key);
     }
-    // A folder offers what a container is for; a file offers the two edits the
-    // panel has for an asset. A module's resource opens no menu at all: nothing
-    // in it may be written, and it is no folder to open either.
     if browser::is_folder(row) || !row.read_only {
         context_menu(
             "assets tile",
@@ -255,9 +291,10 @@ pub fn asset_tile(
             },
         );
     }
-    // Folders are drop targets (a tile lands inside one) and every tile is a
-    // drag source, so a file moves by dragging it onto a folder. A module's
-    // folder takes nothing: nothing may be written into it.
+    // Step 5: carry the tile. A folder tile is a drop target, and every writable
+    // tile is a drag source, so a file moves by dragging its tile onto a
+    // folder. A module's folder takes no drop, because nothing may be written
+    // into it.
     if browser::is_folder(row) {
         if let Some(dragged) = response.dnd_release_payload::<String>() {
             if !row.read_only {
@@ -267,15 +304,15 @@ pub fn asset_tile(
             }
         }
     }
-    // A module's resource is not a drag source either: the payload names a
-    // key no command may act on.
+    // A module's file is not a drag source either: the payload would name a
+    // path that no file command may change.
     if !row.read_only {
         response.dnd_set_drag_payload(key.clone());
     }
-    // A file dragged past the window edge is the OS's: the
-    // tile reports the path once, and the executable starts an OLE drag with
-    // it. The pointer's release never arrives once it leaves the windows, so
-    // "button still down, no pointer position" is what a drag out looks like.
+    // A file dragged past the window edge leaves the editor: the tile reports
+    // its path once and the executable starts the system drag. Once the pointer
+    // has left the window its release never arrives, so a drag out looks like
+    // "button still down, no pointer position".
     if response.dragged() && writes.drag_out.is_none() && !browser::is_folder(row) {
         let left_window =
             ui.input(|input| input.pointer.any_down() && input.pointer.hover_pos().is_none());
@@ -291,8 +328,8 @@ pub fn asset_tile(
     response.on_hover_text(key.as_str());
 }
 
-/// The icon a row's tile draws: folders, the project's asset types by their
-/// last type-name segment, and plain files by their extension.
+/// Returns the icon a row's tile draws: a folder icon, an asset type's icon by
+/// its last type-name segment, or a plain file's icon by its extension.
 pub fn asset_icon(row: &AssetListing) -> icons::Icon {
     if browser::is_folder(row) {
         return icons::Icon::Folder;
@@ -314,9 +351,8 @@ pub fn asset_icon(row: &AssetListing) -> icons::Icon {
     }
 }
 
-/// The icon an asset type draws, by its last type-name segment: what a tile
-/// of that type shows, and what an Inspector asset row puts before the
-/// asset's name.
+/// Returns the icon for an asset type, matched by its last type-name segment. A
+/// tile of that type and an Inspector asset row both draw it.
 pub fn asset_type_icon(asset_type: &str) -> icons::Icon {
     match asset_type.rsplit("::").next().unwrap_or(asset_type) {
         "Mesh" => icons::Icon::Cube,
@@ -328,9 +364,10 @@ pub fn asset_type_icon(asset_type: &str) -> icons::Icon {
     }
 }
 
-/// A tile name's layout job: wrapped to two rows at `width` points, broken
-/// inside a word when it must (a long extension has no spaces), with an
-/// ellipsis where the second row runs out - Unity's tile captions.
+/// Returns the layout job for a tile's name: wrapped to
+/// [`ASSETS_TILE_LABEL_ROWS`] rows at `width` points, broken inside a word when
+/// it must (a long file name has no spaces), with an ellipsis where the last
+/// row runs out.
 pub fn tile_name_job(
     text: &str,
     font: &egui::FontId,
@@ -344,10 +381,9 @@ pub fn tile_name_job(
     job
 }
 
-/// The menu a file tile offers: renaming it and deleting it, the two things
-/// the panel does to an asset. Creating and opening a folder belong to a
-/// container's menu ([`asset_container_menu`]), so a file's menu never carries
-/// them.
+/// Draws the menu a file tile offers: rename and delete. Creating an asset and
+/// opening a folder belong to a container's menu ([`asset_container_menu`]), so
+/// a file's menu never carries them.
 pub fn asset_menu_items(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
@@ -377,12 +413,12 @@ pub fn asset_menu_items(
     }
 }
 
-/// The menu a container offers - the grid's empty strip and a folder tile: the
-/// two things a folder is for, making an asset in it and opening it in the
-/// platform's file manager.
+/// Draws the menu a container offers: the grid's empty strip and a folder tile.
+/// A folder can have an asset created in it and can be opened in the system's
+/// file manager.
 ///
-/// A module's folder is opened but not written into: its resources are shown
-/// and inspected, never created beside.
+/// A module's folder can be opened but not written into: its resources are
+/// shown and inspected, never created beside.
 pub fn asset_container_menu(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
@@ -424,18 +460,18 @@ pub fn asset_container_menu(
     }
 }
 
-/// The create or rename dialog, drawn over the dock while one is open: the
-/// create dialog lists the live standalone types and a name field, the
-/// rename dialog the current path and the new name; their buttons run the
-/// shared submit helpers, which queue the recorded batch and close the
-/// dialog.
+/// Draws the create or rename dialog over the dock while one is open.
+///
+/// The create dialog lists the live standalone types and a name field; the
+/// rename dialog shows the current path and the new name. Their buttons run the
+/// shared submit helpers, which queue the recorded batch and close the dialog.
 ///
 /// Public because [`run_frame`]'s generated hot patch calls it through the
 /// package path.
 ///
-/// Its rectangle joins the frame's overlay regions while it is open:
-/// a click on a dialog button or in its name field is the dialog's, never a
-/// scene pick behind it.
+/// While the dialog is open, its rectangle joins the frame's overlay regions, so
+/// a click on a button or in its name field belongs to the dialog and never
+/// becomes a scene pick behind it.
 pub fn asset_dialog_window(
     context: &egui::Context,
     dialog: &mut Option<AssetDialog>,
@@ -446,8 +482,10 @@ pub fn asset_dialog_window(
     let Some(current) = dialog.as_ref() else {
         return;
     };
-    // An existing name asks first: the same window gains a warning and the
-    // keep-the-guid checkbox, and its submit reads Replace.
+    // Step 1: work out the title from the collision, then draw the dialog's
+    // body and its buttons. An existing name is asked about first: the same
+    // window adds a warning and the keep-the-guid checkbox, and its submit
+    // button reads Replace.
     let collision = assets::create_collision(current, &snapshot.standalone_types, &snapshot.assets);
     let (title, submit_label) = match current {
         AssetDialog::Create { .. } if collision.is_some() => ("Replace Asset", "Replace"),
@@ -517,11 +555,12 @@ pub fn asset_dialog_window(
                                 .color(style::warning()),
                         );
                         let mut keep = overwrite.unwrap_or(true);
-                        // Confirming the warning is the answer to it. The
-                        // checkbox only moves the choice away from the
-                        // keep-the-guid default; leaving `overwrite` unset
-                        // would send the drain the same unanswered refusal
-                        // the warning exists to avoid.
+                        // Showing the warning is also the answer to it: the
+                        // keep-the-guid default goes into `overwrite` at once.
+                        // The checkbox only moves the choice away from that
+                        // default, and an unset `overwrite` would make the
+                        // queued create fail with "already exists" - the
+                        // refusal the warning exists to avoid.
                         if overwrite.is_none() {
                             *overwrite = Some(keep);
                         }
@@ -549,8 +588,8 @@ pub fn asset_dialog_window(
                 }
             }
             ui.separator();
-            // Stock buttons, the submit first so the action the dialog exists
-            // for is the one the pointer meets first.
+            // Stock buttons, submit first, so the action the dialog exists for
+            // is the first the pointer meets.
             ui.horizontal(|ui| {
                 if ui.button(submit_label).clicked() {
                     submit = true;
@@ -560,9 +599,11 @@ pub fn asset_dialog_window(
                 }
             });
         });
+    // Step 2: claim the window's rectangle, so a press inside it is the UI's.
     if let Some(window) = window {
         claim_pointer(window.response.rect, overlay_regions);
     }
+    // Step 3: run the answer the buttons recorded.
     if submit {
         match dialog.as_ref() {
             Some(AssetDialog::Create { .. }) => {

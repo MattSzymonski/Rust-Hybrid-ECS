@@ -195,8 +195,8 @@ pub fn save_scene(
                     .push(format!("{id}: {component_name} has no field layout"));
                 continue;
             };
-            let values = match world.read_component_fields(entity, &component_name) {
-                Ok(values) => values,
+            let field_values = match world.read_component_fields(entity, &component_name) {
+                Ok(field_values) => field_values,
                 Err(_) => {
                     report
                         .skipped_components
@@ -205,10 +205,10 @@ pub fn save_scene(
                 }
             };
             let mut fields = BTreeMap::new();
-            for (descriptor, value) in layout.iter().zip(values.iter()) {
-                match saved_field(world, assets, registry, value) {
-                    Some(encoded) => {
-                        fields.insert(descriptor.name.to_string(), encoded);
+            for (descriptor, field_value) in layout.iter().zip(field_values.iter()) {
+                match encode_field_value(world, assets, registry, field_value) {
+                    Some(encoded_value) => {
+                        fields.insert(descriptor.name.to_string(), encoded_value);
                     }
                     None => report
                         .skipped_fields
@@ -230,7 +230,7 @@ pub fn save_scene(
 /// `Text` is `None` for the same reason `List` is: the field layer cannot
 /// write a heap-backed field, so a value stored here would never reach a
 /// component on load.
-fn saved_field(
+fn encode_field_value(
     world: &World,
     assets: &AssetManager,
     registry: &ImportRegistry,
@@ -255,11 +255,11 @@ fn saved_field(
         FieldValue::Isize(value) => Some(serde_json::json!(value)),
         FieldValue::Bool(value) => Some(serde_json::json!(value)),
         FieldValue::Array(elements) => {
-            let mut encoded = Vec::with_capacity(elements.len());
+            let mut encoded_elements = Vec::with_capacity(elements.len());
             for element in elements {
-                encoded.push(saved_field(world, assets, registry, element)?);
+                encoded_elements.push(encode_field_value(world, assets, registry, element)?);
             }
-            Some(serde_json::Value::Array(encoded))
+            Some(serde_json::Value::Array(encoded_elements))
         }
         FieldValue::Opaque { type_tag, bytes } => Some(serde_json::json!({
             "opaque": hex_of(bytes),
@@ -331,18 +331,22 @@ fn bytes_of(text: &str) -> Option<Vec<u8>> {
 ///   because its id repeats or is already taken.
 /// - [`skipped_fields`](Self::skipped_fields): one field of an attached
 ///   component could not be written, by `<entity>: <component>.<field>`.
+/// - [`unresolved_references`](Self::unresolved_references): an entity
+///   reference was not written into its field, because the id names no entity
+///   of the document or the field refused the write.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SceneLoad {
     /// Entities created.
     pub entities: usize,
-    /// Components attached.
+    /// Components attached, or already present on the entity.
     pub components: usize,
     /// Component type names the world does not know.
     pub unknown_components: Vec<String>,
     /// Components that failed to attach although the type is registered, each
     /// entry naming the entity, the component and the reason.
     pub failed_components: Vec<String>,
-    /// References naming an entity the document did not create.
+    /// Entity references that were not written: the id names no entity of the
+    /// document, or the field refused the write.
     pub unresolved_references: usize,
     /// Document entries whose entity was not created, with the reason.
     pub skipped_entities: Vec<String>,
@@ -367,7 +371,8 @@ pub fn load_scene(
         .get_resource::<ImportRegistry>()
         .cloned()
         .unwrap_or_default();
-    let mut created: Vec<(Entity, &SceneEntity)> = Vec::with_capacity(document.entities.len());
+    let mut created_entities: Vec<(Entity, &SceneEntity)> =
+        Vec::with_capacity(document.entities.len());
     let mut seen = HashSet::with_capacity(document.entities.len());
     for scene_entity in &document.entities {
         if !seen.insert(scene_entity.id) {
@@ -384,7 +389,7 @@ pub fn load_scene(
         {
             Ok(entity) => {
                 report.entities += 1;
-                created.push((entity, scene_entity));
+                created_entities.push((entity, scene_entity));
             }
             Err(_) => report
                 .skipped_entities
@@ -393,34 +398,38 @@ pub fn load_scene(
     }
 
     // Step 1: attach every component, so its fields can be written into it.
-    let mut fresh: HashSet<(Entity, String)> = HashSet::new();
-    for (entity, scene_entity) in &created {
-        for name in scene_entity.components.keys() {
-            match attach_component(engine, *entity, name) {
+    let mut freshly_attached: HashSet<(Entity, String)> = HashSet::new();
+    for (entity, scene_entity) in &created_entities {
+        for component_name in scene_entity.components.keys() {
+            match attach_component(engine, *entity, component_name) {
                 Ok(attached) => {
                     report.components += 1;
                     if attached {
-                        fresh.insert((*entity, name.clone()));
+                        freshly_attached.insert((*entity, component_name.clone()));
                     }
                 }
-                Err(AttachError::UnknownType) => report.unknown_components.push(name.clone()),
-                Err(failure) => report
-                    .failed_components
-                    .push(format!("{entity}: {name} could not attach: {failure}")),
+                Err(AttachError::UnknownType) => {
+                    report.unknown_components.push(component_name.clone());
+                }
+                Err(failure) => report.failed_components.push(format!(
+                    "{entity}: {component_name} could not attach: {failure}"
+                )),
             }
         }
     }
 
     // Step 2: write every field; entity references wait for their entity.
     let mut links = SavedEntityLinks::default();
-    for (entity, scene_entity) in &created {
-        for (name, fields) in &scene_entity.components {
+    for (entity, scene_entity) in &created_entities {
+        for (component_name, fields) in &scene_entity.components {
             // The tags are copied out first: the field loop below writes
             // through `engine.world_mut()`, which cannot run while the layout
             // borrows the world.
             let tags: BTreeMap<String, &'static str> = {
                 let world = engine.world();
-                let Some(component_id) = world.resolve_entity_component_id(*entity, name) else {
+                let Some(component_id) =
+                    world.resolve_entity_component_id(*entity, component_name)
+                else {
                     continue;
                 };
                 let Some(layout) = world.component_field_layout(component_id) else {
@@ -434,9 +443,9 @@ pub fn load_scene(
             // A freshly attached component is a zero-filled image, and a zeroed
             // reference names slot 0 - a real entity or asset. Every reference
             // the document does not name is therefore cleared explicitly.
-            if fresh.contains(&(*entity, name.clone())) {
-                for (field, tag) in &tags {
-                    if fields.contains_key(field.as_str()) {
+            if freshly_attached.contains(&(*entity, component_name.clone())) {
+                for (field_name, tag) in &tags {
+                    if fields.contains_key(field_name.as_str()) {
                         continue;
                     }
                     if !is_handle_tag(tag) && tag != &"entity" {
@@ -444,59 +453,61 @@ pub fn load_scene(
                     }
                     if let Err(error) = engine.world_mut().write_component_field(
                         *entity,
-                        name,
-                        field,
+                        component_name,
+                        field_name,
                         cleared_field(tag),
                     ) {
-                        report
-                            .skipped_fields
-                            .push(format!("{entity}: {name}.{field} was refused: {error}"));
+                        report.skipped_fields.push(format!(
+                            "{entity}: {component_name}.{field_name} was refused: {error}"
+                        ));
                     }
                 }
             }
-            for (field, encoded) in fields {
-                let Some(tag) = tags.get(field.as_str()).copied() else {
-                    report
-                        .skipped_fields
-                        .push(format!("{entity}: {name}.{field} is not in the layout"));
+            for (field_name, encoded_value) in fields {
+                let Some(tag) = tags.get(field_name.as_str()).copied() else {
+                    report.skipped_fields.push(format!(
+                        "{entity}: {component_name}.{field_name} is not in the layout"
+                    ));
                     continue;
                 };
-                let value = match decoded_field(tag, encoded) {
-                    Ok(Decoded::Value(value)) => value,
-                    Ok(Decoded::Asset(saved)) => {
+                let field_value = match decoded_field(tag, encoded_value) {
+                    Ok(DecodedField::Plain(field_value)) => field_value,
+                    Ok(DecodedField::Asset(saved_asset_reference)) => {
                         let assets = engine
                             .world_mut()
                             .get_resource_mut::<AssetManager>()
                             .expect("a world with an asset manager");
-                        restore_asset_reference(assets, database, &registry, &saved)
+                        restore_asset_reference(assets, database, &registry, &saved_asset_reference)
                     }
-                    Ok(Decoded::Entity(id)) => {
-                        links.push(*entity, name, field, id);
+                    Ok(DecodedField::Entity(id)) => {
+                        links.push(*entity, component_name, field_name, id);
                         continue;
                     }
-                    Ok(Decoded::Cleared) => cleared_field(tag),
+                    Ok(DecodedField::Cleared) => cleared_field(tag),
                     Err(reason) => {
-                        report
-                            .skipped_fields
-                            .push(format!("{entity}: {name}.{field} {reason}"));
+                        report.skipped_fields.push(format!(
+                            "{entity}: {component_name}.{field_name} {reason}"
+                        ));
                         continue;
                     }
                 };
-                if let Err(error) = engine
-                    .world_mut()
-                    .write_component_field(*entity, name, field, value)
-                {
-                    report
-                        .skipped_fields
-                        .push(format!("{entity}: {name}.{field} was refused: {error}"));
+                if let Err(error) = engine.world_mut().write_component_field(
+                    *entity,
+                    component_name,
+                    field_name,
+                    field_value,
+                ) {
+                    report.skipped_fields.push(format!(
+                        "{entity}: {component_name}.{field_name} was refused: {error}"
+                    ));
                 }
             }
         }
     }
 
     // Step 3: the entity references, once every entity of the document exists.
-    let (_, unresolved) = links.resolve(engine.world_mut());
-    report.unresolved_references = unresolved.len();
+    let (_, unresolved_links) = links.resolve(engine.world_mut());
+    report.unresolved_references = unresolved_links.len();
     report
 }
 
@@ -519,18 +530,22 @@ impl std::fmt::Display for AttachError {
     }
 }
 
-/// Attach `name` with its defaults to `entity`, reporting whether the image was
-/// freshly attached.
+/// Attach `component_name` with its defaults to `entity`, reporting whether the
+/// image was freshly attached.
 ///
 /// # Errors
 ///
 /// [`AttachError::UnknownType`] when the world knows no component of that
 /// name; [`AttachError::Failed`] when it knows the type but the image cannot be
 /// built or the add command is refused, carrying that layer's own reason.
-fn attach_component(engine: &mut Engine, entity: Entity, name: &str) -> Result<bool, AttachError> {
+fn attach_component(
+    engine: &mut Engine,
+    entity: Entity,
+    component_name: &str,
+) -> Result<bool, AttachError> {
     if engine
         .world()
-        .resolve_entity_component_id(entity, name)
+        .resolve_entity_component_id(entity, component_name)
         .is_some()
     {
         // Already attached: the document listed it twice, or the entity was
@@ -542,21 +557,21 @@ fn attach_component(engine: &mut Engine, entity: Entity, name: &str) -> Result<b
     // separate answers: only the first is an unknown component.
     let component_id = engine
         .world()
-        .resolve_component_id_by_name_any(name)
+        .resolve_component_id_by_name_any(component_name)
         .map_err(|_| AttachError::UnknownType)?
         .ok_or(AttachError::UnknownType)?;
-    let bytes = engine
+    let component_image = engine
         .world()
-        .build_component_image(name, &[])
+        .build_component_image(component_name, &[])
         .map_err(|error| AttachError::Failed(error.to_string()))?;
     engine.queue_deferred_commands(move |_world, queue| {
         if component_id.is_native_storage() {
             queue.add_component_adder_to_entity(
                 entity,
-                Box::new(ByteComponentAdder::new(component_id, bytes)),
+                Box::new(ByteComponentAdder::new(component_id, component_image)),
             );
         } else {
-            queue.add_descriptor_component_to_entity(entity, component_id, bytes);
+            queue.add_descriptor_component_to_entity(entity, component_id, component_image);
         }
     });
     engine
@@ -575,9 +590,9 @@ fn join_command_errors(errors: Vec<CommandError>) -> String {
 }
 
 /// What one document value means for the field it is written into.
-enum Decoded {
-    /// A value to write as it is.
-    Value(FieldValue),
+enum DecodedField {
+    /// A plain value: written into the field as it is.
+    Plain(FieldValue),
     /// An asset reference to resolve against the world's assets.
     Asset(SavedAssetReference),
     /// An entity reference to resolve after every entity exists.
@@ -591,73 +606,91 @@ enum Decoded {
 /// `Err` carries the reason the value cannot be written, which the load report
 /// names next to the field: a shape a field cannot read, or a number that does
 /// not fit the field's type.
-fn decoded_field(tag: &'static str, encoded: &serde_json::Value) -> Result<Decoded, String> {
-    if encoded.is_null() {
+fn decoded_field(
+    tag: &'static str,
+    document_value: &serde_json::Value,
+) -> Result<DecodedField, String> {
+    if document_value.is_null() {
         return if is_handle_tag(tag) || tag == "entity" {
-            Ok(Decoded::Cleared)
+            Ok(DecodedField::Cleared)
         } else {
             Err("does not read".to_owned())
         };
     }
     if is_handle_tag(tag) {
-        let saved: SavedAssetReference =
-            serde_json::from_value(encoded.clone()).map_err(|_| "does not read".to_owned())?;
-        return Ok(Decoded::Asset(saved));
+        let saved_asset_reference: SavedAssetReference =
+            serde_json::from_value(document_value.clone())
+                .map_err(|_| "does not read".to_owned())?;
+        return Ok(DecodedField::Asset(saved_asset_reference));
     }
     if tag == "entity" {
-        return encoded
+        return document_value
             .as_str()
             .and_then(EntityId::parse)
-            .map(Decoded::Entity)
+            .map(DecodedField::Entity)
             .ok_or_else(|| "does not read".to_owned());
     }
     if let Some(element_tag) = tag.strip_prefix("array:") {
         // The element tag is a prefix of the field's own `'static` tag, so the
-        // same decoder applies; a handle or `entity` element is not reached,
-        // because the field layer reads such an array as opaque bytes.
-        let elements = encoded
+        // same decoder applies to every element. A handle element decodes to an
+        // asset reference and an `entity` element to an entity id, and this
+        // branch takes only plain values, so it refuses an array of either.
+        let elements = document_value
             .as_array()
             .ok_or_else(|| "does not read".to_owned())?;
-        let mut values = Vec::with_capacity(elements.len());
+        let mut field_values = Vec::with_capacity(elements.len());
         for element in elements {
             match decoded_field(element_tag, element)? {
-                Decoded::Value(value) => values.push(value),
+                DecodedField::Plain(element_value) => field_values.push(element_value),
                 _ => return Err("does not read".to_owned()),
             }
         }
-        return Ok(Decoded::Value(FieldValue::Array(values)));
+        return Ok(DecodedField::Plain(FieldValue::Array(field_values)));
     }
-    let value = match tag {
-        "f32" => FieldValue::F32(narrowed_f32(tag, encoded)?),
-        "f64" => FieldValue::F64(encoded.as_f64().ok_or_else(|| "does not read".to_owned())?),
-        "i8" => FieldValue::I8(narrowed_signed(tag, encoded)?),
-        "i16" => FieldValue::I16(narrowed_signed(tag, encoded)?),
-        "i32" => FieldValue::I32(narrowed_signed(tag, encoded)?),
-        "i64" => FieldValue::I64(encoded.as_i64().ok_or_else(|| "does not read".to_owned())?),
-        "u8" => FieldValue::U8(narrowed_unsigned(tag, encoded)?),
-        "u16" => FieldValue::U16(narrowed_unsigned(tag, encoded)?),
-        "u32" => FieldValue::U32(narrowed_unsigned(tag, encoded)?),
-        "u64" => FieldValue::U64(encoded.as_u64().ok_or_else(|| "does not read".to_owned())?),
-        "usize" => FieldValue::Usize(narrowed_unsigned(tag, encoded)?),
-        "isize" => FieldValue::Isize(narrowed_signed(tag, encoded)?),
+    let field_value = match tag {
+        "f32" => FieldValue::F32(narrow_to_f32(tag, document_value)?),
+        "f64" => FieldValue::F64(
+            document_value
+                .as_f64()
+                .ok_or_else(|| "does not read".to_owned())?,
+        ),
+        "i8" => FieldValue::I8(narrow_to_signed(tag, document_value)?),
+        "i16" => FieldValue::I16(narrow_to_signed(tag, document_value)?),
+        "i32" => FieldValue::I32(narrow_to_signed(tag, document_value)?),
+        "i64" => FieldValue::I64(
+            document_value
+                .as_i64()
+                .ok_or_else(|| "does not read".to_owned())?,
+        ),
+        "u8" => FieldValue::U8(narrow_to_unsigned(tag, document_value)?),
+        "u16" => FieldValue::U16(narrow_to_unsigned(tag, document_value)?),
+        "u32" => FieldValue::U32(narrow_to_unsigned(tag, document_value)?),
+        "u64" => FieldValue::U64(
+            document_value
+                .as_u64()
+                .ok_or_else(|| "does not read".to_owned())?,
+        ),
+        "usize" => FieldValue::Usize(narrow_to_unsigned(tag, document_value)?),
+        "isize" => FieldValue::Isize(narrow_to_signed(tag, document_value)?),
         "bool" => FieldValue::Bool(
-            encoded
+            document_value
                 .as_bool()
                 .ok_or_else(|| "does not read".to_owned())?,
         ),
         "string" => FieldValue::Text(
-            encoded
+            document_value
                 .as_str()
                 .ok_or_else(|| "does not read".to_owned())?
                 .to_owned(),
         ),
         _ => {
-            return Ok(Decoded::Value(
-                opaque_field(tag, encoded).ok_or_else(|| "does not read".to_owned())?,
+            return Ok(DecodedField::Plain(
+                decode_opaque_field(tag, document_value)
+                    .ok_or_else(|| "does not read".to_owned())?,
             ));
         }
     };
-    Ok(Decoded::Value(value))
+    Ok(DecodedField::Plain(field_value))
 }
 
 /// A whole number narrowed to a signed field's own type.
@@ -665,48 +698,55 @@ fn decoded_field(tag: &'static str, encoded: &serde_json::Value) -> Result<Decod
 /// A value that does not fit is refused rather than cast: `as i8` would wrap 300
 /// into 44 and leave the world holding a number the document never said. The
 /// report names the refused value.
-fn narrowed_signed<T: TryFrom<i64>>(
+fn narrow_to_signed<T: TryFrom<i64>>(
     tag: &'static str,
-    encoded: &serde_json::Value,
+    document_value: &serde_json::Value,
 ) -> Result<T, String> {
-    let number = encoded.as_i64().ok_or_else(|| "does not read".to_owned())?;
-    T::try_from(number).map_err(|_| format!("{encoded} does not fit a `{tag}`"))
+    let number = document_value
+        .as_i64()
+        .ok_or_else(|| "does not read".to_owned())?;
+    T::try_from(number).map_err(|_| format!("{document_value} does not fit a `{tag}`"))
 }
 
 /// A whole number narrowed to an unsigned field's own type, refusing a
 /// negative one and one that does not fit.
-fn narrowed_unsigned<T: TryFrom<u64>>(
+fn narrow_to_unsigned<T: TryFrom<u64>>(
     tag: &'static str,
-    encoded: &serde_json::Value,
+    document_value: &serde_json::Value,
 ) -> Result<T, String> {
-    let number = encoded
+    let number = document_value
         .as_u64()
-        .ok_or_else(|| format!("{encoded} does not fit a `{tag}`"))?;
-    T::try_from(number).map_err(|_| format!("{encoded} does not fit a `{tag}`"))
+        .ok_or_else(|| format!("{document_value} does not fit a `{tag}`"))?;
+    T::try_from(number).map_err(|_| format!("{document_value} does not fit a `{tag}`"))
 }
 
 /// A number narrowed to an `f32`, refusing the one cast that changes its kind:
 /// a finite value whose magnitude exceeds `f32::MAX` became `inf`. Rounding
 /// within range is what the type is for, so it is not a refusal.
-fn narrowed_f32(tag: &'static str, encoded: &serde_json::Value) -> Result<f32, String> {
-    let number = encoded.as_f64().ok_or_else(|| "does not read".to_owned())?;
+fn narrow_to_f32(tag: &'static str, document_value: &serde_json::Value) -> Result<f32, String> {
+    let number = document_value
+        .as_f64()
+        .ok_or_else(|| "does not read".to_owned())?;
     let narrowed = number as f32;
     if number.is_finite() && !narrowed.is_finite() {
-        return Err(format!("{encoded} does not fit a `{tag}`"));
+        return Err(format!("{document_value} does not fit a `{tag}`"));
     }
     Ok(narrowed)
 }
 
 /// The raw bytes an opaque field was written from, tagged with the layout's own
 /// `'static` tag: a document cannot introduce a tag the layout does not have.
-fn opaque_field(tag: &'static str, encoded: &serde_json::Value) -> Option<FieldValue> {
-    let object = encoded.as_object()?;
-    if object.get("tag")?.as_str()? != tag {
+fn decode_opaque_field(
+    tag: &'static str,
+    document_value: &serde_json::Value,
+) -> Option<FieldValue> {
+    let encoded_object = document_value.as_object()?;
+    if encoded_object.get("tag")?.as_str()? != tag {
         return None;
     }
     Some(FieldValue::Opaque {
         type_tag: tag,
-        bytes: bytes_of(object.get("opaque")?.as_str()?)?,
+        bytes: bytes_of(encoded_object.get("opaque")?.as_str()?)?,
     })
 }
 
@@ -800,19 +840,19 @@ mod tests {
     /// A scratch `res` directory, mounted while the test holds the lock, and an
     /// engine with the note type and the actor component registered.
     struct Scratch {
-        root: PathBuf,
+        root_directory: PathBuf,
         engine: Engine,
-        _mounted: std::sync::MutexGuard<'static, ()>,
+        _mount_guard: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Scratch {
         fn new(label: &str) -> Self {
-            let mounted = mounted_directory_test_lock();
-            let root =
+            let mount_guard = mounted_directory_test_lock();
+            let root_directory =
                 std::env::temp_dir().join(format!("pill-scene-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            mount_directory(&root);
+            let _ = std::fs::remove_dir_all(&root_directory);
+            std::fs::create_dir_all(&root_directory).unwrap();
+            mount_directory(&root_directory);
             let mut engine = Engine::new();
             let world = engine.world_mut();
             world.register_imported_asset::<Note>();
@@ -824,23 +864,23 @@ mod tests {
                 Note::metadata_type_name(),
             );
             Self {
-                root,
+                root_directory,
                 engine,
-                _mounted: mounted,
+                _mount_guard: mount_guard,
             }
         }
 
-        fn write(&self, relative: &str, text: &str) {
-            let path = self.root.join(relative);
+        fn write(&self, relative_path: &str, text: &str) {
+            let path = self.root_directory.join(relative_path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
 
-        /// A note at `relative` whose sidecar carries `guid`.
-        fn note(&self, relative: &str, guid: &str) {
-            self.write(relative, "a note");
+        /// A note at `relative_path` whose sidecar carries `guid`.
+        fn note(&self, relative_path: &str, guid: &str) {
+            self.write(relative_path, "a note");
             self.write(
-                &format!("{relative}.meta"),
+                &format!("{relative_path}.meta"),
                 &format!(
                     r#"{{"format_version": 1, "asset_type": "pill_engine::scene::tests::Note", "guid": "{guid}", "settings": null}}"#
                 ),
@@ -856,17 +896,17 @@ mod tests {
         }
 
         fn database(&self) -> AssetDatabase {
-            AssetDatabase::from_directory(&self.root, &self.registry())
+            AssetDatabase::from_directory(&self.root_directory, &self.registry())
         }
     }
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.root_directory);
         }
     }
 
-    fn actor_component() -> String {
+    fn actor_component_name() -> String {
         ComponentRegistry::registered_name::<Actor>()
     }
 
@@ -876,13 +916,13 @@ mod tests {
     #[test]
     fn a_scene_round_trips_through_a_file() {
         // Step 1: the world that saves.
-        let (reference_guid, bytes, target_id) = {
+        let (reference_guid, scene_file_bytes, target_id) = {
             let mut scratch = Scratch::new("round-trip");
             scratch.note("notes/a.note", NOTE_GUID);
             let registry = scratch.registry();
             let database = scratch.database();
             let world = scratch.engine.world_mut();
-            let loaded = {
+            let note_import = {
                 let assets = world.get_resource_mut::<AssetManager>().unwrap();
                 registry
                     .load_by_guid(
@@ -900,7 +940,7 @@ mod tests {
                 .with_id(EntityId::from_name("hero"))
                 .with(Actor {
                     speed: 2.5,
-                    note: Handle::from_raw(loaded.index, loaded.generation),
+                    note: Handle::from_raw(note_import.index, note_import.generation),
                     target,
                 })
                 .build()
@@ -921,9 +961,9 @@ mod tests {
             let actor = document
                 .entities
                 .iter()
-                .find(|entity| entity.components.contains_key(&actor_component()))
+                .find(|entity| entity.components.contains_key(&actor_component_name()))
                 .expect("the actor is in the document");
-            let fields = &actor.components[&actor_component()];
+            let fields = &actor.components[&actor_component_name()];
             assert_eq!(fields["speed"], serde_json::json!(2.5));
             assert_eq!(
                 fields["note"],
@@ -933,17 +973,18 @@ mod tests {
 
             // Step 2: the file, written where a project keeps its scenes.
             let guid = AssetGuid::random().expect("a fresh guid");
-            let bytes = crate::asset_standalone::render_standalone::<Scene>(guid, &document)
-                .expect("the scene renders");
+            let scene_file_bytes =
+                crate::asset_standalone::render_standalone::<Scene>(guid, &document)
+                    .expect("the scene renders");
             assert!(!document.entities.is_empty());
-            (guid, bytes, target_id)
+            (guid, scene_file_bytes, target_id)
         };
 
-        // Step 3: an empty engine with the same project reads the file back,
-        // through the registry that knows the extension.
+        // Step 3: an empty engine with the same project reads the file back as
+        // the scene type the project registered.
         let mut scratch = Scratch::new("load");
         scratch.note("notes/a.note", NOTE_GUID);
-        scratch.write("scenes/a.scene", &String::from_utf8(bytes).unwrap());
+        scratch.write("scenes/a.scene", &String::from_utf8(scene_file_bytes).unwrap());
         let database = scratch.database();
         // Relative, because an asset's name is its path below the project's
         // asset directory.
@@ -954,16 +995,16 @@ mod tests {
                 .world_mut()
                 .get_resource_mut::<AssetManager>()
                 .unwrap();
-            let imported = assets
+            let scene_import = assets
                 .import_standalone::<Scene>(path)
                 .expect("the scene file loads");
             assert_eq!(
-                imported.guid,
+                scene_import.guid,
                 Some(reference_guid),
                 "the file keeps the guid it was saved with"
             );
             assets
-                .get(imported.handle)
+                .get(scene_import.handle)
                 .expect("the scene asset is live")
                 .clone()
         };
@@ -1092,7 +1133,7 @@ mod tests {
         #[repr(C)]
         #[derive(Debug, Clone, Copy)]
         struct Plain {
-            value: u32,
+            number: u32,
         }
         impl Component for Plain {}
 
@@ -1106,7 +1147,7 @@ mod tests {
                 note: Handle::default(),
                 target: Entity::NULL,
             })
-            .with(Plain { value: 7 })
+            .with(Plain { number: 7 })
             .build()
             .expect("entity builds");
         assert_eq!(
@@ -1124,15 +1165,18 @@ mod tests {
 
         // The document holds the component the field layer can write, and only
         // that one.
-        let written = &document.entities[0].components;
+        let written_components = &document.entities[0].components;
         assert_eq!(report.components, 1, "one of the two is written");
-        assert!(written.contains_key(&actor_component()), "{written:?}");
+        assert!(
+            written_components.contains_key(&actor_component_name()),
+            "{written_components:?}"
+        );
 
         // The other one is reported, by entity and name, with the reason.
-        let plain = ComponentRegistry::registered_name::<Plain>();
+        let plain_component_name = ComponentRegistry::registered_name::<Plain>();
         assert_eq!(
             report.skipped_components,
-            vec![format!("{id}: {plain} has no field layout")],
+            vec![format!("{id}: {plain_component_name} has no field layout")],
             "the component the save left out is named"
         );
     }
@@ -1146,7 +1190,7 @@ mod tests {
         let mut fields = BTreeMap::new();
         fields.insert("speed".to_string(), serde_json::json!(1.25));
         let mut components = BTreeMap::new();
-        components.insert(actor_component(), fields);
+        components.insert(actor_component_name(), fields);
         components.insert(
             "demo::Missing".to_string(),
             BTreeMap::from([("x".to_string(), serde_json::json!(1.0))]),
@@ -1175,8 +1219,8 @@ mod tests {
     ///
     /// The two failures mean different things to whoever reads the report: an
     /// unknown name is a missing registration, while an unbuildable image is a
-    /// registered type the field layer cannot create - a heap-backed or
-    /// layout-less component.
+    /// registered type the field layer cannot build, which in practice means a
+    /// component with no field layout.
     #[test]
     fn a_registered_component_that_cannot_be_attached_is_reported_with_its_reason() {
         #[repr(C)]

@@ -1,21 +1,22 @@
-//! The system that turns the world into the frame the renderer draws.
+//! Fills the frame the renderer draws, once per update.
 //!
 //! # Responsibilities
 //!
-//! - Collect the frame once per update: the chosen camera, every drawable the
-//!   world offers, and the clock the shaders read ([`rendering_system`]).
-//! - Resolve the game's pipeline into plain passes, dropping disabled and
-//!   stale entries and calling out a chain whose surface pass breaks the
-//!   contract.
+//! - Collect the frame from the world each update: the camera to draw through,
+//!   every drawable the world offers, and the clock the shaders read
+//!   ([`rendering_system`]).
+//! - Turn the game's pipeline into plain passes. Entries that are switched off
+//!   or point at dead assets are left out, and a chain whose surface pass
+//!   breaks the renderer's contract is reported in the log.
 //!
 //! # Design
 //!
-//! The frame's types - [`RenderFrame`], [`RenderInstance`], [`ResolvedPass`] -
-//! are plain data in `pill_renderer_api`, re-exported here; filling them is
-//! renderer behaviour and lives in this module, where a renderer reload can
-//! replace it. What the system decides rather than reads: the camera choosing
-//! among several, the pipeline resolving into plain passes, the drawables
-//! resolving into instances that carry their own sort key.
+//! [`RenderFrame`], [`RenderInstance`] and [`ResolvedPass`] are plain data
+//! from `pill_renderer_api`, re-exported here. Filling them is renderer
+//! behaviour, so it lives in this module, where a renderer reload can replace
+//! it. The system also makes choices the world data does not spell out: which
+//! of several cameras to use, what each pipeline pass turns into, and the draw
+//! order each instance carries.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -36,32 +37,88 @@ use crate::{
     resources::RenderingManager,
 };
 
-/// The frame's typed key for `handle`: the asset layer's packing, in the type
-/// the contract names a key with.
-fn frame_key<T: pill_engine::Asset>(handle: Handle<T>) -> AssetKey {
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Which producer filled `RenderFrame.ui` on the last frame, so the log states
+/// a change once instead of on every frame.
+///
+/// This is module state rather than a frame field: the frame is plain data
+/// shared through the renderer contract, while the producer is a fact about
+/// this renderer's world. A reload gives the module fresh statics, so the next
+/// frame logs which producer is feeding it again.
+static UI_PRODUCER: AtomicU8 = AtomicU8::new(PRODUCER_UNSET);
+
+/// Whether this renderer image has already asked the UI producer to send its
+/// textures again.
+///
+/// A reload gives the module a fresh image with fresh statics, so the flag
+/// answers "has this image asked yet?". It starts false, so the first frame
+/// that finds a UI slot asks for every texture again.
+static UI_TEXTURES_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// No frame has been filled since this image started.
+const PRODUCER_UNSET: u8 = 0;
+/// The game's own egui UI.
+const PRODUCER_GAME: u8 = 1;
+/// No producer: the frame carries no UI.
+const PRODUCER_NONE: u8 = 2;
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/// The resources [`rendering_system`] reads besides the frame, the assets and
+/// the rendering manager.
+///
+/// They share one parameter because a system function takes at most seven.
+/// They include the world's only UI producer: the slot a game's own UI
+/// publishes into ([`UiFrameSlot`](pill_ui_frame::UiFrameSlot)). A world that
+/// never installed a slot has no UI.
+type RenderingExtras<'w> = (
+    Res<'w, pill_engine::Time>,
+    Res<'w, pill_renderer_api::SurfaceCameras>,
+    ResMut<'w, pill_engine::DebugDraw>,
+    Res<'w, pill_renderer_api::SelectionOutlines>,
+    ResMut<'w, pill_renderer_api::PickRequests>,
+    ResMut<'w, pill_ui_frame::UiFrameSlot>,
+    ResMut<'w, pill_renderer_api::PreviewRequests>,
+);
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Builds the key the frame uses for `handle`.
+///
+/// The asset layer packs the handle into a number; the renderer contract
+/// carries that value as an [`AssetKey`].
+fn frame_asset_key<T: pill_engine::Asset>(handle: Handle<T>) -> AssetKey {
     AssetKey(asset_key(handle))
 }
 
-/// The chain a frame should run, read from the pipeline the game set.
+/// Returns the pass chain this frame should run, read from the pipeline the
+/// game selected.
 ///
-/// Passes the chain leaves out are dropped, handles that name no live asset are
-/// dropped with them, and the rest are ordered by their `order` field; the
-/// pipeline's own order breaks ties, so a game lists its passes in the order it
-/// wants and only an inserted pass needs an explicit `order`.
+/// The result keeps only the passes that are switched on and whose handle still
+/// resolves, and sorts them by their `order` value. Passes with equal `order`
+/// keep the pipeline's own order, so a game lists its passes in the order it
+/// wants and only a pass inserted later needs an explicit `order`.
 ///
-/// Two switches can leave a pass out, and both are the game's own choice rather
-/// than a fault: the entry's `enabled`, which is this chain's, and the pass
-/// asset's, which every chain naming it sees.
+/// A pass can be switched off in two places, and both are the game's own
+/// choice rather than a fault: on the pipeline entry, which affects only this
+/// chain, or on the pass asset itself, which affects every chain that names it.
 fn resolve_passes(
     assets: &pill_engine::AssetManager,
     manager: Option<&RenderingManager>,
 ) -> Vec<ResolvedPass> {
     let handle = manager.and_then(|manager| manager.pipeline());
     let Some(pipeline) = handle.and_then(|handle| assets.get(handle)) else {
-        // A handle that used to resolve but no longer does is a pipeline that
-        // died under the game, not one that was never set: the built-in pass
-        // keeps the frame drawing either way, and naming the case keeps the
-        // log from reading as if the game never asked for a chain.
+        // The handle exists but no longer resolves: the pipeline asset was
+        // removed after the game selected it. That earns a warning, because
+        // the game asked for a chain and lost it. A game that never selected a
+        // pipeline is not news. Both fall back to the built-in pass.
         if handle.is_some() {
             warn!(
                 target: pill_core::telemetry::telemetry_target::RENDERING,
@@ -71,42 +128,42 @@ fn resolve_passes(
         return vec![ResolvedPass::builtin()];
     };
 
-    let mut stale_handles = 0usize;
+    let mut stale_pass_handle_count = 0usize;
     let mut passes = Vec::with_capacity(pipeline.passes.len());
     for entry in &pipeline.passes {
-        // This chain leaves the pass out: the game's choice, not a fault.
+        // The pipeline entry is switched off, so this chain leaves the pass out.
         if !entry.enabled {
             continue;
         }
         let Some(pass) = assets.get(entry.pass) else {
-            stale_handles += 1;
+            stale_pass_handle_count += 1;
             continue;
         };
-        // A disabled pass is the game's own choice too, and it is the one every
-        // chain naming the pass sees.
+        // The pass asset itself is switched off, which hides it from every
+        // chain that names it.
         if !pass.enabled {
             continue;
         }
 
-        // A pass that names a material draws with it: the material's shader,
-        // parameters and textures, under whatever the pass sets itself. Folded
-        // in here, where the chain is resolved, so the renderer sees one plain
-        // pass and a material edit moves the asset revision that re-resolves it.
-        let mut shader = (pass.shader != Handle::INVALID).then(|| frame_key(pass.shader));
+        // A pass that names a material draws with that material's shader,
+        // parameters and textures. Values the pass sets itself win over the
+        // material's. They are merged here, while the chain is resolved, so the
+        // renderer only ever sees one plain pass. Editing the material moves
+        // the asset revision, which resolves the chain again.
+        let mut shader = (pass.shader != Handle::INVALID).then(|| frame_asset_key(pass.shader));
         let mut parameters = BTreeMap::new();
         let mut textures = BTreeMap::new();
         if pass.material != Handle::INVALID {
             match assets.get(pass.material) {
                 Some(material) => {
                     if shader.is_none() && material.shader != Handle::INVALID {
-                        shader = Some(frame_key(material.shader));
+                        shader = Some(frame_asset_key(material.shader));
                     }
                     parameters.extend(material.parameters.clone());
                     textures.extend(
-                        material
-                            .textures
-                            .iter()
-                            .map(|(slot, binding)| (slot.clone(), frame_key(binding.texture))),
+                        material.textures.iter().map(|(slot, binding)| {
+                            (slot.clone(), frame_asset_key(binding.texture))
+                        }),
                     );
                 }
                 None => warn!(
@@ -120,7 +177,7 @@ fn resolve_passes(
         textures.extend(
             pass.textures
                 .iter()
-                .map(|(slot, handle)| (slot.clone(), frame_key(*handle))),
+                .map(|(slot, handle)| (slot.clone(), frame_asset_key(*handle))),
         );
 
         passes.push(ResolvedPass {
@@ -132,18 +189,18 @@ fn resolve_passes(
             textures,
         });
     }
-    if stale_handles > 0 {
+    if stale_pass_handle_count > 0 {
         warn!(
             target: pill_core::telemetry::telemetry_target::RENDERING,
-            "Pass chain: {stale_handles} of {} pass handles no longer resolve and are left out",
+            "Pass chain: {stale_pass_handle_count} of {} pass handles no longer resolve and are left out",
             pipeline.passes.len()
         );
     }
     passes.sort_by_key(|pass| pass.settings.order);
 
-    // Contract from `RenderPass`: one pass writes the surface and it runs last,
-    // or the window shows something other than what the chain produced. Named
-    // here, where the chain changes, rather than once a frame.
+    // A pass that writes the surface has to run last, or the window shows
+    // something other than what the chain produced. Checking that here, where
+    // the chain changes, reports it once instead of once a frame.
     let surface_positions: Vec<usize> = passes
         .iter()
         .enumerate()
@@ -161,11 +218,13 @@ fn resolve_passes(
     passes
 }
 
-/// The camera a frame renders through, chosen out of every enabled one.
+/// Picks the camera the primary surface draws through, out of every enabled
+/// camera in the world.
 ///
-/// Highest `priority` wins; equal priorities go to the lowest entity id, so
-/// the choice cannot wander with traversal order while the same cameras exist.
-/// `None` means no camera is enabled, which is a frame the renderer skips.
+/// The highest `priority` wins. Equal priorities go to the lowest entity id, so
+/// the choice stays the same from frame to frame while the same cameras exist,
+/// whatever order the query walks them in. `None` means no camera is enabled;
+/// the primary surface is then drawn only if a camera is bound to it.
 fn pick_camera(
     cameras: impl IntoIterator<Item = (u64, CameraComponent, TransformComponent)>,
 ) -> Option<(CameraComponent, TransformComponent)> {
@@ -188,12 +247,14 @@ fn pick_camera(
     selected.map(|(_, camera, transform)| (camera, transform))
 }
 
-/// Shared names of the components [`rendering_system`] reads, for
-/// [`RenderCapabilities::consumed_components`](crate::api::RenderCapabilities::consumed_components).
+/// Returns the shared names of the components [`rendering_system`] reads.
 ///
-/// Derived from the types the system queries rather than written out, so a
-/// renamed component can't leave a stale string behind. Keep it in step with
-/// the system's parameters.
+/// [`RenderCapabilities::consumed_components`](crate::api::RenderCapabilities::consumed_components)
+/// carries them. The host compares that list with the render components a
+/// project uses and warns about any the renderer ignores. The names come from
+/// the component types themselves rather than from string literals, so they
+/// cannot drift from the types. Keep the list in step with the system's query
+/// parameters.
 pub(crate) fn consumed_component_names() -> Vec<String> {
     [
         TransformComponent::shared_name(),
@@ -206,64 +267,27 @@ pub(crate) fn consumed_component_names() -> Vec<String> {
     .collect()
 }
 
-/// The resources [`rendering_system`] reads besides the frame, the assets and
-/// the rendering manager, grouped into one parameter because a system takes at
-/// most seven.
-///
-/// The one UI producer is here: the slot a game's own UI publishes into
-/// ([`UiFrameSlot`](pill_ui_frame::UiFrameSlot)). A world that never installed one carries no UI.
-type RenderingExtras<'w> = (
-    Res<'w, pill_engine::Time>,
-    Res<'w, pill_renderer_api::SurfaceCameras>,
-    ResMut<'w, pill_engine::DebugDraw>,
-    Res<'w, pill_renderer_api::SelectionOutlines>,
-    ResMut<'w, pill_renderer_api::PickRequests>,
-    ResMut<'w, pill_ui_frame::UiFrameSlot>,
-    ResMut<'w, pill_renderer_api::PreviewRequests>,
-);
-
-/// Which producer filled `RenderFrame.ui` on the last frame, so a change is
-/// stated once instead of every frame.
-///
-/// Module state rather than a frame field: the frame is plain data the renderer
-/// contract shares, while the producer is a fact about this renderer's world.
-/// A renderer reload starts the record over, which is what makes the next
-/// frame say which producer is feeding it.
-static UI_PRODUCER: AtomicU8 = AtomicU8::new(PRODUCER_UNSET);
-
-/// Whether this renderer image has already asked the UI producer to re-carry
-/// its textures.
-///
-/// A module reload gives a fresh image with fresh statics, so the flag answers
-/// "has *this* painter asked?" - which is the same question as "is this the
-/// first frame after a rebuild?".
-static UI_TEXTURES_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-/// Nothing measured yet.
-const PRODUCER_UNSET: u8 = 0;
-/// The game's own egui UI.
-const PRODUCER_GAME: u8 = 1;
-/// No producer at all: the frame carries no UI.
-const PRODUCER_NONE: u8 = 2;
-
-/// Record that `producer` filled the frame, naming it when that is news.
-fn note_ui_producer(producer: u8, name: &str) {
+/// Records which producer filled the frame, logging its name when that changed.
+fn note_ui_producer(producer: u8, producer_name: &str) {
     if UI_PRODUCER.swap(producer, Ordering::Relaxed) != producer {
         info!(
             target: pill_core::telemetry::telemetry_target::UI,
-            "[ui] producer={name}"
+            "[ui] producer={producer_name}"
         );
     }
 }
 
 /// Fills the frame from the current world, once per update.
 ///
-/// Registered as the post-update `rendering` system, so gameplay has already
-/// written the components it reads. The resolved chain is refreshed only when
-/// what it was derived from moved - the asset revision and the pipeline's key -
-/// so most frames reuse the last one's work. A world with no frame resource, no
-/// assets, or no enabled camera is not an error: the frame simply carries less,
-/// and the renderer clears or skips it.
+/// It runs as the post-update `rendering` system, so gameplay has already
+/// written the components it reads. The pass chain is resolved again only when
+/// the asset revision or the pipeline's key moves, so most frames reuse the
+/// previous result.
+///
+/// A world missing the frame resource or the asset store is not an error: the
+/// system returns and draws nothing. A world with no enabled camera still gets
+/// a frame, but the primary surface has no view unless a camera is bound to it,
+/// and the renderer skips a frame that has no views at all.
 pub fn rendering_system(
     mut frame: ResMut<RenderFrame>,
     assets: Res<AssetManager>,
@@ -278,7 +302,7 @@ pub fn rendering_system(
         mut preview_requests,
     ): RenderingExtras<'_>,
     mut cameras: Query<(Entity, &TransformComponent, &CameraComponent)>,
-    mut objects: Query<(Entity, &TransformComponent, &MeshRendererComponent)>,
+    mut drawables: Query<(Entity, &TransformComponent, &MeshRendererComponent)>,
 ) -> Result<(), SystemError> {
     let Some(mut frame) = frame.get_mut() else {
         return Ok(());
@@ -287,17 +311,17 @@ pub fn rendering_system(
         return Ok(());
     };
 
-    // The manager is re-read every frame - a game can set a pipeline, or toggle
-    // a pass inside one, at any point between two frames - but the chain itself
-    // is resolved again only when the pipeline handle or the revision moved.
-    // Resolution clones every pass's strings and maps, and the renderer uses
-    // the generation it produces to recognise the chain it already built from.
+    // Read the manager every frame, because a game can set a pipeline, or
+    // switch a pass inside one, at any point between two frames. Resolve the
+    // chain again only when the pipeline key or the asset revision moved:
+    // resolution clones every pass's strings and maps. The generation it bumps
+    // tells the renderer whether the chain it built is still this chain.
     let chain_source = ChainSource {
         revision: assets.revision(),
         pipeline: manager
             .get()
             .and_then(|manager| manager.pipeline())
-            .map(frame_key),
+            .map(frame_asset_key),
     };
     if frame.chain_source != Some(chain_source) {
         frame.passes = resolve_passes(assets, manager.get());
@@ -307,32 +331,34 @@ pub fn rendering_system(
 
     frame.sequence = frame.sequence.wrapping_add(1);
     if let Some(time) = time.get() {
-        // Accumulated rather than read from the clock: the frame is what a
-        // shader is handed, and it should advance by the time the game saw pass
-        // while it was filling this frame in.
+        // Add the step to the frame's own clock instead of reading the engine
+        // clock here: a shader is handed this value, so it should grow by the
+        // same step the game's update saw.
         frame.delta_seconds = time.delta_seconds();
         frame.seconds += frame.delta_seconds;
     }
-    // What systems debug-drew, aged by this frame's step; nothing while debug
-    // drawing is off or the world has no drawing.
+    // The debug geometry systems drew, with the timed items aged by this
+    // frame's step. Empty while debug drawing is off, and when the world has no
+    // debug drawing resource.
     let delta_seconds = frame.delta_seconds;
     frame.debug = debug_draw
         .get_mut()
         .map(|mut debug_draw| debug_draw.collect_frame(delta_seconds))
         .unwrap_or_default();
-    // The outlines an editor asked for, as the resource holds them; a world
-    // without the resource outlines nothing.
+    // The selection outlines an editor asked for, copied from the resource. A
+    // world without the resource outlines nothing.
     frame.outlines = outlines
         .get()
         .cloned()
         .unwrap_or_else(pill_renderer_api::SelectionOutlines::default);
-    // Picks asked for since the last frame; the renderer answers them later.
+    // Pick requests queued since the last frame. The renderer answers them
+    // after it draws.
     frame.pick_requests = pick_requests
         .get_mut()
         .map(|mut requests| std::mem::take(&mut requests.pending))
         .unwrap_or_default();
-    // Previews too: the renderer draws at most one per
-    // frame, oldest first.
+    // Preview requests, taken the same way. The renderer draws at most one per
+    // frame, oldest first, and refuses the rest.
     frame.preview_requests = preview_requests
         .get_mut()
         .map(|mut requests| std::mem::take(&mut requests.pending))
@@ -342,16 +368,16 @@ pub fn rendering_system(
         .iter_mut()
         .map(|(entity, transform, camera)| (entity, *camera, *transform))
         .collect();
-    // The camera is picked out of every enabled one; see [`pick_camera`] for
-    // what happens when several are enabled at once. A binding for the primary
-    // surface overrides that choice.
-    let bindings = surface_cameras.get();
-    let primary_binding = bindings.and_then(|bindings| {
-        bindings
+    // A binding for the primary surface chooses its camera outright. Without
+    // one, the camera is picked from every enabled camera in the world;
+    // [`pick_camera`] says which one wins when several are enabled.
+    let surface_cameras_resource = surface_cameras.get();
+    let primary_binding = surface_cameras_resource.and_then(|surface_cameras| {
+        surface_cameras
             .bindings
             .get(&pill_renderer_api::SurfaceId::PRIMARY)
     });
-    let selected = match primary_binding {
+    let selected_camera = match primary_binding {
         Some(binding) => {
             pill_renderer_api::resolve_camera_binding(binding, world_cameras.iter().copied())
                 .map(|view| (view.camera, view.transform))
@@ -362,18 +388,18 @@ pub fn rendering_system(
                 .map(|(entity, camera, transform)| (entity.id(), *camera, *transform)),
         ),
     };
-    // Every surface's camera, the primary one included: its binding when it
-    // has one, the frame's chosen world camera otherwise. A surface with no
-    // camera is left out, and draws nothing.
+    // One entry per surface that has a camera: the primary surface takes the
+    // camera chosen above, and every other surface takes the camera its binding
+    // resolves to. A surface with no camera is left out, and draws nothing.
     frame.surface_views.clear();
-    if let Some((camera, transform)) = selected {
+    if let Some((camera, transform)) = selected_camera {
         frame.surface_views.insert(
             pill_renderer_api::SurfaceId::PRIMARY,
             pill_renderer_api::SurfaceView { camera, transform },
         );
     }
-    if let Some(bindings) = bindings {
-        for (surface, binding) in &bindings.bindings {
+    if let Some(surface_cameras) = surface_cameras_resource {
+        for (surface, binding) in &surface_cameras.bindings {
             if *surface == pill_renderer_api::SurfaceId::PRIMARY {
                 continue;
             }
@@ -384,32 +410,31 @@ pub fn rendering_system(
             }
         }
     }
-    // The scene grid, when a frontend asked for one: every surface bound to a
-    // view camera draws it - the editor's own viewports - and a surface drawn
-    // through a world camera never does. Only its spacing travels; the
-    // surfaces are the editor views named below.
-    frame.grid_cell_size = bindings.and_then(pill_renderer_api::frame_grid);
-    // The editor's views, for the chrome that only belongs on them:
-    // the gizmo handles and the selection outlines. The answer is the
-    // view-bound set whether or not the grid is on, so turning the grid off
-    // never moves the gizmo onto the game's surface.
-    frame.editor_views = bindings
+    // The scene grid's spacing, when a frontend turned the grid on and at least
+    // one surface is bound to a view camera. Those view-bound surfaces are the
+    // only ones that draw the grid, and they are the editor views listed below;
+    // a surface drawn through a world camera never does.
+    frame.grid_cell_size = surface_cameras_resource.and_then(pill_renderer_api::frame_grid);
+    // The surfaces the editor draws its own gizmo handles and selection
+    // outlines on. This is the view-bound set whether the grid is on or off, so
+    // switching the grid off never moves the gizmo onto the game's surface.
+    frame.editor_views = surface_cameras_resource
         .map(pill_renderer_api::editor_view_surfaces)
         .unwrap_or_default();
 
-    // The frame's UI, from the world's one producer. A frame slot means the
-    // project installed its own egui UI, and then that UI is what the frame
-    // carries - including on a frame it drew nothing in, because a game that
-    // owns the UI does not want an empty frame read as "no UI". A world that
-    // never installed a slot carries none. The choice is stated once, not per
-    // frame.
+    // The frame's UI comes from the world's only producer. When the slot
+    // exists, the project installed its own egui UI, and whatever it published
+    // is what the frame carries, even when it drew nothing: a game that owns
+    // the UI must not have an empty frame read as "no UI". A world that never
+    // installed a slot carries no UI. The log names the producer once, when it
+    // changes.
     match ui_slot.get_mut() {
         Some(mut slot) => {
-            // A rebuilt painter begins with an empty texture map while the
+            // A rebuilt painter starts with an empty texture map, while the
             // producer, a shared library that outlives this image, has already
-            // carried every image once. Ask for them again on the first frame
-            // this image runs - the statics below start fresh exactly when the
-            // module does, so this fires once per rebuild.
+            // sent every image once. Ask for all of them again the first time
+            // this image finds a slot. The flag above starts fresh with the
+            // module, so this happens once per rebuild.
             if !UI_TEXTURES_REQUESTED.swap(true, Ordering::Relaxed) {
                 slot.request_texture_resend();
             }
@@ -422,31 +447,31 @@ pub fn rendering_system(
         }
     }
 
-    // The last mesh and material pair resolved, with the draw order it gave
-    // (`None` when either handle was dead). Drawables that share a mesh and a
-    // material are usually many and adjacent in an archetype, so remembering
-    // one pair skips almost every asset lookup - and those lookups are most of
-    // this system's time once thousands of draws share one pair.
-    let mut last_resolved: Option<(Handle<Mesh>, Handle<Material>, Option<u8>)> = None;
-    for (entity, transform, renderer) in objects.iter_mut() {
-        let rendering_order = match last_resolved {
+    // The mesh and material pair resolved last, and the draw order it gave
+    // (`None` when either handle was dead). Many drawables share one mesh and
+    // one material, and those usually sit next to each other in an archetype,
+    // so remembering one pair skips nearly every asset lookup. Those lookups
+    // dominate this system's time once thousands of draws share one pair.
+    let mut last_resolved_pair: Option<(Handle<Mesh>, Handle<Material>, Option<u8>)> = None;
+    for (entity, transform, renderer) in drawables.iter_mut() {
+        let rendering_order = match last_resolved_pair {
             Some((mesh, material, rendering_order))
                 if mesh == renderer.mesh && material == renderer.material =>
             {
                 rendering_order
             }
             _ => {
-                // Handles with nothing behind them are dropped here, so a
+                // A handle with no live asset behind it is dropped here, so a
                 // dangling handle draws nothing instead of failing the frame.
-                // The material is read rather than merely checked because the
-                // draw order it carries rides along with the instance; the
-                // renderer imposes that order when it composes the queue, so
-                // what is left here stays in traversal order.
+                // The material is read, not just checked, because its draw
+                // order travels with the instance. The renderer applies that
+                // order when it builds the queue, so the instances left here
+                // stay in traversal order.
                 let rendering_order = assets
                     .get(renderer.material)
                     .filter(|_| assets.contains(renderer.mesh))
                     .map(|material| material.rendering_order);
-                last_resolved = Some((renderer.mesh, renderer.material, rendering_order));
+                last_resolved_pair = Some((renderer.mesh, renderer.material, rendering_order));
                 rendering_order
             }
         };
@@ -456,16 +481,28 @@ pub fn rendering_system(
         frame.instances.push(RenderInstance {
             entity,
             transform: *transform,
-            mesh: frame_key(renderer.mesh),
-            material: frame_key(renderer.material),
+            mesh: frame_asset_key(renderer.mesh),
+            material: frame_asset_key(renderer.material),
             rendering_order,
         });
     }
     Ok(())
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    // `PassKind`, `Shader`, `Texture`, `RenderPass`, `RenderingPipeline` and
+    // `TextureType` only build the fixture assets and the expectations these
+    // tests need; the code under test names none of them.
+    use crate::{PassKind, RenderPass, RenderingPipeline, Shader, Texture, TextureType};
+    use pill_engine::{AssetManager, Engine};
+
     /// The renderer reports exactly the three components its system queries,
     /// by their pinned shared names.
     #[test]
@@ -479,12 +516,6 @@ mod tests {
             ]
         );
     }
-
-    use super::*;
-    // `PassKind`, `Shader` and `Texture` are here to build the fixture assets the chain
-    // tests need, not by anything in the module itself.
-    use crate::{PassKind, RenderPass, RenderingPipeline, Shader, Texture, TextureType};
-    use pill_engine::{AssetManager, Engine};
 
     #[test]
     fn a_game_with_no_pipeline_runs_the_built_in_pass() {
@@ -591,7 +622,7 @@ mod tests {
         let passes = resolve_passes(&assets, Some(&manager));
 
         assert_eq!(passes.len(), 1);
-        assert_eq!(passes[0].shader, Some(frame_key(shader)));
+        assert_eq!(passes[0].shader, Some(frame_asset_key(shader)));
     }
 
     #[test]
@@ -619,11 +650,14 @@ mod tests {
         let passes = resolve_passes(&assets, Some(&manager));
 
         assert_eq!(passes.len(), 1);
-        assert_eq!(passes[0].textures.get("grain"), Some(&frame_key(texture)));
+        assert_eq!(
+            passes[0].textures.get("grain"),
+            Some(&frame_asset_key(texture))
+        );
     }
 
-    /// A pass that names a material takes the material's shader, parameters and
-    /// textures; what the pass sets itself wins over the material's.
+    /// A pass that names a material takes that material's shader, parameters
+    /// and textures. Values the pass sets itself win over the material's.
     #[test]
     fn a_pass_that_names_a_material_draws_with_it() {
         use crate::{Material, MaterialParameter};
@@ -673,8 +707,11 @@ mod tests {
 
         let passes = resolve_passes(&assets, Some(&manager));
 
-        assert_eq!(passes[0].shader, Some(frame_key(shader)));
-        assert_eq!(passes[0].textures.get("sky"), Some(&frame_key(texture)));
+        assert_eq!(passes[0].shader, Some(frame_asset_key(shader)));
+        assert_eq!(
+            passes[0].textures.get("sky"),
+            Some(&frame_asset_key(texture))
+        );
         assert_eq!(
             passes[0].parameters.get("skybox_exposure"),
             Some(&MaterialParameter::Scalar(2.0))
@@ -769,8 +806,8 @@ mod tests {
         );
     }
 
-    /// An engine that can run the rendering system: the frame and the asset
-    /// store inserted and the system registered.
+    /// Builds an engine the rendering system can run in: the frame and the
+    /// asset store are inserted as resources, and the system is registered.
     fn renderable_engine() -> Engine {
         let mut engine = Engine::new();
         engine.world_mut().insert_resource(RenderFrame::default());
@@ -779,9 +816,9 @@ mod tests {
         engine
     }
 
-    /// A frame carrying one filled quad, as a game's UI producer would publish
-    /// it. Built out of `pill_ui_frame`'s draw vocabulary, which is the plain data
-    /// the slot carries.
+    /// Builds a frame with one filled quad, the way a game's UI producer
+    /// publishes it. It is made from `pill_ui_frame`'s draw vocabulary, which is
+    /// the plain data the slot carries.
     fn drawn_frame() -> pill_renderer_api::frame::RenderFrame {
         let mut frame = RenderFrame::default();
         let mut list = pill_ui_frame::DrawList::new();

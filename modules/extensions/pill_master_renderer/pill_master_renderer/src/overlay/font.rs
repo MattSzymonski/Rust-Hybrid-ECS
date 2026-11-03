@@ -1,20 +1,22 @@
-//! The bitmap font debug labels are drawn in: 5 by 7 pixel glyphs, drawn into
-//! an atlas once, and the quads a line of text becomes.
+//! The bitmap font the debug labels are drawn in: one 5 by 7 pixel glyph per
+//! character, drawn into a single atlas, and the quads a line of text becomes.
 //!
 //! # Responsibilities
 //!
-//! - Hold the glyphs as readable pixel art ([`GLYPHS`]) and lay them out as
-//!   one single-channel atlas ([`build_atlas`]).
+//! - Hold the glyphs as readable pixel art ([`GLYPHS`]) and draw them into one
+//!   single-channel atlas ([`build_atlas`]).
 //! - Hand that atlas to the UI painter as a texture under its own reserved
 //!   id ([`texture_set`], [`FONT_TEXTURE`]).
 //! - Turn a label into glyph quads at a pixel position ([`layout_text`]).
 //!
 //! # Design
 //!
-//! Debug labels need to be legible, not pretty, and must not depend on a font
-//! file being found at runtime: the glyphs live in the source and the atlas is
-//! built from them when the renderer starts. Lowercase letters draw as
-//! uppercase, and a character the font lacks draws as `?`.
+//! Debug labels need to be readable, not pretty, and they must not depend on a
+//! font file being found at runtime. The glyphs therefore live in the source,
+//! and the atlas is built from them when the renderer starts.
+//!
+//! A lowercase letter draws as its uppercase form, and a character the font
+//! does not have draws as `?`.
 
 // Standard library
 use std::sync::Arc;
@@ -22,21 +24,27 @@ use std::sync::Arc;
 // External crates
 use pill_ui_frame::{TextureId, UiTextureFilter, UiTextureSet};
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// Glyph width in pixels.
 pub(super) const GLYPH_WIDTH: u32 = 5;
 /// Glyph height in pixels.
 pub(super) const GLYPH_HEIGHT: u32 = 7;
-/// An atlas cell: the glyph plus one pixel of space right and below, so
-/// sampling one glyph never bleeds into the next.
+/// An atlas cell: the glyph plus one pixel of space to its right and below,
+/// so sampling one glyph never bleeds into the next.
 const CELL_WIDTH: u32 = GLYPH_WIDTH + 1;
 const CELL_HEIGHT: u32 = GLYPH_HEIGHT + 1;
-/// Cells per atlas row.
+/// How many cells one atlas row holds.
 const ATLAS_COLUMNS: u32 = 16;
 /// How many screen pixels one glyph pixel covers.
 pub(super) const GLYPH_SCALE: f32 = 2.0;
 
-/// Every glyph: its character and seven rows of five pixels, `#` lit, rows
-/// separated by `/`.
+/// Every glyph the font has, as its character and its pixel art.
+///
+/// The art is seven rows separated by `/`, each row five characters wide,
+/// with `#` for a lit pixel and `.` for a blank one.
 pub(super) const GLYPHS: &[(char, &str)] = &[
     (' ', "...../...../...../...../...../...../....."),
     ('!', "..#../..#../..#../..#../..#../...../..#.."),
@@ -101,6 +109,18 @@ pub(super) const GLYPHS: &[(char, &str)] = &[
     ('|', "..#../..#../..#../..#../..#../..#../..#.."),
 ];
 
+/// The texture the label list samples the font from.
+///
+/// The id is reserved at the top of the UI's id space. `pill_project_ui` maps
+/// egui's managed textures to `1 << 63 | id` and its user textures below that
+/// ceiling, so the only managed texture that could reach this id is the
+/// largest one.
+pub(crate) const FONT_TEXTURE: TextureId = TextureId(u64::MAX);
+
+// =============================================================================
+// Atlas
+// =============================================================================
+
 /// The atlas: its size and one coverage byte per texel, row by row.
 pub(super) struct Atlas {
     /// Width in texels.
@@ -111,15 +131,29 @@ pub(super) struct Atlas {
     pub texels: Vec<u8>,
 }
 
-/// The texture the label list samples the font from.
-///
-/// Reserved at the top of the UI's id space: `pill_project_ui` maps egui's
-/// managed textures to `1 << 63 | id` and its user textures below that
-/// ceiling, so only the largest managed id could collide with this one.
-pub(crate) const FONT_TEXTURE: TextureId = TextureId(u64::MAX);
+// =============================================================================
+// GlyphQuad
+// =============================================================================
 
-/// The atlas's width and height in texels: every glyph's cell, in rows of
-/// [`ATLAS_COLUMNS`].
+/// One glyph quad: where it goes on screen and which atlas cell it shows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct GlyphQuad {
+    /// Left and top of the quad on screen, in pixels.
+    pub origin: [f32; 2],
+    /// Width and height of the quad on screen, in pixels.
+    pub size: [f32; 2],
+    /// Left and top texel of the glyph's cell in the atlas.
+    pub atlas_origin: [u32; 2],
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// The atlas's width and height in texels.
+///
+/// The width is [`ATLAS_COLUMNS`] cells, and the height is as many rows of
+/// cells as the glyph table needs.
 pub(super) fn atlas_size() -> (u32, u32) {
     let rows = (GLYPHS.len() as u32).div_ceil(ATLAS_COLUMNS);
     (ATLAS_COLUMNS * CELL_WIDTH, rows * CELL_HEIGHT)
@@ -129,10 +163,10 @@ pub(super) fn atlas_size() -> (u32, u32) {
 pub(super) fn build_atlas() -> Atlas {
     let (width, height) = atlas_size();
     let mut texels = vec![0u8; (width * height) as usize];
-    for (index, (_, art)) in GLYPHS.iter().enumerate() {
+    for (index, (_, glyph_art)) in GLYPHS.iter().enumerate() {
         let (cell_x, cell_y) = cell_origin(index);
-        for (row, pixels) in art.split('/').enumerate() {
-            for (column, pixel) in pixels.chars().enumerate() {
+        for (row, pixel_row) in glyph_art.split('/').enumerate() {
+            for (column, pixel) in pixel_row.chars().enumerate() {
                 if pixel == '#' {
                     let x = cell_x + column as u32;
                     let y = cell_y + row as u32;
@@ -148,9 +182,11 @@ pub(super) fn build_atlas() -> Atlas {
     }
 }
 
-/// The atlas as the one-texture set the UI painter registers once: white
-/// texels whose alpha is the glyph coverage, sampled nearest so glyphs stay
-/// crisp at [`GLYPH_SCALE`].
+/// The atlas as the one-texture set the UI painter registers once, when the
+/// renderer starts.
+///
+/// Every texel is white and its alpha is the glyph coverage. The texture is
+/// sampled nearest, which keeps the glyphs sharp at [`GLYPH_SCALE`].
 pub(crate) fn texture_set() -> UiTextureSet {
     let atlas = build_atlas();
     let pixels: Vec<u8> = atlas
@@ -158,8 +194,8 @@ pub(crate) fn texture_set() -> UiTextureSet {
         .iter()
         .flat_map(|&coverage| [255, 255, 255, coverage])
         .collect();
-    let mut set = UiTextureSet::new();
-    set.push_full(
+    let mut font_texture_set = UiTextureSet::new();
+    font_texture_set.push_full(
         FONT_TEXTURE,
         atlas.width,
         atlas.height,
@@ -167,10 +203,10 @@ pub(crate) fn texture_set() -> UiTextureSet {
         UiTextureFilter::Nearest,
         Arc::from(pixels),
     );
-    set
+    font_texture_set
 }
 
-/// The top-left texel of glyph `index`'s cell.
+/// The top-left texel of the cell that holds the glyph at `index`.
 fn cell_origin(index: usize) -> (u32, u32) {
     let index = index as u32;
     (
@@ -179,26 +215,24 @@ fn cell_origin(index: usize) -> (u32, u32) {
     )
 }
 
-/// The glyph a character draws as: itself, its uppercase form, or `?`.
+/// The glyph to draw for `character`.
+///
+/// A lowercase letter uses its uppercase form, and a character the font does
+/// not have uses `?`. If the table held no `?` either, the first glyph (the
+/// space) is used, so the returned index is always valid.
 fn glyph_index(character: char) -> usize {
-    let wanted = character.to_ascii_uppercase();
+    let wanted_character = character.to_ascii_uppercase();
     let lookup = |target: char| GLYPHS.iter().position(|(glyph, _)| *glyph == target);
-    lookup(wanted).or_else(|| lookup('?')).unwrap_or(0)
+    lookup(wanted_character)
+        .or_else(|| lookup('?'))
+        .unwrap_or(0)
 }
 
-/// One glyph quad: its pixel rectangle and its atlas rectangle in texels.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct GlyphQuad {
-    /// Left and top screen pixel.
-    pub origin: [f32; 2],
-    /// Width and height in screen pixels.
-    pub size: [f32; 2],
-    /// Left and top atlas texel.
-    pub atlas_origin: [u32; 2],
-}
-
-/// The quads `text` becomes, starting at pixel (`x`, `y`) as its top-left
-/// corner; a newline starts the next line under the first character.
+/// The quads `text` becomes, starting at pixel (`x`, `y`) as the top-left
+/// corner.
+///
+/// A newline starts the next line under the first character of the line
+/// above.
 pub(super) fn layout_text(text: &str, x: f32, y: f32) -> Vec<GlyphQuad> {
     let advance = CELL_WIDTH as f32 * GLYPH_SCALE;
     let line_height = (CELL_HEIGHT + 2) as f32 * GLYPH_SCALE;
@@ -228,16 +262,21 @@ pub(super) fn layout_text(text: &str, x: f32, y: f32) -> Vec<GlyphQuad> {
     quads
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The painter's texture is the atlas widened to RGBA: coverage in alpha.
+    /// The painter's texture is the atlas widened to RGBA, with the coverage
+    /// in alpha.
     #[test]
     fn the_texture_set_carries_the_atlas_as_white_coverage() {
         let atlas = build_atlas();
-        let set = texture_set();
-        let texture = &set.textures[0];
+        let font_texture_set = texture_set();
+        let texture = &font_texture_set.textures[0];
         assert_eq!((texture.width, texture.height), atlas_size());
         let pixels = &texture.pixels;
         let lit = atlas
@@ -253,11 +292,11 @@ mod tests {
         );
     }
 
-    /// Every glyph is seven rows of five pixels, so none draws garbage.
+    /// Every glyph is seven rows of five pixels, so no glyph draws garbage.
     #[test]
     fn every_glyph_is_five_by_seven() {
-        for (character, art) in GLYPHS {
-            let rows: Vec<&str> = art.split('/').collect();
+        for (character, glyph_art) in GLYPHS {
+            let rows: Vec<&str> = glyph_art.split('/').collect();
             assert_eq!(rows.len(), GLYPH_HEIGHT as usize, "{character:?}");
             for row in rows {
                 assert_eq!(row.len(), GLYPH_WIDTH as usize, "{character:?}");
@@ -266,7 +305,8 @@ mod tests {
         }
     }
 
-    /// The atlas holds every glyph, and a lit glyph pixel is lit in it.
+    /// Every glyph has a cell in the atlas, and a lit glyph pixel comes out
+    /// lit in the atlas.
     #[test]
     fn the_atlas_holds_every_glyph() {
         let atlas = build_atlas();

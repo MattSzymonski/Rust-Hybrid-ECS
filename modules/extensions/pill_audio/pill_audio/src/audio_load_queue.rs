@@ -1,43 +1,55 @@
-//! Shared requests for the audio extension to load project-provided sound bytes.
+//! A queue through which a project asks the audio extension to load sound bytes.
 //!
 //! # Responsibilities
 //!
 //! - Carry encoded sound bytes from a project to the running playback DLL,
 //!   which turns them into [`Sound`](crate::Sound) assets on its next frame.
-//! - Coalesce repeated loads of one playback name.
+//! - Keep one pending load per playback name, with the newest bytes winning.
 //!
 //! # Design
 //!
 //! [`Sound`](crate::Sound) is a shared asset type, so a project that links the
-//! crate can also register a sound itself and take the handle directly - that
-//! is what `examples/project_rs` does with its embedded MP3. The queue is for
-//! bytes a project hands over at runtime without naming the type: the module
-//! drains it, so the project never has to know when loading happens.
+//! crate can also register a sound itself and take the handle directly. The
+//! queue is for bytes a project hands over at runtime without naming the type:
+//! the module drains it, so the project never has to know when loading happens.
 
 // Standard library
 use std::collections::BTreeMap;
 
-/// Pending sound loads, by playback name.
+// =============================================================================
+// AudioLoadQueue
+// =============================================================================
+
+/// Queued sound loads, keyed by playback name, waiting for the audio system.
 #[repr(C)]
 #[derive(Default)]
 pub struct AudioLoadQueue {
+    /// The encoded bytes of each queued sound, by playback name.
     pub(crate) sounds: BTreeMap<String, Vec<u8>>,
 }
 
-// The trait's full path, not an import: the hot-patch inventory is generated at
-// the crate root and cannot see this module's `use` lines.
+impl AudioLoadQueue {
+    /// Queues an encoded sound under its playback name.
+    ///
+    /// Queuing the same name again replaces the bytes that were still waiting.
+    pub fn load(&mut self, playback_name: &str, encoded_bytes: &[u8]) {
+        self.sounds
+            .insert(playback_name.to_owned(), encoded_bytes.to_vec());
+    }
+}
+
+// The trait is written with its full path, not imported: the hot-patch
+// inventory is generated at the crate root, where this module's `use` lines
+// are not visible, so the method would be left out of it.
 impl pill_engine::Resource for AudioLoadQueue {
     fn shared_name() -> Option<&'static str> {
         Some("pill_audio::AudioLoadQueue")
     }
 }
 
-impl AudioLoadQueue {
-    /// Queue an encoded sound under its playback name. Repeated requests coalesce.
-    pub fn load(&mut self, name: &str, bytes: &[u8]) {
-        self.sounds.insert(name.to_owned(), bytes.to_vec());
-    }
-}
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

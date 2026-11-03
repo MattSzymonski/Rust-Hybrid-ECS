@@ -2,36 +2,39 @@
 //!
 //! # Responsibilities
 //!
-//! - Draw the palette while it is open: the query field, the filtered rows and
-//!   the row the arrows select.
+//! - Draw the popup while it is open: the query field, the matching rows and
+//!   the row the arrow keys select.
 //! - Run the selected row through [`run_menu_action`], the same call a menu
-//!   entry makes, so a palette run and a menu click take one path.
-//! - Report the popup's rectangle as an overlay region, so a click inside the
-//!   palette is never a scene pick.
+//!   entry makes, so a palette run and a menu click run the same code.
+//! - Report the popup's rectangle as an overlay region, so a click on the
+//!   popup never becomes a scene pick.
 //!
-//! The model lives in `PaletteState` (the shared session): the scripted
-//! channel sets a query, a run request or a close on it, and this file only
-//! turns that state into pixels and actions. That is why the suite needs no
-//! synthetic keystrokes to drive it.
+//! # Design
+//!
+//! The popup's state lives in `PaletteState`, which the shared session keeps.
+//! The scripted channel sets a query, a run request or a close on it; this
+//! file draws the result and writes back what the user picked. That is why a
+//! test can drive the palette without sending key presses.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// How many rows the popup lists before the list is cut off.
+/// The largest number of matching rows the popup draws.
 pub const PALETTE_ROWS: usize = 12;
 
-/// Where the popup's top centre sits, below the menu bar.
+/// The distance from the top of the editor window to the popup's top edge, in
+/// logical points. It keeps the popup clear of the menu bar.
 pub const PALETTE_TOP: f32 = 72.0;
 
-/// How wide the popup is, in logical points.
+/// The popup's width, in logical points.
 pub const PALETTE_WIDTH: f32 = 360.0;
 
-/// The commands whose titles contain `query`, in registration order.
+/// The commands whose titles contain `query`, in the order the list has them.
 ///
-/// A case-insensitive substring match on the title; an empty query matches
-/// every command. This is the title filter only - the window drops the rows no
-/// action answers, which needs the frame's snapshot.
+/// The match ignores case and the spaces around `query`, so an empty query
+/// matches every command. This is the title filter only: the window drops the
+/// rows that have no action, which needs the frame's snapshot and selection.
 pub fn matches<'a>(commands: &'a [CommandView], query: &str) -> Vec<&'a CommandView> {
     let needle = query.trim().to_lowercase();
     commands
@@ -50,16 +53,18 @@ pub fn palette_window(
     if !palette.open {
         return;
     }
+    // Step 1: Keep the commands whose titles match and that have an action the
+    // model can run.
     let (runnable, unresolved): (Vec<&CommandView>, Vec<&CommandView>) =
         matches(&viewer.snapshot.commands, &palette.query)
             .into_iter()
             .partition(|row| menubar::action_for(row, viewer.snapshot, viewer.selection).is_some());
     let rows: Vec<CommandView> = runnable.into_iter().cloned().collect();
     palette.selected = palette.selected.min(rows.len().saturating_sub(1));
-    // One line per query change, so a suite can wait for the filter result
-    // instead of reading the screen. A command the model has no action for is
-    // named here, once per query, and gets no row: offering it was a no-op the
-    // palette close line used to hide.
+    // Step 2: Report each query change once, so a suite can wait for the
+    // filter result instead of reading the screen. A matching command that the
+    // model has no action for is named here and gets no row, so the popup
+    // never offers a row it cannot run.
     if palette.logged_query.as_deref() != Some(palette.query.as_str()) {
         palette.logged_query = Some(palette.query.clone());
         for row in &unresolved {
@@ -77,6 +82,7 @@ pub fn palette_window(
             "[editor] palette query"
         );
     }
+    // Step 3: Draw the window, and follow the keys and clicks it reports.
     let mut clicked = None;
     let window = egui::Window::new("Command Palette")
         .title_bar(false)
@@ -94,8 +100,9 @@ pub fn palette_window(
             if !field.has_focus() {
                 field.request_focus();
             }
-            // Arrows move the selection, Escape closes; Enter sets the same
-            // run request a click does.
+            // The arrow keys move the selection and wrap around at either
+            // end. Enter sets the same run request a click sets, and Escape
+            // closes the popup.
             let (down, up, enter, escape) = ui.input(|input| {
                 (
                     input.key_pressed(egui::Key::ArrowDown),
@@ -135,6 +142,8 @@ pub fn palette_window(
         palette.selected = index;
         palette.run_requested = true;
     }
+    // Step 4: Report the popup's rectangle as an overlay region, then run the
+    // row the palette was asked to run.
     if let Some(response) = window {
         let rect = response.response.rect;
         viewer.overlay_regions.push(ShellRect {
@@ -157,7 +166,10 @@ pub fn palette_window(
     }
 }
 
-/// Run the selected row, if one matched, and close the palette.
+/// Run the row at the palette's selection and close the popup.
+///
+/// Nothing else happens when no row is selected, which is the case while the
+/// query matches no command that has an action.
 pub fn run_selected(
     palette: &mut PaletteState,
     session: &mut MenubarSession,
@@ -178,8 +190,9 @@ pub fn run_selected(
     );
     match action {
         Some(action) => run_menu_action("palette", label.as_str(), action, session, viewer),
-        // Unreachable through the rows the palette lists, which are the ones
-        // with an action; kept so a scripted run of an unlistable id says so.
+        // Every row the palette lists has an action, so this arm never runs
+        // from the popup. It stays for a caller that hands in rows of its own,
+        // where a row with no action warns instead of silently doing nothing.
         None => pill_core::warn!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
             command = row.id.as_str(),

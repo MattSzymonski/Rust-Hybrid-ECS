@@ -1,10 +1,13 @@
-//! The scene and game viewports: their geometry and overlay chips.
+//! Geometry of the scene and game viewports, their overlay chips, and the
+//! entity badges drawn over the scene.
 //!
 //! # Responsibilities
 //!
 //! - The measured scene body rectangle the frontend places the scene's child
 //!   window at, and the game view's own rectangle.
 //! - The per-viewport overlay chip (the frame counter) and the region it marks.
+//! - The entity badges: the mark each entity gets, the shadow under it, and
+//!   the pick region it marks.
 //!
 //! The globs below are absolute paths: a generated patch crate replays this
 //! file's top-level `use` lines, so a `super::`-relative glob would not
@@ -14,27 +17,72 @@
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// How far the scene rectangle extends past the measured tab body, in
-/// logical points: the body's padding and outline sit inside the leaf, and
-/// the child window must back them too, so no sliver of the game view
-/// behind the overlay shows around the viewport's edge.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// How far, in logical points, the scene rectangle extends past the measured
+/// tab body. The body's padding and outline sit inside the tab, so the child
+/// window must cover them too; otherwise whatever is behind shows around the
+/// viewport's edge.
 pub const SCENE_RECT_OVERSHOOT: f32 = 16.0;
 
-/// A shell update slower than this logs its own `[editor] egui frame` line
-/// in addition to the 210-frame heartbeat. The bar is a whole 60 Hz frame: a
-/// debug build's pass runs several milliseconds, so a lower one would log a
-/// line per frame. A pass that eats a whole frame is worth its own record.
+/// A shell update slower than this logs its own `[editor] egui frame` line,
+/// besides the 210-frame heartbeat. The limit is one whole 60 Hz frame
+/// (16 milliseconds): a debug build's pass takes several milliseconds, so a
+/// lower limit would log a line every frame. A pass that takes a whole frame
+/// is worth its own record.
 pub const SLOW_UPDATE_MICROS: u64 = 16_000;
 
-/// The scene's frame counter: its box in logical points, and the gap to the
-/// tab body's corner.
+/// The width of the scene's frame counter box, in logical points.
 pub const SCENE_COUNTER_WIDTH: f32 = 76.0;
 
+/// The height of the scene's frame counter box, in logical points.
 pub const SCENE_COUNTER_HEIGHT: f32 = 20.0;
 
+/// The gap, in logical points, between the frame counter box and the tab
+/// body's top-right corner.
 pub const SCENE_COUNTER_MARGIN: f32 = 8.0;
 
-/// Convert an egui rectangle into the boundary's plain rectangle.
+/// The space, in logical points, that a badge's mark leaves inside its
+/// clickable rectangle. The icon size preference sets the mark's size, and
+/// this padding makes up the rest of the rectangle.
+pub const SCENE_BADGE_PADDING: f32 = 3.0;
+
+/// How far a badge's shadow spreads, as a fraction of the mark's size.
+pub const SCENE_BADGE_SHADOW_BLUR: f32 = 0.1;
+
+/// How far down and right of the mark the whole shadow sits, as a fraction of
+/// the mark's size. The direction matches a CSS shadow; the offset is small,
+/// so the shadow stays under the mark instead of reading as a second, offset
+/// copy.
+pub const SCENE_BADGE_SHADOW_DISTANCE: f32 = 0.05;
+
+/// The opacity of one shadow sample. The shadow draws the mark once per
+/// sample of [`SCENE_BADGE_SHADOW_SAMPLES`], so the copies add up in the
+/// middle and thin out at the rim.
+pub const SCENE_BADGE_SHADOW_ALPHA: f32 = 0.22;
+
+/// The unit offsets a badge's shadow is sampled at: the centre and a ring
+/// around it. Together they read as one soft edge rather than a second hard
+/// copy of the mark.
+pub const SCENE_BADGE_SHADOW_SAMPLES: [(f32, f32); 9] = [
+    (0.0, 0.0),
+    (1.0, 0.0),
+    (0.5, 0.5),
+    (0.0, 1.0),
+    (-0.5, 0.5),
+    (-1.0, 0.0),
+    (-0.5, -0.5),
+    (0.0, -1.0),
+    (0.5, -0.5),
+];
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Converts an egui rectangle into the boundary's plain rectangle.
 pub fn shell_rect(rect: egui::Rect) -> ShellRect {
     ShellRect {
         x: rect.min.x,
@@ -44,18 +92,20 @@ pub fn shell_rect(rect: egui::Rect) -> ShellRect {
     }
 }
 
-/// A scene tab's body rectangle in logical points, overshooting by
-/// [`SCENE_RECT_OVERSHOOT`] so the child window backs the tab body's padding
-/// and outline too.
+/// Returns a scene tab's body rectangle in logical points, grown by
+/// [`SCENE_RECT_OVERSHOOT`] so the child window also covers the tab body's
+/// padding and outline.
 pub fn scene_body_rect(ui: &egui::Ui) -> ShellRect {
     shell_rect(ui.max_rect().expand(SCENE_RECT_OVERSHOOT))
 }
 
-/// A scene tab's overlay strip: the frame counter, anchored to the viewport's
-/// top-right corner and painted from the theme. The overlay paints above the
-/// scene's child window, so the counter sits over the viewport, and it takes
-/// input, so a click on it never reaches the project. Its rectangle joins the
-/// frame's overlay regions, so a click on it is never read as a scene pick.
+/// Draws a scene tab's overlay chip: the frame counter in the viewport's
+/// top-right corner, painted from the theme.
+///
+/// The editor's composition overlay paints above the scene's child window, so
+/// the counter shows over the viewport. Its rectangle joins the frame's
+/// overlay regions, so a click on it belongs to the UI and is never read as a
+/// scene pick.
 pub fn scene_overlay(
     ui: &mut egui::Ui,
     frames_per_second: f32,
@@ -63,8 +113,8 @@ pub fn scene_overlay(
 ) {
     let counter_rect = frame_counter_rect(ui);
     overlay_regions.push(shell_rect(counter_rect));
-    // The counter is painted rather than laid out, so it costs the tab body
-    // no layout space; its rectangle still senses clicks.
+    // The counter is painted, not laid out, so it takes no space in the tab
+    // body. Its rectangle still senses clicks.
     let _ = ui.interact(
         counter_rect,
         ui.id().with("scene_frame_counter"),
@@ -86,7 +136,8 @@ pub fn scene_overlay(
     );
 }
 
-/// The frame counter's rectangle: the strip's right-anchored box.
+/// Returns the frame counter's rectangle: a box whose top-right corner sits
+/// one margin inside the tab body's top-right corner.
 pub fn frame_counter_rect(ui: &egui::Ui) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(
@@ -97,41 +148,8 @@ pub fn frame_counter_rect(ui: &egui::Ui) -> egui::Rect {
     )
 }
 
-/// The padding a badge's mark leaves inside its clickable rectangle, in
-/// points; the icon size preference sets the mark, and this is the rest.
-pub const SCENE_BADGE_PADDING: f32 = 3.0;
-
-/// The spread a badge's shadow is blurred over, as a fraction of the mark's
-/// size.
-pub const SCENE_BADGE_SHADOW_BLUR: f32 = 0.1;
-
-/// How far the whole shadow sits down and right of the mark, as a fraction of
-/// the mark's size: a CSS shadow's direction, kept short so the mark still
-/// reads as standing on its point.
-pub const SCENE_BADGE_SHADOW_DISTANCE: f32 = 0.05;
-
-/// The opacity of one shadow sample. The shadow is the mark drawn at
-/// [`SCENE_BADGE_SHADOW_SAMPLES`], so the faded copies add up in the middle and
-/// thin out at the rim.
-pub const SCENE_BADGE_SHADOW_ALPHA: f32 = 0.22;
-
-/// The unit offsets a badge's shadow is sampled at: the centre and a ring
-/// around it, which together read as one soft edge instead of a second hard
-/// glyph.
-pub const SCENE_BADGE_SHADOW_SAMPLES: [(f32, f32); 9] = [
-    (0.0, 0.0),
-    (1.0, 0.0),
-    (0.5, 0.5),
-    (0.0, 1.0),
-    (-0.5, 0.5),
-    (-1.0, 0.0),
-    (-0.5, -0.5),
-    (0.0, -1.0),
-    (0.5, -0.5),
-];
-
-/// The centres a badge's shadow is drawn at: the mark's own centre moved to the
-/// shadow's place, then to each blur sample around it.
+/// Returns the centres a badge's shadow is drawn at: the mark's centre moved
+/// to the shadow's place, then moved to each blur sample around that point.
 pub fn badge_shadow_centres(mark: egui::Rect) -> [egui::Pos2; SCENE_BADGE_SHADOW_SAMPLES.len()] {
     let distance = mark.width() * SCENE_BADGE_SHADOW_DISTANCE;
     let blur = mark.width() * SCENE_BADGE_SHADOW_BLUR;
@@ -143,19 +161,22 @@ pub fn badge_shadow_centres(mark: egui::Rect) -> [egui::Pos2; SCENE_BADGE_SHADOW
     centres
 }
 
-/// Draw one scene view's entity badges: the entity's component mark - a
-/// camera, a light - or a plain dot when it has neither, at each point the
-/// executable projected.
+/// Draws one scene view's entity badges: for each point the executable
+/// projected, the entity's component mark (a camera, a light), or a plain dot
+/// when it has neither.
 ///
-/// A badge is the mark alone, with no chip behind it, standing on a short
-/// blurred drop shadow in the theme's shadow ink - the way a CSS shadow keeps a
-/// glyph readable over a busy surface. The mark's size is the
-/// `editor.gizmo_icon_size` preference, and the rectangle that picks it scales
-/// with it. The mark carries the state: a selected entity's is red, and
-/// hovering brightens an unselected one. A badge is the UI's: its rectangle
-/// joins the frame's overlay regions, so a click on it selects its entity
-/// instead of pressing the scene behind it.
+/// A badge is only the mark, with no chip behind it, on a short blurred drop
+/// shadow in the theme's shadow colour. The shadow keeps the glyph readable
+/// over a busy scene, as a CSS text shadow does. The mark's size is the
+/// `editor.gizmo_icon_size` preference, and the rectangle that picks it grows
+/// with it.
+///
+/// The mark's colour carries the state: a selected entity's uses the theme's
+/// danger colour, and hovering brightens an unselected one. A badge belongs
+/// to the UI: its rectangle joins the frame's overlay regions, so a click on
+/// it selects its entity instead of pressing the scene behind it.
 pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: usize) {
+    // Step 1: collect this view's badges. A view with none draws nothing.
     let badges: Vec<ShellBadge> = viewer
         .badges
         .iter()
@@ -165,11 +186,13 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
     if badges.is_empty() {
         return;
     }
-    // The preference is parsed and clamped into its range by the snapshot, so
-    // this only has to size the mark and the rectangle around it.
+    // Step 2: draw one badge per entity.
+    //
+    // The snapshot has already parsed the icon size preference and clamped it
+    // to its range, so this only sizes the mark and the rectangle around it.
     let icon_size = viewer.snapshot.preferences.gizmo_icon_size;
     let badge_size = icon_size + SCENE_BADGE_PADDING * 2.0;
-    let mut picked = None;
+    let mut picked_entity = None;
     for badge in badges {
         let rect = egui::Rect::from_center_size(
             egui::pos2(badge.x, badge.y),
@@ -182,9 +205,9 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
         );
         let hovered = response.hovered();
         let selected = viewer.selection.entities().contains(&badge.entity);
-        let key = format!("{view}:{}", badge.entity);
-        viewer.inspector.badge_seen.insert(key.clone());
-        if remember_moved_rect(&mut viewer.inspector.badge_rects, &key, rect) {
+        let badge_key = format!("{view}:{}", badge.entity);
+        viewer.inspector.badge_seen.insert(badge_key.clone());
+        if remember_moved_rect(&mut viewer.inspector.badge_rects, &badge_key, rect) {
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,
                 view = badge.view,
@@ -196,15 +219,15 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
                 "[editor] scene badge rect"
             );
         }
-        let label = viewer
+        let archetype_label = viewer
             .snapshot
             .entities
             .iter()
             .find(|entry| entry.entity == badge.entity)
             .map(|entry| entry.archetype_label.as_str())
             .unwrap_or_default();
-        // The shadow keeps the theme's shadow ink whatever the mark is doing:
-        // hover and selection are read from the mark's own colour.
+        // The shadow always uses the theme's shadow colour. Hover and
+        // selection only change the mark's own colour.
         let shadow_ink = icons::with_alpha(style::shadow(), SCENE_BADGE_SHADOW_ALPHA);
         let mark = rect.shrink(SCENE_BADGE_PADDING);
         let ink = match (selected, hovered) {
@@ -212,10 +235,11 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
             (false, true) => style::text_strong(),
             (false, false) => style::text(),
         };
-        match inspector::badge_icon(label) {
+        match inspector::badge_icon(archetype_label) {
             Some(icon) => {
-                // A blurred shadow is the mark itself drawn at each sample of
-                // [`badge_shadow_centres`], so the copies sum into a soft edge.
+                // Each shadow copy is the mark drawn at one sample of
+                // [`badge_shadow_centres`], so the copies add up to a soft
+                // edge.
                 for centre in badge_shadow_centres(mark) {
                     icons::paint_duotone(
                         ui.painter(),
@@ -240,23 +264,13 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
                     .circle_filled(mark.center(), icon_size * 0.3, dot_ink);
             }
         }
-        // A hovered badge used to outline itself in the accent. Paused: the
-        // mark brightens instead, so no box is put back around it.
-        //
-        // if hovered {
-        //     ui.painter().rect_stroke(
-        //         rect,
-        //         egui::CornerRadius::same(3),
-        //         egui::Stroke::new(1.0, style::accent()),
-        //         egui::StrokeKind::Inside,
-        //     );
-        // }
         if response.clicked() {
-            picked = Some(badge.entity);
+            picked_entity = Some(badge.entity);
         }
         viewer.overlay_regions.push(shell_rect(rect));
     }
-    if let Some(entity) = picked {
+    // Step 3: select the entity whose badge was clicked.
+    if let Some(entity) = picked_entity {
         select_entity(viewer.selection, entity);
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ENGINE,

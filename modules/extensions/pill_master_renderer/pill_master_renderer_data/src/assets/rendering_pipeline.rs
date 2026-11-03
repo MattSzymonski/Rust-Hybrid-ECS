@@ -3,29 +3,30 @@
 //! # Responsibilities
 //!
 //! - Hold the passes a frame runs, in the order the game wrote them, each with
-//!   the chain's own switch for it ([`PipelinePass`]).
-//! - Stay a handle list rather than a copy of the passes, so one pass can appear
-//!   in several pipelines and editing a pass does not duplicate it.
+//!   this chain's own switch for it ([`PipelinePass`]).
+//! - Stay a list of handles rather than a copy of the passes, so one pass can
+//!   appear in several pipelines and editing a pass does not duplicate it.
 //!
 //! # Design
 //!
-//! This asset is only the declaration. Building the chain - ordering,
-//! resolving target names, creating the pipelines the GPU runs - happens in the
-//! renderer when the game hands this asset over through `RenderingManager`,
-//! because that is the side that owns the device.
+//! This asset is only the declaration. The renderer builds the chain from it -
+//! ordering the passes, resolving the targets they name, creating the GPU
+//! pipelines - because it owns the device. The game picks the pipeline by
+//! setting it on `RenderingManager`, and the renderer builds the chain again
+//! whenever that pipeline or the assets change.
 //!
-//! It is also a file of its own (`.pipeline`): a chain the editor can create and
-//! a project can load by path, whose body lists the `.render_pass` files in the
-//! order they run. Each entry carries an optional `enabled` key, so one chain can
-//! leave a pass out while another that names the same pass runs it - which is
-//! what the pass's own `enabled` key cannot express, since it is the same for
-//! every chain.
+//! The asset is also a file of its own (`.pipeline`), so the editor can create
+//! one and a project can load one by path. Its body names the passes it runs,
+//! in the order they run, and each entry has an optional `enabled` key. That
+//! lets one chain leave a pass out while another chain naming the same pass
+//! still runs it. The pass's own `enabled` key cannot do that, because it
+//! applies to every chain.
 //!
 //! Nothing else belongs here. A pass already carries the shader it draws with
-//! and the values it reads, so a pipeline that also listed its shaders and
-//! textures would be saying the same thing twice - and would go stale the moment
-//! a pass was edited. What an installer put in the store is the store's
-//! business: `AssetManager::handle_by_name` is the index for it.
+//! and the values it reads, so a pipeline that also listed shaders and textures
+//! would repeat them - and would be out of date as soon as a pass was edited.
+//! What the built-in pipelines' `install` functions put in the store is their
+//! own business; `AssetManager::handle_by_name` finds an asset by name.
 
 // External crates
 use pill_engine::{
@@ -37,22 +38,26 @@ use serde::{Deserialize, Serialize};
 // Current crate
 use crate::RenderPass;
 
-/// One pass in a pipeline, with this chain's switch for it.
+// =============================================================================
+// PipelinePass
+// =============================================================================
+
+/// One pass in a pipeline, with this chain's own on/off switch for it.
 ///
-/// The switch is per entry rather than per pass asset: the same `.render_pass`
-/// can appear in two chains, and a project may want bloom in one and not the
-/// other.
+/// The switch belongs to the entry, not to the pass asset: the same
+/// `.render_pass` can appear in two chains, and a project may want bloom in one
+/// and not the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PillMirror)]
 pub struct PipelinePass {
     /// The pass this entry runs.
     pub pass: Handle<RenderPass>,
-    /// Whether the chain runs it. A `.pipeline` file writes it per entry; a
-    /// chain built in code runs every pass it adds.
+    /// Whether this chain runs the pass. A `.pipeline` file writes the switch
+    /// for each entry; a chain built in code runs every pass it adds.
     pub enabled: bool,
 }
 
 impl PipelinePass {
-    /// `pass`, run by the chain that holds it.
+    /// Builds an entry that runs `pass`, switched on.
     pub fn new(pass: Handle<RenderPass>) -> Self {
         Self {
             pass,
@@ -61,17 +66,21 @@ impl PipelinePass {
     }
 }
 
+// =============================================================================
+// RenderingPipeline
+// =============================================================================
+
 /// The passes a frame runs, in the order they were added.
 #[derive(Clone, Debug)]
 #[pill_mirror_object(asset, shared = "pill_master_renderer::assets::RenderingPipeline")]
 pub struct RenderingPipeline {
-    /// The entries, in the order they run. A pass's own `order` key refines this
-    /// when the renderer sorts the chain.
+    /// The passes, in the order they run. The renderer sorts the chain by each
+    /// pass's own `order` value; the order here breaks ties.
     pub passes: Vec<PipelinePass>,
 }
 
 impl Default for RenderingPipeline {
-    /// An empty chain; both derived defaults agree.
+    /// An empty chain, the same value `new` builds.
     fn default() -> Self {
         Self { passes: Vec::new() }
     }
@@ -83,38 +92,44 @@ impl RenderingPipeline {
         Self::default()
     }
 
-    /// Append one pass, run by this chain.
+    /// Appends one pass to the chain, switched on.
     pub fn add(&mut self, pass: Handle<RenderPass>) {
         self.passes.push(PipelinePass::new(pass));
     }
 
-    /// Append one pass, for chaining.
+    /// Appends one pass and returns the chain, so calls can be chained.
     pub fn with_pass(mut self, pass: Handle<RenderPass>) -> Self {
         self.passes.push(PipelinePass::new(pass));
         self
     }
 }
 
-/// One entry as a `.pipeline` file holds it: the pass it names, and whether
-/// this chain runs it.
+// =============================================================================
+// PipelinePassDocument
+// =============================================================================
+
+/// One entry in a `.pipeline` file: the pass it names, and whether this chain
+/// runs it.
 ///
-/// The pass is a reference, so a chain outlives a pass being moved or renamed
-/// and one pass can appear in several chains. Its fields sit beside `enabled`
-/// rather than under a key of their own, which is what makes an entry read
-/// `{ "guid": …, "enabled": false }`.
+/// The pass is stored as a reference, so a chain survives a pass being moved or
+/// renamed, and one pass can appear in several chains. The reference's fields
+/// are written beside `enabled` instead of under a key of their own, so an
+/// entry reads `{ "guid": …, "enabled": false }`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PipelinePassDocument {
     /// The pass this entry runs, by guid.
     #[serde(flatten)]
     pub pass: AssetReference<RenderPass>,
-    /// Whether the chain runs it. A file that leaves the key out runs the pass,
-    /// so an older file keeps drawing what it always did.
+    /// Whether this chain runs the pass. A file that leaves the key out runs
+    /// it, so a file written before the key existed still draws what it always
+    /// did.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
 }
 
 impl Default for PipelinePassDocument {
+    /// An entry that names no pass, switched on.
     fn default() -> Self {
         Self {
             pass: AssetReference::unset(),
@@ -123,12 +138,12 @@ impl Default for PipelinePassDocument {
     }
 }
 
-/// `enabled`'s default, named so the serde attribute and [`Default`] agree.
-fn enabled_by_default() -> bool {
-    true
-}
+// =============================================================================
+// RenderingPipelineDocument
+// =============================================================================
 
-/// The pipeline as its file holds it: the passes, in the order they run.
+/// The pipeline as its file holds it. The passes are listed in the order they
+/// run.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RenderingPipelineDocument {
@@ -147,9 +162,9 @@ impl StandaloneAsset for RenderingPipeline {
         document: RenderingPipelineDocument,
         assets: &AssetManager,
     ) -> AssetLoadResult<Self> {
-        // A reference that resolves to nothing stays an invalid handle, exactly
-        // as a material's does: the chain the renderer builds skips a pass it
-        // cannot reach rather than refusing the whole file.
+        // A reference that resolves to nothing stays an invalid handle, the
+        // same as in a material. The chain the renderer builds then skips that
+        // pass instead of refusing the whole file.
         Ok(Self {
             passes: document
                 .passes
@@ -162,6 +177,20 @@ impl StandaloneAsset for RenderingPipeline {
         })
     }
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// The default for `enabled`, which is on. The serde attribute and [`Default`]
+/// both name this function, so the two cannot disagree.
+fn enabled_by_default() -> bool {
+    true
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -190,7 +219,7 @@ mod tests {
         assert!(RenderingPipeline::new().passes.is_empty());
     }
 
-    /// A chain built in code runs every pass it adds; only a file switches an
+    /// A chain built in code runs every pass it adds. Only a file can switch an
     /// entry off.
     #[test]
     fn an_added_pass_is_on_unless_the_file_says_otherwise() {
@@ -201,8 +230,9 @@ mod tests {
         assert!(pipeline.passes[0].enabled);
     }
 
-    /// The entry's key is optional, and leaving it out runs the pass so an older
-    /// pipeline file draws what it always did.
+    /// The entry's key is optional. Leaving it out runs the pass, so a
+    /// pipeline file written before the key existed still draws what it always
+    /// did.
     #[test]
     fn a_document_entry_reads_the_enabled_key_and_defaults_it_on() {
         let omitted: PipelinePassDocument =
@@ -217,8 +247,8 @@ mod tests {
         assert!(!off.enabled);
     }
 
-    /// A chain's file names its passes by guid, and the document resolves them
-    /// back to the handles the renderer wants, in the order they are listed.
+    /// A chain's file names its passes by guid. Loading the document turns them
+    /// back into handles, in the order the file lists them.
     #[test]
     fn a_document_resolves_its_passes_in_order() {
         let mut assets = AssetManager::new();

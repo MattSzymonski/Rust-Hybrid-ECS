@@ -1,19 +1,20 @@
-//! The UI painter: wgpu rendering for [`pill_ui_frame`] draw lists.
+//! The UI painter: draws [`pill_ui_frame`] draw lists with wgpu.
 //!
 //! # Responsibilities
 //!
-//! - [`UiRenderer`]: draws a [`pill_ui_frame::DrawList`] with wgpu - one pipeline,
-//!   the textures the frames carry as whole images, and scissor clipping.
+//! - [`UiRenderer`]: draws a [`pill_ui_frame::DrawList`] with one pipeline,
+//!   whole-image texture uploads and scissor clipping.
 //!
 //! # Design
 //!
-//! The drawing is plain data in, GPU work out - no global state, no window,
-//! no custom events, and no knowledge of who built the lists: a game's egui
-//! hands over `pill_ui_frame` values like any other producer would. It uses the
-//! renderer's own device and target, so no wgpu object crosses a DLL boundary,
-//! and it lives beside the overlay pass it draws after.
+//! The painter turns plain data into GPU work. It keeps no global state,
+//! opens no window and handles no events. It does not know who built the
+//! lists. A game's egui hands over `pill_ui_frame` values the same way any
+//! other producer would. It draws on the renderer's own device and into the
+//! renderer's target, so no wgpu object crosses a DLL boundary. It is the
+//! `overlay` module's sibling and draws after that module's pass.
 
-/// The draw-list renderer: pipeline, texture uploads, clips.
+/// The draw-list renderer: one pipeline, whole-image texture uploads and scissor clipping.
 mod renderer;
 
 pub(crate) use renderer::UiRenderer;

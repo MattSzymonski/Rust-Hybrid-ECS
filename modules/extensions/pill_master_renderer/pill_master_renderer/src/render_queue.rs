@@ -1,23 +1,25 @@
-//! What a frame's draws bind, and the key the queue sorts them by.
+//! The draw queue of one frame, and the key that decides the order its draws
+//! are made in.
 //!
 //! # Responsibilities
 //!
-//! - Carry one queued draw per frame instance: the shader, material and mesh
-//!   handles it binds, the instance it draws, and the order key the queue
+//! - Carry one queued draw per drawable frame instance: the shader, material
+//!   and mesh handles it binds, the instance it draws, and the key the queue
 //!   sorts on ([`RenderQueueItem`]).
-//! - Pack a draw's material order and the handles' slot identity into the
-//!   `u64` the queue sorts with one comparison
-//!   ([`compose_render_queue_key`]).
+//! - Pack a draw's rendering order and the slot identity of its handles into
+//!   the one `u64` the queue sorts by ([`compose_render_queue_key`]).
 //!
 //! # Design
 //!
-//! Ascending sort order of the key is what puts draws that share a shader,
-//! material, and mesh next to each other, which is what the mesh drawer
-//! batches into single instanced draws. The key exists for that comparison
-//! alone: it holds each index and version in one byte, so a value above 255
-//! truncates, and nothing reads a key back as a handle. The handles a draw
-//! binds travel beside it unchanged, so an asset whose slot version passed 255
-//! still draws with its own objects.
+//! Sorting by the key puts draws that use the same rendering order, shader,
+//! material and mesh next to each other. The mesh drawer records each run of
+//! equal keys as one instanced draw.
+//!
+//! The key exists only for that comparison. It stores each index and version
+//! in one byte, so a value above 255 keeps only its low byte, and nothing
+//! reads a key back as a handle. A draw carries its real handles beside the
+//! key, which is why an asset whose slot version has passed 255 still draws
+//! with its own objects.
 
 // Standard library
 use std::cmp::Ordering;
@@ -25,26 +27,34 @@ use std::cmp::Ordering;
 // Current crate
 use crate::resources::{RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle};
 
-/// One queued draw: the handles it binds, the instance it draws, and its sort
-/// key.
+// =============================================================================
+// Render Queue Item
+// =============================================================================
+
+/// One draw waiting in the queue, with the handles it binds, the instance it
+/// draws, and the key it is sorted by.
 ///
-/// The renderer builds one item per frame instance, so a sorted queue
-/// describes the whole frame's drawing. Ordering compares the key first and
-/// the instance index second, which keeps instances that share state in frame
-/// order within their batch; the handles take no part in it.
+/// The renderer adds one entry for each drawable instance of the frame, so a
+/// sorted queue describes everything the frame draws. Comparing two entries
+/// looks at the key first and at the instance index second, which keeps the
+/// instances that share a key in the frame's own order inside their batch. The
+/// handles take no part in the comparison.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderQueueItem {
-    /// Sort key: the material order and the handles' slot identity, as packed
-    /// by [`compose_render_queue_key`]. Compared, never read back.
+    /// The key this entry is sorted by. It packs the draw's rendering order and
+    /// the slot identity of its three handles, as
+    /// [`compose_render_queue_key`] lays them out. The queue only compares it
+    /// and never turns it back into handles.
     pub key: u64,
-    /// Index of the instance this item draws, into the frame's instance
-    /// vector, where the mesh drawer reads its transform from.
+    /// Position of the drawn instance in the frame's instance vector.
+    /// `build_queued_instances` reads that instance's transform to build the
+    /// model matrix.
     pub frame_instance_index: u32,
-    /// Shader the draw binds.
+    /// The shader this draw binds.
     pub shader: RendererShaderHandle,
-    /// Material the draw binds.
+    /// The material this draw binds.
     pub material: RendererMaterialHandle,
-    /// Mesh the draw binds.
+    /// The mesh this draw binds.
     pub mesh: RendererMeshHandle,
 }
 
@@ -63,7 +73,7 @@ impl PartialOrd for RenderQueueItem {
 }
 
 impl Ord for RenderQueueItem {
-    /// The queue's order: the sort key first, then the frame instance.
+    /// Compares two entries: the sort key first, then the instance index.
     fn cmp(&self, other: &Self) -> Ordering {
         self.key
             .cmp(&other.key)
@@ -71,25 +81,31 @@ impl Ord for RenderQueueItem {
     }
 }
 
-/// Packs a draw's material order and resource identity into one sortable
-/// `u64`, most significant byte first:
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Packs the rendering order of a draw and the resources it binds into one
+/// `u64` that sorts in the order the queue needs. The most significant byte
+/// comes first:
 ///
-/// - bits 56-63: material rendering order, stored inverted (`u8::MAX - order`);
-/// - bits 48-55: shader slot index;
-/// - bits 40-47: version the shader handle was issued at;
-/// - bits 32-39: material slot index;
-/// - bits 24-31: version the material handle was issued at;
-/// - bits 16-23: mesh slot index;
-/// - bits 8-15: version the mesh handle was issued at;
-/// - bits 0-7: unused, always zero.
+/// - bits 56-63: the material's rendering order, stored inverted
+///   (`u8::MAX - order`), so a higher order sorts earlier;
+/// - bits 48-55: the shader's slot index;
+/// - bits 40-47: the slot version the shader handle was issued with;
+/// - bits 32-39: the material's slot index;
+/// - bits 24-31: the slot version the material handle was issued with;
+/// - bits 16-23: the mesh's slot index;
+/// - bits 8-15: the slot version the mesh handle was issued with;
+/// - bits 0-7: unused and always zero.
 ///
-/// Pairing each slot index with its handle version makes a key name one
-/// incarnation of a slot.
+/// Because each slot index sits next to its version, a key names one exact
+/// state of each slot.
 ///
-/// The key is for sorting only. Every index and version occupies a single
-/// byte, so a value above 255 truncates to its low byte and aliases a lower
-/// one; a key never names the handles the draw binds, which travel on
-/// [`RenderQueueItem`] instead.
+/// The key is only ever compared. Every index and version is stored in a
+/// single byte, so a value above 255 keeps only its low byte and can match a
+/// lower value. A key never stands in for the handles a draw binds: those
+/// travel on [`RenderQueueItem`] beside it.
 pub fn compose_render_queue_key(
     order: u8,
     shader: RendererShaderHandle,
@@ -108,24 +124,29 @@ pub fn compose_render_queue_key(
         | (u64::from(mesh.version.get() as u8) << 8)
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::num::NonZeroU32;
 
-    /// A material that has been rebuilt 256 times keeps its own handle.
+    /// A material whose slot version reached 256 still draws with its own handle.
     ///
-    /// A long editing session re-inserts a material on every content change,
-    /// and the slot map hands the freed slot back with a bumped version, so a
-    /// version past 255 is reachable. The queue carries the handle itself, so
-    /// nothing is lost to the key's byte per field.
+    /// A long editing session re-inserts a material on every content change.
+    /// The slot map gives the freed slot back with its version increased by
+    /// one each time, so a version above 255 is reachable in practice. The key
+    /// stores only the low byte of a version, but the queue carries the
+    /// handles themselves, so the draw keeps its own objects.
     #[test]
     fn a_material_at_slot_version_256_keeps_its_handle() {
         let shader = RendererShaderHandle::new(3, NonZeroU32::new(4).unwrap());
         let material = RendererMaterialHandle::new(5, NonZeroU32::new(256).unwrap());
         let mesh = RendererMeshHandle::new(7, NonZeroU32::new(8).unwrap());
 
-        let item = RenderQueueItem {
+        let queued_draw = RenderQueueItem {
             key: compose_render_queue_key(0, shader, material, mesh),
             frame_instance_index: 0,
             shader,
@@ -133,9 +154,9 @@ mod tests {
             mesh,
         };
 
-        assert_eq!(item.material.data().version.get(), 256);
-        assert_eq!(item.shader, shader);
-        assert_eq!(item.mesh, mesh);
+        assert_eq!(queued_draw.material.data().version.get(), 256);
+        assert_eq!(queued_draw.shader, shader);
+        assert_eq!(queued_draw.mesh, mesh);
     }
 
     #[test]
@@ -159,7 +180,7 @@ mod tests {
         let material = RendererMaterialHandle::new(5, NonZeroU32::new(6).unwrap());
         let mesh = RendererMeshHandle::new(7, NonZeroU32::new(8).unwrap());
         let key = compose_render_queue_key(0, shader, material, mesh);
-        let item = |frame_instance_index| RenderQueueItem {
+        let queued_draw_at = |frame_instance_index| RenderQueueItem {
             key,
             frame_instance_index,
             shader,
@@ -167,7 +188,10 @@ mod tests {
             mesh,
         };
 
-        assert!(item(0) < item(1), "the same state keeps frame order");
-        assert_eq!(item(4), item(4));
+        assert!(
+            queued_draw_at(0) < queued_draw_at(1),
+            "the same state keeps frame order"
+        );
+        assert_eq!(queued_draw_at(4), queued_draw_at(4));
     }
 }

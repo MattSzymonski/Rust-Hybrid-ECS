@@ -1,40 +1,36 @@
-//! The wgpu renderer: the GPU machinery that turns the world's renderer data
-//! into frames.
+//! The wgpu renderer: the GPU work that turns the world's renderer data into
+//! frames.
 //!
 //! # Responsibilities
 //!
-//! - Own the GPU half: device and surface lifecycle ([`Renderer`]), the
-//!   [`resources`] caches, the [`drawers`], and the [`render_queue`] keys that
-//!   order a frame's draws, and the [`ui`] painter that draws the frame's
-//!   `pill_ui_frame` lists.
+//! - Own the GPU half: the device and surface lifecycle ([`Renderer`]), the
+//!   [`resources`] the renderer keeps, the [`drawers`], the [`render_queue`]
+//!   keys that order a frame's draws, and the [`ui`] painter that draws the
+//!   frame's `pill_ui_frame` lists.
 //! - Fill each frame from the world ([`frame`], the `rendering` system).
-//! - Install the renderer on an engine through [`register`]: the data from
-//!   `pill_renderer_api`, plus the system.
+//! - Install the renderer on an engine through [`register`], which adds that
+//!   system. The components and assets are not registered here:
+//!   `pill_master_renderer_data` registers them itself.
 //!
 //! # Design
 //!
 //! The data a renderer draws with - assets, components, the default pipelines
 //! and their WGSL - lives in `pill_master_renderer_data`; the contract between
 //! host and renderer - the frame, the backend trait, the camera - lives in
-//! `pill_renderer_api`. Neither carries wgpu, and both are re-exported here.
+//! `pill_renderer_api`. Neither links wgpu, and both are re-exported here.
 //! This crate is the only renderer crate that links wgpu, which is what lets a
 //! development host load and reload it as a module while everything around it
-//! compiles against data.
+//! compiles against data only.
 
-// The contract lives in `pill_renderer_api` and this renderer's data in
-// `pill_master_renderer_data`; neither carries wgpu. Their modules are
-// re-exported so this crate's own paths (`crate::api`, `crate::assets`,
-// `crate::components`, `crate::config`) keep resolving.
-pub use pill_master_renderer_data::{assets, components, config};
-pub use pill_renderer_api::api;
-
-/// The mesh drawer: batches queued entities and records the instanced draws.
+/// The mesh drawer: batches the instances a frame queues and records the
+/// instanced draws they become.
 ///
-/// Crate-private: `renderer.rs` is the only consumer, and the renderer's
-/// extension ABI is what other crates compile against, not these helpers.
+/// Crate-private: `renderer.rs` is its only consumer, and other crates reach
+/// the renderer through its extension ABI, not through these helpers.
 pub(crate) mod drawers;
 
-/// Renderer failures, re-exported, and the wgpu validation capture.
+/// Renderer failures, re-exported from the contract crate, and the capture
+/// that turns wgpu's errors into them.
 pub mod error;
 
 /// The system that turns the world into the frame the renderer draws.
@@ -43,13 +39,15 @@ pub mod frame;
 /// The per-instance transform the drawer uploads for the vertex shader.
 pub mod instance;
 
-/// The frame's chain as GPU objects: a pass pipeline each, and the plan a frame is recorded from.
+/// Holds the frame's chain as GPU objects and the plan each frame is recorded
+/// from.
 mod chain;
 
 /// The asset preview path: one small off-screen render, read back as pixels.
 mod preview;
 
-/// Debug drawing, selection outlines and picking, drawn over each surface.
+/// Debug drawing, gizmos, selection outlines, picking and the scene grid,
+/// drawn over each surface.
 mod overlay;
 
 /// The query sets and readbacks behind GPU profiling measurements.
@@ -58,19 +56,23 @@ pub mod profiler;
 /// Mapping a GPU buffer back to the CPU without stalling a frame.
 mod readback;
 
-/// Queue items: what one instance draws with, in the order a frame draws them.
+/// One queued draw per frame instance, and the sort key that puts draws
+/// sharing a shader, material and mesh next to each other.
 pub mod render_queue;
 
 /// The wgpu renderer: the surfaces, the GPU caches and the frame submission.
 pub mod renderer;
 
-/// The GPU objects behind the asset store, kept level with it one type at a time.
+/// The GPU objects that mirror the asset store, refreshed one asset type at a
+/// time.
 mod rendering_resources_manager;
 
-/// One module per cached GPU resource, re-exported flat for the renderer.
+/// One module per resource the renderer keeps, re-exported flat so callers
+/// name them without the path.
 pub mod resources;
 
-/// A GPU buffer rewritten every surface, shared by the overlay and the UI painter.
+/// A GPU buffer rewritten every surface, shared by the overlay and the UI
+/// painter.
 mod stream_buffer;
 
 /// The window surface, its swapchain, and the lifecycle that keeps them live.
@@ -88,12 +90,18 @@ pub mod module_entry;
 
 // External crates
 use pill_engine::{pill_module, Engine};
+
+// The contract and the data crates are re-exported here - their items and
+// their module names - so this crate's own paths (`crate::api`,
+// `crate::assets`, `crate::components`, `crate::config`) resolve.
 pub use pill_master_renderer_data::components::*;
+pub use pill_master_renderer_data::{assets, components, config};
 pub use pill_master_renderer_data::{
     AssetLoader, Material, MaterialBuilder, MaterialParameter, Mesh, MeshVertex, PassKind,
     PassTarget, PipelinePass, RenderPass, RenderingPipeline, Shader, ShaderBuilder,
     ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, Texture, TextureType,
 };
+pub use pill_renderer_api::api;
 pub use pill_renderer_api::{
     FrameOutcome, HeadlessRenderer, PillRenderer, RawWindowData, RenderCapabilities, RenderMetrics,
 };
@@ -105,19 +113,23 @@ pub use instance::Instance;
 pub use renderer::Renderer;
 pub use resources::RenderingManager;
 
-/// The module's entry point: registers the post-update `rendering` system
-/// that fills the frame, once, and returns zero.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// The module's entry point: adds the post-update `rendering` system that
+/// fills the frame, once, and returns zero.
 ///
-/// The system is registered under whatever scope the caller opened: a host
-/// loading this module scopes it to the module's own owner, so a reload clears
-/// exactly this system and the next generation registers its own. The
-/// generated `host_module_*` wrapper carries this as `pill_module_init` by
-/// expanding `__pill_module_entry_points!`.
+/// The system belongs to whatever scope the caller opened. A host loading this
+/// module gives it the module's own owner, so a reload removes exactly this
+/// system and the next generation registers its own. The generated
+/// `host_module_*` wrapper carries this as `pill_module_init` by expanding
+/// `__pill_module_entry_points!`.
 ///
-/// Registers no data: the host registers `pill_renderer_api` - components,
-/// asset types, resources, the default pipeline - before anything loads, and
-/// doing it here would re-point the asset types' tables at this image, the one
-/// that reloads most often.
+/// Registers no data: `pill_master_renderer_data`'s own `register` declares the
+/// components, asset types, resources and default pipeline before this module
+/// loads, and doing it here would point the asset types' tables at this image,
+/// which reloads most often.
 #[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     if !engine.is_registered("rendering") {
@@ -126,16 +138,20 @@ pub fn register(engine: &mut Engine) -> u32 {
     0
 }
 
-/// Start building a renderer backend on a window, for a host that links this
-/// crate statically - the shipping posture, which has no module to load.
+/// Starts building a renderer backend on a window, for a host that links this
+/// crate statically - the shipping posture, where there is no module to load.
 ///
-/// A future, because creating the device is asynchronous: a native frontend
-/// blocks on it once, a web frontend awaits it. The loaded-module path reaches
-/// the same renderer through the blocking `pill_renderer_attach` export
-/// instead.
+/// Returns a future because creating the device is asynchronous: a native
+/// frontend blocks on it once, and a web frontend awaits it. A host that loads
+/// this crate as a module reaches the same renderer through the blocking
+/// `pill_renderer_attach` export instead.
 ///
-/// The future fails with a [`RendererError`] when creating the renderer fails:
-/// surface, adapter or device creation, or one of the objects built after them.
+/// # Errors
+///
+/// The future fails with a [`RendererError`] when building the renderer fails:
+/// acquiring the surface or the adapter, creating the device, or creating an
+/// object built after them - the surface configuration, the depth buffer, the
+/// resource storage, the default material or the camera.
 ///
 /// # Safety
 ///
@@ -153,13 +169,17 @@ pub unsafe fn attach(
     })
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pill_engine::Engine;
 
-    /// The renderer's registration adds exactly one `rendering` system on top
-    /// of the data, however often it runs.
+    /// Registering twice returns zero both times and leaves the `rendering`
+    /// system registered.
     #[test]
     fn registering_the_renderer_adds_the_rendering_system_once() {
         let mut engine = Engine::new();

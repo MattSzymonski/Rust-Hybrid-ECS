@@ -77,9 +77,10 @@ const REGISTRATION_HEADROOM_WARNING_THRESHOLD: usize = 16;
 //
 // In parallel mode several systems run on different threads at once, so each
 // needs its own "last ran at tick X" baseline for change-detection filters; a
-// field on `World` would race. The scheduler stores the baseline before a system
-// runs and restores the previous value afterwards, so both overrides are `None`
-// in sequential mode and queries fall back to the shared world fields.
+// field on `World` would race. The engine's parallel dispatch stores the
+// baseline before a system runs and restores the previous value afterwards, so
+// both overrides are `None` in sequential mode and queries fall back to the
+// shared world fields.
 //
 // The same storage carries each parallel system's "this run" tick: a batch runs
 // every system against one world, so bumping the shared counter there would be
@@ -190,10 +191,10 @@ impl IteratorTimings {
 pub struct SharedResourceClaim {
     /// The shared name the claiming type declared.
     pub shared_name: String,
-    /// Name of the first declarer: a Rust type's final path segment, or a
+    /// Name of the recorded declarer: a Rust type's final path segment, or a
     /// managed full name for a declaration from another language.
     pub declaring_type: String,
-    /// Whether the first declarer was another language's declaration.
+    /// Whether the recorded declaration came from another language.
     ///
     /// Such a claim carries no Rust type name to compare against, so the name
     /// check applies only between two Rust declarations - see
@@ -218,7 +219,7 @@ pub struct SharedResourceClaim {
 
 /// One live entity and the type names of the components attached to it.
 ///
-/// Returned by [`World::entity_rows`] for the editor's Hierarchy panel. The
+/// Returned by [`World::entity_rows`] for the editor's Hierarchy list. The
 /// names are stable across hot reloads; the [`Entity`] handle is the stable
 /// selection identity.
 #[derive(Clone, Debug, PartialEq)]
@@ -306,8 +307,9 @@ impl ComponentFieldLayout {
 pub struct World {
     // --- Entity allocation and locations ---
     /// Next fresh entity ID handed out when the free list is empty.
-    next_free_entity_id: u64,
-    /// Free list of recycled entity IDs with their next generation. Stored as (id, next_generation) pairs
+    next_fresh_entity_id: u64,
+    /// Free list of recycled entity IDs, each with the generation it will be
+    /// handed out with. Stored as (id, generation) pairs.
     pub(crate) free_entity_ids: Vec<(u64, u32)>,
     /// Stable id of every live entity, by its handle.
     ///
@@ -319,13 +321,13 @@ pub struct World {
     entity_handles: HashMap<EntityId, Entity>,
     /// Seeds the counter-derived ids used when the platform has no random
     /// source; see [`Self::mint_entity_id`].
-    entity_id_fallback: u64,
+    entity_id_fallback_counter: u64,
     // --- Archetypes, columns and entity locations ---
     /// All archetypes in the world
     pub(crate) archetypes: HashMap<ArchetypeId, Archetype>,
     /// Tracks where each entity is located in the archetype system
     pub(crate) entity_locations: HashMap<Entity, EntityLocation>,
-    /// Storage factories for creating component storage by TypeId
+    /// Storage factories for creating component storage by component id
     pub(crate) storage_factories: HashMap<ComponentId, StorageFactory>,
     /// The native function table each id held before its latest registration
     /// replaced it.
@@ -342,10 +344,10 @@ pub struct World {
     // --- Component registry ---
     /// Component registry for bit indices and names
     pub(crate) component_registry: ComponentRegistry,
-    // --- Resources (the six per-id maps are swept together by
-    //     `remove_resource_records`; `resource_claim_counts` is owned by
-    //     `release_resource_claims` and `resource_registration_sequence` is a
-    //     world-wide counter) ---
+    // --- Resources (the five per-id record maps are swept together by
+    //     `remove_resource_records`, and the stored value itself is taken by the
+    //     caller; `resource_claim_counts` is owned by `release_resource_claims`
+    //     and `resource_registration_sequence` is a world-wide counter) ---
     /// Resources (singleton data) stored by type.
     ///
     /// [`ErasedResource`] rather than `Box<dyn Any>`: a trait object carries
@@ -405,8 +407,9 @@ pub struct World {
     // --- Per-frame bookkeeping ---
     /// Monotonically increasing world tick used for change detection.
     ///
-    /// Bumped once per frame by the [`Engine`](crate::engine::Engine) and by
-    /// each query that supports change tracking when its iteration begins.
+    /// Bumped once per frame by the [`Engine`](crate::engine::Engine), once per
+    /// member when a parallel batch reserves its ticks, and by each query that
+    /// supports change tracking when its iteration begins.
     /// Stored as a plain `u32` and compared with wrapping arithmetic
     /// ([`Tick::is_newer_than`](crate::component::Tick::is_newer_than)), so a
     /// wrap is harmless.
@@ -447,7 +450,7 @@ pub struct World {
     #[cfg(debug_assertions)]
     pub(crate) debug_resource_write_locks: std::sync::Mutex<std::collections::HashSet<ResourceId>>,
 
-    /// Number of deferred commands executed in the current frame.
+    /// Number of deferred commands the most recent flush took off the queue.
     /// Set by `CommandQueue::execute_queued_commands`, read by the Engine for Tracy plots.
     pub(crate) commands_executed_this_frame: usize,
 
@@ -506,8 +509,8 @@ pub struct World {
     /// `init` registered at all — the distinction between a type that was
     /// dropped entirely and one merely downgraded to a plain component.
     pub(crate) component_registration_sequence: u64,
-    /// Chronological `(type_name, sequence)` log of every component
-    /// registration, plain and persistable alike.
+    /// Chronological `(type_name, component_id, sequence)` log of every
+    /// component registration, plain and persistable alike.
     pub(crate) component_registration_log: Vec<(String, ComponentId, u64)>,
     /// Field layouts submitted by `#[derive(PillComponent)]` (static, living
     /// in the declaring artifact) or described at runtime by a foreign-language
@@ -531,10 +534,11 @@ pub struct World {
     /// resolver left installed would point into it after it unloads.
     pub(crate) value_type_layout_resolver:
         Option<crate::component_registry::ValueTypeLayoutResolver>,
-    /// First component-registration failure of the current init pass, if any.
+    /// First registration failure of the current init pass, if any.
     ///
-    /// Set when the 128-type ceiling is hit (or any other registry error
-    /// surfaces during `register_component`). The artifact-wide registration
+    /// Set when the 128-type ceiling is hit, when any other registry error
+    /// surfaces during `register_component`, and when a shared resource claim
+    /// or a persistable registration is refused. The artifact-wide registration
     /// loop drains it so the generated `init` can fail the reload
     /// transactionally instead of running with a half-registered component set.
     registration_error: Option<WorldError>,
@@ -544,11 +548,11 @@ impl World {
     /// Create a new empty World
     pub fn new() -> Self {
         Self {
-            next_free_entity_id: 0,
+            next_fresh_entity_id: 0,
             free_entity_ids: Vec::new(),
             entity_ids: HashMap::new(),
             entity_handles: HashMap::new(),
-            entity_id_fallback: 0,
+            entity_id_fallback_counter: 0,
             archetypes: HashMap::new(),
             entity_locations: HashMap::new(),
             storage_factories: HashMap::new(),
@@ -638,11 +642,12 @@ impl World {
         Some((archetype.id, archetype.entities.as_slice()))
     }
 
-    /// Entity IDs that were destroyed and are waiting to be handed out again.
+    /// Entity slots waiting to be handed out again.
     ///
-    /// The engine's own retirement pool: an ID here belongs to no live entity,
-    /// but the slot is kept so a later spawn reuses it with a bumped
-    /// generation rather than growing the ID space.
+    /// The engine's own retirement pool: a slot here belongs to no live entity,
+    /// but it is kept so a later spawn reuses it rather than growing the ID
+    /// space. A destroyed slot comes back with the next generation; one
+    /// released before its entity was inserted keeps its own.
     pub fn recycled_entity_id_count(&self) -> usize {
         self.free_entity_ids.len()
     }
@@ -717,7 +722,7 @@ impl World {
                 ),
                 (
                     "Next fresh entity ID to allocate: {}",
-                    self.next_free_entity_id
+                    self.next_fresh_entity_id
                 )
             ]
         );
@@ -727,10 +732,10 @@ impl World {
         } else {
             // Allocate a fresh ID
             let entity = Entity {
-                id: self.next_free_entity_id,
+                id: self.next_fresh_entity_id,
                 generation: 0,
             };
-            self.next_free_entity_id += 1;
+            self.next_fresh_entity_id += 1;
             entity
         }
     }
@@ -738,8 +743,9 @@ impl World {
     /// Reserve a generation-checked handle for a deferred entity creation.
     ///
     /// The returned entity is not visible to queries until a command inserts
-    /// it. This is the type-erased counterpart of [`Commands::create_entity`]
-    /// used by foreign-language runtimes.
+    /// it. This is the type-erased counterpart of [`Commands::create_entity`],
+    /// used by language bindings, the editor and the renderer to hold a handle
+    /// before the entity exists.
     pub fn reserve_entity(&mut self) -> Entity {
         self.allocate_entity()
     }
@@ -772,9 +778,9 @@ impl World {
     /// Random, so an id says nothing about the order entities were spawned in
     /// and a stale reference names nothing rather than a later occupant. Four
     /// attempts cover a collision; after that - or when the platform has no
-    /// random source at all - the fallback derives an id from a counter, and
-    /// says so once, because a world that cannot spawn is worse than one whose
-    /// ids are predictable.
+    /// random source at all - the fallback derives an id from a counter and
+    /// logs a warning, because a world that cannot spawn is worse than one
+    /// whose ids are predictable.
     fn mint_entity_id(&mut self) -> EntityId {
         for _ in 0..4 {
             match EntityId::random() {
@@ -790,8 +796,8 @@ impl World {
                 }
             }
         }
-        let id = EntityId::from_name(&format!("pill:entity:{}", self.entity_id_fallback));
-        self.entity_id_fallback = self.entity_id_fallback.wrapping_add(1);
+        let id = EntityId::from_name(&format!("pill:entity:{}", self.entity_id_fallback_counter));
+        self.entity_id_fallback_counter = self.entity_id_fallback_counter.wrapping_add(1);
         id
     }
 
@@ -864,20 +870,20 @@ impl World {
         }
 
         // Cold path: create new archetype (only sort when actually creating)
-        let mut sorted_ids = component_ids;
-        sorted_ids.sort();
+        let mut sorted_component_ids = component_ids;
+        sorted_component_ids.sort();
 
         crate::profile_message!(
             "new archetype created: {:?} with {} component types (total archetypes now: {})",
             ArchetypeId(component_mask.bits()),
-            sorted_ids.len(),
+            sorted_component_ids.len(),
             self.archetypes.len() + 1,
         );
 
         // Create archetype with storage for all component types
         let new_archetype = Archetype::new(
             archetype_id,
-            sorted_ids,
+            sorted_component_ids,
             component_mask,
             &self.storage_factories,
         );
@@ -898,7 +904,7 @@ impl World {
             stable_id: None,
             // Most entities have 3-8 components; pre-allocate to avoid
             // reallocation during .with() chains.
-            components: Vec::with_capacity(
+            component_inserters: Vec::with_capacity(
                 crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY,
             ),
         }
@@ -957,7 +963,7 @@ impl World {
                      while inserting entity {entity:?}"
             )
         });
-        let index: usize = archetype.entities.len();
+        let row_index: usize = archetype.entities.len();
 
         // Step 2: Append the entity row, then let the closure push each
         // component's concrete value into its column.
@@ -994,7 +1000,7 @@ impl World {
         // cannot know is which tick the world is on.
         for &component_id in &archetype.component_types {
             if let Some(column) = archetype.component_storages.get_mut(component_id) {
-                column.set_row_ticks(index, ComponentTicks::new(current_tick));
+                column.set_row_ticks(row_index, ComponentTicks::new(current_tick));
             }
         }
 
@@ -1003,7 +1009,7 @@ impl World {
             entity,
             EntityLocation {
                 archetype_id,
-                index_in_archetype: index,
+                index_in_archetype: row_index,
             },
         );
 
@@ -1061,7 +1067,7 @@ impl World {
         );
         // Step 1: Resolve where the entity currently lives.
         let old_location = match self.entity_locations.get(&entity) {
-            Some(loc) => *loc,
+            Some(location) => *location,
             None => return Err(WorldError::EntityNotFound),
         };
 
@@ -1317,8 +1323,8 @@ impl World {
         };
         // `component_types` and `component_storages` are separate fields, so
         // the list can be read while the columns beside it are written.
-        let component_types: &[ComponentId] = &new_archetype.component_types;
-        for &component_id in component_types {
+        let component_type_ids: &[ComponentId] = &new_archetype.component_types;
+        for &component_id in component_type_ids {
             let source = old_archetype.component_storages.get(component_id);
             // A component both archetypes name but the source has no column for
             // cannot be carried, and nothing else would write it, so the
@@ -1365,7 +1371,7 @@ impl World {
         // Step 1: Remove the entity's location record; a missing record
         // means the entity is already gone.
         let location = match self.entity_locations.remove(&entity) {
-            Some(loc) => loc,
+            Some(location) => location,
             None => return false, // Entity doesn't exist
         };
 
@@ -1376,7 +1382,7 @@ impl World {
         }
 
         let archetype = match self.archetypes.get_mut(&location.archetype_id) {
-            Some(arch) => arch,
+            Some(archetype) => archetype,
             None => return false,
         };
 
@@ -1562,8 +1568,8 @@ pub struct EntityBuilder<'w> {
     entity: Entity,
     /// Stable id the creator supplied, or `None` to mint a fresh one.
     stable_id: Option<EntityId>,
-    /// Type-erased components accumulated via [`with`](Self::with).
-    components: Vec<Box<dyn ComponentInserter>>,
+    /// Type-erased component inserters accumulated via [`with`](Self::with).
+    component_inserters: Vec<Box<dyn ComponentInserter>>,
 }
 
 impl<'w> EntityBuilder<'w> {
@@ -1582,7 +1588,7 @@ impl<'w> EntityBuilder<'w> {
     where
         T: Component,
     {
-        self.components
+        self.component_inserters
             .push(Box::new(TypedComponentInserter { component }));
         self
     }
@@ -1597,8 +1603,11 @@ impl<'w> EntityBuilder<'w> {
     /// added more than once, and [`BuildError::DuplicateEntityId`] when the id
     /// given to [`with_id`](Self::with_id) belongs to a live entity.
     pub fn build(self) -> Result<Entity, BuildError> {
-        let mut component_ids: Vec<ComponentId> =
-            self.components.iter().map(|c| c.component_id()).collect();
+        let mut component_ids: Vec<ComponentId> = self
+            .component_inserters
+            .iter()
+            .map(|component_inserter| component_inserter.component_id())
+            .collect();
         let _zone = crate::profile_scope!(
             "entity build",
             [("Component types on entity: {}", component_ids.len())]
@@ -1642,11 +1651,11 @@ impl<'w> EntityBuilder<'w> {
         }
 
         let stable_id = self.stable_id;
-        let components = self.components;
+        let component_inserters = self.component_inserters;
         self.world
             .insert_entity_with_components(entity, component_ids, stable_id, |storage| {
-                for inserter in components {
-                    inserter.insert(storage);
+                for component_inserter in component_inserters {
+                    component_inserter.insert(storage);
                 }
             });
         Ok(entity)

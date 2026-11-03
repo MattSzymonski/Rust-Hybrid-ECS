@@ -2,9 +2,15 @@
 //!
 //! # Responsibilities
 //!
-//! - `inspector_tab` and its header: the selected entity's name and the Add Component popup.
-//! - `entity_inspector` and its section headers: one collapsible section per component, expanded through the row builders.
-//! - `addable_components`: the components the popup offers.
+//! - `inspector_tab` and its header: the selected entity's name and the Add
+//!   Component popup.
+//! - `entity_inspector` and its section headers: one collapsible section per
+//!   component, with the rows the inspector's row model asks for.
+//! - `addable_components`: the components the Add popup and the component menu
+//!   offer.
+//! - The vector row metrics (`INSPECTOR_VECTOR_FIELD_WIDTH`,
+//!   `INSPECTOR_VECTOR_LABEL_WIDTH`, `INSPECTOR_VECTOR_FIELD_HEIGHT`) the
+//!   field rows size each axis group with.
 //!
 //! The globs below are absolute paths, so a patch crate resolves them too.
 
@@ -12,25 +18,36 @@
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// One vector element's group width, in points: the axis letter and its
-/// field together, so a wrap moves the pair and never separates them.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The width of one vector element's group, in points: the axis letter and
+/// its field together. The group wraps as one unit, so a wrap never separates
+/// the letter from its field.
 pub const INSPECTOR_VECTOR_FIELD_WIDTH: f32 = 58.0;
 
-/// The slot an axis letter occupies inside its group, in points: fixed, so
-/// every component's editor gets the same width whatever the glyph's advance
-/// happens to be.
+/// The width of the slot that holds an axis letter inside its group, in
+/// points. The slot is fixed, so every component's editor gets the same width
+/// however wide the letter's glyph is.
 pub const INSPECTOR_VECTOR_LABEL_WIDTH: f32 = 10.0;
 
-/// One vector component's height, in points: the height of the control the
-/// editors draw, and of the row itself.
+/// The height of one vector field, in points. The field's editor and the group
+/// that holds it are both this tall.
 pub const INSPECTOR_VECTOR_FIELD_HEIGHT: f32 = 18.0;
 
-/// The Inspector tab: the selected entity's components as collapsible
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Draws the Inspector tab: the selected entity's components as collapsible
 /// sections (a caret, the component's duotone icon and its label), the Add
 /// Component button in the tab's top-right, and the selected asset's import
-/// settings as editable leaves below. Every commit is a recorded `SetField` /
-/// `SetArrayElement` / `SetAssetSettings` edit, coalesced per widget so a
-/// drag or a typing run is one undo step.
+/// settings as editable rows below.
+///
+/// Every edit the tab queues is recorded as a `SetField`, `SetArrayElement` or
+/// `SetAssetSettings` command. Each widget's edits share one coalesce key, so
+/// one drag or one typing run becomes a single undo step.
 #[pill_hot_fn]
 pub fn inspector_tab(
     ui: &mut egui::Ui,
@@ -40,9 +57,9 @@ pub fn inspector_tab(
     overlay_regions: &mut Vec<ShellRect>,
     session: &mut InspectorSession,
 ) {
-    // No scroll area of its own: the dock wraps every tab body in one, and a
-    // nested area sizes itself to its content rather than to the body, so its
-    // rows would sit outside the scrolled region.
+    // This tab has no scroll area of its own. The dock already wraps the tab
+    // body in one, and a nested area sizes itself to its content instead of
+    // the body, so its rows would fall outside the scrolled region.
     // A selected resource takes the tab: one selection shows one thing.
     if let Some(view) = selection
         .resource
@@ -52,11 +69,10 @@ pub fn inspector_tab(
         resource_section(ui, view, pending);
         return;
     }
-    // The rows this tab reports are the ones it draws for the entity in front
-    // of it: a new subject makes every row - and every rectangle - new again,
-    // so what the previous subject left in the session cannot hide the new
-    // entity's rows or point a click at a rectangle a section no longer
-    // occupies.
+    // The row log and the remembered rectangles belong to the entity on
+    // screen. When another entity becomes the subject, forget both: a stale
+    // row model could hide the new entity's rows, and a remembered rectangle
+    // could point a click at a section that is no longer there.
     let subject = snapshot.detail.as_ref().map(|detail| detail.entity);
     if session.subject != subject {
         session.subject = subject;
@@ -77,8 +93,8 @@ pub fn inspector_tab(
             }
         },
     }
-    // The selected asset's section follows the entity's: its kind and
-    // its import settings, editable leaf by leaf.
+    // The selected asset's section comes after the entity's. It shows the
+    // asset's kind and its import settings, editable one leaf at a time.
     let selected_asset = selection.asset.as_deref();
     if let Some(detail) = snapshot
         .asset_detail
@@ -91,12 +107,13 @@ pub fn inspector_tab(
         if detail.row.standalone {
             read_only_row(ui, "standalone", "yes");
         }
-        // A module's resource is shown as it is: every row reads, and nothing
-        // here can repoint it.
+        // A module's resource is shown as it is. Every row only reads, and
+        // nothing here can repoint it.
         if detail.row.read_only {
-            // The one line that says the section refused to offer an edit,
-            // printed once per asset per session: the tab redraws every frame,
-            // so the notice alone is not something a suite could wait on.
+            // Log the read-only notice once per asset per session. The tab
+            // redraws every frame, so the drawn notice is there all the time
+            // and a suite has no single moment to wait for; this line marks
+            // the first draw.
             if session.notices_logged.insert(detail.key()) {
                 pill_core::info!(
                     target: pill_core::telemetry::telemetry_target::ENGINE,
@@ -131,8 +148,9 @@ pub fn inspector_tab(
             }
         }
     }
-    // The strip below the rows carries the component menu where no
-    // heading is there to hang it on (a right-click there adds).
+    // The strip below the rows carries the component menu where no section
+    // heading can hang it. A right-click there only offers the Add Component
+    // submenu.
     if let Some(detail) = snapshot.detail.as_ref() {
         let empty = ui.allocate_response(empty_area(ui), egui::Sense::click());
         context_menu("inspector", &empty, overlay_regions, &mut |ui| {
@@ -141,8 +159,9 @@ pub fn inspector_tab(
     }
 }
 
-/// The Inspector's top row: the selected entity's name and, right aligned,
-/// the Add Component button with the components it can attach.
+/// Draws the Inspector's top row: the selected entity's name, and the Add
+/// Component button aligned to the right. The button opens and closes the
+/// popup that lists the components it can attach.
 pub fn inspector_header(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
@@ -191,9 +210,10 @@ pub fn inspector_header(
     }
 }
 
-/// The Add Component popup: every registered addable component the entity
-/// does not carry yet, under the `+` button. A pick queues the recorded
-/// `add {short}` step the header menu and the scripted channel queue.
+/// Draws the Add Component popup, opened under the `+` button. It lists every
+/// registered addable component the entity does not carry yet; a pick queues
+/// the recorded `add {short}` step that the component menu and the scripted
+/// channel also queue.
 pub fn inspector_add_popup(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
@@ -250,16 +270,19 @@ pub fn inspector_add_popup(
                     });
             });
         });
-    // The popup floats over the panels; its rectangle is the UI's.
+    // The popup floats over the panels, so the frame must treat a press inside
+    // it as the UI's and never as a scene pick.
     overlay_regions.push(shell_rect(area.response.rect));
     if let Some(type_name) = picked {
         let (command, label) = inspector::component_add(detail.entity, &type_name);
         pending.push_recorded(vec![command], label, None);
         session.add_open = false;
     } else if addable.is_empty() {
-        // Nothing to pick: a second click on the button closes it.
+        // Nothing to pick. The popup stays open, and the next click on the
+        // button or a press outside closes it.
     }
-    // A press anywhere outside the button and the popup closes the popup.
+    // Any pointer press outside the button and outside the popup closes it,
+    // whatever button it was.
     let outside = ui.ctx().input(|input| {
         input.pointer.any_pressed()
             && input.pointer.interact_pos().is_some_and(|position| {
@@ -271,8 +294,8 @@ pub fn inspector_add_popup(
     }
 }
 
-/// The components a section may attach: registered, addable and not already
-/// on the entity.
+/// Returns the components the entity can still take: every registered one
+/// that is marked addable and that the entity does not carry yet.
 pub fn addable_components<'a>(snapshot: &'a EditorSnapshot, detail: &EntityDetail) -> Vec<&'a str> {
     snapshot
         .components
@@ -288,9 +311,10 @@ pub fn addable_components<'a>(snapshot: &'a EditorSnapshot, detail: &EntityDetai
         .collect()
 }
 
-/// One entity's components as collapsible sections: a header bar (caret,
-/// duotone icon, label) that toggles the session's collapse state and carries
-/// the component menu, then the rows the field model asks for.
+/// Draws one entity's components as collapsible sections. Each one has a
+/// header bar (a caret, the component's duotone icon and its label) that
+/// toggles the section and opens the component menu on a right-click, then
+/// the rows the inspector's row model asks for.
 pub fn entity_inspector(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
@@ -360,8 +384,8 @@ pub fn entity_inspector(
     }
 }
 
-/// The selected entities one component's edit reaches: the primary first, then
-/// every other selected entity whose detail carries the component.
+/// Returns the entities one component's edit reaches: the primary first, then
+/// every other selected entity that carries the component.
 pub fn inspector_targets(
     snapshot: &EditorSnapshot,
     primary: Entity,
@@ -370,10 +394,12 @@ pub fn inspector_targets(
     inspector::selection_targets(&snapshot.selected_details, primary, component)
 }
 
-/// One component section's header bar: the foldout caret, the component's
-/// duotone icon and its label, on the panel's control fill. The bar is
-/// clickable as a whole (a click toggles the section) and logs its rectangle
-/// once per placement.
+/// Draws one component section's header bar: the foldout caret, the
+/// component's duotone icon and its label, on the panel's control fill.
+///
+/// Returns the bar's response. The whole bar is clickable, and the caller
+/// toggles the section when the response reports a click. The bar logs its
+/// rectangle once per placement.
 pub fn inspector_section_header(
     ui: &mut egui::Ui,
     component: &ComponentView,

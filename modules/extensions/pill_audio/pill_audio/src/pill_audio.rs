@@ -1,80 +1,90 @@
-//! Extension providing sound playback.
+//! The audio extension: sound assets, playback components and the system that
+//! plays them.
 //!
 //! # Responsibilities
 //!
 //! - Defines the [`Sound`] asset: encoded audio bytes held by the
-//!   [`AssetManager`](pill_engine::AssetManager) and decoded per playback.
+//!   [`AssetManager`](pill_engine::AssetManager) and decoded for each playback.
 //! - Defines the [`AudioListenerComponent`] and [`AudioSourceComponent`]
-//!   components, and the [`AudioManager`] resource owning the output stream
+//!   components, and the [`AudioManager`] resource that owns the output stream
 //!   and its sink pools.
-//! - Registers the [`audio_system`] that drives playback each frame.
+//! - Registers [`audio_system`], which drives playback on every frame.
 //!
 //! # Design
 //!
 //! **A sound is an asset, not a resource.** A world holds many sounds, so
-//! [`Sound`] implements [`Asset`](pill_engine::Asset) and is addressed by
-//! `Handle<Sound>`. The handle is generational: unloading a sound leaves every
-//! [`AudioSourceComponent`] pointing at it resolving to `None` next frame,
-//! instead of the asset having to clear every component that names it.
+//! [`Sound`] implements [`Asset`](pill_engine::Asset) and is referenced by
+//! `Handle<Sound>`. The handle carries a generation: after a sound is unloaded,
+//! a handle that names it finds nothing, so a component that still holds the
+//! handle plays nothing. The asset never has to clear the components that name
+//! it.
 //!
-//! **The audio manager is a resource** because there is exactly one output
-//! device, and its rodio stream must never be dropped while sinks play - the
-//! lifetime a resource has.
+//! **The audio manager is a resource** because the machine has exactly one
+//! output device, and its rodio stream must stay open while any sink plays. A
+//! resource lives as long as the world, which is the lifetime the stream needs.
 //!
-//! **Commands carry intent.** A caller mutating a component cannot reach the
-//! manager, so intent is stored as a plain [`AudioCommand`] field and drained
-//! by [`audio_system`]. The component stays `#[repr(C)]` plain data, which is
-//! what lets it survive a hot reload and be read from C#.
+//! **A component records the request; the system performs it.** A caller that
+//! edits a component cannot reach the manager, so the requested action is kept
+//! as a plain [`AudioCommand`] field and carried out by [`audio_system`]. The
+//! component stays `#[repr(C)]` plain data, which is what lets it survive a hot
+//! reload and be read from C#.
 //!
 //! ## Spatial audio
 //!
-//! A spatial sink wants a 3D point, and the transform's
-//! [`translation`](pill_engine::TransformComponent::translation) is exactly
-//! that: an emitter follows its entity's translation and the listener's ears
-//! are placed around it.
-//! [`AudioListenerComponent`] still carries its own `facing_degrees` rather
-//! than reading the transform's quaternion, and [`ear_positions`] is the one
-//! conversion between a listener's placement and the two points rodio pans
-//! against.
-
-// The build script scans this crate and emits one address entry per function
-// into `function_inventory.rs`; the `include!` is what makes every function
-// resolvable by qualified path with nothing in this file annotated. It lives
-// at the crate root because that is where the generated paths are rooted.
-include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
+//! A spatial sink places a sound at a 3D point. The transform's
+//! [`translation`](pill_engine::TransformComponent::translation) is that point:
+//! an emitter follows its entity's translation, and a listener's ears are
+//! placed around the listener's own translation.
+//!
+//! [`AudioListenerComponent`] keeps its own `facing_degrees` instead of reading
+//! the transform's quaternion, and [`ear_positions`] is the one function that
+//! turns a listener's placement into the two points rodio pans against.
 
 // External crates
 use pill_engine::*;
 
 // =============================================================================
+// Function inventory
+// =============================================================================
+
+// The build script scans this crate and writes `function_inventory.rs`, which
+// holds one address entry for every function a patch can reach. Including it
+// here is what makes those functions resolvable by their qualified paths, with
+// nothing annotated in this file. It has to sit at the crate root because the
+// generated entries name the modules from the crate root.
+include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
+
+// =============================================================================
 // Modules
 // =============================================================================
 
-/// [`AudioCommand`]: what a source has been asked to do next.
+/// The [`AudioCommand`] enum: the action a source has been asked to take next.
 pub mod audio_command;
-/// The [`AudioListenerComponent`] component.
+/// The [`AudioListenerComponent`] component: where the world is heard from.
 pub mod audio_listener_component;
-/// Shared project-to-extension sound loading requests.
+/// The [`AudioLoadQueue`] resource: sound bytes a project asks the module to
+/// load.
 pub mod audio_load_queue;
-/// The [`AudioManager`] resource: output device and sink pools.
+/// The [`AudioManager`] resource: the output device and its sink pools.
 pub mod audio_manager;
-/// The [`AudioSourceComponent`] component.
+/// The [`AudioSourceComponent`] component: an entity that plays a sound.
 pub mod audio_source_component;
-/// The per-frame system driving playback.
+/// The per-frame system that drives playback.
 pub mod audio_system;
-/// Where a listener's ears sit in the world.
+/// [`ear_positions`]: turns a listener's position and facing into its two ear
+/// points.
 pub mod listener_geometry;
-/// The [`Sound`] asset.
+/// The [`Sound`] asset: an audio file held as its encoded bytes.
 pub mod sound;
-/// [`SoundType`]: whether a sound is positional.
+/// The [`SoundType`] enum: whether a sound plays at a position in the world.
 pub mod sound_type;
 
 // =============================================================================
 // Re-exports
 // =============================================================================
 
-// The module that declares a type is an implementation detail; a caller names
-// `pill_audio::AudioSourceComponent` regardless of which file it lives in.
+// The module that declares a type is an implementation detail. A caller names
+// `pill_audio::AudioSourceComponent` wherever the type's file lives.
 pub use audio_command::AudioCommand;
 pub use audio_listener_component::AudioListenerComponent;
 pub use audio_load_queue::AudioLoadQueue;
@@ -91,41 +101,46 @@ pub use sound_type::SoundType;
 // Registration
 // =============================================================================
 
-/// Registers this module's components, resource and system with the engine.
+/// Registers this module's components, resources and system with the engine.
 ///
-/// Called directly by a monolithic build; the generated
-/// `host_module_pill_audio` wrapper carries it as `pill_module_init` for the
-/// host to find in a loaded DLL.
+/// A monolithic build calls it directly. The generated
+/// `host_module_pill_audio` wrapper calls it from `pill_module_init`, the
+/// entry point the host looks up in a loaded DLL.
 ///
-/// Installing the [`AudioManager`] is conditional: a machine with no audio
-/// device gets the components and the system but no manager, and the system
-/// then only drains queued sound loads. That is what keeps this module
-/// loadable on a CI runner.
+/// The [`AudioManager`] is installed only when the machine has an audio
+/// device. Without one the world still gets the components and the system, so
+/// queued sounds are still stored; the system then has nothing to play them
+/// with. That is what lets this module run on a machine with no sound card.
+///
+/// Returns 0.
 #[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
+    // Step 1: Create the shared sound-load queue if the world has none.
     if engine.world().get_resource::<AudioLoadQueue>().is_none() {
         engine
             .world_mut()
             .insert_resource(AudioLoadQueue::default());
     }
-    // Through the derives' own registrars, so each component arrives with its
-    // field layout: that is what the Inspector's rows and the managed codegen
-    // read, and a component without one is an opaque blob to both.
+    // Step 2: Register the components and the sound asset type.
+    // Register each component through its derive's registrar, so it arrives
+    // with its field layout. The Inspector's rows and the managed codegen read
+    // that layout; without it a component is an opaque blob to both.
     audio_listener_component::register(engine.world_mut());
     audio_source_component::register(engine.world_mut());
-    // Declare the asset type this module stores. Sounds outlive a reload of
-    // this DLL - the world's asset store does - so the column's per-type table
-    // has to be re-pointed at the generation still mapped. Registering it as
-    // an imported asset does that and also lets sound files import by
+    // Declare the asset type this module stores. The world's asset store
+    // outlives a reload of this DLL, so a column's per-type table has to be
+    // re-pointed at the generation still mapped. Registering the type as an
+    // imported asset does that, and it also lets sound files import by
     // extension.
     engine.world_mut().register_imported_asset::<Sound>();
 
-    // Only build the device once. Registration runs again on every reload, and
-    // replacing a live manager would cut off whatever is playing.
+    // Step 3: Install the manager once, if an output device exists.
+    // Build the device only once. Registration runs again after every reload,
+    // and replacing a live manager would stop whatever is playing.
     if engine.world().get_resource::<AudioManager>().is_none() {
         match AudioManager::with_defaults() {
-            Some(manager) => {
-                engine.world_mut().insert_resource(manager);
+            Some(audio_manager) => {
+                engine.world_mut().insert_resource(audio_manager);
             }
             None => {
                 pill_core::warn!(
@@ -135,6 +150,7 @@ pub fn register(engine: &mut Engine) -> u32 {
             }
         }
     }
+    // Step 4: Register the playback system and log the registration.
     engine.register_system("pill_audio", audio_system);
 
     pill_core::info!(
@@ -146,17 +162,24 @@ pub fn register(engine: &mut Engine) -> u32 {
     0
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pill_engine::{Engine, Handle};
 
-    /// An audio source's sound is a typed asset reference: it reads back
-    /// naming the shared sound type - what the Inspector draws as an asset row
-    /// and the picker lists - and a handle writes back into the component the
-    /// playback system reads.
+    /// The source's `sound` field is a typed asset reference. Reading it back
+    /// through the component field API names the shared `Sound` type, which is
+    /// what lets the Inspector draw the field as an asset row and the picker
+    /// list sounds. Writing a handle through the same API reaches the
+    /// component the playback system reads, and a handle of another asset type
+    /// is refused.
     #[test]
     fn the_audio_sources_sound_is_a_writable_asset_reference() {
+        // Step 1: Create an entity with a source holding a known handle.
         let mut engine = Engine::new();
         assert_eq!(register(&mut engine), 0);
         let world = engine.world_mut();
@@ -165,10 +188,13 @@ mod tests {
             .with(AudioSourceComponent::new(Handle::from_raw(2, 1)))
             .build()
             .unwrap();
-        let name =
+        let component_name =
             pill_engine::component::ComponentRegistry::registered_name::<AudioSourceComponent>();
+        // Step 2: Read the field back; it must name the shared Sound type.
         assert_eq!(
-            world.read_component_field(entity, &name, "sound").unwrap(),
+            world
+                .read_component_field(entity, &component_name, "sound")
+                .unwrap(),
             pill_engine::FieldValue::Asset {
                 asset_type: Some("pill_audio::Sound".to_owned()),
                 index: 2,
@@ -176,10 +202,11 @@ mod tests {
             }
         );
 
+        // Step 3: Write another sound's handle and check the component took it.
         world
             .write_component_field(
                 entity,
-                &name,
+                &component_name,
                 "sound",
                 pill_engine::FieldValue::Asset {
                     asset_type: Some("pill_audio::Sound".to_owned()),
@@ -196,9 +223,10 @@ mod tests {
             Handle::from_raw(4, 0)
         );
 
-        let refused = world.write_component_field(
+        // Step 4: A handle of another asset type must be refused.
+        let refused_write = world.write_component_field(
             entity,
-            &name,
+            &component_name,
             "sound",
             pill_engine::FieldValue::Asset {
                 asset_type: Some("pill_master_renderer::assets::Mesh".to_owned()),
@@ -208,10 +236,10 @@ mod tests {
         );
         assert!(
             matches!(
-                refused,
+                refused_write,
                 Err(pill_engine::component_field::ComponentFieldError::AssetTypeMismatch { .. })
             ),
-            "{refused:?}"
+            "{refused_write:?}"
         );
     }
 }

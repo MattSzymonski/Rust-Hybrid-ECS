@@ -8,18 +8,18 @@
 //!
 //! # Design
 //!
-//! The crate is a plain `rlib`: the generated `host_module_pill_test` wrapper
-//! links it into the `cdylib` the host stages and loads at runtime, next to and
-//! independently of the project module. All registration work lives in
-//! [`register`], which is a plain Rust function, so the same crate can also be
-//! linked statically into a monolithic build. The `extern "C"` exports the
-//! `#[pill_module]` attribute emits are thin wrappers that catch panics and
-//! translate them into a status code, because unwinding across the module
-//! boundary would abort the process.
+//! The crate is a plain `rlib`. The generated `host_module_pill_test` wrapper
+//! links it into the `cdylib` that the host stages and loads at runtime, beside
+//! the project module and reloaded on its own. All registration work lives in
+//! [`register`], a plain Rust function, so the same crate can also be linked
+//! statically into a monolithic build. The `extern "C"` exports that
+//! `#[pill_module]` emits wrap [`register`]: they catch a panic and turn it
+//! into a status code, because a panic that unwound across the module boundary
+//! would abort the process.
 //!
-//! The component is registered as persistable, so its values survive a reload:
-//! snapshots are keyed by type name, an added field takes its default and a
-//! removed one is dropped.
+//! The component is registered as persistable, so its values survive a reload.
+//! The reload matches persisted types by name, gives a newly added field its
+//! default, and ignores a field the type no longer declares.
 
 // External crates
 use pill_core::info;
@@ -32,32 +32,34 @@ use serde::{Deserialize, Serialize};
 
 /// Number of entities the module keeps alive.
 ///
-/// Hot reload preserves entities, so initialization fills the world up to this
-/// count instead of spawning a fresh batch on every rebuild.
+/// Hot reload keeps the entities the previous generation created, so
+/// initialization fills the world up to this count instead of spawning a
+/// fresh batch each time.
 const MODULE_TEST_ENTITY_COUNT: usize = 4;
 
-/// Frame interval a progress report would use.
+/// Frame interval a progress report would use, counted in frames.
 ///
-/// No report is emitted, so nothing reads the constant and the `allow` keeps
-/// the dead-code lint quiet.
+/// Nothing emits a report, so nothing reads the constant and the `allow`
+/// above keeps the dead-code lint quiet.
 #[allow(dead_code)]
 const REPORT_INTERVAL_FRAMES: u64 = 300;
 
-/// Fixed time step folded into the accumulated time of every entity.
+/// Fixed time step, in seconds, added to every entity's accumulated time.
 ///
-/// Used only by [`module_test_processor`], which [`register`] installs.
+/// Only [`module_test_processor`] uses it, and [`register`] installs that
+/// system.
 const FIXED_DELTA_TIME: f32 = 1.0 / 60.0;
 
 // =============================================================================
 // Component
 // =============================================================================
 
-/// Per-entity state owned by this module.
+/// Per-entity state this module defines.
 ///
-/// The host serializes the component across hot-reload generations, so the
-/// layout is pinned with `#[repr(C)]` and every field stays serde compatible.
-/// Adding or removing a field is safe: serde matches by name, new fields get
-/// their default, and removed fields are dropped.
+/// The host carries the component's values across hot-reload generations, so
+/// the layout is pinned with `#[repr(C)]` and every field stays serde
+/// compatible. Adding or removing a field is safe: serde matches fields by
+/// name, a new field gets its default, and a removed field is ignored.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PillComponent)]
 #[pill(persistable)]
@@ -74,9 +76,9 @@ pub struct ModuleTest {
 
 /// Advances every `ModuleTest` component by one frame.
 ///
-/// Registered under the name `module_test_processor`; the scheduler derives the
-/// system's access pattern from the query signature, so it is scheduled against
-/// the project's systems automatically.
+/// Registered under the name `module_test_processor`. The scheduler derives
+/// the system's access pattern from the query signature, so it places the
+/// system among the project's systems automatically.
 fn module_test_processor(mut query: Query<&mut ModuleTest>) -> Result<(), SystemError> {
     for mut state in query.iter_mut() {
         state.processed_frame_count += 1;
@@ -89,21 +91,29 @@ fn module_test_processor(mut query: Query<&mut ModuleTest>) -> Result<(), System
 // Registration
 // =============================================================================
 
-/// Registers the module's systems and seed entities; component registration
-/// happens automatically from the `PillComponent` derive before this runs.
+/// Registers the module's system and its seed entities, and returns 0 on
+/// success.
 ///
-/// Returns zero on success. Must be idempotent: the host calls it once per
-/// loaded generation and rolls back to the previous library when it reports a
-/// non-zero status, which re-runs this function on the older generation.
-/// Public so a statically linked build can call it directly, and so the
-/// generated `host_module_pill_test` wrapper can carry it as
-/// `pill_module_init` for the host to find in a loaded DLL.
+/// Component registration happens automatically from the `PillComponent`
+/// derive before this runs. Must be idempotent: the host calls it once per
+/// loaded generation, on a fresh load and again if it has to roll back. Public
+/// so a statically linked build can call it directly, and so the generated
+/// `host_module_pill_test` wrapper can export it as `pill_module_init` for the
+/// host to find in a loaded DLL.
+///
+/// # Errors
+///
+/// Returns 1 when an entity cannot be created. The host reads any non-zero
+/// status as a failed generation and rolls back to the previous library, which
+/// calls this function again on the older generation.
 #[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
+    // Step 1: Register the system that advances the component.
     engine.register_system("module_test_processor", module_test_processor);
 
-    // Fill up to the target count rather than spawning a new batch, because
-    // hot reload preserves the entities created by the previous generation.
+    // Step 2: Fill the world up to the target count instead of spawning a
+    // fresh batch, because hot reload keeps the entities the previous
+    // generation created.
     let existing_entity_count = {
         let mut query = Query::<&ModuleTest>::new(engine.world_mut());
         query.iter_mut().count()

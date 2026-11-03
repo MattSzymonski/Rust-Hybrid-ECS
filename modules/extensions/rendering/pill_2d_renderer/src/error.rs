@@ -7,14 +7,14 @@
 //!
 //! # Design
 //!
-//! Lives here rather than in `pill_engine` because most variants wrap a `wgpu`
-//! error type, and `pill_engine` is compiled into every loaded module and every
-//! hot patch - one wgpu type reachable from it would put the whole graphics
+//! The type lives here rather than in `pill_engine` because most variants wrap
+//! a `wgpu` error. `pill_engine` is compiled into every loaded module and every
+//! hot patch, so one wgpu type reachable from it would pull the whole graphics
 //! stack into all of them.
 //!
-//! The diagnostic codes are namespaced `engine::renderer`, for example
-//! `engine::renderer::no_texture_formats`, which is what a log line or an
-//! editor shows a user.
+//! Diagnostic codes use the `engine::renderer` namespace, for example
+//! `engine::renderer::no_texture_formats`. A report built from the error shows
+//! that code beside the message.
 
 // External crates
 use pill_core_macros::engine_error;
@@ -55,17 +55,19 @@ pub enum RendererError {
     #[message("GPU surface exposes no alpha modes")]
     NoAlphaModes,
 
-    /// No presentation configuration the surface accepted.
+    /// The surface refused every presentation configuration it was offered.
     ///
-    /// `Surface::configure` returns nothing and reports a refusal through the
-    /// device's uncaptured-error path instead, so this variant is reached only
-    /// after every fallback candidate has been refused in turn. The backend
-    /// error itself cannot be carried out of `configure`, so each refusal is
-    /// reported where it happens instead.
+    /// `Surface::configure` returns nothing. A refusal goes to the device's
+    /// uncaptured-error path (where wgpu sends errors that no error scope
+    /// captured) and panics by default. So the renderer tries each fallback
+    /// configuration inside its own error scope, and returns this variant only
+    /// when all of them fail. The backend error cannot be carried out of
+    /// `configure`, so each refusal is printed where it happens.
     #[message("failed to configure the GPU surface for presentation")]
     SurfaceConfigure,
 
-    /// The frame texture could not be acquired for a fatal reason.
+    /// The frame texture could not be acquired, for a reason the renderer
+    /// cannot recover from.
     #[message("failed to acquire the GPU surface texture")]
     SurfaceTextureFailed {
         #[source]
@@ -80,7 +82,8 @@ pub enum RendererError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `code()` comes from the diagnostic trait `#[engine_error]` implements.
+    // `code()` comes from the `miette::Diagnostic` trait, which
+    // `#[engine_error]` implements.
     use miette::Diagnostic as _;
 
     /// Renderer unit variants produce their diagnostic code.

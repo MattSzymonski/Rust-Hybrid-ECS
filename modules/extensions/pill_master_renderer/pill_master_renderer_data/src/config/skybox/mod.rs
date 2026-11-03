@@ -1,13 +1,13 @@
 //! The skybox: the two shaders a sky material draws through, and the pass that
-//! draws it.
+//! draws the sky.
 //!
 //! # Responsibilities
 //!
 //! - Install the equirect and cubemap skybox shaders under fixed names and
 //!   guids ([`install_shaders`]), so a `.material` file can name them.
 //! - Build the pass that draws a sky material behind the scene
-//!   ([`skybox_pass`]), and say what a sky material's parameters mean
-//!   ([`default_parameters`]).
+//!   ([`skybox_pass`]), and give the values a sky material's parameters start
+//!   from ([`default_parameters`]).
 //!
 //! # Design
 //!
@@ -15,13 +15,14 @@
 //! shader is one of the two here and whose `sky` slot holds an
 //! [`Equirect`](crate::TextureType::Equirect) or a
 //! [`Cubemap`](crate::TextureType::Cubemap) texture. The pass is an ordinary
-//! [`RenderPass`] of kind [`PassKind::Skybox`] that names the material: one
-//! fullscreen triangle at the far plane, depth-tested against what the
-//! geometry pass drew, so the sky shows only where no mesh does.
+//! [`RenderPass`] of kind [`PassKind::Skybox`] that names the material. It
+//! draws one fullscreen triangle at the far plane and tests it against the
+//! depth the geometry pass wrote, so the sky shows only where no mesh drew.
 //!
-//! A sky material file names its shader by guid -
+//! A sky material file names its shader by guid:
 //! `5628c9e4d9278fec79998a7adab65bc3` ([`EQUIRECT_SHADER_GUID`]) or
-//! `a6dfb611b11dfb57c5039dd8b6fc1a46` ([`CUBEMAP_SHADER_GUID`]):
+//! `a6dfb611b11dfb57c5039dd8b6fc1a46` ([`CUBEMAP_SHADER_GUID`]). A material
+//! file looks like this:
 //!
 //! ```json
 //! "asset": {
@@ -35,9 +36,9 @@
 //! }
 //! ```
 //!
-//! The shaders read the camera's inverse view-projection to turn each pixel
-//! into the direction it looks along, and the equirect one maps that direction
-//! to a uv with [`equirect_uv`](crate::assets::equirect_uv)'s convention.
+//! The shaders use the camera's inverse view-projection to find the direction
+//! each pixel looks along. The equirect shader then turns that direction into
+//! a uv with the same rule as [`equirect_uv`](crate::assets::equirect_uv).
 
 // Standard library
 use std::collections::BTreeMap;
@@ -48,6 +49,10 @@ use pill_engine::{AssetGuid, AssetManager, Handle};
 // Current crate
 use crate::assets::{Material, MaterialParameter, PassKind, PassTarget, RenderPass, Shader};
 use crate::config::ShaderSourceRecord;
+
+// =============================================================================
+// Constants
+// =============================================================================
 
 config_shader_file!(
     /// The skybox vertex stage: a fullscreen triangle at the far plane.
@@ -62,31 +67,32 @@ config_shader_file!(
     CUBEMAP_FRAGMENT, "skybox/shaders/skybox_cubemap_fragment.wgsl"
 );
 
-/// Asset name of the skybox shader that samples an equirectangular panorama:
-/// the path its `.hlsl` source is imported under.
+/// The asset name of the skybox shader that samples an equirectangular
+/// panorama. It is the path the shader's `.hlsl` source is imported under.
 pub const EQUIRECT_SHADER_PATH: &str = "skybox/shaders/skybox_equirect_fragment.hlsl";
 
 /// The guid the equirect skybox shader is stored under, so a sky material file
 /// can name it.
 ///
-/// Derived from a name rather than drawn at random, so every checkout and every
-/// run gives it the same one; the `.hlsl.meta` beside the source carries this
-/// value and [`install_shaders`] asserts the two agree.
+/// It is derived from a seed string rather than drawn at random, so every
+/// checkout and every run gives the shader the same guid. The `.hlsl.meta`
+/// beside the source has to carry this value, and [`install_shaders`] checks
+/// that it does.
 pub const EQUIRECT_SHADER_GUID: AssetGuid = AssetGuid::from_name("pill.skybox.shader.equirect");
 
-/// Asset name of the skybox shader that samples a cubemap: the path its `.hlsl`
-/// source is imported under.
+/// The asset name of the skybox shader that samples a cubemap. It is the path
+/// the shader's `.hlsl` source is imported under.
 pub const CUBEMAP_SHADER_PATH: &str = "skybox/shaders/skybox_cubemap_fragment.hlsl";
 
-/// The guid the cubemap skybox shader is stored under; see
-/// [`EQUIRECT_SHADER_GUID`].
+/// The guid the cubemap skybox shader is stored under. See
+/// [`EQUIRECT_SHADER_GUID`] for how each of the two is derived.
 pub const CUBEMAP_SHADER_GUID: AssetGuid = AssetGuid::from_name("pill.skybox.shader.cubemap");
 
 /// The texture slot both skybox shaders read the sky from.
 pub const SKY_SLOT: &str = "sky";
 
-/// The shader assets [`install_shaders`] creates, and the files each is built
-/// from.
+/// The shader assets [`install_shaders`] creates, with the cooked files each
+/// one was built from.
 pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[
     ShaderSourceRecord {
         shader_asset_name: EQUIRECT_SHADER_PATH,
@@ -100,16 +106,26 @@ pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[
     },
 ];
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Install the equirect and the cubemap skybox shaders, and return them in
 /// that order.
 ///
-/// Idempotent: a store that already holds them gets the same handles back, so
-/// this is safe to call once per generation - and it has to run before a sky
+/// Idempotent: a store that already holds them hands the same handles back, so
+/// this is safe to call once per generation. It has to run before a sky
 /// material file loads, because the file names its shader by guid.
 ///
 /// # Errors
 ///
 /// Returns the store's import error when a source or its meta will not load.
+///
+/// # Panics
+///
+/// Panics on the call that imports a shader whose `.hlsl.meta` is missing or
+/// names a different guid than the constant here declares. No material file
+/// could find such a shader.
 pub fn install_shaders(
     assets: &mut AssetManager,
 ) -> Result<(Handle<Shader>, Handle<Shader>), Box<dyn std::error::Error>> {
@@ -119,8 +135,8 @@ pub fn install_shaders(
     Ok((equirect, cubemap))
 }
 
-/// A sky material's parameters at their neutral values: no tint, unit
-/// exposure, unrotated.
+/// Return the neutral values of a sky material's parameters: white tint,
+/// exposure 1, and no rotation (0 degrees).
 pub fn default_parameters() -> BTreeMap<String, MaterialParameter> {
     BTreeMap::from([
         (
@@ -132,11 +148,14 @@ pub fn default_parameters() -> BTreeMap<String, MaterialParameter> {
     ])
 }
 
-/// A skybox pass named `name` that draws `material` into `target`.
+/// Build a skybox pass named `name` that draws `material` into `target`.
 ///
-/// Ordered with the geometry it sits behind (`order`); it reads the depth that
-/// geometry wrote, so it must write the same target. A pass with no material
-/// ([`Handle::INVALID`]) cannot be drawn, so it starts disabled.
+/// `order` places the pass among the geometry passes it sits behind. The pass
+/// reads the depth those passes wrote, so `target` has to be the target they
+/// wrote.
+///
+/// A pass with no material ([`Handle::INVALID`]) cannot be drawn, so the pass
+/// starts disabled.
 pub fn skybox_pass(
     name: impl Into<String>,
     material: Handle<Material>,
@@ -152,13 +171,18 @@ pub fn skybox_pass(
         .with_enabled(material != Handle::INVALID)
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::assets::ShaderTextureKind;
 
-    /// Sky material files name the shaders by these digits, so they may never
-    /// change; renaming a shader asset would.
+    /// Sky material files name the shaders by these digits, so the digits may
+    /// never change. A seed string above decides each one, and editing a seed
+    /// would hand that shader a different guid.
     #[test]
     fn the_shader_guids_are_the_ones_material_files_name() {
         assert_eq!(

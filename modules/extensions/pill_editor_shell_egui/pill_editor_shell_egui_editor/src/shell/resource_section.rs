@@ -1,23 +1,30 @@
-//! The Inspector's resource section.
+//! The Inspector's resource section: the rows of one editable world resource.
 //!
 //! # Responsibilities
 //!
-//! - [`resource_section`]: draw one editable resource's rows with the same
-//!   widgets the component rows use, and queue each commit as a recorded
-//!   `SetResourceField`.
+//! - [`resource_section`]: draw the resource's heading and note, then one row
+//!   per editable field, through the row and scalar controls the component
+//!   rows use.
+//! - [`queue_edit`]: queue one field write as a recorded `SetResourceField`.
 //!
 //! # Design
 //!
-//! The rows come from the snapshot, which read them through the resource's
-//! curated table (`pill_editor_core::resources`), so the tab cannot offer
-//! a field the write path would refuse. Every commit is one recorded command,
-//! which is what makes a resource edit undoable like any other edit.
+//! The snapshot builds the rows from the resource's curated field table,
+//! listed in `pill_editor_core::resources`, which is the same table the write
+//! path uses. The tab can therefore never show a field a write would refuse.
+//! Each commit becomes one recorded command, which is what makes a resource
+//! edit undoable like any other edit.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The resource section: a heading, then one row per editable field.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Draws one editable resource: the resource's label as a heading, a note that
+/// every edit here is one undo step, then one row per editable field.
 pub fn resource_section(
     ui: &mut egui::Ui,
     view: &ResourceView,
@@ -28,22 +35,22 @@ pub fn resource_section(
     ui.separator();
     for field in &view.fields {
         row(ui, field.label.as_str(), None, &mut |ui| {
-            // The shell's one scalar editor decides the control, so every
-            // numeric kind a resource exposes is editable - the hand match this
-            // replaces covered a boolean and an `f32` and rendered the rest as
-            // text.
+            // The shared scalar control picks the widget: a checkbox for a
+            // boolean and a drag value for every number kind. An enum field
+            // edits too, because the resource's table stores it as a `U32`
+            // discriminant.
             if let Some(edited) = scalar_edit(ui, &field.value) {
                 queue_edit(pending, view, field, edited);
                 return;
             }
-            // What has no widget - an enum's discriminant, an opaque blob -
-            // reads as text.
+            // A kind with no control - text, an array, a list, an asset or
+            // entity reference, an opaque value - shows its text form.
             ui.monospace(inspector::value_text(&field.value));
         });
     }
 }
 
-/// Queue one field write as a recorded `SetResourceField`.
+/// Queues one field write as a recorded `SetResourceField`.
 pub fn queue_edit(
     pending: &mut PendingEditorCommands,
     view: &ResourceView,
@@ -58,13 +65,17 @@ pub fn queue_edit(
     );
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The rows hand every value to one control, so every kind that control
-    /// edits is editable in a resource: the hand match this replaced covered a
-    /// boolean and an `f32` and painted the rest.
+    /// Every kind the shared scalar control edits is editable in a resource,
+    /// because each row hands its value to that control. A text field keeps
+    /// the read-only fallback.
     #[test]
     fn every_numeric_kind_a_resource_carries_is_editable() {
         for value in [

@@ -8,8 +8,8 @@
 //!
 //! - Group entities by their exact component set into [`Archetype`] instances.
 //! - Own the contiguous, type-erased component storage for each archetype,
-//!   both native (`ComponentColumns`) and layout-described
-//!   (`ComponentColumn`).
+//!   for native and layout-described components alike: every column is a
+//!   `ComponentColumn`, held in the archetype's `ComponentColumns`.
 //! - Track change-detection [`ComponentTicks`] for every component instance.
 //!
 //! # Design
@@ -34,8 +34,8 @@
 //!   still vouches for a column: an exact `TypeId` (native), size and alignment
 //!   plus the registry's field-layout comparison (shared), or no Rust type at
 //!   all (descriptor). The typed accessors enforce the first two and
-//!   [`ComponentColumn::get`] panics on a mismatch; a descriptor column never
-//!   receives a typed call, because no Rust type names its rows.
+//!   [`ComponentColumn::get`] panics on a mismatch; a descriptor column has no
+//!   typed reading, because no Rust type names its rows.
 //! - **Alignment hosting.** A column's buffer is allocated with the row's
 //!   alignment, so a row is aligned for the type the column was built for.
 //!   Registration refuses a shared component whose layout changed, unless the
@@ -44,10 +44,10 @@
 //!   stride.
 //! - **Ops discipline.** Everything that depends on what the bytes mean goes
 //!   through [`ColumnOps`], which is plain data a reload refreshes before any
-//!   row is touched. `drop_range` runs exactly once per initialized row - on
-//!   truncation, on `Drop`, and never for a column whose `trivial_drop` is set
-//!   - and [`Blittability`] is the witness that makes a plain-data claim
-//!   checkable rather than assumed.
+//!   row is touched. `drop_range` releases a row exactly once - on
+//!   `swap_remove_discard`, on `Drop`, and never for a column whose
+//!   `trivial_drop` is set - and [`Blittability`] is the witness that makes a
+//!   plain-data claim checkable rather than assumed.
 //! - **Row lifecycle.** `len` counts initialized rows: growth leaves the new
 //!   tail uninitialized until a write fills it, and `swap_remove` moves the tail
 //!   row over the hole before dropping the length, so no row is read or dropped
@@ -221,19 +221,19 @@ pub enum ColumnIdentity {
 /// Per-type behaviour for one column, as plain data.
 ///
 /// This is the interface half of the raw-byte storage model: a column holds
-/// bytes plus a descriptor, and everything that depends on what those bytes
-/// *mean* goes through here. [`ColumnOps::of`] builds the table from `T`'s own
-/// glue, so drop runs destructors; [`ColumnOps::blittable`] needs no per-type
-/// code, because a validated descriptor-only type is plain data - drop is a
-/// no-op and move is `memcpy`.
+/// bytes plus a descriptor, and the one thing that has to know what those
+/// bytes *mean* - releasing a row - goes through here. [`ColumnOps::of`]
+/// builds the table from `T`'s own glue, so drop runs destructors;
+/// [`ColumnOps::blittable`] needs no per-type code, because a validated
+/// descriptor-only type is plain data - drop is a no-op and move is `memcpy`.
 ///
 /// The table is *data*, never a trait object: a column that outlives the DLL
 /// that filled it can be re-pointed at the new generation's table instead of
 /// dangling into an unmapped image.
 #[derive(Clone, Copy)]
 pub struct ColumnOps {
-    /// Drop `count` initialized rows starting at `ptr`, or nothing for plain
-    /// data.
+    /// Drop `row_count` initialized rows starting at `rows_ptr`, or nothing for
+    /// plain data.
     ///
     /// # Safety
     ///
@@ -252,20 +252,24 @@ pub struct ColumnOps {
 /// # Safety
 ///
 /// Trivially safe - it reads neither argument.
-unsafe fn drop_range_of_nothing(_ptr: *mut u8, _count: usize) {}
+unsafe fn drop_range_of_nothing(_rows_ptr: *mut u8, _row_count: usize) {}
 
-/// Drop `count` values of type `T` starting at `ptr`.
+/// Drop `row_count` values of type `T` starting at `rows_ptr`.
 ///
 /// # Safety
 ///
-/// `ptr` must address `count` live, correctly aligned `T` values.
-unsafe fn drop_range_of<T>(ptr: *mut u8, count: usize) {
-    if count == 0 || !std::mem::needs_drop::<T>() {
+/// `rows_ptr` must address `row_count` live, correctly aligned `T` values.
+unsafe fn drop_range_of<T>(rows_ptr: *mut u8, row_count: usize) {
+    if row_count == 0 || !std::mem::needs_drop::<T>() {
         return;
     }
-    // SAFETY: the caller guarantees `count` live, aligned `T` values at `ptr`.
+    // SAFETY: the caller guarantees `row_count` live, aligned `T` values at
+    // `rows_ptr`.
     unsafe {
-        std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(ptr.cast::<T>(), count));
+        std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+            rows_ptr.cast::<T>(),
+            row_count,
+        ));
     }
 }
 
@@ -320,8 +324,8 @@ pub struct ColumnLayout {
 impl ColumnLayout {
     /// Builds a layout, checking that size and alignment can describe storage.
     ///
-    /// The single constructor: every layout carries a [`Blittability`], so no
-    /// column exists without one.
+    /// The descriptor constructor: every layout carries a [`Blittability`], so
+    /// no column exists without one.
     ///
     /// # Errors
     ///
@@ -423,8 +427,9 @@ pub(crate) fn validate_native_component_layout(
 /// One top-level field of a layout, as a migration plan sees it.
 ///
 /// Only the top level, by design: a nested struct field moves as a single
-/// block, so a change inside it cannot silently reinterpret its members. The
-/// fields a plan maps are exactly the names the two layouts agree on.
+/// block, so the plan never maps its inner members - the block is copied or
+/// zero-filled whole rather than migrated field by field. The fields a plan
+/// copies are exactly the names the two layouts agree on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutField<'a> {
     /// Field name. Matching is by name, never by position.
@@ -466,7 +471,8 @@ pub enum FieldSource {
 pub struct PlannedField {
     /// Byte offset of the field in the new row.
     pub offset: usize,
-    /// Number of bytes written at `offset`.
+    /// The field's width in the new row, in bytes; a [`FieldSource::Default`]
+    /// writes only its own `len` bytes of it.
     pub bytes: usize,
     /// Where those bytes come from.
     pub source: FieldSource,
@@ -520,18 +526,19 @@ impl FieldPlan {
     /// Fields are matched **by name**, so a reorder keeps every value with its
     /// own name. A field only the new layout has becomes a zero fill; a field
     /// only the old layout had is left out, which is how a removed field's
-    /// bytes leave the rows. A name repeated in one list matches its first
-    /// occurrence and the rest are ignored, which keeps the plan deterministic
-    /// for a malformed input rather than depending on iteration order.
+    /// bytes leave the rows. A name repeated in the old list matches its first
+    /// occurrence, and the later ones are ignored, which keeps the plan
+    /// deterministic for a malformed input rather than depending on iteration
+    /// order.
     ///
     /// A matched pair whose sizes disagree copies the smaller size and leaves
     /// the remainder zeroed, so a field that grew keeps its bytes and gains a
     /// defined tail instead of reading past the old row.
     #[must_use]
-    pub fn between(old: &[LayoutField<'_>], new: &[LayoutField<'_>]) -> Self {
+    pub fn between(old_fields: &[LayoutField<'_>], new_fields: &[LayoutField<'_>]) -> Self {
         let mut plan = Self::new();
-        for new_field in new {
-            match old
+        for new_field in new_fields {
+            match old_fields
                 .iter()
                 .find(|old_field| old_field.name == new_field.name)
             {
@@ -668,7 +675,8 @@ impl FieldPlan {
     }
 }
 
-/// Whether `bytes` written at `offset` leaves a row of `size` bytes.
+/// Whether `bytes` written at `offset` runs past the end of a row of `size`
+/// bytes.
 ///
 /// A helper rather than two `checked_add` expressions inline: the same question
 /// is asked of the source and the destination of every instruction.
@@ -683,7 +691,7 @@ fn out_of_bounds(offset: usize, bytes: usize, size: usize) -> bool {
 // ComponentColumns
 // =============================================================================
 
-/// The native component columns of one archetype, keyed by [`ComponentId`].
+/// The component columns of one archetype, keyed by [`ComponentId`].
 ///
 /// [`ComponentId`] rather than [`TypeId`](std::any::TypeId): a component type
 /// linked into two binaries has two `TypeId`s, so the binary that did not
@@ -692,7 +700,7 @@ fn out_of_bounds(offset: usize, bytes: usize, size: usize) -> bool {
 /// factories - already identifies the component by one `ComponentId`.
 #[derive(Default)]
 pub struct ComponentColumns {
-    /// One contiguous column per native component in the archetype.
+    /// One contiguous column per component in the archetype.
     columns: HashMap<ComponentId, ComponentColumn>,
 }
 
@@ -809,13 +817,13 @@ fn missing_column<T: Component>() -> ! {
 /// lets components defined in other languages share storage with native ones.
 pub struct ComponentColumn {
     /// Runtime layout of the stored element type.
-    layout: ColumnLayout,
+    element_layout: ColumnLayout,
     /// Per-type behaviour, replaceable when a reload brings newer glue.
     ops: ColumnOps,
     /// What a typed accessor must prove before it may read these rows.
     identity: ColumnIdentity,
     /// Pointer to the heap allocation, or dangling before the first growth.
-    data: NonNull<u8>,
+    row_buffer: NonNull<u8>,
     /// Number of initialized rows.
     len: usize,
     /// Number of rows the current allocation can hold.
@@ -848,12 +856,12 @@ impl ComponentColumn {
     pub fn new(layout: ColumnLayout) -> Result<Self, WorldError> {
         validate_component_layout(layout.size, layout.align)?;
         let ops = ColumnOps::blittable(layout.blittability);
-        let data = unallocated_pointer(layout.align);
+        let row_buffer = unallocated_pointer(layout.align);
         Ok(Self {
-            layout,
+            element_layout: layout,
             ops,
             identity: ColumnIdentity::Descriptor,
-            data,
+            row_buffer,
             len: 0,
             capacity: 0,
             ticks: Vec::new(),
@@ -885,29 +893,37 @@ impl ComponentColumn {
     ///
     /// Returns a layout error when size and alignment cannot describe an
     /// allocation.
-    pub fn from_native_info(info: NativeColumnInfo, schema_hash: u64) -> Result<Self, WorldError> {
+    pub fn from_native_info(
+        column_info: NativeColumnInfo,
+        schema_hash: u64,
+    ) -> Result<Self, WorldError> {
         // SAFETY: never consulted for a native column - its drop glue comes
-        // from `info.ops` - but the layout type requires a witness, so the
-        // claim is made where it is provably unused.
+        // from `column_info.ops` - but the layout type requires a witness, so
+        // the claim is made where it is provably unused.
         let blittability = unsafe { Blittability::assume() };
-        let layout = ColumnLayout::new_native(info.size, info.align, schema_hash, blittability)?;
-        let data = unallocated_pointer(layout.align);
+        let layout = ColumnLayout::new_native(
+            column_info.size,
+            column_info.align,
+            schema_hash,
+            blittability,
+        )?;
+        let row_buffer = unallocated_pointer(layout.align);
         Ok(Self {
-            layout,
-            ops: info.ops,
-            identity: if info.shared {
+            element_layout: layout,
+            ops: column_info.ops,
+            identity: if column_info.shared {
                 ColumnIdentity::Shared
             } else {
-                ColumnIdentity::Native(info.type_id)
+                ColumnIdentity::Native(column_info.type_id)
             },
-            data,
+            row_buffer,
             len: 0,
             capacity: 0,
             ticks: Vec::new(),
         })
     }
 
-    /// The per-type table this column drops and moves its rows through.
+    /// The per-type table this column releases its rows through.
     pub fn ops(&self) -> ColumnOps {
         self.ops
     }
@@ -930,8 +946,8 @@ impl ComponentColumn {
     /// Panic unless `T` may be used to read this column's rows.
     ///
     /// The check mirrors the identity's own promise: an exact `TypeId` for a
-    /// native column, layout equality for a shared one, and nothing at all for
-    /// a descriptor column, which has no typed reading.
+    /// native column, layout equality for a shared one, and a panic for a
+    /// descriptor column, which has no typed reading.
     fn assert_element_type<T: 'static>(&self) {
         match self.identity {
             ColumnIdentity::Native(type_id) => assert!(
@@ -939,11 +955,11 @@ impl ComponentColumn {
                 "column holds a different component type than the requested one"
             ),
             ColumnIdentity::Shared => assert!(
-                std::mem::size_of::<T>() == self.layout.size
-                    && std::mem::align_of::<T>() == self.layout.align,
+                std::mem::size_of::<T>() == self.element_layout.size
+                    && std::mem::align_of::<T>() == self.element_layout.align,
                 "shared column layout {}/{} does not match the requested type's {}/{}",
-                self.layout.size,
-                self.layout.align,
+                self.element_layout.size,
+                self.element_layout.align,
                 std::mem::size_of::<T>(),
                 std::mem::align_of::<T>()
             ),
@@ -965,17 +981,17 @@ impl ComponentColumn {
 
     /// Returns the size in bytes of a single stored component instance.
     pub fn element_size(&self) -> usize {
-        self.layout.size
+        self.element_layout.size
     }
 
     /// Returns the alignment in bytes required by a single stored instance.
     pub fn alignment(&self) -> usize {
-        self.layout.align
+        self.element_layout.align
     }
 
     /// Returns the schema hash identifying the stored component type.
     pub fn schema_hash(&self) -> u64 {
-        self.layout.schema_hash
+        self.element_layout.schema_hash
     }
 
     /// Returns a raw pointer to the underlying buffer.
@@ -983,7 +999,7 @@ impl ComponentColumn {
     /// The pointer is dangling before the first allocation and is invalidated
     /// by any later reallocation or by dropping the column.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.data.as_ptr()
+        self.row_buffer.as_ptr()
     }
 
     /// Refuse a raw-byte write when this column's rows own resources.
@@ -1019,13 +1035,14 @@ impl ComponentColumn {
     /// resources - see [`Self::require_plain_data`].
     pub fn push_zeroed(&mut self) -> Result<(), WorldError> {
         self.require_plain_data()?;
-        self.reserve_one()?;
-        // SAFETY: reserve_one guarantees one writable, correctly aligned slot.
+        self.reserve_one_row()?;
+        // SAFETY: reserve_one_row guarantees one writable, correctly aligned
+        // slot.
         unsafe {
             std::ptr::write_bytes(
-                self.data.as_ptr().add(self.len * self.layout.size),
+                self.row_buffer.as_ptr().add(self.len * self.element_layout.size),
                 0,
-                self.layout.size,
+                self.element_layout.size,
             )
         };
         self.ticks.push(ComponentTicks::default());
@@ -1037,23 +1054,25 @@ impl ComponentColumn {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DescriptorSizeMismatch`] when `bytes` does not
-    /// contain exactly `element_size()` bytes, or
+    /// Returns [`WorldError::ColumnRowsAreNotPlainData`] when the column's rows
+    /// own resources - see [`Self::require_plain_data`] - or
+    /// [`WorldError::DescriptorSizeMismatch`] when `bytes` does not contain
+    /// exactly `element_size()` bytes, or
     /// [`WorldError::DescriptorLayoutInvalid`] when the element layout cannot
     /// describe the next allocation.
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), WorldError> {
         self.require_plain_data()?;
-        if bytes.len() != self.layout.size {
+        if bytes.len() != self.element_layout.size {
             return Err(WorldError::DescriptorSizeMismatch);
         }
-        self.reserve_one()?;
+        self.reserve_one_row()?;
         // SAFETY: source and destination are valid for exactly one element and
         // cannot overlap because the source is outside this column's spare slot.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                self.data.as_ptr().add(self.len * self.layout.size),
-                self.layout.size,
+                self.row_buffer.as_ptr().add(self.len * self.element_layout.size),
+                self.element_layout.size,
             );
         }
         self.ticks.push(ComponentTicks::default());
@@ -1084,21 +1103,24 @@ impl ComponentColumn {
     /// next allocation cannot be represented. Nothing is moved in any of those
     /// cases.
     pub fn take_row_from(&mut self, source: &mut Self, index: usize) -> Result<(), WorldError> {
-        if self.layout.size != source.layout.size {
+        if self.element_layout.size != source.element_layout.size {
             return Err(WorldError::DescriptorSizeMismatch);
         }
         if index >= source.len {
             return Err(WorldError::DescriptorRowInvalid);
         }
-        self.reserve_one()?;
-        // SAFETY: `reserve_one` guarantees one writable, correctly aligned slot
-        // here, the source row is initialized and within its allocation, and the
-        // two columns are distinct objects so the regions cannot overlap.
+        self.reserve_one_row()?;
+        // SAFETY: `reserve_one_row` guarantees one writable, correctly aligned
+        // slot here, the source row is initialized and within its allocation,
+        // and the two columns are distinct objects so the regions cannot
+        // overlap.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                source.data.as_ptr().add(index * source.layout.size),
-                self.data.as_ptr().add(self.len * self.layout.size),
-                self.layout.size,
+                source.row_buffer
+                    .as_ptr()
+                    .add(index * source.element_layout.size),
+                self.row_buffer.as_ptr().add(self.len * self.element_layout.size),
+                self.element_layout.size,
             );
         }
         // The row's change-detection metadata travels with it, which is what
@@ -1124,26 +1146,28 @@ impl ComponentColumn {
     /// Returns [`WorldError::DescriptorLayoutInvalid`] when the doubled
     /// capacity cannot be represented.
     pub fn reserve_row(&mut self) -> Result<(), WorldError> {
-        self.reserve_one()
+        self.reserve_one_row()
     }
 
     /// Overwrites the row at `index` with a copy of the given bytes.
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DescriptorRowInvalid`] when `index` is out of
-    /// bounds or `bytes` does not contain exactly `element_size()` bytes.
+    /// Returns [`WorldError::ColumnRowsAreNotPlainData`] when the column's rows
+    /// own resources - see [`Self::require_plain_data`] - or
+    /// [`WorldError::DescriptorRowInvalid`] when `index` is out of bounds or
+    /// `bytes` does not contain exactly `element_size()` bytes.
     pub fn set_bytes(&mut self, index: usize, bytes: &[u8]) -> Result<(), WorldError> {
         self.require_plain_data()?;
-        if index >= self.len || bytes.len() != self.layout.size {
+        if index >= self.len || bytes.len() != self.element_layout.size {
             return Err(WorldError::DescriptorRowInvalid);
         }
         // SAFETY: the checked row is initialized and bytes has one element's size.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                self.data.as_ptr().add(index * self.layout.size),
-                self.layout.size,
+                self.row_buffer.as_ptr().add(index * self.element_layout.size),
+                self.element_layout.size,
             );
         }
         Ok(())
@@ -1219,8 +1243,9 @@ impl ComponentColumn {
         self.assert_element_type::<T>();
         // SAFETY: the element type was just checked, rows `0..len` are
         // initialized, and the buffer is allocated and aligned for `T`.
-        let rows =
-            unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr().cast::<T>(), self.len) };
+        let rows = unsafe {
+            std::slice::from_raw_parts_mut(self.row_buffer.as_ptr().cast::<T>(), self.len)
+        };
         (rows, &mut self.ticks)
     }
 
@@ -1230,7 +1255,7 @@ impl ComponentColumn {
     /// bindings that address rows as bytes. The pointer is valid only until the
     /// column next grows or is dropped.
     pub fn raw_rows_and_ticks_mut(&mut self) -> (*mut u8, usize, &mut [ComponentTicks]) {
-        (self.data.as_ptr(), self.len, &mut self.ticks)
+        (self.row_buffer.as_ptr(), self.len, &mut self.ticks)
     }
 
     /// Returns the raw bytes of the row at `index`, or `None` when out of bounds.
@@ -1241,8 +1266,8 @@ impl ComponentColumn {
         // SAFETY: the row is initialized and lives for the returned shared borrow.
         Some(unsafe {
             std::slice::from_raw_parts(
-                self.data.as_ptr().add(index * self.layout.size),
-                self.layout.size,
+                self.row_buffer.as_ptr().add(index * self.element_layout.size),
+                self.element_layout.size,
             )
         })
     }
@@ -1252,8 +1277,8 @@ impl ComponentColumn {
     //
     // Available only where a Rust type names the rows; `assert_element_type`
     // is what separates the two lanes at the point of use. The arithmetic is
-    // the same either way - `data + index * element_size` - so a typed read costs
-    // exactly what a byte read costs.
+    // the same either way - `row_buffer + index * element_size` - so a typed
+    // read costs exactly what a byte read costs.
     // ---------------------------------------------------------------------
 
     /// Append a typed value, growing the column when needed.
@@ -1267,16 +1292,17 @@ impl ComponentColumn {
     /// archetype move - have no recovery for.
     pub fn push<T: 'static>(&mut self, value: T) {
         self.assert_element_type::<T>();
-        self.reserve_one()
+        self.reserve_one_row()
             .expect("a native column must be able to grow for one more row");
         self.ticks.push(ComponentTicks::default());
-        // SAFETY: `reserve_one` guaranteed capacity for one more row, and the
-        // element type was just checked, so the slot is correctly aligned and
-        // sized for `T`. `write` does not drop the uninitialized destination.
+        // SAFETY: `reserve_one_row` guaranteed capacity for one more row, and
+        // the element type was just checked, so the slot is correctly aligned
+        // and sized for `T`. `write` does not drop the uninitialized
+        // destination.
         unsafe {
-            self.data
+            self.row_buffer
                 .as_ptr()
-                .add(self.len * self.layout.size)
+                .add(self.len * self.element_layout.size)
                 .cast::<T>()
                 .write(value);
         }
@@ -1316,7 +1342,7 @@ impl ComponentColumn {
     /// which is why this exists.
     pub unsafe fn get_unchecked<T: 'static>(&self, index: usize) -> &T {
         // SAFETY: the caller guarantees the type and the index.
-        unsafe { &*self.data.as_ptr().add(index * self.layout.size).cast::<T>() }
+        unsafe { &*self.row_buffer.as_ptr().add(index * self.element_layout.size).cast::<T>() }
     }
 
     /// Mutable twin of [`Self::get_unchecked`].
@@ -1327,7 +1353,7 @@ impl ComponentColumn {
     /// exist for the lifetime of the returned one.
     pub unsafe fn get_mut_unchecked<T: 'static>(&mut self, index: usize) -> &mut T {
         // SAFETY: the caller guarantees the type, the index and the exclusivity.
-        unsafe { &mut *self.data.as_ptr().add(index * self.layout.size).cast::<T>() }
+        unsafe { &mut *self.row_buffer.as_ptr().add(index * self.element_layout.size).cast::<T>() }
     }
 
     /// The rows as a typed slice.
@@ -1341,7 +1367,7 @@ impl ComponentColumn {
             return &[];
         }
         // SAFETY: the element type was checked and `len` rows are initialized.
-        unsafe { std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.row_buffer.as_ptr().cast::<T>(), self.len) }
     }
 
     /// Mutable twin of [`Self::as_slice`].
@@ -1355,7 +1381,7 @@ impl ComponentColumn {
             return &mut [];
         }
         // SAFETY: as above, with exclusivity from `&mut self`.
-        unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr().cast::<T>(), self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.row_buffer.as_ptr().cast::<T>(), self.len) }
     }
 
     /// Remove one row by swapping the last into its place, returning it.
@@ -1370,14 +1396,14 @@ impl ComponentColumn {
         // moved out; the tail row is then moved over the hole and the length
         // drops, so no row is ever read twice or dropped twice.
         unsafe {
-            let base = self.data.as_ptr();
-            let taken = base.add(index * self.layout.size).cast::<T>().read();
+            let base = self.row_buffer.as_ptr();
+            let taken = base.add(index * self.element_layout.size).cast::<T>().read();
             let last = self.len - 1;
             if index != last {
                 std::ptr::copy_nonoverlapping(
-                    base.add(last * self.layout.size),
-                    base.add(index * self.layout.size),
-                    self.layout.size,
+                    base.add(last * self.element_layout.size),
+                    base.add(index * self.element_layout.size),
+                    self.element_layout.size,
                 );
             }
             self.len = last;
@@ -1419,15 +1445,16 @@ impl ComponentColumn {
         }
         // SAFETY: the index is in range, so the offset stays inside the
         // allocation's initialized prefix.
-        Some(unsafe { self.data.as_ptr().add(index * self.layout.size) })
+        Some(unsafe { self.row_buffer.as_ptr().add(index * self.element_layout.size) })
     }
 
     /// Raw read pointer to the first row.
     pub fn raw_ptr(&self) -> *const u8 {
-        self.data.as_ptr()
+        self.row_buffer.as_ptr()
     }
 
-    /// Runtime identity of the element type, or `None` for a descriptor column.
+    /// Runtime identity of the element type, or `None` when no exact `TypeId`
+    /// names it (a shared or descriptor column).
     pub fn element_type_id(&self) -> Option<std::any::TypeId> {
         match self.identity {
             ColumnIdentity::Native(type_id) => Some(type_id),
@@ -1447,7 +1474,7 @@ impl ComponentColumn {
     /// If `T` is not this column's element type.
     pub fn as_ptr<T: 'static>(&self) -> *const T {
         self.assert_element_type::<T>();
-        self.data.as_ptr().cast::<T>()
+        self.row_buffer.as_ptr().cast::<T>()
     }
 
     /// Iterate the rows as `T`.
@@ -1497,8 +1524,8 @@ impl ComponentColumn {
         plan: &FieldPlan,
     ) -> Result<usize, WorldError> {
         validate_component_layout(layout.size, layout.align)?;
-        plan.validate(self.layout.size, layout.size)?;
-        let previous_size = self.layout.size;
+        plan.validate(self.element_layout.size, layout.size)?;
+        let previous_size = self.element_layout.size;
         Ok(self.relayout_validated(layout, plan, previous_size))
     }
 
@@ -1520,21 +1547,21 @@ impl ComponentColumn {
         // source stride have to be. A disagreement is an internal break: the
         // world-level relayout verifies every column before calling here.
         debug_assert_eq!(
-            previous_size, self.layout.size,
+            previous_size, self.element_layout.size,
             "a column's element size disagrees with the layout its plan was validated against"
         );
         let rows = self.len;
         let old_size = previous_size;
-        let old_align = self.layout.align;
-        let old_data = self.data;
+        let old_align = self.element_layout.align;
+        let previous_row_buffer = self.row_buffer;
         let in_place = layout.size == old_size && layout.align == old_align;
 
         // Step 1: Prepare the destination buffer. An unchanged shape keeps the
         // buffer it has; anything else gets a fresh one at the same capacity,
         // because a relayout is not a reason to re-grow on the next push.
-        let mut new_data = old_data;
+        let mut new_row_buffer = previous_row_buffer;
         if !in_place {
-            new_data = if self.capacity == 0 || layout.size == 0 {
+            new_row_buffer = if self.capacity == 0 || layout.size == 0 {
                 // Nothing to hold, so nothing to allocate - a shape that became
                 // a marker keeps only its row count.
                 unallocated_pointer(layout.align)
@@ -1560,9 +1587,9 @@ impl ComponentColumn {
                 // SAFETY: `row < rows` counts only initialized rows, and both
                 // buffers are allocated for at least `rows` rows.
                 unsafe {
-                    let source = old_data.as_ptr().add(row * old_size);
+                    let source = previous_row_buffer.as_ptr().add(row * old_size);
                     std::ptr::copy_nonoverlapping(source, scratch.as_mut_ptr(), old_size);
-                    let destination = new_data.as_ptr().add(row * layout.size);
+                    let destination = new_row_buffer.as_ptr().add(row * layout.size);
                     std::ptr::write_bytes(destination, 0, layout.size);
                     plan.apply(
                         &scratch,
@@ -1583,14 +1610,14 @@ impl ComponentColumn {
                 // SAFETY: this is the live allocation, created with this layout.
                 unsafe {
                     dealloc(
-                        old_data.as_ptr(),
+                        previous_row_buffer.as_ptr(),
                         Layout::from_size_align_unchecked(old_size * self.capacity, old_align),
                     );
                 }
             }
-            self.data = new_data;
+            self.row_buffer = new_row_buffer;
         }
-        self.layout = layout;
+        self.element_layout = layout;
         rows
     }
 
@@ -1612,9 +1639,9 @@ impl ComponentColumn {
             // SAFETY: both rows are within this allocation; copy permits overlap.
             unsafe {
                 std::ptr::copy(
-                    self.data.as_ptr().add(last * self.layout.size),
-                    self.data.as_ptr().add(index * self.layout.size),
-                    self.layout.size,
+                    self.row_buffer.as_ptr().add(last * self.element_layout.size),
+                    self.row_buffer.as_ptr().add(index * self.element_layout.size),
+                    self.element_layout.size,
                 );
             }
         }
@@ -1636,16 +1663,21 @@ impl ComponentColumn {
         // are overwritten by the swap-in.
         if !self.ops.trivial_drop {
             // SAFETY: index < len, so the row is initialized and addressable.
-            unsafe { (self.ops.drop_range)(self.data.as_ptr().add(index * self.layout.size), 1) };
+            unsafe {
+                (self.ops.drop_range)(
+                    self.row_buffer.as_ptr().add(index * self.element_layout.size),
+                    1,
+                )
+            };
         }
         let last = self.len - 1;
         if index != last {
             // SAFETY: both rows are within this allocation; copy permits overlap.
             unsafe {
                 std::ptr::copy(
-                    self.data.as_ptr().add(last * self.layout.size),
-                    self.data.as_ptr().add(index * self.layout.size),
-                    self.layout.size,
+                    self.row_buffer.as_ptr().add(last * self.element_layout.size),
+                    self.row_buffer.as_ptr().add(index * self.element_layout.size),
+                    self.element_layout.size,
                 );
             }
         }
@@ -1659,7 +1691,7 @@ impl ComponentColumn {
     ///
     /// Returns [`WorldError::DescriptorLayoutInvalid`] when the doubled capacity
     /// or the allocation layout it implies cannot be represented.
-    fn reserve_one(&mut self) -> Result<(), WorldError> {
+    fn reserve_one_row(&mut self) -> Result<(), WorldError> {
         // Step 1: Early-exit when the column still has a spare slot.
         if self.len < self.capacity {
             return Ok(());
@@ -1679,7 +1711,7 @@ impl ComponentColumn {
 
     /// Reallocate the buffer to hold exactly `new_capacity` rows.
     ///
-    /// The single growth implementation: [`Self::reserve_one`] picks the
+    /// The single growth implementation: [`Self::reserve_one_row`] picks the
     /// doubling policy and [`Self::reserve_rows`] picks an exact target, but
     /// both allocate and migrate through here, so the two can never disagree
     /// about how a buffer is moved.
@@ -1694,45 +1726,47 @@ impl ComponentColumn {
         }
         // A zero-sized element has no bytes to hold, so there is nothing to
         // allocate and every row is the same (aligned, dangling) address. The
-        // capacity is still tracked, because `reserve_one` doubles it and the
-        // row count is the column's only real state.
-        if self.layout.size == 0 {
+        // capacity is still tracked, because `reserve_one_row` doubles it and
+        // the row count is the column's only real state.
+        if self.element_layout.size == 0 {
             self.capacity = new_capacity;
             return Ok(());
         }
-        let new_layout = Layout::from_size_align(
-            self.layout
+        let allocation_layout = Layout::from_size_align(
+            self.element_layout
                 .size
                 .checked_mul(new_capacity)
                 .ok_or(WorldError::DescriptorLayoutInvalid)?,
-            self.layout.align,
+            self.element_layout.align,
         )
         .map_err(|_| WorldError::DescriptorLayoutInvalid)?;
 
         // Step 3: Allocate the new buffer and migrate the existing rows.
-        // SAFETY: new_layout has non-zero size because component size is validated.
-        let new_data = unsafe { alloc(new_layout) };
-        let new_data = NonNull::new(new_data).unwrap_or_else(|| handle_alloc_error(new_layout));
+        // SAFETY: allocation_layout has non-zero size because component size is
+        // validated.
+        let new_row_buffer = unsafe { alloc(allocation_layout) };
+        let new_row_buffer =
+            NonNull::new(new_row_buffer).unwrap_or_else(|| handle_alloc_error(allocation_layout));
         if self.len != 0 {
             // SAFETY: both allocations are valid and non-overlapping.
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    self.data.as_ptr(),
-                    new_data.as_ptr(),
-                    self.len * self.layout.size,
+                    self.row_buffer.as_ptr(),
+                    new_row_buffer.as_ptr(),
+                    self.len * self.element_layout.size,
                 );
                 dealloc(
-                    self.data.as_ptr(),
+                    self.row_buffer.as_ptr(),
                     Layout::from_size_align_unchecked(
-                        self.layout.size * self.capacity,
-                        self.layout.align,
+                        self.element_layout.size * self.capacity,
+                        self.element_layout.align,
                     ),
                 );
             }
         }
 
         // Step 4: Adopt the new allocation as the column's buffer.
-        self.data = new_data;
+        self.row_buffer = new_row_buffer;
         self.capacity = new_capacity;
         Ok(())
     }
@@ -1748,8 +1782,8 @@ impl ComponentColumn {
 //    in `swap_remove` and the destructor-free paths below correct: there is no
 //    ownership to duplicate or release.
 // 2. Access is serialised by the same scheduler rules as native columns - see
-//    `SystemAccess::conflicts_with`, which only takes its bitmask fast path when
-//    both systems' access masks are complete.
+//    `SystemAccess::conflicts_with`, which reports a conflict whenever either
+//    system writes a component the other one reads or writes.
 unsafe impl Send for ComponentColumn {}
 // SAFETY: Shared access to a column only permits reading rows, which is sound
 // under the same two premises as `Send` above: rows are blittable value types
@@ -1773,18 +1807,18 @@ impl Drop for ComponentColumn {
         if !self.ops.trivial_drop && self.len != 0 {
             // SAFETY: rows 0..len are initialized, correctly aligned for the
             // element type, and the table is the one that wrote them.
-            unsafe { (self.ops.drop_range)(self.data.as_ptr(), self.len) };
+            unsafe { (self.ops.drop_range)(self.row_buffer.as_ptr(), self.len) };
         }
         // `size != 0` joins the capacity test because a zero-sized column
         // reports a capacity it never allocated for.
-        if self.capacity != 0 && self.layout.size != 0 {
-            // SAFETY: this is the live allocation created by reserve_one.
+        if self.capacity != 0 && self.element_layout.size != 0 {
+            // SAFETY: this is the live allocation created by reserve_one_row.
             unsafe {
                 dealloc(
-                    self.data.as_ptr(),
+                    self.row_buffer.as_ptr(),
                     Layout::from_size_align_unchecked(
-                        self.layout.size * self.capacity,
-                        self.layout.align,
+                        self.element_layout.size * self.capacity,
+                        self.element_layout.align,
                     ),
                 );
             }
@@ -1867,7 +1901,7 @@ impl Archetype {
                     component_id
                 ));
             match factory {
-                StorageFactory::Native(info) => {
+                StorageFactory::Native(column_info) => {
                     // Build the erased column from the registered type
                     // description. It is stored as a concrete
                     // `ComponentColumn` (no trait-object vtable), so the
@@ -1876,7 +1910,7 @@ impl Archetype {
                     // shared between binaries resolves to it from either one.
                     component_storages.insert(
                         component_id,
-                        ComponentColumn::from_native_info(*info, 0)
+                        ComponentColumn::from_native_info(*column_info, 0)
                             .expect("a registered native layout is valid by construction"),
                     );
                 }
@@ -1980,16 +2014,16 @@ impl Archetype {
     /// Logs information about this archetype (component names and entity count).
     #[cold]
     pub fn print_info(&self, registry: &crate::component::ComponentRegistry) {
-        let info = self.get_archetype_info(registry);
-        pill_core::info!(target: pill_core::telemetry::telemetry_target::ECS, "{}", info);
+        let summary = self.get_archetype_info(registry);
+        pill_core::info!(target: pill_core::telemetry::telemetry_target::ECS, "{}", summary);
     }
 
     /// Estimate the memory footprint of this archetype in bytes.
     ///
-    /// Sums entity IDs, component column capacities x element sizes,
-    /// and change-detection tick vectors. Each column reports its own stride:
-    /// the archetype is asked about the memory it holds, so the columns holding
-    /// it are the record to read.
+    /// Sums the entity array's capacity, every component column's rows at the
+    /// entity count, and the change-detection tick vectors. Each column reports
+    /// its own stride: the archetype is asked about the memory it holds, so the
+    /// columns holding it are the record to read.
     pub fn memory_estimate(&self) -> usize {
         // Step 1: Account for the entity ID array (16 bytes per entity).
         let mut total = self.entities.capacity() * std::mem::size_of::<crate::entity::Entity>();

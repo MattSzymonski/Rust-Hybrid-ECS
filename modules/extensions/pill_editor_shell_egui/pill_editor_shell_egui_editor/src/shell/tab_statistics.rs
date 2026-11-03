@@ -2,21 +2,29 @@
 //!
 //! # Responsibilities
 //!
-//! - Show the frame rate, the whole shell pass's time, the world's size and
-//!   one row per tab drawn since the session began, with its smoothed body
-//!   time.
+//! - Draw the frame's numbers: frame rate, frame time, the shell pass's time
+//!   and pass count, and the counts of entities, systems, console lines and
+//!   problems.
+//! - Draw one row per tab drawn since the session began, with that tab's
+//!   smoothed body time and its pass count.
 //!
 //! # Design
 //!
-//! Every number here is a measurement the shell already took: the whole
-//! pass's time in `run_frame` and each `TabViewer::ui` body's time. The tab
-//! only formats them; it records nothing.
+//! The times are measured before the tab draws: `run_frame` times the whole
+//! pass, and `TabViewer::ui` times each tab body. The frame rate comes from
+//! the editor through the shell input, and the counts come from the frame's
+//! snapshot. This tab only formats these numbers; it records nothing.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The Statistics tab: the frame's numbers, then one row per drawn tab.
+/// The Statistics tab: the frame's timings and the editor's counts, then one
+/// row per drawn tab.
+///
+/// `frames_per_second` is the editor's smoothed frame rate, and the frame time
+/// row is computed from it. `stats` holds what the shell recorded: the whole
+/// pass's time, and one timing per tab drawn so far.
 pub fn statistics_tab(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,

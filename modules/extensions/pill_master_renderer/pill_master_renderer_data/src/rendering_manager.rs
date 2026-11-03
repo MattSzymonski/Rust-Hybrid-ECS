@@ -1,19 +1,22 @@
-//! The world resource holding the pipeline the renderer runs.
+//! The world resource that holds the pipeline the renderer runs.
 //!
 //! # Responsibilities
 //!
-//! - Store the pipeline the game set, and nothing else.
+//! - Hold one optional pipeline handle, and nothing else. It is the pipeline
+//!   the renderer should run: the game's choice, or the default that
+//!   [`crate::register`] installs.
 //! - Cross the module boundary: a project DLL sets the pipeline, the host's
 //!   renderer executes it, and both sides have to agree on one resource.
 //!
 //! # Design
 //!
-//! Inserted by [`crate::register`], so it exists before any project code runs
-//! and `set_pipeline` never has to check for it. The shared name, given by
-//! `#[pill_mirror_resource]`, is what makes the host binary and a project module
-//! agree on the resource id, exactly as `RenderFrame` does; without it the
-//! renderer would read a resource the project never wrote. The same name is what
-//! C# computes for its `RenderingManager` marker, so a managed system declares
+//! [`crate::register`] inserts this resource when it is missing, so it exists
+//! before any project code runs and code that sets a pipeline finds it already
+//! there. The resource id the host binary and a project DLL both use is the
+//! shared name that `#[pill_mirror_resource]` gives the type; `RenderFrame`
+//! shares its id the same way. Without a shared name the renderer would read a
+//! resource the project never wrote. C#'s generated `RenderingManager` marker
+//! carries the same name, so a managed system declares
 //! `ResMut<RenderingManager>` and calls `Clear()`.
 
 // External crates
@@ -22,7 +25,11 @@ use pill_engine::{pill_mirror_impl, pill_mirror_method, pill_mirror_resource, Ha
 // Current crate
 use crate::RenderingPipeline;
 
-/// The pipeline the renderer runs, as the game declared it.
+// =============================================================================
+// RenderingManager
+// =============================================================================
+
+/// The renderer's pipeline selection, carried as one optional handle.
 #[derive(Clone, Debug, Default)]
 #[pill_mirror_resource("pill_master_renderer::resources::rendering_manager::RenderingManager")]
 pub struct RenderingManager {
@@ -31,34 +38,40 @@ pub struct RenderingManager {
 
 #[pill_mirror_impl]
 impl RenderingManager {
-    /// A manager with no pipeline: the renderer keeps its built-in chain.
+    /// Creates a manager with no pipeline, which leaves the renderer on its
+    /// built-in chain.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Hand the renderer a pipeline to run.
+    /// Hands the renderer a pipeline to run.
     ///
-    /// This is the call that makes the renderer build the chain: on its next
-    /// frame it resolves the passes, checks every offscreen target against the
-    /// pass that produces it, and creates the pipelines it does not have yet.
-    /// Until then the renderer keeps drawing with its built-in chain.
+    /// This call is what makes the renderer build a new chain. On its next
+    /// frame the renderer resolves the passes, checks that every offscreen
+    /// target a pass reads was declared by an earlier pass, and creates the GPU
+    /// pipelines it does not have yet. Until then it keeps drawing the chain it
+    /// already has.
     #[pill_mirror_method]
     pub fn set_pipeline(&mut self, pipeline: Handle<RenderingPipeline>) {
         self.pipeline = Some(pipeline);
     }
 
-    /// The pipeline the renderer should run, if the game set one.
+    /// Returns the pipeline the renderer should run, or `None` when none is set.
     #[pill_mirror_method]
     pub fn pipeline(&self) -> Option<Handle<RenderingPipeline>> {
         self.pipeline
     }
 
-    /// Drop the pipeline, returning the renderer to its built-in chain.
+    /// Drops the pipeline, which puts the renderer back on its built-in chain.
     #[pill_mirror_method]
     pub fn clear(&mut self) {
         self.pipeline = None;
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

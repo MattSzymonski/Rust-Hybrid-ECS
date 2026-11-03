@@ -1,11 +1,15 @@
-//! The floating toolbox over a scene viewport.
+//! The floating toolbox that sits over a scene viewport.
 //!
 //! # Responsibilities
 //!
-//! - `toolbox_overlay`: the gizmo's tools, space and snapping as one draggable
-//!   panel per scene viewport, with its rectangles logged once per placement.
+//! - `toolbox_overlay`: one draggable panel per scene viewport, holding the
+//!   gizmo's three tools, its space, its snapping and the scene grid's switch.
+//!   The panel's rectangle and every row's rectangle are logged whenever the
+//!   panel moves.
 //!
-//! The globs below are absolute paths: a generated patch crate replays this
+//! # Design
+//!
+//! The globs below are absolute paths. A generated patch crate replays this
 //! file's top-level `use` lines, so a `super::`-relative glob would not
 //! resolve there.
 
@@ -13,19 +17,24 @@
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The floating toolbox over one scene viewport: the gizmo's tools, its space
-/// and its snapping as one panel that drags anywhere inside the view - the
-/// always-visible twin of the viewport menu's items.
+/// Draws the floating toolbox over one scene viewport: the gizmo's tools, its
+/// space, its snapping and the scene grid's switch.
 ///
-/// The panel floats over the scene's child window and its rectangle joins the
+/// The panel carries the same settings as the viewport menu, always on screen.
+/// A press on the handle along the panel's top drags it. A drag is kept inside
+/// the viewport; a viewport too small to hold the whole panel keeps the
+/// panel's top-left corner at its default spot, so the handle and the upper
+/// rows stay reachable.
+///
+/// The panel floats over the scene's child window, and its rectangle joins the
 /// frame's overlay regions, so a click anywhere on it - a row or the gap
-/// between rows - is the UI's and never becomes a scene pick. The drag starts
-/// on the handle and is clamped to the viewport, so the panel can be parked
-/// anywhere inside the view but not lost outside it. The panel's rectangle and
-/// every row's are logged once per placement and again after each drag, which
-/// is where the scripted suite reads its click targets.
+/// between rows - belongs to the UI and never becomes a scene pick. The
+/// panel's rectangle and every row's rectangle are logged whenever the panel
+/// moves, and the scripted suite clicks the centre of the logged rows.
 #[pill_hot_fn]
 pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: usize) {
+    // Step 1: Read the settings the rows show, then place the panel at its
+    // dragged origin or at the viewport's default corner.
     let viewport = ui.max_rect();
     let state = toolbox::ToolboxState {
         gizmo: viewer.snapshot.gizmo,
@@ -38,8 +47,8 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
             .unwrap_or_else(|| toolbox::default_origin(viewport)),
         viewport,
     );
-    // The handle is the one part of the panel a press drags; a click on
-    // a row below it still reaches the row's button.
+    // Step 2: Drag the panel by its handle, which is the one part of the panel
+    // a press drags. A click on a row below it still reaches the row's button.
     let handle = toolbox::handle_rect(origin);
     let response = ui.interact(
         handle,
@@ -59,6 +68,7 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
             "[editor] toolbox moved"
         );
     }
+    // Step 3: Paint the panel's background and its title, then draw its rows.
     let panel = toolbox::panel_rect(origin);
     ui.painter().rect(
         panel,
@@ -74,10 +84,11 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
         egui::TextStyle::Small.resolve(ui.style()),
         style::text_muted(),
     );
-    // The rows are ordinary buttons, each filling its row's width, so the panel
-    // reads as one column of controls: a selected row takes the theme's
-    // selection colour and the rest stay at the widget's idle fill. A row's
-    // rectangle is recorded for the scripted suite, which clicks its centre.
+    // The rows are ordinary buttons, each as wide as its row, so the panel
+    // reads as one column of controls: the row of the current setting takes
+    // the theme's selection colour, and the rest keep the widget's idle fill.
+    // Each button's rectangle is recorded for the layout test, and the
+    // scripted suite clicks the centre of each row's logged rectangle.
     let mut faces = Vec::with_capacity(toolbox::TOOLBOX_ITEMS.len());
     for item in toolbox::TOOLBOX_ITEMS {
         let rect = toolbox::item_rect(item, origin);
@@ -100,6 +111,9 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
             );
         }
     }
+    // Step 4: Record the panel's rectangle as an overlay region and store the
+    // rectangles the row buttons drew in the session. Each time the panel's
+    // rectangle changes, the panel and every row are logged once.
     viewer.toolbox.set_faces(view, faces);
     viewer.overlay_regions.push(shell_rect(panel));
     if viewer.toolbox.remember_logged(view, panel) {

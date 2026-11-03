@@ -1,15 +1,16 @@
-//! [`SoundType`]: whether a sound is positional.
+//! Defines [`SoundType`], which says whether a sound is positioned in the
+//! world.
 //!
 //! # Responsibilities
 //!
-//! - Declares the two playback modes, which select the sink pool a source
-//!   draws from.
+//! - Declares the two playback modes. Each mode selects which of the two sink
+//!   pools a source draws from.
 //!
 //! # Design
 //!
-//! It has its own file because the source component and the manager both name
-//! it, and because it is the discriminant that decides which of the two sink
-//! pools every playback operation touches.
+//! The source component, the manager and the system all name this type, so it
+//! has a file of its own. The manager switches on it to pick one of the two
+//! sink pools, so every playback operation reads it.
 
 // External crates
 use serde::{Deserialize, Serialize};
@@ -22,11 +23,11 @@ use serde::{Deserialize, Serialize};
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SoundType {
-    /// Non-positional: played at a fixed volume regardless of where the
-    /// entity is. Music and UI.
+    /// Not positioned in space: the sound plays at the volume its source sets,
+    /// wherever the entity is. Use this for music and UI sounds.
     Ambient = 0,
-    /// Positional: panned and attenuated by the distance between the entity
-    /// and the listener's ears.
+    /// Positioned in space: panned left or right, and made quieter as the
+    /// distance between the entity and the listener's ears grows.
     #[default]
     Spatial = 1,
 }

@@ -1,27 +1,33 @@
-//! The GPU pipeline a shader asset becomes, and the layouts its draws bind.
+//! What a shader asset becomes on the GPU: its render pipeline and the
+//! layouts of the groups its draws bind.
 //!
 //! # Responsibilities
 //!
-//! - Build the render pipeline and group layouts from a shader's cooked WGSL,
-//!   capturing wgpu validation so a shader the driver refuses is reported
-//!   against the asset that named it instead of taking the host down
-//!   ([`RendererShader::new`]).
+//! - Build the render pipeline and the group layouts from a shader's WGSL,
+//!   and report a shader wgpu refuses against the asset that named it instead
+//!   of taking the host down ([`RendererShader::new`]).
 //! - Create the parameters group layout (set 2) and the textures group layout
-//!   (set 3), each absent when the shader declares none of that kind, and pad
-//!   the pipeline layout so every shader keeps the engine's fixed groups.
-//! - Carry the flags that say whether the shader reads the engine's or the
-//!   camera's uniforms, so a drawer binds those groups only when they are
-//!   read.
+//!   (set 3). Each one is absent when the shader declares no slots of that
+//!   kind.
+//! - Carry the flags that say whether the shader reads the engine's parameters
+//!   or the camera's, so a drawer binds those groups only when the shader
+//!   reads them.
 //!
 //! # Design
 //!
-//! Built during asset sync, when a shader asset is loaded or its version
-//! changes, not per frame. The four group slots are fixed by the engine's
-//! convention - engine parameters at 0, camera at 1, a material's or pass's
-//! parameters at 2, its textures at 3 - and an empty layout keeps a slot the
-//! shader does not declare, so every pipeline has the same shape the drawers
-//! bind against. The WGSL the modules are created from is cooked at build
-//! time; nothing compiles a shader at runtime.
+//! A shader is built during asset sync, when its asset is loaded or its
+//! content version changes, and once at startup for the built-in default
+//! shader. It is not rebuilt per frame.
+//!
+//! The four group slots are fixed by the engine's convention: engine
+//! parameters at 0, camera parameters at 1, a material's or pass's parameters
+//! at 2, and its textures at 3. A slot the shader does not declare still gets
+//! an empty layout, so every pipeline has the same shape the drawers bind
+//! against.
+//!
+//! The WGSL is not written by hand. The data crate's build script compiles its
+//! HLSL sources to it, and in development the host's shader watcher compiles
+//! an edited source again and sends the new text to the shader asset.
 
 // External crates
 use indexmap::IndexMap;
@@ -33,24 +39,28 @@ use crate::{
     error::{RendererError, Result},
 };
 
-// --- Handle ---
+// =============================================================================
+// Handle
+// =============================================================================
 
 pill_core::define_slot_key!(RendererShaderHandle);
 
-/// One shader's GPU pipeline and the layout of the groups its draws bind.
+// =============================================================================
+// RendererShader
+// =============================================================================
+
+/// One shader's GPU pipeline and the group layouts its draws bind.
 ///
-/// Built during asset sync from the shader asset, beside every other GPU
-/// resource. The pipeline is what a draw switches to; the layouts are what a
-/// material or pass built against this shader binds its parameters and
-/// textures through.
+/// The pipeline is what a draw switches to. A material or pass built against
+/// this shader binds its parameters and textures through these layouts.
 pub struct RendererShader {
-    /// Label used in logs and error messages, taken from the shader asset.
+    /// The shader asset's name, used in wgpu object labels, logs and error
+    /// messages.
     pub name: String,
-    /// Pipeline a draw using this shader binds.
+    /// The pipeline a draw through this shader binds.
     ///
-    /// A pass that owns its pipeline can still draw through its own instead,
-    /// because only the pass knows the target's format and its depth and
-    /// culling.
+    /// A pass that owns a pipeline draws through its own instead, because only
+    /// the pass knows the target's format, its depth settings and its culling.
     pub render_pipeline: wgpu::RenderPipeline,
 
     /// The uniforms the shader declares, by name, in declaration order.
@@ -73,32 +83,21 @@ pub struct RendererShader {
     pub reads_camera_parameters: bool,
 }
 
-/// Which of the renderer's shared uniforms a shader reads.
-///
-/// Grouped rather than passed as two bare booleans: `RendererShader::new` takes
-/// a dozen arguments, and a trailing `true, true` says nothing about which
-/// group either one asks for.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct UniformGroups {
-    /// The shader reads group 0, the engine's parameters.
-    pub engine: bool,
-    /// The shader reads group 1, the camera's parameters.
-    pub camera: bool,
-}
-
 impl RendererShader {
-    /// Builds a shader's render pipeline and group layouts from its cooked
-    /// WGSL, for the given color and depth formats.
+    /// Builds a shader's render pipeline and group layouts from its WGSL, for
+    /// the given color and depth formats.
     ///
     /// The parameters and textures layouts exist only when the shader declares
-    /// slots of that kind; the pipeline layout pads a missing one with an empty
-    /// layout, so the shader keeps the engine's fixed group convention.
+    /// slots of that kind. A missing one is padded with an empty layout, so the
+    /// shader keeps the engine's fixed group convention.
     ///
     /// # Errors
     ///
-    /// Returns [`RendererError::Other`] when the pipeline fails wgpu
-    /// validation, a mistake in the shader asset: validation is scoped so the
-    /// refusal names the shader rather than panicking.
+    /// Returns [`RendererError::Other`] when wgpu reports an error while the
+    /// pipeline is created: a validation error, which means the shader asset is
+    /// wrong, or an out-of-memory or internal error. The error is captured
+    /// while the pipeline is built, so the refusal names the shader instead of
+    /// panicking.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: &str,
@@ -114,18 +113,21 @@ impl RendererShader {
         camera_bind_group_layout: &wgpu::BindGroupLayout,
         uniform_groups: UniformGroups,
     ) -> Result<Self> {
-        // Nothing compiles a shader at runtime: the authored sources are HLSL
-        // under the data crate's `shader_sources`, its build script cooks them
-        // to the WGSL these strings carry, and wgpu parses that through naga.
-        let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        // Step 1: Create the two shader modules. The WGSL is not written by
+        // hand: the data crate's build script compiles its HLSL sources to it,
+        // and a shader edited in development is compiled again by the host's
+        // shader watcher. wgpu parses the WGSL when the module is created.
+        let vertex_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("master_vertex_shader"),
             source: wgpu::ShaderSource::Wgsl(vertex_wgsl.into()),
         });
-        let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let fragment_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("master_fragment_shader"),
             source: wgpu::ShaderSource::Wgsl(fragment_wgsl.into()),
         });
 
+        // Step 2: Build the group layouts. A layout is built only when the
+        // shader declares slots of that kind.
         let parameters_bind_group_layout = {
             if !parameter_slots.is_empty() {
                 let bind_group_layout_entry = wgpu::BindGroupLayoutEntry {
@@ -153,12 +155,12 @@ impl RendererShader {
         // Textures bind at group 3, one texture and one sampler per slot.
         let textures_bind_group_layout = {
             if !texture_slots.is_empty() {
-                let mut entries = Vec::new();
+                let mut bind_group_entries = Vec::new();
 
                 for texture_slot in texture_slots.values() {
-                    // A depth slot is bound as depth, with a sampler that does not
-                    // filter: a depth buffer is not a filterable colour texture,
-                    // and wgpu refuses the pipeline that pretends otherwise.
+                    // A depth slot binds a depth view, sampled without filtering.
+                    // wgpu refuses a pipeline that treats a depth buffer as a
+                    // filterable colour texture.
                     let (sample_type, sampler_type) = match texture_slot.kind {
                         ShaderTextureKind::Depth => (
                             wgpu::TextureSampleType::Depth,
@@ -173,9 +175,9 @@ impl RendererShader {
                         ),
                     };
 
-                    // Texture binding: a cubemap slot takes a cube view, which
-                    // is what a shader's `TextureCube` declares.
-                    entries.push(wgpu::BindGroupLayoutEntry {
+                    // The texture half of the slot. A cubemap slot takes a cube
+                    // view, which is what an HLSL `TextureCube` declares.
+                    bind_group_entries.push(wgpu::BindGroupLayoutEntry {
                         binding: texture_slot.texture_binding,
                         visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Texture {
@@ -186,8 +188,7 @@ impl RendererShader {
                         count: None,
                     });
 
-                    // Sampler binding
-                    entries.push(wgpu::BindGroupLayoutEntry {
+                    bind_group_entries.push(wgpu::BindGroupLayoutEntry {
                         binding: texture_slot.sampler_binding,
                         visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Sampler(sampler_type),
@@ -198,7 +199,7 @@ impl RendererShader {
                 Some(
                     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                         label: Some(&format!("{}_textures_bind_group_layout", name)),
-                        entries: &entries,
+                        entries: &bind_group_entries,
                     }),
                 )
             } else {
@@ -206,9 +207,10 @@ impl RendererShader {
             }
         };
 
-        // The four group slots are fixed by the engine's convention; a shader
-        // that declares neither parameters nor textures gets an empty layout in
-        // that slot, so every pipeline has the same shape to bind against.
+        // Step 3: Create the render pipeline. The four group slots are fixed by
+        // the engine's convention, and a shader that declares neither
+        // parameters nor textures gets an empty layout in that slot, so every
+        // pipeline has the same shape to bind against.
         let pipeline_layout = {
             let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("shader_empty_bind_group_layout"),
@@ -247,54 +249,63 @@ impl RendererShader {
             label: Some(&format!("{}_render_pipeline", name)),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &vertex_shader,
+                module: &vertex_shader_module,
                 entry_point: Some("vs_main"),
+                // The buffer layouts of the vertex data this shader reads.
                 buffers: &vertex_layouts
                     .iter()
                     .map(|layout| Some((*layout).clone()))
-                    .collect::<Vec<_>>(), // Specifies structure of vertices that will be passed to the vertex shader
+                    .collect::<Vec<_>>(),
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &fragment_shader,
+                module: &fragment_shader_module,
                 entry_point: Some("fs_main"),
                 targets: color_target_states,
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
-                // Specifies how to interpret vertices when converting them into triangles
-                topology: wgpu::PrimitiveTopology::TriangleList, // Each three vertices will correspond to one triangle
+                // Every three vertices form one triangle.
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw, // Specifies how to determine whether a given triangle is facing forward or not (FrontFace::Ccw means that a triangle is facing forward if the vertices are arranged in a counter clockwise direction)
-                cull_mode: Some(wgpu::Face::Back), // Triangles that are not considered facing forward are culled (not included in the render) as specified by CullMode::Back
-                polygon_mode: wgpu::PolygonMode::Fill, // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
-                conservative: false, // Requires Features::CONSERVATIVE_RASTERIZATION
+                // A triangle faces the camera when its vertices run counter-clockwise.
+                front_face: wgpu::FrontFace::Ccw,
+                // Drop the triangles that face away.
+                cull_mode: Some(wgpu::Face::Back),
+                // Any other polygon mode needs the NON_FILL_POLYGON_MODE feature.
+                polygon_mode: wgpu::PolygonMode::Fill,
+                // `true` needs the CONSERVATIVE_RASTERIZATION feature.
+                conservative: false,
                 unclipped_depth: false,
             },
             depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
                 format,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less), // Specifies when to discard a new pixel. Using LESS means pixels will be drawn front to back
+                // Keep a new pixel only when it is closer than the one already
+                // drawn there.
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: 1, // Determines how many samples pipeline will use (Multisampling)
-                mask: !0, // Specifies which samples should be active
+                count: 1,
+                mask: !0,
                 alpha_to_coverage_enabled: false,
             },
             multiview_mask: None,
             cache: None,
         };
 
-        // Captured so a shader the driver refuses is a mistake reported against
-        // the asset that named it, not through the uncaptured-error handler.
+        // Capture wgpu's error so a refused shader is reported against the
+        // asset that named it, and not only through the device's
+        // uncaptured-error handler.
         let render_pipeline = crate::error::capturing_validation(device, || {
             device.create_render_pipeline(&render_pipeline_descriptor)
         })
         .map_err(|detail| RendererError::Other { detail })?;
 
-        let pipeline = Self {
+        // Step 4: Record the shader, then log what it declares.
+        let renderer_shader = Self {
             name: name.to_string(),
             render_pipeline,
             parameter_slots: parameter_slots.clone(),
@@ -306,8 +317,8 @@ impl RendererShader {
         };
 
         // One line per shader, hidden unless `engine::rendering` is at debug:
-        // the slots it declares and the engine uniform groups it reads.
-        let slot_names = |names: Vec<&String>| {
+        // the slots it declares and the two uniform-group flags.
+        let joined_slot_names = |names: Vec<&String>| {
             names
                 .into_iter()
                 .map(String::as_str)
@@ -317,19 +328,40 @@ impl RendererShader {
         debug!(
             target: pill_core::telemetry::telemetry_target::RENDERING,
             shader = name,
-            parameters = %slot_names(parameter_slots.keys().collect()),
-            textures = %slot_names(texture_slots.keys().collect()),
+            parameters = %joined_slot_names(parameter_slots.keys().collect()),
+            textures = %joined_slot_names(texture_slots.keys().collect()),
             engine_parameters = uniform_groups.engine,
             camera_parameters = uniform_groups.camera,
             "shader created"
         );
 
-        Ok(pipeline)
+        Ok(renderer_shader)
     }
 }
 
-/// The view shape a texture slot of `kind` binds: a cube for a cubemap, a 2D
-/// image for everything else, depth included.
+// =============================================================================
+// UniformGroups
+// =============================================================================
+
+/// Says which of the renderer's shared uniform groups a shader reads.
+///
+/// The two flags travel together because `RendererShader::new` already takes
+/// twelve arguments, and two bare booleans at the end of the call would not
+/// say which group each one turns on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UniformGroups {
+    /// The shader reads group 0, the engine's parameters.
+    pub engine: bool,
+    /// The shader reads group 1, the camera's parameters.
+    pub camera: bool,
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns the view shape a texture slot of `kind` binds: a cube for a cubemap,
+/// a 2D image for every other kind, depth included.
 pub(crate) fn slot_view_dimension(kind: ShaderTextureKind) -> wgpu::TextureViewDimension {
     match kind {
         ShaderTextureKind::Cubemap => wgpu::TextureViewDimension::Cube,
@@ -337,23 +369,26 @@ pub(crate) fn slot_view_dimension(kind: ShaderTextureKind) -> wgpu::TextureViewD
     }
 }
 
-/// Refuse to bind `texture` to a slot whose view shape differs, naming both.
+/// Checks that `texture` fits a slot of `slot_kind`, and names both when it
+/// does not.
 ///
-/// A cubemap bound where a shader reads a 2D image (or the reverse) would fail
-/// wgpu's bind group validation with a message about view dimensions; this says
-/// which slot and which texture instead, while the names are at hand.
+/// A cubemap bound where a shader reads a 2D image (or the other way round)
+/// would fail wgpu's bind group validation with a message about view
+/// dimensions. This check runs while the names are still known, so the error
+/// can say which slot and which texture.
 ///
 /// # Errors
 ///
-/// Returns [`RendererError::Other`] when the shapes differ.
+/// Returns [`RendererError::Other`] when the texture's view shape differs from
+/// the shape the slot declares.
 pub(crate) fn check_slot_shape(
     owner: &str,
     slot_name: &str,
     slot_kind: ShaderTextureKind,
     texture: &crate::resources::RendererTexture,
 ) -> Result<()> {
-    let expected = slot_view_dimension(slot_kind);
-    if texture.view_dimension == expected {
+    let expected_view_dimension = slot_view_dimension(slot_kind);
+    if texture.view_dimension == expected_view_dimension {
         return Ok(());
     }
     Err(RendererError::Other {

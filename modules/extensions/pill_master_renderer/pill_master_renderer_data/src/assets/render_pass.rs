@@ -1,29 +1,30 @@
-//! A pass, described as data rather than as code.
+//! A render pass, described as data instead of as code.
 //!
 //! # Responsibilities
 //!
-//! - Carry everything one pass needs: the shader it draws with, its uniform
-//!   parameters, its texture slots, where it reads and where it writes, and when
-//!   it runs relative to the others.
-//! - Stay the *only* pass type. Every pass in the renderer - geometry, lighting,
-//!   post-processing - is one of these values, so adding a pass is data the game
-//!   supplies, not a struct someone has to write into the renderer.
+//! - Hold everything one pass needs: the shader it draws with, its uniform
+//!   parameters, its texture slots, where it reads from and writes to, and the
+//!   order it runs in.
+//! - Be the only pass type. Every pass in the renderer (geometry, skybox,
+//!   post-processing) is one of these values, so adding a pass means supplying
+//!   data in a game, not writing a new struct into the renderer.
 //! - Load a pass from a `.render_pass` file in `res` ([`StandaloneAsset`] with
-//!   [`RenderPassDocument`]), naming its shader, material and textures by guid.
+//!   [`RenderPassDocument`]). The file names the pass's shader, material and
+//!   textures by guid.
 //!
 //! # Design
 //!
 //! The fields mirror [`Material`](crate::Material) on purpose: a shader handle,
-//! a parameter map and a texture map, packed by the same rules. A pass is
-//! therefore what a material is to a mesh - the shader plus the values it reads -
-//! and the renderer can drive any pass through the code path it already has for
-//! drawing with a material.
+//! a parameter map and a texture map, packed by the same rules. A pass therefore
+//! holds what a material holds for a mesh - the shader and the values that
+//! shader reads - and the renderer draws it through the same binder it uses for
+//! materials.
 //!
 //! A pass can also name a [`Material`](crate::Material) outright
-//! ([`RenderPass::material`]): the material supplies the shader, parameters and
-//! textures, and whatever the pass sets itself overrides it. That is how a
-//! skybox pass draws a sky: the sky is a `.material` file an artist edits, and
-//! the pass only says when and where it is drawn.
+//! ([`RenderPass::material`]). The material supplies the shader, parameters and
+//! textures, and anything the pass sets itself wins. That is how a skybox pass
+//! draws a sky: the sky is a `.material` file an artist edits, and the pass only
+//! says when and where it is drawn.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -39,13 +40,18 @@ use serde::{Deserialize, Serialize};
 // Current crate
 use crate::{Material, Shader, Texture};
 
+// =============================================================================
+// RenderPass
+// =============================================================================
+
 /// One pass in a [`RenderingPipeline`](crate::RenderingPipeline).
 ///
 /// Its maps are `BTreeMap`s, never `HashMap`s. An empty `HashMap` does not
-/// allocate: it points at a static inside the binary that created it. This
-/// value lives in the world and outlives that binary - a project or module
-/// that built it is reloaded and its retired image eventually unmapped - and
-/// reading such a map afterwards faults. A `BTreeMap` holds no such pointer.
+/// allocate, but it points at a static inside the binary that created it.
+/// This value lives in the world and can outlive that binary: a project or
+/// module that built it is reloaded, and its retired image is eventually
+/// unmapped. Reading such a map afterwards faults. A `BTreeMap` holds no such
+/// pointer.
 #[derive(Clone, Debug)]
 #[pill_mirror_object(asset, standalone, shared = "pill_master_renderer::assets::RenderPass")]
 pub struct RenderPass {
@@ -55,28 +61,32 @@ pub struct RenderPass {
     /// drawing through each instance's own material pipeline; a fullscreen or
     /// skybox pass without one is not drawn.
     pub shader: Handle<Shader>,
-    /// Material the pass draws with: its shader, parameters and textures, under
-    /// whatever this pass sets itself. [`Handle::INVALID`] names none.
+    /// Material the pass draws with. It supplies the shader, parameters and
+    /// textures, and anything this pass sets itself wins. [`Handle::INVALID`]
+    /// names no material.
     ///
     /// A [`PassKind::Skybox`] pass takes its sky from here.
     pub material: Handle<Material>,
-    /// Uniform parameters, packed exactly as a material packs its own: one
-    /// 16-byte slot each, in the order the shader declares them.
+    /// Uniform parameters, packed the same way a material packs its own. Each
+    /// value fills one 16-byte slot, and the values are written in the order
+    /// the shader declares its slots.
     pub parameters: BTreeMap<String, MaterialParameter>,
-    /// Textures bound to the slots the shader declares, by slot name. A slot
-    /// the shader declares and neither this map nor [`Self::inputs`] fills falls
-    /// back to the renderer's default texture for its type.
+    /// Textures bound to the slots the shader declares, by slot name. A colour
+    /// slot that neither this map nor [`Self::inputs`] fills gets the renderer's
+    /// default texture for its type. A depth slot has no default, so the pass
+    /// has to name a source for it.
     ///
-    /// A slot named in both takes the input: that is the frame an earlier pass
-    /// of the same chain produced, and the more specific thing to have asked
-    /// for.
+    /// A slot named in both maps takes the input. That is the frame an earlier
+    /// pass of the same chain produced, which is usually what the pass wants.
     pub textures: BTreeMap<String, Handle<Texture>>,
-    /// Offscreen targets the pass samples, by the texture slot they bind to.
+    /// The frame an earlier pass wrote, by the texture slot it binds to.
     ///
     /// Separate from [`Self::textures`] because a target is not an asset: it
-    /// lives for one frame, is named by whichever pass writes it, and has no
-    /// handle to hold. A name no earlier pass writes fails when the chain is
-    /// built, naming the pass and the target rather than showing a flat frame.
+    /// lives for one frame, is named by the pass that writes it, and has no
+    /// handle to hold. The name `depth` means the frame's depth buffer instead
+    /// of a colour target. A target name that no earlier pass writes stops the
+    /// chain from being built, with a message naming the pass and the target,
+    /// instead of drawing a flat frame.
     pub inputs: BTreeMap<String, String>,
     /// What the pass draws, where it writes, and how the draw is set up.
     pub settings: PassSettings,
@@ -86,8 +96,8 @@ pub struct RenderPass {
 }
 
 impl RenderPass {
-    /// A surface-writing geometry pass with no shader of its own, so it draws
-    /// through each instance's material pipeline.
+    /// A geometry pass that writes the surface. It names no shader, so it draws
+    /// each instance through that instance's material pipeline.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -113,7 +123,7 @@ impl RenderPass {
         self
     }
 
-    /// Set one uniform parameter.
+    /// Set one uniform parameter, by the slot name the shader declares.
     pub fn with_parameter(mut self, slot: impl Into<String>, value: MaterialParameter) -> Self {
         self.parameters.insert(slot.into(), value);
         self
@@ -125,7 +135,7 @@ impl RenderPass {
         self
     }
 
-    /// Sample one offscreen target, at the named texture slot.
+    /// Sample one offscreen target in the named texture slot.
     pub fn with_input(mut self, slot: impl Into<String>, target: impl Into<String>) -> Self {
         self.inputs.insert(slot.into(), target.into());
         self
@@ -143,7 +153,7 @@ impl RenderPass {
         self
     }
 
-    /// Choose when the pass runs.
+    /// Choose when the pass runs. A lower order runs first.
     pub fn with_order(mut self, order: u8) -> Self {
         self.settings.order = order;
         self
@@ -155,7 +165,8 @@ impl RenderPass {
         self
     }
 
-    /// Write this pass's targets at `1 / scale` of the surface.
+    /// Write this pass's targets at `1 / scale` of the surface size. A scale of
+    /// 0 is treated as 1.
     pub fn with_target_scale(mut self, scale: u32) -> Self {
         self.settings.target_scale = scale.max(1);
         self
@@ -186,18 +197,24 @@ impl RenderPass {
     }
 }
 
+// =============================================================================
+// RenderPassDocument
+// =============================================================================
+
 /// A pass as written in its `.render_pass` file.
 ///
-/// The asset itself, under the standard asset header. Its shader and textures
-/// are guids ([`AssetReference`]) resolved when the file loads; everything
-/// else is the [`RenderPass`] field of the same name. The default document is
-/// [`RenderPass::new`]'s pass - a geometry pass onto the surface with no shader
-/// of its own - which the renderer runs as it is, so a newly created file is
-/// valid before anyone edits it.
+/// The file holds this document under the standard asset header. Its shader,
+/// material and textures are guids ([`AssetReference`]), resolved when the file
+/// loads. Every other field means the same as the [`RenderPass`] field of the
+/// same name.
+///
+/// The default document is [`RenderPass::new`]'s pass: a geometry pass onto the
+/// surface with no shader of its own. The renderer draws that pass as it is, so
+/// a newly created file is valid before anyone edits it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RenderPassDocument {
-    /// See [`RenderPass::shader`]; unset for the built-in shader.
+    /// See [`RenderPass::shader`]; unset names no shader of its own.
     pub shader: AssetReference<Shader>,
     /// See [`RenderPass::material`]; unset for none.
     pub material: AssetReference<Material>,
@@ -207,8 +224,8 @@ pub struct RenderPassDocument {
     pub textures: BTreeMap<String, AssetReference<Texture>>,
     /// See [`RenderPass::inputs`].
     pub inputs: BTreeMap<String, String>,
-    /// See [`RenderPass::settings`]; flattened, so a `.render_pass` file
-    /// carries these fields at its top level like every other one.
+    /// See [`RenderPass::settings`]. The block is flattened, so the file
+    /// carries its fields at the top level, beside the other ones.
     #[serde(flatten)]
     pub settings: PassSettings,
     /// See [`RenderPass::enabled`].
@@ -216,7 +233,7 @@ pub struct RenderPassDocument {
 }
 
 impl Default for RenderPassDocument {
-    /// [`RenderPass::new`]'s pass.
+    /// The same pass [`RenderPass::new`] builds.
     fn default() -> Self {
         Self {
             shader: AssetReference::unset(),
@@ -230,6 +247,10 @@ impl Default for RenderPassDocument {
     }
 }
 
+// =============================================================================
+// Standalone Asset
+// =============================================================================
+
 impl StandaloneAsset for RenderPass {
     type Document = RenderPassDocument;
     const FILE_EXTENSION: &'static str = "render_pass";
@@ -239,11 +260,14 @@ impl StandaloneAsset for RenderPass {
         document: RenderPassDocument,
         assets: &AssetManager,
     ) -> AssetLoadResult<Self> {
+        // Step 1: Resolve the texture references. A reference to a texture that
+        // is not loaded becomes the invalid handle.
         let textures = document
             .textures
             .into_iter()
             .map(|(slot, texture)| (slot, texture.resolve(assets)))
             .collect();
+        // Step 2: Build the pass.
         Ok(Self {
             name: name.to_owned(),
             shader: document.shader.resolve(assets),
@@ -261,6 +285,10 @@ impl StandaloneAsset for RenderPass {
         })
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -285,8 +313,8 @@ mod tests {
     }
 
     /// A document round-trips through its file JSON, including the pass
-    /// vocabulary's enums. The settings block is flattened, so the file keeps
-    /// the shape it had when the fields were written on the document itself.
+    /// vocabulary's enums. The settings block is flattened, so the file holds
+    /// its fields at the top level rather than under a `settings` key.
     #[test]
     fn a_document_round_trips_through_json() {
         let document = RenderPassDocument {
@@ -303,9 +331,9 @@ mod tests {
         assert_eq!(json["target"], serde_json::json!({"Offscreen": "hdr"}));
         assert_eq!(json["kind"], serde_json::json!("Fullscreen"));
         assert_eq!(json["order"], serde_json::json!(7));
-        let read: RenderPassDocument = serde_json::from_value(json).unwrap();
+        let read_document: RenderPassDocument = serde_json::from_value(json).unwrap();
         assert_eq!(
-            read.settings,
+            read_document.settings,
             PassSettings {
                 kind: PassKind::Fullscreen,
                 target: PassTarget::Offscreen("hdr".to_owned()),
@@ -316,9 +344,9 @@ mod tests {
         );
     }
 
-    /// A `.render_pass` file written before the settings block existed still
-    /// loads: the block is flattened, so its fields sit at the top level of
-    /// the asset exactly where the document used to name them.
+    /// A hand-written `.render_pass` file names its settings fields at the top
+    /// level, and they load as the pass settings. The flattened block means the
+    /// file has no nested `settings` key.
     #[test]
     fn a_flat_document_file_still_loads() {
         let json = serde_json::json!({

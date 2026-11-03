@@ -2,26 +2,27 @@
 //!
 //! # Responsibilities
 //!
-//! - Pack the camera position and the view-projection matrix into the layout
-//!   the shaders' `CameraParams` constant buffer expects
-//!   ([`CameraParametersData`]).
-//! - Replace projection inputs no perspective matrix can use - a field of view
-//!   outside `(0, 180)`, a non-positive near plane, a far plane at or inside
-//!   the near one - and name each replacement, because a NaN matrix produces a
-//!   blank frame with nothing to trace.
+//! - Pack the camera's position, view-projection matrix and inverse
+//!   view-projection matrix into the layout the shaders' `CameraParams`
+//!   constant buffer expects ([`CameraParametersData`]).
+//! - Replace each projection input that no perspective matrix can use, and
+//!   name it in the report: a field of view outside `(0, 180)`, a near plane
+//!   that is not positive, a far plane at or inside the near one. Without
+//!   this, a matrix full of NaN values draws a blank frame with nothing to
+//!   trace it to.
 //! - Own the uniform buffer and the bind group that every shader reading the
 //!   camera binds ([`RendererCamera`]).
 //!
 //! # Design
 //!
 //! The value and the GPU objects are separate: [`CameraParametersData`] is the
-//! `#[repr(C)]` layout the shaders read, [`RendererCamera`] the buffer and bind
-//! group that hold it. The matrices are rebuilt from the camera and transform
-//! components on every update rather than tracked, so a moved entity is always
-//! followed; the projection inputs are sanitized on the same pass, and the
-//! result names what was replaced. Substitutions are reported once per change
-//! rather than once per frame, so a value the game never fixes does not flood
-//! the log.
+//! `#[repr(C)]` layout the shaders read, and [`RendererCamera`] is the buffer
+//! and the bind group that hold it. The matrices are rebuilt from the camera
+//! and transform components on every update instead of being tracked, so a
+//! moved entity is always followed. The same pass replaces the projection
+//! inputs that cannot be used and reports what it replaced. A replacement is
+//! reported once per change rather than once per frame, so a value the game
+//! never fixes does not fill the log.
 
 // External crates
 use pill_core::math::{Matrix4f, Vector3f, Vector4f};
@@ -30,33 +31,39 @@ use wgpu::util::DeviceExt;
 // Current crate
 use crate::components::{CameraComponent, TransformComponent};
 
-// --- Handle ---
+// =============================================================================
+// RendererCameraHandle
+// =============================================================================
 
 pill_core::define_slot_key!(RendererCameraHandle);
 
-// --- Camera Uniform ---
+// =============================================================================
+// CameraParametersData
+// =============================================================================
 
 /// The camera values the shaders read, in the layout of the HLSL
 /// `CameraParams` constant buffer.
 ///
-/// The two sides are one layout written twice: a field changed here has to be
-/// changed in `shader_sources/common_shaders/include/common.hlsl` as well, or
-/// the shader reads the next value from wherever the padding lands.
+/// The struct here and the HLSL structure are one layout written twice. The
+/// HLSL side is the `pill_master_renderer_data` crate's
+/// `shader_sources/common_shaders/include/common.hlsl`. A field changed here
+/// has to be changed there in the same pass, or every value after it is read
+/// from the wrong place.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraParametersData {
     /// Camera position in world space.
     ///
-    /// The shader declares three components; the fourth slot is kept at zero
-    /// because it is the padding that puts the matrix where both sides expect
-    /// it.
+    /// The shader declares three components, and the fourth is kept at zero:
+    /// it is the padding that puts the matrix after it at the offset both
+    /// sides expect.
     pub position: Vector4f,
-    /// View and projection combined, applied to world-space positions by the
-    /// vertex shader.
+    /// The view and projection matrices combined, applied to world-space
+    /// positions by the vertex shader.
     pub view_projection_matrix: Matrix4f,
-    /// The inverse of [`Self::view_projection_matrix`]: takes a clip-space
+    /// The inverse of [`Self::view_projection_matrix`]. It takes a clip-space
     /// point back to world space, which is how a skybox turns a pixel into the
-    /// direction it looks along.
+    /// direction the camera looks along.
     pub inverse_view_projection_matrix: Matrix4f,
 }
 
@@ -67,11 +74,11 @@ impl Default for CameraParametersData {
 }
 
 impl CameraParametersData {
-    /// The zero value: the camera at the origin with an identity
-    /// view-projection, replaced on the first update.
+    /// Creates the empty value: the camera at the origin, with identity
+    /// matrices, which the first update replaces.
     ///
-    /// `Default` goes through here, so both ways of building the parameters
-    /// agree on what "empty" means.
+    /// `Default` calls this, so both ways of building the parameters agree on
+    /// what "empty" means.
     pub fn new() -> Self {
         Self {
             position: Vector4f::ZERO,
@@ -82,17 +89,18 @@ impl CameraParametersData {
 
     /// Rebuilds the uniform values from the camera and transform components.
     ///
-    /// `aspect` is the drawing viewport's width over its height, passed in
-    /// rather than read here so the projection follows the viewport the
-    /// renderer actually draws into. Returns the description of any projection
-    /// input that had to be replaced, or `None` when the component's values
-    /// were all usable.
+    /// `aspect` is the drawing viewport's width divided by its height. It is
+    /// passed in rather than read here, so the projection follows the viewport
+    /// the renderer actually draws into. Returns a description of every
+    /// projection input that had to be replaced, or `None` when all of the
+    /// component's values were usable.
     pub fn update_data(
         &mut self,
         camera_component: &CameraComponent,
         transform_component: &TransformComponent,
         aspect: f32,
     ) -> Option<String> {
+        // Step 1: Copy the camera's world position out of the transform.
         self.position = Vector4f::new(
             transform_component.translation[0],
             transform_component.translation[1],
@@ -100,28 +108,32 @@ impl CameraParametersData {
             0.0,
         );
 
-        // The projection inputs are sanitized first: an impossible field of
-        // view or near/far pair would otherwise become infinities and NaNs in
-        // the matrix, which paint nothing and leave no error to look at.
-        let (vertical_fov, near, far, anomaly) = sanitized_projection(camera_component);
+        // Step 2: Build both matrices, replacing any projection input the
+        // matrix cannot use. An impossible field of view or near/far pair
+        // would otherwise become an infinity or a NaN in the matrix, which
+        // draws nothing and leaves no error to look at.
+        let (vertical_fov, near, far, substitution_report) = sanitize_projection(camera_component);
         self.view_projection_matrix =
             CameraParametersData::calculate_projection_matrix(vertical_fov, near, far, aspect)
                 * CameraParametersData::calculate_view_matrix(transform_component);
+
+        // Step 3: Invert the combined matrix. A skybox reads the inverse to
+        // turn a pixel into the direction the camera looks along.
         self.inverse_view_projection_matrix = self.view_projection_matrix.inverse();
-        anomaly
+        substitution_report
     }
 
-    /// Builds the view matrix looking from the transform's position along its
-    /// forward axis.
+    /// Builds the view matrix: it looks from the transform's position along
+    /// the transform's forward axis.
     ///
-    /// The rotation decides where forward points, and a degenerate one would
-    /// spread NaNs through every basis vector of the matrix; the fallback
-    /// keeps the camera at a finite pose instead.
+    /// The rotation decides where forward points. A degenerate rotation would
+    /// spread NaN values through every basis vector of the matrix, so it is
+    /// replaced before this function uses it.
     fn calculate_view_matrix(transform_component: &TransformComponent) -> Matrix4f {
         let position = Vector3f::from_array(transform_component.translation);
-        // The shared normalize-or-identity rule reads a non-finite or near-zero
-        // quaternion as identity, so the view direction is never decided by
-        // NaNs.
+        // The shared helper normalizes the quaternion, and reads a value that
+        // is not finite or is too close to zero as the identity. That keeps
+        // NaN values out of the view direction.
         let rotation = glam::Quat::from_array(
             pill_engine::common_components::rotation_or_identity(transform_component.rotation),
         );
@@ -132,12 +144,13 @@ impl CameraParametersData {
         )
     }
 
-    /// Builds the perspective matrix for the 0-to-1 depth range wgpu uses.
+    /// Builds the perspective matrix for wgpu's 0-to-1 depth range.
     ///
-    /// The DirectX convention matches that range, which is why glam is asked
-    /// for it rather than for the OpenGL one. The inputs arrive already
-    /// sanitized, so `perspective` never divides by a zero angle or a
-    /// non-positive plane distance.
+    /// The DirectX convention uses that range, which is why glam is asked for
+    /// it rather than for the OpenGL one. `vertical_fov` is in degrees, as the
+    /// component stores it. The inputs arrive already cleaned up, so
+    /// `perspective` never divides by a zero angle or a non-positive plane
+    /// distance.
     fn calculate_projection_matrix(
         vertical_fov: f32,
         near: f32,
@@ -148,79 +161,32 @@ impl CameraParametersData {
     }
 }
 
-/// A projection a perspective matrix can actually use, with a reason.
+// =============================================================================
+// RendererCamera
+// =============================================================================
+
+/// The GPU-side resources of one camera: its uniform values, the buffer those
+/// values are written to, and the bind group that exposes the buffer to
+/// shaders.
 ///
-/// `perspective` divides by `tan(fov / 2)` and by `far - near`, so a field of
-/// view of zero, a non-positive near plane, or a far plane at or inside the
-/// near one produces infinities and NaNs - a frame that paints nothing with no
-/// error to show for it. Each unusable value is replaced with the component's
-/// default (the far plane relative to the near one, because a world may
-/// legitimately use a near plane well past the default far plane), and the
-/// substitutions come back named so the caller can say what it did.
-fn sanitized_projection(camera_component: &CameraComponent) -> (f32, f32, f32, Option<String>) {
-    let mut reasons = Vec::new();
-    let default = CameraComponent::default();
-
-    let vertical_fov = if camera_component.vertical_fov.is_finite()
-        && camera_component.vertical_fov > 0.0
-        && camera_component.vertical_fov < 180.0
-    {
-        camera_component.vertical_fov
-    } else {
-        reasons.push(format!(
-            "vertical_fov {} is outside (0, 180)",
-            camera_component.vertical_fov
-        ));
-        default.vertical_fov
-    };
-
-    let near = if camera_component.near.is_finite() && camera_component.near > 0.0 {
-        camera_component.near
-    } else {
-        reasons.push(format!("near {} is not positive", camera_component.near));
-        default.near
-    };
-
-    let far = if camera_component.far.is_finite() && camera_component.far > near {
-        camera_component.far
-    } else {
-        reasons.push(format!(
-            "far {} is not beyond near {near}",
-            camera_component.far
-        ));
-        near + default.far
-    };
-
-    (
-        vertical_fov,
-        near,
-        far,
-        (!reasons.is_empty()).then(|| reasons.join("; ")),
-    )
-}
-
-// --- Camera ---
-
-/// The GPU-side resources of one camera: its uniform values, the buffer they
-/// are written to, and the bind group that exposes the buffer to shaders.
-///
-/// Built once and then only updated in place: [`RendererCamera::update`]
-/// rewrites the buffer's contents each frame, so moving the camera costs one
-/// buffer write and no bind group rebuild.
+/// It is built once and then only updated in place. [`RendererCamera::update`]
+/// rewrites the buffer's contents on every frame, so moving the camera costs
+/// one buffer write and no bind group rebuild.
 #[derive(Debug)]
 pub struct RendererCamera {
-    /// The values for the current frame, rewritten by
-    /// [`RendererCamera::update`] before they are written to the buffer.
+    /// The values for the current frame. [`RendererCamera::update`] rebuilds
+    /// them before it writes them to the buffer.
     pub parameters_data: CameraParametersData,
-    /// Uniform buffer holding `parameters_data`.
+    /// The uniform buffer that holds `parameters_data`.
     pub parameters_uniform_buffer: wgpu::Buffer,
-    /// Layout the bind group was created from, kept alongside it.
+    /// The layout the bind group was built from, kept beside it.
     pub bind_group_layout: wgpu::BindGroupLayout,
-    /// Bound at group 1 by every shader that reads the camera.
+    /// The bind group every shader that reads the camera binds: at group 1 in
+    /// the chain's pipelines and the mesh drawer, at group 0 in the overlay's.
     pub bind_group: wgpu::BindGroup,
-    /// Whether the last update reported unusable projection values, so the
-    /// warning fires once and then stays quiet until the values become usable
-    /// again, instead of once per frame.
+    /// Whether the last update already found unusable projection values and
+    /// warned about them. The flag keeps that warning to once per change
+    /// instead of once per frame, and clears when the values become usable.
     projection_reported: bool,
 }
 
@@ -228,9 +194,10 @@ impl RendererCamera {
     /// Creates a camera on `device`, with its bind group built from
     /// `camera_bind_group_layout`.
     ///
-    /// The layout is the one the renderer creates at startup and hands to
-    /// both the camera and every camera-reading shader, which is what makes
-    /// the bind group compatible with those pipelines.
+    /// `camera_bind_group_layout` is the layout the renderer creates at
+    /// startup and hands to the camera and to every shader that reads the
+    /// camera. Sharing it is what makes the bind group compatible with those
+    /// pipelines.
     pub fn new(device: &wgpu::Device, camera_bind_group_layout: wgpu::BindGroupLayout) -> Self {
         let parameters_data = CameraParametersData::new();
 
@@ -261,10 +228,10 @@ impl RendererCamera {
 
     /// Uploads the camera's values for this frame to the uniform buffer.
     ///
-    /// Called once per frame with the drawing viewport's aspect ratio. An
-    /// unusable projection value is reported when it first appears rather than
-    /// on every frame it persists, so a broken camera produces one warning,
-    /// not a stream of them.
+    /// Called once for each frame the surface draws, with the drawing
+    /// viewport's aspect ratio. An unusable projection value is reported when
+    /// it first appears, not on every frame it persists, so a broken camera
+    /// produces one warning instead of a stream of them.
     pub fn update(
         &mut self,
         queue: &wgpu::Queue,
@@ -272,10 +239,12 @@ impl RendererCamera {
         transform_component: &TransformComponent,
         aspect: f32,
     ) {
-        let anomaly =
+        // Step 1: Rebuild the values for this frame.
+        let substitution_report =
             self.parameters_data
                 .update_data(camera_component, transform_component, aspect);
-        match anomaly {
+        // Step 2: Warn once for each change, not once per frame.
+        match substitution_report {
             Some(reason) if !self.projection_reported => {
                 pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
@@ -286,6 +255,8 @@ impl RendererCamera {
             None => self.projection_reported = false,
             Some(_) => {}
         }
+        // Step 3: Upload the values. This write is ordered before every
+        // command buffer submitted after it, so this frame's passes read them.
         queue.write_buffer(
             &self.parameters_uniform_buffer,
             0,
@@ -293,6 +264,74 @@ impl RendererCamera {
         );
     }
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Cleans up the camera's projection inputs and names every value it replaced.
+///
+/// `perspective` divides by `tan(fov / 2)` and by `far - near`, so a field of
+/// view of zero, a near plane that is not positive, or a far plane at or
+/// inside the near one produces infinities and NaN values: a frame that draws
+/// nothing, with no error to show for it.
+///
+/// An unusable field of view or near plane is replaced with the component's
+/// default. An unusable far plane is replaced with the near plane plus the
+/// default far distance, because a world may legitimately place its near plane
+/// past the default far plane. The returned text names each replacement, so
+/// the caller can report what it did.
+fn sanitize_projection(camera_component: &CameraComponent) -> (f32, f32, f32, Option<String>) {
+    let mut reasons = Vec::new();
+    let default_camera_component = CameraComponent::default();
+
+    // Step 1: The field of view has to be a finite angle inside (0, 180). A
+    // zero angle would make the matrix divide by zero.
+    let vertical_fov = if camera_component.vertical_fov.is_finite()
+        && camera_component.vertical_fov > 0.0
+        && camera_component.vertical_fov < 180.0
+    {
+        camera_component.vertical_fov
+    } else {
+        reasons.push(format!(
+            "vertical_fov {} is outside (0, 180)",
+            camera_component.vertical_fov
+        ));
+        default_camera_component.vertical_fov
+    };
+
+    // Step 2: The near plane has to be a finite positive distance, because
+    // the matrix is built around it.
+    let near = if camera_component.near.is_finite() && camera_component.near > 0.0 {
+        camera_component.near
+    } else {
+        reasons.push(format!("near {} is not positive", camera_component.near));
+        default_camera_component.near
+    };
+
+    // Step 3: The far plane has to be finite and beyond the near plane, which
+    // may itself have just been replaced.
+    let far = if camera_component.far.is_finite() && camera_component.far > near {
+        camera_component.far
+    } else {
+        reasons.push(format!(
+            "far {} is not beyond near {near}",
+            camera_component.far
+        ));
+        near + default_camera_component.far
+    };
+
+    (
+        vertical_fov,
+        near,
+        far,
+        (!reasons.is_empty()).then(|| reasons.join("; ")),
+    )
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -307,10 +346,10 @@ mod tests {
             ..CameraComponent::default()
         };
 
-        let (vertical_fov, near, far, anomaly) = sanitized_projection(&camera);
+        let (vertical_fov, near, far, report) = sanitize_projection(&camera);
 
         assert_eq!((vertical_fov, near, far), (45.0, 0.5, 250.0));
-        assert!(anomaly.is_none());
+        assert!(report.is_none());
     }
 
     #[test]
@@ -322,15 +361,15 @@ mod tests {
             ..CameraComponent::default()
         };
 
-        let (vertical_fov, near, far, anomaly) = sanitized_projection(&camera);
+        let (vertical_fov, near, far, report) = sanitize_projection(&camera);
 
         assert_eq!(vertical_fov, 60.0);
         assert_eq!(near, 0.1);
         assert!(far > near && far.is_finite());
-        let anomaly = anomaly.expect("every replaced value is named");
-        assert!(anomaly.contains("vertical_fov"));
-        assert!(anomaly.contains("near"));
-        assert!(anomaly.contains("far"));
+        let report = report.expect("every replaced value is named");
+        assert!(report.contains("vertical_fov"));
+        assert!(report.contains("near"));
+        assert!(report.contains("far"));
     }
 
     #[test]
@@ -341,10 +380,10 @@ mod tests {
             ..CameraComponent::default()
         };
 
-        let (_, near, far, anomaly) = sanitized_projection(&camera);
+        let (_, near, far, report) = sanitize_projection(&camera);
 
         assert_eq!(near, 10.0);
         assert!(far > near);
-        assert!(anomaly.is_some_and(|reason| reason.contains("far")));
+        assert!(report.is_some_and(|reason| reason.contains("far")));
     }
 }

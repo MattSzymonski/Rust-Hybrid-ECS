@@ -9,10 +9,13 @@
 //! - Own the import pipeline on [`AssetManager`]: [`AssetManager::import`],
 //!   [`AssetManager::reimport`], [`AssetManager::ensure_metadata`] and
 //!   [`AssetManager::follow_move`].
-//! - Hold the name rule every editor's create dialog shares
-//!   ([`standalone_file_name`], [`checked_relative`]): which base names and
-//!   characters Windows refuses. It lives here so one rule serves them all;
-//!   a standalone file is what such a name is usually for.
+//! - Hold the file-name rule every editor's create dialog shares
+//!   ([`standalone_file_name`]): which base names and characters Windows
+//!   refuses. It lives here so one rule serves them all; a standalone file
+//!   is what such a name is usually for.
+//! - Hold the path check every tool-side asset path goes through
+//!   ([`checked_relative`]): relative, inside the asset directory, and
+//!   naming something.
 //!
 //! # Design
 //!
@@ -65,16 +68,16 @@ pub const METADATA_EXTENSION: &str = "meta";
 /// The metadata header layout this engine writes, and the newest it reads.
 pub const METADATA_FORMAT_VERSION: u32 = 1;
 
-/// The metadata file for the source asset at `source`, relative to the
-/// project's asset directory, or `None` when `source` cannot have one.
+/// The metadata file for the source asset at `source_path`, relative to the
+/// project's asset directory, or `None` when `source_path` cannot have one.
 ///
 /// The path is normalized the way an asset name is (`/`-separated, `.`
 /// removed, by the same rules as the asset store's pack key) and `.meta` is
 /// appended to the full file name: `textures\helmet.jpg` gives
 /// `textures/helmet.jpg.meta`. `None` for a path that does not normalize (absolute, or climbing out with `..`), and for one
 /// that is already a metadata file.
-pub fn metadata_path_for(source: &Path) -> Option<PathBuf> {
-    let name = pack_key(source)?;
+pub fn metadata_path_for(source_path: &Path) -> Option<PathBuf> {
+    let name = pack_key(source_path)?;
     if is_metadata_file(&name) {
         return None;
     }
@@ -96,7 +99,7 @@ fn is_metadata_file(name: &str) -> bool {
 ///
 /// # Errors
 ///
-/// A message naming the path when it is absolute, climbs out, or is empty.
+/// A message when the path is absolute, climbs out with `..`, or is empty.
 pub fn checked_relative(path: &str) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(path.replace('\\', "/"));
     let mut normal = PathBuf::new();
@@ -131,7 +134,7 @@ const INVALID_CHARACTERS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', 
 /// # Errors
 ///
 /// A message when `name` is empty, contains a path separator or a character
-/// Windows refuses, is `.` or `..`, ends with a dot or a space, or is a
+/// Windows refuses, contains `..`, ends with a dot or a space, or is a
 /// reserved Windows name (`CON`, `NUL`, `COM1`, ...).
 pub fn standalone_file_name(name: &str, extension: &str) -> Result<String, String> {
     let name = name.trim();
@@ -177,7 +180,8 @@ pub fn standalone_file_name(name: &str, extension: &str) -> Result<String, Strin
 /// live in an `<asset_name>.meta` file beside it.
 ///
 /// Implemented by the crate that owns the asset type, next to its other
-/// constructors; [`AssetManager::import`] is the one caller.
+/// constructors; [`AssetManager::import`] and [`AssetManager::reimport`] are
+/// its only callers.
 pub trait ImportedAsset: Asset + TraitAccessible<dyn Asset> + Sized {
     /// Everything the source bytes do not say for themselves.
     ///
@@ -291,7 +295,7 @@ pub struct ImportOutcome<T: Asset> {
     /// Where the guid and settings came from.
     pub metadata: MetadataSource,
     /// `true` when the path was already loaded and its existing handle was
-    /// returned; nothing was read, decoded or written.
+    /// returned; the source is not decoded and nothing is written.
     pub already_loaded: bool,
 }
 
@@ -548,7 +552,7 @@ impl AssetManager {
     /// read.
     ///
     /// Importing a path that is already loaded returns its existing handle
-    /// with [`ImportOutcome::already_loaded`] set, and reads nothing.
+    /// with [`ImportOutcome::already_loaded`] set, and decodes nothing.
     ///
     /// # Errors
     ///
@@ -662,8 +666,8 @@ impl AssetManager {
                     // have created the file between step 2 and now, and
                     // `write_beside` keeps theirs. The file is the truth, so
                     // read it back and adopt it if it is not ours.
-                    let written = asset_store::read(&metadata_path)?;
-                    let on_disk = parse_metadata::<T>(&metadata_path, &written)?;
+                    let written_bytes = asset_store::read(&metadata_path)?;
+                    let on_disk = parse_metadata::<T>(&metadata_path, &written_bytes)?;
                     if on_disk.guid == guid {
                         metadata = MetadataSource::CreatedOnDisk;
                     } else {
@@ -802,8 +806,9 @@ impl AssetManager {
 
 impl AssetManager {
     /// Write the metadata file of the source at `path` when it has none, and
-    /// return the guid written; `None` when the file already exists or the
-    /// source is not on a writable filesystem (a packed asset).
+    /// return the guid written; `None` when the file already exists, when the
+    /// source is not on a writable filesystem (a packed asset), or when
+    /// another writer's file carries a different guid.
     ///
     /// Nothing is decoded: a source nothing has loaded gets `T`'s default
     /// settings, one already loaded under `path`'s name the settings it was
@@ -814,7 +819,8 @@ impl AssetManager {
     /// # Errors
     ///
     /// When the path does not normalize, the existing metadata cannot be
-    /// probed, no random guid is available, or the file cannot be written.
+    /// probed, no random guid is available, or the file cannot be written or
+    /// read back.
     pub fn ensure_metadata<T: ImportedAsset>(
         &self,
         path: &Path,
@@ -832,8 +838,8 @@ impl AssetManager {
             Err(AssetLoadError::PathNotFound { .. }) => {}
             Err(error) => return Err(error.into()),
         }
-        let loaded = self.handle_by_name::<T>(&asset_name);
-        let guid = match loaded.and_then(|handle| self.guid_of(handle)) {
+        let loaded_handle = self.handle_by_name::<T>(&asset_name);
+        let guid = match loaded_handle.and_then(|handle| self.guid_of(handle)) {
             Some(guid) => guid,
             None => AssetGuid::random().map_err(|error| AssetLoadError::Metadata {
                 path: metadata_path.clone(),
@@ -844,8 +850,9 @@ impl AssetManager {
         // with; a source nothing has loaded gets the type's defaults. Writing
         // defaults over a loaded asset's own settings would change how the
         // asset decodes on the next run - a normal map read as sRGB.
-        let recorded = loaded.and_then(|handle| self.import_settings::<T>(handle));
-        let settings = match recorded {
+        let recorded_settings =
+            loaded_handle.and_then(|handle| self.import_settings::<T>(handle));
+        let settings = match recorded_settings {
             Some(settings) => serde_json::from_value(settings.clone()).map_err(|error| {
                 AssetLoadError::Metadata {
                     path: metadata_path.clone(),
@@ -858,16 +865,16 @@ impl AssetManager {
         match asset_store::write_beside(Path::new(&asset_name), &metadata_path, &document)? {
             // Another writer may have created the file meanwhile; its guid is
             // the file's truth, and it was not written here.
-            Some(written) => {
+            Some(written_path) => {
                 pill_core::debug!(
                     "metadata for `{asset_name}` written with {}",
-                    match recorded {
+                    match recorded_settings {
                         Some(_) => "the settings the asset was loaded with",
                         None => "the type's defaults",
                     }
                 );
-                let bytes = std::fs::read(&written).map_err(|source| AssetLoadError::Read {
-                    path: written.clone(),
+                let bytes = std::fs::read(&written_path).map_err(|source| AssetLoadError::Read {
+                    path: written_path.clone(),
                     source,
                 })?;
                 let on_disk = parse_metadata::<T>(&metadata_path, &bytes)?;
@@ -986,23 +993,23 @@ pub fn settings_json_for<T: ImportedAsset>(path: &Path) -> AssetLoadResult<serde
     settings_to_json::<T>(path, &settings)
 }
 
-/// `value` read as `T`'s import settings and written back, which fills every
-/// missing field with its default and drops unknown ones.
+/// `settings_document` read as `T`'s import settings and written back, which
+/// fills every missing field with its default and drops unknown ones.
 ///
 /// # Errors
 ///
-/// Returns [`AssetLoadError::Metadata`] when `value` does not fit `T`'s
-/// settings.
+/// Returns [`AssetLoadError::Metadata`] when `settings_document` does not fit
+/// `T`'s settings.
 pub fn normalize_settings_json<T: ImportedAsset>(
-    value: serde_json::Value,
+    settings_document: serde_json::Value,
 ) -> AssetLoadResult<serde_json::Value> {
-    let label = Path::new(T::metadata_type_name());
+    let type_name_path = Path::new(T::metadata_type_name());
     let settings: T::ImportSettings =
-        serde_json::from_value(value).map_err(|error| AssetLoadError::Metadata {
-            path: label.to_owned(),
+        serde_json::from_value(settings_document).map_err(|error| AssetLoadError::Metadata {
+            path: type_name_path.to_owned(),
             detail: format!("the settings do not fit this asset type: {error}"),
         })?;
-    settings_to_json::<T>(label, &settings)
+    settings_to_json::<T>(type_name_path, &settings)
 }
 
 /// `settings` as a JSON value, with `path` naming the failure.
@@ -1114,7 +1121,7 @@ mod tests {
 
     thread_local! {
         /// How many times `Note::import` ran on this test's thread.
-        static DECODES: Cell<usize> = const { Cell::new(0) };
+        static DECODE_COUNT: Cell<usize> = const { Cell::new(0) };
     }
 
     impl ImportedAsset for Note {
@@ -1130,7 +1137,7 @@ mod tests {
             source_bytes: &[u8],
             settings: &NoteSettings,
         ) -> AssetLoadResult<Self> {
-            DECODES.with(|decodes| decodes.set(decodes.get() + 1));
+            DECODE_COUNT.with(|decode_count| decode_count.set(decode_count.get() + 1));
             let text =
                 String::from_utf8(source_bytes.to_vec()).map_err(|_| AssetLoadError::Decode {
                     label: name.to_owned(),
@@ -1150,8 +1157,8 @@ mod tests {
         }
     }
 
-    fn decodes() -> usize {
-        DECODES.with(Cell::get)
+    fn decode_count() -> usize {
+        DECODE_COUNT.with(Cell::get)
     }
 
     /// A scratch `res` directory, mounted for the test's duration under the
@@ -1429,7 +1436,7 @@ mod tests {
         let first = assets
             .import(request("a.note", MetadataPolicy::CreateIfMissing))
             .unwrap();
-        let decodes_after_first = decodes();
+        let decode_count_after_first = decode_count();
 
         let second = assets
             .import(request("a.note", MetadataPolicy::CreateIfMissing))
@@ -1439,8 +1446,8 @@ mod tests {
         assert_eq!(second.handle, first.handle);
         assert_eq!(second.guid, first.guid);
         assert_eq!(
-            decodes(),
-            decodes_after_first,
+            decode_count(),
+            decode_count_after_first,
             "the source was decoded again"
         );
         assert_eq!(assets.len::<Note>(), 1);
@@ -1735,7 +1742,7 @@ mod tests {
         res.write("b.note", "hello");
         res.write("b.note.meta", &metadata_json(GUID_A, r#"{"volume": 9}"#));
         let assets = AssetManager::new();
-        let decodes_before = decodes();
+        let decode_count_before = decode_count();
 
         let written = assets.ensure_metadata::<Note>(Path::new("a.note")).unwrap();
         let kept = assets.ensure_metadata::<Note>(Path::new("b.note")).unwrap();
@@ -1749,7 +1756,7 @@ mod tests {
         );
         assert_eq!(kept, None);
         assert!(res.read("b.note.meta").unwrap().contains(GUID_A));
-        assert_eq!(decodes(), decodes_before, "nothing was decoded");
+        assert_eq!(decode_count(), decode_count_before, "nothing was decoded");
         assert_eq!(
             assets.ensure_metadata::<Note>(Path::new("a.note")).unwrap(),
             None
@@ -1819,7 +1826,7 @@ mod tests {
         let first = assets
             .import(request("a.note", MetadataPolicy::CreateIfMissing))
             .unwrap();
-        let decodes_before = decodes();
+        let decode_count_before = decode_count();
 
         std::fs::create_dir_all(res.root.join("moved")).unwrap();
         std::fs::rename(res.root.join("a.note"), res.root.join("moved/b.note")).unwrap();
@@ -1841,7 +1848,7 @@ mod tests {
             assets.handle_by_guid::<Note>(first.guid.expect("an imported source has a guid")),
             Some(first.handle)
         );
-        assert_eq!(decodes(), decodes_before, "a move decodes nothing");
+        assert_eq!(decode_count(), decode_count_before, "a move decodes nothing");
     }
 
     /// A copy - the old source is still there - is not a move.

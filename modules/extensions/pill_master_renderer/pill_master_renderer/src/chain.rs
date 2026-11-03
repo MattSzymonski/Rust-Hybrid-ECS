@@ -2,26 +2,26 @@
 //!
 //! # Responsibilities
 //!
-//! - Decide when a chain's pipelines, bind groups, and offscreen targets have
-//!   to be rebuilt, from two signatures compared against the frame's chain
-//!   generation, the resource epoch, and the surface size.
+//! - Decide when a chain's pipelines, bind groups and offscreen targets must be
+//!   rebuilt. A tuple of the frame's chain generation, resource epoch and
+//!   surface size is checked every frame; the chain itself and the offscreen
+//!   layout are compared only when that tuple changes.
 //! - Build one pass object per pass of the chain, and remember the reason for
 //!   each pass it could not build.
-//! - Plan each frame - which draws each pass takes, which pass opens each
-//!   target - and name a pass that cannot be recorded once, not once per frame.
+//! - Plan each frame: which draws each pass takes, and which pass opens each
+//!   target. A pass that cannot be recorded is named once, not once per frame.
 //! - Write the chain to the log once per change.
 //!
 //! # Design
 //!
-//! The chain is read every frame but its GPU objects are not rebuilt every
-//! frame: an unchanged frame costs one tuple comparison, and the signature
-//! strings are only built once the chain generation, the resource epoch, or the
-//! surface size moved.
+//! The frame hands this module a resolved chain every frame, but the GPU objects
+//! are built once and reused: an unchanged frame costs one tuple comparison.
 //!
-//! The chain is a script: a game writes it as a [`RenderingPipeline`] of
-//! [`RenderPass`]es, and this is what that declaration becomes once the device
-//! has seen it. A [`ChainContext`] carries what the chain needs of the renderer;
-//! the output is a pass object or the reason there is none.
+//! A game writes its chain as a [`RenderingPipeline`] of [`RenderPass`]es. The
+//! frame resolves that into [`ResolvedPass`]es, and this module turns each of
+//! them into a GPU pass object. A [`ChainContext`] carries what the chain needs
+//! from the renderer, and one pass build yields either that object or the reason
+//! there is none.
 //!
 //! [`RenderingPipeline`]: crate::RenderingPipeline
 //! [`RenderPass`]: crate::RenderPass
@@ -46,32 +46,46 @@ use crate::{
     resources::{RendererPass, RendererShaderHandle, RendererTexture, RendererTextureHandle},
 };
 
+// =============================================================================
+// Pass Output
+// =============================================================================
+
 /// Where a pass writes.
 #[derive(Clone, Copy)]
 pub(crate) enum PassOutput<'a> {
+    /// The frame's own surface, which is the image the caller presents.
     Surface,
+    /// An offscreen colour target, by the name the chain gave it.
     Offscreen(&'a str),
 }
+
+// =============================================================================
+// Pass Slot
+// =============================================================================
 
 /// A pass's GPU object, or the reason there is none.
 pub(crate) enum PassSlot {
     /// Built and ready to record: a pipeline of its own, for the target it
     /// writes.
     Drawable(Box<RendererPass>),
-    /// A geometry pass with no shader of its own. It draws every instance
-    /// through the pipeline each material names, which is the renderer's
-    /// built-in chain and needs nothing built per pass.
+    /// A geometry pass with no shader of its own. Each instance draws through
+    /// the pipeline its own material names, so nothing is built for the pass;
+    /// this is what the built-in chain uses.
     Unshaded,
     /// Cannot be recorded, carrying the reason the log reports.
     Unsupported(String),
 }
 
+// =============================================================================
+// Draw Range
+// =============================================================================
+
 /// One run of queue positions a geometry pass records, and which pipeline it
 /// draws them through.
 ///
-/// `own_pipeline` is true for the instances the pass's own shader shades; false
-/// for instances no pass in the chain claimed, which draw through the pipeline
-/// their own material carries.
+/// `own_pipeline` is true for the instances the pass's own shader shades. It is
+/// false for the instances no pass in the chain claimed: those draw through the
+/// pipeline their own material carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DrawRange {
     /// Positions in the frame's sorted queue (also instance indices).
@@ -80,26 +94,34 @@ pub(crate) struct DrawRange {
     pub own_pipeline: bool,
 }
 
+// =============================================================================
+// Pass Plan
+// =============================================================================
+
 /// One pass the renderer will record.
 pub(crate) enum PassPlan<'a> {
-    /// Instances, batched by material, into the pass's targets.
+    /// Draws instances, batched by material, into the pass's targets.
     ///
-    /// The pass draws the queue items in `ranges`: positions in the frame's
-    /// sorted queue, which are also the instances' positions in the instance
-    /// buffer. A pass that takes the whole queue, the built-in chain's shape,
-    /// is one range; a shader-filtered pass is one range per run of its
-    /// shader. Nothing is copied either way. A pass that names a shader also
-    /// takes the runs no pass in the chain claimed, when it writes the surface:
-    /// those draw through their own materials' pipelines, so an assigned
-    /// material is never left off the screen.
+    /// The pass draws the queue items in `ranges`. A position there is a
+    /// position in the frame's sorted queue, which is also the instance's
+    /// position in the instance buffer, so nothing is copied. A pass that takes
+    /// the whole queue - the built-in chain's shape - has one range; a pass
+    /// filtered by shader has one range per run of that shader.
+    ///
+    /// The first pass that names a shader and writes only the surface also
+    /// takes the runs no pass in the chain claimed, so an assigned material is
+    /// never left off the screen.
     Geometry {
         label: &'a str,
+        /// The frame's render queue, which `ranges` index into.
         queue: &'a [RenderQueueItem],
         ranges: Vec<DrawRange>,
         outputs: Vec<PassOutput<'a>>,
+        /// Whether this pass opens the targets it writes.
         clear: bool,
-        /// The pass's own pipeline, when it built one. `None` leaves each
-        /// instance to the pipeline its material's shader carries.
+        /// Index of the pass's own built object in the chain's pass list, when
+        /// there is one. `None` leaves each instance to the pipeline its
+        /// material's shader carries.
         pass_index: Option<usize>,
     },
     /// Three vertices and no vertex buffers, reading what earlier passes wrote.
@@ -107,6 +129,7 @@ pub(crate) enum PassPlan<'a> {
         label: &'a str,
         pass_index: usize,
         outputs: Vec<PassOutput<'a>>,
+        /// Whether this pass opens the targets it writes.
         clear: bool,
         /// Whether the triangle is tested against the depth buffer: a skybox
         /// is, so it shows only where no mesh drew; a post-processing step is
@@ -137,8 +160,8 @@ impl PassPlan<'_> {
         }
     }
 
-    /// How many instances this pass draws, or the single triangle a
-    /// fullscreen pass is.
+    /// How many instances this pass draws. A fullscreen pass reports one, for
+    /// its triangle.
     pub(crate) fn draws(&self) -> usize {
         match self {
             PassPlan::Geometry { ranges, .. } => ranges
@@ -150,13 +173,19 @@ impl PassPlan<'_> {
     }
 }
 
+// =============================================================================
+// Chain Context
+// =============================================================================
+
 /// What the chain needs from the renderer to build its GPU objects.
 ///
-/// The chain names its shaders and textures by asset key and the renderer caches
-/// their GPU objects by the same key, so it is handed the caches rather than a
-/// way to look them up. Bundled because the borrow split demands it - the
-/// chain is mutated while all of this is borrowed - and because four separate
-/// arguments at every call site would stop the chain reading as one unit.
+/// The chain names its shaders and textures by asset key, and the renderer
+/// caches their GPU objects under the same key, so the chain is handed the
+/// caches instead of a way to look them up.
+///
+/// The fields travel as one struct because the chain is mutated while the
+/// renderer's state is borrowed, and eight separate arguments at every call
+/// site would stop the chain reading as one unit.
 pub(crate) struct ChainContext<'a> {
     /// The device, caches and layouts the passes are built from.
     pub(crate) state: &'a mut State,
@@ -173,36 +202,47 @@ pub(crate) struct ChainContext<'a> {
     /// Texture objects by asset key: a pass's committed textures.
     pub(crate) texture_handles: &'a GpuColumn<RendererTextureHandle>,
     /// Bumped whenever a shader or texture object is created, recreated, or
-    /// dropped. Part of both signatures, because a pass's bind groups reference
-    /// those objects by handle.
+    /// dropped. It is part of both comparison keys, because a pass's bind
+    /// groups reference those objects by handle.
     pub(crate) resource_epoch: u64,
 }
+
+// =============================================================================
+// Offscreen Layout Key
+// =============================================================================
+
+/// What the offscreen targets were built for: the scale each pass asks for on
+/// each target it names, and the surface size.
+type OffscreenLayoutKey = (Vec<(String, u32)>, u32, u32);
+
+// =============================================================================
+// Gpu Chain
+// =============================================================================
 
 /// The GPU side of a chain: one pass object per pass, and the plan a frame is
 /// recorded from.
 ///
-/// Rebuilt only when something the chain depends on moves - its content, the
-/// resource epoch, or the surface size - and asked for a plan on every frame.
-/// The plan borrows the frame it came from, so a plan never outlives the frame
-/// that produced it.
+/// The pass objects are rebuilt only when the chain, the resource epoch or the
+/// surface size changes, or when [`invalidate`](Self::invalidate) is called. A
+/// plan is asked for on every frame, and it borrows the frame it was made from,
+/// so it never outlives that frame.
 pub(crate) struct GpuChain {
     /// One entry per pass of the current chain, in the chain's order.
     passes: Vec<PassSlot>,
     /// The chain those passes were built from, with the resource epoch they
     /// were built at.
     ///
-    /// Compared, never serialized: [`ResolvedPass`] derives equality, so a field
-    /// added to it is compared here without any change in this file - which a
+    /// Held only for comparison: [`ResolvedPass`] derives equality, so a field
+    /// added to it is compared here without any change in this file, which a
     /// hand-built string could not promise.
     built_from: Option<(Vec<ResolvedPass>, u64)>,
     /// What `built_from` was last checked against: the frame's chain generation,
-    /// the resource epoch and the surface size. One tuple compare per frame - no
-    /// chain copied or compared - until the frame's chain or the GPU objects
-    /// behind it actually move.
-    inputs: Option<(u64, u64, u32, u32)>,
-    /// The offscreen layout the current targets were built for: every target
-    /// name with the scale of the pass that names it, and the surface size.
-    offscreen_key: Option<OffscreenKey>,
+    /// the resource epoch and the surface size. One tuple comparison per frame,
+    /// with no chain cloned or compared, until one of those three changes.
+    frame_inputs: Option<(u64, u64, u32, u32)>,
+    /// The offscreen layout the current targets were built for: each offscreen
+    /// target a pass names, with that pass's scale, and the surface size.
+    offscreen_key: Option<OffscreenLayoutKey>,
     /// Passes this chain cannot record yet, remembered so each one is named
     /// once in the log instead of once per frame.
     skipped_passes: HashSet<String>,
@@ -217,7 +257,7 @@ impl GpuChain {
         Self {
             passes: Vec::new(),
             built_from: None,
-            inputs: None,
+            frame_inputs: None,
             offscreen_key: None,
             skipped_passes: HashSet::new(),
             chain_log: None,
@@ -230,17 +270,19 @@ impl GpuChain {
     }
 
     /// Build the GPU objects the chain needs, when something they depend on
-    /// moved.
+    /// changed.
     ///
-    /// Two keys decide. The offscreen layout - every target and scale the chain
-    /// declares, at the surface size - decides the render target textures;
-    /// everything else (the chain itself, compared field by field, and the
-    /// resource epoch) decides the pass pipelines and their bind groups. An
-    /// unchanged frame costs one tuple comparison: the chain is only cloned and
-    /// compared when the chain generation, the resource epoch or the surface
-    /// size moved.
+    /// Two comparisons decide. The offscreen layout - every target and scale
+    /// the chain declares, at the surface size - decides the render target
+    /// textures. Everything else decides the pass pipelines and their bind
+    /// groups: the chain itself, compared field by field, and the resource
+    /// epoch.
     ///
-    /// Infallible on purpose: a pass that would not build is recorded as
+    /// An unchanged frame costs one tuple comparison. The chain is cloned and
+    /// compared only after the chain generation, the resource epoch or the
+    /// surface size has changed.
+    ///
+    /// This never fails. A pass that would not build is stored as
     /// [`PassSlot::Unsupported`] and named in the log, so one bad shader does
     /// not cost the frame the passes that would have drawn.
     pub(crate) fn ensure(
@@ -250,9 +292,10 @@ impl GpuChain {
         chain_generation: u64,
         context: ChainContext<'_>,
     ) {
+        // Step 1: Stop here when nothing the chain depends on changed.
         let (width, height) = context.size;
-        let inputs = (chain_generation, context.resource_epoch, width, height);
-        if self.inputs == Some(inputs) {
+        let frame_inputs = (chain_generation, context.resource_epoch, width, height);
+        if self.frame_inputs == Some(frame_inputs) {
             return;
         }
 
@@ -260,10 +303,12 @@ impl GpuChain {
         let targets_changed = self.offscreen_key.as_ref() != Some(&offscreen_key);
         let built_from = (chain.to_vec(), context.resource_epoch);
         if !targets_changed && self.built_from.as_ref() == Some(&built_from) {
-            self.inputs = Some(inputs);
+            self.frame_inputs = Some(frame_inputs);
             return;
         }
 
+        // Step 2: Rebuild the offscreen targets when the layout or the surface
+        // size changed.
         if targets_changed {
             ensure_offscreen_targets(
                 &context.state.device,
@@ -274,15 +319,16 @@ impl GpuChain {
             self.offscreen_key = Some(offscreen_key);
         }
 
-        // The slots the loop below builds replace the old ones, so what was
-        // said about the old ones goes with them.
+        // Step 3: Rebuild one pass object per pass. The slots the loop below
+        // creates replace the old ones, so what was said about the old ones
+        // goes with them.
         self.forget_passes();
 
         // A pass builds its own pipeline from the shader's sources, and the
-        // chain names that shader by key while the manager looks assets up by
-        // handle. One walk of the shader column builds the way from one to the
-        // other - here rather than once per pass, and only when the chain is
-        // actually rebuilt.
+        // chain names that shader by key while the asset store is walked by
+        // handle. One pass over the shader column builds a map from key to
+        // shader, so each pass looks its shader up without walking the store
+        // again. Only a rebuild pays for it.
         let shaders_by_key: HashMap<u64, &Shader> = assets
             .iter_handles::<Shader>()
             .map(|(handle, shader)| (asset_key(handle), shader))
@@ -311,16 +357,18 @@ impl GpuChain {
         }
         self.passes = passes;
         self.built_from = Some(built_from);
-        self.inputs = Some(inputs);
+        self.frame_inputs = Some(frame_inputs);
     }
 
     /// Hand each pass the draws it was given.
     ///
     /// A geometry pass that names a shader draws the instances shaded by that
-    /// shader and leaves the rest to the other passes; one that names none draws
-    /// every instance, each with the pipeline its own material names, which is
-    /// what the built-in chain is. A fullscreen pass draws nothing but its
-    /// triangle, and reads what earlier passes left in the targets it names.
+    /// shader and leaves the rest to the other passes. One that names no shader
+    /// draws every instance, each with the pipeline its own material names,
+    /// which is what the built-in chain does. The first pass that names a shader
+    /// and writes only the surface also takes the instances no pass claimed.
+    /// A fullscreen pass draws nothing but its triangle, and reads what earlier
+    /// passes left in the targets it names.
     pub(crate) fn plan<'a>(
         &mut self,
         chain: &'a [ResolvedPass],
@@ -328,10 +376,9 @@ impl GpuChain {
         shader_handles: &GpuColumn<RendererShaderHandle>,
     ) -> Vec<PassPlan<'a>> {
         let mut plan = Vec::with_capacity(chain.len());
-        // The shaders a geometry pass in this chain draws, and whether the runs
-        // no pass claimed have been handed to a pass yet. One pass takes them,
-        // so nothing is drawn twice.
-        let mut claimed: std::collections::HashSet<RendererShaderHandle> =
+        // Step 1: Collect the shaders this chain's geometry passes claim. A pass
+        // that names a shader the renderer holds no handle for claims nothing.
+        let mut claimed_shaders: std::collections::HashSet<RendererShaderHandle> =
             std::collections::HashSet::new();
         for pass in chain
             .iter()
@@ -339,11 +386,15 @@ impl GpuChain {
         {
             if let Some(key) = &pass.shader {
                 if let Some(handle) = shader_handles.handle(key.0) {
-                    claimed.insert(handle);
+                    claimed_shaders.insert(handle);
                 }
             }
         }
-        let mut unclaimed_given = false;
+        // Whether the runs no pass claimed have been handed to a pass yet. One
+        // pass takes them, so nothing is drawn twice.
+        let mut has_taken_unclaimed_runs = false;
+
+        // Step 2: Build one plan entry per pass.
         for (index, pass) in chain.iter().enumerate() {
             // The pass's own target first, then the ones it writes beside it.
             let outputs: Vec<PassOutput<'_>> = std::iter::once(&pass.settings.target)
@@ -394,16 +445,16 @@ impl GpuChain {
                             })
                             .collect(),
                     };
-                    // The instances no pass in the chain claimed draw here,
-                    // through their own materials' pipelines, so an assigned
-                    // material is never invisible. Only a pass writing the
-                    // surface can: a material's pipeline is built for the
-                    // surface's formats.
+                    // The instances no pass in the chain claimed are drawn
+                    // here, through the pipeline of their own material, so an
+                    // assigned material never disappears from the picture.
+                    // Only a pass that writes the surface may take them: a
+                    // material's pipeline is built for the surface's formats.
                     let writes_surface_only = outputs
                         .iter()
                         .all(|output| matches!(output, PassOutput::Surface));
-                    if pass.shader.is_some() && !unclaimed_given && writes_surface_only {
-                        let unclaimed = unclaimed_ranges(render_queue, &claimed);
+                    if pass.shader.is_some() && !has_taken_unclaimed_runs && writes_surface_only {
+                        let unclaimed = unclaimed_ranges(render_queue, &claimed_shaders);
                         if !unclaimed.is_empty() {
                             // Per frame, so it stays at debug: the chain's own
                             // line already reports the pass's draw count.
@@ -421,7 +472,7 @@ impl GpuChain {
                                 own_pipeline: false,
                             }));
                         }
-                        unclaimed_given = true;
+                        has_taken_unclaimed_runs = true;
                     }
                     let pass_index = match self.passes.get(index) {
                         Some(PassSlot::Drawable(_)) => Some(index),
@@ -456,8 +507,9 @@ impl GpuChain {
             }
         }
 
-        // A chain with nothing recordable in it still has to open the frame's
-        // targets: a swapchain image nobody cleared presents whatever was in it.
+        // Step 3: A chain with nothing recordable in it still has to open the
+        // frame's targets, because a swapchain image nobody cleared presents
+        // whatever was in it.
         if plan.is_empty() {
             plan.push(PassPlan::Geometry {
                 label: "frame.clear",
@@ -474,10 +526,10 @@ impl GpuChain {
     /// Forget the pass objects and what they were built from, so the next frame
     /// rebuilds them.
     ///
-    /// The offscreen targets are deliberately kept: they are keyed by the
-    /// chain's layout and the surface size, and an asset edit - which is what
-    /// calls this - moves neither. [`invalidate_targets`](Self::invalidate_targets)
-    /// is the version for a surface size that did move.
+    /// The offscreen targets are kept on purpose: they depend on the chain's
+    /// layout and the surface size, and an asset edit - which is what calls
+    /// this - changes neither. Use [`invalidate_targets`](Self::invalidate_targets)
+    /// when the surface size changed.
     pub(crate) fn invalidate(&mut self) {
         self.forget_passes();
     }
@@ -485,21 +537,21 @@ impl GpuChain {
     /// Drop the built passes, the keys they were built from, and what was said
     /// about them.
     ///
-    /// The skip set dedupes the log per build - a pass that stays broken is
-    /// named once, not once per frame - so it may only live as long as the
-    /// slots it describes. Every path that replaces the slots goes through
-    /// here, or a pass that breaks, is fixed and breaks again stays silent.
+    /// The skip set keeps the log quiet: a pass that stays broken is named once,
+    /// not once per frame. It therefore has to be cleared together with the
+    /// slots it describes, or a pass that breaks, is fixed and breaks again
+    /// would stay silent. Every path that replaces the slots goes through here.
     fn forget_passes(&mut self) {
         self.passes.clear();
         self.built_from = None;
-        self.inputs = None;
+        self.frame_inputs = None;
         self.skipped_passes.clear();
     }
 
-    /// Forget the offscreen layout as well, targets included.
+    /// Forget the offscreen layout as well, so the targets are rebuilt too.
     ///
-    /// For a surface size that moved: every target is built at the surface size,
-    /// so a new one makes all of them wrong.
+    /// Use this when the surface size changed: every target is built at the
+    /// surface size, so a new size makes all of them wrong.
     pub(crate) fn invalidate_targets(&mut self) {
         self.invalidate();
         self.offscreen_key = None;
@@ -507,61 +559,64 @@ impl GpuChain {
 
     /// Write the chain to the log, once per change.
     ///
-    /// Each pass is named with the number of draws it was handed, which is the
-    /// one thing that tells a chain doing what the game asked apart from one
-    /// quietly falling back to the built-in pass. A line per frame would bury
+    /// Each pass is named with the number of draws it was handed. That number
+    /// is what shows whether the chain runs the passes the game asked for, or
+    /// quietly falls back to the built-in pass. A line per frame would bury
     /// everything else, and an unchanged chain is the normal case.
     pub(crate) fn log(&mut self, plan: &[PassPlan]) {
-        let mut signature = String::new();
+        let mut chain_signature = String::new();
         for entry in plan {
-            if !signature.is_empty() {
-                signature.push(' ');
+            if !chain_signature.is_empty() {
+                chain_signature.push(' ');
             }
-            signature.push_str(entry.label());
-            signature.push('(');
-            signature.push_str(&entry.draws().to_string());
-            signature.push(')');
+            chain_signature.push_str(entry.label());
+            chain_signature.push('(');
+            chain_signature.push_str(&entry.draws().to_string());
+            chain_signature.push(')');
         }
-        if self.chain_log.as_deref() == Some(signature.as_str()) {
+        if self.chain_log.as_deref() == Some(chain_signature.as_str()) {
             return;
         }
 
         // Logged once per change, like the renderer's other diagnostics: this
         // line is what a reader has when the window shows the wrong thing.
-        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Pass chain: {signature}");
-        self.chain_log = Some(signature);
+        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Pass chain: {chain_signature}");
+        self.chain_log = Some(chain_signature);
     }
 
     /// Name a pass the renderer cannot record, once rather than once per frame.
-    fn report_skip(&mut self, name: &str, reason: &str) {
-        if !self.skipped_passes.insert(name.to_owned()) {
+    fn report_skip(&mut self, pass_name: &str, reason: &str) {
+        if !self.skipped_passes.insert(pass_name.to_owned()) {
             return;
         }
 
         // Logged once per change, like the renderer's other diagnostics.
-        warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "Pass {name} is not drawn: {reason}");
+        warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "Pass {pass_name} is not drawn: {reason}");
     }
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Why a pass cannot write a target scaled down from the surface, or `None`
 /// when it can.
 ///
 /// A render pass's attachments must all be one size. The depth buffer is the
 /// surface's, and a geometry pass writes it while a skybox reads it, so neither
-/// can pair it with a smaller colour target. A fullscreen pass that tests no
-/// depth writes only its own target, so a scale there is the pass's own
-/// business.
+/// can pair it with a smaller colour target. A fullscreen pass attaches no
+/// depth buffer, so it may write a scaled target.
 fn scaled_target_refusal(pass: &ResolvedPass) -> Option<String> {
     if pass.settings.target_scale.max(1) == 1 {
         return None;
     }
-    let depth = match pass.settings.kind {
+    let depth_use = match pass.settings.kind {
         PassKind::Geometry => "writes",
         PassKind::Skybox => "reads",
         PassKind::Fullscreen => return None,
     };
     Some(format!(
-        "it {depth} the full-size depth buffer, so it cannot write a target scaled by {}",
+        "it {depth_use} the full-size depth buffer, so it cannot write a target scaled by {}",
         pass.settings.target_scale
     ))
 }
@@ -572,7 +627,7 @@ fn scaled_target_refusal(pass: &ResolvedPass) -> Option<String> {
 /// A geometry pass without a shader draws through each material's pipeline, and
 /// those pipelines are built for the surface's formats. A target that is not
 /// the surface would be recorded against the wrong format, so the pass is
-/// refused at plan time instead of refusing every draw.
+/// refused while the chain is built, instead of every draw failing.
 fn shaderless_target_refusal(pass: &ResolvedPass) -> Option<String> {
     if pass.settings.kind != PassKind::Geometry || pass.shader.is_some() {
         return None;
@@ -591,14 +646,16 @@ fn shaderless_target_refusal(pass: &ResolvedPass) -> Option<String> {
 
 /// One pass's GPU object, or the reason there is none.
 ///
-/// `defined_targets` is what earlier passes of the chain declared so far; the
-/// pass may only read those.
+/// `defined_targets` is what earlier passes of the chain declared so far, and
+/// the pass may only read those. `context` is what the renderer provides for
+/// building GPU objects.
 fn build_pass(
     pass: &ResolvedPass,
     shaders_by_key: &HashMap<u64, &Shader>,
     defined_targets: &HashSet<String>,
-    chain: &ChainContext<'_>,
+    context: &ChainContext<'_>,
 ) -> PassSlot {
+    // Step 1: Refuse the pass when its targets cannot work.
     // The depth buffer is the surface's size, so a pass that uses it cannot
     // write a smaller target. Checked before the shader lookup: a geometry pass
     // with no shader of its own attaches the same buffer.
@@ -610,8 +667,9 @@ fn build_pass(
     if let Some(reason) = shaderless_target_refusal(pass) {
         return PassSlot::Unsupported(reason);
     }
-    // A geometry pass with no shader of its own is the only kind that needs no
-    // object built here: it draws through each material's pipeline.
+    // Step 2: Resolve the shader the pass draws with. A geometry pass with no
+    // shader of its own is the only kind that needs no object built here: it
+    // draws through each material's pipeline.
     let Some(shader_key) = pass.shader else {
         return match pass.settings.kind {
             PassKind::Geometry => PassSlot::Unshaded,
@@ -628,21 +686,22 @@ fn build_pass(
     let Some(shader) = shaders_by_key.get(&shader_key.0).copied() else {
         return PassSlot::Unsupported("it names no shader the renderer loaded".to_owned());
     };
-    let Some(renderer_shader) = chain
+    let Some(renderer_shader) = context
         .shader_handles
         .handle(shader_key.0)
-        .and_then(|handle| chain.state.renderer_resource_storage.shaders.get(handle))
+        .and_then(|handle| context.state.renderer_resource_storage.shaders.get(handle))
     else {
         return PassSlot::Unsupported("its shader has no pipeline".to_owned());
     };
-    // One format per target the pass writes, in the order the shader's
+    // Step 3: Collect the format of each target and the textures the pass
+    // binds. One format per target the pass writes, in the order the shader's
     // `SV_TARGET` list names them. A target the pass writes beside its own is
     // what a geometry pass leaves a normal buffer in.
     let target_formats: Vec<wgpu::TextureFormat> = std::iter::once(&pass.settings.target)
         .chain(pass.settings.extra_targets.iter())
         .map(|target| match target {
-            PassTarget::Surface => chain.surface_format,
-            PassTarget::Offscreen(name) => chain
+            PassTarget::Surface => context.surface_format,
+            PassTarget::Offscreen(name) => context
                 .offscreen
                 .get(name)
                 .map(|texture| texture.texture.format())
@@ -657,7 +716,7 @@ fn build_pass(
     // quietly showing the wrong map.
     let mut textures: Vec<(String, RendererTextureHandle)> = Vec::new();
     for (slot, key) in &pass.textures {
-        match chain.texture_handles.handle(key.0) {
+        match context.texture_handles.handle(key.0) {
             Some(handle) => textures.push((slot.clone(), handle)),
             None => warn!(
                 target: pill_core::telemetry::telemetry_target::RENDERING,
@@ -667,20 +726,21 @@ fn build_pass(
         }
     }
 
-    let storage = &chain.state.renderer_resource_storage;
+    // Step 4: Build the pass object.
+    let storage = &context.state.renderer_resource_storage;
     match RendererPass::new(
-        &chain.state.device,
-        &chain.state.queue,
+        &context.state.device,
+        &context.state.queue,
         storage,
         &storage.engine_parameters.bind_group_layout,
-        &chain.state.camera_bind_group_layout,
+        &context.state.camera_bind_group_layout,
         pass,
         shader,
         renderer_shader,
         &target_formats,
-        chain.state.depth_format,
-        chain.offscreen,
-        chain.depth_texture,
+        context.state.depth_format,
+        context.offscreen,
+        context.depth_texture,
         &textures,
         defined_targets,
     ) {
@@ -698,17 +758,18 @@ fn whole_queue(render_queue: &[RenderQueueItem]) -> Vec<Range<u32>> {
     }
 }
 
-/// The runs of the queue whose shader no pass in `claimed` names.
+/// The runs of the queue whose shader no pass in `claimed_shaders` names.
 ///
-/// These are the instances an assigned material queued and no geometry pass
-/// would draw: one run per shader, in queue order.
+/// These are the instances that a material queued and no geometry pass draws.
+/// Neighbouring items join one run even when their shaders differ, so a run is a
+/// stretch of the queue, not one shader's items.
 fn unclaimed_ranges(
     render_queue: &[RenderQueueItem],
-    claimed: &std::collections::HashSet<RendererShaderHandle>,
+    claimed_shaders: &std::collections::HashSet<RendererShaderHandle>,
 ) -> Vec<Range<u32>> {
     let mut ranges: Vec<Range<u32>> = Vec::new();
     for (position, item) in render_queue.iter().enumerate() {
-        if claimed.contains(&item.shader) {
+        if claimed_shaders.contains(&item.shader) {
             continue;
         }
         let position = position as u32;
@@ -743,17 +804,13 @@ fn shader_ranges(
     ranges
 }
 
-/// What the offscreen targets were built for: every target with the scale of
-/// the pass that names it, and the surface size.
-type OffscreenKey = (Vec<(String, u32)>, u32, u32);
-
-/// A layout of the offscreen targets a chain needs: every target name with the
-/// scale of the pass that names it, plus the surface size they are built at.
+/// The layout of the offscreen targets a chain needs: one entry per pass and
+/// target it names, with that pass's scale, plus the surface size.
 ///
-/// Kept apart from the chain itself on purpose: editing an asset moves the
+/// Kept apart from the chain itself on purpose: editing an asset changes the
 /// chain (a pass's parameters are part of it) but changes none of this, so the
 /// offscreen textures survive an asset edit.
-fn offscreen_layout(chain: &[ResolvedPass], width: u32, height: u32) -> OffscreenKey {
+fn offscreen_layout(chain: &[ResolvedPass], width: u32, height: u32) -> OffscreenLayoutKey {
     let mut targets = Vec::new();
     for pass in chain {
         let scale = pass.settings.target_scale.max(1);
@@ -770,21 +827,21 @@ fn offscreen_layout(chain: &[ResolvedPass], width: u32, height: u32) -> Offscree
 
 /// Create a target for every offscreen output the chain declares.
 ///
-/// Rebuilt whenever the chain is, and sized to the surface: one that no longer
-/// matches the window would be sampled at a different scale from the pass that
-/// wrote it, which shows up as a picture that shrinks with the window rather
-/// than one that resizes with it.
+/// The targets are rebuilt when the offscreen layout or the surface size
+/// changes, and every one is sized from the surface. A target that kept an old
+/// size would be sampled at a different scale from the pass that writes it, so
+/// the picture would shrink with the window instead of resizing with it.
 fn ensure_offscreen_targets(
     device: &wgpu::Device,
     (width, height): (u32, u32),
-    targets: &mut HashMap<String, RendererTexture>,
+    offscreen_targets: &mut HashMap<String, RendererTexture>,
     chain: &[ResolvedPass],
 ) {
-    targets.clear();
+    offscreen_targets.clear();
     for pass in chain {
-        // The pass's own target first, then the ones it writes beside it. The
-        // scale is the first pass's: a target belongs to the chain, and the
-        // pass that names it first is asking on everyone's behalf.
+        // The pass's own target comes first, then the ones it writes beside it.
+        // The size is the first naming pass's: a target belongs to the chain,
+        // so the pass that names it first decides for all of them.
         let scale = pass.settings.target_scale.max(1);
         let written =
             std::iter::once(&pass.settings.target).chain(pass.settings.extra_targets.iter());
@@ -792,7 +849,7 @@ fn ensure_offscreen_targets(
             let PassTarget::Offscreen(name) = target else {
                 continue;
             };
-            if targets.contains_key(name) {
+            if offscreen_targets.contains_key(name) {
                 continue;
             }
             match RendererTexture::new_render_target(
@@ -803,7 +860,7 @@ fn ensure_offscreen_targets(
                 OFFSCREEN_FORMAT,
             ) {
                 Ok(texture) => {
-                    targets.insert(name.clone(), texture);
+                    offscreen_targets.insert(name.clone(), texture);
                 }
                 // Reported instead of fatal: the passes that read it each say
                 // they are not drawn, which is the same outcome their own
@@ -818,6 +875,10 @@ fn ensure_offscreen_targets(
         }
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -844,9 +905,9 @@ mod tests {
     /// A pass that names a shader takes the runs no pass in the chain claims,
     /// and draws them through their own materials rather than its pipeline.
     ///
-    /// Here the named shader is not loaded (the handle map is empty), so it
-    /// claims nothing and the queue's shader is unclaimed: exactly the case a
-    /// material the chain never thought about is in.
+    /// The shader this pass names is not loaded here (the handle map is empty),
+    /// so the pass claims nothing and the queue's shader stays unclaimed. That
+    /// is what happens to a material whose shader the chain never mentions.
     #[test]
     fn a_pass_that_names_a_shader_takes_the_runs_no_pass_claims() {
         let mut naming = pass(PassKind::Geometry, PassTarget::Surface);
@@ -891,9 +952,9 @@ mod tests {
         }
     }
 
-    /// The rebuild check compares the chain itself, so every field of
-    /// [`ResolvedPass`] is covered by construction - including the ones a
-    /// hand-built string could forget.
+    /// The rebuild check compares the stored chain as a whole, so a field added
+    /// to [`ResolvedPass`] is compared without this file changing - including
+    /// the ones a hand-built string could forget.
     #[test]
     fn the_stored_chain_covers_every_field_a_pass_has() {
         let surface = pass(PassKind::Geometry, PassTarget::Surface);
@@ -942,9 +1003,9 @@ mod tests {
 
     #[test]
     fn a_chain_with_nothing_recordable_still_clears_the_frame() {
-        // Nothing was built for this chain, which is every pass's fate on the
-        // frame a chain first arrives: none of them may be skipped without the
-        // frame targets being opened anyway.
+        // No pass object was built for this chain, which is what happens on the
+        // first frame after a chain arrives. Even then the frame's targets have
+        // to be opened, so the plan holds a clear pass instead of nothing.
         let chain = vec![pass(PassKind::Geometry, PassTarget::Surface)];
         let mut pipeline = GpuChain::new();
 
@@ -1014,14 +1075,15 @@ mod tests {
         )
     }
 
-    /// No shader is mirrored in these tests, so the planner gets an empty
-    /// column to look names up in.
+    /// No test registers a shader, so the planner gets an empty column to look
+    /// shader keys up in.
     fn no_shaders() -> GpuColumn<RendererShaderHandle> {
         GpuColumn::new()
     }
 
-    /// The runs no pass in the chain claims are exactly the shaders it never
-    /// names, so an assigned material is drawn by whichever pass takes them.
+    /// The runs no pass in the chain claims hold the queue items whose shader
+    /// no pass names, so an assigned material is drawn by whichever pass takes
+    /// those runs.
     #[test]
     fn unclaimed_ranges_are_the_shaders_no_pass_names() {
         let queue = vec![

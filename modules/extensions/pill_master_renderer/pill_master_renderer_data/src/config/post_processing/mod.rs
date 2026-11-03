@@ -25,10 +25,10 @@
 //!
 //! # Where the shaders are
 //!
-//! In `shader_sources/post_processing/shaders/`: the fullscreen vertex stage each
-//! pass here draws through, and the four fragment stages. None of the five
-//! `#include` anything, so unlike the geometry half's stages these need no
-//! `include/` directory.
+//! In `shader_sources/post_processing/shaders/`: the fullscreen vertex stage
+//! each pass here draws through, and the four fragment stages. The fragment
+//! stages `#include` nothing. The vertex stage includes `common.hlsl`, which
+//! lives in `shader_sources/common_shaders/include/`.
 
 // External crates
 use pill_engine::{AssetGuid, AssetManager, Handle};
@@ -36,6 +36,10 @@ use pill_engine::{AssetGuid, AssetManager, Handle};
 // Current crate
 use crate::assets::{MaterialParameter, PassKind, PassTarget, RenderPass, Texture, TextureType};
 use crate::config::ShaderSourceRecord;
+
+// =============================================================================
+// Constants
+// =============================================================================
 
 /// Name of the target the frame's geometry pass writes, and the first pass here
 /// reads.
@@ -53,8 +57,8 @@ pub const GRAIN_TEXTURE_NAME: &str = "pill.pbr.grain";
 /// The cooked fullscreen vertex stage every pass here draws through.
 const FULLSCREEN_VERTEX: &str = "post_processing/shaders/fullscreen_vertex.wgsl";
 
-/// The bloom prefilter's fragment stage: the path its `.hlsl` source is
-/// imported from, and the cooked file beside it.
+/// The bloom prefilter's fragment stage, named twice: once as the `.hlsl`
+/// source path it is imported from, and once as the cooked file beside it.
 const PREFILTER_SHADER: &str = "post_processing/shaders/bloom_prefilter_fragment.hlsl";
 const PREFILTER_FRAGMENT: &str = "post_processing/shaders/bloom_prefilter_fragment.wgsl";
 /// The bloom prefilter shader's guid, which its meta repeats.
@@ -111,13 +115,15 @@ const TONEMAP_PASS: &str = "pill.pbr.pass.tonemap";
 /// Asset name of the lens pass.
 const LENS_PASS: &str = "pill.pbr.pass.lens";
 
-// --- The chain's look ---
-//
-// Every value below is a look decision, named so this frame can be read and
-// tuned from here. The engine packs one 16-byte slot per parameter, so a pass
-// with unrelated scalars carries them in one `Color`, in the order its shader's
-// `MaterialParams` declares them; each constant is named after the field it
-// fills.
+// =============================================================================
+// The Chain's Look
+// =============================================================================
+
+// Every value below is a look choice. They are named so the frame's look can be
+// read and tuned from this file. The engine gives every parameter one 16-byte
+// slot, so a pass with unrelated scalars carries them in one `Color`, in the
+// order its shader's `MaterialParams` declares them. Each constant that fills a
+// slot is named after the field it fills.
 
 /// Brightness a pixel has to exceed before it blooms.
 const BLOOM_THRESHOLD: f32 = 1.0;
@@ -128,23 +134,24 @@ const BLOOM_STRENGTH: f32 = 0.6;
 
 /// The tonemap curve's contrast exponent.
 const TONEMAP_CONTRAST: f32 = 1.6;
-/// Where the tonemap's shoulder starts to bend the highlights.
+/// The exponent that shapes how the tonemap bends its highlights down.
 const TONEMAP_SHOULDER: f32 = 0.977;
 /// The range the display has to fit, in scene units.
 const HDR_MAX: f32 = 8.0;
 /// Where mid grey enters the curve, in scene units.
 const MID_GREY_IN: f32 = 0.18;
-/// Where mid grey lands on the display.
+/// The display value that mid grey is mapped to.
 const MID_GREY_OUT: f32 = 0.267;
 
-/// Barrel distortion: negative barrels the image, positive pincushions it.
+/// Barrel distortion. A negative value bows the sides outward; a positive
+/// value pinches them inward.
 const LENS_BARREL_K1: f32 = -0.06;
 /// How far the vignette pulls the corners down.
 ///
-/// The shader multiplies the radius by this before its `smoothstep`, so 1.0 puts
-/// the falloff's full range inside the frame and darkens the corners to black.
-/// Half of that stops the ramp short of the corners: they lose about a third of
-/// their light, and the edges almost nothing.
+/// The shader multiplies the radius by this value before the `smoothstep`. At
+/// 1.0 the whole falloff fits inside the frame and the corners go black. At 0.5
+/// the falloff stops short of the corners: they lose about 40 percent of their
+/// light, and the edges almost none.
 const LENS_VIGNETTE_STRENGTH: f32 = 0.5;
 /// How far red and blue split at the edge, as a scale of the radius squared.
 const LENS_CHROMATIC_ABERRATION: f32 = 0.004;
@@ -155,55 +162,61 @@ const LENS_GAMMA: [f32; 3] = [1.0, 1.0, 1.0];
 const LENS_GRADE: [f32; 3] = [1.0, 0.0, 0.0];
 /// Grain amplitude.
 ///
-/// Zero: the shader's `min(colour + black_limit, grain_amount)` collapses to no
-/// offset, so the tile is sampled and ignored. It is off while the frame's grade
-/// is being settled - the pattern is dense at 1:1 pixels and reads as noise on a
-/// still image - and the rest of the pass stays in place, so turning it back on
-/// is this number alone.
+/// At zero, the shader's `min(colour + black_limit, grain_amount)` gives no
+/// offset, so the tile is sampled and ignored. Grain is off because the pattern
+/// is dense at 1:1 pixels and reads as noise on a still image. The rest of the
+/// pass stays in place, so turning grain back on means changing this number
+/// alone.
 const LENS_GRAIN_AMPLITUDE: f32 = 0.0;
 /// Screen pixels per grain texel.
 const GRAIN_PIXELS_PER_TEXEL: f32 = 1.0;
 
 /// Edge of the grain tile, in texels.
 ///
-/// One number for both sides: the texture is generated at this size, and the
-/// lens pass receives it as a parameter so the shader divides screen pixels by
-/// the same value rather than repeating a literal of its own.
+/// The square tile is generated at this size, so one number sets both sides.
+/// The lens pass also receives the size as a parameter, so the shader can map
+/// screen pixels into the tile without repeating a literal of its own.
 const GRAIN_TILE_SIZE: u32 = 256;
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Install the four post-processing passes.
 ///
-/// Returns the passes in the order the frame runs them. The grain tile the last
-/// one samples is not returned: the lens pass already binds it, and a second
-/// hand-out of that handle would be a copy free to disagree with the pass.
+/// The passes come back in the order the frame runs them. The grain tile the
+/// last pass samples is not returned: the lens pass already holds that texture,
+/// and a second handle would let the two disagree.
 ///
-/// Idempotent: a store that already holds them gets the same handles back rather
-/// than a second copy, so this is safe to call once per generation.
+/// A store that already holds all four passes gets the same handles back
+/// instead of a second copy, so this is safe to call once per generation.
 ///
 /// # Errors
 ///
-/// Returns an error when a name this owns is already taken by an asset of a
-/// different type, or when one of the shaders fails to build.
+/// Returns an error when the store already holds an asset of the same kind
+/// under one of these names, or when one of the shaders fails to build.
 pub fn install(
     assets: &mut AssetManager,
 ) -> Result<Vec<Handle<RenderPass>>, Box<dyn std::error::Error>> {
-    if let (Some(bloom), Some(composite), Some(tonemap), Some(lens)) = (
+    // Step 1: Hand back the passes when the store already holds all four.
+    if let (Some(bloom_pass), Some(composite_pass), Some(tonemap_pass), Some(lens_pass)) = (
         assets.handle_by_name::<RenderPass>(BLOOM_PASS),
         assets.handle_by_name::<RenderPass>(COMPOSITE_PASS),
         assets.handle_by_name::<RenderPass>(TONEMAP_PASS),
         assets.handle_by_name::<RenderPass>(LENS_PASS),
     ) {
-        return Ok(vec![bloom, composite, tonemap, lens]);
+        return Ok(vec![bloom_pass, composite_pass, tonemap_pass, lens_pass]);
     }
 
-    // The grain tile the lens pass samples, generated rather than shipped: the
-    // pattern only has to make neighbouring texels differ, not be random, and
-    // generating it keeps a binary out of the repository.
-    let grain = assets.add_named(GRAIN_TEXTURE_NAME, grain_texture())?;
+    // Step 2: Generate the grain tile the lens pass samples. The pattern only
+    // has to make neighbouring texels differ, not be random, and generating it
+    // keeps a binary out of the repository.
+    let grain_texture_handle = assets.add_named(GRAIN_TEXTURE_NAME, grain_texture())?;
 
-    let prefilter = crate::config::import_shader(assets, PREFILTER_SHADER, PREFILTER_GUID)?;
-    let bloom = RenderPass::new(BLOOM_PASS)
-        .with_shader(prefilter)
+    // Step 3: Build the four passes in the order the frame runs them.
+    let prefilter_shader = crate::config::import_shader(assets, PREFILTER_SHADER, PREFILTER_GUID)?;
+    let bloom_pass = RenderPass::new(BLOOM_PASS)
+        .with_shader(prefilter_shader)
         .with_kind(PassKind::Fullscreen)
         .with_input("hdr", HDR_TARGET)
         .with_parameter(
@@ -211,19 +224,19 @@ pub fn install(
             MaterialParameter::Color([BLOOM_THRESHOLD, BLOOM_KNEE, 0.0]),
         )
         .with_target(PassTarget::Offscreen(BLOOM_TARGET.to_owned()))
-        // Half the surface: bloom is a blur, and a blur that costs a quarter of
-        // the pixels is the reason a pass declares its own target size.
+        // Half the surface on each side costs a quarter of the pixels, and that
+        // saving is why a pass can ask for its own target scale.
         .with_target_scale(2)
         .with_order(1);
-    let bloom = assets.add_named_with_guid(
+    let bloom_pass = assets.add_named_with_guid(
         BLOOM_PASS,
         pill_engine::AssetGuid::from_name(BLOOM_PASS),
-        bloom,
+        bloom_pass,
     )?;
 
-    let composite = crate::config::import_shader(assets, COMPOSITE_SHADER, COMPOSITE_GUID)?;
+    let composite_shader = crate::config::import_shader(assets, COMPOSITE_SHADER, COMPOSITE_GUID)?;
     let composite_pass = RenderPass::new(COMPOSITE_PASS)
-        .with_shader(composite)
+        .with_shader(composite_shader)
         .with_kind(PassKind::Fullscreen)
         .with_input("hdr", HDR_TARGET)
         .with_input("bloom", BLOOM_TARGET)
@@ -239,7 +252,8 @@ pub fn install(
         composite_pass,
     )?;
 
-    // Solved from the art parameters, so an artist sets the look and these follow.
+    // Work out the two curve constants from the look values above: an artist
+    // tunes the look, and the constants follow.
     let (b, c) = lottes_bc(
         TONEMAP_CONTRAST,
         TONEMAP_SHOULDER,
@@ -247,9 +261,9 @@ pub fn install(
         MID_GREY_IN,
         MID_GREY_OUT,
     );
-    let tonemap = crate::config::import_shader(assets, TONEMAP_SHADER, TONEMAP_GUID)?;
+    let tonemap_shader = crate::config::import_shader(assets, TONEMAP_SHADER, TONEMAP_GUID)?;
     let tonemap_pass = RenderPass::new(TONEMAP_PASS)
-        .with_shader(tonemap)
+        .with_shader(tonemap_shader)
         .with_kind(PassKind::Fullscreen)
         .with_input("hdr", LIT_TARGET)
         .with_parameter("contrast", MaterialParameter::Scalar(TONEMAP_CONTRAST))
@@ -264,13 +278,13 @@ pub fn install(
         tonemap_pass,
     )?;
 
-    // The last stage writes the swapchain, so the chain ends where it has to.
-    let lens = crate::config::import_shader(assets, LENS_SHADER, LENS_GUID)?;
+    // The last pass writes the surface, so the chain ends here.
+    let lens_shader = crate::config::import_shader(assets, LENS_SHADER, LENS_GUID)?;
     let lens_pass = RenderPass::new(LENS_PASS)
-        .with_shader(lens)
+        .with_shader(lens_shader)
         .with_kind(PassKind::Fullscreen)
         .with_input("source", LDR_TARGET)
-        .with_texture("grain", grain)
+        .with_texture("grain", grain_texture_handle)
         .with_parameter(
             "shape",
             MaterialParameter::Color([
@@ -303,31 +317,37 @@ pub fn install(
         lens_pass,
     )?;
 
-    Ok(vec![bloom, composite_pass, tonemap_pass, lens_pass])
+    Ok(vec![bloom_pass, composite_pass, tonemap_pass, lens_pass])
 }
 
-/// The curve shape and the two constants Lottes' tonemap is defined by.
+/// Solve the two constants that define the shape of Lottes' tonemap.
 ///
 /// `b` and `c` are solved rather than authored: an artist says where mid grey
-/// should land and how much highlight the display has to fit, and these two
-/// follow. See Tim Lottes' GDC 2016 talk on HDR color pipelines; the fragment
-/// shader's own `lottes` function evaluates the curve these place.
-fn lottes_bc(contrast: f32, shoulder: f32, hdr_max: f32, mid_in: f32, mid_out: f32) -> (f32, f32) {
+/// should be on the display and how much highlight the display has to fit, and
+/// these two follow. See Tim Lottes' GDC 2016 talk on HDR color pipelines; the
+/// fragment shader's own `lottes` function evaluates the curve these place.
+fn lottes_bc(
+    contrast: f32,
+    shoulder: f32,
+    hdr_max: f32,
+    mid_grey_in: f32,
+    mid_grey_out: f32,
+) -> (f32, f32) {
     let hdr_a = hdr_max.powf(contrast);
-    let mid_a = mid_in.powf(contrast);
+    let mid_a = mid_grey_in.powf(contrast);
     let hdr_ad = hdr_a.powf(shoulder);
     let mid_ad = mid_a.powf(shoulder);
-    let denom = (hdr_ad - mid_ad) * mid_out;
-    let b = (-mid_a + hdr_a * mid_out) / denom;
-    let c = (hdr_ad * mid_a - hdr_a * mid_ad * mid_out) / denom;
+    let denominator = (hdr_ad - mid_ad) * mid_grey_out;
+    let b = (-mid_a + hdr_a * mid_grey_out) / denominator;
+    let c = (hdr_ad * mid_a - hdr_a * mid_ad * mid_grey_out) / denominator;
     (b, c)
 }
 
 /// A [`GRAIN_TILE_SIZE`] square grain tile, generated rather than shipped.
 ///
-/// The pattern is value noise - what matters is that neighbouring texels differ,
-/// not that it is random - so this makes one at install time and the shader gets
-/// that input without a binary in the repository.
+/// Each texel gets a level from an integer hash. Neighbouring texels only have
+/// to differ, not be truly random, so this builds the tile at install time and
+/// the crate needs no binary for it.
 fn grain_texture() -> Texture {
     const SIZE: u32 = GRAIN_TILE_SIZE;
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
@@ -339,14 +359,18 @@ fn grain_texture() -> Texture {
             hash ^= hash >> 15;
             hash = hash.wrapping_mul(0x2545_F491);
             hash ^= hash >> 13;
-            let value = (hash & 0xFF) as u8;
-            rgba.extend_from_slice(&[value, value, value, 255]);
+            let noise_level = (hash & 0xFF) as u8;
+            rgba.extend_from_slice(&[noise_level, noise_level, noise_level, 255]);
         }
     }
 
     Texture::from_rgba(GRAIN_TEXTURE_NAME, TextureType::Color, rgba, SIZE, SIZE)
         .expect("the tile is SIZE x SIZE RGBA")
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -366,8 +390,9 @@ mod tests {
             b > 0.0 && c > 0.0,
             "the curve needs both constants positive"
         );
-        // The reference's own values for these art parameters, to three places:
-        // a change here means the solve moved, not that rounding did.
+        // The reference values for these art parameters, given to three decimal
+        // places. A change here means the solved curve moved; a rounding
+        // difference stays inside the 0.002 tolerance.
         assert!((b - 1.073).abs() < 0.002, "b came out {b}");
         assert!((c - 0.168).abs() < 0.002, "c came out {c}");
     }

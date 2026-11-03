@@ -1,46 +1,49 @@
-//! The shell module's own editor panel.
+//! The shell module's own editor panel: the example a module's panel is
+//! written against, and the body the panel budget is tested with.
 //!
 //! # Responsibilities
 //!
-//! - [`demo_panel`]: the reference a module's panel is written against - it
-//!   reads only [`PanelContext`] and draws with egui, so nothing of this
-//!   crate's state outlives the frame that drew it.
-//! - The deliberate overshoot behind `PILL_TEST_PANEL_SLOW`: a body that
-//!   costs more than [`PANEL_BUDGET_MICROS`], which is how the egui suite
-//!   proves the tab's badge and the budget toast.
+//! - [`demo_panel`]: draws the docked tab and, when the shell asks for it, the
+//!   confirmation window. It reads only [`PanelContext`] and draws with egui,
+//!   so it keeps nothing of this crate past the frame that drew it.
+//! - The slow body: when `PILL_TEST_PANEL_SLOW` is set, the panel spends
+//!   several times [`PANEL_BUDGET_MICROS`] spinning on purpose. The egui suite
+//!   uses that to check the tab's badge and the budget toast.
 //!
 //! # Design
 //!
-//! The panel is registered by this crate's `register` through
-//! [`PanelRegistrations`], and the executable binds the request to a liveness
-//! marker that dies with this module's image. It holds no state of its own: a
-//! panel that kept a counter would need somewhere to keep it that survives a
-//! reload, and a world resource is the only such place - the egui context is
-//! never one (see the reload-safety contract in `pill_editor_core`).
+//! This crate's `register` queues the panel through [`PanelRegistrations`]. The
+//! executable then ties the request to a marker it owns, so the panel goes dead
+//! when this module's image unloads. The panel keeps no state of its own: a
+//! value that must survive a reload goes in a world resource, and never into
+//! egui's context (see the reload-safety contract in `pill_editor_core`).
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
-// Deliberately unused in this compilation: a patch crate replays this
-// file's opening, and the first sibling this body names resolves through it.
+// Nothing in this file uses this import, but it has to stay: a patch crate
+// copies this file's top-level `use` lines, and a sibling function the body
+// names resolves through them.
 #[allow(unused_imports)]
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The environment variable that makes the panel deliberately slow.
+/// The environment variable that switches the panel to its deliberately slow
+/// body.
 pub const PANEL_SLOW_ENV: &str = "PILL_TEST_PANEL_SLOW";
 
-/// How many times the panel budget the slow posture burns.
+/// The multiple of [`PANEL_BUDGET_MICROS`] the slow body spends spinning.
 const SLOW_MULTIPLE: f32 = 3.0;
 
 /// The demo panel's confirmation window id.
 pub const DEMO_CONFIRM_WINDOW: &str = "demo.confirm";
 
-/// The module's demo panel.
+/// The demo panel: the docked tab and the confirmation window it opens.
 ///
-/// Public because the function inventory names it by path, and a private `fn`
-/// would fail the build of the generated wrapper crate.
+/// Public because the function inventory names it by path, and that inventory
+/// is included at this crate's root, which cannot name a private function.
 pub fn demo_panel(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
-    // The confirmation's own body: the shell draws its buttons and reads Enter
-    // and Escape, the answer comes back on the pass after.
+    // The confirmation window draws this body. The shell draws the window's
+    // buttons and reads Enter and Escape, and the answer reaches the panel on
+    // the next draw.
     if context.window == Some(DEMO_CONFIRM_WINDOW) {
         ui.label("Confirm the demo action?");
         ui.monospace("Enter applies it, Escape dismisses.");
@@ -82,7 +85,7 @@ pub fn demo_panel(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
     }
 }
 
-/// The confirmation the demo panel asks for: a modal window.
+/// Returns the confirmation window the demo panel asks for: a modal window.
 pub fn demo_confirm_window() -> PanelWindowRequest {
     PanelWindowRequest {
         id: DEMO_CONFIRM_WINDOW.to_string(),
@@ -93,18 +96,20 @@ pub fn demo_confirm_window() -> PanelWindowRequest {
     }
 }
 
-/// Whether `PILL_TEST_PANEL_SLOW` asks for the over-budget body.
+/// Returns whether `PILL_TEST_PANEL_SLOW` asks for the over-budget body. Any
+/// value other than an empty string or `0` counts as on.
 ///
-/// Public because the function inventory names every function by path.
+/// Public because the function inventory names it by path.
 pub fn slow_requested() -> bool {
     std::env::var(PANEL_SLOW_ENV)
         .map(|value| !value.is_empty() && value != "0")
         .unwrap_or(false)
 }
 
-/// Spend `micros` of wall clock doing nothing: the budget's worst case.
+/// Spins on the wall clock for `micros` microseconds without doing any work,
+/// which is how the slow body spends more than its frame budget.
 ///
-/// Public because the function inventory names every function by path.
+/// Public because the function inventory names it by path.
 pub fn burn_micros(micros: f32) {
     let started = pill_core::platform::Instant::now();
     let budget = std::time::Duration::from_micros(micros as u64);

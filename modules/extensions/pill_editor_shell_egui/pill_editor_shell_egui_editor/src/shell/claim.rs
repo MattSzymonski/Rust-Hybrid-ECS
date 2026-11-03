@@ -3,91 +3,108 @@
 //! # Responsibilities
 //!
 //! - [`claim_shell_context`]: the per-generation wrapper `run_frame` calls
-//!   before its pass, which buys the once-per-generation rule here and the
-//!   clearing itself from the session that owns the contexts.
-//! - [`claim_context_once`]: the rule on its own, for a caller holding one
-//!   context.
+//!   before its pass. It applies the once-per-generation rule kept in this
+//!   file, and gets the actual clearing from the session that owns the
+//!   contexts.
+//! - [`claim_context_once`]: the same rule for a single context, with the
+//!   flag passed in instead of read from this file's static.
 //!
 //! # Design
 //!
-//! The egui `Context` belongs to the frontend, which never unloads, so it
-//! survives a shell reload. egui's `Memory::data` map can still hold values
-//! the previous generation created - a drag payload, a tooltip's state, a
-//! dock's scratch entry - and a value whose type that generation defined
-//! carries its drop code and vtable in the image the reload unmapped, so
-//! touching it after the reload is a use-after-unmap.
+//! The egui `Context` lives in the session, a world resource whose type the
+//! shared model crate defines, and the frontend that keeps the world never
+//! unloads. So the context survives a shell reload. egui's `Memory::data` map
+//! can still hold values the previous generation created: a scroll position,
+//! a text editor's cursor, the dock's own saved state. Such a value also
+//! carries drop code and a vtable from the generation that created it. After
+//! a reload those point into an image that is no longer loaded, so touching
+//! the value is a use-after-unmap.
 //!
 //! The first frame of every generation therefore clears every context the
 //! session owns, main and popped-out alike
-//! ([`EguiShellState::claim_generation`](pill_editor_core::session::EguiShellState::claim_generation)):
-//! widget-local state (focus, scroll offsets, text-edit state) is not worth a
-//! dangling pointer. Long-lived UI state lives in the session itself, a world
-//! resource the shared model crate defines, which is what makes it safe across
-//! generations.
+//! ([`EguiShellState::claim_generation`](pill_editor_core::session::EguiShellState::claim_generation)).
+//! Widget-local state that egui keeps in that map goes with it. That loss is
+//! acceptable, because keeping such state is not worth the risk of reading a
+//! pointer into an unloaded image. Long-lived UI state lives in the session
+//! itself, a world resource the shared model crate defines, which is what
+//! makes it safe across generations.
 //!
 //! The "already claimed" flag is a `static` of this crate, and a static lives
-//! in the module's own image: every generation starts unclaimed, and later
-//! frames of the same generation are no-ops. That is also why the flag cannot
-//! move to the model with the clearing: the model outlives the generation
-//! whose claim it would be.
+//! in the module's own image. Every generation therefore starts unclaimed,
+//! and later frames of the same generation do nothing. That is also why the
+//! flag cannot move to the model with the clearing: the model outlives the
+//! generation whose claim it would be.
 
 // Standard library
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
-// Deliberately unused in this compilation: a patch crate replays this
-// file's opening, and the first sibling this body names resolves through it.
+// Deliberately unused in this build. A patch crate replays this file's
+// opening `use` lines, so a patched body that calls a sibling in the shell
+// module finds it through this glob.
 #[allow(unused_imports)]
 use pill_editor_shell_egui_editor::shell::*;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// Whether this shell generation has cleared egui's temporary data yet.
 ///
-/// Per image by construction: a reloaded shell starts from `false`, which is
-/// what makes the claim run exactly once per generation.
+/// The flag lives in the module's own image, so a reloaded shell always
+/// starts from `false`. That is what makes the claim run exactly once per
+/// generation.
 static CONTEXT_CLAIMED: AtomicBool = AtomicBool::new(false);
 
-/// Claim every egui context the session owns for this shell generation.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Claims every egui context the session owns for this shell generation.
 ///
-/// `run_frame` calls it before the egui pass, so no stale value survives into
-/// the new generation's first draw. Answers what was cleared on the
-/// generation's first frame and `None` on every later one.
+/// `run_frame` calls it before the egui pass, so no value the previous
+/// generation left behind is still there when the new generation first
+/// draws. Returns what was cleared on that first frame, and `None` on every
+/// later frame of the generation.
 pub fn claim_shell_context(
     session: &mut pill_editor_core::session::EguiShellState,
 ) -> Option<pill_editor_core::session::ContextClaim> {
     if CONTEXT_CLAIMED.swap(true, Ordering::AcqRel) {
         return None;
     }
-    let claim = session.claim_generation();
+    let context_claim = session.claim_generation();
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
-        entries = claim.main_entries,
+        entries = context_claim.main_entries,
         windows = session.popout_contexts.len(),
-        cleared = claim.popout_windows,
+        cleared = context_claim.popout_windows,
         "[editor] shell context claimed"
     );
-    Some(claim)
+    Some(context_claim)
 }
 
-/// The once-per-generation rule, with its flag passed in.
+/// Applies the once-per-generation rule to one context.
 ///
-/// The flag is a parameter so a test can run the rule against its own: two
-/// tests sharing one process-wide static would make each other's expectations
-/// depend on the test order.
+/// The flag is a parameter so a test can pass its own. Two tests sharing one
+/// process-wide static would make each other's expectations depend on the
+/// order they run in. Returns `true` when this call did the clearing and
+/// `false` when the flag was already set.
 pub fn claim_context_once(claimed: &AtomicBool, context: &egui::Context) -> bool {
     if claimed.swap(true, Ordering::AcqRel) {
         return false;
     }
-    // Everything happens through the memory handle: the map is egui's, and
-    // counting and clearing it in one borrow keeps the two readings honest.
-    let entries = context.memory_mut(|memory| {
-        let entries = memory.data.len();
+    // Read the count and clear the map in one borrow of egui's memory, so
+    // the count is exactly what was cleared and nothing can be added in
+    // between.
+    let entry_count = context.memory_mut(|memory| {
+        let entry_count_before_clear = memory.data.len();
         memory.data.clear();
-        entries
+        entry_count_before_clear
     });
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
-        entries,
+        entries = entry_count,
         "[editor] shell context claimed"
     );
     true
@@ -101,11 +118,11 @@ pub fn claim_context_once(claimed: &AtomicBool, context: &egui::Context) -> bool
 mod tests {
     use super::*;
 
-    /// A value a previous generation could have left in the map: defined
-    /// here, so its drop code belongs to this test's image.
+    /// A value a previous generation could have left in the map. It is
+    /// defined here so its drop code belongs to this test's image.
     #[derive(Clone)]
     struct StaleRow {
-        /// The label the row carried.
+        /// The text the row carries.
         label: String,
     }
 
@@ -115,7 +132,7 @@ mod tests {
     fn a_previous_generations_value_is_cleared_on_the_first_claim() {
         let context = egui::Context::default();
         let id = egui::Id::new("stale-row");
-        // The plant: what a previous generation could have left behind.
+        // Store a value the way a previous generation would have.
         context.memory_mut(|memory| {
             // egui-state-ok: the previous generation's value
             memory.data.insert_temp(
@@ -137,7 +154,7 @@ mod tests {
             "the previous generation's value is gone"
         );
 
-        // The new generation stores its own value; the next frame's claim
+        // The new generation stores its own value. The next frame's claim
         // must not throw it away.
         context.memory_mut(|memory| {
             // egui-state-ok: the value the run must keep
@@ -152,24 +169,27 @@ mod tests {
             !claim_context_once(&claimed, &context),
             "a later frame of the same generation does not claim again"
         );
-        let kept = context
-            // egui-state-ok: reading back the value the claim kept.
+        let kept_row = context
+            // egui-state-ok: the value the claim kept
             .memory_mut(|memory| memory.data.get_temp::<StaleRow>(id))
             .expect("the generation's own value survives");
-        assert_eq!(kept.label, "from the new image");
+        assert_eq!(kept_row.label, "from the new image");
     }
 
     /// A fresh context holds nothing to clear, and the claim still marks the
     /// generation.
     #[test]
-    fn the_claim_reports_how_many_values_it_cleared() {
+    fn claiming_an_empty_context_still_marks_the_generation() {
         let context = egui::Context::default();
         let claimed = AtomicBool::new(false);
-        // An empty map still counts as a claim (the generation is marked),
-        // and the entry count reported is zero.
-        let before = context.memory(|memory| memory.data.len());
+        // An empty map is still claimed, so the generation gets marked, and
+        // the map holds nothing before the claim and nothing after it.
+        let entry_count_before_claim = context.memory(|memory| memory.data.len());
         assert!(claim_context_once(&claimed, &context));
-        assert_eq!(before, 0, "a fresh context holds no temporary data");
+        assert_eq!(
+            entry_count_before_claim, 0,
+            "a fresh context holds no temporary data"
+        );
         assert!(context.memory(|memory| memory.data.is_empty()));
     }
 }

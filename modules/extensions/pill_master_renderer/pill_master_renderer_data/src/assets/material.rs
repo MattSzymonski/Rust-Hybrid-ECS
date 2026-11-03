@@ -5,8 +5,8 @@
 //! - Carry what one drawn surface needs: the shader it draws with and the
 //!   values that shader reads, both as uniform parameters and as bound
 //!   textures.
-//! - Keep materials data. A material names its shader by handle and its values
-//!   by the slot names the shader declares, so a game describes an appearance
+//! - Be plain data. A material names its shader by handle and its values by
+//!   the slot names the shader declares, so a game describes an appearance
 //!   without reaching into the renderer.
 //! - Load a material from a `.material` file in `res`
 //!   ([`StandaloneAsset`] with [`MaterialDocument`]), which names its shader
@@ -14,11 +14,11 @@
 //!
 //! # Design
 //!
-//! The fields mirror [`RenderPass`](crate::RenderPass) on purpose: a shader
-//! handle, a parameter map and a texture map, keyed by the slot names the
-//! shader declares and packed by the same rules. The renderer therefore drives
-//! a material and a pass through one code path, and a material's
-//! `rendering_order` decides where it sorts within the pass that draws it.
+//! The fields copy [`RenderPass`](crate::RenderPass) by design: a shader
+//! handle, a map of parameter values and a map of textures. Both maps are keyed
+//! by the slot names the shader declares and packed by the same rules, so the
+//! renderer drives a material and a pass through one code path. A material's
+//! `rendering_order` decides where it sorts inside the pass that draws it.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -28,7 +28,7 @@ use pill_engine::{
     pill_mirror_impl, pill_mirror_method, pill_mirror_object, AssetLoadResult, AssetManager,
     AssetReference, Handle, StandaloneAsset,
 };
-// Part of the frame contract (a resolved pass carries parameters too).
+// The parameter vocabulary is part of the frame contract, shared with passes.
 use pill_renderer_api::frame::MaterialParameter;
 use serde::{Deserialize, Serialize};
 
@@ -36,44 +36,52 @@ use serde::{Deserialize, Serialize};
 use super::{Shader, Texture};
 use crate::config::pbr_pipeline;
 
+// =============================================================================
+// MaterialTexture
+// =============================================================================
+
 /// A texture handle bound to one of a material's slots.
 ///
-/// Wraps the handle rather than a GPU texture: the renderer resolves it when
-/// the material is built, so the same asset can back any number of slots
-/// without being copied.
+/// It holds the asset handle, not a GPU texture. The renderer looks the handle
+/// up when it builds the material, so one texture asset can fill any number of
+/// slots without being copied.
 #[derive(Clone, Debug)]
 pub struct MaterialTexture {
-    /// Texture asset this binding resolves through.
+    /// The texture asset this binding points at.
     pub texture: Handle<Texture>,
 }
 
-/// A surface appearance: the shader a draw runs and the values that shader
+// =============================================================================
+// Material
+// =============================================================================
+
+/// How a surface looks: the shader a draw runs and the values that shader
 /// reads.
 ///
-/// A material is an asset, so the renderer rebuilds its bind groups when the
-/// asset's version moves rather than expecting a game to mutate renderer state
-/// mid frame. [`MaterialBuilder`] is the supported way to make one.
+/// A material is an asset, so the renderer rebuilds its bind groups whenever the
+/// asset's content version changes. A game never has to edit renderer state in
+/// the middle of a frame. [`MaterialBuilder`] is the supported way to make one.
 ///
-/// Its maps are `BTreeMap`s, never `HashMap`s. An empty `HashMap` does not
-/// allocate: it points at a static inside the binary that created it. This
-/// value lives in the world and outlives that binary - a project or module
-/// that built it is reloaded and its retired image eventually unmapped - and
-/// reading such a map afterwards faults. A `BTreeMap` holds no such pointer.
+/// Its maps are `BTreeMap`s, never `HashMap`s. An empty `HashMap` allocates
+/// nothing: it points at a static inside the binary that created it. A material
+/// lives in the world and outlives that binary - a project or module that made
+/// it reloads and its old image is eventually unloaded - so reading such a map
+/// afterwards would fault. A `BTreeMap` keeps no such pointer.
 #[derive(Clone, Debug)]
 #[pill_mirror_object(asset, standalone, shared = "pill_master_renderer::assets::Material")]
 pub struct Material {
-    /// Label used in logs, profiling and error messages.
+    /// Label used in logs and error messages.
     pub name: String,
     /// Shader the material draws with. [`Handle::INVALID`] selects the
     /// renderer's built-in shader, as does a handle that names no loaded
     /// shader.
     pub shader: Handle<Shader>,
-    /// Textures bound to the slots the shader declares, by slot name.
+    /// Textures bound to the shader's slots, by slot name.
     ///
-    /// A map, like [`RenderPass::textures`](crate::RenderPass), so a slot named
-    /// twice has one entry rather than a vector the binder reads only its first
-    /// match out of. A declared slot the material leaves unbound falls back to
-    /// the renderer's default texture for that slot's type.
+    /// It is a map, like [`RenderPass::textures`](crate::RenderPass): a slot
+    /// named twice has one entry, where a list would leave the binder to take
+    /// its first match. A slot the shader declares and the material leaves
+    /// unbound gets the renderer's default texture for that slot's type.
     pub textures: BTreeMap<String, MaterialTexture>,
     /// Uniform parameters, packed one 16-byte slot each, in the order the
     /// shader declares them. A declared slot the material leaves unset packs
@@ -81,19 +89,23 @@ pub struct Material {
     pub parameters: BTreeMap<String, MaterialParameter>,
     /// Sort key for materials inside the pass that draws them.
     ///
-    /// The queue's composed key stores this byte inverted and sorts the key
-    /// ascending, so a *larger* value is drawn earlier: the default `u8::MAX`
-    /// draws before any material given an explicit order. Note the split with
-    /// passes, where it is the opposite - a lower [`RenderPass::order`] runs
-    /// first.
+    /// The render queue stores this byte inverted in its sort key and sorts the
+    /// key ascending, so a larger value is drawn earlier. The default `u8::MAX`
+    /// therefore draws before any material given an explicit order. Passes are
+    /// the reverse: a lower `order` in
+    /// [`RenderPass::settings`](crate::RenderPass) runs first.
     pub rendering_order: u8,
 }
 
+// =============================================================================
+// MaterialBuilder
+// =============================================================================
+
 /// Builds a [`Material`] one field at a time.
 ///
-/// A fresh builder starts on the renderer's built-in shader with no textures,
-/// no parameters, and the highest rendering order, so a material only mentions
-/// the fields the game wants to differ from those defaults.
+/// A fresh builder holds the renderer's built-in shader, no textures, no
+/// parameters and the highest rendering order. A call therefore only has to
+/// name the fields that should differ from those defaults.
 #[pill_mirror_object]
 pub struct MaterialBuilder {
     material: Material,
@@ -103,8 +115,8 @@ pub struct MaterialBuilder {
 impl Material {
     /// Start building a material under the given name.
     ///
-    /// The name labels the material in logs, profiling and error messages,
-    /// which is why it is the one field the builder asks for up front.
+    /// The name labels the material in logs and error messages, which is why
+    /// the builder asks for it up front.
     #[pill_mirror_method]
     pub fn builder(name: impl Into<String>) -> MaterialBuilder {
         MaterialBuilder {
@@ -131,8 +143,8 @@ impl MaterialBuilder {
 
     /// Bind a texture to one of the shader's declared slots.
     ///
-    /// Binding a slot twice replaces the earlier binding: the map keeps one
-    /// texture per slot, and the last call is the one that was meant.
+    /// Binding the same slot twice replaces the earlier binding: the map holds
+    /// one texture per slot, so the last call wins.
     #[pill_mirror_method]
     pub fn texture(mut self, slot: impl Into<String>, texture: &Handle<Texture>) -> Self {
         self.material
@@ -184,27 +196,31 @@ impl MaterialBuilder {
     }
 }
 
+// =============================================================================
+// MaterialDocument
+// =============================================================================
+
 /// A material as written in its `.material` file.
 ///
-/// The asset itself, under the standard asset header (format version, asset
-/// type, guid). Its shader and textures are guids ([`AssetReference`]), resolved
-/// to handles when the file loads: a handle means nothing in the next run, a
-/// guid does. A reference that names no loaded asset resolves to
-/// [`Handle::INVALID`], which draws with the renderer's built-in shader or the
-/// slot's default texture.
+/// It is the asset itself, stored under the standard asset header (format
+/// version, asset type, guid). Its shader and textures are guids
+/// ([`AssetReference`]), resolved to handles when the file loads: a handle means
+/// nothing in the next run, a guid does. A reference that names no loaded asset
+/// resolves to [`Handle::INVALID`], which draws with the renderer's built-in
+/// shader or the slot's default texture.
 ///
-/// The default document is what a newly created file holds, and it draws as it
-/// is: the PBR chain's shader (by its fixed guid,
+/// A newly created file holds the default document, and it draws as it is: the
+/// PBR chain's shader (by its fixed guid,
 /// [`pbr_pipeline::SHADER_GUID`](crate::config::pbr_pipeline::SHADER_GUID)) at
-/// its neutral parameters, with no maps bound. It names the chain's shader
-/// because that pass draws only the instances using its own shader, so a
-/// material left on the built-in one would load and never be drawn. Maps are
-/// `BTreeMap`s for the reason [`Material`] gives.
+/// the chain's neutral parameters, with no maps bound. Naming that shader
+/// matters, because the chain's geometry pass draws only the instances using
+/// its own shader; a material left on the built-in one would load and never be
+/// drawn. Maps are `BTreeMap`s for the reason [`Material`] gives.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MaterialDocument {
-    /// The shader the material draws with; unset for the renderer's built-in
-    /// one, which only a pass with no shader of its own draws.
+    /// The shader the material draws with. Unset means the renderer's
+    /// built-in shader.
     pub shader: AssetReference<Shader>,
     /// Textures bound to the shader's slots, by slot name.
     pub textures: BTreeMap<String, AssetReference<Texture>>,
@@ -238,9 +254,9 @@ impl StandaloneAsset for Material {
         let textures = document
             .textures
             .into_iter()
-            .map(|(slot, texture)| {
-                let texture = texture.resolve(assets);
-                (slot, MaterialTexture { texture })
+            .map(|(slot_name, texture_reference)| {
+                let texture = texture_reference.resolve(assets);
+                (slot_name, MaterialTexture { texture })
             })
             .collect();
         Ok(Self {
@@ -253,13 +269,17 @@ impl StandaloneAsset for Material {
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A new `.material` file's document draws in the default frame: it
-    /// names the PBR chain's shader, which resolves once the chain is
-    /// installed, at the chain's neutral parameters, with nothing bound.
+    /// A newly created `.material` file draws as it is: it names the PBR
+    /// chain's shader, which resolves once the chain is installed, and starts
+    /// at the chain's neutral parameters with nothing bound.
     #[test]
     fn the_default_document_is_the_pbr_chains_neutral_material() {
         let mut assets = AssetManager::new();
@@ -278,10 +298,10 @@ mod tests {
         assert_eq!(material.parameters, pbr_pipeline::neutral_parameters());
         assert_eq!(material.rendering_order, u8::MAX);
         // The chain's own default material starts from the same values.
-        let chain_default = assets
+        let chain_default_material = assets
             .get_by_name::<Material>(pbr_pipeline::DEFAULT_MATERIAL_PATH)
             .unwrap();
-        assert_eq!(chain_default.parameters, material.parameters);
+        assert_eq!(chain_default_material.parameters, material.parameters);
         assert_eq!(
             serde_json::to_value(MaterialDocument::default()).unwrap()["shader"],
             serde_json::json!({ "guid": pbr_pipeline::SHADER_GUID.to_string() }),

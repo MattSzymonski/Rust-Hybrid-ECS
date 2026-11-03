@@ -1,41 +1,43 @@
-//! The simple frame: one lit geometry pass onto the surface.
+//! The simple frame: one lit geometry pass drawn onto the surface.
 //!
 //! # Responsibilities
 //!
-//! - Install the smallest chain that draws something - one geometry pass,
-//!   through a shader built from the renderer's own lit WGSL, writing the
-//!   swapchain - and hand back the pipeline asset ([`install`]).
+//! - Install the smallest chain that draws something: one geometry pass that
+//!   draws through the renderer's own lit shader into the surface, and hand
+//!   back the pipeline asset ([`install`]).
 //!
 //! # Design
 //!
-//! The pass names a shader, so it draws every instance whose material was built
-//! from that shader, and the shader it installs is the same lit one the renderer
-//! falls back to with the same declared slots: a material written for the
-//! fallback works here without being rebuilt.
+//! The pass names a shader, so it draws every instance whose material uses that
+//! shader. It writes only the surface, so it also draws the instances no pass
+//! in the chain claimed, each through its own material. The shader it installs
+//! is the same lit one the renderer falls back to, with the same declared
+//! slots, so a material written for the fallback works here without being
+//! rebuilt.
 //!
-//! The renderer's built-in chain is a geometry pass that names *no* shader, and
-//! draws every instance through its own material. This is what to install when a
-//! project wants that frame named, stored and swappable instead of implicit.
+//! The renderer's built-in chain is a geometry pass that names no shader and
+//! draws every instance through its own material. Install this pipeline when a
+//! project wants that frame stored as an asset it can swap out.
 //!
 //! # Where the shaders are
 //!
-//! The lit fragment stage is in `shader_sources/simple_pipeline/shaders/`, and
-//! is imported from there like a project's own shader: its slots and its guid
-//! live in the `.hlsl.meta` beside it. The vertex stage it pairs with lives in
-//! `shader_sources/common_shaders/`, because it is not this pipeline's alone: the
-//! renderer's fallback material is built from the same pair - a material written
-//! for the fallback draws here without being rebuilt - and the PBR geometry pass
-//! reuses the vertex stage, since every lit pass in the crate starts from the
-//! same instance layout. Three readers, one copy of the vertex stage.
+//! The lit fragment stage is in `shader_sources/simple_pipeline/shaders/`. It
+//! is imported from its `.hlsl` source the way a project's own shader is, and
+//! its slots and guid live in the `.hlsl.meta` beside that source.
 //!
-//! The build script cooks the whole `shader_sources/` tree in one call: every
+//! The vertex stage it pairs with lives in `shader_sources/common_shaders/`,
+//! because it is shared: the renderer's fallback material, the PBR geometry
+//! pass and this pipeline all build on it. Every lit pass in the crate starts
+//! from the same instance layout, so the crate keeps one copy of the stage.
+//!
+//! The build script cooks the whole `shader_sources/` tree in one call. Every
 //! directory that directly holds `.hlsl` files is a source directory, and every
-//! `include/` in the tree is on every source's include path.
+//! `include/` directory in the tree is on every source's include path.
 //!
-//! The one text this crate embeds is the fallback pair itself
-//! ([`DEFAULT_VERTEX`] and [`DEFAULT_LIT_FRAGMENT`]): the GPU module builds its
-//! stand-in shader from it before any store exists, so it cannot be read from
-//! one.
+//! Every stage declared with `config_shader_file!` embeds its file's text, but
+//! only the fallback pair ([`DEFAULT_VERTEX`] and [`DEFAULT_LIT_FRAGMENT`]) is
+//! read back out of its constant: the GPU module builds its stand-in shader
+//! from it before any store exists, so the store cannot supply it.
 
 // External crates
 use pill_engine::{AssetManager, Handle};
@@ -46,13 +48,18 @@ use crate::{
     config::{ShaderSourceRecord, DEFAULT_VERTEX},
 };
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 config_shader_file!(
-    /// The pass's fragment stage, cooked from `default_lit_fragment.hlsl`; also
-    /// the renderer's built-in fallback shader.
+    /// The pass's fragment stage, cooked from `default_lit_fragment.hlsl`. It
+    /// is also the fragment stage of the renderer's built-in fallback shader.
     pub DEFAULT_LIT_FRAGMENT, "simple_pipeline/shaders/default_lit_fragment.wgsl"
 );
 
-/// The shader assets [`install`] creates, and the files each is built from.
+/// The shader assets [`install`] creates, and the cooked files each is built
+/// from.
 pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[ShaderSourceRecord {
     shader_asset_name: SHADER_PATH,
     vertex_path: DEFAULT_VERTEX.relative_path,
@@ -62,39 +69,56 @@ pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[ShaderSourceRecord {
 /// Asset name the installed pipeline is stored under.
 pub const PIPELINE_NAME: &str = "pill.simple.pipeline";
 
-/// The shader the pass draws through: the path its `.hlsl` source is imported
-/// under, because an imported asset is named by the path it came from.
+/// The path the pass's shader source is imported under. An imported asset is
+/// named by the path it came from, so this is also the shader's asset name.
 pub const SHADER_PATH: &str = "simple_pipeline/shaders/default_lit_fragment.hlsl";
 
 /// The guid the shader is stored under.
 ///
-/// Derived from a name rather than drawn at random, so every checkout and every
-/// run gives it the same one; the `.hlsl.meta` beside the source carries this
-/// value and [`install`] asserts the two agree.
+/// It is derived from a fixed name instead of drawn at random, so every
+/// checkout and every run gives the same value. The `.hlsl.meta` beside the
+/// source carries that value.
 pub const SHADER_GUID: pill_engine::AssetGuid =
     pill_engine::AssetGuid::from_name("pill.simple.shader");
 
 /// Asset name of the pass the pipeline holds.
 pub const PASS_NAME: &str = "pill.simple.pass";
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Install the simple frame, and return the pipeline asset.
 ///
 /// Idempotent: a store that already holds the pipeline gets that handle back
-/// rather than a second copy, so this is safe to call once per generation.
+/// rather than a second copy, so calling it again on a later reload generation
+/// is safe.
 ///
 /// # Errors
 ///
-/// Returns an error when a name this owns is already taken by an asset of a
-/// different type, or when the shader's stages fail to build.
+/// Returns the store's import error when the shader's source, its `.hlsl.meta`
+/// or the cooked `.wgsl` stages they name will not load. Returns
+/// [`pill_engine::AssetBindingError::NameInUse`] when a name it stores under
+/// already belongs to a live asset of that type.
+///
+/// # Panics
+///
+/// Panics when the shader's `.hlsl.meta` is missing or names a guid other than
+/// [`SHADER_GUID`].
 pub fn install(
     assets: &mut AssetManager,
 ) -> Result<Handle<RenderingPipeline>, Box<dyn std::error::Error>> {
+    // Step 1: Hand back the pipeline when the store already holds it, so calling
+    // this again adds no second copy.
     if let Some(pipeline) = assets.handle_by_name::<RenderingPipeline>(PIPELINE_NAME) {
         return Ok(pipeline);
     }
 
+    // Step 2: Import the shader from its source and its meta. The import also
+    // checks that the meta carries the guid this module declares.
     let shader = crate::config::import_shader(assets, SHADER_PATH, SHADER_GUID)?;
 
+    // Step 3: Build the pass and the pipeline, and store both under their names.
     let pass = RenderPass::new(PASS_NAME)
         .with_shader(shader)
         .with_kind(PassKind::Geometry)

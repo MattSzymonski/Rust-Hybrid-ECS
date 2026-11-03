@@ -1,16 +1,18 @@
-//! The names every shell module shares, re-exported once.
+//! The names every shell module shares, re-exported in one place.
 //!
 //! # Responsibilities
 //!
-//! - Re-export the engine, UI and editor-core types the shell's modules name,
-//!   so each of them opens with two globs instead of a long import list.
+//! - Re-export the engine, editor-core, UI and JSON types the shell's modules
+//!   name, so each module opens with two globs instead of a long import list.
 //!
 //! # Design
 //!
-//! A split module writes `use pill_editor_shell_egui_editor::shell::prelude::*;`
-//! and `use pill_editor_shell_egui_editor::shell::*;`, both by absolute path:
-//! a generated patch crate replays the edited file's top-level `use` lines,
-//! and a `super::`-relative glob would not resolve inside that crate.
+//! A shell module writes
+//! `use pill_editor_shell_egui_editor::shell::prelude::*;` and
+//! `use pill_editor_shell_egui_editor::shell::*;`. Both spell the whole path
+//! from the crate root. A generated patch copies the edited file's top-level
+//! `use` lines into a small crate of its own, where a `super::`-relative
+//! glob would have nothing to point at.
 
 // External crates
 pub use pill_editor_core::assets::{self, AssetDialog};

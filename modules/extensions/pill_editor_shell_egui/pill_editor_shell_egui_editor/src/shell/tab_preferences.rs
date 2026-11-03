@@ -1,24 +1,32 @@
-//! The Preferences tab: the editor-wide rows and the project's gizmo state.
+//! The Preferences tab: the editor-wide preference rows and the project's
+//! gizmo rows.
 //!
 //! # Responsibilities
 //!
-//! - `preferences_tab`: the editor-wide rows (seeded into the session's draft
-//!   buffers, saved as one batch or thrown away by a cancel) and the project's
-//!   gizmo rows.
+//! - `preferences_tab`: draws the editor-wide rows, then the project's name,
+//!   its remembered and active gizmo settings, and the buttons that change the
+//!   gizmo. The rows' text is kept in the session's draft: Save sends it as one
+//!   batch, and a cancel drops it.
 //!
-//! The globs below are absolute paths: a generated patch crate replays this
-//! file's top-level `use` lines, so a `super::`-relative glob would not
-//! resolve there.
+//! # Design
+//!
+//! The globs below are absolute paths. A generated patch crate copies this
+//! file's top-level `use` lines into a crate of its own, where a `super::`
+//! path would have nothing to point at.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The Preferences tab: the editor-wide rows seeded from the preferences file
-/// and saved as one read-modify-write batch - or thrown away by a cancel,
-/// which re-seeds them from the file - then the project's remembered gizmo
-/// choices: the same `SetGizmoTool` commands the shortcuts, the menus and the
-/// scripted channel queue.
+/// Draws the Preferences tab: the editor-wide rows, then the project's name,
+/// its remembered and active gizmo settings and the buttons that change the
+/// gizmo.
+///
+/// The rows start from the text in the preferences file. Save queues one
+/// read-modify-write batch holding every row, and Cancel drops the edits, so
+/// the next frame starts from the file again. The gizmo buttons queue the same
+/// `SetGizmoTool` commands the shortcuts, the menus and the scripted channel
+/// queue.
 #[pill_hot_fn]
 pub fn preferences_tab(
     ui: &mut egui::Ui,
@@ -27,10 +35,11 @@ pub fn preferences_tab(
     pending: &mut PendingEditorCommands,
 ) {
     egui::ScrollArea::vertical().show(ui, |ui| {
+        // Step 1: The editor-wide rows, drawn from the draft.
         let view = &snapshot.preferences;
-        // The buffers seed from the file once and stay until a save;
-        // `None` means "re-seed from the file" and covers the first frame
-        // and the frame after a save.
+        // `None` means the draft is re-read from the file. The first frame sets
+        // it; a save or a cancel drops it, so the next frame starts from the
+        // file again.
         let buffers = draft.get_or_insert_with(|| view.seed_buffers());
         ui.heading("Editor");
         ui.label(
@@ -39,11 +48,11 @@ pub fn preferences_tab(
         );
         for field in preferences::PREFERENCE_FIELDS {
             let buffer = buffers.entry(field.key.to_string()).or_default();
-            // The previews switch is a real checkbox - a boolean row whose
-            // state the person can see - written back as the text the
-            // document's parser reads. It applies the moment it is ticked: the
-            // tiles on screen start rendering without a Save, while every other
-            // row still waits for one.
+            // The previews row is a checkbox, not a text box, so its state is
+            // visible. Ticking it writes "true" or "false" back as the text the
+            // preferences parser reads, and queues the change at once: the
+            // asset tiles start rendering without a Save, while every other row
+            // still waits for one.
             if field.key == pill_editor_core::previews::RENDER_PREVIEWS_KEY {
                 let mut enabled = buffer.trim().eq_ignore_ascii_case("true");
                 let mut changed = false;
@@ -67,6 +76,7 @@ pub fn preferences_tab(
                 ui.add(egui::TextEdit::singleline(buffer).desired_width(ui.available_width()));
             });
         }
+        // Step 2: The Save and Cancel buttons.
         let mut save = false;
         let mut cancel = false;
         ui.horizontal(|ui| {
@@ -84,8 +94,8 @@ pub fn preferences_tab(
                 })
                 .collect::<Vec<_>>();
             pending.push(vec![EditorCommand::SetPreferences { values }]);
-            // Re-seed from the file next frame, so the rows show what the
-            // save actually wrote.
+            // Drop the draft, so the next frame reads the file again and the
+            // rows show the values the save wrote rather than the edited text.
             *draft = None;
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,
@@ -93,14 +103,16 @@ pub fn preferences_tab(
             );
         }
         if cancel {
-            // A cancel throws the edits away: the rows re-seed from the file
-            // on the next frame, exactly as they do after a save.
+            // A cancel throws the edits away. The next frame reads the file
+            // again, just as it does after a save.
             *draft = None;
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,
                 "[editor] preferences cancel"
             );
         }
+        // Step 3: The project's name and remembered gizmo, the active gizmo,
+        // then the buttons that change it.
         ui.separator();
         ui.heading("Project");
         value_row_in(
@@ -168,8 +180,8 @@ pub fn preferences_tab(
                     pending.push(vec![item.command(&state)]);
                 }
             }
-            // The Preferences row is narrow, so the spaces use their short
-            // names here rather than the menu's.
+            // The row is narrow, so the spaces show their short names here
+            // instead of the long labels the viewport menu uses.
             for row in toolbox::SPACE_ROWS {
                 let button = icons::IconButton::new(row.icon, row.short)
                     .active(snapshot.gizmo.space == row.space);

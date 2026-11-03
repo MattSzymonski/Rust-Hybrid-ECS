@@ -1,5 +1,5 @@
-//! The master renderer's data: everything a game says to this renderer, with
-//! no graphics stack behind it.
+//! The master renderer's data: the assets, components and pipeline choice a
+//! game draws with, and no graphics stack behind any of it.
 //!
 //! # Responsibilities
 //!
@@ -15,22 +15,22 @@
 //!
 //! This crate never depends on wgpu or winit. It is one of the master
 //! renderer's two crates: this one holds the data, `pill_master_renderer` holds
-//! the GPU code and is the only artifact that links the graphics stack. That
-//! split lets a headless build store a game's cameras, meshes and lights
+//! the GPU code and is the only renderer crate that links the graphics stack.
+//! That split lets a headless build store a game's cameras, meshes and lights
 //! without linking a renderer, and lets the GPU module be reloaded without
 //! registering any data of its own.
 //!
-//! The contract every renderer shares - the backend trait, the frame, the pass
-//! vocabulary, the camera - lives in `pill_renderer_api`, which this crate
-//! builds on; the types a game needs from it are re-exported here.
+//! This crate builds on `pill_renderer_api`, the contract every renderer
+//! shares: the backend trait, the frame, the pass vocabulary and the camera.
+//! The types a game needs from it are re-exported here.
 //!
 //! The shader sources live at the crate root (`shader_sources/`), not under
-//! `src/`, so a shader edit is not a Rust source edit. Live reload is
-//! [`shader_hot_reload`]'s, compiled into native development builds: the
-//! development host re-cooks an edited source and hands the result to that
-//! module's export.
+//! `src/`, so a shader edit is not a Rust source edit. The [`shader_hot_reload`]
+//! module handles live reload in native development builds: the development
+//! host re-cooks an edited source and hands the result to that module's export.
 
-/// The drawable assets - meshes, textures, shaders, materials, passes - and their builders.
+/// The drawable assets - meshes, textures, shaders, materials, passes - and the
+/// builders that create them.
 pub mod assets;
 /// The sRGB transfer curve the importer and the GPU module share.
 pub mod color_space;
@@ -44,11 +44,10 @@ pub mod config;
 /// The resource a game sets its pipeline in.
 mod rendering_manager;
 
-/// Development shader reload: puts WGSL the host re-cooked into the shader assets built from it.
+/// Development shader reload: puts the WGSL the host re-cooked into the shader
+/// assets built from that source.
 #[cfg(any(test, all(debug_assertions, not(target_arch = "wasm32"))))]
 pub mod shader_hot_reload;
-/// The name the host loads this module under: its crate name.
-pub const MODULE_NAME: &str = "pill_master_renderer_data";
 
 // Standard library
 use std::path::Path;
@@ -71,57 +70,78 @@ pub use assets::{
 pub use components::*;
 pub use rendering_manager::RenderingManager;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The name the host knows this module by, which is its crate name.
+pub const MODULE_NAME: &str = "pill_master_renderer_data";
+
 /// Registers the renderer's components, asset types and resources with an
-/// engine, and installs its default pipeline; returns zero.
+/// engine and installs its default pipeline, then returns zero.
 ///
-/// Registers no system: filling the frame and drawing it is the GPU module's
-/// (`pill_master_renderer`), and a headless engine has neither. The generated
-/// `host_module_pill_master_renderer_data` wrapper carries this as
-/// `pill_module_init` for the host.
+/// It registers no system. Filling the frame and drawing it belong to the GPU
+/// module (`pill_master_renderer`), and a headless engine has neither. The
+/// generated `host_module_pill_master_renderer_data` wrapper carries this
+/// function as `pill_module_init` for the host.
 ///
-/// Components go in through [`register_components`]; the six asset types and
-/// the two resources are declared so their per-type tables are re-pointed at
-/// the artifact still mapped; the [`RenderFrame`] and [`RenderingManager`]
-/// values are only inserted when missing - every step checks what is already
-/// there, so a repeated call changes nothing.
+/// The components go in through [`register_components`]. The six asset types
+/// and the two resources are declared so the tables that hold their values
+/// point at code in the artifact that is still mapped. The [`RenderFrame`] and
+/// [`RenderingManager`] values are only inserted when they are missing.
+/// Declaring a type or a resource again changes nothing, so calling this a
+/// second time changes nothing either.
 ///
 /// It also installs the PBR pipeline ([`config::pbr_pipeline`]) and points the
 /// manager at it, so a project that never declares a frame still draws one.
-/// That is the *default*, not a decision: a project that wants a different
-/// chain calls [`RenderingManager::set_pipeline`] after registering, and one
-/// that wants the renderer's fallback chain clears the manager.
+/// That is only a default: a project that wants a different chain calls
+/// [`RenderingManager::set_pipeline`] after registering, and one that wants the
+/// renderer's own chain clears the manager.
+///
+/// # Panics
+///
+/// Panics when one of this crate's asset roots exists but a file it names
+/// below that root is missing. `declare_crate_roots` makes that check while
+/// this function runs.
 #[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
+    // Step 1: Register the components, field layouts included.
     register_components(engine.world_mut());
-    // Declare the asset types. Every artifact that registers calls this on
-    // every generation, and asset columns outlive the reload, so the
-    // declaration is what re-points their per-type tables at an artifact
-    // still mapped.
-    // Mesh and texture files import by extension too (scan, watcher, editor),
-    // which declares the asset type as well.
+
+    // Step 2: Declare the asset types. An asset type's column holds a table of
+    // functions from the artifact that filled it, and the column outlives a
+    // reload, so declaring the type again points that table at the artifact
+    // that is still mapped.
+    //
+    // Mesh and texture files also import by extension in the resource scan, the
+    // file watcher and the editor, so these two calls add their registry
+    // entries as well as their types in the store.
     engine.world_mut().register_imported_asset::<Mesh>();
     engine.world_mut().register_imported_asset::<Texture>();
-    // Shaders are `.hlsl` sources with a `.hlsl.meta` beside them.
+    // A shader imports like those two: an `.hlsl` source with a `.hlsl.meta`
+    // beside it.
     engine.world_mut().register_imported_asset::<Shader>();
-    // Materials are also files of their own (`.material`), loaded by extension.
+    // A material is a file of its own (`.material`), loaded by extension.
     engine.world_mut().register_standalone_asset::<Material>();
-    // Passes are also files of their own (`.render_pass`), loaded by extension.
+    // A pass is a file of its own too (`.render_pass`), loaded by extension.
     engine.world_mut().register_standalone_asset::<RenderPass>();
-    // Chains are files of their own too (`.pipeline`): the editor creates one
-    // from its dialog and a project loads it by path.
+    // A chain is a file of its own too (`.pipeline`). The editor creates one
+    // from its dialog, and a project loads it by path.
     engine
         .world_mut()
         .register_standalone_asset::<RenderingPipeline>();
-    // The reference fields these types' documents use, so the editor can draw a
-    // picker without knowing a renderer type: each target is the Rust type the
-    // field holds, so a renamed type moves here with the code. A `.*` key is a
-    // family - every texture slot the material's shader declares, every entry
-    // of a chain's pass list.
-    if let Some(registry) = engine
+
+    // Step 3: Declare the reference fields the asset documents use, so the
+    // editor can draw a picker without knowing any renderer type. Each target
+    // is the Rust type the field holds, so a renamed type moves here with the
+    // code. A `.*` key stands for a family: `textures.*` is every texture slot
+    // the material's shader declares, and `passes.*` is every entry of a
+    // chain's pass list.
+    if let Some(import_registry) = engine
         .world_mut()
         .get_resource_mut::<pill_engine::ImportRegistry>()
     {
-        registry.declare_references(
+        import_registry.declare_references(
             <Material as pill_engine::StandaloneAsset>::metadata_type_name(),
             &[
                 (
@@ -134,7 +154,7 @@ pub fn register(engine: &mut Engine) -> u32 {
                 ),
             ],
         );
-        registry.declare_references(
+        import_registry.declare_references(
             <RenderingPipeline as pill_engine::StandaloneAsset>::metadata_type_name(),
             &[(
                 "passes.*",
@@ -142,57 +162,73 @@ pub fn register(engine: &mut Engine) -> u32 {
             )],
         );
     }
-    // Declare the resources this crate inserts, before inserting them. Once the
-    // crate is a loaded module, a reload keeps the existing values and never
-    // calls `insert_resource` again, so this declaration is what re-points
-    // their drop functions at an image that is still mapped.
+
+    // Step 4: Declare the resources this crate inserts, before inserting them.
+    // Once the crate is a loaded module, a reload keeps the existing values and
+    // never calls `insert_resource` again, so this declaration is what points
+    // their drop functions at code that is still mapped.
     engine.world_mut().register_resource::<RenderFrame>();
     engine.world_mut().register_resource::<RenderingManager>();
     if engine.world().get_resource::<RenderFrame>().is_none() {
         engine.world_mut().insert_resource(RenderFrame::default());
     }
-    // The game writes the pipeline here; the renderer reads it back. Inserted
-    // here so a project that never sets one still finds the resource.
+    // The game writes the pipeline here and the renderer reads it back. It is
+    // inserted here so a project that never sets one still finds the resource.
     if engine.world().get_resource::<RenderingManager>().is_none() {
         engine.world_mut().insert_resource(RenderingManager::new());
     }
-    // This crate's own assets: the default material the chain draws with,
-    // declared here from the crate's directory, so the store answers
+
+    // Step 5: Declare this crate's own assets - the default material the chain
+    // draws with - from the crate's directory. The store then answers
     // `defaults/pill.pbr.material` by name and the editor lists the folder
-    // read-only; a file that went missing stops the engine at this declaration
-    // instead of leaving a scene unlit.
+    // read-only. A file that went missing stops the engine here instead of
+    // leaving a scene unlit.
     //
     // A shipped build links this crate statically and mounts its pack instead,
     // so it has no module directory to declare.
     declare_crate_roots();
-    // The frame the renderer runs when a project declares none: the PBR chain,
-    // installed as assets and pointed at by the manager. A project that sets
-    // its own pipeline does so after this call, so its choice wins.
+
+    // Step 6: Install the pipeline the renderer runs when a project declares
+    // none: the PBR chain, installed as assets and pointed at by the manager. A
+    // project that sets its own pipeline does so after this call, so its choice
+    // wins.
     if engine
         .world()
         .get_resource::<RenderingManager>()
-        .is_some_and(|manager| manager.pipeline().is_none())
+        .is_some_and(|rendering_manager| rendering_manager.pipeline().is_none())
     {
-        install_default_pipeline(engine.world_mut());
+        install_default_pbr_pipeline(engine.world_mut());
     }
     0
 }
 
-/// Declare the read-only roots this crate ships, from its own directory.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Declares the read-only roots this crate ships, from its own directory.
 ///
-/// The default material under `res`, and the sources the chain's shaders are
-/// cooked from under `shader_sources`. The `.wgsl` beside each source is this
-/// crate's build product - the store answers it, because a shader's stages are
-/// read from it by path, and the editor's tree leaves it out so the person sees
-/// what they author. Declaring the same roots again is what a reload does and
-/// changes nothing, which is also what lets this crate's own tests read the
-/// files a running module reads.
+/// Under `res` sits the default material; under `shader_sources` sit the
+/// sources the chain's shaders are cooked from. The `.wgsl` beside each source
+/// is this crate's build product: the store answers it because a shader's
+/// stages are read from it by path, and the editor's tree leaves it out so a
+/// person sees only what they author.
+///
+/// Declaring the same roots again is what a reload does, and it changes
+/// nothing. It is also what lets this crate's own tests read the same files a
+/// running module reads.
+///
+/// # Panics
+///
+/// Panics when `res` or `shader_sources` exists but one of the files this
+/// function names below it is missing; the message names the module and the
+/// path.
 fn declare_crate_roots() {
-    let resources = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/res"));
-    if resources.is_dir() {
+    let resources_directory = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/res"));
+    if resources_directory.is_dir() {
         pill_engine::asset_store::declare_module_root(
             MODULE_NAME,
-            resources,
+            resources_directory,
             &[
                 config::pbr_pipeline::DEFAULT_MATERIAL_PATH,
                 assets::DEFAULT_COLOR_TEXTURE,
@@ -200,11 +236,11 @@ fn declare_crate_roots() {
             ],
         );
     }
-    let sources = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/shader_sources"));
-    if sources.is_dir() {
+    let sources_directory = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/shader_sources"));
+    if sources_directory.is_dir() {
         pill_engine::asset_store::declare_module_root_hiding(
             MODULE_NAME,
-            sources,
+            sources_directory,
             &[
                 "common_shaders/default_vertex.hlsl",
                 "common_shaders/include/common.hlsl",
@@ -234,24 +270,24 @@ fn declare_crate_roots() {
     }
 }
 
-/// Install [`config::pbr_pipeline`] and point the manager at it.
+/// Installs [`config::pbr_pipeline`] and points the manager at it.
 ///
-/// A failure is warned and not returned: a renderer that could not install the
-/// default pipeline still runs, through its built-in chain, and the log says
+/// A failure is logged and not returned: a renderer that could not install the
+/// default pipeline still runs through its own built-in chain, and the log says
 /// what went wrong. Three failures reach here: a name clash with an asset the
-/// project already owns, the default material's file not parsing or loading,
-/// and a shader of ours that will not build.
-fn install_default_pipeline(world: &mut World) {
-    let installed = match world.get_resource_mut::<AssetManager>() {
+/// project already owns, the default material's file failing to parse or load,
+/// and one of our shaders failing to build.
+fn install_default_pbr_pipeline(world: &mut World) {
+    let pipeline_install = match world.get_resource_mut::<AssetManager>() {
         Some(assets) => config::pbr_pipeline::install(assets),
         // No store to install into: nothing can be drawn anyway.
         None => return,
     };
 
-    match installed {
+    match pipeline_install {
         Ok(pipeline) => {
-            if let Some(manager) = world.get_resource_mut::<RenderingManager>() {
-                manager.set_pipeline(pipeline);
+            if let Some(rendering_manager) = world.get_resource_mut::<RenderingManager>() {
+                rendering_manager.set_pipeline(pipeline);
             }
         }
         Err(error) => pill_core::warn!(
@@ -261,15 +297,19 @@ fn install_default_pipeline(world: &mut World) {
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pill_engine::{Engine, Handle, ImportRegistry, MetadataPolicy};
 
-    /// A mesh renderer's handle fields are typed asset references:
-    /// they read naming the registered asset type, another mesh's handle
-    /// writes through the field layer into the component the renderer reads,
-    /// and a material handle is refused for the mesh field.
+    /// A mesh renderer's handle fields are typed asset references: reading one
+    /// names the registered asset type, writing another mesh's handle goes
+    /// through the field layer into the component the renderer reads, and a
+    /// material handle is refused for the mesh field.
     #[test]
     fn the_mesh_renderers_handles_are_writable_asset_references() {
         let mut engine = Engine::new();
@@ -283,13 +323,15 @@ mod tests {
             })
             .build()
             .unwrap();
-        let name =
+        let component_name =
             pill_engine::component::ComponentRegistry::registered_name::<MeshRendererComponent>();
-        let mesh_type = "pill_master_renderer::assets::Mesh";
+        let mesh_type_name = "pill_master_renderer::assets::Mesh";
         assert_eq!(
-            world.read_component_field(entity, &name, "mesh").unwrap(),
+            world
+                .read_component_field(entity, &component_name, "mesh")
+                .unwrap(),
             pill_engine::FieldValue::Asset {
-                asset_type: Some(mesh_type.to_owned()),
+                asset_type: Some(mesh_type_name.to_owned()),
                 index: 0,
                 generation: 0,
             }
@@ -298,10 +340,10 @@ mod tests {
         world
             .write_component_field(
                 entity,
-                &name,
+                &component_name,
                 "mesh",
                 pill_engine::FieldValue::Asset {
-                    asset_type: Some(mesh_type.to_owned()),
+                    asset_type: Some(mesh_type_name.to_owned()),
                     index: 5,
                     generation: 2,
                 },
@@ -318,7 +360,7 @@ mod tests {
 
         let refused = world.write_component_field(
             entity,
-            &name,
+            &component_name,
             "mesh",
             pill_engine::FieldValue::Asset {
                 asset_type: Some("pill_master_renderer::assets::Material".to_owned()),
@@ -336,19 +378,20 @@ mod tests {
     }
 
     /// Registering the crate makes texture and mesh files importable by
-    /// extension, through the registry, without naming their types.
+    /// extension through the registry, without naming their types.
     ///
-    /// The only test in this crate that mounts a directory, so it needs no
-    /// lock against another test replacing the mount.
+    /// This is the only test in this crate that mounts a directory, so it needs
+    /// no lock against another test replacing the mount.
     #[test]
     fn textures_and_meshes_import_by_extension_through_the_registry() {
-        let root = std::env::temp_dir().join(format!("pill_data_registry_{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let asset_root_directory =
+            std::env::temp_dir().join(format!("pill_data_registry_{}", std::process::id()));
+        std::fs::create_dir_all(&asset_root_directory).unwrap();
         image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
-            .save(root.join("pixel.png"))
+            .save(asset_root_directory.join("pixel.png"))
             .unwrap();
         std::fs::write(
-            root.join("triangle.obj"),
+            asset_root_directory.join("triangle.obj"),
             "v 0 0 0
 v 1 0 0
 v 0 1 0
@@ -359,24 +402,24 @@ f 1/1 2/2 3/3
 ",
         )
         .unwrap();
-        pill_engine::asset_store::mount_directory(&root);
+        pill_engine::asset_store::mount_directory(&asset_root_directory);
         let mut engine = Engine::new();
         assert_eq!(register(&mut engine), 0);
 
         let world = engine.world_mut();
-        let registry = world
+        let import_registry = world
             .remove_resource::<ImportRegistry>()
             .unwrap()
             .expect("register records the imported types");
         let assets = world.get_resource_mut::<AssetManager>().unwrap();
-        let texture = registry
+        let texture_import = import_registry
             .import(
                 assets,
                 std::path::Path::new("pixel.png"),
                 MetadataPolicy::ReadIfPresent,
             )
             .unwrap();
-        let mesh = registry
+        let mesh_import = import_registry
             .import(
                 assets,
                 std::path::Path::new("triangle.obj"),
@@ -384,20 +427,23 @@ f 1/1 2/2 3/3
             )
             .unwrap();
 
-        assert_eq!(texture.type_name, "pill_master_renderer::assets::Texture");
-        assert_eq!(mesh.type_name, "pill_master_renderer::assets::Mesh");
+        assert_eq!(
+            texture_import.type_name,
+            "pill_master_renderer::assets::Texture"
+        );
+        assert_eq!(mesh_import.type_name, "pill_master_renderer::assets::Mesh");
         assert!(assets.get_by_name::<Texture>("pixel.png").is_some());
         assert!(assets.get_by_name::<Mesh>("triangle.obj").is_some());
-        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&asset_root_directory).unwrap();
     }
 
-    /// The pipeline the manager points at, and the store's view of it.
-    fn defaulted_pipeline(engine: &Engine) -> Handle<RenderingPipeline> {
-        let manager = engine
+    /// The pipeline the manager points at.
+    fn installed_pipeline(engine: &Engine) -> Handle<RenderingPipeline> {
+        let rendering_manager = engine
             .world()
             .get_resource::<RenderingManager>()
             .expect("register inserts the manager");
-        manager
+        rendering_manager
             .pipeline()
             .expect("register points the manager at a pipeline")
     }
@@ -408,9 +454,9 @@ f 1/1 2/2 3/3
 
         assert_eq!(register(&mut engine), 0);
 
-        // The manager runs the PBR chain, and the store holds it under that
-        // chain's name rather than something the project happened to add.
-        let pipeline = defaulted_pipeline(&engine);
+        // The manager runs the PBR chain, and the store holds that same
+        // pipeline under the chain's asset name.
+        let pipeline = installed_pipeline(&engine);
         let assets = engine
             .world()
             .get_resource::<AssetManager>()
@@ -426,20 +472,20 @@ f 1/1 2/2 3/3
     fn installing_the_chain_twice_returns_the_same_assets() {
         let mut engine = Engine::new();
         register(&mut engine);
-        let first = defaulted_pipeline(&engine);
+        let pipeline_before_reload = installed_pipeline(&engine);
 
         assert_eq!(register(&mut engine), 0);
 
-        assert_eq!(defaulted_pipeline(&engine), first);
+        assert_eq!(installed_pipeline(&engine), pipeline_before_reload);
     }
 
-    /// What a project sets stays set: the default is only for a manager that has
-    /// nothing.
+    /// A pipeline a project sets survives a later `register`: the default only
+    /// fills a manager that has none.
     #[test]
     fn a_pipeline_a_project_set_survives_a_later_register() {
         let mut engine = Engine::new();
         register(&mut engine);
-        let own = {
+        let project_pipeline = {
             let assets = engine
                 .world_mut()
                 .get_resource_mut::<AssetManager>()
@@ -450,15 +496,15 @@ f 1/1 2/2 3/3
             .world_mut()
             .get_resource_mut::<RenderingManager>()
             .expect("register inserts the manager")
-            .set_pipeline(own);
+            .set_pipeline(project_pipeline);
 
         register(&mut engine);
 
-        assert_eq!(defaulted_pipeline(&engine), own);
+        assert_eq!(installed_pipeline(&engine), project_pipeline);
     }
 
-    /// Registering the data registers no system: drawing is the renderer
-    /// module's, and a headless engine must not run any of it.
+    /// Registering the data registers no system: drawing belongs to the
+    /// renderer module, and a headless engine must not run any of it.
     #[test]
     fn registering_the_data_registers_no_rendering_system() {
         let mut engine = Engine::new();

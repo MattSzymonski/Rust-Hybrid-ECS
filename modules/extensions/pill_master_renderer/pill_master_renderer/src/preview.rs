@@ -4,25 +4,28 @@
 //!
 //! - Render one requested asset into a 128x128 RGBA8 target and copy it to a
 //!   readback buffer ([`PreviewRenderer::record`],
-//!   [`PreviewRenderer::record_mesh`]), at most one request per frame.
+//!   [`PreviewRenderer::record_mesh`]). At most one request is drawn per
+//!   frame.
 //! - Map that buffer after the frame that wrote it was submitted
-//!   ([`PreviewRenderer::after_submit`]), and hand the pixels back once the
-//!   GPU finished ([`PreviewRenderer::collect`]).
+//!   ([`PreviewRenderer::after_submit`]). Hand the pixels back once the GPU
+//!   has finished ([`PreviewRenderer::collect`]).
 //! - Decode and upload a texture file the first time a preview names it, and
-//!   again when the file changes ([`PreviewRenderer::texture`]); the same for
-//!   a mesh file ([`PreviewRenderer::mesh`]).
+//!   again when the file changes ([`PreviewRenderer::texture`]). Mesh files
+//!   work the same way ([`PreviewRenderer::mesh`]).
 //!
 //! # Design
 //!
-//! A texture or material preview is one fullscreen triangle: the fragment
+//! A texture or material preview is one fullscreen triangle. The fragment
 //! shader samples the asset's texture, or shades a sphere in a material's
-//! colour, so no vertex buffers, camera or depth target are involved. A mesh
-//! preview is a second pipeline that draws the decoded triangle list through a
-//! camera fitted to the mesh's bounds, with a depth target because a solid
-//! seen from a three-quarter angle occludes itself. The target and both
-//! pipelines are built once and reused; the readback is a mapped buffer polled
-//! without waiting, the shape the pick buffer already uses. Nothing is written
-//! to disk: the pixels cross to the editor as data.
+//! colour, so these previews need no vertex buffer, camera or depth target.
+//! A mesh preview uses a second pipeline that draws the decoded triangle list
+//! through a camera fitted to the mesh's bounds. It has a depth target because
+//! a solid seen from a three-quarter angle hides part of itself.
+//!
+//! The target and both pipelines are built once and reused. The readback is a
+//! mapped buffer polled without waiting, the same shape the pick buffer uses.
+//! Nothing is written to disk: the pixels reach the editor as data.
+
 // Standard library
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -34,22 +37,48 @@ use pill_renderer_api::PreviewImage;
 // Current crate
 use crate::readback::{MappedReadback, Readback};
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// Edge length of one preview, in texels.
 pub const PREVIEW_SIZE: u32 = 128;
 
 /// Bytes one preview's pixels take: RGBA8, tightly packed.
 const PREVIEW_BYTES: u64 = (PREVIEW_SIZE as u64) * (PREVIEW_SIZE as u64) * 4;
 
-/// How many GPU bytes the decoded texture files a preview drew may hold.
+/// How many GPU bytes the decoded texture files may hold.
 ///
-/// The cache exists so scrolling back to a tile costs no decode; it is not a
-/// residency list, so it is bounded rather than grown for the session. A 4K
-/// texture is 64 MB, so this holds one of those or a few dozen smaller ones.
-const SOURCE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+/// The cache is there so that scrolling back to a tile costs no decode. It is
+/// not a residency list, so it has a fixed limit instead of growing for the
+/// whole session. A 4K texture is 64 MB, so this limit holds one of those or a
+/// few dozen smaller ones.
+const TEXTURE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
-/// How many GPU bytes the decoded mesh files may hold. A mesh is far smaller
-/// than a texture, so the same budget covers a whole browsing session.
+/// How many GPU bytes the decoded mesh files may hold.
+///
+/// A mesh is far smaller than a texture, so the same limit covers a whole
+/// browsing session.
 const MESH_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The mesh vertex attributes the mesh pipeline reads: position and normal,
+/// at the offsets the asset crate's vertex struct gives them.
+const MESH_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x3,
+        offset: 0,
+        shader_location: 0,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x3,
+        offset: 20,
+        shader_location: 1,
+    },
+];
+
+// =============================================================================
+// Preview Mode
+// =============================================================================
 
 /// What the fragment shader draws, as the mode the parameters carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,27 +89,40 @@ pub(super) enum PreviewMode {
     Material = 1,
 }
 
-/// The one uniform a flat preview writes.
+// =============================================================================
+// Preview Parameters
+// =============================================================================
+
+/// The uniform a texture or material preview writes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct PreviewParameters {
-    /// The material's colour; unused for a texture.
+    /// The material's colour. A texture preview leaves it unused.
     color: [f32; 4],
-    /// [`PreviewMode`] as the shader's `u32`, in the first word of a vec4 so
-    /// the uniform stays a multiple of 16 bytes.
+    /// The [`PreviewMode`] value the shader compares against, stored in the
+    /// first word of a vec4. The other three words keep the uniform a multiple
+    /// of 16 bytes.
     mode: [u32; 4],
 }
 
-/// The uniform a mesh preview writes: the camera framing and the shading
-/// colour.
+// =============================================================================
+// Mesh Parameters
+// =============================================================================
+
+/// The uniform a mesh preview writes. It carries the camera framing and the
+/// colour the mesh is shaded in.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct MeshParameters {
-    /// Projection times view, with the mesh centred on the origin.
+    /// Projection times view, aimed at the centre of the mesh's bounds.
     transform: [[f32; 4]; 4],
     /// The grey a mesh preview shades in.
     color: [f32; 4],
 }
+
+// =============================================================================
+// Mesh Source
+// =============================================================================
 
 /// One decoded mesh on the GPU, with the transform that frames it.
 #[derive(Clone)]
@@ -95,23 +137,15 @@ pub(super) struct MeshSource {
     transform: [[f32; 4]; 4],
 }
 
-/// The mesh vertex attributes the preview pipeline reads: position and
-/// normal, at the offsets the asset crate's vertex struct puts them.
-const MESH_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x3,
-        offset: 0,
-        shader_location: 0,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x3,
-        offset: 20,
-        shader_location: 1,
-    },
-];
+// =============================================================================
+// Preview Renderer
+// =============================================================================
 
-/// One preview's target, pipelines and readback slot.
+/// The GPU state one preview at a time needs: a 128x128 target, the two
+/// pipelines that draw into it, and one readback slot.
 pub(super) struct PreviewRenderer {
+    /// The flat preview's bind group layout and pipeline: its parameters,
+    /// texture and sampler.
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     /// The mesh pipeline and its camera uniform: its own vertex layout,
@@ -130,24 +164,24 @@ pub(super) struct PreviewRenderer {
     parameters: wgpu::Buffer,
     /// The sampler a texture preview reads through.
     sampler: wgpu::Sampler,
-    /// A 1x1 white texture, bound for a material preview so the bind group is
-    /// always the same shape.
-    white: wgpu::TextureView,
-    /// The textures previews drew, by path, with the modified time each was
-    /// decoded from.
-    sources: BudgetedCache<wgpu::TextureView>,
-    /// The meshes previews drew, by path, with the modified time each was
-    /// decoded from.
-    meshes: BudgetedCache<MeshSource>,
-    /// The request whose pixels are on their way, by id.
-    in_flight: Option<u64>,
+    /// A 1x1 white texture. A material preview binds it in place of the
+    /// asset's texture, so one bind group layout serves both modes.
+    white_texture_view: wgpu::TextureView,
+    /// Texture views by path, with the modified time each was decoded from.
+    texture_sources: BudgetedCache<wgpu::TextureView>,
+    /// Mesh sources by path, with the modified time each was decoded from.
+    mesh_sources: BudgetedCache<MeshSource>,
+    /// The id of the request whose pixels are on their way.
+    in_flight_request_id: Option<u64>,
     /// Finished previews waiting for the next [`Self::collect`].
-    finished: Vec<PreviewImage>,
+    finished_previews: Vec<PreviewImage>,
 }
 
 impl PreviewRenderer {
-    /// Build the target, pipeline and buffers once.
+    /// Builds the target, both pipelines, the readback buffer and the caches.
     pub(super) fn new(device: &wgpu::Device) -> Self {
+        // Step 1: The flat pipeline - one fullscreen triangle with a uniform, a
+        // texture and a sampler.
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("preview_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("preview.wgsl").into()),
@@ -213,6 +247,8 @@ impl PreviewRenderer {
             multiview_mask: None,
             cache: None,
         });
+        // Step 2: The target every preview draws into, and the buffer its
+        // pixels are copied out to.
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("preview_target"),
             size: wgpu::Extent3d {
@@ -240,9 +276,10 @@ impl PreviewRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // The mesh half of the pass: its own shader, camera uniform and depth
-        // target, because a mesh needs perspective and occlusion where a quad
-        // and a sphere need neither.
+        // Step 3: The mesh pipeline and the target it tests against. A mesh
+        // needs its own shader, camera uniform and depth target, because it
+        // needs perspective and occlusion where a quad and a sphere need
+        // neither.
         let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("preview_mesh_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("preview_mesh.wgsl").into()),
@@ -325,6 +362,8 @@ impl PreviewRenderer {
                 view_formats: &[],
             })
             .create_view(&wgpu::TextureViewDescriptor::default());
+        // Step 4: The sampler a texture preview reads through, and the white
+        // texture a material binds in its place.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("preview_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -335,7 +374,7 @@ impl PreviewRenderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
-        // A 1x1 white texture for the material mode's unused sampler slot.
+        // A 1x1 white texture for the sampler slot a material leaves unused.
         let white_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("preview_white"),
             size: wgpu::Extent3d {
@@ -363,32 +402,35 @@ impl PreviewRenderer {
             readback,
             parameters,
             sampler,
-            white,
-            sources: BudgetedCache::new(SOURCE_BUDGET_BYTES),
-            meshes: BudgetedCache::new(MESH_BUDGET_BYTES),
-            in_flight: None,
-            finished: Vec::new(),
+            white_texture_view: white,
+            texture_sources: BudgetedCache::new(TEXTURE_BUDGET_BYTES),
+            mesh_sources: BudgetedCache::new(MESH_BUDGET_BYTES),
+            in_flight_request_id: None,
+            finished_previews: Vec::new(),
         }
     }
 
-    /// Whether a request can be taken this frame: nothing is in flight and
-    /// nothing is waiting to be handed over.
+    /// Returns whether a request can be drawn this frame: nothing is in flight
+    /// and no finished preview is still waiting to be handed over.
     pub(super) fn ready(&self) -> bool {
-        self.in_flight.is_none() && self.finished.is_empty()
+        self.in_flight_request_id.is_none() && self.finished_previews.is_empty()
     }
 
-    /// Answer a request this renderer will not draw, so the caller stops
+    /// Answers a request this renderer will not draw, so the caller stops
     /// waiting for it.
     ///
-    /// The refusal joins the finished list, which is what `collect` hands over,
-    /// so a caller sees one answer per request it made.
+    /// The refusal goes on the finished list, which [`Self::collect`] hands
+    /// over, so the caller gets exactly one answer for every request it made.
     pub(super) fn refuse(&mut self, id: u64) {
-        self.finished.push(PreviewImage::refused(id));
+        self.finished_previews.push(PreviewImage::refused(id));
     }
 
-    /// The source a texture preview samples: the file decoded and uploaded the
-    /// first time, and again once its modified time moves, so a re-imported
-    /// texture previews its new pixels.
+    /// Returns the view and sampler a texture preview samples.
+    ///
+    /// The file is decoded and uploaded on first use. Its modified time is
+    /// remembered, and when the file changes it is decoded again, so a
+    /// re-imported texture previews its new pixels. Returns `None` when the
+    /// file cannot be read or decoded.
     pub(super) fn texture(
         &mut self,
         device: &wgpu::Device,
@@ -398,7 +440,7 @@ impl PreviewRenderer {
         let modified = std::fs::metadata(path)
             .ok()
             .and_then(|metadata| metadata.modified().ok());
-        if let Some(view) = self.sources.get_fresh(path, modified) {
+        if let Some(view) = self.texture_sources.fresh_value(path, modified) {
             return Some((view, self.sampler.clone()));
         }
         let decoded = image::open(Path::new(path)).ok()?.to_rgba8();
@@ -434,34 +476,37 @@ impl PreviewRenderer {
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bytes = u64::from(size.width) * u64::from(size.height) * 4;
-        let dropped = self.sources.insert(path, modified, view.clone(), bytes);
+        let dropped = self
+            .texture_sources
+            .insert(path, modified, view.clone(), bytes);
         self.report_trimmed("source", &dropped);
         Some((view, self.sampler.clone()))
     }
 
-    /// Says what one cache dropped, under the line the previews have always
-    /// logged for it.
-    fn report_trimmed(&self, kind: &str, dropped: &[String]) {
+    /// Logs a trim of one cache: how many entries were dropped and how many
+    /// bytes the cache holds now.
+    fn report_trimmed(&self, cache_name: &str, dropped: &[String]) {
         if dropped.is_empty() {
             return;
         }
-        let bytes = match kind {
-            "mesh" => self.meshes.bytes,
-            _ => self.sources.bytes,
+        let bytes = match cache_name {
+            "mesh" => self.mesh_sources.bytes,
+            _ => self.texture_sources.bytes,
         };
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::RENDERING,
             dropped = dropped.len(),
             bytes,
-            "[preview] {kind} cache trimmed"
+            "[preview] {cache_name} cache trimmed"
         );
     }
 
-    /// Record one preview into `encoder`: the asset's texture through
-    /// `source`, or a sphere in `color` when it is `None`.
+    /// Records one texture or material preview into `encoder`.
     ///
-    /// The caller submits the encoder; [`Self::after_submit`] then starts the
-    /// readback's mapping, and [`Self::collect`] hands the pixels over.
+    /// `source` is the texture to sample. When it is `None`, the shader draws a
+    /// sphere in `color` instead. The caller submits the encoder, then calls
+    /// [`Self::after_submit`] to start the readback's mapping, and
+    /// [`Self::collect`] hands the pixels over.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         &mut self,
@@ -473,9 +518,10 @@ impl PreviewRenderer {
         color: [f32; 4],
         source: Option<(wgpu::TextureView, wgpu::Sampler)>,
     ) {
+        // Step 1: Bind the texture the preview samples and write its uniform.
         let (texture_view, sampler) = match source {
             Some((view, sampler)) => (view, sampler),
-            None => (self.white.clone(), self.sampler.clone()),
+            None => (self.white_texture_view.clone(), self.sampler.clone()),
         };
         let parameters = PreviewParameters {
             color,
@@ -500,6 +546,7 @@ impl PreviewRenderer {
                 },
             ],
         });
+        // Step 2: Draw the fullscreen triangle into the target.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("preview"),
@@ -521,12 +568,17 @@ impl PreviewRenderer {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        self.copy_out(encoder);
-        self.in_flight = Some(id);
+        // Step 3: Copy the square out and remember which request is on its way.
+        self.copy_target_to_readback(encoder);
+        self.in_flight_request_id = Some(id);
     }
 
-    /// The mesh a preview draws: the file decoded and uploaded the first time,
-    /// and again once its modified time moves.
+    /// Returns the GPU mesh a mesh preview draws.
+    ///
+    /// The file is decoded and uploaded on first use, and again when its
+    /// modified time changes. Returns `None` when the file cannot be read or
+    /// decoded, when it holds no vertices or triangles, or when its bounds
+    /// leave no room to frame it.
     pub(super) fn mesh(
         &mut self,
         device: &wgpu::Device,
@@ -536,15 +588,15 @@ impl PreviewRenderer {
         let modified = std::fs::metadata(path)
             .ok()
             .and_then(|metadata| metadata.modified().ok());
-        if let Some(mesh) = self.meshes.get_fresh(path, modified) {
+        if let Some(mesh) = self.mesh_sources.fresh_value(path, modified) {
             return Some(mesh);
         }
-        let bytes = std::fs::read(Path::new(path)).ok()?;
-        let decoded = crate::assets::Mesh::from_obj_bytes(path, &bytes).ok()?;
+        let file_bytes = std::fs::read(Path::new(path)).ok()?;
+        let decoded = crate::assets::Mesh::from_obj_bytes(path, &file_bytes).ok()?;
         if decoded.indices.is_empty() || decoded.vertices.is_empty() {
             return None;
         }
-        let transform = framing(&decoded.vertices)?;
+        let transform = mesh_framing_transform(&decoded.vertices)?;
         let vertices = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("preview_mesh_vertices"),
             size: std::mem::size_of_val(decoded.vertices.as_slice()) as u64,
@@ -565,14 +617,16 @@ impl PreviewRenderer {
             index_count: decoded.indices.len() as u32,
             transform,
         };
-        let bytes = source.vertices.size() + source.indices.size();
-        let dropped = self.meshes.insert(path, modified, source.clone(), bytes);
+        let gpu_bytes = source.vertices.size() + source.indices.size();
+        let dropped = self
+            .mesh_sources
+            .insert(path, modified, source.clone(), gpu_bytes);
         self.report_trimmed("mesh", &dropped);
         Some(source)
     }
 
-    /// Record one mesh preview into `encoder`, then copy the square out for
-    /// mapping. The caller submits the encoder, as for the flat modes.
+    /// Records one mesh preview into `encoder`, then copies the square out for
+    /// mapping. The caller submits the encoder, as it does for the other modes.
     pub(super) fn record_mesh(
         &mut self,
         device: &wgpu::Device,
@@ -581,6 +635,7 @@ impl PreviewRenderer {
         id: u64,
         mesh: &MeshSource,
     ) {
+        // Step 1: Write the camera uniform the mesh is drawn through.
         let parameters = MeshParameters {
             transform: mesh.transform,
             color: [0.72, 0.73, 0.75, 1.0],
@@ -594,6 +649,7 @@ impl PreviewRenderer {
                 resource: self.mesh_parameters.as_entire_binding(),
             }],
         });
+        // Step 2: Draw the mesh with the depth test on.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("preview_mesh"),
@@ -624,13 +680,14 @@ impl PreviewRenderer {
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
         }
-        self.copy_out(encoder);
-        self.in_flight = Some(id);
+        // Step 3: Copy the square out and remember which request is on its way.
+        self.copy_target_to_readback(encoder);
+        self.in_flight_request_id = Some(id);
     }
 
-    /// Copy the target's pixels into the readback buffer, the step both
-    /// preview paths end with.
-    fn copy_out(&self, encoder: &mut wgpu::CommandEncoder) {
+    /// Copies the target's pixels into the readback buffer. Both preview
+    /// paths end with this step.
+    fn copy_target_to_readback(&self, encoder: &mut wgpu::CommandEncoder) {
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.target,
@@ -642,8 +699,9 @@ impl PreviewRenderer {
                 buffer: self.readback.buffer(),
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    // RGBA8 at 128 texels is 512 bytes a row, already the
-                    // copy alignment, so the pixels land tightly packed.
+                    // One row of RGBA8 at 128 texels is 512 bytes, which is
+                    // already a multiple of the 256-byte alignment the copy
+                    // needs, so the rows are tightly packed.
                     bytes_per_row: Some(PREVIEW_SIZE * 4),
                     rows_per_image: Some(PREVIEW_SIZE),
                 },
@@ -656,29 +714,31 @@ impl PreviewRenderer {
         );
     }
 
-    /// Start mapping the readback the frame that recorded a preview wrote.
+    /// Starts mapping the readback buffer, which the last recorded preview
+    /// wrote.
     ///
-    /// Called after the submission: a buffer asked to map before its copy is
-    /// submitted makes the submission fail.
+    /// Call this after the submission that holds the copy. Asking the buffer
+    /// to map before its copy is submitted makes the submission fail.
     pub(super) fn after_submit(&mut self) {
-        if self.in_flight.is_none() {
+        if self.in_flight_request_id.is_none() {
             return;
         }
         self.readback.start();
     }
 
-    /// Every preview the GPU finished, polling without waiting.
+    /// Returns every preview the GPU has finished, polling without waiting.
     ///
-    /// A readback the GPU could not deliver answers its request with a
-    /// refusal: a caller waiting for an answer that never comes stops asking,
-    /// which would leave every later preview undrawn.
+    /// When the readback fails, the request is answered with a refusal
+    /// instead. A caller that waits for an answer that never comes stops
+    /// asking, which would leave every later preview undrawn.
     pub(super) fn collect(&mut self, device: &wgpu::Device) -> Vec<PreviewImage> {
-        if self.in_flight.is_some() {
-            // Not waiting: an unfinished readback is answered on a later call.
+        if self.in_flight_request_id.is_some() {
+            // Poll without waiting: an unfinished readback is answered on a
+            // later call.
             let _ = device.poll(wgpu::PollType::Poll);
         }
-        let Some(id) = self.in_flight else {
-            return std::mem::take(&mut self.finished);
+        let Some(id) = self.in_flight_request_id else {
+            return std::mem::take(&mut self.finished_previews);
         };
         let outcome = self.readback.poll(|pixels| PreviewImage {
             id,
@@ -688,30 +748,39 @@ impl PreviewRenderer {
         });
         match outcome {
             Readback::Done(image) => {
-                self.finished.push(image);
-                self.in_flight = None;
+                self.finished_previews.push(image);
+                self.in_flight_request_id = None;
             }
             Readback::Failed => {
                 pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
                     "[preview] the readback could not be read: request {id} is refused"
                 );
-                self.in_flight = None;
+                self.in_flight_request_id = None;
                 self.refuse(id);
             }
             Readback::Pending => {}
         }
-        std::mem::take(&mut self.finished)
+        std::mem::take(&mut self.finished_previews)
     }
 }
 
-/// The transform a mesh preview draws through: the mesh's own bounds decide
-/// where the camera sits, so any asset fills the square.
+// =============================================================================
+// Mesh Framing Transform
+// =============================================================================
+
+/// Builds the transform a mesh preview draws through.
 ///
-/// The camera looks at the bounds' centre and backs off far enough for their
-/// bounding sphere to fit the field of view, from a three-quarter angle so the
-/// silhouette reads as a solid rather than a flat outline.
-fn framing(vertices: &[crate::assets::MeshVertex]) -> Option<[[f32; 4]; 4]> {
+/// The mesh's own bounds decide where the camera sits, so any asset fills the
+/// square.
+///
+/// The camera looks at the bounds' centre and moves back until their
+/// bounding sphere fits the field of view, from a three-quarter angle, so the
+/// preview shows a solid shape instead of a flat outline.
+///
+/// Returns `None` when the vertices have no usable bounds: there are none, all
+/// of them sit at one point, or their coordinates are not finite.
+fn mesh_framing_transform(vertices: &[crate::assets::MeshVertex]) -> Option<[[f32; 4]; 4]> {
     let mut min = glam::Vec3::splat(f32::INFINITY);
     let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
     for vertex in vertices {
@@ -739,23 +808,25 @@ fn framing(vertices: &[crate::assets::MeshVertex]) -> Option<[[f32; 4]; 4]> {
     Some((projection * view).to_cols_array_2d())
 }
 
-/// The paths a cache must drop to fit `budget`, oldest first, with `total`
-/// reduced by the bytes each carried.
+// =============================================================================
+// Budgeted Cache
+// =============================================================================
+
+/// A cache of GPU data by file path, limited by bytes rather than by a count.
 ///
-/// A path-keyed cache holding at most `budget` bytes of GPU data, oldest out
-/// first.
-///
-/// The preview's two caches are one concept - a file's contents on the GPU,
-/// stale once the file moves, bounded by bytes rather than by a count - so they
-/// are one type. Using an entry makes it the newest, so the budget drops what a
-/// person scrolled past rather than what they are looking at, and the newest
-/// entry is never dropped even alone over budget: a source bigger than the whole
-/// cache still previews.
+/// The preview has two of these, and both hold the same thing: a file's
+/// contents on the GPU, which go stale once the file changes. Using an entry
+/// makes it the newest, so the limit drops what a person scrolled past instead
+/// of what they are looking at. The newest entry is never dropped, even when it
+/// is alone over the limit, so a source bigger than the whole cache still
+/// previews.
 struct BudgetedCache<V> {
-    /// The values, with the modified time each was built from.
-    entries: HashMap<String, (Option<SystemTime>, V)>,
-    /// Paths oldest first, each with the bytes it holds: the eviction order.
-    order: VecDeque<(String, u64)>,
+    /// The cached values by path, each with the modified time it was built
+    /// from.
+    cached_entries: HashMap<String, (Option<SystemTime>, V)>,
+    /// The paths, oldest first, each with the bytes it holds. This is the
+    /// order entries are dropped in.
+    eviction_order: VecDeque<(String, u64)>,
     /// The bytes every entry holds together.
     bytes: u64,
     /// How many bytes the cache may hold.
@@ -766,31 +837,32 @@ impl<V: Clone> BudgetedCache<V> {
     /// An empty cache that may hold `budget` bytes.
     fn new(budget: u64) -> Self {
         Self {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
+            cached_entries: HashMap::new(),
+            eviction_order: VecDeque::new(),
             bytes: 0,
             budget,
         }
     }
 
-    /// The value for `path` when it was built from `modified`, made the newest
-    /// entry by the use.
-    fn get_fresh(&mut self, path: &str, modified: Option<SystemTime>) -> Option<V> {
-        let (cached, value) = self.entries.get(path)?;
+    /// Returns the cached value for `path` if it was built from `modified`.
+    ///
+    /// Using the value makes its entry the newest one.
+    fn fresh_value(&mut self, path: &str, modified: Option<SystemTime>) -> Option<V> {
+        let (cached, value) = self.cached_entries.get(path)?;
         if *cached != modified {
             return None;
         }
         let value = value.clone();
-        if let Some(index) = self.order.iter().position(|(key, _)| key == path) {
-            if let Some(entry) = self.order.remove(index) {
-                self.order.push_back(entry);
+        if let Some(index) = self.eviction_order.iter().position(|(key, _)| key == path) {
+            if let Some(entry) = self.eviction_order.remove(index) {
+                self.eviction_order.push_back(entry);
             }
         }
         Some(value)
     }
 
-    /// Stores `value` as the newest entry and drops what the budget can no
-    /// longer hold, returning the paths it dropped.
+    /// Stores `value` as the newest entry, drops entries until the cache fits
+    /// its limit again, and returns the paths it dropped.
     fn insert(
         &mut self,
         path: &str,
@@ -799,30 +871,36 @@ impl<V: Clone> BudgetedCache<V> {
         bytes: u64,
     ) -> Vec<String> {
         self.forget(path);
-        self.entries.insert(path.to_owned(), (modified, value));
-        self.order.push_back((path.to_owned(), bytes));
+        self.cached_entries
+            .insert(path.to_owned(), (modified, value));
+        self.eviction_order.push_back((path.to_owned(), bytes));
         self.bytes += bytes;
         let mut dropped = Vec::new();
-        while self.bytes > self.budget && self.order.len() > 1 {
-            let Some((path, bytes)) = self.order.pop_front() else {
+        while self.bytes > self.budget && self.eviction_order.len() > 1 {
+            let Some((path, bytes)) = self.eviction_order.pop_front() else {
                 break;
             };
             self.bytes = self.bytes.saturating_sub(bytes);
-            self.entries.remove(&path);
+            self.cached_entries.remove(&path);
             dropped.push(path);
         }
         dropped
     }
 
-    /// Forgets `path`'s accounting, for the entry an insert replaces.
+    /// Removes `path`'s bytes from the total, for the entry an insert
+    /// replaces.
     fn forget(&mut self, path: &str) {
-        if let Some(index) = self.order.iter().position(|(key, _)| key == path) {
-            if let Some((_, bytes)) = self.order.remove(index) {
+        if let Some(index) = self.eviction_order.iter().position(|(key, _)| key == path) {
+            if let Some((_, bytes)) = self.eviction_order.remove(index) {
                 self.bytes = self.bytes.saturating_sub(bytes);
             }
         }
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -855,7 +933,7 @@ mod tests {
     #[test]
     fn a_mesh_preview_frames_the_whole_mesh_inside_the_square() {
         let matrix = glam::Mat4::from_cols_array_2d(
-            &framing(&unit_box()).expect("a box has bounds to frame"),
+            &mesh_framing_transform(&unit_box()).expect("a box has bounds to frame"),
         );
         let mut widest: f32 = 0.0;
         for corner in unit_box() {
@@ -882,13 +960,14 @@ mod tests {
 
     #[test]
     fn a_mesh_with_no_extent_is_not_drawn() {
-        assert!(framing(&[]).is_none());
+        assert!(mesh_framing_transform(&[]).is_none());
         let point = vertex([0.5, 0.5, 0.5]);
-        assert!(framing(&[point, point]).is_none());
-        // A vertex the file left unplaced is no bound to frame: the rest of
-        // the mesh is, and a mesh of nothing but unplaced vertices is not.
-        assert!(framing(&[vertex([f32::NAN, 0.0, 0.0])]).is_none());
-        assert!(framing(&[vertex([f32::NAN, 0.0, 0.0]), vertex([1.0, 1.0, 1.0])]).is_some());
+        assert!(mesh_framing_transform(&[point, point]).is_none());
+        // A vertex with no usable position gives no bound to frame. The other
+        // vertices still do, but a mesh made only of such vertices does not.
+        assert!(mesh_framing_transform(&[vertex([f32::NAN, 0.0, 0.0])]).is_none());
+        let unplaced_then_placed = [vertex([f32::NAN, 0.0, 0.0]), vertex([1.0, 1.0, 1.0])];
+        assert!(mesh_framing_transform(&unplaced_then_placed).is_some());
     }
 
     /// A 4K texture is 64 MB, so browsing a folder of them must not keep every
@@ -896,14 +975,14 @@ mod tests {
     #[test]
     fn browsing_many_textures_keeps_the_cache_under_its_budget() {
         let texture_bytes = 4096 * 4096 * 4;
-        let mut cache = BudgetedCache::new(SOURCE_BUDGET_BYTES);
+        let mut cache = BudgetedCache::new(TEXTURE_BUDGET_BYTES);
         for index in 0..100u32 {
             let path = format!("textures/t{index}.png");
             let dropped = cache.insert(&path, None, index, texture_bytes);
             // The cache drops as it grows, so what it holds never climbs past
             // the budget.
             assert!(
-                cache.bytes <= SOURCE_BUDGET_BYTES || cache.order.len() == 1,
+                cache.bytes <= TEXTURE_BUDGET_BYTES || cache.eviction_order.len() == 1,
                 "{} bytes held after {index} textures",
                 cache.bytes
             );
@@ -911,42 +990,42 @@ mod tests {
         }
         // The tile a person is on is the one that stays.
         assert_eq!(
-            cache.order.back().map(|(path, _)| path.as_str()),
+            cache.eviction_order.back().map(|(path, _)| path.as_str()),
             Some("textures/t99.png")
         );
-        assert_eq!(cache.order.len(), 1);
-        assert_eq!(cache.get_fresh("textures/t99.png", None), Some(99));
+        assert_eq!(cache.eviction_order.len(), 1);
+        assert_eq!(cache.fresh_value("textures/t99.png", None), Some(99));
     }
 
-    /// A source larger than the whole cache still previews: it is the newest
-    /// entry, and the budget never drops the newest.
+    /// A source larger than the whole cache still previews, because it is the
+    /// newest entry and the limit never drops that one.
     #[test]
     fn a_source_larger_than_the_budget_is_still_kept() {
-        let mut cache = BudgetedCache::new(SOURCE_BUDGET_BYTES);
+        let mut cache = BudgetedCache::new(TEXTURE_BUDGET_BYTES);
 
-        let dropped = cache.insert("huge.png", None, 1, SOURCE_BUDGET_BYTES * 4);
+        let dropped = cache.insert("huge.png", None, 1, TEXTURE_BUDGET_BYTES * 4);
 
         assert!(dropped.is_empty());
-        assert_eq!(cache.order.len(), 1);
-        assert_eq!(cache.bytes, SOURCE_BUDGET_BYTES * 4);
-        assert_eq!(cache.get_fresh("huge.png", None), Some(1));
+        assert_eq!(cache.eviction_order.len(), 1);
+        assert_eq!(cache.bytes, TEXTURE_BUDGET_BYTES * 4);
+        assert_eq!(cache.fresh_value("huge.png", None), Some(1));
     }
 
-    /// The mesh cache evicts by the same rule, and an entry a person is looking
-    /// at survives a browse that would otherwise push it out.
+    /// The mesh cache drops entries by the same rule. An entry a person is
+    /// looking at survives a browse that would otherwise push it out.
     #[test]
     fn a_touched_entry_outlives_the_ones_around_it() {
         let mut cache = BudgetedCache::new(2 * MESH_BUDGET_BYTES);
         cache.insert("meshes/a.obj", None, 1, MESH_BUDGET_BYTES);
         cache.insert("meshes/b.obj", None, 2, MESH_BUDGET_BYTES);
         // Using `a` makes it the newest, so `b` is the one the budget drops.
-        assert_eq!(cache.get_fresh("meshes/a.obj", None), Some(1));
+        assert_eq!(cache.fresh_value("meshes/a.obj", None), Some(1));
 
         let dropped = cache.insert("meshes/c.obj", None, 3, MESH_BUDGET_BYTES);
 
         assert_eq!(dropped, vec!["meshes/b.obj".to_owned()]);
-        assert_eq!(cache.get_fresh("meshes/a.obj", None), Some(1));
-        assert_eq!(cache.get_fresh("meshes/b.obj", None), None);
+        assert_eq!(cache.fresh_value("meshes/a.obj", None), Some(1));
+        assert_eq!(cache.fresh_value("meshes/b.obj", None), None);
     }
 
     /// A file whose modified time moved is not the cached entry: the preview
@@ -957,7 +1036,7 @@ mod tests {
         let before = Some(SystemTime::UNIX_EPOCH);
         cache.insert("meshes/a.obj", before, 1, 16);
 
-        assert_eq!(cache.get_fresh("meshes/a.obj", before), Some(1));
-        assert_eq!(cache.get_fresh("meshes/a.obj", None), None);
+        assert_eq!(cache.fresh_value("meshes/a.obj", before), Some(1));
+        assert_eq!(cache.fresh_value("meshes/a.obj", None), None);
     }
 }

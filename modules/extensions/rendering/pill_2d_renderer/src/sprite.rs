@@ -9,27 +9,29 @@
 //!
 //! # Design
 //!
-//! The GPU half of the split whose data half is [`crate::component`]: the
-//! components, their field layouts, the viewport types and the instance
-//! record all live there, in a module that names no `wgpu` type.
+//! This is the GPU half of the renderer. Its data half, [`crate::component`],
+//! holds the components, their field layouts, the viewport types and the
+//! instance record, and names no `wgpu` type.
 //!
-//! The upload record below is deliberately private and separate from
-//! [`SpriteInstance`], so `bytemuck` stays on this side of the split too.
+//! The upload record below is private and separate from [`SpriteInstance`] on
+//! purpose, so `bytemuck` stays on this side of the split as well.
 
 // External crates
-use crate::component::{self, RenderViewport, SpriteInstance, VirtualResolution};
 use pill_engine::world::World;
 use wgpu::util::DeviceExt;
+
+// Current crate
+use crate::component::{self, RenderViewport, SpriteInstance, VirtualResolution};
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-/// WGSL source for the sprite render pipeline.
+/// The shader source, in WGSL, for the sprite pipeline.
 ///
-/// Declares the `Viewport` uniform, the per-instance vertex inputs, and both
-/// the vertex and fragment entry points for instanced quad rendering.
-const SHADER_SOURCE: &str = r#"
+/// It declares the `Viewport` uniform and the per-instance vertex inputs, and
+/// holds the vertex and fragment entry points that draw one quad per instance.
+const SPRITE_WGSL_SOURCE: &str = r#"
 struct Viewport {
     size: vec2<f32>,
 };
@@ -78,59 +80,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Viewport background, as sRGB channel values in the 0.0-1.0 range.
+/// The viewport background, one sRGB channel value per entry in 0.0-1.0.
 ///
-/// A dark desaturated blue-grey (roughly `#23282F`), chosen so sprites read
-/// clearly against it without the background competing for attention.
+/// A dark, desaturated blue-grey (about `#23282F`). Sprites read clearly
+/// against it, and the background does not compete with them for attention.
 const VIEWPORT_BACKGROUND_SRGB: [f64; 3] = [35.0 / 255.0, 40.0 / 255.0, 47.0 / 255.0];
 
-/// Convert one sRGB channel to linear.
-///
-/// `wgpu` interprets a clear value as LINEAR when the attachment format is
-/// sRGB, and writes it through unchanged otherwise. Picking a colour by eye in
-/// sRGB and skipping this conversion is the classic way to end up with a
-/// background that looks right on one adapter and nearly black on another, so
-/// the value above is stated once in sRGB and converted per format.
-fn srgb_channel_to_linear(channel: f64) -> f64 {
-    if channel <= 0.04045 {
-        channel / 12.92
-    } else {
-        ((channel + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-/// The clear colour for a target of `format`, from [`VIEWPORT_BACKGROUND_SRGB`].
-fn viewport_background(format: wgpu::TextureFormat) -> wgpu::Color {
-    let [red, green, blue] = VIEWPORT_BACKGROUND_SRGB;
-    let convert = |channel: f64| {
-        if format.is_srgb() {
-            srgb_channel_to_linear(channel)
-        } else {
-            channel
-        }
-    };
-    wgpu::Color {
-        r: convert(red),
-        g: convert(green),
-        b: convert(blue),
-        // Opaque: the viewport is a solid background now, not a transparent
-        // hole a compositor fills in.
-        a: 1.0,
-    }
-}
-
 // =============================================================================
-// GPU records
+// GpuSpriteInstance
 // =============================================================================
 
-/// Per-instance data as the vertex shader reads it.
+/// One sprite, in the shape the vertex shader reads.
 ///
-/// A private mirror of [`SpriteInstance`] that carries the `bytemuck` derives
-/// needed to upload it as raw bytes. The engine-side type stays free of
-/// `bytemuck` so the data half of the renderer has no GPU dependency at all;
-/// the two must therefore be laid out identically, which the assertion below
-/// checks at compile time rather than trusting a comment. If they ever drift,
-/// sprites would render as garbage with no error reported anywhere.
+/// A private copy of [`SpriteInstance`] that derives the `bytemuck` traits the
+/// upload needs. The data-half type stays free of `bytemuck`, so it knows
+/// nothing about the GPU. The two must have the same layout, and the
+/// assertions below check that when the code is compiled: if they ever drifted
+/// apart, sprites would draw as garbage and nothing would report an error.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuSpriteInstance {
@@ -177,8 +143,12 @@ impl From<SpriteInstance> for GpuSpriteInstance {
     }
 }
 
-/// Uniform holding the viewport size, used to convert pixel coordinates to
-/// normalized device coordinates in the vertex shader.
+// =============================================================================
+// ViewportUniform
+// =============================================================================
+
+/// The uniform that carries the viewport size to the vertex shader, which
+/// uses it to turn pixel coordinates into normalized device coordinates.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ViewportUniform {
@@ -186,7 +156,8 @@ struct ViewportUniform {
     width: f32,
     /// Viewport height in pixels.
     height: f32,
-    /// Padding to 16-byte alignment required by WGSL uniform buffers.
+    /// Padding, so the uniform is 16 bytes: the size WGSL requires for a
+    /// uniform buffer.
     _padding: [f32; 2],
 }
 
@@ -196,8 +167,8 @@ struct ViewportUniform {
 
 /// Draws every `(Position, Sprite)` entity as an instanced colored quad.
 ///
-/// Owns a render pipeline and reusable GPU buffers; does not own a window,
-/// surface, device, or queue - callers create those and pass them in.
+/// Owns a render pipeline and the GPU buffers it reuses. It does not own a
+/// window, surface, device or queue: callers create those and pass them in.
 pub struct SpriteRenderer {
     /// Compiled render pipeline for the sprite shader.
     pipeline: wgpu::RenderPipeline,
@@ -209,22 +180,24 @@ pub struct SpriteRenderer {
     instance_buffer: wgpu::Buffer,
     /// Number of `GpuSpriteInstance` slots currently allocated on the GPU.
     instance_capacity: usize,
-    /// Background the render pass clears to, resolved for the target format.
+    /// The colour the render pass clears to, converted for the target format.
     clear_color: wgpu::Color,
 }
 
 impl SpriteRenderer {
-    /// Initial instance-buffer capacity, in sprites. Grown on demand.
-    const INITIAL_CAPACITY: usize = 256;
+    /// How many sprites the instance buffer holds when the renderer is built.
+    /// The buffer is replaced by a larger one when more are needed.
+    const INITIAL_INSTANCE_CAPACITY: usize = 256;
 
-    /// Build the render pipeline for the given device and target format.
+    /// Creates the sprite renderer on `device`: its pipeline, its buffers and
+    /// the bind group, for a target of `target_format`.
     ///
-    /// `target_format` must match the surface/texture format the renderer
-    /// will draw into.
+    /// `target_format` must match the format of the surface or texture the
+    /// renderer draws into.
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sprite shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
+            source: wgpu::ShaderSource::Wgsl(SPRITE_WGSL_SOURCE.into()),
         });
 
         let viewport_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -301,7 +274,8 @@ impl SpriteRenderer {
 
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sprite instance buffer"),
-            size: (Self::INITIAL_CAPACITY * std::mem::size_of::<GpuSpriteInstance>()) as u64,
+            size: (Self::INITIAL_INSTANCE_CAPACITY * std::mem::size_of::<GpuSpriteInstance>())
+                as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -311,15 +285,15 @@ impl SpriteRenderer {
             viewport_buffer,
             viewport_bind_group,
             instance_buffer,
-            instance_capacity: Self::INITIAL_CAPACITY,
-            clear_color: viewport_background(target_format),
+            instance_capacity: Self::INITIAL_INSTANCE_CAPACITY,
+            clear_color: viewport_background_color(target_format),
         }
     }
 
-    /// Draw every `(Position, Sprite)` entity in `world` into `view`.
+    /// Draws every `(Position, Sprite)` entity in `world` into all of `view`.
     ///
-    /// `viewport_width`/`viewport_height` are the render target's size in
-    /// pixels, used to map pixel coordinates to clip space.
+    /// `viewport_width` and `viewport_height` are the render target's size in
+    /// pixels. They are used to map pixel coordinates to clip space.
     pub fn render(
         &mut self,
         world: &mut World,
@@ -338,13 +312,14 @@ impl SpriteRenderer {
         );
     }
 
-    /// Draw sprites within one physical region of a larger render target.
+    /// Draws sprites inside one physical region of a larger render target.
     ///
-    /// The render pass clears the complete target to the opaque viewport
-    /// background before drawing; sprite pixels are transformed and clipped to
-    /// `viewport`. The clear covers the whole target, not just `viewport`, so a
-    /// UI framework compositing above this surface sees the background colour
-    /// wherever its own panels do not paint.
+    /// The render pass clears the whole target to the opaque viewport
+    /// background, then draws the sprites, clipped, inside `viewport`.
+    ///
+    /// The clear covers the whole target, not only `viewport`, so a UI drawn
+    /// above this surface shows the background colour wherever its own panels
+    /// do not paint.
     pub fn render_in_viewport(
         &mut self,
         world: &mut World,
@@ -363,11 +338,11 @@ impl SpriteRenderer {
         );
     }
 
-    /// Draw sprites in a physical viewport using a stable logical resolution.
+    /// Draws sprites in a physical viewport with a fixed logical resolution.
     ///
-    /// Sprite positions and sizes are interpreted in `virtual_resolution`.
-    /// wgpu then scales that complete coordinate space to fill `viewport`, and
-    /// the scissor rectangle prevents pixels from escaping that rectangle.
+    /// Sprite positions and sizes are read in `virtual_resolution`. The GPU
+    /// viewport scales that whole coordinate space to fill `viewport`, and the
+    /// scissor rectangle stops pixels from spilling outside it.
     pub fn render_in_viewport_with_resolution(
         &mut self,
         world: &mut World,
@@ -459,5 +434,45 @@ impl SpriteRenderer {
         }
 
         queue.submit(Some(encoder.finish()));
+    }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Converts one sRGB colour channel to its linear value.
+///
+/// `wgpu` treats a clear value as linear when the target format is sRGB, and
+/// uses it unchanged otherwise. Choosing a colour by eye in sRGB and skipping
+/// this conversion is how a background ends up looking right on one adapter
+/// and almost black on another, so the colour is written once in sRGB, in
+/// [`VIEWPORT_BACKGROUND_SRGB`], and converted for each format.
+fn srgb_channel_to_linear(channel: f64) -> f64 {
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Returns the clear colour for a target of `target_format`, taken from
+/// [`VIEWPORT_BACKGROUND_SRGB`].
+fn viewport_background_color(target_format: wgpu::TextureFormat) -> wgpu::Color {
+    let [red, green, blue] = VIEWPORT_BACKGROUND_SRGB;
+    let channel_in_target_space = |channel: f64| {
+        if target_format.is_srgb() {
+            srgb_channel_to_linear(channel)
+        } else {
+            channel
+        }
+    };
+    wgpu::Color {
+        r: channel_in_target_space(red),
+        g: channel_in_target_space(green),
+        b: channel_in_target_space(blue),
+        // Fully opaque: the viewport is a solid background, so a UI drawn
+        // above this surface never shows a hole here.
+        a: 1.0,
     }
 }

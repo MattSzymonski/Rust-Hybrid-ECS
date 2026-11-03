@@ -1,21 +1,22 @@
-//! The [`AudioManager`] resource: the output device and its sink pools.
+//! The [`AudioManager`] resource: the audio output device and its sink pools.
 //!
 //! # Responsibilities
 //!
-//! - Owns the rodio output stream, which must outlive everything playing
-//!   through it.
-//! - Hands out and reclaims sinks from two fixed pools, one per
-//!   [`SoundType`].
+//! - Owns the rodio output stream. The stream must stay open while any sound
+//!   plays through it, because dropping it stops every sound.
+//! - Hands out a sink from one of two fixed pools, one pool per [`SoundType`],
+//!   and takes it back when the sound using it ends.
 //!
 //! # Design
 //!
-//! A resource, because there is exactly one audio device and the stream must
-//! outlive every sink playing through it.
+//! There is exactly one audio device. A value a system builds per frame would
+//! be dropped at the end of that frame, which silences the sound it just
+//! started, so the device lives in a resource instead.
 //!
-//! Sinks are pooled rather than created on demand: creating one allocates a
-//! mixer channel, and doing that while a frame is being assembled is work on
-//! a path that must not stall. The pool size is therefore also the ceiling on
-//! concurrent voices.
+//! The sinks are pooled instead of created on demand. Creating one makes rodio
+//! allocate a mixer channel, and doing that while a frame is being built would
+//! put an allocation on the audio path, which must not stall. The size of a
+//! pool is therefore also the limit on how many voices play at once.
 
 // External crates
 use pill_engine::Resource;
@@ -30,81 +31,83 @@ use crate::sound_type::SoundType;
 
 /// Sinks the manager creates for non-positional playback.
 ///
-/// A sink is one voice, so this is the ceiling on concurrent 2D sounds. Fixed
-/// at construction because rodio allocates a mixer channel per sink and a pool
-/// that grows mid-frame would allocate on the audio path.
+/// One sink is one voice, so this is also the limit on how many non-positional
+/// sounds play at once. The pool is built once, in [`AudioManager::new`],
+/// because rodio allocates a mixer channel per sink and a pool that grew
+/// mid-frame would allocate on the audio path.
 pub const DEFAULT_AMBIENT_SINK_COUNT: usize = 16;
 
-/// Sinks the manager creates for positional playback.
+/// Sinks the manager creates for positional playback, and so the limit on how
+/// many positional sounds play at once.
 pub const DEFAULT_SPATIAL_SINK_COUNT: usize = 16;
 
-/// Half-distance between the listener's ears, in world units.
+/// Half the distance between the listener's ears, in world units.
 ///
-/// rodio derives its stereo panning from the distance between each ear and the
-/// emitter, so this value is the whole of the panning strength.
+/// rodio pans a spatial sink by the distance between each ear and the emitter,
+/// so this value decides how strong the stereo effect is.
 pub const EAR_SEPARATION: f32 = 1.0;
 
 // =============================================================================
 // AudioManager
 // =============================================================================
 
-/// Owns the output stream and the pools of sinks that play through it.
+/// Owns the output stream and the pooled sinks that play through it.
 ///
-/// A resource, because there is exactly one audio device. It must outlive
-/// every sound playing through it: dropping the stream stops all audio, which
-/// is why this is a resource and not a value a system constructs per frame.
-///
-/// Sinks are pooled rather than created on demand. Creating one allocates a
-/// mixer channel, and doing that while a frame is being assembled is work on
-/// the path that must not stall.
+/// The manager must outlive every sound playing through it, because dropping
+/// the stream stops all audio. It is a resource for that reason, and because
+/// there is exactly one audio device.
 pub struct AudioManager {
-    /// The output stream. Never read after construction, but dropping it
+    /// The output stream. Nothing reads it after construction, but dropping it
     /// silences every sink, so it is held for its lifetime alone.
     _stream: rodio::OutputStream,
-    /// Handle used to build sinks against the stream.
+    /// Handle used to build sinks against the stream. Also handed out by
+    /// [`AudioManager::stream_handle`].
     stream_handle: rodio::OutputStreamHandle,
-    /// Non-positional sinks, indexed by the value in [`AudioSourceComponent::sink`].
-    ambient: Vec<rodio::Sink>,
+    /// Non-positional sinks, indexed by the sink index a source stores in
+    /// [`AudioSourceComponent::sink`].
+    ambient_sinks: Vec<rodio::Sink>,
     /// Positional sinks, indexed the same way.
-    spatial: Vec<rodio::SpatialSink>,
-    /// Ambient sink indices not currently assigned to a source.
-    free_ambient: Vec<u32>,
-    /// Spatial sink indices not currently assigned to a source.
-    free_spatial: Vec<u32>,
+    spatial_sinks: Vec<rodio::SpatialSink>,
+    /// Indices of the ambient sinks that no source holds.
+    free_ambient_sink_indices: Vec<u32>,
+    /// Indices of the spatial sinks that no source holds.
+    free_spatial_sink_indices: Vec<u32>,
 }
 
 // SAFETY: every field is `Send` in rodio 0.20 except `OutputStream`, which is
-// not because the underlying cpal stream is tied to the thread that created
-// it on some backends. The engine only ever reaches this resource from a
-// system, and the scheduler serialises `ResMut<AudioManager>` against every
-// other accessor, so the value is touched by one thread at a time. What it
-// must not do is *move* between threads while a sink plays - which the
-// resource store never does: a resource is written once into world memory and
-// read in place thereafter.
+// not, because the cpal stream inside it belongs to the thread that created it
+// on some platforms. The engine only reaches this resource from a system, and
+// the scheduler serialises `ResMut<AudioManager>` against every other
+// accessor, so one thread touches the value at a time. It must also not move
+// between threads while a sink plays, and the resource store never moves it: a
+// resource is written once into world memory and read in place from then on.
 unsafe impl Send for AudioManager {}
-// SAFETY: as above; shared access is serialised by the same analysis.
+// SAFETY: `Sync` needs nothing beyond what `Send` above argues - the scheduler
+// hands out one accessor at a time, so two threads never share the value.
 unsafe impl Sync for AudioManager {}
 
 impl Resource for AudioManager {}
 
 impl AudioManager {
-    /// Open the default output device and build both sink pools.
+    /// Opens the default output device and builds both sink pools.
     ///
-    /// Returns `None` when no audio device is available - a headless CI
-    /// runner, a container, a machine with audio disabled. That is an ordinary
-    /// condition rather than an error: [`crate::register`] then installs no
+    /// Returns `None` when there is no audio device: a headless CI runner, a
+    /// container, a machine with audio turned off. That is an ordinary
+    /// condition rather than an error. [`crate::register`] then installs no
     /// manager, and [`crate::audio_system`] only drains queued sound loads.
-    pub fn new(ambient_count: usize, spatial_count: usize) -> Option<Self> {
+    pub fn new(ambient_sink_count: usize, spatial_sink_count: usize) -> Option<Self> {
+        // Step 1: Open the default output device.
         let (stream, stream_handle) = rodio::OutputStream::try_default().ok()?;
 
-        let mut ambient = Vec::with_capacity(ambient_count);
-        for _ in 0..ambient_count {
-            ambient.push(rodio::Sink::try_new(&stream_handle).ok()?);
+        // Step 2: Build one sink per voice in each pool.
+        let mut ambient_sinks = Vec::with_capacity(ambient_sink_count);
+        for _ in 0..ambient_sink_count {
+            ambient_sinks.push(rodio::Sink::try_new(&stream_handle).ok()?);
         }
 
-        let mut spatial = Vec::with_capacity(spatial_count);
-        for _ in 0..spatial_count {
-            spatial.push(
+        let mut spatial_sinks = Vec::with_capacity(spatial_sink_count);
+        for _ in 0..spatial_sink_count {
+            spatial_sinks.push(
                 rodio::SpatialSink::try_new(
                     &stream_handle,
                     [0.0, 0.0, 0.0],
@@ -115,101 +118,108 @@ impl AudioManager {
             );
         }
 
-        // Handed out from the back, so the pools drain in index order.
-        let free_ambient = (0..ambient_count as u32).rev().collect();
-        let free_spatial = (0..spatial_count as u32).rev().collect();
+        // Step 3: Fill the free lists back to front, so `pop` hands out index
+        // 0 first and the pools run in index order.
+        let free_ambient_sink_indices = (0..ambient_sink_count as u32).rev().collect();
+        let free_spatial_sink_indices = (0..spatial_sink_count as u32).rev().collect();
 
         Some(Self {
             _stream: stream,
             stream_handle,
-            ambient,
-            spatial,
-            free_ambient,
-            free_spatial,
+            ambient_sinks,
+            spatial_sinks,
+            free_ambient_sink_indices,
+            free_spatial_sink_indices,
         })
     }
 
-    /// Open the default device with the default pool sizes.
+    /// Opens the default device with the default pool sizes.
     pub fn with_defaults() -> Option<Self> {
         Self::new(DEFAULT_AMBIENT_SINK_COUNT, DEFAULT_SPATIAL_SINK_COUNT)
     }
 
-    /// Take a free sink index from the pool `sound_type` names.
+    /// Takes a free sink index from the pool that `sound_type` names.
     ///
-    /// `None` when every sink of that kind is busy, which caps concurrent
-    /// voices rather than allocating under load.
+    /// Returns `None` when every sink of that kind is busy, which limits the
+    /// number of voices instead of allocating more under load.
     pub fn acquire(&mut self, sound_type: SoundType) -> Option<u32> {
         match sound_type {
-            SoundType::Ambient => self.free_ambient.pop(),
-            SoundType::Spatial => self.free_spatial.pop(),
+            SoundType::Ambient => self.free_ambient_sink_indices.pop(),
+            SoundType::Spatial => self.free_spatial_sink_indices.pop(),
         }
     }
 
-    /// Return a sink to its pool, stopping whatever it was playing.
+    /// Returns a sink to its pool, stopping whatever it was playing.
     ///
-    /// Stopping is what makes the sink reusable: a sink still holding a
-    /// decoder would resume the previous sound when the next source appended
-    /// to it. Returning an index twice is refused rather than corrupting the
-    /// pool - a double free would hand one sink to two sources.
-    pub fn release(&mut self, sound_type: SoundType, sink: u32) {
-        let free = match sound_type {
-            SoundType::Ambient => &mut self.free_ambient,
-            SoundType::Spatial => &mut self.free_spatial,
+    /// Stopping is what makes the sink reusable. rodio queues a new source
+    /// behind whatever the sink still holds, so leftover audio from the last
+    /// sound would play first; a stopped sink ends its current sound and drops
+    /// the queued ones within a few milliseconds. Handing back an index the
+    /// pool already holds is refused, because a double free would give one
+    /// sink to two sources.
+    pub fn release(&mut self, sound_type: SoundType, sink_index: u32) {
+        let unassigned_sink_indices = match sound_type {
+            SoundType::Ambient => &mut self.free_ambient_sink_indices,
+            SoundType::Spatial => &mut self.free_spatial_sink_indices,
         };
-        if free.contains(&sink) {
+        if unassigned_sink_indices.contains(&sink_index) {
             return;
         }
         match sound_type {
             SoundType::Ambient => {
-                if let Some(handle) = self.ambient.get(sink as usize) {
-                    handle.stop();
+                if let Some(pooled_sink) = self.ambient_sinks.get(sink_index as usize) {
+                    pooled_sink.stop();
                 }
             }
             SoundType::Spatial => {
-                if let Some(handle) = self.spatial.get(sink as usize) {
-                    handle.stop();
+                if let Some(pooled_sink) = self.spatial_sinks.get(sink_index as usize) {
+                    pooled_sink.stop();
                 }
             }
         }
-        free.push(sink);
+        unassigned_sink_indices.push(sink_index);
     }
 
-    /// Whether the sink has audio queued and is not paused.
-    pub fn is_playing(&self, sound_type: SoundType, sink: u32) -> bool {
+    /// Returns whether the sink has audio queued and is not paused.
+    ///
+    /// An index with no sink of that kind reports `false`.
+    pub fn is_playing(&self, sound_type: SoundType, sink_index: u32) -> bool {
         match sound_type {
             SoundType::Ambient => self
-                .ambient
-                .get(sink as usize)
-                .is_some_and(|handle| !handle.empty() && !handle.is_paused()),
+                .ambient_sinks
+                .get(sink_index as usize)
+                .is_some_and(|pooled_sink| !pooled_sink.empty() && !pooled_sink.is_paused()),
             SoundType::Spatial => self
-                .spatial
-                .get(sink as usize)
-                .is_some_and(|handle| !handle.empty() && !handle.is_paused()),
+                .spatial_sinks
+                .get(sink_index as usize)
+                .is_some_and(|pooled_sink| !pooled_sink.empty() && !pooled_sink.is_paused()),
         }
     }
 
-    /// Whether the sink has drained everything appended to it.
-    pub fn is_finished(&self, sound_type: SoundType, sink: u32) -> bool {
+    /// Returns whether the sink has drained everything appended to it.
+    ///
+    /// An index with no sink of that kind counts as finished.
+    pub fn is_finished(&self, sound_type: SoundType, sink_index: u32) -> bool {
         match sound_type {
             SoundType::Ambient => self
-                .ambient
-                .get(sink as usize)
+                .ambient_sinks
+                .get(sink_index as usize)
                 .is_none_or(rodio::Sink::empty),
             SoundType::Spatial => self
-                .spatial
-                .get(sink as usize)
+                .spatial_sinks
+                .get(sink_index as usize)
                 .is_none_or(rodio::SpatialSink::empty),
         }
     }
 
-    /// Queue `sound` on `sink` and begin playing at `volume`.
+    /// Queues `sound` on `sink_index` and starts playing it at `volume`.
     ///
-    /// Returns `false`, leaving the sink untouched, when the bytes cannot be
-    /// decoded or `sink` names no sink of that kind.
+    /// Returns `false` and leaves the sink untouched when the bytes cannot be
+    /// decoded or when `sink_index` names no sink of that kind.
     pub(crate) fn start(
         &self,
         sound_type: SoundType,
-        sink: u32,
+        sink_index: u32,
         sound: &Sound,
         volume: f32,
     ) -> bool {
@@ -218,82 +228,86 @@ impl AudioManager {
         };
         match sound_type {
             SoundType::Ambient => {
-                let Some(handle) = self.ambient.get(sink as usize) else {
+                let Some(pooled_sink) = self.ambient_sinks.get(sink_index as usize) else {
                     return false;
                 };
-                handle.append(decoder);
-                handle.set_volume(volume);
-                handle.play();
+                pooled_sink.append(decoder);
+                pooled_sink.set_volume(volume);
+                pooled_sink.play();
             }
             SoundType::Spatial => {
-                let Some(handle) = self.spatial.get(sink as usize) else {
+                let Some(pooled_sink) = self.spatial_sinks.get(sink_index as usize) else {
                     return false;
                 };
-                handle.append(decoder);
-                handle.set_volume(volume);
-                handle.play();
+                pooled_sink.append(decoder);
+                pooled_sink.set_volume(volume);
+                pooled_sink.play();
             }
         }
         true
     }
 
-    /// Halt a sink without releasing it.
-    pub(crate) fn pause(&self, sound_type: SoundType, sink: u32) {
+    /// Halts a sink without returning it to the pool.
+    pub(crate) fn pause(&self, sound_type: SoundType, sink_index: u32) {
         match sound_type {
             SoundType::Ambient => {
-                if let Some(handle) = self.ambient.get(sink as usize) {
-                    handle.pause();
+                if let Some(pooled_sink) = self.ambient_sinks.get(sink_index as usize) {
+                    pooled_sink.pause();
                 }
             }
             SoundType::Spatial => {
-                if let Some(handle) = self.spatial.get(sink as usize) {
-                    handle.pause();
+                if let Some(pooled_sink) = self.spatial_sinks.get(sink_index as usize) {
+                    pooled_sink.pause();
                 }
             }
         }
     }
 
-    /// Set a playing sink's volume.
-    pub(crate) fn set_volume(&self, sound_type: SoundType, sink: u32, volume: f32) {
+    /// Sets a sink's playback volume, where 1.0 is the sound's own level.
+    pub(crate) fn set_volume(&self, sound_type: SoundType, sink_index: u32, volume: f32) {
         match sound_type {
             SoundType::Ambient => {
-                if let Some(handle) = self.ambient.get(sink as usize) {
-                    handle.set_volume(volume);
+                if let Some(pooled_sink) = self.ambient_sinks.get(sink_index as usize) {
+                    pooled_sink.set_volume(volume);
                 }
             }
             SoundType::Spatial => {
-                if let Some(handle) = self.spatial.get(sink as usize) {
-                    handle.set_volume(volume);
+                if let Some(pooled_sink) = self.spatial_sinks.get(sink_index as usize) {
+                    pooled_sink.set_volume(volume);
                 }
             }
         }
     }
 
-    /// Move a spatial sink's emitter to a world position.
-    pub(crate) fn set_emitter(&self, sink: u32, position: [f32; 3]) {
-        if let Some(handle) = self.spatial.get(sink as usize) {
-            handle.set_emitter_position(position);
+    /// Moves a spatial sink's emitter to a world position.
+    pub(crate) fn set_emitter(&self, sink_index: u32, emitter_position: [f32; 3]) {
+        if let Some(pooled_sink) = self.spatial_sinks.get(sink_index as usize) {
+            pooled_sink.set_emitter_position(emitter_position);
         }
     }
 
-    /// Move every spatial sink's ears.
+    /// Moves the ears of every spatial sink.
     ///
-    /// The ears belong to the listener, not to a sound, so they are set on all
-    /// sinks at once rather than per source.
-    pub(crate) fn set_ears(&self, left: [f32; 3], right: [f32; 3]) {
-        for handle in &self.spatial {
-            handle.set_left_ear_position(left);
-            handle.set_right_ear_position(right);
+    /// The ears belong to the listener, not to a sound, so they are set on
+    /// every spatial sink at once instead of per source.
+    pub(crate) fn set_ears(&self, left_ear_position: [f32; 3], right_ear_position: [f32; 3]) {
+        for pooled_sink in &self.spatial_sinks {
+            pooled_sink.set_left_ear_position(left_ear_position);
+            pooled_sink.set_right_ear_position(right_ear_position);
         }
     }
 
-    /// The stream handle, for code building its own sinks.
+    /// Returns the stream handle, for code that builds its own sinks.
     pub fn stream_handle(&self) -> &rodio::OutputStreamHandle {
         &self.stream_handle
     }
 
-    /// How many sinks of each kind are unassigned, as `(ambient, spatial)`.
+    /// Returns how many sinks of each kind are unassigned, as
+    /// `(ambient, spatial)`.
     pub fn free_counts(&self) -> (usize, usize) {
-        (self.free_ambient.len(), self.free_spatial.len())
+        (
+            self.free_ambient_sink_indices.len(),
+            self.free_spatial_sink_indices.len(),
+        )
     }
 }

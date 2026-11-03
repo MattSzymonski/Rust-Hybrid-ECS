@@ -1,28 +1,32 @@
-//! The GPU objects behind the asset store, kept level with it one type at a
-//! time.
+//! The GPU objects behind the asset store, kept up to date with it one asset
+//! type at a time.
 //!
 //! # Responsibilities
 //!
 //! - Hold one GPU object per live asset - shader, texture, mesh, material - and
 //!   the content version it was built from.
-//! - Bring those objects level with the store when its revision moves, and only
-//!   what moved: one edited texture is re-uploaded while its neighbours keep the
-//!   objects they already have, and a removed asset frees its slot.
-//! - Own the resource epoch: the counter that moves whenever a shader or texture
-//!   object changes, which is what tells the chain its bind groups are stale.
+//! - Bring those objects up to date when the store's revision moves, and only
+//!   the ones that moved: an edited texture is uploaded again while its
+//!   neighbours keep the objects they already have, and a removed asset frees
+//!   its slot.
+//! - Own the resource epoch, the counter that increases whenever a shader or
+//!   texture object changes. The chain reads it to learn that its bind groups
+//!   are out of date.
 //! - Resolve a frame's instances to the GPU handles the draw path needs, and
-//!   hold the defaults an asset that names nothing falls back to.
+//!   hold the default shader and material that an asset naming none falls back
+//!   to.
 //!
 //! # Design
 //!
-//! A mirror, not a cache: `AssetManager` looks assets up by handle and this
-//! caches by key, so every sync walks the store's column for its own type - the
-//! only way back from a cached key to whether the asset behind it is still live.
+//! This mirrors the store rather than caching it: `AssetManager` looks assets
+//! up by handle, while this keys its GPU objects by asset key. A key alone does
+//! not say whether the asset behind it is still live, so every sync walks the
+//! store's column for its own asset type.
 //!
-//! Failures are per-asset, never fatal: a texture that will not upload, a shader
-//! that will not compile, a material whose pipeline will not build is named in
-//! the log and skipped, and the unrecorded version is what makes the next
-//! revision try it again.
+//! A failure is per asset and never fatal: a texture that will not upload, a
+//! shader that will not compile or a material whose pipeline will not build is
+//! named in the log and skipped. Its version is left unrecorded, so the next
+//! store revision tries it again.
 
 // Standard library
 use std::collections::{HashMap, HashSet};
@@ -48,31 +52,37 @@ use crate::{
     Instance,
 };
 
+// =============================================================================
+// GpuColumn
+// =============================================================================
+
 /// One asset type's GPU objects, keyed by asset key.
 ///
 /// An entry is the handle of the object on the GPU plus the content version it
-/// was built from. `None` for the version is the fourth state the sync needs:
-/// the handle is still there, but the object behind it is stale, so the next sync
-/// rebuilds it - which is what a material whose shader or texture moved asks for
-/// without its own content changing.
+/// was built from, which leaves the sync four cases per key: not built yet,
+/// built from the current version, built from an older version, and built but
+/// marked stale. The last one keeps the handle and forgets the version, so the
+/// next sync rebuilds the object even though the asset's own content did not
+/// change - which is what a material asks for when its shader or texture moved.
 pub(crate) struct GpuColumn<H> {
     entries: HashMap<u64, (H, Option<u64>)>,
 }
 
 impl<H: Copy> GpuColumn<H> {
-    /// A column with nothing mirrored.
+    /// Creates a column that holds no objects yet.
     pub(crate) fn new() -> Self {
         Self {
             entries: HashMap::new(),
         }
     }
 
-    /// The object behind `key`, when one is there.
+    /// The handle of the object behind `key`, when one is there.
     pub(crate) fn handle(&self, key: u64) -> Option<H> {
         self.entries.get(&key).map(|(handle, _)| *handle)
     }
 
-    /// Whether `key`'s object was built from content version `version`.
+    /// Returns whether `key`'s object was built from content version
+    /// `version`.
     fn is_current(&self, key: u64, version: u64) -> bool {
         matches!(self.entries.get(&key), Some((_, Some(built))) if *built == version)
     }
@@ -82,25 +92,26 @@ impl<H: Copy> GpuColumn<H> {
         self.entries.insert(key, (handle, Some(version)));
     }
 
-    /// Takes `key`'s object out, for the rebuild that replaces or drops it.
+    /// Removes `key`'s entry and hands back its handle, for the rebuild that
+    /// replaces or drops the object.
     fn remove(&mut self, key: u64) -> Option<H> {
         self.entries.remove(&key).map(|(handle, _)| handle)
     }
 
     /// Keeps `key`'s handle but forgets the version, so the next sync rebuilds
-    /// it against whatever the object now depends on.
+    /// it from the assets it depends on as they are now.
     fn invalidate(&mut self, key: u64) {
         if let Some((_, version)) = self.entries.get_mut(&key) {
             *version = None;
         }
     }
 
-    /// Every key the column holds.
+    /// Returns every key the column holds.
     fn keys(&self) -> impl Iterator<Item = u64> + '_ {
         self.entries.keys().copied()
     }
 
-    /// Forgets every object's version, keeping the handles: the next sync
+    /// Forgets every object's version and keeps the handles, so the next sync
     /// rebuilds all of them.
     fn invalidate_all(&mut self) {
         for (_, version) in self.entries.values_mut() {
@@ -109,46 +120,59 @@ impl<H: Copy> GpuColumn<H> {
     }
 }
 
+// =============================================================================
+// RenderingResourcesManager
+// =============================================================================
+
 /// The GPU objects behind the asset store, and what they were built from.
+///
+/// The four columns below hold, per asset type, the content version each GPU
+/// object was built from. A key that is not recorded, or whose version moved,
+/// is rebuilt; a key whose version matches keeps its object.
 pub(crate) struct RenderingResourcesManager {
-    /// The store revision these caches are level with, or `None` after an
-    /// explicit invalidation; the sync runs when it does not match the store's.
+    /// The store revision these caches are up to date with, or `None` after an
+    /// explicit invalidation. The sync runs when it does not match the store's
+    /// revision.
     synced_revision: Option<u64>,
-    /// Content version of every asset the GPU object behind a key was built
-    /// from, one column per asset type. A key whose version moved - or that is
-    /// not recorded here at all - is rebuilt; a key whose version matches keeps
-    /// its object.
+    /// Shader objects by asset key.
     shaders: GpuColumn<RendererShaderHandle>,
+    /// Material objects by asset key.
     materials: GpuColumn<RendererMaterialHandle>,
+    /// Texture objects by asset key.
     textures: GpuColumn<RendererTextureHandle>,
+    /// Mesh objects by asset key.
     meshes: GpuColumn<RendererMeshHandle>,
-    /// What an asset that names no shader, or no material, draws with.
+    /// The shader an instance draws with when its material names none, names
+    /// one that is not loaded, or is not in the resource storage.
     default_shader: RendererShaderHandle,
+    /// The material an instance draws with when its material never built.
     default_material: RendererMaterialHandle,
-    /// Bumped whenever a shader or texture object is created, recreated, or
-    /// dropped: pass bind groups reference those objects by handle, so a change
-    /// to one is what invalidates them.
+    /// Generation counter for the shader and texture objects, increased by one
+    /// in each sync that created, recreated or dropped one. Pass bind groups
+    /// reference those objects by handle, so such a change is what puts them
+    /// out of date.
     resource_epoch: u64,
-    /// Scratch: every key the store still holds for the column being walked.
+    /// Scratch: the keys the store still holds for the column being walked.
     ///
-    /// One set serves all four columns, because the walks run in sequence and
-    /// each clears it first.
-    live: HashSet<u64>,
-    /// Scratch: the keys whose object this sync rebuilt. Read once, by
-    /// `invalidate_dependent_materials`, and meaningless outside the sync that
-    /// filled it.
-    changed: HashSet<u64>,
+    /// One set serves all four columns, because the walks run one after
+    /// another and each clears it first.
+    live_asset_keys: HashSet<u64>,
+    /// Scratch: the keys whose object this sync rebuilt or removed. Read once,
+    /// by `invalidate_dependent_materials`, and meaningless outside the sync
+    /// that filled it.
+    changed_asset_keys: HashSet<u64>,
 }
 
 impl RenderingResourcesManager {
-    /// Nothing mirrored yet, plus the two objects the fallbacks need.
+    /// Creates a manager holding no GPU objects, plus the two objects the
+    /// fallbacks need.
     ///
     /// # Errors
     ///
     /// Returns a [`RendererError`](crate::RendererError) when the built-in lit
-    /// shader or the material built from it will not build. Every later fallback
-    /// depends on those two, so this is the one creation failure here that is
-    /// worth refusing to start over.
+    /// shader or the material built from it will not build. Both defaults are
+    /// built here and every later fallback depends on them, so this is the one
+    /// creation failure that stops the renderer from starting.
     pub(crate) fn new(state: &mut State) -> Result<Self> {
         let (default_shader, default_material) = install_default_material(state)?;
         Ok(Self {
@@ -160,53 +184,59 @@ impl RenderingResourcesManager {
             default_shader,
             default_material,
             resource_epoch: 0,
-            live: HashSet::new(),
-            changed: HashSet::new(),
+            live_asset_keys: HashSet::new(),
+            changed_asset_keys: HashSet::new(),
         })
     }
 
-    /// Bring the GPU caches level with the asset store, per asset.
+    /// Brings the GPU objects up to date with the asset store, one asset at a
+    /// time.
     ///
-    /// The manager's revision gates the pass, and its per-asset content versions
-    /// decide what inside it moved: one edited texture is re-uploaded while its
-    /// neighbours keep their GPU objects, and a removed asset frees its slot.
-    /// Creation failures are reported and skipped rather than aborting the pass,
-    /// so one bad asset neither holds the rest of the revision hostage nor is
-    /// retried every frame.
+    /// The store's revision decides whether this pass runs at all. Each
+    /// asset's content version then decides whether its object is rebuilt, so
+    /// one edited texture is uploaded again while its neighbours keep their
+    /// GPU objects and a removed asset frees its slot. A creation failure is
+    /// logged and skipped instead of ending the pass, so one bad asset neither
+    /// blocks the rest of the revision nor is retried every frame.
     ///
-    /// The scratch sets it walks with are reused across calls rather than
-    /// allocated per column: this runs whenever the store moved, which for a
-    /// game that edits assets is every frame.
+    /// The scratch sets are fields rather than locals, because this runs on
+    /// every frame in which the store moved and a game that edits assets moves
+    /// it often.
     pub(crate) fn sync(&mut self, assets: &AssetManager, state: &mut State) {
         if self.synced_revision == Some(assets.revision()) {
             return;
         }
         self.synced_revision = Some(assets.revision());
 
-        // Textures and shaders first: materials bind them by handle. The epoch
-        // moves only when one of these two layers did, because those are the
-        // objects a pass's bind groups keep - and the materials built against
-        // them are invalidated by key, because their own content version alone
-        // would not ask for a rebuild.
-        self.changed.clear();
+        // Step 1: Textures and shaders first, because materials bind them by
+        // handle. Only these two move the epoch: they are the objects a pass's
+        // bind groups keep.
+        self.changed_asset_keys.clear();
         let mut epoch_moved = self.sync_textures(assets, state);
         epoch_moved |= self.sync_shaders(assets, state);
+        // Step 2: Meshes. The draw path resolves a mesh handle per frame, so a
+        // rebuilt mesh needs no epoch bump.
         self.sync_meshes(assets, state);
-        if !self.changed.is_empty() {
+        // Step 3: Rebuild the materials built against an object that just
+        // changed. Their own content version alone would not ask for that, so
+        // their version record is dropped first; then the materials whose own
+        // content moved.
+        if !self.changed_asset_keys.is_empty() {
             self.invalidate_dependent_materials(assets);
         }
         self.sync_materials(assets, state);
+        // Step 4: Increase the epoch once, if a shader or texture object moved.
         if epoch_moved {
             self.resource_epoch = self.resource_epoch.wrapping_add(1);
         }
     }
 
-    /// Forget which versions the objects were built from, so the next sync
-    /// rebuilds every one of them.
+    /// Forgets which versions the objects were built from, so the next sync
+    /// rebuilds all of them.
     ///
-    /// The objects themselves are left in place until that rebuild replaces
-    /// them: the sync removes a key's old object as it creates the new one, so
-    /// clearing the records is enough to make the whole store reach the GPU
+    /// The objects themselves stay in place until that rebuild replaces them:
+    /// the sync removes a key's old object when it creates the new one, so
+    /// clearing the records is enough to get the whole store onto the GPU
     /// again.
     pub(crate) fn invalidate(&mut self) {
         self.synced_revision = None;
@@ -216,48 +246,56 @@ impl RenderingResourcesManager {
         self.materials.invalidate_all();
     }
 
-    /// One queue item per drawable instance, sorted for recording.
+    /// Builds one queue item per drawable instance, sorted so that draws
+    /// sharing a key are recorded as one instanced draw.
     ///
-    /// An instance whose mesh never uploaded is skipped; one whose material
-    /// never built falls back to the default material, and a material with no
-    /// shader of its own to the default shader. A partially-broken revision
-    /// therefore still draws something, which is what the two defaults are for.
+    /// An instance whose mesh never uploaded is skipped. One whose material
+    /// never built draws with the default material, and a material the
+    /// resource storage does not hold draws with the default shader. A partly
+    /// broken revision therefore still draws something, which is what the two
+    /// defaults are for.
     pub(crate) fn build_queue(&self, frame: &RenderFrame, state: &State) -> Vec<RenderQueueItem> {
         let resolve_zone = pill_core::profile_scope!("build queue: resolve instances");
         let mut queue = Vec::with_capacity(frame.instances.len());
-        // The last mesh and material keys resolved, with what they resolved to.
-        // Instances that share both are usually many and adjacent (one
-        // archetype's worth), so remembering one pair skips nearly every
-        // lookup - and those lookups are the whole of this function's time once
-        // thousands of instances share one mesh and material. Nothing changes
-        // the caches during the call, so a remembered answer is the answer a
-        // fresh lookup would give.
-        let mut last_resolved = None;
+        // The mesh and material keys resolved last, with the handles they
+        // resolved to. Instances that share both are usually many and next to
+        // each other (one archetype's worth), so keeping one pair skips nearly
+        // every lookup - and those lookups take most of this function's time
+        // once thousands of instances share one mesh and material. Nothing
+        // changes the caches during the call, so a remembered answer is the
+        // one a fresh lookup would give.
+        let mut last_resolved_handles = None;
         for (index, instance) in frame.instances.iter().enumerate() {
-            let resolved = match last_resolved {
-                Some((mesh_key, material_key, resolved))
+            let resolved_handles = match last_resolved_handles {
+                Some((mesh_key, material_key, resolved_handles))
                     if mesh_key == instance.mesh && material_key == instance.material =>
                 {
-                    resolved
+                    resolved_handles
                 }
                 _ => {
-                    // The renderer's own caches key by the raw value; the frame
-                    // names it as a typed key.
-                    let resolved =
+                    // The renderer's own caches key by the raw value, while the
+                    // frame names it as a typed key.
+                    let resolved_handles =
                         self.resolve_draw_handles(instance.mesh.0, instance.material.0, state);
-                    last_resolved = Some((instance.mesh, instance.material, resolved));
-                    resolved
+                    last_resolved_handles =
+                        Some((instance.mesh, instance.material, resolved_handles));
+                    resolved_handles
                 }
             };
-            let Some((shader, material, mesh)) = resolved else {
+            let Some((shader_handle, material_handle, mesh_handle)) = resolved_handles else {
                 continue;
             };
             queue.push(RenderQueueItem {
-                key: compose_render_queue_key(instance.rendering_order, shader, material, mesh),
+                key: compose_render_queue_key(
+                    instance.rendering_order,
+                    shader_handle,
+                    material_handle,
+                    mesh_handle,
+                ),
                 frame_instance_index: index as u32,
-                shader,
-                material,
-                mesh,
+                shader: shader_handle,
+                material: material_handle,
+                mesh: mesh_handle,
             });
         }
         drop(resolve_zone);
@@ -266,11 +304,11 @@ impl RenderingResourcesManager {
         queue
     }
 
-    /// The shader, material and mesh objects one instance draws with, or `None`
-    /// when its mesh never uploaded.
+    /// Returns the shader, material and mesh handles one instance draws with,
+    /// or `None` when its mesh never uploaded.
     ///
     /// A material that never built falls back to the default material, and a
-    /// material with no shader of its own to the default shader.
+    /// material the resource storage does not hold to the default shader.
     fn resolve_draw_handles(
         &self,
         mesh_key: u64,
@@ -281,34 +319,36 @@ impl RenderingResourcesManager {
         RendererMaterialHandle,
         RendererMeshHandle,
     )> {
-        let mesh = self.meshes.handle(mesh_key)?;
-        let material = self
+        let mesh_handle = self.meshes.handle(mesh_key)?;
+        let material_handle = self
             .materials
             .handle(material_key)
             .unwrap_or(self.default_material);
-        let shader = state
+        let shader_handle = state
             .renderer_resource_storage
             .materials
-            .get(material)
+            .get(material_handle)
             .map(|material| material.shader_handle)
             .unwrap_or(self.default_shader);
-        Some((shader, material, mesh))
+        Some((shader_handle, material_handle, mesh_handle))
     }
 
-    /// The shader column, for naming a pass's shader in the queue.
+    /// Returns the shader column, which the chain reads to find the pipeline
+    /// behind a pass's shader.
     pub(crate) fn shader_handles(&self) -> &GpuColumn<RendererShaderHandle> {
         &self.shaders
     }
 
-    /// What the chain needs of these caches to build its GPU objects.
+    /// Returns what the chain needs from these caches to build its GPU
+    /// objects.
     ///
-    /// The chain reads the shader and texture caches by key and the epoch that
-    /// moves when one of them is rebuilt, beside the surface it is built for;
-    /// bundling them here keeps the borrow split in one place instead of at
-    /// every call site. The surface arrives as the pieces the chain reads -
-    /// its format, its size, its depth buffer and its offscreen targets -
-    /// rather than as the whole target, so the chain they belong to can be
-    /// rebuilt at the same time.
+    /// The chain reads the shader and texture columns by key, together with
+    /// the epoch that moves when one of them is rebuilt. Passing them together
+    /// keeps the borrow split in one place instead of at every call site. The
+    /// surface arrives as the pieces the chain reads - its format, its size,
+    /// its depth buffer and its offscreen targets - rather than as the whole
+    /// target, so the chain those pieces belong to can be rebuilt at the same
+    /// time.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn chain_context<'a>(
         &'a self,
@@ -330,51 +370,55 @@ impl RenderingResourcesManager {
         }
     }
 
-    /// Forget every built material that reads an asset just recreated.
+    /// Forgets the version of every material that reads an asset this sync
+    /// rebuilt.
     ///
-    /// A material's bind groups are built against the layouts and views its
-    /// shader and textures had at the time; when one of those is rebuilt or
-    /// removed, the groups go stale while the material's own content version
-    /// stands still. Dropping the version record is what makes `sync_materials`
-    /// rebuild it in the same pass, against the new object.
+    /// A material's bind groups are built from the layouts and views its
+    /// shader and textures had at the time. When one of those is rebuilt or
+    /// removed, the bind groups are out of date, yet the material's own
+    /// content version does not change. Forgetting the version makes
+    /// `sync_materials` rebuild the material in the same pass, against the new
+    /// object.
     fn invalidate_dependent_materials(&mut self, assets: &AssetManager) {
         for (handle, material) in assets.iter_handles::<Material>() {
-            let shader_changed = self.changed.contains(&asset_key(material.shader));
-            let texture_changed = material
-                .textures
-                .values()
-                .any(|texture| self.changed.contains(&asset_key(texture.texture)));
+            let shader_changed = self
+                .changed_asset_keys
+                .contains(&asset_key(material.shader));
+            let texture_changed = material.textures.values().any(|texture| {
+                self.changed_asset_keys
+                    .contains(&asset_key(texture.texture))
+            });
             if shader_changed || texture_changed {
                 self.materials.invalidate(asset_key(handle));
             }
         }
     }
 
-    /// Drop and rebuild the textures whose asset changed.
+    /// Drops and rebuilds the textures whose asset changed.
     ///
-    /// Returns whether any texture object was created, recreated, or dropped.
-    /// Keys whose object moved are added to `changed`, so the materials built
-    /// against them can be rebuilt too.
+    /// Returns whether any texture object was created, recreated or dropped.
+    /// Keys whose object moved are added to `changed_asset_keys`, so the
+    /// materials built against them can be rebuilt too.
     fn sync_textures(&mut self, assets: &AssetManager, state: &mut State) -> bool {
         let mut epoch_moved = false;
-        // Every key the store still holds, collected while the rebuild pass
-        // walks it. The mirror caches by key and `AssetManager` looks up by handle,
-        // so walking the store is the only way back from a cached key to whether
-        // the asset behind it is still live.
-        self.live.clear();
+        // The keys the store still holds, collected while the rebuild loop
+        // walks it. These caches key by asset key and `AssetManager` looks
+        // assets up by handle, so walking the store is the only way to tell
+        // whether the asset behind a cached key is still live.
+        self.live_asset_keys.clear();
 
         for (handle, texture) in assets.iter_handles::<Texture>() {
             let key = asset_key(handle);
-            self.live.insert(key);
+            self.live_asset_keys.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
             if self.textures.is_current(key, version) {
                 continue;
             }
-            // Recorded before the rebuild: even a failed creation dropped the
-            // texture the old materials were built against.
-            self.changed.insert(key);
-            if let Some(old) = self.textures.remove(key) {
-                state.renderer_resource_storage.textures.remove(old);
+            // Recorded before the rebuild, because a failed creation has still
+            // dropped the texture the old materials were built against.
+            self.changed_asset_keys.insert(key);
+            if let Some(old_handle) = self.textures.remove(key) {
+                state.renderer_resource_storage.textures.remove(old_handle);
             }
             match RendererTexture::new_texture(
                 &state.device,
@@ -385,13 +429,16 @@ impl RenderingResourcesManager {
                 texture.height,
                 texture.texture_type,
             ) {
-                Ok(value) => {
-                    let gpu = state.renderer_resource_storage.textures.insert(value);
-                    self.textures.insert(key, gpu, version);
+                Ok(texture_object) => {
+                    let gpu_handle = state
+                        .renderer_resource_storage
+                        .textures
+                        .insert(texture_object);
+                    self.textures.insert(key, gpu_handle, version);
                     epoch_moved = true;
                 }
-                // Left unrecorded, so a later revision tries again - and named,
-                // so the log says which asset is not on the GPU.
+                // The key stays unrecorded, so a later revision tries again,
+                // and the warning names the asset that is not on the GPU.
                 Err(error) => pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
                     "texture `{}` is not uploaded: {error}",
@@ -400,46 +447,46 @@ impl RenderingResourcesManager {
             }
         }
 
-        // A cached key the store no longer holds: its asset was removed, so its
+        // A key the store no longer holds belongs to a removed asset, so its
         // object goes with it.
-        let removed: Vec<u64> = self
+        let removed_keys: Vec<u64> = self
             .textures
             .keys()
-            .filter(|key| !self.live.contains(key))
+            .filter(|key| !self.live_asset_keys.contains(key))
             .collect();
-        for key in removed {
-            if let Some(gpu) = self.textures.remove(key) {
-                state.renderer_resource_storage.textures.remove(gpu);
-                self.changed.insert(key);
+        for key in removed_keys {
+            if let Some(gpu_handle) = self.textures.remove(key) {
+                state.renderer_resource_storage.textures.remove(gpu_handle);
+                self.changed_asset_keys.insert(key);
                 epoch_moved = true;
             }
         }
         epoch_moved
     }
 
-    /// Drop and rebuild the shaders whose asset changed.
+    /// Drops and rebuilds the shaders whose asset changed.
     ///
-    /// Returns whether any shader object was created, recreated, or dropped.
-    /// Keys whose object moved are added to `changed`, so the materials built
-    /// against them can be rebuilt too.
+    /// Returns whether any shader object was created, recreated or dropped.
+    /// Keys whose object moved are added to `changed_asset_keys`, so the
+    /// materials built against them can be rebuilt too.
     fn sync_shaders(&mut self, assets: &AssetManager, state: &mut State) -> bool {
         let mut epoch_moved = false;
-        // See `sync_textures`: walking the store is what says which cached keys
-        // are still live.
-        self.live.clear();
+        // See `sync_textures`: walking the store is how this learns which
+        // cached keys are still live.
+        self.live_asset_keys.clear();
 
         for (handle, shader) in assets.iter_handles::<Shader>() {
             let key = asset_key(handle);
-            self.live.insert(key);
+            self.live_asset_keys.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
             if self.shaders.is_current(key, version) {
                 continue;
             }
-            self.changed.insert(key);
-            if let Some(old) = self.shaders.remove(key) {
-                state.renderer_resource_storage.shaders.remove(old);
+            self.changed_asset_keys.insert(key);
+            if let Some(old_handle) = self.shaders.remove(key) {
+                state.renderer_resource_storage.shaders.remove(old_handle);
             }
-            let value = RendererShader::new(
+            let compiled_shader = RendererShader::new(
                 &shader.name,
                 &state.device,
                 state.surface_format,
@@ -462,10 +509,13 @@ impl RenderingResourcesManager {
                     camera: shader.pass_camera_parameters,
                 },
             );
-            match value {
-                Ok(value) => {
-                    let gpu = state.renderer_resource_storage.shaders.insert(value);
-                    self.shaders.insert(key, gpu, version);
+            match compiled_shader {
+                Ok(shader_object) => {
+                    let gpu_handle = state
+                        .renderer_resource_storage
+                        .shaders
+                        .insert(shader_object);
+                    self.shaders.insert(key, gpu_handle, version);
                     epoch_moved = true;
                 }
                 Err(error) => pill_core::warn!(
@@ -476,42 +526,43 @@ impl RenderingResourcesManager {
             }
         }
 
-        let removed: Vec<u64> = self
+        let removed_keys: Vec<u64> = self
             .shaders
             .keys()
-            .filter(|key| !self.live.contains(key))
+            .filter(|key| !self.live_asset_keys.contains(key))
             .collect();
-        for key in removed {
-            if let Some(gpu) = self.shaders.remove(key) {
-                state.renderer_resource_storage.shaders.remove(gpu);
-                self.changed.insert(key);
+        for key in removed_keys {
+            if let Some(gpu_handle) = self.shaders.remove(key) {
+                state.renderer_resource_storage.shaders.remove(gpu_handle);
+                self.changed_asset_keys.insert(key);
                 epoch_moved = true;
             }
         }
         epoch_moved
     }
 
-    /// Drop and rebuild the meshes whose asset changed.
+    /// Drops and rebuilds the meshes whose asset changed.
     ///
-    /// No epoch is needed for meshes: the draw path resolves a mesh handle per
-    /// frame, so a rebuilt one is picked up without invalidating any pipeline.
+    /// Meshes need no epoch increase. The draw path resolves a mesh handle per
+    /// frame, so a rebuilt mesh is picked up without any pipeline going out of
+    /// date.
     fn sync_meshes(&mut self, assets: &AssetManager, state: &mut State) {
-        self.live.clear();
+        self.live_asset_keys.clear();
 
         for (handle, mesh) in assets.iter_handles::<Mesh>() {
             let key = asset_key(handle);
-            self.live.insert(key);
+            self.live_asset_keys.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
             if self.meshes.is_current(key, version) {
                 continue;
             }
-            if let Some(old) = self.meshes.remove(key) {
-                state.renderer_resource_storage.meshes.remove(old);
+            if let Some(old_handle) = self.meshes.remove(key) {
+                state.renderer_resource_storage.meshes.remove(old_handle);
             }
             match RendererMesh::new(&state.device, &mesh.name, mesh) {
-                Ok(value) => {
-                    let gpu = state.renderer_resource_storage.meshes.insert(value);
-                    self.meshes.insert(key, gpu, version);
+                Ok(mesh_object) => {
+                    let gpu_handle = state.renderer_resource_storage.meshes.insert(mesh_object);
+                    self.meshes.insert(key, gpu_handle, version);
                 }
                 Err(error) => pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
@@ -521,39 +572,39 @@ impl RenderingResourcesManager {
             }
         }
 
-        let removed: Vec<u64> = self
+        let removed_keys: Vec<u64> = self
             .meshes
             .keys()
-            .filter(|key| !self.live.contains(key))
+            .filter(|key| !self.live_asset_keys.contains(key))
             .collect();
-        for key in removed {
-            if let Some(gpu) = self.meshes.remove(key) {
-                state.renderer_resource_storage.meshes.remove(gpu);
+        for key in removed_keys {
+            if let Some(gpu_handle) = self.meshes.remove(key) {
+                state.renderer_resource_storage.meshes.remove(gpu_handle);
             }
         }
     }
 
-    /// Drop and rebuild the materials whose asset changed.
+    /// Drops and rebuilds the materials whose asset changed.
     fn sync_materials(&mut self, assets: &AssetManager, state: &mut State) {
-        self.live.clear();
+        self.live_asset_keys.clear();
 
         for (handle, material) in assets.iter_handles::<Material>() {
             let key = asset_key(handle);
-            self.live.insert(key);
+            self.live_asset_keys.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
             if self.materials.is_current(key, version) {
                 continue;
             }
-            if let Some(old) = self.materials.remove(key) {
-                state.renderer_resource_storage.materials.remove(old);
+            if let Some(old_handle) = self.materials.remove(key) {
+                state.renderer_resource_storage.materials.remove(old_handle);
             }
             let shader_key = asset_key(material.shader);
-            let shader = if material.shader == Handle::INVALID {
-                // A material built without a shader is documented to draw with
-                // the renderer's own; that is a choice, not a fault.
+            let shader_handle = if material.shader == Handle::INVALID {
+                // A material with no shader is documented to draw with the
+                // renderer's built-in one, so this is a choice, not a fault.
                 self.default_shader
-            } else if let Some(gpu) = self.shaders.handle(shader_key) {
-                gpu
+            } else if let Some(shader_handle) = self.shaders.handle(shader_key) {
+                shader_handle
             } else {
                 pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
@@ -568,7 +619,7 @@ impl RenderingResourcesManager {
                 .filter_map(|(slot, texture)| {
                     self.textures
                         .handle(asset_key(texture.texture))
-                        .map(|gpu| (slot.clone(), gpu))
+                        .map(|gpu_handle| (slot.clone(), gpu_handle))
                 })
                 .collect::<Vec<_>>();
             match RendererMaterial::new(
@@ -576,13 +627,16 @@ impl RenderingResourcesManager {
                 &state.queue,
                 &state.renderer_resource_storage,
                 &material.name,
-                shader,
+                shader_handle,
                 &textures,
                 &material.parameters,
             ) {
-                Ok(value) => {
-                    let gpu = state.renderer_resource_storage.materials.insert(value);
-                    self.materials.insert(key, gpu, version);
+                Ok(material_object) => {
+                    let gpu_handle = state
+                        .renderer_resource_storage
+                        .materials
+                        .insert(material_object);
+                    self.materials.insert(key, gpu_handle, version);
                 }
                 Err(error) => pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
@@ -592,33 +646,44 @@ impl RenderingResourcesManager {
             }
         }
 
-        let removed: Vec<u64> = self
+        let removed_keys: Vec<u64> = self
             .materials
             .keys()
-            .filter(|key| !self.live.contains(key))
+            .filter(|key| !self.live_asset_keys.contains(key))
             .collect();
-        for key in removed {
-            if let Some(gpu) = self.materials.remove(key) {
-                state.renderer_resource_storage.materials.remove(gpu);
+        for key in removed_keys {
+            if let Some(gpu_handle) = self.materials.remove(key) {
+                state.renderer_resource_storage.materials.remove(gpu_handle);
             }
         }
     }
 }
 
-/// Build the built-in lit shader and a material from it, and return both.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Builds the built-in lit shader and a material from it, and returns both.
 ///
-/// The material is what a mesh whose material never built draws with, and the
-/// shader is what a material that names none draws with, so the two are built
-/// together and kept as one pair.
+/// The material is what an instance draws with when its own material never
+/// built. The shader is what a material draws with when it names none or names
+/// one that is not loaded. The two are built together and kept as one pair.
 ///
-/// The lit WGSL is the shipped pipeline's own, not a copy of it: the vertex stage
-/// from `shader_sources/common_shaders/default_vertex.wgsl`, the fragment from
-/// `shader_sources/simple_pipeline/shaders/default_lit_fragment.wgsl`.
+/// The WGSL is the shipped pipeline's own text rather than a copy: the vertex
+/// stage comes from `shader_sources/common_shaders/default_vertex.wgsl` and the
+/// fragment from `shader_sources/simple_pipeline/shaders/default_lit_fragment.wgsl`.
 /// `simple_pipeline` names the same shader with the same declared slots, so a
 /// material written for this fallback draws there without being rebuilt.
+///
+/// # Errors
+///
+/// Returns a [`RendererError`](crate::RendererError) when wgpu refuses the
+/// built-in shader's pipeline or the material's bind groups. Both point at this
+/// fallback rather than at a project's own asset.
 fn install_default_material(
     state: &mut State,
 ) -> Result<(RendererShaderHandle, RendererMaterialHandle)> {
+    // Step 1: Build the shader from the two embedded stages and store it.
     let parameter_slots = slots_by_name(
         "pill_default_lit",
         "parameter",
@@ -658,7 +723,9 @@ fn install_default_material(
             camera: true,
         },
     )?;
-    let shader = state.renderer_resource_storage.shaders.insert(shader);
+    let shader_handle = state.renderer_resource_storage.shaders.insert(shader);
+    // Step 2: Build a material from the shader, with one value for each
+    // declared parameter slot, and store it.
     let parameters = std::collections::BTreeMap::from([
         ("tint".to_owned(), MaterialParameter::Color([1.0; 3])),
         ("specularity".to_owned(), MaterialParameter::Scalar(0.5)),
@@ -668,21 +735,24 @@ fn install_default_material(
         &state.queue,
         &state.renderer_resource_storage,
         "pill_default_lit",
-        shader,
+        shader_handle,
         &[],
         &parameters,
     )?;
-    let material = state.renderer_resource_storage.materials.insert(material);
-    Ok((shader, material))
+    let material_handle = state.renderer_resource_storage.materials.insert(material);
+    Ok((shader_handle, material_handle))
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The fourth state the sync needs: a material whose shader or texture moved
-    /// keeps its handle but loses its version, so the next sync rebuilds it
-    /// against the new object.
+    /// A material whose shader or texture moved keeps its handle but loses its
+    /// version, so the next sync rebuilds it against the new object.
     #[test]
     fn forgetting_a_version_keeps_the_handle_and_asks_for_a_rebuild() {
         let mut column: GpuColumn<u32> = GpuColumn::new();

@@ -108,7 +108,7 @@ impl ErasedImportOutcome {
     ///
     /// The previous content version follows from the change: a path that was
     /// already loaded keeps the version it had, and a fresh import had none.
-    fn of_import<T>(
+    fn from_import<T>(
         assets: &AssetManager,
         type_name: &str,
         handle: Handle<T>,
@@ -142,7 +142,7 @@ impl ErasedImportOutcome {
     ///
     /// `previous_content_version` is read before the call, because the reimport
     /// is what moves it.
-    fn of_reimport<T>(
+    fn from_reimport<T>(
         assets: &AssetManager,
         type_name: &str,
         handle: Handle<T>,
@@ -167,7 +167,7 @@ impl ErasedImportOutcome {
     }
 }
 
-/// What a call did with a path that already had a value.
+/// What a call did with the path's value, or with the path when it had none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportChange {
     /// Nothing was there: the asset was decoded and added.
@@ -247,7 +247,7 @@ struct ImportFunctions {
 
 impl ImportFunctions {
     /// The entry points for `T`, compiled into the calling binary.
-    fn of<T: ImportedAsset>() -> Self {
+    fn for_type<T: ImportedAsset>() -> Self {
         Self {
             import: import_erased::<T>,
             reimport: reimport_erased::<T>,
@@ -256,11 +256,11 @@ impl ImportFunctions {
             follow_move: AssetManager::follow_move::<T>,
             is_loaded: is_loaded::<T>,
             remove_loaded: remove_loaded::<T>,
-            identity: identity_of::<T>,
+            identity: asset_identity_of::<T>,
             guid_by_path: guid_by_path::<T>,
             loaded_by_guid: loaded_by_guid_of::<T>,
             loaded_by_name: handle_by_name_of::<T>,
-            loaded: loaded_of::<T>,
+            loaded: loaded_assets_of::<T>,
             default_document: None,
             ensure_metadata: Some(AssetManager::ensure_metadata::<T>),
         }
@@ -268,7 +268,7 @@ impl ImportFunctions {
 
     /// The entry points for the standalone type `T`, compiled into the calling
     /// binary. "Settings" are the asset's own document here.
-    fn of_standalone<T: StandaloneAsset>() -> Self {
+    fn for_standalone_type<T: StandaloneAsset>() -> Self {
         Self {
             import: import_standalone_erased::<T>,
             reimport: reimport_standalone_erased::<T>,
@@ -277,11 +277,11 @@ impl ImportFunctions {
             follow_move: AssetManager::follow_standalone_move::<T>,
             is_loaded: is_loaded::<T>,
             remove_loaded: remove_loaded::<T>,
-            identity: identity_of::<T>,
+            identity: asset_identity_of::<T>,
             guid_by_path: guid_by_path::<T>,
             loaded_by_guid: loaded_by_guid_of::<T>,
             loaded_by_name: handle_by_name_of::<T>,
-            loaded: loaded_of::<T>,
+            loaded: loaded_assets_of::<T>,
             default_document: Some(default_standalone_document::<T>),
             ensure_metadata: None,
         }
@@ -296,7 +296,7 @@ fn import_standalone_erased<T: StandaloneAsset>(
     _policy: MetadataPolicy,
 ) -> ErasedImportResult {
     let outcome = assets.import_standalone::<T>(path)?;
-    Ok(ErasedImportOutcome::of_import::<T>(
+    Ok(ErasedImportOutcome::from_import::<T>(
         assets,
         T::metadata_type_name(),
         outcome.handle,
@@ -315,7 +315,7 @@ fn reimport_standalone_erased<T: StandaloneAsset>(
         .and_then(|name| assets.handle_by_name::<T>(&name))
         .and_then(|handle| assets.content_version(handle));
     let outcome = assets.reimport_standalone::<T>(path)?;
-    Ok(ErasedImportOutcome::of_reimport::<T>(
+    Ok(ErasedImportOutcome::from_reimport::<T>(
         assets,
         T::metadata_type_name(),
         outcome.handle,
@@ -332,7 +332,7 @@ fn import_erased<T: ImportedAsset>(
     policy: MetadataPolicy,
 ) -> ErasedImportResult {
     let outcome = assets.import(AssetImport::<T>::new(path, policy))?;
-    Ok(ErasedImportOutcome::of_import::<T>(
+    Ok(ErasedImportOutcome::from_import::<T>(
         assets,
         T::metadata_type_name(),
         outcome.handle,
@@ -363,7 +363,11 @@ where
 
 /// The live asset a `T` handle with `index` and `generation` addresses, or
 /// `None` when the handle is stale.
-fn identity_of<T>(assets: &AssetManager, index: u32, generation: u32) -> Option<AssetIdentity>
+fn asset_identity_of<T>(
+    assets: &AssetManager,
+    index: u32,
+    generation: u32,
+) -> Option<AssetIdentity>
 where
     T: Asset + TraitAccessible<dyn Asset>,
 {
@@ -408,7 +412,7 @@ where
 }
 
 /// Every live `T` in the store, as its guid and its name.
-fn loaded_of<T>(assets: &AssetManager) -> Vec<(Option<AssetGuid>, String)>
+fn loaded_assets_of<T>(assets: &AssetManager) -> Vec<(Option<AssetGuid>, String)>
 where
     T: Asset + TraitAccessible<dyn Asset>,
 {
@@ -429,7 +433,7 @@ fn reimport_erased<T: ImportedAsset>(assets: &mut AssetManager, path: &Path) -> 
         .and_then(|name| assets.handle_by_name::<T>(&name))
         .and_then(|handle| assets.content_version(handle));
     let outcome = assets.reimport::<T>(path)?;
-    Ok(ErasedImportOutcome::of_reimport::<T>(
+    Ok(ErasedImportOutcome::from_reimport::<T>(
         assets,
         T::metadata_type_name(),
         outcome.handle,
@@ -484,7 +488,7 @@ pub enum ErasedImportError {
         /// The guid asked for.
         guid: AssetGuid,
     },
-    /// The asset with this guid is of another type than the one asked for.
+    /// The asset is of another type than the one asked for.
     #[error("the asset{} is a `{found}`, not a `{expected}`", guid_clause(.guid))]
     WrongType {
         /// The guid asked for, when the caller named one: a path-based load
@@ -543,14 +547,14 @@ impl Registration {
 
 /// One imported asset type and every live registration of it, newest last.
 #[derive(Clone)]
-struct ImportEntry {
+struct ImportedTypeEntry {
     /// The type's metadata type name, owned: a `&'static str` would point
     /// into the registering binary.
     type_name: String,
     registrations: Vec<Registration>,
 }
 
-impl ImportEntry {
+impl ImportedTypeEntry {
     /// The newest registration still alive, which is the one to call.
     fn current(&self) -> Option<&Registration> {
         self.registrations
@@ -574,7 +578,7 @@ impl ImportEntry {
 /// after the clone was taken is skipped by the clone too.
 #[derive(Default, Clone)]
 pub struct ImportRegistry {
-    entries: Vec<ImportEntry>,
+    entries: Vec<ImportedTypeEntry>,
     /// The reference fields each type declares, by owner type name: the field
     /// key a settings document uses and the type name it points at. A key that
     /// ends in `.*` covers a family - `textures.*` is every texture slot the
@@ -603,7 +607,7 @@ impl ImportRegistry {
         self.record(
             T::metadata_type_name(),
             T::SOURCE_EXTENSIONS,
-            ImportFunctions::of::<T>(),
+            ImportFunctions::for_type::<T>(),
             alive,
         )
     }
@@ -621,7 +625,7 @@ impl ImportRegistry {
         self.record(
             T::metadata_type_name(),
             &[T::FILE_EXTENSION],
-            ImportFunctions::of_standalone::<T>(),
+            ImportFunctions::for_standalone_type::<T>(),
             alive,
         )
     }
@@ -665,7 +669,7 @@ impl ImportRegistry {
             .find(|entry| entry.type_name == type_name)
         {
             Some(entry) => entry.registrations.push(registration),
-            None => self.entries.push(ImportEntry {
+            None => self.entries.push(ImportedTypeEntry {
                 type_name: type_name.to_owned(),
                 registrations: vec![registration],
             }),
@@ -694,9 +698,10 @@ impl ImportRegistry {
     /// type name)` pairs.
     ///
     /// A registry call rather than a schema in the file: the target is the Rust
-    /// type the field holds, named by [`Asset::metadata_type_name`], so a
-    /// renamed type moves here with the code instead of drifting. Declaring
-    /// again replaces the owner's whole list, which is what a reload does.
+    /// type the field holds, named by [`ImportedAsset::metadata_type_name`] or
+    /// [`StandaloneAsset::metadata_type_name`], so a renamed type moves here
+    /// with the code instead of drifting. Declaring again replaces the owner's
+    /// whole list, which is what a reload does.
     pub fn declare_references(&mut self, owner_type: &str, references: &[(&str, &str)]) {
         let declared: Vec<(String, String)> = references
             .iter()
@@ -817,24 +822,24 @@ impl ImportRegistry {
 
     /// The entry points for the type that imports `path`'s extension.
     fn functions_for_path(&self, path: &Path) -> Result<ImportFunctions, ErasedImportError> {
-        let display = path.display().to_string();
+        let path_text = path.display().to_string();
         if Self::is_metadata_file(path) {
-            return Err(ErasedImportError::MetadataFile { path: display });
+            return Err(ErasedImportError::MetadataFile { path: path_text });
         }
         let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
             .ok_or_else(|| ErasedImportError::NoExtension {
-                path: display.clone(),
+                path: path_text.clone(),
             })?
             .to_ascii_lowercase();
         self.entries
             .iter()
-            .filter_map(ImportEntry::current)
+            .filter_map(ImportedTypeEntry::current)
             .find(|registration| registration.extensions.contains(&extension))
             .map(|registration| registration.functions)
             .ok_or(ErasedImportError::UnknownExtension {
-                path: display,
+                path: path_text,
                 extension,
             })
     }
@@ -844,7 +849,7 @@ impl ImportRegistry {
         self.entries
             .iter()
             .find(|entry| entry.type_name == type_name)
-            .and_then(ImportEntry::current)
+            .and_then(ImportedTypeEntry::current)
             .map(|registration| registration.functions)
             .ok_or_else(|| ErasedImportError::UnknownType {
                 type_name: type_name.to_owned(),
@@ -897,9 +902,9 @@ impl ImportRegistry {
     /// that owns it and the handle's raw parts; `None` when no live type has
     /// it loaded.
     ///
-    /// An asset built in code - a chain's built-in passes, the default
-    /// material - has no file for a panel to read, so this is what turns the
-    /// guid a document stored back into a name to show and a handle to record.
+    /// An asset built in code - a chain's built-in pass, for instance - has no
+    /// file for a panel to read, so this is what turns the guid a document
+    /// stored back into a name to show and a handle to record.
     pub fn loaded_by_guid(
         &self,
         assets: &AssetManager,
@@ -915,9 +920,9 @@ impl ImportRegistry {
     /// The type the store holds an asset named `name` as, with the handle's raw
     /// parts; `None` when no live type has it loaded.
     ///
-    /// An asset built in code - a chain's built-in passes, the renderer's
-    /// default material - has no file for a tool to name and may have no guid,
-    /// so its name in the store is the one identity it always has.
+    /// An asset built in code - a chain's built-in pass - has no file for a
+    /// tool to name and may have no guid, so its name in the store is the one
+    /// identity it always has.
     pub fn loaded_by_name(&self, assets: &AssetManager, name: &str) -> Option<(String, u32, u32)> {
         self.entries.iter().find_map(|entry| {
             let registration = entry.current()?;
@@ -929,9 +934,9 @@ impl ImportRegistry {
     /// Every live asset every type of this registry holds, as
     /// `(type_name, guid, name)`.
     ///
-    /// A directory walk sees files: a chain's built-in passes and the
-    /// renderer's default material are built in code and appear in none, so
-    /// this is the only place a picker learns they exist.
+    /// A directory walk sees files: a chain's built-in passes are built in
+    /// code and appear in none, so this is the only place a picker learns they
+    /// exist.
     pub fn loaded_assets(&self, assets: &AssetManager) -> Vec<(String, Option<AssetGuid>, String)> {
         let mut loaded = Vec::new();
         for entry in &self.entries {

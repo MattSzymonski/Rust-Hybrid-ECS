@@ -57,7 +57,7 @@ pub const GAMEPAD_SLOT_COUNT: usize = 4;
 pub const GAMEPAD_AXIS_DEADZONE: f32 = 0.05;
 
 /// Words in the key bit set: 256 bits, room for every [`KeyCode`].
-const KEY_SET_WORDS: usize = 4;
+const KEY_SET_WORD_COUNT: usize = 4;
 
 // =============================================================================
 // KeyCode
@@ -180,7 +180,7 @@ key_codes! {
 }
 
 // Every key needs a bit in the key set.
-const _: () = assert!(KeyCode::ALL.len() <= KEY_SET_WORDS * 64);
+const _: () = assert!(KeyCode::ALL.len() <= KEY_SET_WORD_COUNT * 64);
 
 // =============================================================================
 // Buttons, Axes and Players
@@ -221,8 +221,8 @@ impl MouseButton {
         MouseButton::Forward,
     ];
 
-    /// This button's bit in a button mask.
-    const fn bit(self) -> u8 {
+    /// This button's bit mask.
+    const fn bit_mask(self) -> u8 {
         1 << self as u8
     }
 }
@@ -268,8 +268,8 @@ pub enum GamepadButton {
 }
 
 impl GamepadButton {
-    /// This button's bit in a button mask.
-    const fn bit(self) -> u32 {
+    /// This button's bit mask.
+    const fn bit_mask(self) -> u32 {
         1 << self as u8
     }
 }
@@ -377,10 +377,11 @@ pub struct Modifiers {
 
 /// One input change, as a frontend reports it.
 ///
-/// Positions and deltas are in physical pixels; positions are relative to the
-/// top-left corner of the area the game is drawn in. Committed text and IME
-/// pre-edit carry owned strings, so this is not `Copy`; each event is still
-/// plain data, safe to hand across a module boundary.
+/// Cursor positions and wheel amounts are in physical pixels, and a position is
+/// relative to the top-left corner of the area the game is drawn in. Raw mouse
+/// motion is not: its unit is the device's, and the platform does not scale it.
+/// Committed text and IME pre-edit carry owned strings, so this is not `Copy`;
+/// each event is still plain data, safe to hand across a module boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
     /// A key went down or came up.
@@ -503,7 +504,7 @@ pub struct RumbleRequest {
 
 /// One bit per [`KeyCode`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct KeySet([u64; KEY_SET_WORDS]);
+struct KeySet([u64; KEY_SET_WORD_COUNT]);
 
 impl KeySet {
     /// Whether `key` is in the set.
@@ -531,24 +532,24 @@ impl KeySet {
 /// the mouse, a `u32` per gamepad - so this trait is the only thing the edge
 /// rule below needs to know about them.
 trait EdgeBits: Copy + Default {
-    /// Whether `bit` is set.
-    fn has(&self, bit: u32) -> bool;
+    /// Whether `bit_index` is set.
+    fn has(&self, bit_index: u32) -> bool;
 
-    /// Sets or clears `bit`.
-    fn set(&mut self, bit: u32, present: bool);
+    /// Sets or clears `bit_index`.
+    fn set(&mut self, bit_index: u32, present: bool);
 
     /// Adds every bit of `other`.
     fn merge(&mut self, other: Self);
 }
 
 impl EdgeBits for KeySet {
-    fn has(&self, bit: u32) -> bool {
-        let index = bit as usize;
+    fn has(&self, bit_index: u32) -> bool {
+        let index = bit_index as usize;
         self.0[index / 64] & (1 << (index % 64)) != 0
     }
 
-    fn set(&mut self, bit: u32, present: bool) {
-        let index = bit as usize;
+    fn set(&mut self, bit_index: u32, present: bool) {
+        let index = bit_index as usize;
         let mask = 1 << (index % 64);
         if present {
             self.0[index / 64] |= mask;
@@ -565,15 +566,15 @@ impl EdgeBits for KeySet {
 }
 
 impl EdgeBits for u8 {
-    fn has(&self, bit: u32) -> bool {
-        *self & (1u8 << bit) != 0
+    fn has(&self, bit_index: u32) -> bool {
+        *self & (1u8 << bit_index) != 0
     }
 
-    fn set(&mut self, bit: u32, present: bool) {
+    fn set(&mut self, bit_index: u32, present: bool) {
         if present {
-            *self |= 1u8 << bit;
+            *self |= 1u8 << bit_index;
         } else {
-            *self &= !(1u8 << bit);
+            *self &= !(1u8 << bit_index);
         }
     }
 
@@ -583,15 +584,15 @@ impl EdgeBits for u8 {
 }
 
 impl EdgeBits for u32 {
-    fn has(&self, bit: u32) -> bool {
-        *self & (1u32 << bit) != 0
+    fn has(&self, bit_index: u32) -> bool {
+        *self & (1u32 << bit_index) != 0
     }
 
-    fn set(&mut self, bit: u32, present: bool) {
+    fn set(&mut self, bit_index: u32, present: bool) {
         if present {
-            *self |= 1u32 << bit;
+            *self |= 1u32 << bit_index;
         } else {
-            *self &= !(1u32 << bit);
+            *self &= !(1u32 << bit_index);
         }
     }
 
@@ -610,17 +611,17 @@ fn apply_edge<B: EdgeBits>(
     held: &mut B,
     pressed: &mut B,
     released: &mut B,
-    bit: u32,
+    bit_index: u32,
     state: ButtonState,
 ) {
     match state {
-        ButtonState::Pressed if !held.has(bit) => {
-            held.set(bit, true);
-            pressed.set(bit, true);
+        ButtonState::Pressed if !held.has(bit_index) => {
+            held.set(bit_index, true);
+            pressed.set(bit_index, true);
         }
-        ButtonState::Released if held.has(bit) => {
-            held.set(bit, false);
-            released.set(bit, true);
+        ButtonState::Released if held.has(bit_index) => {
+            held.set(bit_index, false);
+            released.set(bit_index, true);
         }
         ButtonState::Pressed | ButtonState::Released => {}
     }
@@ -642,11 +643,11 @@ struct GamepadState {
     /// Whether a gamepad holds this slot.
     connected: bool,
     /// [`GamepadButton`] bits down at the start of the frame.
-    held: u32,
-    /// Bits that went down since the previous frame.
-    pressed: u32,
-    /// Bits that came up since the previous frame.
-    released: u32,
+    buttons_held: u32,
+    /// Button bits that went down since the previous frame.
+    buttons_pressed: u32,
+    /// Button bits that came up since the previous frame.
+    buttons_released: u32,
     /// Latest value per [`GamepadAxis`], after the deadzone.
     axes: [f32; GamepadAxis::COUNT],
 }
@@ -673,8 +674,8 @@ struct GamepadState {
 /// ```
 ///
 /// Every value describes the frame being processed and stays fixed for its
-/// whole duration. Headless runs never receive events, so everything reads as
-/// released and zero.
+/// whole duration. Headless runs never receive events, so nothing is held,
+/// nothing accumulates and there is no cursor.
 #[derive(Debug, Default)]
 pub struct Input {
     /// Keys down at the start of the frame.
@@ -790,17 +791,17 @@ impl Input {
 
     /// Whether `button` is down this frame.
     pub fn mouse_button_held(&self, button: MouseButton) -> bool {
-        self.mouse_held & button.bit() != 0
+        self.mouse_held & button.bit_mask() != 0
     }
 
     /// Whether `button` went down since the previous frame.
     pub fn mouse_button_pressed(&self, button: MouseButton) -> bool {
-        self.mouse_pressed & button.bit() != 0
+        self.mouse_pressed & button.bit_mask() != 0
     }
 
     /// Whether `button` came up since the previous frame.
     pub fn mouse_button_released(&self, button: MouseButton) -> bool {
-        self.mouse_released & button.bit() != 0
+        self.mouse_released & button.bit_mask() != 0
     }
 
     /// The cursor position in physical pixels from the top-left corner of the
@@ -809,7 +810,8 @@ impl Input {
         self.cursor_position
     }
 
-    /// Mouse movement since the previous frame, in physical pixels.
+    /// Mouse movement since the previous frame, in the frontend's raw units:
+    /// the platform reports device motion unscaled.
     ///
     /// Keeps reporting at the window border, so it is the value for mouse-look.
     pub fn mouse_delta(&self) -> Vector2f {
@@ -844,17 +846,17 @@ impl Input {
 
     /// Whether `player`'s `button` is down this frame.
     pub fn gamepad_button_held(&self, player: PlayerId, button: GamepadButton) -> bool {
-        self.gamepads[player.index()].held & button.bit() != 0
+        self.gamepads[player.index()].buttons_held & button.bit_mask() != 0
     }
 
     /// Whether `player`'s `button` went down since the previous frame.
     pub fn gamepad_button_pressed(&self, player: PlayerId, button: GamepadButton) -> bool {
-        self.gamepads[player.index()].pressed & button.bit() != 0
+        self.gamepads[player.index()].buttons_pressed & button.bit_mask() != 0
     }
 
     /// Whether `player`'s `button` came up since the previous frame.
     pub fn gamepad_button_released(&self, player: PlayerId, button: GamepadButton) -> bool {
-        self.gamepads[player.index()].released & button.bit() != 0
+        self.gamepads[player.index()].buttons_released & button.bit_mask() != 0
     }
 
     /// `player`'s `axis`, after the deadzone; zero without a gamepad.
@@ -910,20 +912,20 @@ impl Input {
         self.scroll_pixels = Vector2f::ZERO;
         self.text_entered.clear();
         for gamepad in &mut self.gamepads {
-            gamepad.pressed = 0;
-            gamepad.released = 0;
+            gamepad.buttons_pressed = 0;
+            gamepad.buttons_released = 0;
         }
 
         // Taken out and put back so the buffer's capacity is reused.
         let mut events = std::mem::take(&mut self.pending_events);
         for event in events.drain(..) {
-            self.apply(event);
+            self.apply_event(event);
         }
         self.pending_events = events;
     }
 
     /// Apply one event to the current frame's state.
-    fn apply(&mut self, event: InputEvent) {
+    fn apply_event(&mut self, event: InputEvent) {
         match event {
             InputEvent::Key { key, state } => self.apply_key(key, state),
             // A repeat is not a new press: the held state is what it was.
@@ -979,10 +981,10 @@ impl Input {
             } => {
                 let gamepad = &mut self.gamepads[player.index()];
                 apply_edge(
-                    &mut gamepad.held,
-                    &mut gamepad.pressed,
-                    &mut gamepad.released,
-                    button.bit().trailing_zeros(),
+                    &mut gamepad.buttons_held,
+                    &mut gamepad.buttons_pressed,
+                    &mut gamepad.buttons_released,
+                    button.bit_mask().trailing_zeros(),
                     state,
                 );
             }
@@ -1020,7 +1022,7 @@ impl Input {
             &mut self.mouse_held,
             &mut self.mouse_pressed,
             &mut self.mouse_released,
-            button.bit().trailing_zeros(),
+            button.bit_mask().trailing_zeros(),
             state,
         );
     }

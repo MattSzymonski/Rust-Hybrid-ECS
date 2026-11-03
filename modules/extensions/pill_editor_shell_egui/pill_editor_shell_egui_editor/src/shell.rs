@@ -3,27 +3,30 @@
 //! # Responsibilities
 //!
 //! - [`run_frame`]: one egui pass, from the boundary input to the boundary
-//!   frame the executable draws, including the scene rectangle the frontend
-//!   places the scene's child window at.
+//!   frame the executable draws, including the scene and game rectangles the
+//!   frontend places their child windows at.
 //! - The tab bodies ([`entities_tab`], [`systems_tab`], [`inspector_tab`],
 //!   [`assets_tab`], [`preferences_tab`], all `#[pill_hot_fn]` so a body edit
 //!   patches live). The scene and game tabs draw nothing: their bodies stay
 //!   holes so the child windows under the overlay show through.
+//! - The module's declarations: one `pub mod` per file under `shell/`, and the
+//!   re-exports a patch crate reaches those items through.
 //!
 //! # Design
 //!
-//! The dock is the session's `egui_dock` state, so layout edits land in the
-//! resource the next generation re-claims. Nothing here stores anything in
-//! egui's `Context` (the reload-safety contract `pill_editor_core` documents);
-//! the tabs read the snapshot and write the shared selection.
+//! The dock is the session's `egui_dock` state, so a layout edit changes a
+//! resource that survives into the next generation. Nothing here stores
+//! anything in egui's `Context` (the reload-safety contract `pill_editor_core`
+//! documents); the tabs read the snapshot and write the shared selection.
 //!
 //! # Patchability
 //!
 //! A patch crate holds one function body and reaches this module only through
-//! the crate root's re-export, so every item an edited body can name is `pub`
-//! here - and every module is, because the build script's function inventory
-//! names each addressable function by its module path. A body that names a
-//! private item fails to compile as a patch, and the host reloads.
+//! the crate root's re-export. Every item an edited body can name is therefore
+//! `pub` here, and every module is too, because the build script's function
+//! inventory names each addressable function by its module path. A body that
+//! names a private item fails to compile as a patch, and the host reloads
+//! instead.
 //!
 //! That rule has a shape too: the scanner refuses an `impl` header containing
 //! `<` or `where`, so a method in `impl TabViewer for EditorTabViewer<'_>` is
@@ -109,7 +112,8 @@ pub mod resource_section;
 
 pub use resource_section::{queue_edit as queue_resource_edit, resource_section};
 
-/// The [`views`] module: the scene and game viewports: their geometry and overlay chips.
+/// The [`views`] module: the scene and game viewports, their geometry and
+/// their overlay chips.
 pub mod views;
 
 pub use views::frame_counter_rect;
@@ -283,14 +287,173 @@ pub use assets_tiles::ASSETS_TILE_LABEL_ROWS;
 pub mod tests;
 
 // =============================================================================
-// Constants
+// Types
 // =============================================================================
 
-/// One shell frame: the boundary input becomes egui input, the dock runs, and
-/// the output becomes the executable's frame. The asset dialog, when one is
-/// open, is drawn over the dock.
-// The executable hands the pass its world borrows; there is no smaller shape
-// that does not mean building a struct per frame.
+/// Draws the dock's tabs; the tab bodies come from the tab functions.
+///
+/// The type and every field are public because a hot patch for [`run_frame`]
+/// is compiled as its own crate, and the generated source builds this value
+/// through the package path. The rule is the crate header's: everything a hot
+/// function's body names must be reachable from outside.
+pub struct EditorTabViewer<'a> {
+    /// The engine data the tabs read.
+    pub snapshot: &'a EditorSnapshot,
+    /// The shared selection the tabs read and write.
+    pub selection: &'a mut EditorSelection,
+    /// The asset dialog that is open, if one is; the Assets tab and the
+    /// dialog window both read and write it.
+    pub asset_dialog: &'a mut Option<AssetDialog>,
+    /// The queue the assets actions push their recorded batches into.
+    pub pending: &'a mut PendingEditorCommands,
+    /// The Preferences tab's unsaved field buffers; the tab seeds them
+    /// from the snapshot and a save clears them.
+    pub preferences_draft: &'a mut Option<preferences::PreferencesDraft>,
+    /// The floating viewport toolboxes' session state: where each scene
+    /// view's toolbox floats and what the log already reported.
+    pub toolbox: &'a mut ToolboxSession,
+    /// The Inspector's collapsed sections and its logged geometry.
+    pub inspector: &'a mut InspectorSession,
+    /// The Assets tab's project browser: the folder its grid lists, the
+    /// tree's open folders and the tile size.
+    pub browser: &'a mut ProjectBrowser,
+    /// The scene viewports' body rectangles this pass, in logical points, one
+    /// slot per view index. The frontend places each viewport's child window
+    /// at its slot. The list is sized from the dock before the pass, so a view
+    /// the person just added already has a slot.
+    pub scene_rects: Vec<Option<ShellRect>>,
+    /// The game viewport's body rectangle this pass, in logical points; the
+    /// frontend places the primary surface's child window at it.
+    pub game_rect: Option<ShellRect>,
+    /// The regions drawn over the viewport this pass, in logical points; a
+    /// click inside one belongs to the UI, not to a scene pick. The overlay
+    /// chips, the menus, the toasts and the dialogs all add their rectangles
+    /// here.
+    pub overlay_regions: Vec<ShellRect>,
+    /// The editor's smoothed frame rate, for the scene's counter.
+    pub frames_per_second: f32,
+    /// The active tab of each leaf this pass, one entry per leaf. The tab bar
+    /// draws its accent underline under these tabs only, so an unselected tab
+    /// keeps the strip's neutral line.
+    pub active_tabs: &'a [EditorTab],
+    /// What the pass could not do while the dock and its tabs were borrowed:
+    /// pop a tab out or re-dock one, open a new scene view, hand a dragged
+    /// tile to the OS, or quit. Each request is written where it is raised and
+    /// applied by `settle_pass` after the pass.
+    pub deferred: &'a mut FrameRequests,
+    /// The Console tab's filters; the executable applies them
+    /// to the history on its next frame.
+    pub console_filters: &'a mut ConsoleFilterSettings,
+    /// The requests this pass raises for the executable: the Problems row a
+    /// click asked to open, the menu's undo and redo steps, and the dock tab it
+    /// asked to show. `settle_pass` moves the value onto the frame the
+    /// executable drains.
+    pub requests: &'a mut ShellRequests,
+    /// The timings the Statistics tab reads: the shell writes
+    /// them around each tab body, the tab only formats them.
+    pub stats: &'a mut StatisticsSession,
+    /// The panels the loaded modules registered: a module
+    /// tab's title, body and liveness all come from here.
+    pub panels: &'a PanelRegistry,
+    /// Every module panel's build time, written around each panel body and
+    /// read by the tab's badge and by the budget toast.
+    pub panel_budget: &'a mut PanelBudget,
+    /// The commands the module panels asked for this pass, applied by the
+    /// executable at the frame boundary.
+    pub panel_commands: &'a mut Vec<PanelCommand>,
+    /// The world's entities, as module panels see them.
+    pub panel_entities: &'a [PanelEntityRow],
+    /// The selected entity's components, as module panels see them.
+    pub panel_detail: Option<&'a PanelEntityDetail>,
+    /// The answer a modal window took, read during the following pass. It is
+    /// owned here so the viewer never borrows the panel-window state that the
+    /// settle stage clears.
+    pub panel_answer: Option<pill_editor_core::panels::PanelAnswer>,
+    /// The windows the panels asked to open or close this pass, with the slot
+    /// that asked: applied after the dock, before the windows draw.
+    pub panel_window_requests: &'a mut Vec<(u16, PanelCommand)>,
+    /// The slot a scripted window request named, and the window id it wants
+    /// that panel to open.
+    pub pending_panel_window: Option<(u16, &'a str)>,
+    /// Whether the pending window's panel drew this pass, so the request is
+    /// spent.
+    pub pending_panel_window_used: bool,
+    /// The shell's side of the OS clipboard: the request
+    /// the executable carries out, and the text it read back.
+    pub clipboard: &'a mut pill_editor_core::clipboard::EditorClipboard,
+    /// The asset tiles' previews: the textures to draw and the tiles this pass
+    /// drew, so the executable asks only for what is on screen.
+    pub previews: &'a mut pill_editor_core::session::PreviewStates,
+    /// The entity badges the executable projected into this frame's scene
+    /// views.
+    pub badges: &'a [ShellBadge],
+}
+
+// The dock's tab methods, forwarded to the free functions below.
+//
+// The patch scanner refuses an `impl` header that contains `<` or `where`, and
+// this trait impl's receiver has a lifetime. So no body in this block can be
+// addressed, and an edit to one reloads the shell. Each method is therefore one
+// call, and the body lives in the `#[pill_hot_fn]` function below it, which a
+// patch crate can compile.
+impl TabViewer for EditorTabViewer<'_> {
+    type Tab = EditorTab;
+
+    /// The dock needs one stable id per tab to key its widgets on.
+    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
+        egui::Id::new(("pill_editor_shell_egui.tab", *tab))
+    }
+
+    /// The tab's title in the dock; the work happens in [`tab_title`].
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        tab_title(self, *tab)
+    }
+
+    /// The tab's body; the work happens in [`tab_body`].
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        tab_body(self, ui, *tab);
+    }
+
+    /// The dock tab's menu content. After it, the dock adds its own Eject
+    /// (into a window) and Close rows; a floating window's tab gets a Redock
+    /// row here, which brings the surface's tabs back into the dock.
+    fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab, path: NodePath) {
+        tab_context_menu(self, ui, *tab, path);
+    }
+
+    /// The tab button hook. The active tab's accent underline is painted here,
+    /// because the dock knows each tab's rectangle but has one line colour for
+    /// all of them. A right-click that opens the tab menu is logged here, once
+    /// per click: the menu content itself runs every frame it is open.
+    fn on_tab_button(&mut self, tab: &mut Self::Tab, response: &egui::Response) {
+        tab_button(self, *tab, response);
+    }
+
+    /// The scene and game tabs keep their bodies transparent: the scene and
+    /// game child windows show through them from under the overlay.
+    fn clear_background(&self, tab: &Self::Tab) -> bool {
+        !matches!(tab, EditorTab::Scene(_) | EditorTab::Game)
+    }
+
+    /// The scene and game tabs' bodies are viewports; they never scroll.
+    fn scroll_bars(&self, tab: &Self::Tab) -> [bool; 2] {
+        match tab {
+            EditorTab::Scene(_) | EditorTab::Game => [false, false],
+            _ => [true, true],
+        }
+    }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Runs one shell frame: the boundary input becomes egui input, the dock and
+/// its tabs draw, and the result becomes the frame the executable draws. The
+/// asset dialog, the menus, the toasts and the command palette are drawn over
+/// the dock.
+// Every argument is another part of the editor state the pass reads or writes.
+// Grouping them would mean building a new struct on every frame.
 #[allow(clippy::too_many_arguments)]
 pub fn run_frame(
     state: &mut EguiShellState,
@@ -307,10 +470,10 @@ pub fn run_frame(
 ) {
     state.frame_index = state.frame_index.wrapping_add(1);
     let frame_index = state.frame_index;
-    // The executable resolves the theme's layers and publishes the merge on
-    // the snapshot; the shell installs it whenever the generation moves, on
-    // the main context and every popped-out one, so a preference or project
-    // edit restyles the editor without a restart.
+    // The executable merges the theme's layers and publishes the result on the
+    // snapshot. The shell installs it on the main context and on every
+    // popped-out one whenever the generation number changes, so an edit to a
+    // preference or to the project restyles the editor without a restart.
     if state.applied_theme_generation != snapshot.theme_generation {
         state.applied_theme_generation = snapshot.theme_generation;
         pill_editor_core::style::apply_theme(
@@ -330,9 +493,9 @@ pub fn run_frame(
             );
         }
     }
-    // The saved layout's module tabs name panel slots from the run that wrote
-    // them; the registry's ids are what map them to today's slots. Once per
-    // session: a shell reload must not undo a dock the user moved.
+    // The saved layout names module panel slots from the run that wrote the
+    // layout file. The registry maps each saved id to today's slot, once per
+    // session, so a shell reload never undoes a dock the user arranged.
     if !state.panels_remapped {
         let ids: Vec<String> = panels
             .entries()
@@ -345,10 +508,10 @@ pub fn run_frame(
     // The host's notices become toasts before the dock draws, so a reload that
     // happened this frame is on screen in this frame.
     push_notices(state, notices);
-    // The row heartbeat: the editor suite reads it to prove the shell sees the
-    // project's data, that the frame counter - and with it the session
-    // resource - survives a reload or patch, and which entity the Inspector's
-    // detail tier describes.
+    // The row heartbeat. The editor suite reads this line to prove the shell
+    // sees the project's data, that the frame counter survives a reload or a
+    // patch (which shows the session resource did too), and which entity the
+    // snapshot's detail describes.
     if frame_index.is_multiple_of(210) {
         let detail_entity = snapshot
             .detail
@@ -369,33 +532,36 @@ pub fn run_frame(
             "[editor] egui shell rows"
         );
     }
-    // The first frame of a shell generation owns every egui context the
-    // session holds - the main one and each popped-out window's: whatever the
+    // The first frame of a shell generation claims every egui context the
+    // session holds, the main one and each popped-out window's. Anything the
     // previous generation left in their temporary data would be a dangling
-    // read once this one draws (claim.rs has the reasoning). It runs here,
-    // before any borrow of the dock or the popout map.
+    // read once this one draws (claim.rs explains why). This runs before
+    // anything borrows the dock or the popout map.
     claim_shell_context(state);
-    // The UI heartbeat: one full shell update (input conversion, the egui
-    // dock and its tabs, the frame conversion) in microseconds. The shell
-    // benchmark reads the UI-redraw case from it; the GPU overlay draw is
-    // outside it, as presentation is vsync-bound.
+    // The UI heartbeat: how long one full shell update took in microseconds,
+    // from input conversion through the dock and its tabs to the frame
+    // conversion. The shell benchmark takes its UI-redraw case from this
+    // number. Drawing on the GPU happens outside it, because presenting is
+    // limited by vsync.
     let ui_started = pill_core::platform::Instant::now();
     let raw_input = pill_editor_core::input::raw_input(shell_input);
     // The brand mark is uploaded once per session: the context owns the
     // texture, so a shell reload finds it already there.
     let mark = state.mark_texture();
-    // The context is a cheap clone (refcounted handle); the dock and the
-    // asset dialog are separate fields, borrowed apart so the dock's layout
-    // borrow and the dialog's state borrow coexist.
+    // The context is a cheap clone of a refcounted handle. The dock and the
+    // asset dialog are separate fields, so they are borrowed apart: the dock's
+    // layout borrow and the dialog's state borrow can then exist at the same
+    // time.
     let context = state.context.clone();
-    // What the module panels read this pass: only built when a panel is
-    // registered, so a build with none costs nothing. The panels see this
-    // frame's rate, the same number the scene chips show.
+    // What the module panels read this pass. The rows are copied only when a
+    // panel is registered, so an editor with no module panels pays nothing for
+    // them. The panels see this frame's rate, the same number the scene chips
+    // show.
     let mut panel_feed = panel_feed(snapshot, panels);
     panel_feed.frames_per_second = shell_input.frames_per_second;
-    // A window the scripted channel asked for: the panel itself decides what
-    // that id means. Kept until the pinged panel is drawn - a request must not
-    // be dropped by a frame where that tab was not on screen.
+    // The window a scripted `panel window` line asked for. The panel itself
+    // decides what the id means. The request stays set until that panel draws,
+    // so a frame where its tab is not on screen does not drop it.
     let pending_panel_window = state.pending_panel_window.clone();
     let panel_answer =
         state
@@ -406,9 +572,9 @@ pub fn run_frame(
                 window: answer.window.clone(),
                 accepted: answer.accepted,
             });
-    // What the pass could not act on while the dock and its tabs were
-    // borrowed: each tab and menu writes the value where the request is
-    // raised, and `settle_pass` applies it after the pass.
+    // What the pass could not do while the dock and its tabs were borrowed.
+    // Each tab and menu writes its request into this value where it is raised,
+    // and `settle_pass` applies it after the pass.
     let mut deferred = pill_editor_shell_egui_editor::shell::FrameRequests::default();
     let mut panel_window_requests: Vec<(u16, PanelCommand)> = Vec::new();
     let EguiShellState {
@@ -437,17 +603,17 @@ pub fn run_frame(
     // The rows record their rectangles either way - the shell's own tests read
     // them - but only a scripted run asks for them in the log.
     inspector.log_rects = shell_input.scripted;
-    // The accent underline belongs to each leaf's active tab alone; the dock
-    // draws its line under every tab in one colour, so the pass reads which
-    // tabs are active before the dock paints them.
+    // Only a leaf's active tab gets the accent underline, and the dock draws
+    // its own line under every tab in one colour. The pass therefore reads
+    // which tabs are active before the dock paints them.
     let active_tabs: Vec<EditorTab> = dock
         .state()
         .iter_leaves()
         .filter_map(|(_path, leaf)| leaf.tabs.get(leaf.active.0).copied())
         .collect();
-    // Named through the package path, not as a file-local item: a hot patch
-    // compiles this body in a crate of its own, where only the package's
-    // public items exist (see the crate header).
+    // Named through the package path rather than as a file-local item: a hot
+    // patch compiles this body in a crate of its own, where only the package's
+    // public items exist (the crate header has the details).
     let mut viewer = pill_editor_shell_egui_editor::shell::EditorTabViewer {
         snapshot,
         selection,
@@ -482,16 +648,16 @@ pub fn run_frame(
         badges: &shell_input.badges,
     };
     let output = context.run_ui(raw_input, |ui| {
-        // What the tabs and badges draw this pass is what their rectangle
-        // caches keep: the dock pass opens the frame's window for it, so a row
-        // that left the list stops occupying the session.
+        // The tabs and badges a pass draws are the ones their rectangle caches
+        // keep for this frame. Opening the window here means a row that left
+        // the list stops occupying the session.
         viewer.inspector.begin_geometry_pass();
-        // The strip comes first, so the dock - and every viewport rectangle it
-        // reports - starts below it.
+        // The menu strip comes first, so the dock and every viewport rectangle
+        // it reports start below it.
         menu_bar(ui, menubar, &mark, &mut viewer);
-        // Tab bars carry the tabs and their close buttons only: without the
-        // collapse chevron and the panel-level close-all ✖, a panel closes
-        // exactly when its last tab does.
+        // Tab bars carry the tabs and their close buttons only. With no
+        // collapse chevron and no panel-level close-all button, a panel closes
+        // exactly when its last tab closes.
         DockArea::new(dock.state_mut())
             .style(style::dock_style(
                 ui.ctx().global_style().as_ref(),
@@ -522,8 +688,8 @@ pub fn run_frame(
             ui.ctx(),
             &mut viewer.overlay_regions,
         );
-        // The command palette sits over everything: it is the one surface that
-        // is meant to be read while the pointer is elsewhere.
+        // The command palette draws last so it sits above every other surface:
+        // it is driven from the keyboard, not from the pointer.
         pill_editor_shell_egui_editor::shell::palette_window(
             ui.ctx(),
             palette,
@@ -574,11 +740,11 @@ pub fn run_frame(
     shell_frame.scene_rects = std::mem::take(&mut viewer.scene_rects);
     shell_frame.game_rect = viewer.game_rect.take();
     shell_frame.overlay_regions = std::mem::take(&mut viewer.overlay_regions);
-    // The pass's deferred requests live in `viewer.deferred`: each tab and
-    // menu wrote the value where the request was raised, and the settle stage
-    // applies them in the order the pass requires (its module docs say why
-    // each request sits where it does). The viewer is passed whole, so the
-    // value needs no second argument and cannot disagree with itself.
+    // The pass's deferred requests live in `viewer.deferred`. Each tab and menu
+    // wrote its request where it was raised, and the settle stage applies them
+    // in the order the pass needs (its module docs say why each request sits
+    // where it does). Passing the viewer whole means the value needs no second
+    // argument and cannot disagree with itself.
     *frame = pill_editor_shell_egui_editor::shell::settle_pass(
         dock,
         popout_contexts,
@@ -592,15 +758,15 @@ pub fn run_frame(
         shell_frame,
     );
     let ui_micros = ui_started.elapsed().as_micros() as u64;
-    // The Statistics tab's top row: the pass this frame actually took,
-    // recorded before the frame's own logging so the tab and the log line
-    // below never disagree.
+    // The Statistics tab's top row: the time this frame's pass actually took.
+    // It is recorded before the frame's own log line below, so the tab and the
+    // log never disagree.
     stats.record_shell(ui_micros);
     stats.frames_per_second = shell_input.frames_per_second;
-    // The periodic heartbeat, plus any update that runs past
-    // `SLOW_UPDATE_MICROS`: the suites prove the counter advances, and the
-    // benchmark gets samples even when 210 frames take longer than its
-    // measurement window.
+    // The periodic heartbeat, plus any update slower than `SLOW_UPDATE_MICROS`.
+    // The suites read it to prove the counter advances, and the benchmark
+    // still gets samples when 210 frames take longer than its measurement
+    // window.
     if frame_index.is_multiple_of(210) || ui_micros >= SLOW_UPDATE_MICROS {
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ECS,
@@ -611,22 +777,18 @@ pub fn run_frame(
     }
 }
 
-// =============================================================================
-// The tab viewer and the tabs
-// =============================================================================
-
-/// Run one egui pass per popped-out tab.
+/// Runs one egui pass for each popped-out tab.
 ///
-/// Each popped-out window has its own context, so it draws independently of
-/// the dock pass that ran a moment earlier in the main window: same data, same
-/// viewer code, its own widget state and its own input record. The tab body is
-/// the `TabViewer::ui` implementation the dock calls, which is what keeps a
-/// tab looking and behaving the same in a window as it does in the dock.
+/// Every popped-out window has its own context, so it draws on its own, after
+/// the dock pass in the main window. The data and the viewer code are the same;
+/// the widget state and the input record are the window's own. The tab body is
+/// the same `TabViewer::ui` implementation the dock calls, which is what keeps
+/// a tab looking and behaving the same in a window and in the dock.
 ///
-/// `dock.popouts()` holds tabs that are *not* in the dock tree, so nothing is
-/// drawn twice. The viewer's viewport rectangles are reset per pass: a popped
-/// out Scene tab reports its rectangle in its own window's coordinates, and
-/// the frontend places that view's surface there.
+/// `dock.popouts()` holds the tabs that are *not* in the dock tree, so nothing
+/// is drawn twice. The viewer's viewport rectangles are reset for each pass: a
+/// popped-out Scene tab reports its rectangle in its own window's coordinates,
+/// and the frontend places that view's surface there.
 pub fn run_popout_passes(
     dock: &mut pill_editor_core::layout::EditorDock,
     contexts: &mut std::collections::BTreeMap<EditorTab, egui::Context>,
@@ -653,8 +815,8 @@ pub fn run_popout_passes(
         let raw_input = pill_editor_core::input::raw_input(&input);
         viewer.scene_rects = vec![None; dock.scene_view_count()];
         let output = context.run_ui(raw_input, |ui| {
-            // The window has no dock around it, so it draws the one dock
-            // affordance it needs: the way back.
+            // The window has no dock around it, so it draws the one control
+            // the dock would give it: the Redock button.
             let mut send_back = false;
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(tab.title()).strong());
@@ -699,7 +861,7 @@ pub fn run_popout_passes(
 
 /// What module panels read this pass.
 ///
-/// Built only when a panel is registered: the rows are a copy of the snapshot
+/// The rows are copied only when a panel is registered: they duplicate what
 /// the tabs already read, and an editor with no module panels should not pay
 /// for them.
 pub fn panel_feed(snapshot: &EditorSnapshot, panels: &PanelRegistry) -> PanelFeed {
@@ -742,158 +904,11 @@ pub fn panel_feed(snapshot: &EditorSnapshot, panels: &PanelRegistry) -> PanelFee
     feed
 }
 
-/// Draws the dock's tabs; the tab bodies come from the tab functions.
+/// Returns one tab's dock title.
 ///
-/// Public - fields included - because a hot patch for [`run_frame`] is
-/// compiled as its own crate and builds this value: the generated source
-/// reaches the type and its fields through the package path, the rule the
-/// crate header states for every hot function's dependencies.
-pub struct EditorTabViewer<'a> {
-    /// The engine data the tabs read.
-    pub snapshot: &'a EditorSnapshot,
-    /// The shared selection the tabs read and write.
-    pub selection: &'a mut EditorSelection,
-    /// The asset dialog that is open, if one is; the Assets tab and the
-    /// dialog window both read and write it.
-    pub asset_dialog: &'a mut Option<AssetDialog>,
-    /// The queue the assets actions push their recorded batches into.
-    pub pending: &'a mut PendingEditorCommands,
-    /// The Preferences tab's unsaved field buffers; the tab seeds them
-    /// from the snapshot and a save clears them.
-    pub preferences_draft: &'a mut Option<preferences::PreferencesDraft>,
-    /// The floating viewport toolboxes' session state: where each scene
-    /// view's toolbox floats and what the log already reported.
-    pub toolbox: &'a mut ToolboxSession,
-    /// The Inspector's collapsed sections and its logged geometry.
-    pub inspector: &'a mut InspectorSession,
-    /// The Assets tab's project browser: the folder its grid lists, the
-    /// tree's open folders and the tile size.
-    pub browser: &'a mut ProjectBrowser,
-    /// The scene viewports' body rectangles this pass, in logical points,
-    /// one slot per view index; the frontend places each viewport's child
-    /// window at its slot. Sized from the dock before the pass, so a view
-    /// the person added has its slot already.
-    pub scene_rects: Vec<Option<ShellRect>>,
-    /// The game viewport's body rectangle this pass, in logical points; the
-    /// frontend places the primary surface's child window at it.
-    pub game_rect: Option<ShellRect>,
-    /// The overlay chips' rectangles this pass, in logical points: points
-    /// over a scene viewport where a click is the UI's, not the scene's.
-    pub overlay_regions: Vec<ShellRect>,
-    /// The editor's smoothed frame rate, for the scene's counter.
-    pub frames_per_second: f32,
-    /// The tabs each leaf shows as active this pass, one per leaf: the tab
-    /// bar carries its accent underline under these tabs alone, so a tab that
-    /// is not selected keeps the strip's neutral line.
-    pub active_tabs: &'a [EditorTab],
-    /// What the pass could not act on while the dock and its tabs were
-    /// borrowed: a tab pop-out or re-dock, a new scene view, a tile drag that
-    /// left the windows, and a quit. Written where each request is raised,
-    /// applied by `settle_pass` after the pass.
-    pub deferred: &'a mut FrameRequests,
-    /// The Console tab's filters; the executable applies them
-    /// to the history on its next frame.
-    pub console_filters: &'a mut ConsoleFilterSettings,
-    /// The asks this pass raises for the executable: the Problems row a click
-    /// asked to open, the menu's undo/redo and its dock tab. `settle_pass`
-    /// moves the value onto the frame the executable drains.
-    pub requests: &'a mut ShellRequests,
-    /// The timings the Statistics tab reads: the shell writes
-    /// them around each tab body, the tab only formats them.
-    pub stats: &'a mut StatisticsSession,
-    /// The panels the loaded modules registered: a module
-    /// tab's title, body and liveness all come from here.
-    pub panels: &'a PanelRegistry,
-    /// Every module panel's build time, written around each panel body and
-    /// read by the tab's badge and by the budget toast.
-    pub panel_budget: &'a mut PanelBudget,
-    /// The commands the module panels asked for this pass, applied by the
-    /// executable at the frame boundary.
-    pub panel_commands: &'a mut Vec<PanelCommand>,
-    /// The world's entities, as module panels see them.
-    pub panel_entities: &'a [PanelEntityRow],
-    /// The selected entity's components, as module panels see them.
-    pub panel_detail: Option<&'a PanelEntityDetail>,
-    /// The answer a modal window took, for the pass that follows it; owned so
-    /// the viewer never borrows the panel-window state the settle stage clears.
-    pub panel_answer: Option<pill_editor_core::panels::PanelAnswer>,
-    /// The windows the panels asked to open or close this pass, with the slot
-    /// that asked: applied after the dock, before the windows draw.
-    pub panel_window_requests: &'a mut Vec<(u16, PanelCommand)>,
-    /// The slot a scripted window request named, and the window id it wants
-    /// that panel to open.
-    pub pending_panel_window: Option<(u16, &'a str)>,
-    /// Whether the pending window's panel drew this pass, so the request is
-    /// spent.
-    pub pending_panel_window_used: bool,
-    /// The shell's side of the OS clipboard: the request
-    /// the executable carries out, and the text it read back.
-    pub clipboard: &'a mut pill_editor_core::clipboard::EditorClipboard,
-    /// The asset tiles' previews: the textures to draw and the tiles this pass
-    /// drew, so the executable asks only for what is on screen.
-    pub previews: &'a mut pill_editor_core::session::PreviewStates,
-    /// The entity badges the executable projected into this frame's scene
-    /// views.
-    pub badges: &'a [ShellBadge],
-}
-
-// The dock's tab methods, forwarded to the free functions below.
-//
-// `impl TabViewer for EditorTabViewer<'_>` is a trait impl whose receiver
-// carries a lifetime, and the patch scanner refuses any impl header containing
-// `<` or `where` - so no body in this block can be addressed, and an edit to one
-// reloads the shell. Each method here is therefore one call. The bodies live in
-// the `#[pill_hot_fn]` functions below, which a patch crate can compile.
-impl TabViewer for EditorTabViewer<'_> {
-    type Tab = EditorTab;
-
-    /// The dock needs one stable id per tab to key its widgets on.
-    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
-        egui::Id::new(("pill_editor_shell_egui.tab", *tab))
-    }
-
-    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
-        tab_title(self, *tab)
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
-        tab_body(self, ui, *tab);
-    }
-
-    /// The dock tab's menu. The dock itself offers Eject (into a window)
-    /// and Close; a floating window's tab gets Redock, which brings the
-    /// surface's tabs back into the dock.
-    fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab, path: NodePath) {
-        tab_context_menu(self, ui, *tab, path);
-    }
-
-    /// The tab button hook: the selected tab's accent underline is painted
-    /// here (the dock knows the tab's rectangle but has one line colour for
-    /// all of them), and a right-click that opens the tab menu is logged
-    /// here, once per click - the menu content runs every frame it is open.
-    fn on_tab_button(&mut self, tab: &mut Self::Tab, response: &egui::Response) {
-        tab_button(self, *tab, response);
-    }
-
-    /// The scene and game tabs keep their bodies transparent: the scene and
-    /// game child windows show through them from under the overlay.
-    fn clear_background(&self, tab: &Self::Tab) -> bool {
-        !matches!(tab, EditorTab::Scene(_) | EditorTab::Game)
-    }
-
-    /// The scene and game tabs' bodies are viewports; they never scroll.
-    fn scroll_bars(&self, tab: &Self::Tab) -> [bool; 2] {
-        match tab {
-            EditorTab::Scene(_) | EditorTab::Game => [false, false],
-            _ => [true, true],
-        }
-    }
-}
-
-/// One tab's dock title.
-///
-/// A module panel's title is the registry's: it changes when the module unloads,
-/// and it carries the over-budget badge every other tab lacks.
+/// A module panel's title comes from the registry, so it changes when the
+/// module unloads. A panel that went over its frame budget gets a `(slow)` mark
+/// that no other tab carries.
 #[pill_hot_fn]
 pub fn tab_title(viewer: &mut EditorTabViewer<'_>, tab: EditorTab) -> egui::WidgetText {
     if let Some(slot) = tab.module_slot() {
@@ -908,10 +923,10 @@ pub fn tab_title(viewer: &mut EditorTabViewer<'_>, tab: EditorTab) -> egui::Widg
     icons::rich(tab_icon(tab), tab.title().as_str()).into()
 }
 
-/// The dock's tab dispatch: every tab body, each timed for the Statistics tab.
+/// Draws one active tab's body and records how long it took.
 ///
-/// The timing is here because the Statistics tab's whole point is that its rows
-/// are measurements rather than estimates.
+/// Every tab is timed here because the Statistics tab exists to show
+/// measurements, not estimates.
 #[pill_hot_fn]
 pub fn tab_body(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, tab: EditorTab) {
     let started = pill_core::platform::Instant::now();
@@ -950,8 +965,8 @@ pub fn tab_body(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, tab: Editor
             viewer.inspector,
         ),
         EditorTab::Assets => {
-            // One bundle of the handles the panel writes through, the same
-            // shape a grid tile takes (see `AssetTileWrites`).
+            // One bundle of the handles the Assets tab writes through, the same
+            // shape a grid tile gets (see `AssetTileWrites`).
             let mut writes = AssetTileWrites {
                 selection: viewer.selection,
                 dialog: viewer.asset_dialog,
@@ -980,11 +995,13 @@ pub fn tab_body(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, tab: Editor
         .record(tab, started.elapsed().as_micros() as f64);
 }
 
-/// One module panel's pass: liveness, its draw, the window requests it makes,
-/// and its share of the panel budget.
+/// Runs one module panel's pass: check that its module is alive, draw the
+/// panel, collect the window requests it made, and charge its draw time to the
+/// panel budget.
 ///
-/// The panel belongs to a module: its draw function runs only while that
-/// module's liveness marker is alive, and the tab says so when it is not.
+/// The panel belongs to a module. Its draw function runs only while that
+/// module's liveness marker is alive; when the marker is gone the tab says so
+/// instead.
 #[pill_hot_fn]
 pub fn draw_module_panel(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, slot: u16) {
     let Some(draw) = viewer.panels.draw_of(slot) else {
@@ -1078,8 +1095,9 @@ pub fn tab_context_menu(
         viewer.deferred.tab_redock = Some(path.surface);
         ui.close();
     }
-    // The dock owns this menu's shell, so its drawn content is what is
-    // reported: an item click over the viewport must not pick either.
+    // This menu's frame belongs to the dock, so only the content drawn here is
+    // reported. With its rectangle in the overlay regions, a click on a menu
+    // item over the viewport never becomes a scene pick.
     let rect = ui.min_rect();
     viewer.overlay_regions.push(ShellRect {
         x: rect.min.x,

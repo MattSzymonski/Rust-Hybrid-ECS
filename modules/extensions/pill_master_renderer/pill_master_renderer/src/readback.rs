@@ -4,20 +4,22 @@
 //!
 //! - Start a buffer's mapping once the frame that wrote it was submitted
 //!   ([`MapState::start`]).
-//! - Poll that mapping without waiting, hand the mapped bytes to a decoder, and
+//! - Poll that mapping without waiting, hand the mapped bytes to a decoder and
 //!   report one of three outcomes ([`MapState::poll`]).
-//! - Own a readback buffer together with its mapping for a user that has one
-//!   ([`MappedReadback`]).
+//! - Own a readback buffer together with its mapping, for a caller that needs
+//!   both ([`MappedReadback`]).
 //!
 //! # Design
 //!
-//! Reading a buffer back cannot block a frame, so the work is split: the copy
-//! is recorded while the frame is built, [`MapState::start`] asks for the map
-//! only after the submission (a buffer asked to map before its copy is
-//! submitted makes the submission fail), and a later poll decodes whatever has
-//! arrived. Neither a failed map nor bytes that cannot be read may leave a
-//! caller waiting, so both answer [`Readback::Failed`] and the caller answers
-//! its request with nothing.
+//! Reading a buffer back cannot block a frame, so the work is split. The copy
+//! is recorded while the frame is built, and only after that frame is
+//! submitted does [`MapState::start`] ask the device to map the buffer. Asking
+//! earlier would make the submission fail. A later poll decodes whatever has
+//! arrived by then.
+//!
+//! Neither a map that failed nor bytes that cannot be read may leave a caller
+//! waiting, so both cases report [`Readback::Failed`], and the caller answers
+//! its own request with nothing.
 //!
 //! The state lives behind an [`Arc`] because the map callback runs on the
 //! device's own thread while the frame path polls it.
@@ -29,21 +31,35 @@ use std::sync::Arc;
 // External crates
 use wgpu::Buffer;
 
-/// Where a buffer's mapping stands, as the callback reports it.
+// =============================================================================
+// Mapping State Codes
+// =============================================================================
+
+/// The map callback has not reported yet.
 const MAPPING_PENDING: u8 = 0;
+/// The callback reported that the buffer is mapped and readable.
 const MAPPING_DONE: u8 = 1;
+/// The callback reported that the device refused to map the buffer.
 const MAPPING_FAILED: u8 = 2;
+
+// =============================================================================
+// Readback
+// =============================================================================
 
 /// What one [`MapState::poll`] found.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Readback<T> {
-    /// The GPU has not finished the copy yet: poll again later.
+    /// The map has not finished yet. Poll again later.
     Pending,
     /// The map succeeded and the bytes were decoded.
     Done(T),
-    /// The map or the read failed: nothing will arrive for this one.
+    /// The map or the read failed. Nothing will arrive for this one.
     Failed,
 }
+
+// =============================================================================
+// Map Outcome
+// =============================================================================
 
 /// What the device's map callback reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,43 +72,53 @@ pub(crate) enum MapOutcome {
     Failed,
 }
 
+// =============================================================================
+// Map State
+// =============================================================================
+
 /// One buffer's mapping, shared with the callback that reports it.
+///
+/// The callback stores its outcome with `Release` and the frame path reads it
+/// with `Acquire`, so a thread that reads the new outcome also sees everything
+/// the callback wrote before it stored that outcome.
 pub(crate) struct MapState {
-    state: Arc<AtomicU8>,
+    outcome_code: Arc<AtomicU8>,
 }
 
 impl MapState {
     /// Asks for `buffer` to be mapped for reading.
     ///
-    /// Only call this once the submission that wrote the buffer is in: a map
-    /// asked for earlier makes that submission fail.
+    /// Only call this after the submission that wrote the buffer. A map asked
+    /// for earlier makes that submission fail.
     pub(crate) fn start(buffer: &Buffer) -> Self {
-        let state = Arc::new(AtomicU8::new(MAPPING_PENDING));
-        let reported = Arc::clone(&state);
+        // Step 1: Make one code cell that this state and the callback share.
+        let outcome_code = Arc::new(AtomicU8::new(MAPPING_PENDING));
+        let callback_outcome_code = Arc::clone(&outcome_code);
+        // Step 2: Ask for the map. The callback stores what came of it.
         buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
-                let outcome = if result.is_ok() {
+                let reported_code = if result.is_ok() {
                     MAPPING_DONE
                 } else {
                     MAPPING_FAILED
                 };
-                reported.store(outcome, Ordering::Release);
+                callback_outcome_code.store(reported_code, Ordering::Release);
             });
-        Self { state }
+        Self { outcome_code }
     }
 
     /// Whether the map has finished, whether it succeeded or failed.
     ///
-    /// This is what a ring of readbacks tests before it reads: a slot is free
-    /// once nothing it asked for is still mapping.
+    /// The frame profiler tests this for each slot of its ring before it reads
+    /// the slot: a slot is read once every map it asked for has finished.
     pub(crate) fn finished(&self) -> bool {
         self.outcome() != MapOutcome::Pending
     }
 
     /// What the device's callback last reported.
     pub(crate) fn outcome(&self) -> MapOutcome {
-        match self.state.load(Ordering::Acquire) {
+        match self.outcome_code.load(Ordering::Acquire) {
             MAPPING_DONE => MapOutcome::Mapped,
             MAPPING_FAILED => MapOutcome::Failed,
             _ => MapOutcome::Pending,
@@ -101,9 +127,9 @@ impl MapState {
 
     /// Polls the mapping without waiting.
     ///
-    /// On success the bytes are handed to `read` once and the buffer is
-    /// unmapped; a map the device refused answers [`Readback::Failed`] without
-    /// ever touching the buffer.
+    /// When the map is done, the bytes are handed to `read` once and the buffer
+    /// is unmapped. A map the device refused answers [`Readback::Failed`] and
+    /// the buffer is never read.
     pub(crate) fn poll<T>(&self, buffer: &Buffer, read: impl FnOnce(&[u8]) -> T) -> Readback<T> {
         match self.outcome() {
             MapOutcome::Pending => Readback::Pending,
@@ -116,40 +142,25 @@ impl MapState {
     /// drive the failure branches without a device.
     #[cfg(test)]
     pub(crate) fn at_outcome(outcome: MapOutcome) -> Self {
-        let value = match outcome {
+        let outcome_code = match outcome {
             MapOutcome::Pending => MAPPING_PENDING,
             MapOutcome::Mapped => MAPPING_DONE,
             MapOutcome::Failed => MAPPING_FAILED,
         };
         Self {
-            state: Arc::new(AtomicU8::new(value)),
+            outcome_code: Arc::new(AtomicU8::new(outcome_code)),
         }
     }
 }
 
-/// Reads a mapped buffer through `read`, unmapping it either way.
-///
-/// A read the device refuses answers [`Readback::Failed`] rather than leaving
-/// the buffer mapped, which would refuse every later use of it.
-pub(crate) fn read_mapped<T>(buffer: &Buffer, read: impl FnOnce(&[u8]) -> T) -> Readback<T> {
-    match buffer.slice(..).get_mapped_range() {
-        Ok(bytes) => {
-            let value = read(&bytes);
-            drop(bytes);
-            buffer.unmap();
-            Readback::Done(value)
-        }
-        Err(_) => {
-            buffer.unmap();
-            Readback::Failed
-        }
-    }
-}
+// =============================================================================
+// Mapped Readback
+// =============================================================================
 
 /// A readback buffer that remembers its own mapping.
 pub(crate) struct MappedReadback {
     buffer: Buffer,
-    state: Option<MapState>,
+    map_state: Option<MapState>,
 }
 
 impl MappedReadback {
@@ -157,7 +168,7 @@ impl MappedReadback {
     pub(crate) fn new(buffer: Buffer) -> Self {
         Self {
             buffer,
-            state: None,
+            map_state: None,
         }
     }
 
@@ -168,49 +179,82 @@ impl MappedReadback {
 
     /// Asks for the map, unless one is already under way.
     pub(crate) fn start(&mut self) {
-        if self.state.is_none() {
-            self.state = Some(MapState::start(&self.buffer));
+        if self.map_state.is_none() {
+            self.map_state = Some(MapState::start(&self.buffer));
         }
     }
 
     /// Polls the map without waiting, decoding through `read` once.
+    ///
+    /// While no map is under way this answers [`Readback::Pending`], and keeps
+    /// answering it until [`Self::start`] asks for the next map.
     pub(crate) fn poll<T>(&mut self, read: impl FnOnce(&[u8]) -> T) -> Readback<T> {
-        let Some(state) = self.state.as_ref() else {
+        let Some(map_state) = self.map_state.as_ref() else {
             return Readback::Pending;
         };
-        let outcome = state.poll(&self.buffer, read);
-        if !matches!(outcome, Readback::Pending) {
-            self.state = None;
+        let readback = map_state.poll(&self.buffer, read);
+        if !matches!(readback, Readback::Pending) {
+            self.map_state = None;
         }
-        outcome
+        readback
     }
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Reads a mapped buffer through `read`, unmapping it either way.
+///
+/// A read that fails still unmaps the buffer. Leaving it mapped would stop
+/// every later use of the buffer.
+pub(crate) fn read_mapped<T>(buffer: &Buffer, read: impl FnOnce(&[u8]) -> T) -> Readback<T> {
+    match buffer.slice(..).get_mapped_range() {
+        Ok(bytes) => {
+            let decoded = read(&bytes);
+            drop(bytes);
+            buffer.unmap();
+            Readback::Done(decoded)
+        }
+        Err(_) => {
+            buffer.unmap();
+            Readback::Failed
+        }
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_failed_map_is_finished_and_answers_nothing() {
-        let state = MapState::at_outcome(MapOutcome::Failed);
+    fn a_failed_map_is_finished_and_reports_failed() {
+        let map_state = MapState::at_outcome(MapOutcome::Failed);
 
-        assert!(state.finished(), "a failed map is finished, not pending");
-        assert_eq!(state.outcome(), MapOutcome::Failed);
+        assert!(
+            map_state.finished(),
+            "a failed map is finished, not pending"
+        );
+        assert_eq!(map_state.outcome(), MapOutcome::Failed);
     }
 
     #[test]
     fn a_pending_map_is_not_finished() {
-        let state = MapState::at_outcome(MapOutcome::Pending);
+        let map_state = MapState::at_outcome(MapOutcome::Pending);
 
-        assert!(!state.finished());
-        assert_eq!(state.outcome(), MapOutcome::Pending);
+        assert!(!map_state.finished());
+        assert_eq!(map_state.outcome(), MapOutcome::Pending);
     }
 
     #[test]
-    fn a_mapped_readback_is_a_read_away_from_its_bytes() {
-        let state = MapState::at_outcome(MapOutcome::Mapped);
+    fn a_mapped_map_is_finished_and_reports_mapped() {
+        let map_state = MapState::at_outcome(MapOutcome::Mapped);
 
-        assert!(state.finished());
-        assert_eq!(state.outcome(), MapOutcome::Mapped);
+        assert!(map_state.finished());
+        assert_eq!(map_state.outcome(), MapOutcome::Mapped);
     }
 }

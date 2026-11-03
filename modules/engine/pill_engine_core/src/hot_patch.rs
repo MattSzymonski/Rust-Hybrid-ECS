@@ -5,10 +5,10 @@
 //! - Defines [`HotSlot`], the stable indirection a registered system dispatches
 //!   through, so its implementation can be replaced without re-registering it.
 //! - Defines [`HotPatchRegistry`], the engine-owned map from system name to slot.
-//! - Computes [`signature_hash`], the gate that refuses a patch whose ABI no
-//!   longer matches the running system.
-//! - Provides [`verify_abi`], a startup self-check for the one platform
-//!   assumption the design rests on.
+//! - Computes [`signature_hash`], the signature identity the install gate
+//!   compares, so a patch whose ABI moved is refused.
+//! - Provides [`verify_abi`], the self-check for the one platform assumption
+//!   the design rests on.
 //!
 //! # Design
 //!
@@ -74,7 +74,7 @@ pub const PANIC_ROLLBACK_FRAMES: u32 = 3;
 pub struct FaultReport {
     /// The function's qualified path: the identity a rollback resolves.
     pub function: String,
-    /// The panic message, for the toast and the Problems panel.
+    /// The panic message, quoted in the host's rollback log line.
     pub message: String,
 }
 
@@ -85,7 +85,7 @@ pub struct FaultReport {
 static PANIC_STREAKS: Mutex<Option<HashMap<String, (u32, String)>>> = Mutex::new(None);
 
 /// How many functions currently hold a non-zero streak.
-static FLAKY_FUNCTIONS: AtomicUsize = AtomicUsize::new(0);
+static FLAKY_FUNCTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Reports waiting for the host's next frame boundary.
 static FAULT_REPORTS: Mutex<Vec<FaultReport>> = Mutex::new(Vec::new());
@@ -98,20 +98,20 @@ static FAULT_REPORTS: Mutex<Vec<FaultReport>> = Mutex::new(Vec::new());
 /// frame, and only a later successful invocation (a rollback, or a new patch)
 /// starts a fresh streak.
 pub fn record_panic(function: &str, message: &str) {
-    let mut guard = PANIC_STREAKS
+    let mut panic_streaks_guard = PANIC_STREAKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let streaks = guard.get_or_insert_with(HashMap::new);
-    let entry = streaks.entry(function.to_string()).or_insert_with(|| {
-        FLAKY_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
+    let streaks = panic_streaks_guard.get_or_insert_with(HashMap::new);
+    let streak = streaks.entry(function.to_string()).or_insert_with(|| {
+        FLAKY_FUNCTION_COUNT.fetch_add(1, Ordering::Relaxed);
         (0, String::new())
     });
-    entry.1 = message.to_string();
-    if entry.0 >= PANIC_ROLLBACK_FRAMES {
+    streak.1 = message.to_string();
+    if streak.0 >= PANIC_ROLLBACK_FRAMES {
         return;
     }
-    entry.0 += 1;
-    if entry.0 == PANIC_ROLLBACK_FRAMES {
+    streak.0 += 1;
+    if streak.0 == PANIC_ROLLBACK_FRAMES {
         let report = FaultReport {
             function: function.to_string(),
             message: message.to_string(),
@@ -129,17 +129,17 @@ pub fn record_panic(function: &str, message: &str) {
 /// ordinary one - never touches the map.
 #[inline]
 pub fn record_success(function: &str) {
-    if FLAKY_FUNCTIONS.load(Ordering::Relaxed) == 0 {
+    if FLAKY_FUNCTION_COUNT.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let mut guard = PANIC_STREAKS
+    let mut panic_streaks_guard = PANIC_STREAKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(streaks) = guard.as_mut() else {
+    let Some(streaks) = panic_streaks_guard.as_mut() else {
         return;
     };
     if streaks.remove(function).is_some() {
-        FLAKY_FUNCTIONS.fetch_sub(1, Ordering::Relaxed);
+        FLAKY_FUNCTION_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -166,10 +166,10 @@ pub fn panic_into_failure(name: &str, payload: Box<dyn Any + Send>) -> crate::er
 /// The host calls this at a frame boundary and rolls each function back to its
 /// previous generation.
 pub fn take_fault_reports() -> Vec<FaultReport> {
-    let mut reports = FAULT_REPORTS
+    let mut fault_reports_guard = FAULT_REPORTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    std::mem::take(&mut *reports)
+    std::mem::take(&mut *fault_reports_guard)
 }
 
 // =============================================================================
@@ -278,9 +278,9 @@ impl HotSlot {
 
     /// The implementation recorded at registration.
     ///
-    /// This is what a rollback to generation zero installs, and it stays valid
-    /// for as long as the artifact that registered the system is loaded - which
-    /// the host guarantees by never unmapping a retired generation.
+    /// This is what a rollback to generation zero installs. The address belongs
+    /// to the artifact that registered the system, and a reload builds a fresh
+    /// slot for its replacement rather than carrying this address over.
     pub fn original(&self) -> usize {
         self.original.load(Ordering::Acquire)
     }
@@ -377,10 +377,10 @@ impl HotPatchRegistry {
     /// its function path, and leaving either behind would let a patch install
     /// into a system the scheduler has already dropped.
     pub fn remove(&mut self, name: &str) {
-        let Some(target) = self.slots.get(name).cloned() else {
+        let Some(target_slot) = self.slots.get(name).cloned() else {
             return;
         };
-        self.slots.retain(|_, slot| !Arc::ptr_eq(slot, &target));
+        self.slots.retain(|_, slot| !Arc::ptr_eq(slot, &target_slot));
     }
 
     /// The slot registered for `name`, if any.
@@ -454,13 +454,13 @@ where
 /// for instance, whose `type_name` is a compiler-generated placeholder with no
 /// stable path a patch could name.
 pub fn function_path<F>() -> Option<String> {
-    let name = std::any::type_name::<F>();
+    let type_name = std::any::type_name::<F>();
     // Closures render as `crate::outer::{{closure}}`, and generic instantiations
     // carry angle brackets; neither is a name a patch can be keyed by.
-    if name.contains('{') || name.contains('<') || !name.contains("::") {
+    if type_name.contains('{') || type_name.contains('<') || !type_name.contains("::") {
         return None;
     }
-    Some(name.to_string())
+    Some(type_name.to_string())
 }
 
 /// Address of the dispatch entry point for a locally compiled system function.
@@ -561,7 +561,7 @@ impl Default for PlainSlot {
 // Prologue patching (Windows x86-64 only)
 // =============================================================================
 
-/// The thread allowed to rewrite live code, claimed by the first patch.
+/// The thread allowed to rewrite live code, declared by the host each frame.
 ///
 /// Patching assumes no thread is executing inside the bytes being overwritten.
 /// The host upholds that by patching at a frame boundary with no system
@@ -569,7 +569,7 @@ impl Default for PlainSlot {
 /// stated in a comment is one that quietly stops being true. Recording the
 /// thread turns it into something checkable: a second thread attempting a patch
 /// is refused rather than racing the first.
-static PATCHING_THREAD: AtomicU64 = AtomicU64::new(0);
+static PATCHING_THREAD_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 /// A stable-ish numeric identity for the current thread.
 ///
@@ -591,8 +591,8 @@ fn current_thread_token() -> u64 {
 /// thread allowed to patch, which is what tests and offline tools want.
 pub fn declare_patching_thread() {
     let token = current_thread_token();
-    if PATCHING_THREAD.load(Ordering::Relaxed) != token {
-        PATCHING_THREAD.store(token, Ordering::Release);
+    if PATCHING_THREAD_TOKEN.load(Ordering::Relaxed) != token {
+        PATCHING_THREAD_TOKEN.store(token, Ordering::Release);
     }
 }
 
@@ -603,7 +603,7 @@ pub fn declare_patching_thread() {
 /// Returns the message to refuse with. Undeclared means unrestricted.
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn check_patching_thread() -> Result<(), String> {
-    let declared = PATCHING_THREAD.load(Ordering::Acquire);
+    let declared = PATCHING_THREAD_TOKEN.load(Ordering::Acquire);
     if declared == 0 || declared == current_thread_token() {
         return Ok(());
     }
@@ -681,16 +681,16 @@ pub fn function_extent(address: usize) -> Option<(usize, usize)> {
     // directory for an arbitrary address and reports a null entry when it finds
     // none. `image_base` is a writable local, and passing a null history table
     // asks for no caching.
-    let entry =
+    let function_entry =
         unsafe { RtlLookupFunctionEntry(address as u64, &mut image_base, core::ptr::null_mut()) };
-    if entry.is_null() {
+    if function_entry.is_null() {
         return None;
     }
     // SAFETY: the pointer is non-null and points into the image's static
     // exception directory, which stays mapped for as long as the module is.
-    let entry = unsafe { &*entry };
-    let begin = image_base as usize + entry.begin_address as usize;
-    let end = image_base as usize + entry.end_address as usize;
+    let function_entry = unsafe { &*function_entry };
+    let begin = image_base as usize + function_entry.begin_address as usize;
+    let end = image_base as usize + function_entry.end_address as usize;
     if end <= begin {
         return None;
     }
@@ -752,7 +752,7 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
 
     // SAFETY: the caller guarantees `target` addresses executable code; making
     // its page writable is exactly what this function exists to do.
-    let changed = unsafe {
+    let protection_changed = unsafe {
         VirtualProtect(
             target_pointer as *mut core::ffi::c_void,
             ABSOLUTE_JUMP_LENGTH,
@@ -760,7 +760,7 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
             &mut previous_protection,
         )
     };
-    if changed == 0 {
+    if protection_changed == 0 {
         return Err("VirtualProtect refused to make the page writable".to_string());
     }
 
@@ -783,12 +783,12 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
 
     // SAFETY: restoring the protection the call above reported.
     unsafe {
-        let mut discarded: u32 = 0;
+        let mut discarded_protection: u32 = 0;
         VirtualProtect(
             target_pointer as *mut core::ffi::c_void,
             ABSOLUTE_JUMP_LENGTH,
             previous_protection,
-            &mut discarded,
+            &mut discarded_protection,
         );
         // Required on any core whose instruction cache may hold the old bytes.
         FlushInstructionCache(
@@ -846,8 +846,8 @@ pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), Str
     // SAFETY: the extent check above established that `target` is the entry of a
     // mapped function at least `original.len()` bytes long, so this many bytes
     // are readable.
-    let installed = unsafe { core::slice::from_raw_parts(target_pointer, original.len()) };
-    if installed.len() < 2 || installed[0] != 0x48 || installed[1] != 0xB8 {
+    let installed_bytes = unsafe { core::slice::from_raw_parts(target_pointer, original.len()) };
+    if installed_bytes.len() < 2 || installed_bytes[0] != 0x48 || installed_bytes[1] != 0xB8 {
         return Err(format!(
             "0x{target:016x} does not begin with the jump this patch installed, so \
              it is no longer the function those bytes came from; refusing to \
@@ -857,7 +857,7 @@ pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), Str
 
     let mut previous_protection: u32 = 0;
     // SAFETY: as documented on this function.
-    let changed = unsafe {
+    let protection_changed = unsafe {
         VirtualProtect(
             target_pointer as *mut core::ffi::c_void,
             original.len(),
@@ -865,18 +865,18 @@ pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), Str
             &mut previous_protection,
         )
     };
-    if changed == 0 {
+    if protection_changed == 0 {
         return Err("VirtualProtect refused to make the page writable".to_string());
     }
     // SAFETY: the page is writable and the length matches the saved slice.
     unsafe {
         core::ptr::copy_nonoverlapping(original.as_ptr(), target_pointer, original.len());
-        let mut discarded: u32 = 0;
+        let mut discarded_protection: u32 = 0;
         VirtualProtect(
             target_pointer as *mut core::ffi::c_void,
             original.len(),
             previous_protection,
-            &mut discarded,
+            &mut discarded_protection,
         );
         FlushInstructionCache(
             GetCurrentProcess(),
@@ -1203,11 +1203,11 @@ mod integration_tests {
     fn cleared_systems_stop_being_patchable() {
         use cleared_slots as systems;
         let mut engine = sequential_engine();
-        let owner = SystemOwner::extension(0);
+        let system_owner = SystemOwner::extension(0);
 
         // Distinct functions, so each system gets its own function-path alias
         // and the two do not share a registry entry.
-        engine.begin_module_registration(owner);
+        engine.begin_module_registration(system_owner);
         engine.register_system("module_counter", systems::original);
         engine.end_module_registration();
         engine.register_system("project_counter", systems::replacement);
@@ -1215,7 +1215,7 @@ mod integration_tests {
         assert!(engine.hot_patch_registry().get("module_counter").is_some());
         assert!(engine.hot_patch_registry().get("project_counter").is_some());
 
-        engine.clear_systems_owned_by(owner);
+        engine.clear_systems_owned_by(system_owner);
 
         assert!(
             engine.hot_patch_registry().get("module_counter").is_none(),
@@ -1238,7 +1238,7 @@ mod integration_tests {
 
     /// A system is patchable by its function path as well as its display name.
     ///
-    /// The two routinely differ - the example project registers
+    /// The two routinely differ - the `native` test project registers
     /// `physics_system` as `"ball_physics"` - and a generated patch only knows
     /// the path, because that is what `#[pill_hot]` derives.
     #[test]
@@ -1251,12 +1251,12 @@ mod integration_tests {
         assert!(path.is_none(), "a bare fn pointer type has no path");
 
         // The path the engine recorded for this registration.
-        let recorded: Vec<String> = engine
+        let recorded_names: Vec<String> = engine
             .hot_patch_registry()
             .names()
             .map(|name| name.to_string())
             .collect();
-        let function_path_entry = recorded
+        let function_path_entry = recorded_names
             .iter()
             .find(|name| name.ends_with("::original"))
             .expect("the function path must be registered alongside the display name");
@@ -1474,8 +1474,8 @@ mod integration_tests {
         let pretend_original = vec![0x90u8; ABSOLUTE_JUMP_LENGTH];
 
         // SAFETY: expected to refuse before writing, which is what this asserts.
-        let result = unsafe { restore_prologue(target, &pretend_original) };
-        let detail = result.expect_err("an unpatched function must be refused");
+        let restore_result = unsafe { restore_prologue(target, &pretend_original) };
+        let detail = restore_result.expect_err("an unpatched function must be refused");
         assert!(
             detail.contains("does not begin with the jump"),
             "unexpected reason: {detail}"
@@ -1504,8 +1504,8 @@ mod integration_tests {
 
         // SAFETY: the call is expected to refuse before writing anything, which
         // is exactly what this asserts.
-        let result = unsafe { patch_prologue(target, replacement) };
-        let detail = result.expect_err("a non-function address must be refused");
+        let patch_result = unsafe { patch_prologue(target, replacement) };
+        let detail = patch_result.expect_err("a non-function address must be refused");
         assert!(
             detail.contains("exception directory"),
             "unexpected reason: {detail}"
@@ -1525,8 +1525,8 @@ mod integration_tests {
         let replacement = patch_replacement as *const () as usize;
 
         // SAFETY: expected to refuse before writing.
-        let result = unsafe { patch_prologue(target, replacement) };
-        let detail = result.expect_err("an interior address must be refused");
+        let patch_result = unsafe { patch_prologue(target, replacement) };
+        let detail = patch_result.expect_err("an interior address must be refused");
         assert!(
             detail.contains("not a function entry point"),
             "unexpected reason: {detail}"

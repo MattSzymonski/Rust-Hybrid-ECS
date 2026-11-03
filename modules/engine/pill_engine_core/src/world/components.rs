@@ -2,24 +2,24 @@
 //!
 //! # Responsibilities
 //!
-//! - Registers component types in all three lanes - a Rust type, a type shared
-//!   between binaries, and a layout described at runtime by a manifest - and
-//!   keeps the per-type storage descriptions a reload replaces.
-//! - Reshapes and re-homes live columns across a reload: a relayout rewrites a
-//!   column's rows into a new shape, a remap moves them onto a successor
-//!   registration, and the re-homing pass re-points every column's function
-//!   table at code that is still mapped.
+//! - Registers component types of all three kinds - a Rust type, a type shared
+//!   between DLLs, and a layout described at runtime by a manifest - and keeps
+//!   the storage description that a reload replaces.
+//! - Reshapes and re-homes live columns across a reload. A relayout rewrites a
+//!   column's rows in a new shape, a remap moves them onto a successor
+//!   registration, and the re-homing pass points every column's function table
+//!   at code that is still mapped.
 //! - Reads and writes one entity's component, and adds or removes one, which
-//!   migrates the entity between archetypes.
+//!   moves the entity to another archetype.
 //!
 //! # Design
 //!
-//! Registration is data rather than code: a component's storage description is
-//! a layout plus a function table, never a closure monomorphized into the
-//! artifact that registered it, so a column outlives the generation that filled
-//! it and the table is replaced on reload. The three lanes differ only in what
-//! vouches for a row's meaning - an exact `TypeId`, a name-derived identity, or
-//! nothing but a validated layout - and share one column type underneath.
+//! Registration is data, not code. A component's storage description is a
+//! layout plus a table of function pointers, never a closure compiled into the
+//! DLL that registered it, so a column survives the DLL that filled it and the
+//! table is replaced on reload. The three kinds differ only in what proves a
+//! row holds the right type - an exact `TypeId`, an identity derived from a
+//! name, or just a validated layout - and all three share one column type.
 
 use super::*;
 
@@ -29,11 +29,11 @@ use super::*;
 
 /// One archetype's raw rows of one component, as a language binding reads them.
 ///
-/// Every chunk accessor returns this type, so a caller reads `len` as a row
-/// count and `element_size` as the row stride by name instead of by position -
-/// the two are adjacent in the signatures, and every lane returns both.
+/// The four language-binding chunk accessors return this type. Because every
+/// field is named, a binding reads `len` as a row count and `element_size` as
+/// the row stride, instead of remembering their order in a tuple.
 pub struct ColumnChunk<'a> {
-    /// The archetype the rows belong to.
+    /// The id of the archetype the rows belong to.
     pub archetype: ArchetypeId,
     /// The column's contiguous row buffer, one `element_size` block per row.
     pub data: *mut u8,
@@ -53,12 +53,12 @@ impl World {
     /// The first shared component in `declared` whose registered layout differs
     /// from the layout the reading binary's type declares, if any.
     ///
-    /// `declared` pairs each shared component a query targets with the schema
-    /// hash its type declares ([`crate::QueryTarget::declared_shared_schemas`]).
-    /// A component whose registration carries no hash is not compared: there is
-    /// no evidence either way, and size and alignment still guard the column.
-    /// Each mismatch is logged once per (component, declared hash), since the
-    /// query that hits it is typically rebuilt every frame.
+    /// `declared` lists each shared component a query targets together with the
+    /// schema hash its type declares ([`crate::QueryTarget::declared_shared_schemas`]).
+    /// A component whose registration carries no hash is skipped, because there
+    /// is no evidence either way; the column's size and alignment are still
+    /// checked. Each mismatch is logged once per component and declared hash,
+    /// because the query that hits it is usually rebuilt every frame.
     pub(crate) fn find_stale_shared_reader(
         &mut self,
         declared: &[(ComponentId, u64)],
@@ -75,7 +75,8 @@ impl World {
             if registered_hash == declared_hash {
                 continue;
             }
-            // Log the first sighting only; the refusal itself happens every time.
+            // Log each mismatched pair only once; the refusal itself happens on
+            // every call.
             if !self
                 .reported_schema_mismatches
                 .contains(&(component_id, declared_hash))
@@ -104,9 +105,10 @@ impl World {
     /// Reserve capacity for at least `additional` instances of component `T`
     /// in every archetype that currently contains `T`.
     ///
-    /// This is a hint - the ECS may reserve more or less than requested
-    /// depending on archetype distribution. Call after registering components
-    /// and after creating archetypes you intend to populate.
+    /// This is a hint, not a promise: every archetype holding `T` reserves
+    /// `additional` rows, so the total reserved can be more than the number
+    /// asked for. Call it after registering components and after creating the
+    /// archetypes you intend to populate.
     pub fn reserve_components<T>(&mut self, additional: usize)
     where
         T: Component,
@@ -123,8 +125,10 @@ impl World {
     /// Return one component chunk together with its parallel change-tick column.
     ///
     /// Language bindings use this form when exposing writable component data.
-    /// Both slices have identical lengths and row `i` in `ticks` describes row
-    /// `i` in `components`.
+    /// Both slices have the same length, and row `i` in `ticks` describes row
+    /// `i` in the returned component slice. `chunk_index` counts the archetypes
+    /// that hold `T` in the map's iteration order, so it is only stable for the
+    /// pass it is read in.
     pub fn component_chunk_with_ticks_mut<T>(
         &mut self,
         chunk_index: usize,
@@ -149,10 +153,9 @@ impl World {
     /// Return one component chunk from one already-known archetype, with its
     /// parallel change-tick column.
     ///
-    /// The archetype-scoped twin of [`Self::component_chunk_with_ticks_mut`]:
-    /// language bindings that hold an archetype identity (from a driver chunk)
-    /// resolve the remaining query terms directly instead of scanning chunk
-    /// indices until the archetypes match.
+    /// The archetype-scoped twin of [`Self::component_chunk_with_ticks_mut`]: a
+    /// binding that already has an archetype id reads the chunk directly
+    /// instead of counting chunks until the archetypes match.
     pub fn component_chunk_with_ticks_mut_in_archetype<T>(
         &mut self,
         archetype_id: ArchetypeId,
@@ -172,13 +175,14 @@ impl World {
         Some((archetype_id, components, ticks))
     }
 
-    /// Register a component type with the World
+    /// Register a component type with the World.
     ///
-    /// This must be called for each component type before it can be used.
+    /// Call it for every component type before that type is used.
     ///
-    /// A component needs no `Clone`: an archetype move carries its row bitwise,
-    /// so a type that cannot sensibly be cloned - a handle, a guard, anything
-    /// whose duplication means something - is registrable like any other.
+    /// A component does not need `Clone`. An archetype move copies its row byte
+    /// for byte, so a type that must not be cloned - a handle, a guard,
+    /// anything whose duplication would mean something - registers like any
+    /// other.
     pub fn register_component<T>(&mut self)
     where
         T: Component,
@@ -189,21 +193,20 @@ impl World {
     /// Shared registration body for the layout-less and layout-carrying entry
     /// points.
     ///
-    /// `fields` is the compile-time field layout when the caller has one. It
-    /// is forwarded to the registry, which records it so a second registration
-    /// of the same component can be checked against the first - a diagnostic
-    /// for an ordinary component, and the soundness check for a shared one.
+    /// `fields` is the compile-time field layout, when the caller has one. The
+    /// registry records it, so a second registration of the same component can
+    /// be checked against the first. For an ordinary component that check is a
+    /// diagnostic; for a shared one it is the soundness check.
     ///
     /// # Shared components
     ///
-    /// A component that declares [`Component::shared_name`] resolves to the
-    /// same [`ComponentId`] in every binary that links it, so a second binary's
-    /// registration finds the bit already taken and **binds to the existing
-    /// column** rather than allocating a second one: the registry reports
-    /// `AlreadyPresent`, no new bit is consumed, and entities spawned from
-    /// either binary land in the same archetype. That falls out of the ids
-    /// being equal, so there is no window in which two binaries share a column
-    /// but not a mask bit.
+    /// A component that declares [`Component::shared_name`] gets the same
+    /// [`ComponentId`] in every DLL that links it. A second DLL's registration
+    /// therefore finds the bit already taken and **binds to the existing
+    /// column** instead of allocating a new one: the registry reports
+    /// `AlreadyPresent`, no new bit is used, and entities spawned from either
+    /// DLL get the same archetype. All of that follows from the ids being equal,
+    /// so there is no moment when two DLLs share a column but not a mask bit.
     pub(crate) fn register_component_inner<T>(
         &mut self,
         fields: &'static [crate::component_registry::ComponentFieldDescriptor],
@@ -213,9 +216,9 @@ impl World {
         self.register_component_inner_superseding::<T>(fields, false);
     }
 
-    /// [`Self::register_component_inner`] for a registration the host
-    /// announced as replacing the previous generation of the same subject,
-    /// which may re-lay out a shared component (see
+    /// [`Self::register_component_inner`] for a registration the host announced
+    /// as replacing an earlier generation of the same subject, which may give a
+    /// shared component a new layout (see
     /// [`crate::component::ComponentRegistry::register_with_layout_superseding`]).
     pub(crate) fn register_component_inner_superseding<T>(
         &mut self,
@@ -234,10 +237,11 @@ impl World {
         let component_id = ComponentId::of::<T>();
         let type_name = crate::component::ComponentRegistry::registered_name::<T>();
 
-        // Register component (bit index + name + layout)
-        // `register_bit_with_layout` rather than `register`: the world does not
-        // act on whether the type was already present, and re-registration is
-        // normal here because a hot reload re-runs every `init`.
+        // Step 1: Register the component - bit index, name and layout. This
+        // calls `register_with_layout_superseding` rather than `register`: the
+        // world does not act on whether the type was already present, and
+        // registering again is normal here because a hot reload re-runs every
+        // `init`.
         let bit = match self
             .component_registry
             .register_with_layout_superseding::<T>(fields, superseding)
@@ -245,13 +249,12 @@ impl World {
         {
             Ok(bit) => bit,
             Err(error) => {
-                // Neither the 128-type ceiling nor a shared-layout
-                // disagreement is a programming error - both are outcomes of
-                // what the user's binaries declare - so they are reported as
-                // first-class diagnostics and recorded for the init entry
-                // point instead of panicking. The caller (project/module init)
-                // fails the reload transactionally when the error is drained
-                // by `component_registry::register_all_components`.
+                // Hitting the 128-type ceiling or a shared-layout disagreement
+                // is not a programming error: both follow from what the user's
+                // binaries declare. So the failure is logged, recorded for the
+                // init entry point, and not a panic. The caller (project or
+                // module init) fails the whole reload when
+                // `component_registry::register_all_components` drains it.
                 error!(
                     target: pill_core::telemetry::telemetry_target::ECS,
                     type_name = %type_name,
@@ -263,8 +266,8 @@ impl World {
                 return;
             }
         };
-        // Warn while headroom is still available but getting thin, so
-        // exhaustion is visible before it is fatal.
+        // Step 2: Warn while slots are still free but running out, so the
+        // ceiling shows up before registration starts failing.
         let remaining = self.component_registry.available_slots();
         if remaining <= REGISTRATION_HEADROOM_WARNING_THRESHOLD {
             warn!(
@@ -275,13 +278,13 @@ impl World {
             );
         }
 
-        // Record the registration chronologically so the host can enumerate
-        // which types one module's init registered at all (plain or
-        // persistable), which is how a type dropped from a reloaded module is
-        // told apart from one merely downgraded to a plain component. The id is
-        // recorded beside the name because a rebuilt image gets a fresh
-        // `TypeId` per name: comparing ids is what tells a failed generation's
-        // leftovers apart from a rollback generation's re-registration.
+        // Step 3: Record the registration in order, so the host can list every
+        // type one module's init registered - plain or persistable. That is how
+        // a type dropped from a reloaded module is told apart from one only
+        // downgraded to a plain component. The id is stored beside the name
+        // because a rebuilt DLL gets a fresh `TypeId` for each name: comparing
+        // ids is what separates a failed generation's leftovers from a rollback
+        // generation's re-registration.
         self.component_registration_log.push((
             type_name,
             component_id,
@@ -289,25 +292,24 @@ impl World {
         ));
         self.component_registration_sequence = self.component_registration_sequence.wrapping_add(1);
 
-        // Register the storage factory as plain DATA (type id, layout, and a
-        // per-type function table) instead of a closure that would be
-        // monomorphized into this generation's DLL. The engine builds the
-        // actual column in `Archetype::new` as a concrete `ComponentColumn`
-        // with no trait-object vtable, and re-homes its function table on
-        // every reload, so columns survive DLL unloads.
+        // Step 4: Store the storage factory as plain data - type id, layout and
+        // a per-type function table - instead of a closure compiled into this
+        // DLL. `Archetype::new` then builds a concrete `ComponentColumn` with no
+        // vtable, and the table is replaced on every reload, so a column
+        // survives a DLL unload.
         //
         // A shared component's column is built with `of_shared`, so its
-        // element-type check compares layout instead of `TypeId`. That is the
-        // point where the compiler stops vouching for the type and the
-        // registry's layout check above takes over: the second binary's `T` is
-        // a different `TypeId` for the same type, and only the recorded size,
-        // alignment and schema hash establish that it really is.
+        // element-type check compares the layout instead of the `TypeId`. That
+        // is where the compiler stops checking the type and the registry's
+        // layout check above takes over: the second DLL's `T` has a different
+        // `TypeId` for the same type, and only the recorded size, alignment and
+        // schema hash show that it really is the same type.
         //
-        // Re-registering replaces the factory, so the function table points at
-        // the most recently loaded generation - the same last-writer-wins rule
-        // the reload path already relies on, with `rehome_native_columns`
-        // re-pointing live columns at it afterwards.
-        let storage_info = if let Some(shared) = T::shared_name() {
+        // Registering again replaces the factory, so the function table points
+        // at the newest loaded DLL. That is the same last-writer-wins rule the
+        // reload path relies on, and `rehome_native_columns` points live
+        // columns at the new table afterwards.
+        let native_column_info = if let Some(shared) = T::shared_name() {
             // One line per registration, so a declared identity shows up in the
             // startup and reload logs rather than only in the periodic report,
             // which needs frames.
@@ -322,34 +324,33 @@ impl World {
             crate::archetype::NativeColumnInfo::of::<T>(false)
         };
         // Keep the table that is about to be replaced: the migration that
-        // consumes old-layout columns must drop them through the glue that
-        // wrote them, and by then this registration's table is the one stamped
-        // on every column - see `migrate_component_column_in_place`.
+        // consumes old-layout columns has to drop them through the code that
+        // allocated them, and by then every column already carries this
+        // registration's table. See `migrate_component_column_in_place`.
         if let Some(StorageFactory::Native(previous)) = self.storage_factories.get(&component_id) {
             self.retired_native_storage_ops
                 .insert(component_id, previous.ops);
         }
         self.storage_factories
-            .insert(component_id, StorageFactory::Native(storage_info));
+            .insert(component_id, StorageFactory::Native(native_column_info));
     }
 
     /// Drain the first registration failure recorded by
     /// [`Self::register_component`], if any.
     ///
     /// The artifact-wide registration loop calls this after running every
-    /// descriptor so the generated `init` can fail the reload with a non-zero
-    /// status when the component-type ceiling was hit — a diagnosable startup
-    /// failure rather than a silent half-registration.
+    /// descriptor, so the generated `init` can fail the reload with a non-zero
+    /// status when the component-type ceiling was hit. That makes a startup
+    /// failure diagnosable instead of leaving the world half registered.
     pub fn take_registration_error(&mut self) -> Option<WorldError> {
         self.registration_error.take()
     }
 
-    /// Record a registration failure raised outside `register_component`, so
-    /// the artifact-wide registration loop fails the reload the same way it
-    /// does for the component-type ceiling.
+    /// Record a registration failure so the artifact-wide registration loop
+    /// fails the reload the same way it does for the component-type ceiling.
     ///
     /// The first failure wins: later registrations in the same pass are often
-    /// knock-on effects of the first, and the original is the diagnosable one.
+    /// knock-on effects of the first, and the first one is the diagnosable one.
     pub(crate) fn record_registration_error(&mut self, error: WorldError) {
         if self.registration_error.is_none() {
             self.registration_error = Some(error);
@@ -358,11 +359,11 @@ impl World {
 
     /// Register a component together with its compile-time field layout, so
     /// the C# mirror codegen can emit a typed struct. Components registered
-    /// without field metadata (hand-registered, descriptor, or unit types) keep
+    /// without field metadata (hand-registered, descriptor or unit types) keep
     /// the opaque ABI-blob mirror.
     ///
-    /// Nested `struct:` fields are expanded into dotted leaf rows as the layout
-    /// is recorded for the editor; see `record_component_field_layout`.
+    /// Nested `struct:` fields become dotted leaf rows when the layout is
+    /// recorded for the editor; see `record_component_field_layout`.
     pub fn register_component_with_layout<T>(
         &mut self,
         fields: &'static [crate::component_registry::ComponentFieldDescriptor],
@@ -376,17 +377,18 @@ impl World {
     /// Record a runtime-described layout for a descriptor component.
     ///
     /// Overwrites any previous layout for the same id, so a manifest reload
-    /// replaces rather than accumulates. Used by the C# backend so managed
-    /// components become field-inspectable in the editor.
+    /// replaces the old layout instead of adding to it. The C# backend uses
+    /// this so managed components become field-inspectable in the editor.
     ///
     /// # Errors
     ///
     /// Returns [`ComponentFieldError::UnsupportedField`] for a descriptor that
-    /// reaches past the component's registered size or names a container tag.
+    /// reaches past the component's registered size, or names a container tag.
+    ///
     /// A descriptor row is raw bytes with no Rust value in it, so the accessors
-    /// have to be able to trust both: the bound keeps them inside the row, and
-    /// the tag check keeps them from following a `(pointer, length)` pair the
-    /// row never held.
+    /// must be able to trust the bounds and the tag. The size check keeps a read
+    /// inside the row. The tag check stops a `(pointer, length)` pair from being
+    /// followed in a row that never held one.
     pub fn register_component_descriptor_with_layout(
         &mut self,
         component_id: ComponentId,
@@ -424,22 +426,22 @@ impl World {
         Ok(())
     }
 
-    /// Re-home every native column's per-type function table.
+    /// Point every native column's per-type function table at the newest code.
     ///
-    /// Called by the host after each generation's `init` and before migration.
-    /// Columns store function pointers into the DLL that created them; when
-    /// that DLL is evicted from the reload graveyard the pointers dangle. This
-    /// pass refreshes each column from the latest factory registered for its
+    /// The host calls this after each generation's `init` and before migration.
+    /// A column stores function pointers into the DLL that created it, so those
+    /// pointers dangle once that DLL is evicted from the reload graveyard. This
+    /// pass takes each column's table from the newest factory registered for its
     /// component id, so:
     ///
-    /// - unchanged types point at the freshly loaded generation (still mapped),
-    /// - schema-changed types point at the previous generation (still mapped
-    ///   while the migration consumes and drops their columns),
-    /// - type-erased (foreign-language) columns are untouched.
+    /// - an unchanged type points at the newly loaded generation (mapped),
+    /// - a type whose schema changed points at the previous generation (mapped
+    ///   until the migration drops its columns),
+    /// - a type-erased (foreign-language) column is left alone.
     pub fn rehome_native_columns(&mut self) {
-        // Step 1: Snapshot the current per-type function tables first so the
-        // immutable borrow of `storage_factories` cannot conflict with the
-        // mutable borrow of `archetypes` below.
+        // Step 1: Copy the current per-type function tables out first, so the
+        // immutable borrow of `storage_factories` does not overlap the mutable
+        // borrow of `archetypes` below.
         let factory_ops: HashMap<ComponentId, crate::archetype::ColumnOps> = self
             .storage_factories
             .iter()
@@ -449,7 +451,8 @@ impl World {
             })
             .collect();
 
-        // Step 2: Refresh every column whose component id has a native factory.
+        // Step 2: Give every column whose component id has a native factory the
+        // table that factory holds.
         for archetype in self.archetypes.values_mut() {
             for &component_id in &archetype.component_types {
                 let Some(&ops) = factory_ops.get(&component_id) else {
@@ -462,16 +465,16 @@ impl World {
         }
     }
 
-    /// Native columns the world still stores although no factory describes
-    /// their component id.
+    /// Counts the native columns the world still stores although no factory
+    /// describes their component id.
     ///
-    /// A column outlives its registration when a type is re-registered under a
-    /// fresh id - the rebuilt image's "same name, fresh `TypeId`" case - and
-    /// the old id is never swept: the archetype keeps the id in its mask and
-    /// the column in its storage, but no factory is left to describe the type.
-    /// The host's reload path uses this as the gate on unmapping a retired
-    /// image, because a column's drop table lives in the image that produced
-    /// it.
+    /// A column can outlive its registration: when a type is registered again
+    /// under a fresh id - the rebuilt DLL's "same name, fresh `TypeId`" case -
+    /// the old id is never removed, so the archetype keeps the id in its mask
+    /// and the column in its storage, but no factory describes the type any
+    /// more. The host's reload path checks this count before it unmaps a
+    /// retired image, because a column's drop table lives in the image that
+    /// produced it.
     pub fn columns_without_factory(&self) -> usize {
         self.archetypes
             .values()
@@ -485,17 +488,17 @@ impl World {
 
     /// Drop every native column whose component id has no factory left.
     ///
-    /// The id-keyed counterpart of `drop_forgotten_components`: the name-keyed
-    /// sweep cannot reach these, because the name resolves to whatever
-    /// registration claimed it last while the stale column keeps the id the
-    /// previous generation minted. Each affected component is removed from
+    /// The id-keyed counterpart of `drop_forgotten_components`. The name-keyed
+    /// sweep cannot reach these, because the name resolves to whichever
+    /// registration claimed it last, while the stale column keeps the id the
+    /// previous generation created. Each affected component is removed from
     /// every entity that carries it, which empties the archetypes holding it
     /// and drops their columns through the table that is still mapped while
-    /// this runs. Returns the number of orphaned component ids swept.
+    /// this runs. Returns the number of orphaned component ids dropped.
     pub fn drop_columns_without_factory(&mut self) -> usize {
         // Step 1: Collect the orphaned ids across every archetype. Deduplicated
         // by hand: the list is a handful of entries at most, and a `HashSet`
-        // would hide the ordering.
+        // would hide the order.
         let mut orphaned_ids: Vec<ComponentId> = Vec::new();
         for archetype in self.archetypes.values() {
             for &component_id in &archetype.component_types {
@@ -508,9 +511,9 @@ impl World {
             }
         }
 
-        // Step 2: Remove each orphaned component from every entity carrying
-        // it. The entities are collected up front so the mutable borrows
-        // during removal never overlap the iteration, exactly as in
+        // Step 2: Remove each orphaned component from every entity carrying it.
+        // The entities are collected up front, so the mutable borrows during
+        // removal never overlap the iteration, exactly as in
         // `drop_forgotten_components`.
         for component_id in &orphaned_ids {
             let entities: Vec<Entity> = self
@@ -532,14 +535,14 @@ impl World {
 
     /// Register an unmanaged component described by an external language.
     ///
-    /// Re-registering an identical layout and name for the same `stable_id` is
-    /// idempotent and returns the existing [`ComponentId`].
+    /// Re-registering the same layout and name under the same `stable_id` does
+    /// nothing and returns the existing [`ComponentId`].
     ///
-    /// `blittability` is the caller's evidence that every field of the component
-    /// is a blittable value type, and it is required, not optional: the storage
-    /// built from this layout copies rows with `ptr::copy`, frees them without
-    /// running element destructors, and is shared across threads, so no check
-    /// this function could run would make an owning layout safe.
+    /// `blittability` is the caller's word that every field of the component is
+    /// a blittable value type, and it is required rather than optional. The
+    /// storage built from this layout copies rows with `ptr::copy`, frees them
+    /// without running element destructors, and is shared across threads, so no
+    /// check this function could run would make an owning layout safe.
     /// [`Blittability`] documents what each constructor proves.
     ///
     /// # Errors
@@ -549,7 +552,9 @@ impl World {
     /// [`WorldError::DescriptorAlignmentInvalid`] for a zero or non-power-of-two
     /// `align`, [`WorldError::DescriptorLayoutInvalid`] for an oversized layout,
     /// [`WorldError::DescriptorAlreadyRegistered`] when the `stable_id` is
-    /// already taken by a different layout or name, and
+    /// already taken by a different layout or name,
+    /// [`WorldError::ComponentNameCollision`] when another registered component
+    /// already claims the name and still holds rows, and
     /// [`WorldError::ComponentTypeLimitExceeded`] when the registry is full.
     pub fn register_component_descriptor(
         &mut self,
@@ -582,12 +587,12 @@ impl World {
             };
         }
         // A name already claimed by a live column belongs to a different
-        // component, not to an earlier generation of this one: a manifest
-        // reload derives `stable_id` from the same full name, so it lands on
-        // the idempotent path above rather than here. Registering a second
-        // component under that name would make every later lookup by name
-        // ambiguous, and managed code binds by name, so the collision is
-        // reported now instead of producing a binding to the wrong column.
+        // component, not to an earlier generation of this one. A manifest reload
+        // derives `stable_id` from the same full name, so it takes the
+        // idempotent path above instead of reaching here. A second component
+        // under that name would make every later lookup by name ambiguous, and
+        // managed code binds by name, so the collision is reported now instead
+        // of producing a binding to the wrong column.
         if let Some((existing_id, live_rows)) = self.live_component_with_name(&name, component_id) {
             return Err(WorldError::ComponentNameCollision {
                 type_name: name,
@@ -597,8 +602,9 @@ impl World {
             });
         }
 
-        // The registry reports the 128-type ceiling as a typed error (with the
-        // offending name and current count) rather than panicking; propagate it.
+        // The registry reports the 128-type ceiling as a typed error carrying
+        // the offending name and the current count, rather than panicking. Pass
+        // it on.
         self.component_registry
             .register_descriptor(stable_id, name)?;
         self.storage_factories.insert(
@@ -608,18 +614,19 @@ impl World {
         Ok(component_id)
     }
 
-    /// Replace a descriptor component's layout, migrating every stored row.
+    /// Replace a descriptor component's layout and migrate every stored row.
     ///
-    /// The one way a descriptor component's storage shape may change after
-    /// registration. The component keeps its id, its registry bit and its
-    /// archetype membership - a fresh registration would allocate a new bit
-    /// index, and that index is baked into archetype masks and scheduled access
-    /// masks - so only the columns' element layout and the recorded size move.
+    /// This is the only way a descriptor component's storage shape may change
+    /// after registration. The component keeps its id, its registry bit and its
+    /// archetype membership, because a fresh registration would allocate a new
+    /// bit index, and that index is stored in archetype masks and scheduled
+    /// access masks. Only the columns' element layout and the recorded size
+    /// change.
     ///
     /// `plan` says where each byte of a new row comes from ([`FieldPlan::between`]
-    /// builds one from two field lists); anything it does not cover is left zero.
-    /// Row order and change ticks are preserved, so entity locations stay valid
-    /// and no system observes a spurious `Added`. The new layout and the plan are
+    /// builds one from two field lists); anything it does not cover is left
+    /// zero. Row order and change ticks are kept, so entity locations stay valid
+    /// and no system sees a spurious `Added`. The new layout and the plan are
     /// checked before the first column is touched, so a rejected call leaves the
     /// world exactly as it was.
     ///
@@ -636,6 +643,11 @@ impl World {
     /// [`WorldError::ComponentColumnLayoutMismatch`] when a column's element size
     /// disagrees with the registered layout, and [`WorldError::DescriptorRowInvalid`]
     /// when a planned field falls outside a row of either layout.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an archetype listed by the verification pass has lost the
+    /// column by the time it is migrated, which is an internal-invariant break.
     pub fn relayout_descriptor_component(
         &mut self,
         component_id: ComponentId,
@@ -656,10 +668,10 @@ impl World {
         plan.validate(previous_size, size)?;
 
         // Every archetype holding the component, including the ones with no
-        // rows: their columns must carry the new element layout so the next
-        // entity added to them is stored at the new shape.
-        // A relayout keeps the witness and the release hook: the shape
-        // changes, the promise about what a row owns does not.
+        // rows: their columns must carry the new element layout, so the next
+        // entity added to them is stored in the new shape.
+        // A relayout keeps `blittability`: the shape changes, but the promise
+        // about what a row owns does not.
         let layout = ColumnLayout {
             size,
             align,
@@ -667,12 +679,12 @@ impl World {
             blittability: previous.blittability,
         };
 
-        // Step 1: Verify every column before touching one. The plan and the
-        // factory were checked above; what remains is the possibility that a
-        // column disagrees with the factory - the desync a partially applied
-        // relayout leaves behind - so the whole set is checked first and the
-        // report names the column that disagrees.
-        let mut targets = Vec::new();
+        // Step 1: Check every column before touching any of them. The plan and
+        // the factory were checked above; the remaining risk is a column that
+        // disagrees with the factory, which is the desync a partly applied
+        // relayout leaves behind. So the whole set is checked first, and the
+        // error names the column that disagrees.
+        let mut target_archetype_ids = Vec::new();
         for (archetype_id, archetype) in &self.archetypes {
             if !archetype.component_types.contains(&component_id) {
                 continue;
@@ -691,13 +703,13 @@ impl World {
                     actual: column.element_size(),
                 });
             }
-            targets.push(*archetype_id);
+            target_archetype_ids.push(*archetype_id);
         }
 
         // Step 2: Migrate. Every column here was verified a moment ago and
         // nothing in between reshapes the map, so the lookups cannot miss.
-        let mut migrated = 0;
-        for archetype_id in targets {
+        let mut migrated_row_count = 0;
+        for archetype_id in target_archetype_ids {
             let archetype = self
                 .archetypes
                 .get_mut(&archetype_id)
@@ -706,31 +718,32 @@ impl World {
                 .component_storages
                 .get_mut(component_id)
                 .expect("the verification pass checked the column is present");
-            migrated += column.relayout_validated(layout.clone(), plan, previous_size);
+            migrated_row_count += column.relayout_validated(layout.clone(), plan, previous_size);
         }
 
-        // Publish the new shape to the one record that describes storage: the
-        // factory the chunk accessors and the size readers consult. The
-        // columns that were just reshaped carry the same shape.
+        // Store the new shape in the one record that describes storage: the
+        // factory the chunk accessors and the size readers consult. The columns
+        // just reshaped carry the same shape.
         self.storage_factories
             .insert(component_id, StorageFactory::Descriptor(layout));
-        Ok(migrated)
+        Ok(migrated_row_count)
     }
 
     /// Move every row of one descriptor component into another and retire the
     /// source registration.
     ///
-    /// The rename half of the managed manifest's storage story: a successor
-    /// registration derives its id from its own name, so rows cannot stay put
+    /// This is how a managed manifest renames a type. A successor registration
+    /// derives its id from its own name, so the rows cannot stay where they are
     /// the way a relayout keeps them. Each row is reshaped through `plan` - the
     /// same [`FieldPlan`] a relayout uses, measured from the source's field
     /// layout to the successor's - and added to the successor before it is
-    /// removed from the source, so an entity whose only component this is
-    /// survives instead of being destroyed when the removal empties it.
+    /// removed from the source. An entity whose only component this is
+    /// therefore survives, instead of being destroyed when the removal empties
+    /// it.
     ///
-    /// The source registration is then retired: its name claim, registry entry
-    /// and storage factory go, and its bit is released when no archetype with
-    /// live rows still references it.
+    /// The source registration is then retired: its name claim, its registry
+    /// entry and its storage factory go, and its bit is released when no
+    /// archetype with live rows still references it.
     ///
     /// Returns the number of rows moved.
     ///
@@ -742,36 +755,38 @@ impl World {
     /// [`WorldError::DescriptorComponentAlreadyPresent`] when the successor
     /// already carries rows (merging two row sets would make the plan's source
     /// side wrong for half its input), [`WorldError::DescriptorRowInvalid`] when
-    /// the plan does not fit the two layouts, and
+    /// the plan does not fit the two layouts,
     /// [`WorldError::DescriptorStorageMissing`] when an archetype lists the
-    /// source without a column.
+    /// source without a column, and
+    /// [`WorldError::DescriptorComponentMissing`] when the removal of a moved
+    /// row finds the source column gone.
     pub fn remap_descriptor_component(
         &mut self,
-        old_component_id: ComponentId,
-        new_component_id: ComponentId,
+        source_component_id: ComponentId,
+        successor_component_id: ComponentId,
         plan: &FieldPlan,
     ) -> Result<usize, WorldError> {
-        if old_component_id == new_component_id {
+        if source_component_id == successor_component_id {
             return Err(WorldError::DescriptorRemapSelf);
         }
-        let old_size = match self.storage_factories.get(&old_component_id) {
+        let source_size = match self.storage_factories.get(&source_component_id) {
             Some(StorageFactory::Descriptor(layout)) => layout.size,
             _ => {
                 return Err(WorldError::DescriptorComponentNotRegistered {
-                    id: old_component_id,
+                    id: source_component_id,
                 })
             }
         };
-        let new_size = match self.storage_factories.get(&new_component_id) {
+        let successor_size = match self.storage_factories.get(&successor_component_id) {
             Some(StorageFactory::Descriptor(layout)) => layout.size,
             _ => {
                 return Err(WorldError::DescriptorComponentNotRegistered {
-                    id: new_component_id,
+                    id: successor_component_id,
                 })
             }
         };
-        plan.validate(old_size, new_size)?;
-        if self.live_row_count(new_component_id) != 0 {
+        plan.validate(source_size, successor_size)?;
+        if self.live_row_count(successor_component_id) != 0 {
             return Err(WorldError::DescriptorComponentAlreadyPresent);
         }
 
@@ -779,57 +794,57 @@ impl World {
         // row the plan cannot describe fails before anything has moved. The
         // plan was validated against the registered sizes, so the slices in
         // here are in bounds.
-        let mut moves: Vec<(Entity, Vec<u8>)> = Vec::new();
+        let mut row_moves: Vec<(Entity, Vec<u8>)> = Vec::new();
         for (archetype_id, archetype) in &self.archetypes {
-            if !archetype.component_types.contains(&old_component_id) {
+            if !archetype.component_types.contains(&source_component_id) {
                 continue;
             }
-            let Some(column) = archetype.component_storages.get(old_component_id) else {
+            let Some(column) = archetype.component_storages.get(source_component_id) else {
                 return Err(WorldError::DescriptorStorageMissing {
-                    component_id: old_component_id,
+                    component_id: source_component_id,
                     archetype_id: *archetype_id,
                 });
             };
             for (row, entity) in archetype.entities.iter().enumerate() {
-                let old_bytes = column.bytes(row).ok_or(WorldError::DescriptorRowInvalid)?;
-                let mut new_bytes = vec![0_u8; new_size];
-                plan.apply(old_bytes, &mut new_bytes);
-                moves.push((*entity, new_bytes));
+                let source_bytes = column.bytes(row).ok_or(WorldError::DescriptorRowInvalid)?;
+                let mut successor_bytes = vec![0_u8; successor_size];
+                plan.apply(source_bytes, &mut successor_bytes);
+                row_moves.push((*entity, successor_bytes));
             }
         }
 
         // Step 2: Move every row. Add first, remove second: the two columns
         // coexist for a moment and the entity never loses its last component.
-        let mut moved_rows = 0;
-        for (entity, new_bytes) in moves {
-            self.add_descriptor_component(entity, new_component_id, &new_bytes)?;
-            self.remove_component_by_id(entity, old_component_id)
+        let mut moved_row_count = 0;
+        for (entity, successor_bytes) in row_moves {
+            self.add_descriptor_component(entity, successor_component_id, &successor_bytes)?;
+            self.remove_component_by_id(entity, source_component_id)
                 .map_err(|_| WorldError::DescriptorComponentMissing)?;
-            moved_rows += 1;
+            moved_row_count += 1;
         }
 
         // Step 3: The source holds no rows now; retire it so its name can be
         // declared again and its bit returns to the pool. Every archetype that
-        // carried it was emptied by Step 2, which is the precondition the
-        // retirement's bit rule checks.
-        self.retire_registration(old_component_id);
-        Ok(moved_rows)
+        // carried it was emptied by Step 2, which is the condition the
+        // retirement's bit rule needs.
+        self.retire_registration(source_component_id);
+        Ok(moved_row_count)
     }
 
     /// Return a raw descriptor component column for language bindings.
     ///
-    /// `chunk_position` indexes the archetypes that carry the component in the
+    /// `chunk_index` counts the archetypes that carry the component, in the
     /// map's iteration order, so it is only stable for the pass it is read in.
     pub fn descriptor_component_chunk_mut(
         &mut self,
         component_id: ComponentId,
-        chunk_position: usize,
+        chunk_index: usize,
     ) -> Option<ColumnChunk<'_>> {
         let archetype = self
             .archetypes
             .values_mut()
             .filter(|archetype| archetype.component_types.contains(&component_id))
-            .nth(chunk_position)?;
+            .nth(chunk_index)?;
         let archetype_id = archetype.id;
         let column = archetype.component_storages.get_mut(component_id)?;
         let element_size = column.element_size();
@@ -855,7 +870,7 @@ impl World {
     pub fn native_component_chunk_mut(
         &mut self,
         component_id: ComponentId,
-        chunk_position: usize,
+        chunk_index: usize,
     ) -> Option<ColumnChunk<'_>> {
         if !component_id.is_native_storage() {
             return None;
@@ -864,7 +879,7 @@ impl World {
             .archetypes
             .values_mut()
             .filter(|archetype| archetype.component_types.contains(&component_id))
-            .nth(chunk_position)?;
+            .nth(chunk_index)?;
         let archetype_id = archetype.id;
         let column = archetype.component_storages.get_mut(component_id)?;
         let element_size = column.element_size();
@@ -926,13 +941,13 @@ impl World {
         })
     }
 
-    /// Total number of rows every archetype currently stores for one
-    /// component id.
+    /// Returns the total number of rows every archetype stores for one component
+    /// id.
     ///
-    /// Zero means the component is registered but nothing is using it, which
-    /// is what a superseded hot-reload generation looks like once its entities
-    /// have migrated away. A non-zero count means the column is still live, so
-    /// its registration cannot be treated as stale and discarded.
+    /// Zero means nothing uses the component any more, which is what a
+    /// superseded hot-reload generation looks like once its entities have
+    /// migrated away. A non-zero count means the column is still live, so its
+    /// registration cannot be treated as stale and discarded.
     pub fn live_row_count(&self, component_id: ComponentId) -> usize {
         self.archetypes
             .values()
@@ -943,9 +958,9 @@ impl World {
 
     /// Whether any archetype still lists this component id.
     ///
-    /// The host's failed-generation cleanup uses this to assert, in debug
-    /// builds, that a stranded id is really gone - rows, columns and tables -
-    /// before the image that defined it is retired from the graveyard.
+    /// The host's cleanup after a failed generation uses this, in debug builds,
+    /// to assert that a leftover id is really gone - its rows, columns and
+    /// tables - before the image that defined it leaves the graveyard.
     pub fn any_archetype_lists_component(&self, component_id: ComponentId) -> bool {
         self.archetypes
             .values()
@@ -955,14 +970,13 @@ impl World {
     /// The first registered component other than `excluding` that claims
     /// `type_name` and still holds rows, with that row count.
     ///
-    /// Both collision guards ask the same question: is a same-name
-    /// registration a superseded generation or a live peer? Live rows answer
-    /// part of it - a peer's rows are the ones that would be lost - but they do
-    /// not separate the two cases on their own, because a generation being
-    /// retired still holds its rows while its replacement registers. The host
-    /// therefore announces the retiring generation's names before init (see
-    /// [`Self::supersede_persist_registrations`]); this lookup supplies the
-    /// candidate the announcement is judged against.
+    /// Both collision guards answer one question: is a same-name registration a
+    /// superseded generation or a live peer? Live rows settle part of it - a
+    /// peer's rows are the ones that would be lost - but not all of it, because
+    /// a generation being retired still holds its rows while its replacement
+    /// registers. So the host announces the retiring generation's names before
+    /// init (see [`Self::supersede_persist_registrations`]), and this lookup
+    /// supplies the candidate that announcement is judged against.
     pub(crate) fn live_component_with_name(
         &self,
         type_name: &str,
@@ -979,11 +993,11 @@ impl World {
     /// order.
     ///
     /// Unlike [`Self::live_component_with_name`] this neither requires live
-    /// rows nor excludes an id. A rebuilt image usually gets the compiler's id
+    /// rows nor excludes an id. A rebuilt DLL usually gets the compiler's id
     /// back for an unchanged type, so a superseding registration's predecessor
     /// is often the entry *with* the incoming id, and older generations can
-    /// still be listed under the same name - every candidate has to be
-    /// considered, not one of them.
+    /// still be listed under the same name. Every candidate has to be
+    /// considered, not just one of them.
     pub(crate) fn component_ids_with_name(&self, type_name: &str) -> Vec<ComponentId> {
         self.component_registry
             .registered_components()
@@ -992,25 +1006,30 @@ impl World {
             .collect()
     }
 
-    /// Resolve a component ID from its registered type name, without the
+    /// Resolve a component id from its registered type name, without the
     /// persistable-only filter.
     ///
-    /// Used by the C# backend to map an extension's exposed component
-    /// name (e.g. `pill_spline::Spline`) to its native [`ComponentId`] so a
+    /// The C# backend uses this to map an extension's exposed component name
+    /// (e.g. `pill_spline::Spline`) to its native [`ComponentId`], so a
     /// byte-level binding can be created without naming the concrete type.
     ///
     /// Unlike the persistable resolver, this has no `persist_inserters` filter
-    /// to collapse the candidate set, so a name claimed by two registrations
-    /// arrives here with both still visible. The bit index is no recency
-    /// ordering - `allocate_bit` reissues bits reclaimed by `remove` before
-    /// advancing `next_bit`, so the highest bit can belong to the older
-    /// registration - so an ambiguous name is reported as
-    /// [`WorldError::ComponentNameAmbiguous`] rather than binding managed code
+    /// to shrink the candidate set, so a name claimed by two registrations
+    /// arrives here with both still visible. A bit index says nothing about
+    /// age: `allocate_bit` hands out bits freed by `remove` before it advances
+    /// `next_bit`, so the highest bit can belong to the older registration. An
+    /// ambiguous name is therefore reported as
+    /// [`WorldError::ComponentNameAmbiguous`], rather than binding managed code
     /// silently to one of the two columns.
     ///
     /// A component declared with a shared identity cannot reach this state:
-    /// every binary that links it computes the same [`ComponentId`], so there
-    /// is only ever one registration to find.
+    /// every DLL that links it computes the same [`ComponentId`], so there is
+    /// only ever one registration to find.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::ComponentNameAmbiguous`] when more than one
+    /// registration claims the name.
     pub fn resolve_component_id_by_name_any(
         &self,
         type_name: &str,
@@ -1024,17 +1043,17 @@ impl World {
         let Some(first) = candidates.next() else {
             return Ok(None);
         };
-        let extra = candidates.count();
-        if extra > 0 {
+        let extra_candidate_count = candidates.count();
+        if extra_candidate_count > 0 {
             return Err(WorldError::ComponentNameAmbiguous {
                 type_name: type_name.to_string(),
-                count: extra + 1,
+                count: extra_candidate_count + 1,
             });
         }
         Ok(Some(first))
     }
 
-    /// Read one runtime-defined component as its raw manifest bytes.
+    /// Read one runtime-defined component row as raw bytes.
     pub fn descriptor_component_bytes(
         &self,
         entity: Entity,
@@ -1048,9 +1067,9 @@ impl World {
             .bytes(location.index_in_archetype)
     }
 
-    /// Get immutable reference to a component on an entity
+    /// Returns an immutable reference to a component on an entity.
     ///
-    /// Returns None if the entity doesn't exist or doesn't have the component.
+    /// Returns `None` if the entity doesn't exist or doesn't have the component.
     pub fn get_component<T>(&self, entity: Entity) -> Option<&T>
     where
         T: Component,
@@ -1063,22 +1082,21 @@ impl World {
                 std::any::type_name::<T>()
             )]
         );
-        // Get component bit for O(1) archetype check
+
+        // Step 1: Look up the component's registry bit. The archetype check
+        // below then needs one mask test instead of a search.
         let component_id = ComponentId::of::<T>();
         let bit = self.component_registry.get_bit(&component_id)?;
 
-        // Get entity location
+        // Step 2: Find the entity's location and its archetype, and confirm
+        // that the archetype's mask lists the component.
         let location = self.entity_locations.get(&entity)?;
-
-        // Get archetype
         let archetype = self.archetypes.get(&location.archetype_id)?;
-
-        // Check if archetype has this component type (O(1) bitmask check)
         if !archetype.has_component_bit(bit) {
             return None;
         }
 
-        // Get component from storage
+        // Step 3: Read the entity's row from the column.
         Some(
             archetype
                 .component_storages
@@ -1087,9 +1105,9 @@ impl World {
         )
     }
 
-    /// Get mutable reference to a component on an entity
+    /// Returns a mutable reference to a component on an entity.
     ///
-    /// Returns None if the entity doesn't exist or doesn't have the component.
+    /// Returns `None` if the entity doesn't exist or doesn't have the component.
     pub fn get_component_mut<T>(&mut self, entity: Entity) -> Option<&mut T>
     where
         T: Component,
@@ -1102,24 +1120,23 @@ impl World {
                 std::any::type_name::<T>()
             )]
         );
-        // Get component bit for O(1) archetype check
+
+        // Step 1: Look up the component's registry bit. The archetype check
+        // below then needs one mask test instead of a search.
         let component_id = ComponentId::of::<T>();
         let bit = self.component_registry.get_bit(&component_id)?;
 
-        // Get entity location
+        // Step 2: Find the entity's location and its archetype, and confirm
+        // that the archetype's mask lists the component.
         let location = self.entity_locations.get(&entity)?;
         let archetype_id = location.archetype_id;
         let index = location.index_in_archetype;
-
-        // Get archetype
         let archetype = self.archetypes.get_mut(&archetype_id)?;
-
-        // Check if archetype has this component type (O(1) bitmask check)
         if !archetype.has_component_bit(bit) {
             return None;
         }
 
-        // Get component from storage
+        // Step 3: Take the mutable row.
         Some(
             archetype
                 .component_storages
@@ -1128,35 +1145,34 @@ impl World {
         )
     }
 
-    /// Get raw mutable pointer to a component on an entity
+    /// Returns a raw mutable pointer to a component on an entity.
     ///
-    /// This is used by ScriptContext to avoid aliasing issues when a script
-    /// accesses components of its own type. By returning a raw pointer instead
-    /// of `&mut T`, we opt out of Rust's noalias optimization.
+    /// `ScriptContext` uses this to avoid aliasing problems when a script
+    /// accesses components of its own type. Returning a raw pointer instead of
+    /// `&mut T` opts out of Rust's `noalias` assumption.
     ///
-    /// Returns None if the entity doesn't exist or doesn't have the component.
+    /// Returns `None` if the entity doesn't exist or doesn't have the component.
     pub(crate) fn get_component_ptr_mut<T>(&mut self, entity: Entity) -> Option<*mut T>
     where
         T: Component,
     {
-        // Get component bit for O(1) archetype check
+        // Step 1: Look up the component's registry bit. The archetype check
+        // below then needs one mask test instead of a search.
         let component_id = ComponentId::of::<T>();
         let bit = self.component_registry.get_bit(&component_id)?;
 
-        // Get entity location
+        // Step 2: Find the entity's location and its archetype, and confirm
+        // that the archetype's mask lists the component.
         let location = self.entity_locations.get(&entity)?;
         let archetype_id = location.archetype_id;
         let index = location.index_in_archetype;
-
-        // Get archetype
         let archetype = self.archetypes.get_mut(&archetype_id)?;
-
-        // Check if archetype has this component type (O(1) bitmask check)
         if !archetype.has_component_bit(bit) {
             return None;
         }
 
-        // Get raw pointer to component - avoids creating intermediate &mut
+        // Step 3: Take the raw pointer to the row. Going through `get_mut` and
+        // casting avoids handing out a `&mut` that could alias.
         let storage = archetype.component_storages.column_of_mut::<T>();
         Some(storage.get_mut::<T>(index) as *mut T)
     }
@@ -1421,6 +1437,14 @@ impl World {
     }
 
     /// Replace the bytes of an existing runtime-defined component row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::EntityNotFound`] when the entity has no location,
+    /// [`WorldError::DescriptorComponentMissing`] when its archetype has no
+    /// column for the component, [`WorldError::ColumnRowsAreNotPlainData`] when
+    /// the column holds values that own resources, and
+    /// [`WorldError::DescriptorRowInvalid`] when `bytes` is not exactly one row.
     pub(crate) fn set_descriptor_component_bytes(
         &mut self,
         entity: Entity,

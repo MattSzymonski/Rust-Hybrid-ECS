@@ -1,15 +1,17 @@
-//! Mesh assets and their interleaved vertex representation.
+//! Mesh assets: the vertices and indices the renderer draws, and the decoders
+//! that build them.
 //!
 //! # Responsibilities
 //!
 //! - Carry the geometry the renderer uploads: vertices interleaved in the
 //!   order the pipeline's vertex step reads them, plus a 32-bit index list.
-//! - Build meshes three ways: from buffers the game already holds, from the
+//! - Build a mesh three ways: from buffers the game already holds, from the
 //!   built-in triangle used as a stand-in, and by decoding a Wavefront OBJ
-//!   buffer - flipping V, or keeping it as authored for a top-down asset.
-//! - Derive tangent space after an OBJ decode. A file carries positions, UVs
-//!   and normals, so the tangents and bitangents the shaders read are
-//!   accumulated from the mesh's triangles and normalized here.
+//!   buffer. The decode flips V by default; the top-down decode keeps it as
+//!   authored.
+//! - Derive tangent space after an OBJ decode, when the import settings ask
+//!   for it: the tangents and bitangents are accumulated from the mesh's
+//!   triangles and their UVs, then normalized.
 //! - Load through a metadata file ([`ImportedAsset`]): the
 //!   [`MeshImportSettings`] in `<model>.obj.meta` hold the decode choices.
 //!
@@ -17,9 +19,9 @@
 //!
 //! [`MeshVertex`] is `repr(C)` and `Pod`, so a mesh's vertices upload as a
 //! plain byte slice, and that same field order is the attribute layout the
-//! renderer declares to wgpu. A mesh is an [`Asset`], so the renderer
-//! re-uploads its buffers when the asset's version moves rather than
-//! expecting a game to mutate renderer state mid frame.
+//! renderer declares to wgpu. A mesh is an asset ([`pill_engine::Asset`]), so
+//! the renderer rebuilds its buffers when the asset's version moves, and a
+//! game never touches renderer state mid frame.
 
 // External crates
 use pill_engine::{
@@ -28,41 +30,52 @@ use pill_engine::{
 };
 use serde::{Deserialize, Serialize};
 
-/// One vertex, in the layout the vertex buffer step reads it.
+// =============================================================================
+// MeshVertex
+// =============================================================================
+
+/// One vertex of a mesh, in the layout of the vertex buffer.
 ///
-/// `repr(C)` and `Pod` are what let a run of these upload to the GPU as raw
-/// bytes, and the field order is the attribute layout the renderer declares
-/// to wgpu, so the two have to agree.
+/// The type is `repr(C)` and `Pod`, so a run of vertices uploads to the GPU as
+/// raw bytes. The field order is also the attribute layout the renderer
+/// declares to wgpu, so the two have to agree.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable, PillMirror)]
 pub struct MeshVertex {
     /// Object-space position.
     pub position: [f32; 3],
     /// Texture coordinates for the shader's UV input. The OBJ decoder flips
-    /// V, because a file counts it upward from the bottom edge; a top-down
-    /// asset decodes through `Mesh::from_obj_bytes_top_down` instead.
+    /// V, because a file counts it upward from the bottom edge while the
+    /// renderer samples from the top. `Mesh::from_obj_bytes_top_down` decodes
+    /// without the flip, for an asset authored top-down.
     pub texture_coordinates: [f32; 2],
-    /// Object-space normal. A decoded vertex the file gives no normal for
-    /// falls back to +Y.
+    /// Object-space normal. A vertex whose file entry has no normal falls
+    /// back to +Y.
     pub normal: [f32; 3],
-    /// Tangent along the U direction, one axis of the TBN frame the shaders
-    /// use for normal mapping.
+    /// Tangent along the U direction, one axis of the TBN frame (tangent,
+    /// bitangent, normal) the shaders use for normal mapping.
     pub tangent: [f32; 3],
-    /// Bitangent along the V direction, the frame's third axis. The OBJ
-    /// decode starts both at zero and fills them from the triangles.
+    /// Bitangent along the V direction, the TBN frame's third axis. The OBJ
+    /// decode starts the tangent and the bitangent at zero and fills them
+    /// from the triangles.
     pub bitangent: [f32; 3],
 }
 
-/// One drawable piece of geometry: interleaved vertices plus a 32-bit index
-/// list.
+// =============================================================================
+// Mesh
+// =============================================================================
+
+/// One drawable piece of geometry, holding interleaved vertices and a 32-bit
+/// index list.
 ///
 /// The renderer builds a GPU copy once and rebuilds it when the asset's
-/// version moves, so a game edits the mesh it holds and lets the renderer
-/// notice rather than touching buffers itself.
+/// version moves. A game edits the mesh it holds and lets the renderer notice,
+/// instead of touching buffers itself.
 #[derive(Clone, Debug)]
 #[pill_mirror_object(asset, import, shared = "pill_master_renderer::assets::Mesh")]
 pub struct Mesh {
-    /// Label used in logs, profiling, and error messages.
+    /// Name used in logs and error messages, and as the label of the GPU
+    /// buffers built from the mesh.
     pub name: String,
     /// Vertices, interleaved as [`MeshVertex`] lays them out.
     pub vertices: Vec<MeshVertex>,
@@ -74,7 +87,7 @@ pub struct Mesh {
 impl Mesh {
     /// Builds a mesh from finished vertex and index buffers.
     ///
-    /// The buffers are stored as given: nothing checks the indices against
+    /// The buffers are stored as given. Nothing checks the indices against
     /// the vertex list, so the caller supplies a pair that already agrees.
     #[pill_mirror_method]
     pub fn from_data(
@@ -89,15 +102,16 @@ impl Mesh {
         }
     }
 
-    /// The built-in stand-in mesh: one triangle in the XY plane, half a unit
-    /// quad, facing +Z with its UVs and tangent space filled in.
+    /// The built-in stand-in mesh is one triangle in the XY plane, one unit
+    /// wide and one unit tall, facing +Z, with its UVs and tangent space
+    /// filled in.
     ///
     /// A project with no geometry of its own can register this and draw it
-    /// through the same material and pipeline path as any loaded mesh, which
-    /// keeps a fresh scene renderable before its assets exist.
+    /// through the same material and pipeline as any loaded mesh. That keeps
+    /// a fresh scene renderable before its assets exist.
     #[pill_mirror_method]
     pub fn triangle() -> Self {
-        let vertex = |position, texture_coordinates| MeshVertex {
+        let make_vertex = |position, texture_coordinates| MeshVertex {
             position,
             texture_coordinates,
             normal: [0.0, 0.0, 1.0],
@@ -107,9 +121,9 @@ impl Mesh {
         Self::from_data(
             "triangle",
             vec![
-                vertex([-0.5, -0.5, 0.0], [0.0, 1.0]),
-                vertex([0.5, -0.5, 0.0], [1.0, 1.0]),
-                vertex([0.0, 0.5, 0.0], [0.5, 0.0]),
+                make_vertex([-0.5, -0.5, 0.0], [0.0, 1.0]),
+                make_vertex([0.5, -0.5, 0.0], [1.0, 1.0]),
+                make_vertex([0.0, 0.5, 0.0], [0.5, 0.0]),
             ],
             vec![0, 1, 2],
         )
@@ -117,31 +131,29 @@ impl Mesh {
 
     /// Decodes a Wavefront OBJ buffer into an indexed, tangent-space mesh.
     ///
-    /// A managed (C#) project has no way to build a [`MeshVertex`] buffer
-    /// itself, so the bridge hands the host raw file bytes and gets a mesh
-    /// back; the renderer's asset preview decodes a file through here too.
+    /// The C# bridge hands the host a model file's raw bytes and gets a mesh
+    /// back through this function, and the renderer's asset preview decodes a
+    /// file through it too.
     ///
     /// # Errors
     ///
     /// Returns [`AssetLoadError::Decode`] when the buffer is not a readable
-    /// OBJ, or when it holds no triangles - the two ways a mesh the renderer
-    /// would otherwise upload empty comes back named instead. Both carry the
-    /// mesh's name, so the failure points at the asset rather than at the
-    /// bytes.
+    /// OBJ or holds no triangles. Both cases carry the mesh's name, so the
+    /// failure points at the asset rather than at the bytes.
     #[pill_mirror_method]
     pub fn from_obj_bytes(name: impl Into<String>, bytes: &[u8]) -> Result<Self, AssetLoadError> {
         Self::decode_obj(name.into(), bytes, &MeshImportSettings::default())
     }
 
-    /// Decodes a Wavefront OBJ buffer whose V coordinates are taken as
-    /// authored: top-down, `0.0` at the image's top edge, which is how the
-    /// renderer samples.
+    /// Decodes a Wavefront OBJ buffer whose V coordinates are kept as
+    /// authored, top-down, with `0.0` at the image's top edge. The renderer
+    /// samples the same way.
     ///
-    /// [`Self::from_obj_bytes`] is the decode for a file that counts V up
-    /// from the bottom edge - the OBJ convention - and flips it; an asset
-    /// authored against a top-left sampler, a port of an older demo being the
-    /// usual case, decodes through here so its UV islands land where the
-    /// texture was painted. The metadata import states the same choice as
+    /// [`Self::from_obj_bytes`] decodes the other way, flipping V because an
+    /// OBJ file counts V up from the bottom edge. Use this function for a
+    /// file written for a top-left sampler, such as a port of an older demo.
+    /// Its texture coordinates then still point at the same parts of the
+    /// image. The metadata import makes the same choice through
     /// [`MeshImportSettings::flip_v`].
     ///
     /// # Errors
@@ -160,20 +172,28 @@ impl Mesh {
         Self::decode_obj(name.into(), bytes, &settings)
     }
 
-    /// The OBJ decode behind [`Self::from_obj_bytes`] and the metadata import,
-    /// with the choices `settings` controls.
+    /// The OBJ decode behind [`Self::from_obj_bytes`] and the metadata import.
+    ///
+    /// `settings` says whether the decode flips V and whether it derives
+    /// tangent space.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetLoadError::Decode`] when `tobj` cannot read the buffer
+    /// as an OBJ, and when the result holds no vertices or no indices.
     fn decode_obj(
         name: String,
         bytes: &[u8],
         settings: &MeshImportSettings,
     ) -> Result<Self, AssetLoadError> {
-        let mut source = std::io::Cursor::new(bytes);
-        let options = tobj::LoadOptions {
+        // Step 1: parse the buffer, ignoring any material libraries it names.
+        let mut byte_cursor = std::io::Cursor::new(bytes);
+        let load_options = tobj::LoadOptions {
             triangulate: true,
             single_index: true,
             ..Default::default()
         };
-        let (models, _) = tobj::load_obj_buf(&mut source, &options, |_| {
+        let (models, _) = tobj::load_obj_buf(&mut byte_cursor, &load_options, |_| {
             Ok((Vec::new(), Default::default()))
         })
         .map_err(|error| AssetLoadError::Decode {
@@ -181,23 +201,25 @@ impl Mesh {
             detail: error.to_string(),
         })?;
 
+        // Step 2: copy every model's vertices and indices into the combined
+        // buffers.
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for model in models {
-            let source = model.mesh;
-            let base = vertices.len() as u32;
-            for index in 0..source.positions.len() / 3 {
+            let model_mesh = model.mesh;
+            let first_vertex_index = vertices.len() as u32;
+            for index in 0..model_mesh.positions.len() / 3 {
                 let position = [
-                    source.positions[index * 3],
-                    source.positions[index * 3 + 1],
-                    source.positions[index * 3 + 2],
+                    model_mesh.positions[index * 3],
+                    model_mesh.positions[index * 3 + 1],
+                    model_mesh.positions[index * 3 + 2],
                 ];
-                let texture_coordinates = if source.texcoords.len() >= index * 2 + 2 {
-                    // A file counts V upward from the bottom edge; the
+                let texture_coordinates = if model_mesh.texcoords.len() >= index * 2 + 2 {
+                    // A file counts V upward from the bottom edge, but the
                     // renderer samples from the top.
-                    let v_coordinate = source.texcoords[index * 2 + 1];
+                    let v_coordinate = model_mesh.texcoords[index * 2 + 1];
                     [
-                        source.texcoords[index * 2],
+                        model_mesh.texcoords[index * 2],
                         if settings.flip_v {
                             1.0 - v_coordinate
                         } else {
@@ -207,11 +229,11 @@ impl Mesh {
                 } else {
                     [0.0; 2]
                 };
-                let normal = if source.normals.len() >= index * 3 + 3 {
+                let normal = if model_mesh.normals.len() >= index * 3 + 3 {
                     [
-                        source.normals[index * 3],
-                        source.normals[index * 3 + 1],
-                        source.normals[index * 3 + 2],
+                        model_mesh.normals[index * 3],
+                        model_mesh.normals[index * 3 + 1],
+                        model_mesh.normals[index * 3 + 2],
                     ]
                 } else {
                     [0.0, 1.0, 0.0]
@@ -224,12 +246,19 @@ impl Mesh {
                     bitangent: [0.0; 3],
                 });
             }
-            indices.extend(source.indices.into_iter().map(|index| base + index));
+            indices.extend(
+                model_mesh
+                    .indices
+                    .into_iter()
+                    .map(|index| first_vertex_index + index),
+            );
         }
 
+        // Step 3: derive tangent space when the settings ask for it.
         if settings.calculate_tangents {
             calculate_tangent_space(&mut vertices, &indices);
         }
+        // Step 4: refuse a decode that produced nothing to draw.
         if vertices.is_empty() || indices.is_empty() {
             return Err(AssetLoadError::Decode {
                 label: name,
@@ -240,9 +269,61 @@ impl Mesh {
     }
 }
 
-/// Accumulates and normalizes per-vertex tangent/bitangent vectors from the
-/// mesh's triangles and their UV coordinates.
+// The metadata type name defaults to the shared name in the attribute above,
+// so every binary's copy of `Mesh` reads the same `.meta` files.
+impl ImportedAsset for Mesh {
+    type ImportSettings = MeshImportSettings;
+    const SOURCE_EXTENSIONS: &'static [&'static str] = &["obj"];
+
+    fn import(
+        name: &str,
+        source_bytes: &[u8],
+        settings: &MeshImportSettings,
+    ) -> AssetLoadResult<Self> {
+        Self::decode_obj(name.to_owned(), source_bytes, settings)
+    }
+}
+
+// =============================================================================
+// MeshImportSettings
+// =============================================================================
+
+/// How to decode a model file into a mesh; a metadata file holds these
+/// choices.
+///
+/// The defaults flip V and derive tangents. An import with no metadata file
+/// uses them, and so does [`Mesh::from_obj_bytes`]. Every field is part of the
+/// metadata file format, and `#[serde(default)]` lets a file written before a
+/// field existed still load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MeshImportSettings {
+    /// Whether the decode flips the V texture coordinate (`v` becomes
+    /// `1 - v`). A file counts V upward from the bottom edge; the renderer
+    /// samples from the top.
+    pub flip_v: bool,
+    /// Whether the decode derives tangents and bitangents from the triangles
+    /// and their UVs. Normal mapping needs them; with this off they stay zero.
+    pub calculate_tangents: bool,
+}
+
+impl Default for MeshImportSettings {
+    fn default() -> Self {
+        Self {
+            flip_v: true,
+            calculate_tangents: true,
+        }
+    }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Builds every vertex's tangent and bitangent from the mesh's triangles and
+/// their UV coordinates, then normalizes the two.
 fn calculate_tangent_space(vertices: &mut [MeshVertex], indices: &[u32]) {
+    // Step 1: add each triangle's tangent and bitangent to its three corners.
     for triangle in indices.chunks_exact(3) {
         let [a, b, c] = [
             triangle[0] as usize,
@@ -263,71 +344,38 @@ fn calculate_tangent_space(vertices: &mut [MeshVertex], indices: &[u32]) {
         if determinant.abs() < 1.0e-8 {
             continue;
         }
-        let reciprocal = determinant.recip();
-        let tangent = (edge1 * delta2.y - edge2 * delta1.y) * reciprocal;
-        let bitangent = (edge2 * delta1.x - edge1 * delta2.x) * reciprocal;
+        let determinant_reciprocal = determinant.recip();
+        let tangent = (edge1 * delta2.y - edge2 * delta1.y) * determinant_reciprocal;
+        let bitangent = (edge2 * delta1.x - edge1 * delta2.x) * determinant_reciprocal;
         for index in [a, b, c] {
             vertices[index].tangent = (glam::Vec3::from(vertices[index].tangent) + tangent).into();
             vertices[index].bitangent =
                 (glam::Vec3::from(vertices[index].bitangent) + bitangent).into();
         }
     }
+    // Step 2: normalize each vertex's pair, using an axis when a vertex got no
+    // usable triangle.
     for vertex in vertices {
-        vertex.tangent = normalized_or(glam::Vec3::from(vertex.tangent), glam::Vec3::X).into();
-        vertex.bitangent = normalized_or(glam::Vec3::from(vertex.bitangent), glam::Vec3::Y).into();
+        vertex.tangent =
+            normalize_or_fallback(glam::Vec3::from(vertex.tangent), glam::Vec3::X).into();
+        vertex.bitangent =
+            normalize_or_fallback(glam::Vec3::from(vertex.bitangent), glam::Vec3::Y).into();
     }
 }
 
-/// Returns the normalized vector, or the fallback axis when the vector is
-/// non-finite or too short to normalize.
-fn normalized_or(value: glam::Vec3, fallback: glam::Vec3) -> glam::Vec3 {
-    if value.is_finite() && value.length_squared() > 1.0e-8 {
-        value.normalize()
+/// Returns the vector scaled to length 1, or `fallback_axis` when the vector
+/// is not finite or too short to normalize.
+fn normalize_or_fallback(vector: glam::Vec3, fallback_axis: glam::Vec3) -> glam::Vec3 {
+    if vector.is_finite() && vector.length_squared() > 1.0e-8 {
+        vector.normalize()
     } else {
-        fallback
+        fallback_axis
     }
 }
 
-/// How to decode a model file into a mesh: what its `.meta` file holds.
-///
-/// The defaults flip V and derive tangents, which is what an import with no
-/// metadata file uses, and what [`Mesh::from_obj_bytes`] decodes with. Every
-/// field is part of the metadata file format; `#[serde(default)]` lets a file
-/// written before a field existed still load.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MeshImportSettings {
-    /// Flip the V texture coordinate (`v` becomes `1 - v`). A file counts V
-    /// upward from the bottom edge; the renderer samples from the top.
-    pub flip_v: bool,
-    /// Derive tangents and bitangents from the triangles and their UVs, which
-    /// normal mapping needs. Off leaves them zero.
-    pub calculate_tangents: bool,
-}
-
-impl Default for MeshImportSettings {
-    fn default() -> Self {
-        Self {
-            flip_v: true,
-            calculate_tangents: true,
-        }
-    }
-}
-
-// The metadata type name defaults to the shared name above, so every binary's
-// copy of `Mesh` reads the same files.
-impl ImportedAsset for Mesh {
-    type ImportSettings = MeshImportSettings;
-    const SOURCE_EXTENSIONS: &'static [&'static str] = &["obj"];
-
-    fn import(
-        name: &str,
-        source_bytes: &[u8],
-        settings: &MeshImportSettings,
-    ) -> AssetLoadResult<Self> {
-        Self::decode_obj(name.to_owned(), source_bytes, settings)
-    }
-}
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -354,8 +402,8 @@ f 1/1 2/2 3/3\n";
         assert!(Mesh::from_obj_bytes("empty", b"").is_err());
     }
 
-    /// The top-down decode keeps every V as authored, so it is the mirror of
-    /// the default decode's flip and nothing else moves.
+    /// The top-down decode keeps every V as authored, so it mirrors the
+    /// default decode's flip and changes nothing else.
     #[test]
     fn the_top_down_decode_mirrors_the_default_flip() {
         let flipped = Mesh::from_obj_bytes("t", TRIANGLE_OBJ.as_bytes()).unwrap();
@@ -373,21 +421,24 @@ f 1/1 2/2 3/3\n";
         }
     }
 
-    /// An import with no metadata file decodes through the default settings,
+    /// An import with no metadata file decodes with the default settings,
     /// which is what `from_obj_bytes` uses.
     #[test]
     fn importing_with_default_settings_matches_from_obj_bytes() {
         let decoded = Mesh::from_obj_bytes("t", TRIANGLE_OBJ.as_bytes()).unwrap();
         let imported =
             Mesh::import("t", TRIANGLE_OBJ.as_bytes(), &MeshImportSettings::default()).unwrap();
-        let positions_and_uvs = |mesh: &Mesh| {
+        let positions_uvs_and_tangents = |mesh: &Mesh| {
             mesh.vertices
                 .iter()
                 .map(|vertex| (vertex.position, vertex.texture_coordinates, vertex.tangent))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(positions_and_uvs(&imported), positions_and_uvs(&decoded));
-        // V was flipped: the second texture coordinate of `vt 0.0 1.0` is 0.
+        assert_eq!(
+            positions_uvs_and_tangents(&imported),
+            positions_uvs_and_tangents(&decoded)
+        );
+        // V was flipped, so the second texture coordinate of `vt 0.0 1.0` is 0.
         assert_eq!(imported.vertices[2].texture_coordinates, [0.0, 0.0]);
     }
 

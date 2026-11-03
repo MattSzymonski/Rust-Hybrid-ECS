@@ -1,29 +1,33 @@
-//! Draws a [`DrawList`] with wgpu: one pipeline, textures, clips.
+//! Draws [`DrawList`]s with wgpu: one render pipeline, whole-image texture
+//! uploads and scissor clipping.
 //!
 //! # Responsibilities
 //!
 //! - [`UiRenderer`]: owns the render pipeline and the textures the frames
-//!   carried; uploads texture changes and draws a surface's [`DrawList`]s.
+//!   carried. It uploads texture changes and draws a surface's [`DrawList`]s.
 //! - Applies each list's scale factor, its nested clip rectangles (as scissor
 //!   rectangles) and correct sRGB blending.
 //!
 //! # Design
 //!
-//! The painter uses the renderer module's device, queue and target, and keeps
-//! no camera, no window and no frame state beyond its GPU resources. One call
-//! per surface ([`UiRenderer::render`]) carries every list for it into one
-//! pair of reused buffers, since a buffer can only be written once per
-//! submission (see [`StreamBuffer`]).
+//! The UI renderer uses the renderer module's device, queue and target. It
+//! keeps no camera, no window and no per-frame state, apart from two scratch
+//! vectors that hold the surface being drawn. One call per surface
+//! ([`UiRenderer::render`]) converts every list for that surface into one pair
+//! of reused buffers, because a buffer can be written only once per submission
+//! (see [`StreamBuffer`]).
 //!
-//! Textures arrive as a versioned set ([`UiRenderer::apply_texture_set`]): the
-//! painter remembers the revision it applied per texture and uploads the whole
-//! image whenever that revision differs, so an instance rebuilt mid-run
-//! re-uploads every carried texture instead of drawing with empty textures. A
-//! draw naming a texture it does not hold is skipped.
+//! Textures arrive as a versioned set ([`UiRenderer::apply_texture_set`]). The
+//! renderer remembers the revision it applied for each texture and uploads the
+//! whole image whenever that revision differs. A new instance holds no
+//! textures, so the next set it receives uploads all of them instead of drawing
+//! with empty textures. A draw that names a texture it does not hold draws
+//! nothing.
 //!
-//! Colour correctness: `pill_ui_frame` colours are straight-alpha sRGB; the
-//! shader decodes vertex colours, and textures are `Rgba8UnormSrgb`. With an
-//! sRGB target the hardware encodes linear to sRGB exactly once. Blending is
+//! Colours: `pill_ui_frame` hands over straight-alpha sRGB. The shader decodes
+//! the vertex colour to linear light, and the textures are `Rgba8UnormSrgb`, so
+//! the texels it samples are linear too. When the target format is sRGB, the
+//! hardware encodes linear light back to sRGB exactly once. Blending is
 //! `src * src_alpha + dst * (1 - src_alpha)`.
 
 // Standard library
@@ -43,8 +47,9 @@ use crate::stream_buffer::StreamBuffer;
 // Shader
 // =============================================================================
 
-/// The whole pipeline in one WGSL source: physical pixels to clip space in
-/// the vertex stage, linear light out of the fragment stage.
+/// The whole pipeline in one WGSL source. The vertex stage turns physical
+/// pixels into clip space, and the fragment stage returns linear light that an
+/// sRGB target encodes.
 const UI_SHADER: &str = r#"
 struct Globals {
     // Physical target size in .xy; .zw unused.
@@ -98,8 +103,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 // GpuVertex
 // =============================================================================
 
-/// One vertex as the GPU sees it: position in physical pixels, texture
-/// coordinate, colour - `f32` components in a fixed layout the pipeline
+/// One vertex as the GPU sees it: a position in physical pixels, a texture
+/// coordinate and a colour, each `f32` in the fixed layout the pipeline
 /// declares.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -110,8 +115,9 @@ struct GpuVertex {
 }
 
 impl GpuVertex {
-    /// `vertex` with its logical position scaled to physical pixels, so lists
-    /// of different scale factors can share one buffer and one pass.
+    /// Returns `vertex` with its logical position multiplied by `scale_factor`
+    /// to give physical pixels. Lists drawn at different scale factors can then
+    /// share one buffer and one pass.
     fn scaled(vertex: &UiVertex, scale_factor: f32) -> GpuVertex {
         GpuVertex {
             position: [
@@ -129,7 +135,7 @@ impl GpuVertex {
     }
 }
 
-/// The vertex layout matching [`GpuVertex`].
+/// The vertex attributes that match the fields of [`GpuVertex`].
 const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
     0 => Float32x2,
     1 => Float32x2,
@@ -140,37 +146,44 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
 // UiRenderer
 // =============================================================================
 
-/// GPU resources for drawing `pill_ui_frame` draw lists.
+/// The GPU resources that draw `pill_ui_frame` draw lists.
 ///
-/// One renderer belongs to one device and one target format. The caller
-/// uploads texture changes once per frame ([`Self::apply_texture_set`]) and calls
+/// One instance belongs to one device and one target format. The caller uploads
+/// texture changes once per frame ([`Self::apply_texture_set`]) and then calls
 /// [`Self::render`] once per surface.
 pub struct UiRenderer {
     pipeline: wgpu::RenderPipeline,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     texture_layout: wgpu::BindGroupLayout,
-    /// The sampler [`UiTextureFilter::Linear`] asks for.
+    /// The sampler used for textures that ask for [`UiTextureFilter::Linear`].
     sampler: wgpu::Sampler,
-    /// The sampler [`UiTextureFilter::Nearest`] asks for.
+    /// The sampler used for textures that ask for [`UiTextureFilter::Nearest`].
     nearest_sampler: wgpu::Sampler,
-    /// Every texture a set carried and has not freed, with the revision
-    /// applied; a rebuilt instance starts empty and so re-uploads everything.
-    textures: HashMap<TextureId, PainterTexture>,
-    /// Every list of the surface being drawn: its vertices, then its indices.
+    /// Every texture the received sets carried and this renderer has not freed,
+    /// with the revision it was uploaded at. A new instance starts empty, so
+    /// its first set uploads everything.
+    textures: HashMap<TextureId, HeldTexture>,
+    /// The vertices of every list on the surface being drawn, one list after
+    /// the next.
     vertices: StreamBuffer,
+    /// The indices of every list on the surface being drawn, in the same
+    /// order.
     indices: StreamBuffer,
-    /// One frame's vertices and indices, converted here and reused for every
-    /// surface it draws on: cleared between surfaces, never reallocated.
+    /// Vertices converted for the surface being drawn. The next surface clears
+    /// and refills them, so their allocation is reused.
     scratch_vertices: Vec<GpuVertex>,
+    /// Indices of the surface being drawn, reused in the same way.
     scratch_indices: Vec<u32>,
 }
 
 impl UiRenderer {
-    /// Build the pipeline for `target_format`.
+    /// Creates the pipeline and the resources it draws with for
+    /// `target_format`.
     ///
-    /// Pass an sRGB target format (`Rgba8UnormSrgb`, or a surface format's
-    /// sRGB variant); the shader assumes the target encodes linear light.
+    /// `target_format` must be an sRGB format, such as `Rgba8UnormSrgb` or a
+    /// surface format's sRGB variant. The shader writes linear light and relies
+    /// on the target to encode it.
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> UiRenderer {
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pill_ui_frame globals layout"),
@@ -312,44 +325,44 @@ impl UiRenderer {
         }
     }
 
-    /// Upload every texture in `set` whose carried revision this instance has
-    /// not applied, then free the ones it names.
+    /// Uploads every texture in `texture_set` whose revision this instance has
+    /// not applied yet, then frees the ones the set names.
     ///
-    /// This is the reload-safe path: a rebuilt instance holds no textures, so
-    /// the first set it sees uploads every texture from the whole images the
-    /// set carries - no back-channel, no cadence. A live instance only uploads
-    /// what changed.
+    /// A set carries whole images, so a new instance that holds no textures
+    /// uploads all of them from this one call and can draw with them straight
+    /// away. A running instance uploads only the textures whose revision
+    /// changed.
     pub fn apply_texture_set(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        set: &UiTextureSet,
+        texture_set: &UiTextureSet,
     ) {
-        for texture in &set.textures {
-            let applied = self.textures.get(&texture.id).map(|entry| entry.revision);
-            if applied != Some(texture.revision) {
+        for texture in &texture_set.textures {
+            let applied_revision = self.textures.get(&texture.id).map(|entry| entry.revision);
+            if applied_revision != Some(texture.revision) {
                 self.apply_texture(device, queue, texture);
             }
         }
-        for id in &set.frees {
+        for id in &texture_set.frees {
             self.textures.remove(id);
         }
     }
 
-    /// Upload one texture's whole image at its carried revision, reusing the
-    /// GPU texture when its size is unchanged.
+    /// Uploads one texture's whole image at the revision it carries. A GPU
+    /// texture of the same size is reused instead of creating a new one.
     fn apply_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &UiTexture) {
-        let size = (texture.width, texture.height);
-        let created = match self.textures.remove(&texture.id) {
-            Some(entry) if entry.size == size => entry.texture,
-            _ => create_srgb_texture(device, "pill_ui_frame texture", size),
+        let texture_size = (texture.width, texture.height);
+        let gpu_texture = match self.textures.remove(&texture.id) {
+            Some(entry) if entry.texture_size == texture_size => entry.texture,
+            _ => create_srgb_texture(device, "pill_ui_frame texture", texture_size),
         };
-        upload_whole_texture(queue, &created, size, &texture.pixels);
+        upload_whole_texture(queue, &gpu_texture, texture_size, &texture.pixels);
         let sampler = match texture.filter {
             UiTextureFilter::Nearest => &self.nearest_sampler,
             UiTextureFilter::Linear => &self.sampler,
         };
-        let view = created.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = gpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pill_ui_frame texture bind group"),
             layout: &self.texture_layout,
@@ -366,21 +379,23 @@ impl UiRenderer {
         });
         self.textures.insert(
             texture.id,
-            PainterTexture {
-                texture: created,
+            HeldTexture {
+                texture: gpu_texture,
                 bind_group,
-                size,
+                texture_size,
                 revision: texture.revision,
             },
         );
     }
 
-    /// Draw `lists` into `target`, in order, over what it already holds.
+    /// Draws `lists` into `target`, in order, on top of what the target
+    /// already holds.
     ///
-    /// `target_size` is the target in physical pixels; each list comes with
-    /// the monitor scale its logical pixels are in. Call this once per
-    /// surface with every list for it: the lists share one upload, because
-    /// the painter's buffers can be written only once per submission.
+    /// `target_size` is the target's size in physical pixels. Each list comes
+    /// with the scale factor of the monitor it was built for, which turns its
+    /// logical pixels into physical ones. Call this once per surface with every
+    /// list for that surface, because the buffers hold one surface's data and
+    /// can be written only once per submission.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -394,43 +409,47 @@ impl UiRenderer {
             return;
         }
 
+        // Step 1: Write the target size the vertex stage divides by.
         queue.write_buffer(
             &self.globals_buffer,
             0,
             bytemuck::cast_slice(&[target_size.0 as f32, target_size.1 as f32, 0.0, 0.0]),
         );
-        // One upload for the surface: each list's vertices after the previous
-        // list's, its indices unchanged and offset by `base_vertex` per draw.
-        // The two vectors are the painter's own, so a frame that draws on four
-        // surfaces converts its UI once per surface but allocates nothing.
-        let mut vertices = std::mem::take(&mut self.scratch_vertices);
-        vertices.clear();
-        let mut indices = std::mem::take(&mut self.scratch_indices);
-        indices.clear();
-        let mut placements = Vec::with_capacity(lists.len());
+        // Step 2: Convert every list into one vertex run and one index run. A
+        // list's vertices follow the previous list's, and its indices keep
+        // their own values, so its first vertex is passed as the draw's base
+        // vertex. The two vectors belong to this renderer, so drawing on four
+        // surfaces reuses their allocation.
+        let mut surface_vertices = std::mem::take(&mut self.scratch_vertices);
+        surface_vertices.clear();
+        let mut surface_indices = std::mem::take(&mut self.scratch_indices);
+        surface_indices.clear();
+        let mut list_starts = Vec::with_capacity(lists.len());
         for (list, scale_factor) in lists {
-            placements.push((vertices.len() as i32, indices.len() as u32));
-            vertices.extend(
+            list_starts.push((surface_vertices.len() as i32, surface_indices.len() as u32));
+            surface_vertices.extend(
                 list.vertices
                     .iter()
                     .map(|vertex| GpuVertex::scaled(vertex, *scale_factor)),
             );
-            indices.extend_from_slice(&list.indices);
+            surface_indices.extend_from_slice(&list.indices);
         }
         let vertex_buffer = self
             .vertices
-            .write(device, queue, bytemuck::cast_slice(&vertices))
+            .write(device, queue, bytemuck::cast_slice(&surface_vertices))
             .cloned();
         let index_buffer = self
             .indices
-            .write(device, queue, bytemuck::cast_slice(&indices))
+            .write(device, queue, bytemuck::cast_slice(&surface_indices))
             .cloned();
-        self.scratch_vertices = vertices;
-        self.scratch_indices = indices;
+        self.scratch_vertices = surface_vertices;
+        self.scratch_indices = surface_indices;
         let (Some(vertex_buffer), Some(index_buffer)) = (vertex_buffer, index_buffer) else {
             return;
         };
 
+        // Step 3: Record one pass that draws every list of the surface, with the
+        // clip that is in force at each draw.
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("pill_ui_frame"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -452,9 +471,9 @@ impl UiRenderer {
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-        for ((list, scale_factor), (base_vertex, index_offset)) in lists.iter().zip(placements) {
-            // The list's clips nest; the innermost one is the pass's scissor
-            // and the stack restores the previous one on every pop.
+        for ((list, scale_factor), (base_vertex, index_offset)) in lists.iter().zip(list_starts) {
+            // A list's clips nest. The innermost one is the scissor in force, and
+            // the clip stack gives the previous one back on every pop.
             let full_clip = Rect::new(
                 Vector2f::ZERO,
                 Vector2f::new(
@@ -463,25 +482,26 @@ impl UiRenderer {
                 ),
             );
             let mut clip = full_clip;
-            let mut stack: Vec<Rect> = Vec::new();
+            let mut clip_stack: Vec<Rect> = Vec::new();
 
             for command in &list.commands {
                 match command {
                     DrawCommand::PushClip(rect) => {
-                        stack.push(clip);
+                        clip_stack.push(clip);
                         clip = clip
                             .intersection(rect)
                             .unwrap_or(Rect::from_min_size(Vector2f::ZERO, Vector2f::ZERO));
                     }
                     DrawCommand::PopClip => {
-                        clip = stack.pop().unwrap_or(full_clip);
+                        clip = clip_stack.pop().unwrap_or(full_clip);
                     }
                     DrawCommand::Draw {
                         texture,
                         first_index,
                         index_count,
                     } => {
-                        // A texture the painter does not hold draws nothing.
+                        // A draw whose texture this renderer does not hold is
+                        // skipped.
                         let Some(entry) = self.textures.get(texture) else {
                             continue;
                         };
@@ -501,23 +521,29 @@ impl UiRenderer {
 }
 
 // =============================================================================
-// Free Functions
+// HeldTexture
 // =============================================================================
 
-/// One texture the painter holds: the image, how it is bound, its texel size
-/// and the revision it was uploaded at.
-struct PainterTexture {
+/// One texture this renderer holds on the GPU: the image, the bind group that
+/// binds it together with its sampler, its texel size and the revision it was
+/// uploaded at.
+struct HeldTexture {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
-    size: (u32, u32),
+    texture_size: (u32, u32),
     revision: u64,
 }
 
-/// Upload `pixels` as the whole 2D texture `texture` of `size`.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Uploads `pixels` as the whole image of the 2D `texture`, which is
+/// `texture_size` texels.
 fn upload_whole_texture(
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
-    size: (u32, u32),
+    texture_size: (u32, u32),
     pixels: &[u8],
 ) {
     queue.write_texture(
@@ -530,25 +556,30 @@ fn upload_whole_texture(
         pixels,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(size.0 * 4),
-            rows_per_image: Some(size.1),
+            bytes_per_row: Some(texture_size.0 * 4),
+            rows_per_image: Some(texture_size.1),
         },
         wgpu::Extent3d {
-            width: size.0,
-            height: size.1,
+            width: texture_size.0,
+            height: texture_size.1,
             depth_or_array_layers: 1,
         },
     );
 }
 
-/// An `Rgba8UnormSrgb` texture the shader can sample and the queue can
-/// write: sampling decodes sRGB to linear, matching the shader's model.
-fn create_srgb_texture(device: &wgpu::Device, label: &str, size: (u32, u32)) -> wgpu::Texture {
+/// Creates an `Rgba8UnormSrgb` texture of `texture_size` texels that the shader
+/// can sample and the queue can write. Sampling an sRGB texture decodes it to
+/// linear light, which is what the shader expects.
+fn create_srgb_texture(
+    device: &wgpu::Device,
+    label: &str,
+    texture_size: (u32, u32),
+) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
-            width: size.0,
-            height: size.1,
+            width: texture_size.0,
+            height: texture_size.1,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -560,9 +591,10 @@ fn create_srgb_texture(device: &wgpu::Device, label: &str, size: (u32, u32)) -> 
     })
 }
 
-/// A logical-pixel clip as the scissor rectangle a render pass wants, in
-/// physical pixels clamped to the target; `None` when nothing would be
-/// drawn (an empty or fully outside clip).
+/// Converts a `clip` in logical pixels into the scissor rectangle a render pass
+/// takes: physical pixels, rounded outward and clamped to `target_size`.
+/// Returns `None` when nothing would be drawn, because the clip is empty or
+/// lies entirely outside the target.
 fn physical_scissor(clip: &Rect, scale_factor: f32, target_size: (u32, u32)) -> Option<[u32; 4]> {
     let min_x = (clip.min.x * scale_factor).floor().max(0.0);
     let min_y = (clip.min.y * scale_factor).floor().max(0.0);
@@ -597,9 +629,9 @@ mod tests {
             Some([1, 2, 30, 39]),
             "min floors, max ceils"
         );
-        let scaled = Rect::new(Vector2f::new(1.2, 2.7), Vector2f::new(30.5, 40.1));
+        let clip_at_scale_two = Rect::new(Vector2f::new(1.2, 2.7), Vector2f::new(30.5, 40.1));
         assert_eq!(
-            physical_scissor(&scaled, 2.0, target),
+            physical_scissor(&clip_at_scale_two, 2.0, target),
             Some([2, 5, 59, 75]),
             "the scale factor multiplies before rounding"
         );
@@ -635,13 +667,13 @@ mod tests {
             uv: Vector2f::new(0.25, 0.75),
             color: Color::rgba(0.1, 0.2, 0.3, 0.4),
         };
-        let gpu = GpuVertex::scaled(&vertex, 2.0);
+        let gpu_vertex = GpuVertex::scaled(&vertex, 2.0);
         assert_eq!(
-            gpu.position,
+            gpu_vertex.position,
             [2.0, 4.0],
             "the position is scaled to physical pixels"
         );
-        assert_eq!(gpu.uv, [0.25, 0.75]);
-        assert_eq!(gpu.color, [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(gpu_vertex.uv, [0.25, 0.75]);
+        assert_eq!(gpu_vertex.color, [0.1, 0.2, 0.3, 0.4]);
     }
 }

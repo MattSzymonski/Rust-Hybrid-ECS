@@ -2,78 +2,74 @@
 //!
 //! # Responsibilities
 //!
-//! - The tab bodies, the asset listing's icons, the addable list and the
-//!   shared selection's moves.
+//! - The tab bodies and the panel logic behind them: the asset browser's
+//!   tree, path bar and grid, the tile icons, the addable component list, the
+//!   shared selection's moves and the Inspector's rows and settings.
+//! - The shared chrome: the popup's dismissal rule, the left-aligned row, the
+//!   logged row placements and the floating toolbox's rows.
 //!
 //! # Design
 //!
-//! A child module of the shell, so `use super::*;` reaches the shell's items.
+//! The shell declares this module as `#[cfg(test)] pub mod tests`, so nothing
+//! here is built into the module the host loads, and `use super::*;` reaches
+//! every shell item. A test that needs pointer events goes through
+//! [`run_pass_with`]; the rest use [`run_pass`].
 
-// Current crate
-
-use super::*;
+// External crates
 use pill_engine::Engine;
 
-/// Run one egui pass for its side effects.
+// Current crate
+use super::*;
+
+// =============================================================================
+// Free functions
+// =============================================================================
+
+/// Runs one egui pass for its side effects and discards the output.
 ///
-/// epaint 0.36 panics when a `TexturesDelta` with unapplied deltas is
-/// dropped, and a test has no GPU to apply them on: the delta is cleared
-/// instead, the contract epaint asks a caller that ignores it to keep.
+/// A test has no GPU, so it never applies the texture updates the pass
+/// produces. epaint panics in a debug build when a `TexturesDelta` with
+/// unapplied updates is dropped, so the helper clears them first, which is
+/// what epaint asks of a caller that ignores the updates.
 ///
-/// The `cfg` gate is the one `#[test]` puts on a test function: it keeps
-/// this helper out of the hot-patch function inventory, which cannot name a
-/// function that is absent from the built artifact.
+/// `#[cfg(test)]` is the gate `#[test]` puts on a test function. It keeps this
+/// helper out of the hot-patch function inventory, which names functions by
+/// module path and cannot name one the library build leaves out.
 #[cfg(test)]
 fn run_pass(context: &egui::Context, pass: &mut dyn FnMut(&mut egui::Ui)) {
-    let mut output = context.run_ui(egui::RawInput::default(), pass);
-    output.textures_delta.clear();
+    let mut frame_output = context.run_ui(egui::RawInput::default(), pass);
+    frame_output.textures_delta.clear();
 }
 
-#[test]
-fn entity_rows_list_the_worlds_entities() {
-    let mut engine = Engine::new();
-    engine
-        .world_mut()
-        .create_entity()
-        .build()
-        .expect("entity builds");
-    let second = engine
-        .world_mut()
-        .create_entity()
-        .build()
-        .expect("entity builds");
-    let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
-    let rows = entity_rows(&snapshot);
-    assert_eq!(rows.len(), 2);
-    let expected = format!("{}v{}", second.id(), second.generation());
-    assert!(
-        rows.iter()
-            .any(|(entity, label)| *entity == second && label.contains(&expected)),
-        "the second entity's row carries its display id: {rows:?}"
-    );
-}
-
-#[test]
-fn the_systems_rows_name_the_worlds_systems() {
-    let mut engine = Engine::new();
-    engine.register_system("tick", || {});
-    engine.register_system("render", || {});
-    let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
-    let rows: Vec<String> = snapshot
-        .systems
-        .iter()
-        .map(systems::system_row_label)
-        .collect();
-    assert!(rows.iter().any(|row| row.contains("tick")), "{rows:?}");
-    assert!(rows.iter().any(|row| row.contains("render")), "{rows:?}");
+/// Runs one egui pass over a fixed 1280x720 screen with the given events.
+///
+/// The drag tests need presses, moves and releases, and [`run_pass`] sends no
+/// events at all.
+#[cfg(test)]
+fn run_pass_with(
+    context: &egui::Context,
+    events: Vec<egui::Event>,
+    pass: &mut dyn FnMut(&mut egui::Ui),
+) {
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 720.0),
+        )),
+        events,
+        ..Default::default()
+    };
+    let mut frame_output = context.run_ui(input, pass);
+    frame_output.textures_delta.clear();
 }
 
 /// The assets the tree and the grid tests draw: a folder, a folder inside it,
-/// a mesh and a shader.
+/// a mesh and a shader source file.
 ///
 /// A macro rather than a function because the patch scanner lists every
-/// module-level function of this crate and the inventory is compiled into the
-/// library as well as the tests, where `#[cfg(test)] mod tests` does not exist.
+/// module-level function that carries no `cfg` gate, and its inventory is
+/// compiled into the library as well as the tests. A plain function here would
+/// need the `#[cfg(test)]` gate [`run_pass`] carries; a macro needs none.
 macro_rules! browser_fixture {
     () => {
         vec![
@@ -117,9 +113,55 @@ macro_rules! browser_fixture {
     };
 }
 
-/// The tree and the grid agree about where the panel is looking: `open`
-/// expands a folder's ancestors (not the folder itself), a row's caret toggles
-/// that folder, and the path bar names every segment of the open folder.
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[test]
+fn entity_rows_list_the_worlds_entities() {
+    let mut engine = Engine::new();
+    engine
+        .world_mut()
+        .create_entity()
+        .build()
+        .expect("entity builds");
+    let second = engine
+        .world_mut()
+        .create_entity()
+        .build()
+        .expect("entity builds");
+    let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
+    let rows = entity_rows(&snapshot);
+    assert_eq!(rows.len(), 2);
+    let expected = format!("{}v{}", second.id(), second.generation());
+    assert!(
+        rows.iter()
+            .any(|(entity, label)| *entity == second && label.contains(&expected)),
+        "the second entity's row carries its display id: {rows:?}"
+    );
+}
+
+#[test]
+fn the_systems_rows_name_the_worlds_systems() {
+    let mut engine = Engine::new();
+    engine.register_system("tick", || {});
+    engine.register_system("render", || {});
+    let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
+    let rows: Vec<String> = snapshot
+        .systems
+        .iter()
+        .map(systems::system_row_label)
+        .collect();
+    assert!(rows.iter().any(|row| row.contains("tick")), "{rows:?}");
+    assert!(rows.iter().any(|row| row.contains("render")), "{rows:?}");
+}
+
+/// The tree, the path bar and the grid agree on which folder is open.
+///
+/// Opening a folder expands its parent folders, but not the folder's own row,
+/// because the folder's children are listed in the grid. A row's caret opens
+/// and closes that row, and the path bar gets one segment for each folder from
+/// the root down to the open folder.
 #[test]
 fn the_browser_opens_a_folder_and_the_tree_follows() {
     let assets = browser_fixture!();
@@ -137,8 +179,8 @@ fn the_browser_opens_a_folder_and_the_tree_follows() {
     assert!(browser.is_expanded("models/nested"));
     assert!(!browser.toggle_expanded("models/nested"));
     assert!(!browser.is_expanded("models/nested"));
-    // The path bar the panel draws above the grid: one segment per folder, the
-    // root first, each cumulative.
+    // The path bar draws one segment for each folder from the root down, and
+    // each segment holds the full path up to that folder.
     let segments: Vec<String> = browser::breadcrumb(&browser.folder)
         .into_iter()
         .map(|(path, _label)| path)
@@ -162,10 +204,9 @@ fn the_browser_opens_a_folder_and_the_tree_follows() {
     );
 }
 
-/// The dismissal rule the three pickers share now lives in
+/// The rule all three pickers (asset, entity and reference) get from
 /// `chrome::floating_popup`: a press outside the popup and its anchor closes
-/// it, a press on either keeps it. The entity reference row had no dismissal
-/// at all before the rule moved here.
+/// it, and a press on either one keeps it open.
 #[test]
 fn a_press_outside_a_floating_popup_is_reported_outside() {
     let context = egui::Context::default();
@@ -197,8 +238,9 @@ fn a_press_outside_a_floating_popup_is_reported_outside() {
     let mut on_anchor = None;
     let mut outside = None;
     let mut inside = None;
-    // One pass per press: `any_pressed` is the frame's edge, so each press
-    // needs its own frame. The area keeps its rectangle across passes.
+    // Each press gets its own frame: `any_pressed` reports only the frame a
+    // press starts in, and the popup keeps its rectangle from one frame to the
+    // next.
     run_pass_with(&context, Vec::new(), &mut |ui| {
         popup_rect = Some(draw(ui).response.rect);
     });
@@ -220,10 +262,10 @@ fn a_press_outside_a_floating_popup_is_reported_outside() {
     assert_eq!(outside, Some(true), "a press away from it closes it");
 }
 
-/// Drawing the tab bodies is a smoke test: the assertions are that nothing
-/// panics, that no tab queues a command, and that the one overlay the frame
-/// draws is the scene counter. It is named for that, not for what the tabs
-/// show.
+/// Drawing every tab body is a smoke test: it checks that nothing panics, that
+/// no tab queues a command, and that the only overlay region the pass claims
+/// is the scene's frame counter. The name states the queuing check, not what
+/// the tabs draw.
 #[test]
 fn drawing_every_tab_body_queues_nothing() {
     let mut engine = Engine::new();
@@ -286,8 +328,8 @@ fn drawing_every_tab_body_queues_nothing() {
     );
 }
 
-/// The Add list the popup and the component menu share omits every component
-/// the entity already carries, whether it is addable or not.
+/// The Add list the popup and the component menu share offers only components
+/// that are registered as addable and that the entity does not carry yet.
 #[test]
 fn the_addable_list_omits_the_components_the_entity_carries() {
     let mut engine = Engine::new();
@@ -344,7 +386,7 @@ fn the_assets_panel_wraps_a_long_tile_caption_and_queues_nothing() {
     let context = egui::Context::default();
     style::apply(&context);
     let mut regions = Vec::new();
-    let mut caption_rows = 0usize;
+    let mut caption_row_count = 0usize;
     let mut caption_width = 0.0f32;
     run_pass(&context, &mut |ui| {
         egui::CentralPanel::default().show(ui, |ui| {
@@ -379,11 +421,14 @@ fn the_assets_panel_wraps_a_long_tile_caption_and_queues_nothing() {
                 40.0,
             );
             let galley = ui.painter().layout_job(job);
-            caption_rows = galley.rows.len();
+            caption_row_count = galley.rows.len();
             caption_width = galley.size().x;
         });
     });
-    assert_eq!(caption_rows, 2, "a long name wraps to the two caption rows");
+    assert_eq!(
+        caption_row_count, 2,
+        "a long name wraps to the two caption rows"
+    );
     assert!(
         caption_width <= 41.0,
         "the caption stays inside the tile: {caption_width}"
@@ -463,26 +508,6 @@ fn an_asset_type_names_its_row_icon() {
     assert_eq!(asset_type_icon(""), icons::Icon::File);
 }
 
-/// One egui pass over a fixed screen with an explicit event list: the drag
-/// tests need presses and releases, which the plain [`run_pass`] never sends.
-#[cfg(test)]
-fn run_pass_with(
-    context: &egui::Context,
-    events: Vec<egui::Event>,
-    pass: &mut dyn FnMut(&mut egui::Ui),
-) {
-    let input = egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(1280.0, 720.0),
-        )),
-        events,
-        ..Default::default()
-    };
-    let mut output = context.run_ui(input, pass);
-    output.textures_delta.clear();
-}
-
 /// Dragging an asset tile from the grid onto its Inspector asset row queues
 /// the reference edit, through egui's drag-and-drop payload.
 #[test]
@@ -500,7 +525,7 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
         pending: &mut PendingEditorCommands,
         regions: &mut Vec<ShellRect>,
         drag_out: &mut Option<String>,
-        session: &mut InspectorSession,
+        inspector_session: &mut InspectorSession,
         view: &ComponentView,
         entity: Entity,
     ) {
@@ -533,7 +558,7 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
                         engine_assets: &[],
                     },
                     pending,
-                    session,
+                    inspector_session,
                     regions,
                 );
             });
@@ -571,7 +596,7 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
     let mut pending = PendingEditorCommands::default();
     let mut regions: Vec<ShellRect> = Vec::new();
     let mut drag_out: Option<String> = None;
-    let mut session = InspectorSession::default();
+    let mut inspector_session = InspectorSession::default();
     let context = egui::Context::default();
     style::apply(&context);
 
@@ -586,7 +611,7 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
         &mut pending,
         &mut regions,
         &mut drag_out,
-        &mut session,
+        &mut inspector_session,
         &view,
         entity,
     );
@@ -601,7 +626,7 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
             )
         })
         .expect("the tile drew");
-    let row = session
+    let row = inspector_session
         .asset_row_rects
         .iter()
         .next()
@@ -610,8 +635,9 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
     let from = tile.center();
     let to = row.center();
 
-    // Press on the tile, move onto the row, release: the scripted drag's
-    // three frames, in the same event shapes the window bridge produces.
+    // Press on the tile, move onto the row, then release, one frame each: the
+    // same three frames and event shapes the window bridge produces for a
+    // scripted drag.
     let press = egui::Event::PointerButton {
         pos: from,
         button: egui::PointerButton::Primary,
@@ -639,7 +665,7 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
             &mut pending,
             &mut regions,
             &mut drag_out,
-            &mut session,
+            &mut inspector_session,
             &view,
             entity,
         );
@@ -661,13 +687,15 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
     );
 }
 
-/// Dragging a list row reorders it: the drop rewrites the whole array in one
-/// recorded step, and the picker of the row the pointer lands on does not
-/// swallow the drag on the way.
+/// Dragging a list row reorders the list.
+///
+/// The drop rewrites the whole array in one recorded step, so undo takes back
+/// the reorder and not the file. A release on a row's picker button must count
+/// as a drop on the list instead of being taken by the picker.
 #[test]
 fn a_dragged_row_reorders_the_list() {
     const PASS_TYPE: &str = "pill_master_renderer::assets::RenderPass";
-    const ASSET: &str = "pipelines/main.pipeline";
+    const ASSET_PATH: &str = "pipelines/main.pipeline";
 
     #[cfg(test)]
     fn draw(
@@ -676,7 +704,7 @@ fn a_dragged_row_reorders_the_list() {
         document: &serde_json::Value,
         references: &[AssetReferenceField],
         pending: &mut PendingEditorCommands,
-        session: &mut InspectorSession,
+        inspector_session: &mut InspectorSession,
         regions: &mut Vec<ShellRect>,
     ) {
         run_pass_with(context, events, &mut |ui| {
@@ -684,14 +712,14 @@ fn a_dragged_row_reorders_the_list() {
                 ui.allocate_ui(egui::vec2(420.0, 300.0), |ui| {
                     inspector_settings::reference_list_rows(
                         ui,
-                        ASSET,
+                        ASSET_PATH,
                         document,
                         references,
                         &mut SettingsWalk {
                             assets: &[],
                             engine_assets: &[],
                             pending,
-                            session,
+                            session: inspector_session,
                             overlay_regions: regions,
                             read_only: false,
                         },
@@ -716,7 +744,7 @@ fn a_dragged_row_reorders_the_list() {
         })
         .collect();
     let mut pending = PendingEditorCommands::default();
-    let mut session = InspectorSession::default();
+    let mut inspector_session = InspectorSession::default();
     let mut regions: Vec<ShellRect> = Vec::new();
     let context = egui::Context::default();
     style::apply(&context);
@@ -728,19 +756,22 @@ fn a_dragged_row_reorders_the_list() {
         &document,
         &references,
         &mut pending,
-        &mut session,
+        &mut inspector_session,
         &mut regions,
     );
     let rows: Vec<egui::Rect> = (0..3)
         .map(|index| {
-            let key = format!("{ASSET}:passes[{index}]");
-            session.settings_row_rects.get(&key).expect("the row drew")
+            let key = format!("{ASSET_PATH}:passes[{index}]");
+            inspector_session
+                .settings_row_rects
+                .get(&key)
+                .expect("the row drew")
         })
         .collect();
 
-    // Press on the first row's picker, move just below the third row's middle,
-    // release: the scripted drag's three frames, in the event shapes the
-    // window bridge produces.
+    // Press on the first row's picker, move to the bottom edge of the third
+    // row, then release, one frame each: the three frames and event shapes of
+    // a scripted drag.
     let from = egui::pos2(rows[0].right() - 40.0, rows[0].center().y);
     let to = egui::pos2(rows[2].right() - 40.0, rows[2].bottom() - 1.0);
     let press = egui::Event::PointerButton {
@@ -766,7 +797,7 @@ fn a_dragged_row_reorders_the_list() {
             &document,
             &references,
             &mut pending,
-            &mut session,
+            &mut inspector_session,
             &mut regions,
         );
     }
@@ -782,7 +813,7 @@ fn a_dragged_row_reorders_the_list() {
             pending.batches[0].commands
         );
     };
-    assert_eq!(path, ASSET);
+    assert_eq!(path, ASSET_PATH);
     let order: Vec<&str> = settings["passes"]
         .as_array()
         .expect("the list stays an array")
@@ -792,9 +823,9 @@ fn a_dragged_row_reorders_the_list() {
     assert_eq!(order, vec!["b", "c", "a"], "the first row moved to the end");
 }
 
-/// A row starts its label where its column starts - a label centred in the
-/// column would drift with its own length - and keeps the row's gap before the
-/// control, whatever the label and the panel's item spacing are.
+/// A row's label starts at the left edge of the label column, so the control
+/// begins at the same x whatever the label says; a centred label would move
+/// with its own length. The control keeps the row's own gap from the column.
 #[test]
 fn a_row_left_aligns_its_label_and_keeps_the_gap() {
     let context = egui::Context::default();
@@ -953,8 +984,11 @@ fn field_values_format_for_display() {
     );
 }
 
-/// A list entry's reference key belongs to its family, which is what keeps a
-/// chain's raw `passes` array out of the settings walk.
+/// A list entry's key (`passes[2]`) names the list family it belongs to, and a
+/// plain key names no family.
+///
+/// The settings walk uses the family to skip a list's raw array, so its guids
+/// are never drawn as JSON rows.
 #[test]
 fn a_reference_keys_family_is_what_a_list_row_belongs_to() {
     let entry = AssetReferenceField {
@@ -972,8 +1006,9 @@ fn a_reference_keys_family_is_what_a_list_row_belongs_to() {
     assert_eq!(inspector_settings::reference_family(&named), None);
 }
 
-/// A row's rectangle is logged once per placement: sub-point jitter and a
-/// row that scrolls out and back do not log again, a real move does.
+/// A row's rectangle is logged once per placement. A jitter smaller than a
+/// point and a row that scrolls out and back log nothing new; a real move
+/// logs again.
 #[test]
 fn a_rows_placement_is_logged_once_per_place() {
     let mut logged = LoggedRects::default();
@@ -992,9 +1027,9 @@ fn a_rows_placement_is_logged_once_per_place() {
     );
 }
 
-/// Every component of a vector keeps one width: a value long enough to need
-/// more room than its field is cropped there instead of widening the row, so
-/// the axes beside it never move.
+/// Every component of a vector keeps the same width. A value too long for its
+/// field is cropped inside it instead of widening the row, so the axis labels
+/// beside it never move.
 #[test]
 fn a_vectors_components_keep_one_width() {
     let values = [
@@ -1035,8 +1070,8 @@ fn a_vectors_components_keep_one_width() {
         widths[0] <= INSPECTOR_VECTOR_FIELD_WIDTH + 8.0,
         "the row stays the width of its group: {widths:?}"
     );
-    // The same value in a plain row does grow the row, which is what the fixed
-    // field's crop exists to prevent.
+    // The same value in a plain row does grow the row. That growth is what the
+    // fixed-width field in a vector row prevents.
     let mut plain_width = 0.0f32;
     run_pass(&context, &mut |ui| {
         egui::CentralPanel::default().show(ui, |ui| {
@@ -1055,9 +1090,11 @@ fn a_vectors_components_keep_one_width() {
     );
 }
 
-/// The floating toolbox's rows are ordinary buttons, each one as wide as its
-/// row: the panel reads as one column of controls, an active row takes the
-/// theme's selection colour, and a click still queues the row's command.
+/// The floating toolbox draws one ordinary button per row, as wide as the row.
+///
+/// The panel therefore reads as one column of controls. The active row takes
+/// the theme's selection colour, and a click on a row still queues that row's
+/// command.
 #[test]
 fn the_toolbox_rows_fill_their_width() {
     /// Draw the toolbox over a viewport-sized screen, one frame.
@@ -1133,9 +1170,9 @@ fn the_toolbox_rows_fill_their_width() {
                 .expect("every row drew its face this pass")
         })
         .collect();
-    // The panel anchors off the viewport's own corner, which sits inside the
-    // central panel's margin, so the test reads the origin back from the first
-    // row it drew rather than assuming the screen's corner.
+    // The panel is placed against the viewport's corner, which sits inside the
+    // central panel's margin, so the test works the origin out from the first
+    // row it drew instead of assuming the screen's corner.
     let origin = faces[0].min
         - egui::vec2(
             toolbox::TOOLBOX_PADDING,
@@ -1160,7 +1197,7 @@ fn the_toolbox_rows_fill_their_width() {
     let first = faces[0];
     let neutral = faces[1];
     let selection_fill = palette.selection;
-    let mut output = context.run_ui(
+    let mut frame_output = context.run_ui(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -1205,18 +1242,21 @@ fn the_toolbox_rows_fill_their_width() {
             });
         },
     );
-    output.textures_delta.clear();
+    frame_output.textures_delta.clear();
     // A painted fill counts for a row when it covers that row's width, so the
     // panel's own background (narrower than a row) never matches.
     let painted = |face: egui::Rect, fill: egui::Color32| {
-        output.shapes.iter().any(|clipped| match &clipped.shape {
-            egui::Shape::Rect(rect) => {
-                rect.fill == fill
-                    && rect.rect.intersects(face)
-                    && rect.rect.width() >= face.width() - 2.0
-            }
-            _ => false,
-        })
+        frame_output
+            .shapes
+            .iter()
+            .any(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) => {
+                    rect.fill == fill
+                        && rect.rect.intersects(face)
+                        && rect.rect.width() >= face.width() - 2.0
+                }
+                _ => false,
+            })
     };
     assert!(
         painted(first, selection_fill),
@@ -1269,12 +1309,11 @@ fn the_toolbox_rows_fill_their_width() {
     );
 }
 
-/// The Preferences tab's Save and Cancel: Save queues the batch, Cancel throws
-/// the edits away without queueing anything.
+/// The Preferences tab's first draw seeds its draft buffers and queues no
+/// command.
 #[test]
 fn the_preferences_pair_saves_and_cancels() {
-    /// Draw the tab for one frame: the tab seeds its draft buffers on the
-    /// first draw and must queue nothing until an answer is pressed.
+    /// Draws the Preferences tab for one frame with the given events.
     fn draw(
         context: &egui::Context,
         events: Vec<egui::Event>,

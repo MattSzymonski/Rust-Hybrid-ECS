@@ -7,25 +7,29 @@
 //!   Inspector uses.
 //! - [`reseed_window`]: the re-seed confirmation, a modal the shell owns and
 //!   this panel draws.
-//! - [`reseed_command`]: the write the confirmation applies, shared by the
-//!   modal's answer and the scripted channel so a test drives the same code
-//!   the button does.
+//! - [`reseed_command`]: the write the confirmation applies when the person
+//!   accepts the re-seed.
 //!
 //! # Design
 //!
-//! The panel is the reference a module's editor crate is written against: it
-//! names no crate's types. A spline is found by its component's *name*
-//! (`archetype` is the joined component names the Entities tab already shows),
-//! and its values arrive as text through [`PanelContext`], so nothing here can
-//! outlive the module that registered it.
+//! The panel is the example a module's editor crate is written against: it
+//! names no type from another crate. A spline is found by the name of its
+//! component (`archetype` holds the component names joined, as the Entities
+//! tab shows them), and its values arrive as text through [`PanelContext`].
+//! Nothing here can therefore outlive the module that registered it.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// The panel's registry id.
 pub const SPLINE_PANEL_ID: &str = "shell.spline_tool";
-/// The component a spline entity carries, by registered name.
+/// The spline component's short type name: the end of the name it registers
+/// under.
 pub const SPLINE_COMPONENT: &str = "Spline";
 /// The re-seed confirmation's window id.
 pub const RESEED_WINDOW: &str = "spline.reseed";
@@ -35,31 +39,61 @@ pub const RESEED_POINTS: usize = 4;
 /// The component field the control points live in.
 pub const SPLINE_POINTS_FIELD: &str = "control_points";
 
-/// How many control-point rows the panel draws: a spline may carry more than a
-/// person wants to scroll past, and the rest stay reachable in the Inspector.
+/// How many control-point rows the panel draws. A spline can hold more points
+/// than fit on screen; the rest stay reachable in the Inspector.
 pub const POINTS_SHOWN: usize = 8;
 
-/// The panel body: the same code draws the docked tab and the modal.
+// =============================================================================
+// Types
+// =============================================================================
+
+/// The data behind the re-seed write: the entity it edits and the
+/// control-point count it sets.
+pub struct Reseed {
+    /// The entity the spline belongs to.
+    pub entity: Entity,
+    /// The control-point count the write sets.
+    pub value: usize,
+}
+
+impl Reseed {
+    /// Turns the confirmation into the recorded panel command that applies it.
+    pub fn into_command(self) -> PanelCommand {
+        PanelCommand::SetField {
+            entity: self.entity,
+            component: SPLINE_COMPONENT.to_string(),
+            field: "control_point_count".to_string(),
+            value: self.value.to_string(),
+        }
+    }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Draws the panel: the docked tab and the re-seed modal it opens.
 pub fn spline_tool_panel(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
-    // The re-seed confirmation draws its own body and nothing else.
+    // Step 1: the re-seed confirmation draws its own body and nothing else.
     if context.window == Some(RESEED_WINDOW) {
         reseed_body(ui, context);
         return;
     }
+    // Step 2: list the entities that carry a spline; a row selects one.
     ui.heading("Spline Tool");
     ui.label("Edits a spline through the editor's recorded commands.");
     ui.separator();
-    let splines: Vec<PanelEntityRow> = context
+    let spline_rows: Vec<PanelEntityRow> = context
         .entities
         .iter()
         .filter(|row| row.archetype.contains(SPLINE_COMPONENT))
         .cloned()
         .collect();
-    if splines.is_empty() {
+    if spline_rows.is_empty() {
         ui.label("No entity carries a spline.");
         return;
     }
-    for row in &splines {
+    for row in &spline_rows {
         let selected = context.selected_entity == Some(row.entity);
         if ui
             .selectable_label(selected, format!("{} ({})", row.display, row.entity))
@@ -85,43 +119,46 @@ pub fn spline_tool_panel(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
         return;
     };
     ui.separator();
-    // The control points. The engine's expanded layout names an element of a
-    // struct array as one scalar row per leaf (`control_points[0].x`), so a
-    // point is three ordinary fields and the same recorded write path serves
-    // it - no struct value ever has to cross this crate's boundary.
-    let points = spline_point_count(component);
-    if points > 0 {
-        ui.label(format!("{points} control points"));
-        for index in 0..points.min(POINTS_SHOWN) {
-            row(ui, &format!("point {index}"), None, &mut |ui| {
-                for axis in 0..3 {
-                    let Some(field) = point_leaf(component, index, axis) else {
+    // Step 3: draw the control points. The engine expands a struct array into
+    // one row per leaf (`control_points[0].x`), so a point arrives as three
+    // ordinary fields and the same recorded write path serves it. No struct
+    // value has to cross this crate's boundary.
+    let point_count = spline_point_count(component);
+    if point_count > 0 {
+        ui.label(format!("{point_count} control points"));
+        for point_index in 0..point_count.min(POINTS_SHOWN) {
+            row(ui, &format!("point {point_index}"), None, &mut |ui| {
+                for axis_index in 0..3 {
+                    let Some(field) = point_leaf(component, point_index, axis_index) else {
                         continue;
                     };
-                    // The row's value is the text the shell rendered it as; a
-                    // leaf that is not a float has no drag value.
-                    let Ok(mut value) = field.value.parse::<f32>() else {
+                    // The row holds its value as text, in the Inspector's form.
+                    // A leaf that is not a float has no drag value.
+                    let Ok(mut coordinate) = field.value.parse::<f32>() else {
                         continue;
                     };
-                    let name = field.name.clone();
+                    let field_name = field.name.clone();
                     if ui
-                        .add(egui::DragValue::new(&mut value).speed(0.05))
+                        .add(egui::DragValue::new(&mut coordinate).speed(0.05))
                         .changed()
                     {
-                        context
-                            .commands
-                            .push(point_write(detail.entity, name.as_str(), value));
+                        context.commands.push(point_write(
+                            detail.entity,
+                            field_name.as_str(),
+                            coordinate,
+                        ));
                     }
                 }
             });
         }
     }
+    // Step 4: offer the re-seed, then apply the answer the modal took. The
+    // shell hands an answer over for one draw only.
     if ui.button("Re-seed...").clicked() {
         context
             .commands
             .push(PanelCommand::OpenWindow(reseed_window()));
     }
-    // The answer the shell took from the modal, exactly once.
     if let Some(answer) = context.answer {
         if answer.window == RESEED_WINDOW && answer.accepted {
             context
@@ -131,60 +168,65 @@ pub fn spline_tool_panel(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
     }
 }
 
-/// How many control points the selected spline's rows describe.
+/// Returns how many control points the selected spline's rows describe.
 ///
-/// The count comes from the rows themselves: the expanded layout names every
-/// element `control_points[i].<axis>`, so the highest index seen plus one is
-/// what the panel can offer.
+/// The count comes from the rows themselves: every element of the array is
+/// named `control_points[i].<axis>`, so the highest index seen plus one is the
+/// number the panel offers.
 pub fn spline_point_count(component: &PanelComponentValues) -> usize {
-    let mut count = 0;
+    let mut point_count = 0;
     for field in &component.fields {
-        if let Some(index) = field_element_index(field.name.as_str()) {
-            count = count.max(index + 1);
+        if let Some(element_index) = field_element_index(field.name.as_str()) {
+            point_count = point_count.max(element_index + 1);
         }
     }
-    count
+    point_count
 }
 
-/// The leaf of one control point's axis (0 = x, 1 = y, 2 = z).
+/// Returns the field row of one control point's axis, where 0 is x, 1 is y and
+/// 2 is z, when the component describes it.
 pub fn point_leaf(
     component: &PanelComponentValues,
-    index: usize,
-    axis: usize,
+    point_index: usize,
+    axis_index: usize,
 ) -> Option<&PanelFieldValue> {
-    let suffix = ["x", "y", "z"].get(axis)?;
+    let axis_suffix = ["x", "y", "z"].get(axis_index)?;
     component
         .fields
         .iter()
-        .find(|field| field.name == format!("{SPLINE_POINTS_FIELD}[{index}].{suffix}"))
+        .find(|field| field.name == format!("{SPLINE_POINTS_FIELD}[{point_index}].{axis_suffix}"))
 }
 
-/// The write one control-point row queues when its drag value changes.
+/// Builds the write one control-point row queues when its drag value changes.
 ///
-/// `field` is the expanded leaf's name (`control_points[0].x`), so the write is
-/// an ordinary recorded scalar edit - the same one an Inspector row queues.
-pub fn point_write(entity: Entity, field: &str, value: f32) -> PanelCommand {
+/// `field_name` is the row's name (`control_points[0].x`), so the write is an
+/// ordinary recorded scalar edit - the same one an Inspector row queues.
+pub fn point_write(entity: Entity, field_name: &str, coordinate: f32) -> PanelCommand {
     PanelCommand::SetField {
         entity,
         component: SPLINE_COMPONENT.to_string(),
-        field: field.to_string(),
-        value: format!("{value}"),
+        field: field_name.to_string(),
+        value: format!("{coordinate}"),
     }
 }
 
-/// The element index a dotted element row names (`control_points[3].y` -> 3).
+/// Returns the element index a `control_points[i]` row names:
+/// `control_points[3].y` gives 3.
 ///
-/// Public because the function inventory names every function by path.
-pub fn field_element_index(name: &str) -> Option<usize> {
-    let rest = name.strip_prefix(SPLINE_POINTS_FIELD)?.strip_prefix('[')?;
-    let (index, _) = rest.split_once(']')?;
-    index.parse().ok()
+/// Public because the function inventory names it by path, and that inventory
+/// is included at this crate's root, which cannot name a private function.
+pub fn field_element_index(field_name: &str) -> Option<usize> {
+    let element_text = field_name
+        .strip_prefix(SPLINE_POINTS_FIELD)?
+        .strip_prefix('[')?;
+    let (element_index, _) = element_text.split_once(']')?;
+    element_index.parse().ok()
 }
 
-/// The re-seed confirmation's body.
+/// Draws the re-seed confirmation's body.
 ///
-/// The shell draws the buttons and reads Enter and Escape; this only says what
-/// the confirmation is for.
+/// The shell draws the window's buttons and reads Enter and Escape. This body
+/// states the question and the entity it applies to.
 pub fn reseed_body(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
     ui.label(format!(
         "Re-seed the spline to {} control points?",
@@ -196,7 +238,8 @@ pub fn reseed_body(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
     };
 }
 
-/// The window the panel asks for: a modal, so the editor waits for an answer.
+/// Builds the request for the re-seed window. It is a modal, so the editor
+/// waits for an answer.
 pub fn reseed_window() -> PanelWindowRequest {
     PanelWindowRequest {
         id: RESEED_WINDOW.to_string(),
@@ -207,28 +250,7 @@ pub fn reseed_window() -> PanelWindowRequest {
     }
 }
 
-/// The write the confirmation applies: the recorded field edit that sets the
-/// control-point count.
-pub struct Reseed {
-    /// The entity the spline belongs to.
-    pub entity: Entity,
-    /// The value written into the component's count field.
-    pub value: usize,
-}
-
-impl Reseed {
-    /// The panel command a confirmation produces.
-    pub fn into_command(self) -> PanelCommand {
-        PanelCommand::SetField {
-            entity: self.entity,
-            component: SPLINE_COMPONENT.to_string(),
-            field: "control_point_count".to_string(),
-            value: self.value.to_string(),
-        }
-    }
-}
-
-/// The re-seed write for one entity.
+/// Builds the re-seed write for one entity.
 pub fn reseed_command(entity: Entity) -> Reseed {
     Reseed {
         entity,
@@ -236,12 +258,15 @@ pub fn reseed_command(entity: Entity) -> Reseed {
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The component rows the engine's expanded layout hands a panel for a
-    /// two-point spline.
+    /// Builds the component rows a panel receives for a two-point spline.
     fn points_component() -> PanelComponentValues {
         let mut fields = vec![PanelFieldValue {
             name: "control_point_count".to_string(),
@@ -261,14 +286,15 @@ mod tests {
         }
     }
 
-    /// A row per point, each pointing at that point's own expanded leaves.
+    /// Each point gets one row, and each row reads that point's own field
+    /// leaves.
     #[test]
     fn control_points_become_one_row_per_point() {
         let component = points_component();
         assert_eq!(spline_point_count(&component), 2);
         let y_of_second = point_leaf(&component, 1, 1).expect("second point's y leaf");
         assert_eq!(y_of_second.name, "control_points[1].y");
-        // A point past the rows the panel draws is simply absent, not stale.
+        // A point the component does not describe is simply absent.
         assert!(point_leaf(&component, 2, 0).is_none());
     }
 
@@ -292,7 +318,7 @@ mod tests {
         }
     }
 
-    /// The element index the panel counts rows from.
+    /// Checks the element index the panel counts rows from.
     #[test]
     fn element_indices_come_from_the_expanded_leaf_names() {
         assert_eq!(field_element_index("control_points[3].y"), Some(3));

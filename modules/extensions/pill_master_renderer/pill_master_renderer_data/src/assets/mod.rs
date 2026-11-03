@@ -3,24 +3,25 @@
 //! # Responsibilities
 //!
 //! - Own the asset types a project draws from - [`Mesh`], [`Texture`],
-//!   [`Shader`], [`Material`], [`RenderPass`], [`RenderingPipeline`] -
-//!   re-exported flat so a game names them without the submodule they sit in.
+//!   [`Shader`], [`Material`], [`RenderPass`], [`RenderingPipeline`] - and
+//!   re-export them flat, so a game names them without their submodule.
 //! - Carry each type's builder and binding declarations: [`MaterialBuilder`],
 //!   [`ShaderBuilder`], the parameter and texture slot types, and the helpers
 //!   that key slot lists by the names they carry.
-//! - Register every type behind `dyn Asset`, so the world's `AssetManager`
-//!   stores them many per type like any other asset.
-//! - Provide [`asset_key`], packing a handle's index and generation into the
-//!   `u64` the renderer's caches key on.
+//! - Register every asset type behind `dyn Asset`, the bound every
+//!   `AssetManager` method asks for, so the store holds as many of each as a
+//!   game wants.
+//! - Provide [`asset_key`], which packs a handle's index and generation into
+//!   the `u64` the renderer's caches use as their key.
 //!
 //! # Design
 //!
-//! Each type here is data plus declaration: a game builds it, the
-//! `AssetManager` owns it, and the renderer reads it while resolving a frame,
-//! with the GPU side - caches, pipelines, bind groups - living in the GPU
-//! module (`pill_master_renderer`), which links this crate. [`asset_key`] packs
-//! a handle's generation above its index, so one `u64` tells a cache which
-//! asset and which version of it a resource was built for.
+//! Each asset type is plain data plus a declaration. A game builds it, the
+//! `AssetManager` owns it, and the renderer reads it while building a frame.
+//! The GPU side - caches, pipelines and bind groups - lives in the GPU module
+//! (`pill_master_renderer`), which links this crate. [`asset_key`] puts a
+//! handle's generation above its index, so one `u64` tells a cache which asset
+//! is meant and which version of it a resource was built from.
 
 mod material;
 mod mesh;
@@ -29,14 +30,19 @@ mod rendering_pipeline;
 mod shader;
 mod texture;
 
+// External crates
+use pill_engine::{Asset, Handle};
+// The pass vocabulary belongs to the renderer contract
+// (`pill_renderer_api::frame`), which also carries it on the frame's resolved
+// pass. It is re-exported here so `assets::` reaches it beside the types that
+// use it.
+pub use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
+
+// Current crate
 pub use material::{Material, MaterialBuilder, MaterialDocument, MaterialTexture};
 pub use mesh::{Mesh, MeshImportSettings, MeshVertex};
 pub use render_pass::RenderPass;
 pub use render_pass::RenderPassDocument;
-// The pass vocabulary belongs to the renderer contract
-// (`pill_renderer_api::frame`), where a resolved pass is written too;
-// re-exported so `assets::` reaches it beside the types that carry it.
-pub use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
 pub use rendering_pipeline::{
     PipelinePass, PipelinePassDocument, RenderingPipeline, RenderingPipelineDocument,
 };
@@ -50,8 +56,9 @@ pub use texture::{
     TextureImportSettings, TextureType, DEFAULT_COLOR_TEXTURE, DEFAULT_NORMAL_TEXTURE,
 };
 
-use pill_engine::{Asset, Handle};
-
+// Make every asset type usable through `dyn Asset`. The store's methods all
+// ask for that bound, so a type missing from this list cannot be added to an
+// `AssetManager` or looked up by its handle.
 trait_type_map::impl_trait_accessible!(
     dyn Asset;
     Mesh,
@@ -62,21 +69,32 @@ trait_type_map::impl_trait_accessible!(
     RenderingPipeline
 );
 
-/// Packs a typed generational asset handle into a renderer cache key.
-pub fn asset_key<T: Asset>(handle: Handle<T>) -> u64 {
-    (u64::from(handle.generation()) << 32) | u64::from(handle.index())
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Turns a typed asset handle into the key the renderer's caches use.
+///
+/// The generation is packed above the index, so two versions of one asset
+/// never share a key.
+pub fn asset_key<T: Asset>(asset_handle: Handle<T>) -> u64 {
+    (u64::from(asset_handle.generation()) << 32) | u64::from(asset_handle.index())
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The asset types' shared names are an identity contract: they are what
-    /// lets the data module, the GPU module and a project reach one column per
-    /// type, so the exact strings are asserted here.
+    /// The shared names of the asset types are a fixed contract. They are what
+    /// lets this crate, the GPU module and a project reach the same column for
+    /// a type, so the exact strings are asserted here.
     #[test]
     fn the_asset_types_keep_their_pinned_shared_names() {
-        let names = [
+        let shared_names = [
             Mesh::shared_name(),
             Texture::shared_name(),
             Shader::shared_name(),
@@ -85,7 +103,7 @@ mod tests {
             RenderingPipeline::shared_name(),
         ];
         assert_eq!(
-            names,
+            shared_names,
             [
                 Some("pill_master_renderer::assets::Mesh"),
                 Some("pill_master_renderer::assets::Texture"),
@@ -97,12 +115,13 @@ mod tests {
         );
     }
 
-    /// Each asset's identity is the hash of its pinned name, not the
-    /// per-binary `TypeId` the trait falls back to - which is what makes the
-    /// six columns one column across the module, the GPU module and a project.
+    /// An asset type's identity is the hash of its pinned name, not the
+    /// `TypeId` that only means something inside one binary. That is what
+    /// makes each of the six columns one column in this crate, the GPU module
+    /// and a project.
     ///
-    /// The value is bound as a `const` by the attribute that declares the
-    /// name, so the same number comes back on every call without hashing.
+    /// The attribute that declares the name also stores the hash in a `const`,
+    /// so every call returns the same number and nothing is hashed at runtime.
     #[test]
     fn an_asset_identity_is_the_hash_of_its_pinned_name() {
         for (identity, name) in [
