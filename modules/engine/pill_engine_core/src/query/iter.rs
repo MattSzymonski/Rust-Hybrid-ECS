@@ -446,7 +446,9 @@ where
                 let durations = &mut timings.per_iterator_label_average_duration;
                 let entry = match durations.get_mut(label) {
                     Some(entry) => entry,
-                    None => durations.entry(label.to_owned()).or_insert(elapsed_nanoseconds),
+                    None => durations
+                        .entry(label.to_owned())
+                        .or_insert(elapsed_nanoseconds),
                 };
                 let delta = elapsed_nanoseconds as i64 - *entry as i64;
                 *entry = (*entry as i64
@@ -876,13 +878,15 @@ fn iterator_work_group_count(
     let most_work_group_count =
         pool_threads * config::ParallelProcessingConfig::WORK_GROUPS_PER_THREAD;
     let target_work_group_count = if hint_nanoseconds > 0 {
-        (hint_nanoseconds
-            / config::ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION)
+        (hint_nanoseconds / config::ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION)
             as usize
     } else {
         pool_threads
     };
-    target_work_group_count.clamp(1, most_work_group_count.max(1)).min(slice_count).max(1)
+    target_work_group_count
+        .clamp(1, most_work_group_count.max(1))
+        .min(slice_count)
+        .max(1)
 }
 
 // =============================================================================

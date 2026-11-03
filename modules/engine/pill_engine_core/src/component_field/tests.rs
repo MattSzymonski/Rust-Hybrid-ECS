@@ -326,7 +326,10 @@ fn nested_fields_expand_into_editable_rows() {
         .component_field_layout(ComponentId::of::<NestedOuter>())
         .expect("NestedOuter registered with a layout");
     let field_names: Vec<&str> = layout.iter().map(|field| field.name).collect();
-    assert_eq!(field_names, ["lead", "inner.a", "inner.b", "probe.x", "probe.y"]);
+    assert_eq!(
+        field_names,
+        ["lead", "inner.a", "inner.b", "probe.x", "probe.y"]
+    );
     assert_eq!(layout[1].offset, 4, "composed offsets for inner.a");
     assert_eq!(layout[2].offset, 8, "composed offsets for inner.b");
     assert_eq!(layout[3].offset, 12, "composed offsets for probe.x");
@@ -664,11 +667,21 @@ fn every_scalar_tag_sizes_encodes_decodes_and_names_itself() {
         assert!(is_scalar_tag(type_tag), "`{type_tag}` is a scalar tag");
 
         let mut bytes = Vec::new();
-        assert!(encode_scalar(type_tag, &field_value, &mut bytes), "`{type_tag}` encodes");
-        assert_eq!(bytes.len(), size, "`{type_tag}` encodes to its declared size");
+        assert!(
+            encode_scalar(type_tag, &field_value, &mut bytes),
+            "`{type_tag}` encodes"
+        );
+        assert_eq!(
+            bytes.len(),
+            size,
+            "`{type_tag}` encodes to its declared size"
+        );
 
         let decoded = decode_scalar(&bytes, 0, type_tag).expect("the encoded value decodes");
-        assert_eq!(decoded, field_value, "`{type_tag}` survives its own round trip");
+        assert_eq!(
+            decoded, field_value,
+            "`{type_tag}` survives its own round trip"
+        );
     }
 
     // A tag no helper knows, `u128` here, is refused by every one of them

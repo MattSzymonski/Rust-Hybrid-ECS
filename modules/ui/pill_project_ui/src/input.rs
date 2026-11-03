@@ -13,14 +13,14 @@
 //!
 //! # Design
 //!
-//! The engine reports input as a *snapshot* (what is held, what went down or
-//! up this frame, the accumulated text and scroll), not as an event list, so
-//! the bridge derives egui's events from the snapshot's edges and remembers
+//! The engine reports input as a *snapshot*: what is held, what went down or
+//! up this frame, the text typed and the scroll. A system sees only a snapshot,
+//! not an event list, so the bridge turns it into egui's events and remembers
 //! the two values that only exist as "the current state". Order matters to
 //! egui: modifiers change before the keys they apply to, and the pointer moves
 //! before a button press that names its position. The editor's equivalent
-//! (`pill_editor_core::input`) mirrors this shape without a dependency, since
-//! its crate carries `egui_dock`, which a game build must not link.
+//! (`pill_editor_core::input`) mirrors this shape without depending on it,
+//! because that crate carries `egui_dock`, which a game build must not link.
 
 // External crates
 use egui::{Event, ImeEvent, Modifiers, MouseWheelUnit, Pos2, RawInput, Rect, Vec2};
@@ -33,9 +33,9 @@ use pill_engine_core::input::{Input, KeyCode, Modifiers as EngineModifiers, Mous
 
 /// One frame of engine input, owned.
 ///
-/// Captured from the engine's [`Input`] snapshot at the top of a system; the
-/// fields are the snapshot's own values, not a summary, so the bridge below
-/// sees exactly what the engine saw.
+/// A system captures it from the engine's [`Input`] at the top of its body.
+/// Every field holds the snapshot's own value rather than a summary, so the
+/// bridge below sees exactly what the engine saw.
 #[derive(Clone, Debug, Default)]
 pub struct InputFrame {
     /// Where the cursor is, in physical pixels, when it is over the window.
@@ -46,17 +46,17 @@ pub struct InputFrame {
     pub keys_pressed: Vec<KeyCode>,
     /// The keys that went up this frame.
     pub keys_released: Vec<KeyCode>,
-    /// The buttons that went down this frame.
+    /// The left, right and middle buttons that went down this frame.
     pub buttons_pressed: Vec<MouseButton>,
-    /// The buttons that went up this frame.
+    /// The left, right and middle buttons that went up this frame.
     pub buttons_released: Vec<MouseButton>,
-    /// The text typed (or pasted) this frame.
+    /// The text typed or committed by the IME this frame.
     pub text: String,
-    /// The IME composition string, when one is active.
+    /// The IME composition string, while a composition is active.
     pub preedit: Option<String>,
-    /// The scroll, in lines.
+    /// The scroll, in lines; positive `y` is up.
     pub scroll_lines: Vector2f,
-    /// The scroll, in physical pixels.
+    /// The scroll, in physical pixels; positive `y` is up.
     pub scroll_pixels: Vector2f,
 }
 
@@ -88,8 +88,11 @@ impl InputFrame {
 // InputMemory
 // =============================================================================
 
-/// What the previous frame told the bridge, so the next frame can report the
-/// changes a snapshot states only as "the current value".
+/// What the bridge reported last frame, so it can tell what changed this one.
+///
+/// A snapshot only holds the current state. A change in the modifiers or in
+/// the cursor position is found by comparing the new value with the one the
+/// previous pass reported.
 #[derive(Debug, Default)]
 pub struct InputMemory {
     /// The modifier state the previous frame reported.
@@ -119,11 +122,14 @@ impl InputMemory {
 // raw_input
 // =============================================================================
 
-/// One frame of egui input from `frame`.
+/// One frame of egui input, built from `frame`.
 ///
-/// `viewport` is the UI's logical size (the surface's, divided by
-/// `scale_factor`), `scale_factor` the monitor scale, and `time` the seconds
-/// since the UI's first pass, which egui uses for animation.
+/// `viewport` is the UI's logical size in points: the surface's size divided by
+/// `scale_factor`. `scale_factor` is the monitor scale, which turns the engine's
+/// physical pixels into points. `time` is the seconds since the UI started,
+/// which egui uses for its animation clock. `memory` carries the state between
+/// passes - the modifiers and the cursor position reported last time - and this
+/// call updates it.
 pub fn raw_input(
     frame: &InputFrame,
     viewport: Vector2f,
@@ -131,15 +137,17 @@ pub fn raw_input(
     time: f64,
     memory: &mut InputMemory,
 ) -> RawInput {
-    let scale = if scale_factor > 0.0 {
+    // Treat a zero scale factor as one: the divisions below would otherwise
+    // produce infinities.
+    let effective_scale_factor = if scale_factor > 0.0 {
         scale_factor
     } else {
         1.0
     };
     let mut events = Vec::new();
 
-    // Step 1: the modifier state, when it changed, before anything it applies
-    // to.
+    // Step 1: report the modifier state when it changed, before the keys and
+    // buttons whose events carry it.
     let modifiers = modifiers(frame.modifiers);
     if frame.modifiers != memory.modifiers {
         memory.modifiers = frame.modifiers;
@@ -147,9 +155,12 @@ pub fn raw_input(
     }
 
     // Step 2: where the pointer is, and whether it left.
-    let cursor = frame
-        .cursor
-        .map(|position| Pos2::new(position.x / scale, position.y / scale));
+    let cursor = frame.cursor.map(|position| {
+        Pos2::new(
+            position.x / effective_scale_factor,
+            position.y / effective_scale_factor,
+        )
+    });
     match cursor {
         Some(position) if memory.cursor != Some(position) => {
             memory.cursor = Some(position);
@@ -162,25 +173,25 @@ pub fn raw_input(
         _ => {}
     }
 
-    // Step 3: buttons, each naming the position it landed at. A press with no
-    // known pointer position is dropped: egui could not attribute it to a
-    // widget.
+    // Step 3: buttons, each holding the position it was reported at. A press
+    // with no known pointer position is dropped, because egui could not tell
+    // which widget it belongs to.
     if let Some(position) = memory.cursor {
-        for button in &frame.buttons_pressed {
-            if let Some(pointer) = pointer_button(*button) {
+        for engine_button in &frame.buttons_pressed {
+            if let Some(egui_button) = pointer_button(*engine_button) {
                 events.push(Event::PointerButton {
                     pos: position,
-                    button: pointer,
+                    button: egui_button,
                     pressed: true,
                     modifiers,
                 });
             }
         }
-        for button in &frame.buttons_released {
-            if let Some(pointer) = pointer_button(*button) {
+        for engine_button in &frame.buttons_released {
+            if let Some(egui_button) = pointer_button(*engine_button) {
                 events.push(Event::PointerButton {
                     pos: position,
-                    button: pointer,
+                    button: egui_button,
                     pressed: false,
                     modifiers,
                 });
@@ -188,7 +199,8 @@ pub fn raw_input(
         }
     }
 
-    // Step 4: scrolling, in whatever unit the platform reported.
+    // Step 4: scrolling. The engine reports it in lines or in pixels, and each
+    // kind becomes its own wheel event.
     if frame.scroll_lines.x != 0.0 || frame.scroll_lines.y != 0.0 {
         events.push(Event::MouseWheel {
             unit: MouseWheelUnit::Line,
@@ -200,15 +212,18 @@ pub fn raw_input(
     if frame.scroll_pixels.x != 0.0 || frame.scroll_pixels.y != 0.0 {
         events.push(Event::MouseWheel {
             unit: MouseWheelUnit::Point,
-            delta: Vec2::new(frame.scroll_pixels.x / scale, frame.scroll_pixels.y / scale),
+            delta: Vec2::new(
+                frame.scroll_pixels.x / effective_scale_factor,
+                frame.scroll_pixels.y / effective_scale_factor,
+            ),
             modifiers,
             phase: egui::TouchPhase::Move,
         });
     }
 
-    // Step 5: keys.
-    for key in &frame.keys_pressed {
-        if let Some(key) = map_key(*key) {
+    // Step 5: key presses and releases.
+    for engine_key in &frame.keys_pressed {
+        if let Some(key) = map_key(*engine_key) {
             events.push(Event::Key {
                 key,
                 physical_key: Some(key),
@@ -218,8 +233,8 @@ pub fn raw_input(
             });
         }
     }
-    for key in &frame.keys_released {
-        if let Some(key) = map_key(*key) {
+    for engine_key in &frame.keys_released {
+        if let Some(key) = map_key(*engine_key) {
             events.push(Event::Key {
                 key,
                 physical_key: Some(key),
@@ -230,9 +245,10 @@ pub fn raw_input(
         }
     }
 
-    // Step 6: composed text and the IME's composition. The engine reports a
-    // commit as text, which is what egui inserts; a composition arrives as the
-    // preedit string, without the character range a platform may not report.
+    // Step 6: typed text and the IME composition. The engine reports committed
+    // text (typed characters and IME commits) and egui inserts it unchanged.
+    // A composition still in progress arrives as the preedit string alone: the
+    // cursor range inside it is not part of this frame.
     if !frame.text.is_empty() {
         events.push(Event::Text(frame.text.clone()));
     }
@@ -249,8 +265,9 @@ pub fn raw_input(
             Vec2::new(viewport.x, viewport.y),
         )),
         time: Some(time),
-        // The bridge is fed by the game's own window; the engine releases held
-        // input when that window loses focus, so egui sees no stale presses.
+        // The bridge is fed by the game's own window. When that window loses
+        // focus the engine reports every held key and button as released, so
+        // egui never sees a stale press.
         focused: true,
         events,
         ..Default::default()
@@ -262,6 +279,8 @@ pub fn raw_input(
 // =============================================================================
 
 /// Map an engine mouse button to egui's pointer button.
+///
+/// The two side buttons map to nothing and return `None`.
 pub fn pointer_button(button: MouseButton) -> Option<egui::PointerButton> {
     Some(match button {
         MouseButton::Left => egui::PointerButton::Primary,
@@ -367,14 +386,19 @@ pub fn map_key(key: KeyCode) -> Option<egui::Key> {
     })
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pill_engine_core::input::{ButtonState, InputEvent, ScrollDelta};
     use pill_engine_core::Engine;
 
-    /// The engine's input snapshot after one frame with `events` queued.
-    fn captured(events: &[InputEvent]) -> InputFrame {
+    /// Run one frame with `events` queued and capture the engine's input
+    /// snapshot.
+    fn capture_frame_after_events(events: &[InputEvent]) -> InputFrame {
         let mut engine = Engine::new();
         for event in events {
             engine.push_input_event(event.clone());
@@ -389,7 +413,7 @@ mod tests {
 
     #[test]
     fn a_key_press_and_release_become_egui_key_events() {
-        let frame = captured(&[
+        let frame = capture_frame_after_events(&[
             InputEvent::Key {
                 key: KeyCode::KeyW,
                 state: ButtonState::Pressed,
@@ -420,7 +444,7 @@ mod tests {
 
     #[test]
     fn a_modifier_change_is_reported_once() {
-        let frame = captured(&[InputEvent::ModifiersChanged {
+        let frame = capture_frame_after_events(&[InputEvent::ModifiersChanged {
             modifiers: EngineModifiers {
                 control: true,
                 ..Default::default()
@@ -442,7 +466,7 @@ mod tests {
 
     #[test]
     fn a_press_needs_a_pointer_position_and_scales_it() {
-        let frame = captured(&[
+        let frame = capture_frame_after_events(&[
             InputEvent::CursorMoved {
                 position: Vector2f::new(200.0, 100.0),
             },
@@ -469,7 +493,8 @@ mod tests {
             .expect("the press is reported");
         assert!(pressed);
         assert_eq!(button, egui::PointerButton::Primary);
-        // 200 engine pixels over a 2x monitor is 100 logical points.
+        // 200 x 100 engine pixels over a 2x monitor are 100 x 50 logical
+        // points.
         assert_eq!(position, Pos2::new(100.0, 50.0));
         assert_eq!(
             memory.cursor(),
@@ -518,7 +543,7 @@ mod tests {
 
     #[test]
     fn typed_text_and_a_preedit_reach_egui() {
-        let frame = captured(&[InputEvent::TextInput {
+        let frame = capture_frame_after_events(&[InputEvent::TextInput {
             text: "zoo".to_owned(),
         }]);
         assert_eq!(frame.text, "zoo");
@@ -542,7 +567,7 @@ mod tests {
 
     #[test]
     fn wheel_units_survive_and_pixels_scale() {
-        let frame = captured(&[
+        let frame = capture_frame_after_events(&[
             InputEvent::MouseWheel {
                 delta: ScrollDelta::Lines(Vector2f::new(0.0, -3.0)),
             },

@@ -133,11 +133,11 @@ impl World {
         let (archetype_id, row) = self
             .entity_row_location(entity)
             .ok_or(ComponentFieldError::EntityNotFound)?;
-        let component_id = self.resolve_entity_component_id(entity, component_name).ok_or(
-            ComponentFieldError::ComponentNotFound {
+        let component_id = self
+            .resolve_entity_component_id(entity, component_name)
+            .ok_or(ComponentFieldError::ComponentNotFound {
                 component: component_name.to_string(),
-            },
-        )?;
+            })?;
         let descriptor = self
             .required_component_field_layout(component_id, component_name)?
             .iter()

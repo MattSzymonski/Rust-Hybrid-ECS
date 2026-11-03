@@ -1017,10 +1017,9 @@ mod tests {
         // The next build of the same resource, one field wider, registered
         // under the same persistence name.
         let mut loaded = World::new();
-        loaded
-            .register_persistable_resource_as::<PersistProbeVolumeBrightnessSettings>(
-                PROBE_SETTINGS_NAME,
-            );
+        loaded.register_persistable_resource_as::<PersistProbeVolumeBrightnessSettings>(
+            PROBE_SETTINGS_NAME,
+        );
         loaded.restore_resources(&snapshot);
 
         assert_eq!(
@@ -1131,10 +1130,9 @@ mod tests {
 
         // The arriving generation registers the wider shape under the same
         // persistence name, which supersedes the outgoing build's entries.
-        world
-            .register_persistable_resource_as::<PersistProbeVolumeBrightnessSettings>(
-                PROBE_SETTINGS_NAME,
-            );
+        world.register_persistable_resource_as::<PersistProbeVolumeBrightnessSettings>(
+            PROBE_SETTINGS_NAME,
+        );
         let migrated_resource_names =
             world.migrate_changed_persistable_resources(&previous_manifest);
 

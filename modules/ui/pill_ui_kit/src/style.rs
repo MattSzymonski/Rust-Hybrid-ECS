@@ -2,24 +2,25 @@
 //!
 //! # Responsibilities
 //!
-//! - [`build_style`]: a complete [`egui::Style`] from a
+//! - [`build_style`]: builds a complete [`egui::Style`] from a
 //!   [`Theme`](pill_ui_theme::Theme).
-//! - [`font_definitions`]: egui's defaults, the theme's fonts, the caller's
-//!   built-in families behind them, and every family name the styles use
-//!   registered.
-//! - [`install`]: fonts first (only when their signature changed, reported by
-//!   its return), then the style written to both egui themes, then the dark
-//!   theme pinned.
-//! - [`FontSignature`]: the caller-held record that makes `set_fonts` run only
-//!   when the fonts changed.
+//! - [`font_definitions`]: builds the font definitions - egui's defaults, the
+//!   theme's fonts in front of the caller's built-in families, and every
+//!   family the translated styles name.
+//! - [`install`]: puts the fonts on a context first, and only when their
+//!   signature changed (the return says whether it did). Then it writes the
+//!   style to both egui themes and pins the dark theme.
+//! - [`FontSignature`]: the record the caller keeps, so that `set_fonts` runs
+//!   only when the fonts changed.
 //!
 //! # Design
 //!
-//! Every entry point is a plain function compiled into the caller's dylib, so
-//! no closure created by a reloadable image ends up inside an egui `Style`.
-//! The kit holds no statics: the font signature, the font bytes and the theme
-//! all belong to the caller. Fonts are installed before the style, because a
-//! style that names an unregistered family panics on the next pass.
+//! Every entry point is a plain function that the caller's dylib compiles in,
+//! so nothing this kit hands egui stores code from a reloadable image. The
+//! context only ever receives plain data and owned font bytes, and the kit
+//! holds no statics - the font signature, the font bytes and the theme all
+//! belong to the caller. Fonts are installed before the style, because a style
+//! that names a family nobody registered makes egui panic on the next pass.
 
 // Standard library
 use std::hash::{Hash, Hasher};
@@ -36,6 +37,10 @@ use egui::{
 // Current crate
 use pill_ui_theme::{FontFamilyName, Rgba, Stroke, Theme, WidgetStyle};
 
+// =============================================================================
+// Font keys
+// =============================================================================
+
 /// The family name a theme's `display` font is registered under.
 pub const DISPLAY_FAMILY: &str = "display";
 
@@ -46,39 +51,44 @@ pub const THEME_DISPLAY_KEY: &str = "theme.display";
 /// The font-definition key a theme's monospace font is registered under.
 pub const THEME_MONOSPACE_KEY: &str = "theme.monospace";
 
-/// Whether `name` is one of the theme's own font keys.
+/// Whether `font_key` names one of the theme's own fonts.
 ///
-/// A caller inserting its built-in families uses this to keep the theme's font
-/// in front: the theme font is what a layer asked for, the caller's is the
-/// fallback behind it.
-pub fn is_theme_font(name: &str) -> bool {
-    name.starts_with("theme.")
+/// A caller that adds its built-in families uses this to keep the theme's font
+/// in front. The theme font is what a theme layer asked for; the caller's font
+/// is only the fallback behind it.
+pub fn is_theme_font(font_key: &str) -> bool {
+    font_key.starts_with("theme.")
 }
 
-/// The font bytes a theme layer resolved.
+// =============================================================================
+// Font records
+// =============================================================================
+
+/// The font bytes the theme's layers supplied.
 ///
-/// The kit installs owned copies: the game copies them out of the asset store,
-/// the editor's user layer out of the file.
+/// The kit installs its own copy of each font. The game copies the bytes out of
+/// its asset store; the editor's user layer reads them from the file it names.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ThemeFonts {
-    /// The body font.
+    /// The body font's bytes.
     pub body: Option<Vec<u8>>,
-    /// The display font.
+    /// The display font's bytes.
     pub display: Option<Vec<u8>>,
-    /// The monospace font.
+    /// The monospace font's bytes.
     pub monospace: Option<Vec<u8>>,
 }
 
-/// A caller-held record of the font set last installed.
+/// The font set last installed, recorded by the caller.
 ///
-/// A new signature (or a fresh one, for a new context) makes [`install`] call
-/// `set_fonts`; an unchanged one skips it, because epaint compares the full TTF
-/// data on every call.
+/// [`install`] calls `set_fonts` when the signature is new - also when it is
+/// fresh, as it is for a new context - and skips the call when the signature
+/// has not changed. Skipping matters because every `set_fonts` call compares
+/// the whole font data, which is expensive.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FontSignature(Option<u64>);
 
 impl FontSignature {
-    /// The signature of `fonts`.
+    /// Computes the signature of `fonts` from the bytes of all three families.
     pub fn of(fonts: &ThemeFonts) -> Self {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for bytes in [&fonts.body, &fonts.display, &fonts.monospace] {
@@ -103,15 +113,22 @@ impl std::fmt::Display for FontSignature {
     }
 }
 
-/// Build egui's style from `theme`, starting from `base`.
+// =============================================================================
+// Style and font installation
+// =============================================================================
+
+/// Builds egui's style from `theme`, starting from `base_style`.
 ///
-/// Every field the theme owns is overwritten; the rest of `base` is kept.
-pub fn build_style(theme: &Theme, base: &egui::Style) -> egui::Style {
-    let mut style = base.clone();
+/// Every field the theme owns is overwritten. Everything else keeps the value
+/// `base_style` has.
+pub fn build_style(theme: &Theme, base_style: &egui::Style) -> egui::Style {
+    // Step 1: the colours, strokes, shadows and the five widget states.
+    let mut style = base_style.clone();
     let visuals = &mut style.visuals;
     visuals.dark_mode = theme.dark_mode;
-    // Per-state `fg_stroke` carries the text colours; the override flattens
-    // them.
+    // Each widget state gives its text colour in `fg_stroke`.
+    // `override_text_color` would replace all of them with one colour, so it
+    // is cleared.
     visuals.override_text_color = None;
     visuals.panel_fill = color(theme.palette.panel);
     visuals.window_fill = color(theme.palette.panel);
@@ -137,6 +154,7 @@ pub fn build_style(theme: &Theme, base: &egui::Style) -> egui::Style {
     visuals.widgets.active = widget_visuals(theme.widgets.active);
     visuals.widgets.open = widget_visuals(theme.widgets.open);
 
+    // Step 2: the spacing values.
     let spacing = &mut style.spacing;
     spacing.item_spacing = vec2(theme.spacing.item_spacing);
     spacing.button_padding = vec2(theme.spacing.button_padding);
@@ -155,8 +173,8 @@ pub fn build_style(theme: &Theme, base: &egui::Style) -> egui::Style {
     spacing.combo_height = theme.spacing.combo_height;
     spacing.text_edit_width = theme.spacing.text_edit_width;
     spacing.menu_spacing = theme.spacing.menu_spacing;
-    // A floating bar is the solid one at its floating width, so the theme owns
-    // both the width and the posture.
+    // The theme chooses the scrollbar's width and whether it floats. Every
+    // other scrollbar setting comes from egui's floating or solid preset.
     spacing.scroll = if theme.spacing.scroll_floating {
         ScrollStyle {
             bar_width: theme.spacing.scroll_bar_width,
@@ -169,6 +187,7 @@ pub fn build_style(theme: &Theme, base: &egui::Style) -> egui::Style {
         }
     };
 
+    // Step 3: the text styles, each by name and family.
     let mut text_styles = style.text_styles.clone();
     for (name, text_style) in &theme.text_styles {
         text_styles.insert(
@@ -180,20 +199,22 @@ pub fn build_style(theme: &Theme, base: &egui::Style) -> egui::Style {
     style
 }
 
-/// Build the font definitions for `fonts` and the caller's built-ins.
+/// Builds the font definitions from `fonts` and the caller's built-in families.
 ///
-/// Order per family: the theme font first, then the caller's built-ins, then
-/// egui's defaults. The theme's fonts go in *before* `builtin` runs, so a
-/// family the caller registers by copying the proportional list (an icon font's
-/// fallback chain) carries the theme's body font too.
+/// Within a family the order is: the theme's font first, then the caller's
+/// built-ins, then egui's defaults. The theme's fonts are added before
+/// `append_builtin_fonts` runs, so a family the caller builds by copying the
+/// proportional list (an icon font's fallback chain, for example) carries the
+/// theme's body font as well.
 ///
-/// The named `display` family always exists, so a style may name it even when
-/// the theme ships no display font; it falls back to the family as the caller
-/// left it.
+/// The `display` family always exists, so a style can name it even when the
+/// theme ships no display font. In that case it holds whatever the proportional
+/// family holds.
 pub fn font_definitions(
     fonts: &ThemeFonts,
-    builtin: impl FnOnce(&mut FontDefinitions),
+    append_builtin_fonts: impl FnOnce(&mut FontDefinitions),
 ) -> FontDefinitions {
+    // Step 1: the theme's body and monospace fonts, ahead of everything else.
     let mut definitions = FontDefinitions::default();
     if let Some(bytes) = &fonts.body {
         definitions.font_data.insert(
@@ -217,8 +238,11 @@ pub fn font_definitions(
             .or_default()
             .insert(0, THEME_MONOSPACE_KEY.to_owned());
     }
-    builtin(&mut definitions);
+    // Step 2: the caller's own families, behind the theme's fonts.
+    append_builtin_fonts(&mut definitions);
 
+    // Step 3: the `display` family - the theme's display font, then the
+    // proportional family.
     let proportional = definitions
         .families
         .get(&FontFamily::Proportional)
@@ -239,26 +263,30 @@ pub fn font_definitions(
     definitions
 }
 
-/// Install `theme` on `context`: fonts first, then the style to both egui
-/// themes, then the dark theme pinned. `builtin` appends the caller's own
-/// families (the editor's Inter, JetBrains Mono and Phosphor). It runs only
-/// when the fonts are installed. `signature` belongs to the context; pass a
-/// fresh one for a new context.
+/// Installs `theme` on `context`: the fonts first, then the style on both egui
+/// themes, then the dark theme pinned.
 ///
-/// Returns whether `set_fonts` ran, so the caller can say so once per install.
+/// `append_builtin_fonts` adds the caller's own families - the editor passes
+/// its Inter, JetBrains Mono and Phosphor - and it runs only when the fonts are
+/// installed. `signature` belongs to the context, so pass a new one for each
+/// new context.
+///
+/// Returns whether `set_fonts` ran, so the caller can log the install once.
 pub fn install(
     context: &Context,
     theme: &Theme,
     fonts: &ThemeFonts,
-    builtin: impl FnOnce(&mut FontDefinitions),
+    append_builtin_fonts: impl FnOnce(&mut FontDefinitions),
     signature: &mut FontSignature,
 ) -> bool {
-    let next = FontSignature::of(fonts);
-    let fonts_installed = *signature != next;
+    // Step 1: replace the fonts, but only when the signature changed.
+    let next_signature = FontSignature::of(fonts);
+    let fonts_installed = *signature != next_signature;
     if fonts_installed {
-        context.set_fonts(font_definitions(fonts, builtin));
-        *signature = next;
+        context.set_fonts(font_definitions(fonts, append_builtin_fonts));
+        *signature = next_signature;
     }
+    // Step 2: write the style to both egui themes and pin the dark one.
     let style = build_style(theme, &egui::Style::default());
     context.set_style_of(EguiTheme::Dark, style.clone());
     context.set_style_of(EguiTheme::Light, style);
@@ -266,9 +294,15 @@ pub fn install(
     fonts_installed
 }
 
-/// The egui text-style key for a theme's named style.
-fn text_style_key(name: &str) -> TextStyle {
-    match name {
+// =============================================================================
+// Value conversion
+// =============================================================================
+
+/// Returns the egui text-style key for a theme text style's name.
+///
+/// A name egui has no built-in key for becomes `TextStyle::Name`.
+fn text_style_key(style_name: &str) -> TextStyle {
+    match style_name {
         "small" => TextStyle::Small,
         "body" => TextStyle::Body,
         "button" => TextStyle::Button,
@@ -278,7 +312,9 @@ fn text_style_key(name: &str) -> TextStyle {
     }
 }
 
-/// The egui family for a theme family.
+/// Returns the egui font family for a theme font family.
+///
+/// `Display` maps to the named `display` family.
 fn text_style_family(family: FontFamilyName) -> FontFamily {
     match family {
         FontFamilyName::Proportional => FontFamily::Proportional,
@@ -287,48 +323,55 @@ fn text_style_family(family: FontFamilyName) -> FontFamily {
     }
 }
 
-/// An egui colour from a theme colour (straight sRGB alpha).
-fn color(value: Rgba) -> Color32 {
-    let [red, green, blue, alpha] = value.0;
+/// Converts a theme colour to an egui colour. Both use straight alpha.
+fn color(theme_color: Rgba) -> Color32 {
+    let [red, green, blue, alpha] = theme_color.0;
     Color32::from_rgba_unmultiplied(red, green, blue, alpha)
 }
 
-/// An egui stroke from a theme stroke.
-fn stroke(value: Stroke) -> EguiStroke {
-    EguiStroke::new(value.width, color(value.color))
+/// Converts a theme stroke to an egui stroke.
+fn stroke(theme_stroke: Stroke) -> EguiStroke {
+    EguiStroke::new(theme_stroke.width, color(theme_stroke.color))
 }
 
-/// An egui widget look from a theme widget look.
-fn widget_visuals(value: WidgetStyle) -> egui::style::WidgetVisuals {
+/// Converts a theme widget style to the egui look of one widget state.
+fn widget_visuals(theme_widget: WidgetStyle) -> egui::style::WidgetVisuals {
     egui::style::WidgetVisuals {
-        bg_fill: color(value.bg_fill),
-        weak_bg_fill: color(value.weak_bg_fill),
-        bg_stroke: stroke(value.bg_stroke),
-        corner_radius: CornerRadius::same(value.corner_radius),
-        fg_stroke: stroke(value.fg_stroke),
-        expansion: value.expansion,
+        bg_fill: color(theme_widget.bg_fill),
+        weak_bg_fill: color(theme_widget.weak_bg_fill),
+        bg_stroke: stroke(theme_widget.bg_stroke),
+        corner_radius: CornerRadius::same(theme_widget.corner_radius),
+        fg_stroke: stroke(theme_widget.fg_stroke),
+        expansion: theme_widget.expansion,
     }
 }
 
-/// An egui shadow from a theme shadow (integer fields in egui 0.36).
-fn shadow(value: pill_ui_theme::Shadow) -> Shadow {
+/// Converts a theme shadow to an egui shadow. Both use whole-point fields.
+fn shadow(theme_shadow: pill_ui_theme::Shadow) -> Shadow {
     Shadow {
-        offset: value.offset,
-        blur: value.blur,
-        spread: value.spread,
-        color: color(value.color),
+        offset: theme_shadow.offset,
+        blur: theme_shadow.blur,
+        spread: theme_shadow.spread,
+        color: color(theme_shadow.color),
     }
 }
 
-/// An egui vector from a theme pair.
-fn vec2(value: [f32; 2]) -> Vec2 {
-    Vec2::new(value[0], value[1])
+/// Converts a theme's `[x, y]` pair to an egui vector.
+fn vec2(theme_pair: [f32; 2]) -> Vec2 {
+    Vec2::new(theme_pair[0], theme_pair[1])
 }
 
-/// An egui margin from one theme number.
-fn margin(value: f32) -> Margin {
-    Margin::same(value.round().clamp(0.0, 127.0) as i8)
+/// Converts one theme number to an egui margin.
+///
+/// egui stores a margin as an `i8`, so the value is rounded and clamped to
+/// `0..=127`.
+fn margin(theme_margin: f32) -> Margin {
+    Margin::same(theme_margin.round().clamp(0.0, 127.0) as i8)
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -419,13 +462,13 @@ mod tests {
             |_| {},
             &mut signature,
         );
-        // A pass that names the family must not panic.
-        let mut output = context.run_ui(RawInput::default(), |ui| {
+        // A pass that lays out text in the named family must not panic.
+        let mut pass_output = context.run_ui(RawInput::default(), |ui| {
             let text =
                 egui::RichText::new("display").family(FontFamily::Name(DISPLAY_FAMILY.into()));
             ui.label(text);
         });
-        output.textures_delta.clear();
+        pass_output.textures_delta.clear();
     }
 
     #[test]
@@ -466,9 +509,9 @@ mod tests {
         assert_eq!(proportional.first().map(String::as_str), Some("theme.body"));
     }
 
-    /// The theme's fonts go in before the caller's, so a family the built-in
-    /// callback copies the proportional list into carries them too - an icon
-    /// family draws a label beside its icon in the theme's body font.
+    /// The theme's fonts are added before the caller's, so a family the built-in
+    /// callback copies the proportional list into carries them too. That is what
+    /// lets an icon family draw a label beside its icon in the theme's body font.
     #[test]
     fn a_built_in_family_built_after_the_theme_font_carries_it() {
         let fonts = ThemeFonts {
@@ -477,8 +520,8 @@ mod tests {
             ..ThemeFonts::default()
         };
         let definitions = font_definitions(&fonts, |definitions| {
-            // The shape an icon installer uses: its own font first, then the
-            // proportional family as it stands.
+            // The shape an icon installer uses: the proportional family as it
+            // stands, then its own font.
             let fallbacks = definitions
                 .families
                 .get(&FontFamily::Proportional)
@@ -488,11 +531,11 @@ mod tests {
                 "builtin.icon".to_owned(),
                 Arc::new(FontData::from_static(&[9, 9])),
             );
-            let mut names = fallbacks;
-            names.push("builtin.icon".to_owned());
+            let mut family_names = fallbacks;
+            family_names.push("builtin.icon".to_owned());
             definitions
                 .families
-                .insert(FontFamily::Name("icons".into()), names);
+                .insert(FontFamily::Name("icons".into()), family_names);
         });
 
         let icons = definitions
@@ -501,8 +544,8 @@ mod tests {
             .expect("the built-in family");
         assert_eq!(icons.first().map(String::as_str), Some(THEME_BODY_KEY));
         assert_eq!(icons.last().map(String::as_str), Some("builtin.icon"));
-        // The display family leads with its own face and falls back to the
-        // body font the caller's families were built on.
+        // The display family starts with its own face, then falls back to the
+        // proportional family, which begins with the theme's body font.
         let display = definitions
             .families
             .get(&FontFamily::Name(DISPLAY_FAMILY.into()))
@@ -511,8 +554,9 @@ mod tests {
         assert_eq!(display.get(1).map(String::as_str), Some(THEME_BODY_KEY));
     }
 
-    /// `install` reports whether it ran `set_fonts`, which is what both UIs log
-    /// and what keeps an unchanged font set from being re-parsed.
+    /// `install` reports whether it ran `set_fonts`: true on the first install
+    /// and after a font changes, false when the font set is unchanged. Both UIs
+    /// use the answer to log the install.
     #[test]
     fn install_reports_whether_the_fonts_were_installed() {
         let context = Context::default();
@@ -560,7 +604,7 @@ mod tests {
         );
     }
 
-    /// The theme's spacing reaches egui.
+    /// Checks that the theme's spacing values reach egui's style.
     #[test]
     fn spacing_maps_to_egui() {
         let theme = Theme::brutalist();

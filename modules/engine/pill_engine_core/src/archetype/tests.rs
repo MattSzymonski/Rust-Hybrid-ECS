@@ -500,7 +500,10 @@ fn relayout_refuses_a_plan_that_leaves_a_row() {
         &plan,
     );
 
-    assert!(matches!(relayout_result, Err(WorldError::DescriptorRowInvalid)));
+    assert!(matches!(
+        relayout_result,
+        Err(WorldError::DescriptorRowInvalid)
+    ));
     assert_eq!(
         column.bytes(0).unwrap(),
         [1, 0, 0, 0, 2, 0, 0, 0].as_slice(),
@@ -788,4 +791,3 @@ fn a_descriptor_relayout_that_widens_alignment_reallocates() {
     assert_eq!(&column.bytes(0).expect("row")[8..12], &[2, 0, 0, 0]);
     assert_eq!(&column.bytes(1).expect("row")[0..4], &[4, 0, 0, 0]);
 }
-

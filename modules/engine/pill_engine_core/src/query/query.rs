@@ -580,7 +580,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         let matching_archetype_ids = self.matching_archetype_ids().to_vec();
         let _zone = crate::profile_scope!(
             "create parallel query iterator",
-            [("Archetypes matching this query: {}", matching_archetype_ids.len())]
+            [(
+                "Archetypes matching this query: {}",
+                matching_archetype_ids.len()
+            )]
         );
 
         // Step 3: Build one target state and one filter state per matching

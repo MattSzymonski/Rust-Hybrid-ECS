@@ -184,9 +184,9 @@ pub fn save_scene(
         for component_name in world.entity_component_names(entity).unwrap_or_default() {
             let Some(component_id) = world.resolve_entity_component_id(entity, &component_name)
             else {
-                report
-                    .skipped_components
-                    .push(format!("{id}: {component_name} is not registered on this entity"));
+                report.skipped_components.push(format!(
+                    "{id}: {component_name} is not registered on this entity"
+                ));
                 continue;
             };
             let Some(layout) = world.component_field_layout(component_id) else {
@@ -267,7 +267,7 @@ fn saved_field(
         })),
         FieldValue::Text(_) | FieldValue::List { .. } => None,
         FieldValue::Asset { .. } | FieldValue::Entity { .. } => {
-            match saved_reference(world, assets, registry, value) {
+            match saved_reference(world, assets, registry, field_value) {
                 Some(SavedReference::Asset(reference)) => serde_json::to_value(reference).ok(),
                 Some(SavedReference::Entity(id)) => Some(serde_json::json!(id.to_string())),
                 // An unset reference is written as `null`, and a load reads
@@ -285,7 +285,7 @@ fn saved_field(
 /// can.
 fn is_set_reference(field_value: &FieldValue) -> bool {
     match field_value {
-        FieldValue::Asset { .. } | FieldValue::Entity { .. } => !value.references_nothing(),
+        FieldValue::Asset { .. } | FieldValue::Entity { .. } => !field_value.references_nothing(),
         _ => false,
     }
 }
@@ -654,7 +654,7 @@ fn decoded_field(tag: &'static str, encoded: &serde_json::Value) -> Result<Decod
         _ => {
             return Ok(Decoded::Value(
                 opaque_field(tag, encoded).ok_or_else(|| "does not read".to_owned())?,
-            ))
+            ));
         }
     };
     Ok(Decoded::Value(value))

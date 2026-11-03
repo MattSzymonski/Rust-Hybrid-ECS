@@ -614,11 +614,8 @@ impl ErasedResource {
         // box's table is never refreshed from the resource factories - that is
         // what stops a Rust type sharing the name from handing its drop to
         // these bytes - so this is the one place it changes.
-        self.function_table = ErasedResourceOps::foreign(
-            size,
-            align,
-            self.function_table.schema_hash.unwrap_or(0),
-        );
+        self.function_table =
+            ErasedResourceOps::foreign(size, align, self.function_table.schema_hash.unwrap_or(0));
         Ok(())
     }
 
@@ -709,9 +706,8 @@ impl ErasedResource {
         let undropped_box = std::mem::ManuallyDrop::new(self);
         // SAFETY: the check above establishes a live `T` at `value_allocation`,
         // and `ManuallyDrop` guarantees nothing else reads or drops it.
-        let taken_value = unsafe {
-            std::ptr::read(undropped_box.value_allocation.as_ptr().cast::<T>())
-        };
+        let taken_value =
+            unsafe { std::ptr::read(undropped_box.value_allocation.as_ptr().cast::<T>()) };
         if undropped_box.size != 0 {
             let layout = Layout::from_size_align(undropped_box.size, undropped_box.align)
                 .expect("valid resource layout");
@@ -898,7 +894,8 @@ mod tests {
 
     impl Drop for Tracked {
         fn drop(&mut self) {
-            self.drop_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.drop_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -995,7 +992,11 @@ mod tests {
         let returned = erased
             .take::<Lookalike>()
             .expect_err("the box does not hold a Lookalike");
-        assert_eq!(drops_of(&drop_count), 0, "a refused take must not drop anything");
+        assert_eq!(
+            drops_of(&drop_count),
+            0,
+            "a refused take must not drop anything"
+        );
         assert_eq!(returned.get::<Tracked>().unwrap().carried_value, 3);
 
         drop(returned);

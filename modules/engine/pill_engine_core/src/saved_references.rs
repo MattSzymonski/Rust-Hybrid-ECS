@@ -610,7 +610,10 @@ mod tests {
             {
                 let assets = world.get_resource::<AssetManager>().unwrap();
                 let text = assets
-                    .get(Handle::<Text>::from_raw(load_outcome.index, load_outcome.generation))
+                    .get(Handle::<Text>::from_raw(
+                        load_outcome.index,
+                        load_outcome.generation,
+                    ))
                     .expect("the note loaded");
                 assert_eq!(text.text(), "hello");
             }

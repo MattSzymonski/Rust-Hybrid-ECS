@@ -282,11 +282,7 @@ impl AssetDatabase {
 ///
 /// The header is read from the file itself when its type is standalone, and
 /// from its `.meta` otherwise.
-fn read_record(
-    root: &Path,
-    relative_path: &str,
-    registry: &ImportRegistry,
-) -> Option<AssetRecord> {
+fn read_record(root: &Path, relative_path: &str, registry: &ImportRegistry) -> Option<AssetRecord> {
     let standalone = is_standalone(relative_path, registry);
     let header_path = if standalone {
         root.join(relative_path)

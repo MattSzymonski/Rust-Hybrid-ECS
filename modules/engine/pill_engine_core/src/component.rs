@@ -1092,10 +1092,7 @@ mod tests {
         // Registering the same type again reports that, rather than looking
         // identical to a fresh registration.
         let repeat_registration = registry.register::<ReRegisterTestComponent>().unwrap();
-        assert_eq!(
-            repeat_registration,
-            Registration::AlreadyPresent(first_bit)
-        );
+        assert_eq!(repeat_registration, Registration::AlreadyPresent(first_bit));
         assert!(!repeat_registration.is_new());
 
         registry.remove(&component_id);
@@ -1269,10 +1266,7 @@ mod tests {
         let relaid_registration = registry
             .register_with_layout_superseding::<second_copy::SharedProbe>(FIELDS_B, true)
             .expect("a superseding registration re-lays out the component");
-        assert!(
-            !relaid_registration.is_new(),
-            "the component keeps its bit"
-        );
+        assert!(!relaid_registration.is_new(), "the component keeps its bit");
         assert_eq!(
             registry
                 .get_layout(&ComponentId::of::<first_copy::SharedProbe>())

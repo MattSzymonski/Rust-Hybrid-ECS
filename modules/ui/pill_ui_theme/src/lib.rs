@@ -2,35 +2,46 @@
 //!
 //! # Responsibilities
 //!
-//! - [`theme`]: the complete base [`Theme`], the neutral [`Theme::fallback`]
-//!   and the [`Theme::brutalist`] recipe, plus the one pure merge.
-//! - [`overrides`]: [`ThemeOverrides`], the sparse document a `.theme` file
-//!   holds, and its JSON reader (bare body or standalone document).
-//! - [`asset`]: the `.theme` standalone asset type.
-//! - [`font`]: the `.ttf`/`.otf` font asset a layer names.
-//! - [`register`](mod@register): registration, the game/editor path scopes and
-//!   the handle-returning loaders.
+//! - [`theme`]: the complete base [`Theme`] and its two built-in themes,
+//!   [`Theme::fallback`] (neutral dark) and [`Theme::brutalist`], plus the
+//!   merge that applies an override document to one.
+//! - [`overrides`]: [`ThemeOverrides`], the document a `.theme` file holds,
+//!   which lists only the items it changes, and the reader that parses it.
+//! - [`asset`]: the `.theme` asset type, which carries its own header and
+//!   guid, so it needs no `.meta` file.
+//! - [`font`]: the `.ttf`/`.otf` font a theme names, loaded as an asset.
+//! - [`register`](mod@register): declares both asset types on a world, applies
+//!   the game/editor path rule, and loads a theme or font, returning its
+//!   handle.
 //!
 //! # Design
 //!
-//! This crate is a shared `dylib`: a project, `pill_project_ui`, the editor shell
-//! and `pill_editor_core` share the `Theme`, `ThemeOverrides` and `FontAsset`
-//! types, one asset column and one world resource. It is egui-free: the
-//! translator lives in `pill_ui_kit`, compiled into each UI's link unit, so no
-//! egui value crosses this boundary (two copies cannot share a link unit).
+//! This crate is a shared `dylib`: a project, `pill_project_ui`, the editor
+//! shell and `pill_editor_core` share the `Theme`, `ThemeOverrides` and
+//! `FontAsset` types and one asset column in the world's asset manager.
+//!
+//! The crate is egui-free. The translator that builds egui's `Style` from a
+//! `Theme` lives in `pill_ui_kit`, compiled into each UI's link unit, so no
+//! egui value ever crosses this DLL boundary: every UI has its own copy of
+//! egui, and the copies are not interchangeable.
 //!
 //! A theme is always complete: a `.theme` file carries **only overrides**, and
-//! merging never falls back to an egui default, so an absent item cannot change.
+//! the merge starts from a complete base theme, never from egui's defaults, so
+//! an item the file leaves out keeps the base value.
 
-/// The `.theme` standalone asset.
+/// The `.theme` asset type, which carries its own header and guid, so it needs
+/// no `.meta` file.
 pub mod asset;
-/// The `.ttf`/`.otf` font asset a theme layer names.
+/// The `.ttf`/`.otf` font a theme names, loaded as an asset.
 pub mod font;
-/// The sparse override document and its JSON reader.
+/// The document a `.theme` file holds, which lists only the items it changes,
+/// and the reader that parses it.
 pub mod overrides;
-/// Registration, path scopes and the loader.
+/// Puts the theme asset types on a world, then loads a theme or font within the
+/// game or editor path rule.
 pub mod register;
-/// The complete theme tokens and the pure merge.
+/// The complete theme values, and the merge that applies an override document
+/// to a base theme.
 pub mod theme;
 
 pub use asset::THEME_SHARED_NAME;

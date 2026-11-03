@@ -393,7 +393,11 @@ impl DebugDraw {
         let head_length = shaft_length * 0.2;
         let back = subtract_vectors(end, scale_vector(forward, head_length));
         for offset in [side, scale_vector(side, -1.0), up, scale_vector(up, -1.0)] {
-            self.line(end, add_vectors(back, scale_vector(offset, head_length * 0.5)), style);
+            self.line(
+                end,
+                add_vectors(back, scale_vector(offset, head_length * 0.5)),
+                style,
+            );
         }
         self
     }

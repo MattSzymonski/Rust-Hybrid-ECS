@@ -391,7 +391,11 @@ impl EcsSnapshot {
                         Some(bit) => format!("bit {bit:>3}"),
                         None => "bit   ?".to_string(),
                     };
-                    write_split_row(&mut out, &format!("    {bit_label}  {}", column.name), &size);
+                    write_split_row(
+                        &mut out,
+                        &format!("    {bit_label}  {}", column.name),
+                        &size,
+                    );
                 }
             }
         }

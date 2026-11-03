@@ -193,12 +193,12 @@ impl ScalarKind {
             Self::U32 => FieldValue::U32(u32::from_ne_bytes(read_bytes::<4>(bytes, offset)?)),
             Self::U64 => FieldValue::U64(u64::from_ne_bytes(read_bytes::<8>(bytes, offset)?)),
             Self::Bool => FieldValue::Bool(bytes.get(offset).copied()? != 0),
-            Self::Usize => FieldValue::Usize(usize::from_ne_bytes(
-                read_bytes::<{ size_of::<usize>() }>(bytes, offset)?,
-            )),
-            Self::Isize => FieldValue::Isize(isize::from_ne_bytes(
-                read_bytes::<{ size_of::<isize>() }>(bytes, offset)?,
-            )),
+            Self::Usize => FieldValue::Usize(usize::from_ne_bytes(read_bytes::<
+                { size_of::<usize>() },
+            >(bytes, offset)?)),
+            Self::Isize => FieldValue::Isize(isize::from_ne_bytes(read_bytes::<
+                { size_of::<isize>() },
+            >(bytes, offset)?)),
         })
     }
 }
@@ -251,7 +251,10 @@ fn array_element_size(descriptor: &ComponentFieldDescriptor) -> Option<usize> {
 /// Returns `None` when the image ends before the whole word does.
 fn header_word(bytes: &[u8], byte_offset: usize) -> Option<usize> {
     Some(usize::from_ne_bytes(
-        bytes.get(byte_offset..byte_offset + size_of::<usize>())?.try_into().ok()?,
+        bytes
+            .get(byte_offset..byte_offset + size_of::<usize>())?
+            .try_into()
+            .ok()?,
     ))
 }
 
@@ -488,7 +491,11 @@ pub(super) fn encode_field_write(
     // re-creating a destroyed entity, or re-attaching a removed component,
     // hands back the bytes an earlier read produced. Any other value goes
     // through the editable rules below.
-    if let FieldValue::Opaque { type_tag: captured_type_tag, bytes } = field_value {
+    if let FieldValue::Opaque {
+        type_tag: captured_type_tag,
+        bytes,
+    } = field_value
+    {
         if *captured_type_tag == type_tag && bytes.len() == descriptor.size {
             return Ok(FieldWrite {
                 row_offset: descriptor.offset,

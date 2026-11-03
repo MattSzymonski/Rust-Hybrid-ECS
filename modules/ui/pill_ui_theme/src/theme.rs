@@ -1,25 +1,25 @@
-//! The complete theme tokens and the one pure merge.
+//! The complete theme tokens and the merge that applies overrides to them.
 //!
 //! # Responsibilities
 //!
 //! - [`Theme`]: every value a UI's style needs, as plain owned data.
 //! - [`Theme::fallback`] and [`Theme::brutalist`]: the neutral dark base and
 //!   the brutalist recipe.
-//! - [`Theme::merged_with`]: the one place a sparse override document becomes a
-//!   complete theme.
+//! - [`Theme::merged_with`]: turns a sparse override document into a complete
+//!   theme.
 //! - The token types the document and the UI kit share ([`Rgba`], [`Stroke`],
 //!   [`Shadow`], [`Spacing`], [`Shape`], [`WidgetStyle`], [`WidgetStates`]).
 //!
 //! # Design
 //!
-//! Everything here is plain data with no egui dependency. The crate is a shared
+//! Everything here is plain data and needs no egui. This crate is a shared
 //! `dylib`, so a project, `pill_project_ui`, the editor shell and
-//! `pill_editor_core` share one `Theme` identity, and each UI translates the
+//! `pill_editor_core` all see the same `Theme` type, and each UI converts the
 //! tokens inside its own link unit.
 //!
-//! A merge never fills from egui defaults: the base is complete, an absent item
-//! keeps the value below it, and a refused item fails the whole layer rather
-//! than producing a half-applied theme.
+//! A merge never fills gaps from egui's defaults. The base theme is complete,
+//! so an item the document leaves out keeps the base value. One refused item
+//! rejects the whole layer, so a UI never paints a half-applied theme.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -37,7 +37,8 @@ use crate::overrides::{
 // Colours and strokes
 // =============================================================================
 
-/// An sRGB colour with straight alpha, as `[red, green, blue, alpha]`.
+/// An sRGB colour with straight (not premultiplied) alpha, stored as
+/// `[red, green, blue, alpha]`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rgba(pub [u8; 4]);
 
@@ -56,8 +57,8 @@ impl Rgba {
     ///
     /// # Errors
     ///
-    /// A message naming the refused text when it lacks the `#`, has the wrong
-    /// length, or names a non-hex channel.
+    /// A message containing the refused text, when it lacks the `#`, has the
+    /// wrong length, or has a channel that is not hexadecimal.
     pub fn parse(text: &str) -> Result<Self, String> {
         let digits = text
             .strip_prefix('#')
@@ -156,11 +157,12 @@ pub enum FontFamilyName {
 }
 
 impl FontFamilyName {
-    /// Parse `proportional`, `monospace` or `display`.
+    /// Parse a family name: `proportional` (or `body`), `monospace` (or
+    /// `mono`) or `display`.
     ///
     /// # Errors
     ///
-    /// A message listing the accepted names.
+    /// A message naming the accepted families.
     pub fn parse(text: &str) -> Result<Self, String> {
         match text.trim().to_ascii_lowercase().as_str() {
             "proportional" | "body" => Ok(Self::Proportional),
@@ -200,9 +202,9 @@ impl TextStyle {
 
 /// The font paths a theme names, resolved by each consumer.
 ///
-/// Paths are carried through a merge; bytes are not. The game resolves them as
-/// `FontAsset`s, the editor's project layer the same way, and the editor's user
-/// layer from disk.
+/// A merge carries the paths and not the font bytes. The game loads a path as
+/// a `FontAsset`, the editor's project layer does the same, and the editor's
+/// user layer reads the file from disk.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ThemeFontPaths {
     /// The body font's path.
@@ -232,32 +234,33 @@ pub struct Spacing {
     pub menu_margin: f32,
     /// Offset of an indented body.
     pub indent: f32,
-    /// A slider's rail width.
+    /// A slider's width.
     pub slider_width: f32,
     /// A slider rail's height.
     pub slider_rail_height: f32,
-    /// A checkbox or radio box's outer size.
+    /// The outer size of the icon a check box or radio button draws.
     pub icon_width: f32,
-    /// A checkbox or radio box's inner size.
+    /// The inner size of that icon: the mark inside the box.
     pub icon_width_inner: f32,
     /// The gap between an icon and its label.
     pub icon_spacing: f32,
-    /// A menu's minimum width; zero lets egui size it.
+    /// A menu's wrapping width. egui 0.36 never reads its `menu_width`, so
+    /// this changes nothing today.
     pub menu_width: f32,
     /// A tooltip's maximum width; zero lets egui size it.
     pub tooltip_width: f32,
-    /// A combo box's width; zero lets egui size it.
+    /// A combo box's minimum width; zero lets egui size it.
     pub combo_width: f32,
-    /// A combo box's maximum height.
+    /// The height at which a combo box starts to scroll.
     pub combo_height: f32,
     /// A text edit's default width.
     pub text_edit_width: f32,
-    /// Vertical spacing between menu entries.
+    /// The horizontal gap between a menu and its submenu.
     pub menu_spacing: f32,
     /// A scroll bar's width.
     pub scroll_bar_width: f32,
-    /// Whether scroll bars float over the content: thin until the pointer
-    /// reaches them, and taking no layout width.
+    /// Whether scroll bars float over the content. A floating bar is thin
+    /// until the pointer reaches it and takes no layout width.
     pub scroll_floating: bool,
 }
 
@@ -287,7 +290,8 @@ impl Default for Spacing {
     }
 }
 
-/// The radii, strokes, shadows and chrome accents a UI reads from the theme.
+/// The corner radii, strokes, shadows and two accent widths a UI reads from
+/// the theme.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shape {
     /// The default corner radius.
@@ -333,11 +337,12 @@ impl Default for Shape {
 /// One widget's look in one interaction state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WidgetStyle {
-    /// The fill for widgets that must have one.
+    /// The fill for widgets that must have a background, such as a check box
+    /// or a text edit.
     pub bg_fill: Rgba,
-    /// The fill for widgets that may have one (buttons).
+    /// The fill for widgets whose background is optional, such as buttons.
     pub weak_bg_fill: Rgba,
-    /// The outline.
+    /// The outline drawn around a widget that has one.
     pub bg_stroke: Stroke,
     /// The text and glyph colour.
     pub fg_stroke: Stroke,
@@ -471,11 +476,12 @@ pub struct Palette {
     pub frame: Rgba,
     /// A panel's background.
     pub panel: Rgba,
-    /// A raised surface: menus, hovered rows, tooltips.
+    /// A surface one step lighter than the panel: a hovered tab, a neutral
+    /// button's face, and striped rows.
     pub panel_raised: Rgba,
     /// A flat control's fill: buttons and rows drawn on a panel.
     pub control: Rgba,
-    /// Inputs and wells.
+    /// The background of text inputs and other sunken areas.
     pub well: Rgba,
     /// Borders and separators.
     pub line: Rgba,
@@ -579,9 +585,10 @@ impl Palette {
 /// A complete set of UI tokens.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
-    /// A label for logs and `dump theme`.
+    /// A name identifying this theme; a `.theme` document may override it.
     pub name: String,
-    /// Whether egui should derive light-mode values from this palette.
+    /// Whether the theme is dark, with light text on dark surfaces. egui
+    /// reads it as a summary flag and builds no values from it.
     pub dark_mode: bool,
     /// The colours.
     pub palette: Palette,
@@ -606,8 +613,8 @@ impl Default for Theme {
 impl Theme {
     /// A neutral dark theme built in code.
     ///
-    /// This is what a game gets from a plain `install(engine)`: a usable look
-    /// with no file and no project code.
+    /// `install(engine)` installs this theme. It gives a game a usable look
+    /// with no theme file and no project code.
     pub fn fallback() -> Self {
         Self {
             name: "fallback".to_owned(),
@@ -623,8 +630,9 @@ impl Theme {
 
     /// The brutalist recipe, as a code default.
     ///
-    /// Square corners, hard offset shadows (blur 0), a pink accent, light text
-    /// on near-black surfaces, and the recipe's spacing and text table.
+    /// It has square corners, shadows with no blur, a pink accent and light
+    /// text on near-black surfaces. Its spacing and text sizes are the
+    /// recipe's own.
     pub fn brutalist() -> Self {
         let mut text_styles = BTreeMap::new();
         text_styles.insert(
@@ -693,8 +701,8 @@ impl Theme {
     ///
     /// # Errors
     ///
-    /// A [`ThemeError`] naming the first refused item. The caller keeps the
-    /// theme it had; no partially merged value is returned.
+    /// A [`ThemeError`] naming the first item the document gets wrong. The
+    /// theme this was called on is left unchanged.
     pub fn merged_with(&self, overrides: &ThemeOverrides) -> Result<Self, ThemeError> {
         let mut theme = self.clone();
         if let Some(name) = &overrides.name {
@@ -760,7 +768,8 @@ pub enum ThemeError {
 }
 
 impl ThemeError {
-    /// Refuse one item.
+    /// Builds the error for one refused item, from its dotted path and the
+    /// reason it was refused.
     fn item(item: impl Into<String>, detail: impl Into<String>) -> Self {
         Self::Item {
             item: item.into(),
@@ -774,11 +783,22 @@ impl ThemeError {
 // =============================================================================
 
 /// Parse a colour and name it on failure.
+///
+/// # Errors
+///
+/// [`ThemeError::Item`] naming `item` and the reason [`Rgba::parse`] refused
+/// `text`.
 fn parse_color(item: &str, text: &str) -> Result<Rgba, ThemeError> {
     Rgba::parse(text).map_err(|detail| ThemeError::item(item, detail))
 }
 
-/// Refuse a number that is not finite and non-negative.
+/// Returns `value` when it is finite and non-negative, or an error naming
+/// `item` otherwise.
+///
+/// # Errors
+///
+/// [`ThemeError::Item`] naming `item` when `value` is negative, infinite or
+/// NaN.
 fn check_number(item: &str, value: f32) -> Result<f32, ThemeError> {
     if value.is_finite() && value >= 0.0 {
         Ok(value)
@@ -791,6 +811,10 @@ fn check_number(item: &str, value: f32) -> Result<f32, ThemeError> {
 }
 
 /// Replace every colour role the document names.
+///
+/// # Errors
+///
+/// [`ThemeError::Item`] naming the first colour the document does not parse.
 fn merge_palette(palette: &mut Palette, overrides: &PaletteOverrides) -> Result<(), ThemeError> {
     macro_rules! colours {
         ($( $field:ident => $item:literal ),* $(,)?) => {{
@@ -829,6 +853,11 @@ fn merge_palette(palette: &mut Palette, overrides: &PaletteOverrides) -> Result<
 }
 
 /// Replace the named text styles the document names, adding new ones.
+///
+/// # Errors
+///
+/// [`ThemeError::Item`] naming a size that is not positive, or a family the
+/// document does not accept.
 fn merge_text_styles(
     styles: &mut BTreeMap<String, TextStyle>,
     overrides: &BTreeMap<String, TextStyleOverride>,
@@ -856,6 +885,11 @@ fn merge_text_styles(
 }
 
 /// Replace the metrics the document names.
+///
+/// # Errors
+///
+/// [`ThemeError::Item`] naming the first number that is negative, infinite or
+/// NaN.
 fn merge_spacing(spacing: &mut Spacing, overrides: &SpacingOverrides) -> Result<(), ThemeError> {
     macro_rules! numbers {
         ($( $field:ident => $item:literal ),* $(,)?) => {{
@@ -908,6 +942,11 @@ fn merge_spacing(spacing: &mut Spacing, overrides: &SpacingOverrides) -> Result<
 }
 
 /// Replace one stroke's present fields.
+///
+/// # Errors
+///
+/// [`ThemeError::Item`] naming a width or colour the document states
+/// incorrectly.
 fn merge_stroke(
     stroke: &mut Stroke,
     item: &str,
@@ -923,6 +962,11 @@ fn merge_stroke(
 }
 
 /// Replace one shadow's present fields.
+///
+/// # Errors
+///
+/// [`ThemeError::Item`] naming an offset, blur or spread that does not fit its
+/// integer field, or a colour that does not parse.
 fn merge_shadow(
     shadow: &mut Shadow,
     item: &str,
@@ -962,6 +1006,11 @@ fn merge_shadow(
 }
 
 /// Replace the shape items the document names.
+///
+/// # Errors
+///
+/// [`ThemeError::Item`] from a stroke, a shadow, or a width that is negative,
+/// infinite or NaN.
 fn merge_shape(shape: &mut Shape, overrides: &ShapeOverrides) -> Result<(), ThemeError> {
     if let Some(value) = overrides.corner_radius {
         shape.corner_radius = value;
@@ -994,6 +1043,11 @@ fn merge_shape(shape: &mut Shape, overrides: &ShapeOverrides) -> Result<(), Them
 }
 
 /// Replace one widget state's present fields.
+///
+/// # Errors
+///
+/// [`ThemeError::Item`] naming a colour, a stroke or an expansion the document
+/// states incorrectly.
 fn merge_widget(
     widget: &mut WidgetStyle,
     item: &str,
@@ -1020,7 +1074,11 @@ fn merge_widget(
     Ok(())
 }
 
-/// Replace the widget states the document names.
+/// Replace the fields the document names in each widget state.
+///
+/// # Errors
+///
+/// [`ThemeError::Item`] from the first state the document states incorrectly.
 fn merge_widgets(
     widgets: &mut WidgetStates,
     overrides: &WidgetsOverrides,
@@ -1054,6 +1112,10 @@ fn merge_fonts(fonts: &mut ThemeFontPaths, overrides: &FontsOverrides) {
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1070,7 +1132,7 @@ mod tests {
         let merged = base.merged_with(&accent_only()).unwrap();
 
         assert_eq!(merged.palette.accent, Rgba::rgb(0x33, 0xd1, 0x7a));
-        // Everything else is the base, token for token.
+        // Every other value stays exactly as the base has it.
         let mut expected = base.clone();
         expected.palette.accent = merged.palette.accent;
         assert_eq!(merged, expected);
@@ -1083,8 +1145,8 @@ mod tests {
         assert_eq!(merged, base);
     }
 
-    /// A layer that names one family keeps the other two: font paths merge per
-    /// family, so a project naming only `body` does not undo the user's
+    /// A layer that names one family keeps the other two. Font paths merge per
+    /// family, so a project that names only `body` keeps the user's
     /// `monospace`.
     #[test]
     fn font_paths_merge_per_family() {

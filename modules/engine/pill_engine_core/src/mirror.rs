@@ -1021,7 +1021,10 @@ mod tests {
         unsafe {
             write(packed_arguments.as_mut_ptr(), text.as_ptr() as usize);
             write(packed_arguments.as_mut_ptr().add(8), text.len() as u32);
-            write(packed_arguments.as_mut_ptr().add(16), numbers.as_ptr() as usize);
+            write(
+                packed_arguments.as_mut_ptr().add(16),
+                numbers.as_ptr() as usize,
+            );
             write(packed_arguments.as_mut_ptr().add(24), numbers.len() as u32);
             assert_eq!(read_str(slot(packed_arguments.as_ptr(), 0)), Ok("pill"));
             assert_eq!(
@@ -1072,7 +1075,10 @@ mod tests {
         unsafe {
             write(packed_arguments.as_mut_ptr(), 7u32);
             write(packed_arguments.as_mut_ptr().add(4), 2u32);
-            write(packed_arguments.as_mut_ptr().add(16), path.as_ptr() as usize);
+            write(
+                packed_arguments.as_mut_ptr().add(16),
+                path.as_ptr() as usize,
+            );
             write(packed_arguments.as_mut_ptr().add(24), path.len() as u32);
             *packed_arguments.as_mut_ptr().add(28) = 0;
             let handle = Handle::<Mesh>::read_slot(slot(packed_arguments.as_ptr(), 0)).unwrap();
@@ -1096,7 +1102,9 @@ mod tests {
                 ),
                 Ok(None)
             );
-            *packed_arguments.as_mut_ptr().add(OPTION_ARGUMENT_FLAG_OFFSET) = 1;
+            *packed_arguments
+                .as_mut_ptr()
+                .add(OPTION_ARGUMENT_FLAG_OFFSET) = 1;
             assert_eq!(
                 read_option(
                     slot(packed_arguments.as_ptr(), 0),

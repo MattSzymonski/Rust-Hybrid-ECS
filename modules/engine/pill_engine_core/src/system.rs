@@ -523,7 +523,9 @@ where
                     crate::hot_patch::record_success(&name);
                     output.into_system_result()
                 }
-                Err(panic_payload) => Err(crate::hot_patch::panic_into_failure(&name, panic_payload)),
+                Err(panic_payload) => {
+                    Err(crate::hot_patch::panic_into_failure(&name, panic_payload))
+                }
             }
         })
     }

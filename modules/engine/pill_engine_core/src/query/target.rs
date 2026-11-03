@@ -67,7 +67,10 @@ pub trait QueryTarget {
     /// because `report_component_access` refuses it there.
     fn component_ids() -> Vec<ComponentId> {
         let (read_component_ids, write_component_ids) = Self::report_component_access();
-        read_component_ids.into_iter().chain(write_component_ids).collect()
+        read_component_ids
+            .into_iter()
+            .chain(write_component_ids)
+            .collect()
     }
 
     /// Reports which components this target reads and which it writes, for

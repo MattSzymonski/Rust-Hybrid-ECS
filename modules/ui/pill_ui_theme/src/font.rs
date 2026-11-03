@@ -2,19 +2,24 @@
 //!
 //! # Responsibilities
 //!
-//! - [`FontAsset`]: the file's bytes as an asset, so a font a theme names is
-//!   imported, versioned and watched like every other asset.
-//! - [`FontAsset::bytes`]: the copy a UI hands to egui's `set_fonts`.
-//! - [`FONT_SHARED_NAME`]: the pinned asset identity across binaries.
+//! - [`FontAsset`]: the font file's bytes as an asset, so a font a theme names
+//!   is imported, versioned and re-imported when the file changes, like every
+//!   other asset.
+//! - [`FontAsset::bytes`]: the bytes a UI hands to egui's `set_fonts`.
+//! - [`FONT_SHARED_NAME`]: the name that identifies the asset type across
+//!   binaries.
 //!
 //! # Design
 //!
-//! The bytes say everything the asset needs, so the import settings are empty
-//! and the document is the file. The type exists rather than a project reading
-//! the file itself so that an edited font moves the store's content version:
-//! that is what makes both UIs re-install their fonts without a restart. The
-//! asset never borrows from the store - the bytes are owned - so nothing a
-//! reloadable image owns outlives it.
+//! A font file needs no import settings, so the asset is only the bytes,
+//! copied out of the file. Going through the asset store is what lets a
+//! changed font reach a running UI: when the file is imported again, the store
+//! moves the font's content version, and both the game UI and the editor
+//! install the fonts again without a restart. A project that read the file
+//! itself would never notice the change.
+//!
+//! The bytes are an owned copy, never a borrow from the file or pack they came
+//! from, so the asset stays valid after the module that loaded it is unloaded.
 
 // External crates
 use serde::{Deserialize, Serialize};
@@ -23,13 +28,29 @@ use trait_type_map::impl_trait_accessible;
 // Current crate
 use pill_engine_core::{Asset, AssetLoadError, AssetLoadResult, ImportedAsset};
 
-/// The pinned shared name of [`FontAsset`].
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The name [`FontAsset`] is registered under, the same in every binary.
+///
+/// It is a literal for two reasons: the store keys one asset column across
+/// binaries by it, and each font's `.meta` file records it, so it must not
+/// move when the type or its module is renamed.
 pub const FONT_SHARED_NAME: &str = "pill_ui_theme::FontAsset";
 
+// =============================================================================
+// FontAsset
+// =============================================================================
+
 /// A font file a theme layer named, as its bytes.
+///
+/// The type is an asset so the store can version it and load it again when the
+/// file changes; a UI copies [`Self::bytes`] into egui when it installs the
+/// fonts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FontAsset {
-    /// The file's bytes, as shipped.
+    /// The font file's bytes, copied unchanged.
     pub bytes: Vec<u8>,
 }
 
@@ -39,13 +60,20 @@ impl Asset for FontAsset {
     }
 }
 
-// The trait object the registry stores; every asset type registers one.
+// Lets the asset manager keep a `FontAsset` column: it stores assets as
+// `dyn Asset` trait objects, so each asset type declares this access.
 impl_trait_accessible!(dyn Asset; FontAsset);
 
-/// How a font file is read, as stored in its `.meta` file.
+// =============================================================================
+// FontImportSettings
+// =============================================================================
+
+/// The import settings a font's `.meta` file holds.
 ///
-/// Empty: a font's bytes say everything about it. It exists so a font file
-/// gets a metadata file, and with it a guid that survives a rename.
+/// There is nothing to configure, because the bytes say everything about the
+/// font, but an imported asset needs a settings type. The `.meta` file is also
+/// where the font's guid lives, and that guid keeps the font's identity when
+/// the file is renamed.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FontImportSettings {}
@@ -54,10 +82,11 @@ impl ImportedAsset for FontAsset {
     type ImportSettings = FontImportSettings;
     const SOURCE_EXTENSIONS: &'static [&'static str] = &["ttf", "otf"];
 
-    /// Take the file's bytes.
+    /// Copies the file's bytes into the asset.
     ///
-    /// An empty file is refused here rather than at `set_fonts`: epaint
-    /// panics on empty font data, and a refusal names the file instead.
+    /// An empty file is refused here rather than left for `set_fonts`: epaint
+    /// panics while parsing empty font data, and the error returned here names
+    /// the file instead.
     ///
     /// # Errors
     ///
@@ -78,6 +107,10 @@ impl ImportedAsset for FontAsset {
         })
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

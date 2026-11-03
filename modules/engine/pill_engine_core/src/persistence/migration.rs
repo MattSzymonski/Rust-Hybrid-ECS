@@ -443,9 +443,10 @@ impl World {
             let mut serialized_components: Vec<Vec<u8>> =
                 Vec::with_capacity(source_archetype.entities.len());
             for entity_index in 0..source_archetype.entities.len() {
-                let Some(bytes) =
-                    serialize_retiring_component(&source_archetype.component_storages, entity_index)
-                else {
+                let Some(bytes) = serialize_retiring_component(
+                    &source_archetype.component_storages,
+                    entity_index,
+                ) else {
                     self.archetypes
                         .insert(source_archetype_id, source_archetype);
                     return Err(PersistenceError::SerializationFailed {

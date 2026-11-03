@@ -10,11 +10,11 @@
 //!
 //! # Design
 //!
-//! Every struct refuses unknown fields and defaults every item to "unchanged".
-//! A typo therefore fails loudly instead of silently doing nothing, and a
-//! document never has to restate a value it keeps. Colours stay strings here
-//! and are parsed during the merge, where the item's dotted path is known, so
-//! an error can name `palette.accent` rather than just "a colour".
+//! Every struct refuses unknown fields, and a field left out of a document
+//! means "no change". A typo therefore fails loudly instead of silently doing
+//! nothing, and a document never has to restate a value it keeps. Colours stay
+//! strings here and are parsed during the merge, where the item's dotted path
+//! is known, so an error can name `palette.accent` instead of "a colour".
 
 // Standard library
 use std::collections::BTreeMap;
@@ -25,16 +25,21 @@ use serde::{Deserialize, Serialize};
 // Current crate
 use crate::theme::ThemeError;
 
-/// A sparse document of theme overrides.
+// =============================================================================
+// The document
+// =============================================================================
+
+/// The theme changes a `.theme` document lists.
 ///
-/// This is the `.theme` asset's document: a file that changes only some items.
-/// Merging it onto a complete base yields the theme a UI installs.
+/// A document names only the items it changes. Merging it onto a complete base
+/// theme yields the theme a UI installs.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ThemeOverrides {
-    /// A label for logs and `dump theme`.
+    /// The theme's name. A document may set it, and the merge copies it onto
+    /// the theme.
     pub name: Option<String>,
-    /// Whether egui should derive light-mode values from the palette.
+    /// Whether egui treats the theme as dark mode.
     pub dark_mode: Option<bool>,
     /// The colour roles this document changes.
     pub palette: PaletteOverrides,
@@ -42,30 +47,29 @@ pub struct ThemeOverrides {
     pub text_styles: BTreeMap<String, TextStyleOverride>,
     /// The layout metrics this document changes.
     pub spacing: SpacingOverrides,
-    /// The radii, strokes, shadows and accents this document changes.
+    /// The corner radii, strokes, shadows and accent widths this document
+    /// changes.
     pub shape: ShapeOverrides,
-    /// The widget state fields this document changes.
+    /// The widget states this document changes.
     pub widgets: WidgetsOverrides,
     /// The font paths this document names.
     pub fonts: FontsOverrides,
 }
 
 impl ThemeOverrides {
-    /// Read an override document, bare or wrapped in a standalone asset file.
+    /// Reads an override document from its JSON text.
     ///
-    /// A standalone file carries its body under `asset`; a bare body is the
-    /// override itself. Both parse to the same value.
+    /// The text is either the override body itself or a standalone asset file,
+    /// which carries its body under `asset`. Both give the same value.
     ///
     /// # Errors
     ///
-    /// [`ThemeError::Json`] with serde's message when the text is not JSON, is
-    /// not an object, or names an unknown or wrongly typed item.
-    pub fn from_json_str(text: &str) -> Result<Self, ThemeError> {
-        let value: serde_json::Value =
-            serde_json::from_str(text).map_err(|error| ThemeError::Json(error.to_string()))?;
-        let body = match value {
-            // A standalone file carries the body under `asset`; a bare body is
-            // the override itself.
+    /// [`ThemeError::Json`] with serde's message when the text is not JSON,
+    /// does not hold an object, or names an unknown or wrongly typed item.
+    pub fn from_json_str(json_text: &str) -> Result<Self, ThemeError> {
+        let parsed_json: serde_json::Value =
+            serde_json::from_str(json_text).map_err(|error| ThemeError::Json(error.to_string()))?;
+        let body = match parsed_json {
             serde_json::Value::Object(mut map) => match map.remove("asset") {
                 Some(asset) => asset,
                 None => serde_json::Value::Object(map),
@@ -76,7 +80,12 @@ impl ThemeOverrides {
     }
 }
 
-/// The colour roles [`ThemeOverrides`] can change, as `#rrggbb`/`#rrggbbaa`.
+// =============================================================================
+// The palette
+// =============================================================================
+
+/// The colour roles [`ThemeOverrides`] can change, each written as `#rrggbb` or
+/// `#rrggbbaa`.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PaletteOverrides {
@@ -126,15 +135,24 @@ pub struct PaletteOverrides {
     pub log_error: Option<String>,
 }
 
+// =============================================================================
+// Text styles
+// =============================================================================
+
 /// One named text style's overridable fields.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TextStyleOverride {
-    /// The size in points; must be positive.
+    /// The size in points. It must be a positive, finite number.
     pub size: Option<f32>,
-    /// `proportional`, `monospace` or `display`.
+    /// The family: `proportional`, `monospace` or `display`. The aliases
+    /// `body` and `mono` are accepted too.
     pub family: Option<String>,
 }
+
+// =============================================================================
+// Spacing and shape
+// =============================================================================
 
 /// The layout metrics [`ThemeOverrides`] can change.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -180,7 +198,7 @@ pub struct SpacingOverrides {
     pub scroll_floating: Option<bool>,
 }
 
-/// The shape items [`ThemeOverrides`] can change.
+/// The shape values [`ThemeOverrides`] can change.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ShapeOverrides {
@@ -210,26 +228,31 @@ pub struct ShapeOverrides {
 pub struct StrokeOverride {
     /// The width in points.
     pub width: Option<f32>,
-    /// The colour as `#rrggbb`/`#rrggbbaa`.
+    /// The colour, written as `#rrggbb` or `#rrggbbaa`.
     pub color: Option<String>,
 }
 
 /// One shadow's overridable fields.
 ///
-/// The numbers are wider than egui's fields so an out-of-range value is
-/// refused by the merge with the item's path, not by serde without it.
+/// Each number is stored wider than egui's own field, so the merge can refuse
+/// an out-of-range value and name the item it came from. serde alone would
+/// reject it without that path.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ShadowOverride {
-    /// The offset in points; must fit egui 0.36's `[i8; 2]`.
+    /// The offset in points. It must fit egui 0.36's `[i8; 2]`.
     pub offset: Option<[i32; 2]>,
-    /// The blur radius in points; must fit egui 0.36's `u8`.
+    /// The blur radius in points. It must fit egui 0.36's `u8`.
     pub blur: Option<i32>,
-    /// The spread in points; must fit egui 0.36's `u8`.
+    /// The spread in points. It must fit egui 0.36's `u8`.
     pub spread: Option<i32>,
-    /// The colour as `#rrggbb`/`#rrggbbaa`.
+    /// The colour, written as `#rrggbb` or `#rrggbbaa`.
     pub color: Option<String>,
 }
+
+// =============================================================================
+// Widget states
+// =============================================================================
 
 /// The widget states [`ThemeOverrides`] can change.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -251,11 +274,11 @@ pub struct WidgetsOverrides {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WidgetStyleOverride {
-    /// The fill for widgets that must have one.
+    /// The fill for widgets that must have a background.
     pub bg_fill: Option<String>,
-    /// The fill for widgets that may have one.
+    /// The fill for widgets that may have a background (buttons).
     pub weak_bg_fill: Option<String>,
-    /// The outline.
+    /// The outline around the widget.
     pub bg_stroke: Option<StrokeOverride>,
     /// The text and glyph colour.
     pub fg_stroke: Option<StrokeOverride>,
@@ -264,6 +287,10 @@ pub struct WidgetStyleOverride {
     /// How much the frame grows in this state.
     pub expansion: Option<f32>,
 }
+
+// =============================================================================
+// Fonts
+// =============================================================================
 
 /// The font paths [`ThemeOverrides`] can name.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -276,6 +303,10 @@ pub struct FontsOverrides {
     /// The monospace font's path.
     pub monospace: Option<String>,
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
