@@ -1,38 +1,45 @@
-//! Keyboard, mouse and gamepad state, maintained by the engine and readable
-//! from any system.
+//! Keyboard, mouse and gamepad state for the current frame, maintained by the
+//! engine and readable from any system.
 //!
 //! # Responsibilities
 //!
-//! - Defines [`Input`], the engine-owned resource, and its plain-data
-//!   vocabulary ([`InputEvent`], [`KeyCode`], gamepad and mouse types).
-//! - Tracks, per frame, what is held, what was pressed or released since the
-//!   previous frame, and the cursor, motion and scroll accumulated over it;
-//!   queues rumble requests for the frontend that owns the gamepads.
+//! - Defines [`Input`], the engine-owned resource, and the plain-data types a
+//!   frontend feeds it ([`InputEvent`], [`KeyCode`], and the gamepad and mouse
+//!   types).
+//! - Tracks what is held this frame, what was pressed or released since the
+//!   previous frame, and the cursor, motion and scroll collected over the
+//!   frame. Also queues rumble requests for the frontend that owns the
+//!   gamepads.
 //!
 //! # Design
 //!
-//! The engine knows no windowing or gamepad library: a frontend translates its
+//! The engine knows no windowing or gamepad library. A frontend translates its
 //! platform's events (winit, the editor's DOM, gilrs) into [`InputEvent`]s and
-//! queues them through
+//! queues them with
 //! [`Engine::push_input_event`](crate::engine::Engine::push_input_event). The
-//! queue is applied at the top of the next frame, right after advancing
-//! [`Time`](crate::time::Time) and for the same reason - the scheduler orders
-//! systems independently of registration, so an "input system" could run after
-//! its readers - and every system therefore sees the same input. The type lives
-//! in the engine core, the one shared dylib every artifact links, so a project
-//! DLL reads the host's instance through `Res<Input>` across a reload.
+//! engine applies the queue at the top of the next frame, just after it
+//! advances [`Time`](crate::time::Time). Both happen there for the same reason:
+//! the scheduler orders systems on its own, without regard to registration
+//! order, so a separate "input system" could run after the systems that read
+//! its data. Applying the queue at the frame start means every system sees the
+//! same input.
 //!
-//! Key codes name physical keys (the W3C `KeyboardEvent.code` vocabulary, as
-//! winit does), not the characters a layout produces: `KeyW` is the key left of
-//! `KeyE` on every layout, which is what movement bindings want. Text arrives
-//! separately, through `InputEvent::TextInput`, `ImeCommit` and `ImePreedit`.
+//! The type lives in the engine core, the one shared dylib every artifact
+//! links. A project DLL therefore reads the host's instance through
+//! `Res<Input>` across a reload.
 //!
-//! Frame semantics: `*_held` is down at the start of the frame; `*_pressed` and
-//! `*_released` changed since the previous one (a press and a release inside
-//! one frame report both, so a short tap is never lost, and operating-system
-//! key repeat produces no new press). Motion, scroll and committed text add up
-//! over the frame; the cursor position, modifier state and IME composition are
-//! the latest reported ones.
+//! Key codes name physical keys, using the W3C `KeyboardEvent.code` vocabulary
+//! that winit also uses. They do not name the characters a layout produces:
+//! `KeyW` is the key left of `KeyE` on every layout, which is what movement
+//! bindings want. Text arrives separately, through `InputEvent::TextInput`,
+//! `ImeCommit` and `ImePreedit`.
+//!
+//! In frame terms, `*_held` was down at the start of the frame, and `*_pressed`
+//! and `*_released` changed since the previous frame. A press and a release
+//! inside one frame report both edges, so a short tap is never lost. Operating
+//! system key repeat reports no new press. Motion, scroll and committed text
+//! add up over the frame. The cursor position, modifier state and IME
+//! composition are the latest reported values.
 
 // Standard library
 use std::time::Duration;
@@ -56,7 +63,8 @@ pub const GAMEPAD_SLOT_COUNT: usize = 4;
 /// character drifts while nobody touches the pad.
 pub const GAMEPAD_AXIS_DEADZONE: f32 = 0.05;
 
-/// Words in the key bit set: 256 bits, room for every [`KeyCode`].
+/// Number of 64-bit words in the key bit set. Their 256 bits have room for
+/// every [`KeyCode`].
 const KEY_SET_WORD_COUNT: usize = 4;
 
 // =============================================================================
@@ -274,8 +282,10 @@ impl GamepadButton {
     }
 }
 
-/// A gamepad axis. Sticks range over `-1.0..=1.0` (up and right are positive),
-/// triggers over `0.0..=1.0`.
+/// A gamepad axis.
+///
+/// Stick axes range over `-1.0..=1.0`, with up and right positive. Trigger axes
+/// range over `0.0..=1.0`.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum GamepadAxis {
@@ -360,9 +370,9 @@ pub enum ScrollDelta {
 
 /// The modifier keys' state, as the platform reports it.
 ///
-/// Separate from the physical modifier keys ([`KeyCode::ShiftLeft`] and
-/// friends): a platform folds both shifts, both controls and AltGr into this
-/// one state, which is what shortcut matching wants.
+/// This is separate from the physical modifier keys ([`KeyCode::ShiftLeft`]
+/// and the other modifier codes). A platform merges both shifts, both controls
+/// and AltGr into this one state, which is what shortcut matching needs.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Modifiers {
     /// Whether a shift key is down.
@@ -377,11 +387,13 @@ pub struct Modifiers {
 
 /// One input change, as a frontend reports it.
 ///
-/// Cursor positions and wheel amounts are in physical pixels, and a position is
-/// relative to the top-left corner of the area the game is drawn in. Raw mouse
-/// motion is not: its unit is the device's, and the platform does not scale it.
-/// Committed text and IME pre-edit carry owned strings, so this is not `Copy`;
-/// each event is still plain data, safe to hand across a module boundary.
+/// Cursor positions and wheel amounts are in physical pixels. A cursor position
+/// is measured from the top-left corner of the area the game is drawn in. Raw
+/// mouse motion has no pixel unit: the platform reports it in the device's own
+/// units and does not scale it.
+///
+/// The text variants carry owned strings, so the enum is not `Copy`. Every
+/// event is still plain data, safe to pass across a module boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
     /// A key went down or came up.
@@ -393,9 +405,10 @@ pub enum InputEvent {
     },
     /// A held key repeated, as the operating system reports it.
     ///
-    /// A repeat is not a new press or release: [`Input`] leaves the held and
-    /// edge state alone. Frontends deliver it so text fields and navigation can
-    /// respond to a held key; a game that ignores it sees no change.
+    /// A repeat is not a new press or release. [`Input`] leaves the held and
+    /// edge state alone. Frontends deliver repeats so text fields and
+    /// navigation can respond to a held key. A game that ignores this event
+    /// sees no change.
     KeyRepeat {
         /// Which key.
         key: KeyCode,
@@ -405,8 +418,8 @@ pub enum InputEvent {
         /// The new state, as the platform reports it.
         modifiers: Modifiers,
     },
-    /// Text was committed by typing: one character, or a short run for a key
-    /// that produces several.
+    /// Text committed by typing. Usually one character, or a short run for a
+    /// key that produces several.
     TextInput {
         /// The committed text.
         text: String,
@@ -440,8 +453,9 @@ pub enum InputEvent {
     },
     /// The cursor left the game's area.
     CursorLeft,
-    /// The mouse moved, independent of the cursor: unaccelerated where the
-    /// platform reports it, and not stopped by the window border.
+    /// The mouse moved, separately from the cursor. The movement is
+    /// unaccelerated where the platform reports it that way, and it continues
+    /// when the cursor reaches the window border.
     MouseMotion {
         /// The movement.
         delta: Vector2f,
@@ -451,8 +465,8 @@ pub enum InputEvent {
         /// How far.
         delta: ScrollDelta,
     },
-    /// The game lost keyboard focus: everything held is released, because the
-    /// matching releases will go to someone else.
+    /// The game lost keyboard focus. Everything held is released, because the
+    /// matching release events will go to another window.
     FocusLost,
     /// A gamepad connected and took a slot.
     GamepadConnected {
@@ -523,14 +537,33 @@ impl KeySet {
 }
 
 // =============================================================================
+// GamepadState
+// =============================================================================
+
+/// The state of one gamepad slot.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+struct GamepadState {
+    /// Whether a gamepad holds this slot.
+    connected: bool,
+    /// [`GamepadButton`] bits down at the start of the frame.
+    buttons_held: u32,
+    /// Button bits that went down since the previous frame.
+    buttons_pressed: u32,
+    /// Button bits that came up since the previous frame.
+    buttons_released: u32,
+    /// Latest value per [`GamepadAxis`], after the deadzone.
+    axes: [f32; GamepadAxis::COUNT],
+}
+
+// =============================================================================
 // Edge Tracking
 // =============================================================================
 
 /// A fixed set of button bits, one bit per button.
 ///
-/// Each device kind widens its bits differently - [`KeySet`] words, a `u8` for
-/// the mouse, a `u32` per gamepad - so this trait is the only thing the edge
-/// rule below needs to know about them.
+/// Each device kind stores its bits differently: [`KeySet`] uses 64-bit words,
+/// the mouse uses a `u8`, and each gamepad uses a `u32`. This trait hides those
+/// differences, so the edge rule below can be written once for all of them.
 trait EdgeBits: Copy + Default {
     /// Whether `bit_index` is set.
     fn has(&self, bit_index: u32) -> bool;
@@ -601,65 +634,14 @@ impl EdgeBits for u32 {
     }
 }
 
-/// Applies one button edge.
-///
-/// A press of a bit already held is the operating system's repeat and changes
-/// nothing; a release of a bit that is not held (one already released by
-/// [`InputEvent::FocusLost`]) changes nothing either. Keys, mouse buttons and
-/// gamepad buttons all come through here, so the rule is stated once.
-fn apply_edge<B: EdgeBits>(
-    held: &mut B,
-    pressed: &mut B,
-    released: &mut B,
-    bit_index: u32,
-    state: ButtonState,
-) {
-    match state {
-        ButtonState::Pressed if !held.has(bit_index) => {
-            held.set(bit_index, true);
-            pressed.set(bit_index, true);
-        }
-        ButtonState::Released if held.has(bit_index) => {
-            held.set(bit_index, false);
-            released.set(bit_index, true);
-        }
-        ButtonState::Pressed | ButtonState::Released => {}
-    }
-}
-
-/// Releases every held bit, reporting each as released.
-fn release_edges<B: EdgeBits>(held: &mut B, released: &mut B) {
-    released.merge(*held);
-    *held = B::default();
-}
-
-// =============================================================================
-// GamepadState
-// =============================================================================
-
-/// One slot's gamepad.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-struct GamepadState {
-    /// Whether a gamepad holds this slot.
-    connected: bool,
-    /// [`GamepadButton`] bits down at the start of the frame.
-    buttons_held: u32,
-    /// Button bits that went down since the previous frame.
-    buttons_pressed: u32,
-    /// Button bits that came up since the previous frame.
-    buttons_released: u32,
-    /// Latest value per [`GamepadAxis`], after the deadzone.
-    axes: [f32; GamepadAxis::COUNT],
-}
-
 // =============================================================================
 // Input
 // =============================================================================
 
 /// Keyboard, mouse and gamepad state for the current frame.
 ///
-/// Inserted automatically by the engine; a project never constructs one.
-/// Read it from any system:
+/// The engine inserts this resource automatically, and a project never
+/// constructs one. Read it from any system:
 ///
 /// ```no_run
 /// # use pill_engine::*;
@@ -673,9 +655,9 @@ struct GamepadState {
 /// }
 /// ```
 ///
-/// Every value describes the frame being processed and stays fixed for its
-/// whole duration. Headless runs never receive events, so nothing is held,
-/// nothing accumulates and there is no cursor.
+/// Every value describes the frame being processed and stays fixed for the
+/// whole frame. Headless runs never receive events, so nothing is held,
+/// nothing accumulates, and there is no cursor.
 #[derive(Debug, Default)]
 pub struct Input {
     /// Keys down at the start of the frame.
@@ -698,7 +680,7 @@ pub struct Input {
     /// Text committed since the previous frame: typed characters and IME
     /// commits, in order.
     text_entered: String,
-    /// The IME's active composition text, while one is composing.
+    /// The IME's active composition text, while a composition is in progress.
     ime_preedit: Option<String>,
     /// The composing cursor range within [`Self::ime_preedit`], as byte
     /// offsets, when the platform reports one.
@@ -810,10 +792,11 @@ impl Input {
         self.cursor_position
     }
 
-    /// Mouse movement since the previous frame, in the frontend's raw units:
-    /// the platform reports device motion unscaled.
+    /// Mouse movement since the previous frame, in the frontend's raw units.
+    /// The platform reports device motion without scaling it.
     ///
-    /// Keeps reporting at the window border, so it is the value for mouse-look.
+    /// Motion keeps arriving when the cursor reaches the window border, so this
+    /// is the value to use for mouse-look.
     pub fn mouse_delta(&self) -> Vector2f {
         self.mouse_delta
     }
@@ -866,9 +849,10 @@ impl Input {
 
     /// Ask the frontend to rumble `player`'s gamepad.
     ///
-    /// Strengths are clamped to `0.0..=1.0`. Played after the frame by the
-    /// frontend that owns the gamepads; ignored where there is none (headless,
-    /// the browser) or the gamepad cannot rumble.
+    /// Both strengths are clamped to `0.0..=1.0`. The frontend that owns the
+    /// gamepads plays the request after the frame. It is ignored when no such
+    /// frontend exists (headless, the browser) or when the gamepad cannot
+    /// rumble.
     pub fn request_rumble(&mut self, player: PlayerId, weak: f32, strong: f32, duration: Duration) {
         self.rumble_requests.push(RumbleRequest {
             player,
@@ -878,7 +862,7 @@ impl Input {
         });
     }
 
-    /// Take every rumble request queued so far; the frontend's half of
+    /// Take every rumble request queued so far. This is the frontend's half of
     /// [`Self::request_rumble`].
     pub fn take_rumble_requests(&mut self) -> Vec<RumbleRequest> {
         std::mem::take(&mut self.rumble_requests)
@@ -891,18 +875,19 @@ impl Input {
     /// Queue `event` for the next frame.
     ///
     /// Frontends call this between frames, through
-    /// [`Engine::push_input_event`](crate::engine::Engine::push_input_event).
-    /// A system may also queue events, to simulate input; they take effect
-    /// next frame.
+    /// [`Engine::push_input_event`](crate::engine::Engine::push_input_event). A
+    /// system may also queue events to simulate input. Either way, the events
+    /// take effect on the next frame.
     pub fn push_event(&mut self, event: InputEvent) {
         self.pending_events.push(event);
     }
 
-    /// Start a frame: forget the previous frame's edges and motion, then
-    /// apply every queued event in order.
+    /// Start a frame: forget the previous frame's edges, motion and committed
+    /// text, then apply every queued event in order.
     ///
     /// Called by the engine at the top of each frame, before systems run.
     pub(crate) fn begin_frame(&mut self) {
+        // Step 1: Clear the previous frame's edges, motion and committed text.
         self.keys_pressed = KeySet::default();
         self.keys_released = KeySet::default();
         self.mouse_pressed = 0;
@@ -916,7 +901,8 @@ impl Input {
             gamepad.buttons_released = 0;
         }
 
-        // Taken out and put back so the buffer's capacity is reused.
+        // Step 2: Apply every queued event in order. The buffer is taken out
+        // and put back so its capacity is reused.
         let mut events = std::mem::take(&mut self.pending_events);
         for event in events.drain(..) {
             self.apply_event(event);
@@ -928,7 +914,7 @@ impl Input {
     fn apply_event(&mut self, event: InputEvent) {
         match event {
             InputEvent::Key { key, state } => self.apply_key(key, state),
-            // A repeat is not a new press: the held state is what it was.
+            // A repeat is not a new press. The held state stays as it was.
             InputEvent::KeyRepeat { .. } => {}
             InputEvent::ModifiersChanged { modifiers } => self.modifiers = modifiers,
             InputEvent::TextInput { text } => self.text_entered.push_str(&text),
@@ -957,9 +943,10 @@ impl Input {
                 delta: ScrollDelta::Pixels(delta),
             } => self.scroll_pixels += delta,
             InputEvent::FocusLost => {
-                // A composition cannot survive the focus that owned it, and
-                // the platform stops reporting a modifier state it no longer
-                // feeds; the next report re-establishes both.
+                // A composition cannot outlive the focus that owned it. The
+                // platform also stops reporting modifier state while it has no
+                // focus, so the state is reset. The next report sets both
+                // again.
                 self.modifiers = Modifiers::default();
                 self.ime_preedit = None;
                 self.ime_cursor = None;
@@ -1003,9 +990,11 @@ impl Input {
         }
     }
 
-    /// Apply a key change. A press of a held key is the operating system's
-    /// repeat and changes nothing; a release of a key that is not held (one
-    /// already released by [`InputEvent::FocusLost`]) changes nothing either.
+    /// Apply a key change.
+    ///
+    /// A press of a held key is the operating system's repeat, so nothing
+    /// changes. A release of a key that is not held changes nothing either; it
+    /// may already have been released by [`InputEvent::FocusLost`].
     fn apply_key(&mut self, key: KeyCode, state: ButtonState) {
         apply_edge(
             &mut self.keys_held,
@@ -1032,6 +1021,42 @@ impl Input {
         release_edges(&mut self.keys_held, &mut self.keys_released);
         release_edges(&mut self.mouse_held, &mut self.mouse_released);
     }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Applies one button edge.
+///
+/// A press of a bit that is already held is the operating system's repeat, so
+/// nothing changes. A release of a bit that is not held changes nothing either;
+/// [`InputEvent::FocusLost`] may already have released it. Keys, mouse buttons
+/// and gamepad buttons all come through here, so the rule lives in one place.
+fn apply_edge<B: EdgeBits>(
+    held: &mut B,
+    pressed: &mut B,
+    released: &mut B,
+    bit_index: u32,
+    state: ButtonState,
+) {
+    match state {
+        ButtonState::Pressed if !held.has(bit_index) => {
+            held.set(bit_index, true);
+            pressed.set(bit_index, true);
+        }
+        ButtonState::Released if held.has(bit_index) => {
+            held.set(bit_index, false);
+            released.set(bit_index, true);
+        }
+        ButtonState::Pressed | ButtonState::Released => {}
+    }
+}
+
+/// Releases every held bit, reporting each as released.
+fn release_edges<B: EdgeBits>(held: &mut B, released: &mut B) {
+    released.merge(*held);
+    *held = B::default();
 }
 
 // =============================================================================
@@ -1428,10 +1453,9 @@ mod tests {
 
     /// Keys, mouse buttons and gamepad buttons report the same edge pattern.
     ///
-    /// The three device kinds share one edge rule, so a sequence driven through
-    /// each of them must produce identical press/repeat/release answers: a
-    /// press is one press, a repeat while held is nothing, and the release is
-    /// one release.
+    /// The three device kinds share one edge rule, so the same sequence driven
+    /// through each of them must give the same answers. A press is one press, a
+    /// repeat while held is nothing, and a release is one release.
     #[test]
     fn every_device_kind_reports_the_same_press_repeat_release_pattern() {
         let mut input = Input::new();
@@ -1499,7 +1523,7 @@ mod tests {
             "a repeat leaves every kind held"
         );
 
-        // One release, and the second release of the same button is nothing.
+        // One release. A second release of the same button is not an edge.
         frame(
             &mut input,
             &[

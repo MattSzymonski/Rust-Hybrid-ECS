@@ -1,24 +1,27 @@
-//! Central ECS state container - entities, archetypes, components, and resources.
+//! The world: the engine's central store of entities, archetypes, components
+//! and resources.
 //!
 //! # Responsibilities
 //!
-//! - Declares the [`World`] struct itself: every map and counter the engine's
-//!   state consists of, and the one place they are constructed.
-//! - Manages entity creation, destruction, and ID recycling via a free list.
-//! - Owns all archetypes, including the migration that moves one entity's row
+//! - Declares the [`World`] struct: every map and counter the engine's state
+//!   consists of, and the one place they are constructed.
+//! - Creates and destroys entities, and hands their ids out again through a
+//!   free list.
+//! - Owns every archetype, including the migration that moves one entity's row
 //!   from one archetype to another.
 //!
 //! # Design
 //!
-//! Component types must be registered before use so the world can assign bit
-//! indices for archetype mask matching, and entity destruction recycles IDs
-//! through a free list with generation counters to prevent dangling handles.
+//! A component type has to be registered before it can be used, because the
+//! world gives it a bit index that archetype masks are matched with. Destroying
+//! an entity puts its id back on a free list with a new generation, so an old
+//! handle cannot reach the slot's next occupant.
 //!
-//! One type, several jobs, one `impl` per job: `World` is the engine's
-//! effective API, and its jobs - script dispatch, resource claims, field
-//! reflection - are separable enough to live in their own files of the module
-//! tree below. A child module's `impl World` is the same `impl World` and
-//! reaches the struct's private fields, so the split widens no visibility.
+//! `World` is the API most of the engine talks to, and it has several jobs:
+//! script dispatch, resource claims and field reflection. Each job has a file
+//! of its own below, and each of those files adds its own `impl World`. That
+//! split exposes nothing new, because a child module's `impl World` is the same
+//! implementation and can reach the struct's private fields.
 
 // Standard library
 use std::collections::HashMap;
@@ -44,7 +47,7 @@ use crate::scripting::{ScriptComponent, ScriptContext};
 // Module Tree
 // =============================================================================
 //
-// One file per job, split by responsibility; the module header says why.
+// Each job has its own file; the module header above explains the split.
 
 mod components;
 mod reflection;
@@ -64,90 +67,29 @@ pub use crate::error::{AddComponentError, BuildError, RemoveComponentError, Worl
 // Registration headroom
 // =============================================================================
 
-/// Component-type headroom below which registration warns.
+/// Free component types left below the 128-type ceiling at which registration
+/// starts to warn.
 ///
-/// The 128-type ceiling is shared across a project and every extension,
-/// so it can be exhausted even with few of "your own" types. Warn while there
-/// is still room to act, so exhaustion is visible before it is fatal.
+/// The ceiling is shared by a project and all of its extensions, so a project
+/// with few types of its own can still reach it. The warning fires while there
+/// is still room to react, so the limit shows up before registration starts to
+/// fail.
 const REGISTRATION_HEADROOM_WARNING_THRESHOLD: usize = 16;
-
-// =============================================================================
-// Per-Thread Last-Run Tick (thread-local statics)
-// =============================================================================
-//
-// In parallel mode several systems run on different threads at once, so each
-// needs its own "last ran at tick X" baseline for change-detection filters; a
-// field on `World` would race. The engine's parallel dispatch stores the
-// baseline before a system runs and restores the previous value afterwards, so
-// both overrides are `None` in sequential mode and queries fall back to the
-// shared world fields.
-//
-// The same storage carries each parallel system's "this run" tick: a batch runs
-// every system against one world, so bumping the shared counter there would be
-// an unsynchronized read-modify-write. The engine instead allocates one tick per
-// batch member on the dispatch thread and installs it here.
-//
-// The thread-locals live in `pill_core::system_ticks`, not here: `Query` is
-// generic, so a system's queries read them from the DLL that declares the
-// system, and a copy in this rlib would be per-DLL - a module's systems would
-// never see the scheduler's values.
-
-/// This thread's "my system last ran at tick ___" value; `None` outside a
-/// parallel batch.
-#[inline]
-fn per_thread_last_run_tick() -> Option<Tick> {
-    pill_core::system_ticks::last_run_tick().map(Tick::new)
-}
-
-/// The tick the engine reserved for the system running on this thread;
-/// `None` means "bump the shared counter".
-#[inline]
-fn per_thread_this_run_tick() -> Option<Tick> {
-    pill_core::system_ticks::this_run_tick().map(Tick::new)
-}
-
-/// Whether a size and alignment can describe a foreign resource's allocation.
-///
-/// The predicate both [`World::register_foreign_resource`] and
-/// [`World::relayout_foreign_resource`] need, kept in one place so the two
-/// cannot drift apart: a declaration that passed while its next relayout did
-/// not would leave the world holding a shape it can no longer store.
-fn is_valid_foreign_layout(size: usize, align: usize) -> bool {
-    size != 0
-        && align != 0
-        && align.is_power_of_two()
-        && std::alloc::Layout::from_size_align(size, align).is_ok()
-}
-
-/// Store a per-thread baseline tick, returning the old value so the
-/// caller can restore it when the system finishes (RAII-style).
-#[inline]
-pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> {
-    pill_core::system_ticks::replace_last_run_tick(value.map(Tick::get)).map(Tick::new)
-}
-
-/// Store the tick reserved for the system about to run on this thread,
-/// returning the old value so the caller can restore it afterwards.
-#[inline]
-pub(crate) fn set_per_thread_this_run_tick(value: Option<Tick>) -> Option<Tick> {
-    pill_core::system_ticks::replace_this_run_tick(value.map(Tick::get)).map(Tick::new)
-}
 
 // =============================================================================
 // EntityLocation
 // =============================================================================
 
-/// Tracks where an entity is stored in the archetype system.
+/// Where one entity is stored: its archetype and its row in that archetype.
 ///
 /// Maps an [`Entity`] handle to the [`Archetype`] that owns its component
-/// columns plus the row index within that archetype. Updated on every entity
-/// creation, migration, and destruction so that random-access component
-/// lookups stay O(1).
+/// columns, plus the row in that archetype. The world updates it on every
+/// creation, migration and destruction, so a lookup by handle stays O(1).
 #[derive(Clone, Copy)]
 pub(crate) struct EntityLocation {
     /// The archetype that currently stores the entity's components.
     pub(crate) archetype_id: ArchetypeId,
-    /// Row of the entity inside its archetype's parallel columns.
+    /// Row of the entity in the archetype, shared by all of its columns.
     pub(crate) index_in_archetype: usize,
 }
 
@@ -155,15 +97,17 @@ pub(crate) struct EntityLocation {
 // IteratorTimings
 // =============================================================================
 
-/// Shared state for per-label iterator timing feedback.
+/// Timing data for parallel iterators, grouped by label and shared between
+/// them.
 ///
-/// Every label is an owned copy. A label is usually a string literal of the
-/// module whose system ran the iterator, and the world outlives that module's
-/// DLL: a borrowed `&'static str` kept here would point into an image the
-/// reload graveyard unmaps, and the next comparison against it would read
-/// unmapped memory.
+/// Every label is an owned `String`. A label is usually a string literal from
+/// the module whose system ran the iterator, and the world outlives that
+/// module's DLL. A borrowed `&'static str` stored here would point into memory
+/// that hot reload unmaps, and the next comparison against it would read
+/// memory that is no longer mapped.
 pub(crate) struct IteratorTimings {
-    /// Per-label splitting hint duration (ns), ~32-frame average.
+    /// Average time in nanoseconds each label's iterator run took, over about
+    /// the last 32 frames. Parallel iterators use it as their splitting hint.
     pub per_iterator_label_average_duration: std::collections::HashMap<String, u64>,
     /// Labels visited in the current frame. Cleared each frame.
     pub visited_iterator_labels: Vec<String>,
@@ -182,34 +126,38 @@ impl IteratorTimings {
     }
 }
 
-/// What a shared resource name was claimed with.
+/// The declaration that claimed a shared resource name.
 ///
-/// Recorded per shared [`ResourceId`] so a second claim can be checked against
-/// the first: the same type arriving from another artifact is the case the
-/// feature exists for, while a different type claiming one name is a collision.
+/// The world records one of these for each shared [`ResourceId`], so it can
+/// compare a second claim with the first. The same type arriving twice is the
+/// case shared resources exist for; a different type claiming the name is a
+/// collision.
 #[derive(Debug, Clone)]
 pub struct SharedResourceClaim {
     /// The shared name the claiming type declared.
     pub shared_name: String,
-    /// Name of the recorded declarer: a Rust type's final path segment, or a
-    /// managed full name for a declaration from another language.
+    /// The name of the type that recorded the declaration.
+    ///
+    /// For a Rust type this is the last segment of its path; for another
+    /// language it is the full managed name.
     pub declaring_type: String,
     /// Whether the recorded declaration came from another language.
     ///
-    /// Such a claim carries no Rust type name to compare against, so the name
-    /// check applies only between two Rust declarations - see
+    /// A declaration from another language has no Rust type name, so the world
+    /// compares names only between two Rust declarations - see
     /// [`World::claim_shared_resource`].
     pub foreign: bool,
     /// Size in bytes the claiming type declared.
     pub size: usize,
     /// Alignment in bytes the claiming type declared.
     pub align: usize,
-    /// Structural hash of the claiming type's layout, when one is available.
+    /// A structural hash of the claiming type's layout, when it has one.
     ///
-    /// Foreign declarations carry theirs from the manifest; Rust declarations
-    /// carry whatever [`Resource::shared_schema_hash`] answers, which defaults
-    /// to `None`. Compared only when both sides have one, so the check is
-    /// extra evidence rather than a new requirement.
+    /// A declaration from another language brings the hash in its manifest. A
+    /// Rust type gets whatever [`Resource::shared_schema_hash`] returns, which
+    /// defaults to `None`. The world compares the two hashes only when both
+    /// sides have one, so the check adds evidence instead of a new
+    /// requirement.
     pub schema_hash: Option<u64>,
 }
 
@@ -219,9 +167,9 @@ pub struct SharedResourceClaim {
 
 /// One live entity and the type names of the components attached to it.
 ///
-/// Returned by [`World::entity_rows`] for the editor's Hierarchy list. The
-/// names are stable across hot reloads; the [`Entity`] handle is the stable
-/// selection identity.
+/// [`World::entity_rows`] returns these for the editor's Hierarchy list. The
+/// type names and the [`Entity`] handle stay the same across hot reloads, which
+/// makes the handle a stable selection identity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntityRow {
     /// The live entity handle, generation-tagged.
@@ -230,19 +178,19 @@ pub struct EntityRow {
     pub components: Vec<String>,
 }
 
-/// One component's field list, in the two forms the world needs.
+/// One component's list of fields, held in the two forms the world needs.
 ///
-/// Native components submit a `&'static` slice from their declaring artifact's
-/// static data; components defined by another language describe themselves in a
-/// runtime manifest, so their layout is owned by the `World`. The difference is
-/// storage, not meaning, so each form lives in a `Cow`.
+/// A native component hands over a `&'static` slice from the static data of the
+/// artifact that declares it. A component defined by another language describes
+/// its fields in a manifest at runtime, so the world owns that list. The two
+/// differ only in where the list is stored, so both use a `Cow`.
 ///
-/// The list is kept twice because the two readers want different things: the
-/// **declared** fields are what a generated mirror (the C# struct) has to
-/// describe, while the **editor** view flattens `struct:` fields into one dotted
-/// leaf row per channel (`position.x`), which makes a nested colour editable row
-/// by row but describes no declaration a mirror could emit. Both views are the
-/// same slice when nothing needed flattening.
+/// The list is kept twice because two readers want different things. The
+/// **declared** fields are what a generated mirror such as the C# struct has to
+/// describe. The **editor** view flattens `struct:` fields into one dotted row
+/// per leaf field (`position.x`), so a nested colour can be edited field by
+/// field; that view describes no declaration a mirror could emit. When nothing
+/// needed flattening, the two views are the same slice.
 #[derive(Debug, Clone)]
 pub(crate) struct ComponentFieldLayout {
     /// The fields exactly as the declaring artifact registered them.
@@ -252,7 +200,8 @@ pub(crate) struct ComponentFieldLayout {
 }
 
 impl ComponentFieldLayout {
-    /// Wrap a compile-time layout living in the declaring artifact's static data.
+    /// Wraps a layout that lives in the declaring artifact's static data and
+    /// needs no flattening.
     pub(crate) fn from_static(
         fields: &'static [crate::component_registry::ComponentFieldDescriptor],
     ) -> Self {
@@ -262,7 +211,7 @@ impl ComponentFieldLayout {
         }
     }
 
-    /// Wrap a compile-time layout whose editor view needed flattening.
+    /// Wraps a layout whose editor view was flattened into extra rows.
     pub(crate) fn from_expanded(
         declared: &'static [crate::component_registry::ComponentFieldDescriptor],
         editor: Vec<crate::component_registry::ComponentFieldDescriptor>,
@@ -273,11 +222,11 @@ impl ComponentFieldLayout {
         }
     }
 
-    /// Wrap a runtime-described layout owned by the world (foreign-language
-    /// components and resources).
+    /// Wraps a layout that another language described at runtime and the world
+    /// owns.
     ///
-    /// Nothing flattens these: a manifest describes fields it wants seen as
-    /// they are, so the two views are one list.
+    /// Nothing is flattened here. A manifest lists its fields the way it wants
+    /// them seen, so both views hold the same list.
     pub(crate) fn from_owned(
         fields: Vec<crate::component_registry::ComponentFieldDescriptor>,
     ) -> Self {
@@ -298,12 +247,13 @@ impl ComponentFieldLayout {
     }
 }
 
-/// Manages all entities, archetypes, and resources in the ECS.
+/// Holds all entities, archetypes and resources of the ECS.
 ///
-/// The central hub of the engine. It allocates entity IDs with generation
-/// counters, owns the archetype storage for every component combination,
-/// tracks entity-to-archetype locations, stores singleton resources, and
-/// maintains the component type registry used to build archetype storage.
+/// This is the centre of the engine. It hands out entity ids together with
+/// their generation, owns the archetype storage for every component
+/// combination, tracks the archetype and row each entity lives in, stores
+/// singleton resources, and keeps the component registry that archetype
+/// storage is built from.
 pub struct World {
     // --- Entity allocation and locations ---
     /// Next fresh entity ID handed out when the free list is empty.
@@ -311,13 +261,14 @@ pub struct World {
     /// Free list of recycled entity IDs, each with the generation it will be
     /// handed out with. Stored as (id, generation) pairs.
     pub(crate) free_entity_ids: Vec<(u64, u32)>,
-    /// Stable id of every live entity, by its handle.
+    /// The stable id of every live entity, keyed by its handle.
     ///
-    /// World metadata rather than a component: it is one row per entity the
-    /// archetypes would otherwise have to carry through every move, and no
-    /// query ever needs it as data.
+    /// This is world data, not a component. Keeping it here means the
+    /// archetypes do not have to carry a row for it through every migration,
+    /// and no query needs the id as component data.
     entity_ids: HashMap<Entity, EntityId>,
-    /// Reverse of [`Self::entity_ids`], so a saved reference resolves in O(1).
+    /// Reverse of [`Self::entity_ids`], so a saved reference finds its entity
+    /// in O(1).
     entity_handles: HashMap<EntityId, Entity>,
     /// Seeds the counter-derived ids used when the platform has no random
     /// source; see [`Self::mint_entity_id`].
@@ -325,227 +276,249 @@ pub struct World {
     // --- Archetypes, columns and entity locations ---
     /// All archetypes in the world
     pub(crate) archetypes: HashMap<ArchetypeId, Archetype>,
-    /// Tracks where each entity is located in the archetype system
+    /// The archetype and row each entity lives in.
     pub(crate) entity_locations: HashMap<Entity, EntityLocation>,
     /// Storage factories for creating component storage by component id
     pub(crate) storage_factories: HashMap<ComponentId, StorageFactory>,
-    /// The native function table each id held before its latest registration
-    /// replaced it.
+    /// The native function table each component id had before its latest
+    /// registration replaced it.
     ///
-    /// The in-place migration consumes columns that still hold the *old*
-    /// layout's values, so it has to release them through the glue that wrote
-    /// them; by the time it runs, `rehome_native_columns` has already stamped
-    /// the arriving generation's table onto every column.
-    /// `register_component_inner` records the outgoing table here so the
-    /// migration can put it back for the removal that drops those rows.
+    /// A migration that runs in place still holds rows written with the *old*
+    /// layout, so it must release them through the code that wrote them. By
+    /// the time it runs, `rehome_native_columns` has already written the
+    /// arriving generation's table onto every column. `register_component_inner`
+    /// saves the outgoing table here, so the migration can restore it for the
+    /// removal that drops those rows.
     pub(crate) retired_native_storage_ops: HashMap<ComponentId, crate::archetype::ColumnOps>,
-    /// Script updaters for calling update() on script components
+    /// Updaters that call `update()` on each script component.
     script_updaters: HashMap<ComponentId, scripting::ScriptUpdater>,
     // --- Component registry ---
     /// Component registry for bit indices and names
     pub(crate) component_registry: ComponentRegistry,
-    // --- Resources (the five per-id record maps are swept together by
-    //     `remove_resource_records`, and the stored value itself is taken by the
-    //     caller; `resource_claim_counts` is owned by `release_resource_claims`
-    //     and `resource_registration_sequence` is a world-wide counter) ---
-    /// Resources (singleton data) stored by type.
+    // --- Resources ---
+    //
+    // `remove_resource_records` clears the five per-id maps below in one place;
+    // the stored value itself is removed by its caller. `resource_claim_counts`
+    // belongs to `release_resource_claims`, and `resource_registration_sequence`
+    // is one counter for the whole world.
+    /// The singleton resources, stored by id.
     ///
-    /// [`ErasedResource`] rather than `Box<dyn Any>`: a trait object carries
-    /// its destructor in a vtable belonging to the artifact that created the
-    /// value, and resources are never cleared on reload, so retiring a module
-    /// that owned one would leave that destructor pointing into an unmapped
-    /// image. The erased box holds a replaceable function table instead - the
-    /// same discipline component columns already use.
+    /// The values are [`ErasedResource`], not `Box<dyn Any>`. A trait object
+    /// carries its destructor in a vtable that belongs to the artifact which
+    /// created the value. Resources are never cleared on reload, so retiring
+    /// the module that owned one would leave that destructor pointing into
+    /// unmapped memory. The erased box holds a replaceable function table
+    /// instead, the same approach component columns already use.
     pub(crate) resources: HashMap<ResourceId, ErasedResource>,
-    /// Per-resource change-detection ticks (parallel to `resources`).
+    /// Change-detection ticks for each resource, keyed the same as `resources`.
     pub(crate) resource_ticks: HashMap<ResourceId, ComponentTicks>,
-    /// Latest per-type function table registered for each resource id.
+    /// The most recent function table registered for each resource id.
     ///
-    /// The counterpart of `storage_factories` for components, and what
-    /// [`Self::rehome_resources`] refreshes live resources from. Written by
-    /// [`Self::insert_resource`] and [`Self::register_resource`], so a
-    /// generation that re-registers a type without re-inserting its value
-    /// still contributes a table pointing at code that is mapped.
+    /// This is the resource equivalent of `storage_factories` for components.
+    /// [`Self::rehome_resources`] uses it to update live resources. Both
+    /// [`Self::insert_resource`] and [`Self::register_resource`] write it, so a
+    /// generation that registers a type again without inserting its value
+    /// still leaves a table whose code is mapped.
     pub(crate) resource_factories: HashMap<ResourceId, ErasedResourceOps>,
-    /// Declared field layout of each foreign resource, when its declarer sent
-    /// one.
+    /// The declared field layout of each foreign resource that sent one.
     ///
-    /// The resource twin of `component_field_layouts`, and kept for the same
-    /// reason: a foreign resource's bytes are opaque without it, so the editor
-    /// and any reader that wants named fields has nothing to go on. It is
-    /// separate from `resource_factories` because a layout is optional - a
-    /// resource registered without one still works, it just is not
-    /// inspectable.
+    /// This is the resource counterpart of `component_field_layouts`. A foreign
+    /// resource's bytes mean nothing without its layout, so the editor and any
+    /// other reader that wants named fields need it. It is separate from
+    /// `resource_factories` because a layout is optional: a resource registered
+    /// without one still works, it just cannot be inspected.
     pub(crate) resource_field_layouts: HashMap<ResourceId, ComponentFieldLayout>,
-    /// For each shared resource id, the Rust type that claimed it and the
+    /// For each shared resource id, the declaration that claimed it and the
     /// layout it declared.
     ///
-    /// Only shared ids appear here: an ordinary resource is identified by its
-    /// `TypeId`, so a second claim on the same id is by definition the same
-    /// type. Mirrors what `ComponentRegistry` records for shared components.
+    /// Only shared ids are listed. An ordinary resource is identified by its
+    /// `TypeId`, so a second claim on the same id is always the same type. This
+    /// is what `ComponentRegistry` records for shared components.
     pub(crate) shared_resource_claims: HashMap<ResourceId, SharedResourceClaim>,
-    /// Monotonic counter stamped onto each resource registration.
+    /// Counter that goes up by one with every resource registration.
     pub(crate) resource_registration_sequence: u64,
-    /// Most recent registration sequence stamped for each resource id.
+    /// The most recent registration sequence recorded for each resource id.
     ///
-    /// The resource twin of the component registration log, and needed for the
-    /// same reason: `resource_factories` accumulates and never forgets, so it
-    /// cannot distinguish "registered by the generation now running" from
-    /// "registered by a generation since retired". One entry per id, not per
-    /// registration, because `insert_resource` is the replace path - a stamp
-    /// per replacement would grow for the process lifetime and every reload
-    /// diff would scan and sort it.
+    /// The resource counterpart of the component registration log, and needed
+    /// for the same reason: `resource_factories` only ever grows, so it cannot
+    /// tell a table registered by the current generation from one registered
+    /// by a generation that has since retired. There is one entry per id rather
+    /// than one per registration, because `insert_resource` replaces a value: a
+    /// record per replacement would grow for the life of the process, and every
+    /// reload diff would scan and sort it.
     pub(crate) resource_registration_stamps: HashMap<ResourceId, u64>,
-    /// How many subjects currently claim each resource id.
+    /// How many claimants each resource id currently has.
     ///
-    /// A shared id can be registered *by name* from more than one subject -
-    /// the project and a module, say - and `drop_resources` is how one of them
-    /// retires what its generation stopped registering. Without this count the
-    /// first subject to retire the id destroys a value the other still uses,
-    /// claim and all. Ids with no entry are dropped unconditionally.
+    /// More than one claimant can register a shared id by name - the project
+    /// and a module, for example. `drop_resources` is how one of them retires
+    /// what its generation stopped registering. Without this count, the first
+    /// claimant to retire the id would destroy a value another one still uses.
+    /// Ids with no entry are dropped unconditionally.
     pub(crate) resource_claim_counts: HashMap<ResourceId, u32>,
     // --- Per-frame bookkeeping ---
-    /// Monotonically increasing world tick used for change detection.
+    /// Counter used for change detection; it only ever goes up.
     ///
-    /// Bumped once per frame by the [`Engine`](crate::engine::Engine), once per
-    /// member when a parallel batch reserves its ticks, and by each query that
-    /// supports change tracking when its iteration begins.
-    /// Stored as a plain `u32` and compared with wrapping arithmetic
-    /// ([`Tick::is_newer_than`](crate::component::Tick::is_newer_than)), so a
-    /// wrap is harmless.
+    /// The [`Engine`](crate::engine::Engine) adds one to it once per frame. A
+    /// parallel batch adds one for each of its members when it reserves their
+    /// ticks, and each query that tracks changes adds one when it starts
+    /// iterating. The value is a plain `u32` compared with wrapping arithmetic
+    /// ([`Tick::is_newer_than`](crate::component::Tick::is_newer_than)), so
+    /// wrapping around is harmless.
     pub(crate) change_tick: u32,
-    /// Last-run tick for the system that is currently fetching its
-    /// parameters from this world.
+    /// The tick at which the system fetching parameters from this world last
+    /// ran.
     ///
-    /// The [`Engine`](crate::engine::Engine) sets this immediately before
-    /// invoking each system so that change-detection filters
-    /// (e.g. `Changed<T>`, `Added<T>`) constructed inside the system
-    /// compare against the correct baseline. Defaults to `0`, meaning
-    /// "since the beginning of time" - useful for ad-hoc queries that are
-    /// not driven by the engine.
+    /// The [`Engine`](crate::engine::Engine) sets it right before it calls a
+    /// system, so change filters built inside the system, such as `Changed<T>`
+    /// and `Added<T>`, compare against the right point in time. It starts at
+    /// `0`, which means "since the beginning", so an ad-hoc query that no
+    /// system drives still sees everything.
     pub(crate) system_last_run: u32,
 
-    /// Monotonically incrementing generation counter. Bumped whenever
-    /// an archetype is added or removed.  Queries use this to cache
-    /// matching archetype lists - if the generation hasn't changed,
-    /// the cached list is still valid. Solely optimization reasons.
+    /// Counter that goes up by one whenever an archetype is added or removed.
+    ///
+    /// Queries cache the list of archetypes that match them and compare this
+    /// counter on each run: if it has not changed, the cached list is still
+    /// correct. It exists only to save that work.
     pub(crate) archetype_generation: u64,
 
-    /// Debug-only: resources with an active mutable borrow, so a scheduler bug
-    /// that hands two systems `&mut` to one resource is caught. Cleared at the
-    /// start of every frame by the [`Engine`](crate::engine::Engine).
+    /// Debug builds only: resources that currently have a mutable borrow.
     ///
-    /// Behind a mutex because the systems of one parallel batch each rebuild
-    /// `&mut World` from the same pointer and run concurrently: their resource
-    /// ids are disjoint, but a `HashSet` is not safe to mutate concurrently
-    /// whatever the keys are.
+    /// A scheduler bug that hands `&mut` for one resource to two systems is
+    /// caught here. The [`Engine`](crate::engine::Engine) clears the set at the
+    /// start of every frame.
     ///
-    /// A `std` mutex, never `parking_lot`: this `World` is shared by the host
-    /// and every loaded artifact, each linking its own copy of `pill_engine`
-    /// and with it its own `parking_lot`, whose table of parked threads is per
-    /// copy - an unlock running another copy's code never finds the parked
-    /// thread. `std` is one shared library, and on Windows its mutex waits on
-    /// the lock's own address, so a wakeup reaches the waiter whichever
-    /// artifact unlocks.
+    /// It sits behind a mutex because the systems of one parallel batch each
+    /// rebuild `&mut World` from the same pointer and run at the same time.
+    /// Their resource ids never overlap, but a `HashSet` is not safe to modify
+    /// from several threads whatever its keys are.
+    ///
+    /// The mutex must come from `std`, never from `parking_lot`. The host and
+    /// every loaded DLL share this `World`, and each one links its own copy of
+    /// `pill_engine` and with it its own `parking_lot`, whose list of parked
+    /// threads belongs to that copy alone. An unlock running in another copy's
+    /// code would look in its own list and never find the waiting thread. `std`
+    /// is a single shared library, and on Windows its mutex waits on the lock's
+    /// own address, so a wakeup reaches the waiting thread whichever DLL unlocks
+    /// it.
     #[cfg(debug_assertions)]
     pub(crate) debug_resource_write_locks: std::sync::Mutex<std::collections::HashSet<ResourceId>>,
 
-    /// Number of deferred commands the most recent flush took off the queue.
-    /// Set by `CommandQueue::execute_queued_commands`, read by the Engine for Tracy plots.
+    /// How many deferred commands the most recent flush took off the queue.
+    ///
+    /// `CommandQueue::execute_queued_commands` sets it, and the Engine reads it
+    /// for its Tracy plots.
     pub(crate) commands_executed_this_frame: usize,
 
-    /// Per-label splitting hint execution timing for parallel iterators.
-    /// Keyed by the `label()` string set on each `ParQueryIter`.
-    /// Shared via `Arc` so iterators can read/write without a raw
-    /// World pointer - the `Mutex` handles concurrent access from
-    /// systems in the same engine batch.
+    /// How long each labelled parallel iterator took, keyed by the string its
+    /// `label()` returns.
+    ///
+    /// It is shared through an `Arc` so iterators can read and write it without
+    /// a raw `World` pointer. The `Mutex` handles concurrent access from the
+    /// systems of one engine batch.
     pub(crate) iterator_timings: std::sync::Arc<std::sync::Mutex<IteratorTimings>>,
 
     // --- Persistence registries ---
-    /// Per-component-type serialize fn for snapshotting (persistence module).
+    /// Serializer for each component type, used when taking a snapshot.
     pub(crate) persist_serializers: HashMap<ComponentId, crate::persistence::SerializeComponentFn>,
-    /// Per-type-name deserialize fn for restoring (persistence module).
+    /// Deserializer for each type name, used when restoring a snapshot.
     pub(crate) persist_deserializers: HashMap<String, crate::persistence::DeserializeComponentFn>,
-    /// Per-component-type insert fn for pushing Box<dyn Component> into storage.
+    /// Inserter for each component type: pushes a `Box<dyn Component>` into
+    /// storage.
     pub(crate) persist_inserters: HashMap<ComponentId, crate::persistence::InsertComponentFn>,
-    /// Per-type-name schema hash for persistable components.
+    /// Schema hash for each persistable component, keyed by type name.
     pub(crate) persist_schema_hashes: HashMap<String, u64>,
-    /// Monotonic counter bumped on every persistable registration, letting the
-    /// host enumerate exactly which types one module's `init` registered.
+    /// Counter that goes up by one on every persistable registration, so the
+    /// host can list exactly which types one module's `init` registered.
     pub(crate) persist_registration_sequence: u64,
-    /// Chronological `(type_name, sequence)` log of persistable registrations.
+    /// Log of persistable registrations in order, as `(type_name, sequence)`
+    /// pairs.
     pub(crate) persist_registration_log: Vec<(String, u64)>,
-    /// Type names the host announced as superseded for the init pass that is
-    /// about to run, so a reloaded generation may replace its predecessor's
-    /// persist entries instead of being refused as a concurrent peer.
+    /// Type names the host marked as superseded for the init pass about to
+    /// run.
+    ///
+    /// A reloaded generation may then replace the persist entries of the
+    /// generation before it, instead of being refused as a second claimant.
     pub(crate) superseded_persist_names: std::collections::HashSet<String>,
-    /// The subset of those names whose predecessor was already stale: built
-    /// against a layout another subject has since replaced. A registration of
-    /// one of them in a layout other than the registered one is skipped
-    /// instead of re-laying the component out again.
+    /// The subset of those names whose earlier generation was already stale,
+    /// because it was built against a layout something else has since
+    /// replaced.
+    ///
+    /// A registration of one of these in any layout but the registered one is
+    /// skipped, so the component is not laid out a second time.
     pub(crate) stale_superseded_persist_names: std::collections::HashSet<String>,
 
-    /// Per-resource serialize fn for snapshotting, keyed by the live id.
+    /// Serializer for each resource, used when taking a snapshot and keyed by
+    /// the live id.
     ///
-    /// Keyed by id rather than name because the serializer has to find the
-    /// value, and a value is stored under its id. Its twin below is keyed by
-    /// name because a restore starts from a snapshot entry, which carries a
-    /// name and never an id.
+    /// It is keyed by id rather than name because the serializer has to find
+    /// the value, and values are stored under their id. The restorer below is
+    /// keyed by name instead, because a restore starts from a snapshot entry,
+    /// which carries a name and never an id.
     pub(crate) persist_resource_serializers:
         HashMap<ResourceId, crate::persistence::SerializeResourceFn>,
-    /// Per-name restore fn for rebuilding a resource out of snapshot bytes.
+    /// Restorer for each name: rebuilds a resource from snapshot bytes.
     pub(crate) persist_resource_restorers: HashMap<String, crate::persistence::RestoreResourceFn>,
     /// The persistence name each registered resource id was recorded under.
     pub(crate) persist_resource_names: HashMap<ResourceId, String>,
-    /// Per-name schema hash for persistable resources, so a reload can tell a
+    /// Schema hash for each persistable resource, so a reload can tell a
     /// reshaped resource from an unchanged one.
     pub(crate) persist_resource_schema_hashes: HashMap<String, u64>,
-    /// Stale shared-component readers already reported, as (component,
-    /// declared hash), so a query rebuilt every frame logs its refusal once.
+    /// Shared-component readers already reported as stale, as `(component,
+    /// declared hash)` pairs, so a query that is rebuilt every frame logs its
+    /// refusal only once.
     pub(crate) reported_schema_mismatches: Vec<(ComponentId, u64)>,
     // --- Component registration log and field layouts ---
-    /// Monotonic counter bumped on every component registration (plain or
-    /// persistable), letting the host enumerate which types one module's
-    /// `init` registered at all — the distinction between a type that was
-    /// dropped entirely and one merely downgraded to a plain component.
-    pub(crate) component_registration_sequence: u64,
-    /// Chronological `(type_name, component_id, sequence)` log of every
-    /// component registration, plain and persistable alike.
-    pub(crate) component_registration_log: Vec<(String, ComponentId, u64)>,
-    /// Field layouts submitted by `#[derive(PillComponent)]` (static, living
-    /// in the declaring artifact) or described at runtime by a foreign-language
-    /// manifest (owned). Consumed by the C# mirror codegen and the editor's
-    /// generic inspector. Re-registered by each reloaded generation; a
-    /// descriptor manifest replaces rather than accumulates.
+    /// Counter that goes up by one on every component registration, plain or
+    /// persistable.
     ///
-    /// A native layout is recorded with its nested `struct:` fields expanded
-    /// into dotted leaf rows (`World::record_component_field_layout`), so a
-    /// nested colour or vector is editable channel by channel.
+    /// The host uses it to list every type that one module's `init` registered
+    /// at all, which shows whether a type was dropped or only downgraded to a
+    /// plain component.
+    pub(crate) component_registration_sequence: u64,
+    /// Log of every component registration, plain and persistable alike, in
+    /// order, as `(type_name, component_id, sequence)` triples.
+    pub(crate) component_registration_log: Vec<(String, ComponentId, u64)>,
+    /// The field layout of each component, as its declaring artifact submitted
+    /// it or as another language described it.
+    ///
+    /// A `#[derive(PillComponent)]` layout is static and lives in the declaring
+    /// artifact. A layout from a manifest is created at runtime and owned by the
+    /// world. The C# mirror codegen and the editor's generic inspector read
+    /// these layouts. Each reloaded generation records them again, and a
+    /// descriptor manifest replaces its entry instead of adding to it.
+    ///
+    /// A native layout is stored with its nested `struct:` fields expanded into
+    /// dotted leaf rows (`World::record_component_field_layout`), so a nested
+    /// colour or vector can be edited one channel at a time.
     pub(crate) component_field_layouts: HashMap<ComponentId, ComponentFieldLayout>,
-    /// The asset type each `Handle<T>` field of a component references, by
-    /// field name: the registered name of `T`. Owned copies, since
-    /// the names come from module code; re-recorded by each generation's
-    /// registration.
+    /// The asset type each `Handle<T>` field of a component refers to, keyed by
+    /// field name and holding the registered name of `T`.
+    ///
+    /// The names are owned copies because they come from module code. Each
+    /// generation's registration records them again.
     pub(crate) asset_field_types: HashMap<ComponentId, HashMap<String, String>>,
-    /// Finds a `#[derive(PillMirror)]` value type's layout while a layout is
-    /// recorded, so its nested fields expand. Installed by the facade's
-    /// `register_all_components` for the duration of its loop, and `None`
-    /// otherwise: the value types belong to the registering DLL, and a
-    /// resolver left installed would point into it after it unloads.
+    /// Looks up the layout of a `#[derive(PillMirror)]` value type while another
+    /// layout is being recorded, so its nested fields can be expanded.
+    ///
+    /// The facade's `register_all_components` installs it for the length of its
+    /// loop and leaves it `None` at all other times. The value types belong to
+    /// the DLL that registers them, and a resolver left in place would point
+    /// into that DLL after it unloads.
     pub(crate) value_type_layout_resolver:
         Option<crate::component_registry::ValueTypeLayoutResolver>,
-    /// First registration failure of the current init pass, if any.
+    /// The first registration failure of the current init pass, if any.
     ///
-    /// Set when the 128-type ceiling is hit, when any other registry error
-    /// surfaces during `register_component`, and when a shared resource claim
-    /// or a persistable registration is refused. The artifact-wide registration
-    /// loop drains it so the generated `init` can fail the reload
-    /// transactionally instead of running with a half-registered component set.
+    /// It is set when the 128-type ceiling is reached, when another registry
+    /// error comes out of `register_component`, and when a shared resource claim
+    /// or a persistable registration is refused. The registration loop of one
+    /// artifact takes it out at the end, so the generated `init` can fail the
+    /// whole reload instead of running with only half its components registered.
     registration_error: Option<WorldError>,
 }
 
 impl World {
-    /// Create a new empty World
+    /// Creates an empty world.
     pub fn new() -> Self {
         Self {
             next_fresh_entity_id: 0,
@@ -596,13 +569,13 @@ impl World {
         }
     }
 
-    /// Reserve capacity for at least `additional` more entities.
+    /// Reserves room for at least `additional` more entities.
     ///
-    /// Pre-allocates internal data structures to avoid reallocation
-    /// overhead when creating many entities in a batch. Call this
-    /// before a loop that calls `create_entity()` for best performance.
+    /// The internal maps are grown now, so creating many entities in a row does
+    /// not have to grow them again. Call it before a loop that calls
+    /// `create_entity()`.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```no_run
     /// # use pill_engine::*;
@@ -621,19 +594,20 @@ impl World {
         self.entity_locations.reserve(additional);
     }
 
-    /// Return one archetype-sized entity chunk for language bindings.
+    /// Returns the entities of the archetype at `chunk_index`, for language
+    /// bindings.
     ///
-    /// Entity chunks enumerate every archetype and provide the driver for
-    /// `EntityTerm` and queries containing only optional component terms.
+    /// Entity chunks let a binding walk every archetype in turn. They drive
+    /// `EntityTerm` and queries whose component terms are all optional.
     pub fn entity_chunk(&self, chunk_index: usize) -> Option<(ArchetypeId, &[Entity])> {
         let archetype = self.archetypes.values().nth(chunk_index)?;
         Some((archetype.id, archetype.entities.as_slice()))
     }
 
-    /// Return one already-known archetype's entity column.
+    /// Returns the entity column of an archetype the caller already knows.
     ///
-    /// The archetype-scoped twin of [`Self::entity_chunk`], used by language
-    /// bindings that identified the archetype through a driver chunk.
+    /// This is [`Self::entity_chunk`] for a known archetype, used by language
+    /// bindings that found the archetype through a driver chunk.
     pub fn entity_chunk_in_archetype(
         &self,
         archetype_id: ArchetypeId,
@@ -644,24 +618,32 @@ impl World {
 
     /// Entity slots waiting to be handed out again.
     ///
-    /// The engine's own retirement pool: a slot here belongs to no live entity,
-    /// but it is kept so a later spawn reuses it rather than growing the ID
-    /// space. A destroyed slot comes back with the next generation; one
-    /// released before its entity was inserted keeps its own.
+    /// The engine keeps these slots so a later creation reuses an id instead of
+    /// growing the id space. A slot whose entity was destroyed comes back with
+    /// the next generation; a slot released before its entity was inserted
+    /// keeps its own.
     pub fn recycled_entity_id_count(&self) -> usize {
         self.free_entity_ids.len()
     }
 
-    /// Create an entity consisting entirely of runtime-defined components.
+    /// Creates an entity from components that are defined at runtime.
+    ///
+    /// Each entry pairs a component id with the bytes of one value.
     ///
     /// # Errors
     ///
     /// Returns [`WorldError::DescriptorEntityEmpty`] if `components` is empty,
-    /// [`WorldError::DescriptorDuplicateComponent`] if a component appears more
-    /// than once, [`WorldError::DescriptorComponentNotRegistered`] if a
-    /// component was never registered, and
-    /// [`WorldError::DescriptorByteLengthMismatch`] if a byte payload does not
-    /// match its registered layout size.
+    /// [`WorldError::DescriptorDuplicateComponent`] if an id appears more than
+    /// once, [`WorldError::DescriptorComponentNotRegistered`] if a component was
+    /// never registered, and [`WorldError::DescriptorByteLengthMismatch`] if a
+    /// payload does not match its registered layout size.
+    ///
+    /// Writing the payloads afterwards can only fail on a world invariant that
+    /// no longer holds: [`WorldError::EntityNotFound`],
+    /// [`WorldError::DescriptorComponentMissing`],
+    /// [`WorldError::ColumnRowsAreNotPlainData`] and
+    /// [`WorldError::DescriptorRowInvalid`]. The checks above rule all four out
+    /// before the entity is created.
     pub fn create_descriptor_entity(
         &mut self,
         components: &[(ComponentId, Vec<u8>)],
@@ -686,11 +668,11 @@ impl World {
             }
         }
 
-        // Step 2: Insert the entity through the shared append ritual, which
+        // Step 2: Insert the entity with the shared code that appends a row. It
         // grows one zeroed row per descriptor column and stamps the arrival
-        // tick, then write each payload into its row. The pre-flight pass above
-        // rules out a missing column and a wrong payload size, so a payload
-        // write can only fail on a world invariant that no longer holds.
+        // tick. Then write each payload into its row; the checks above rule out
+        // a missing column and a wrong payload size, so a write can only fail
+        // on a world invariant that no longer holds.
         let entity = self.allocate_entity();
         self.insert_entity_with_components(entity, component_ids, None, |_| {});
         for (id, bytes) in components {
@@ -699,19 +681,21 @@ impl World {
         Ok(entity)
     }
 
-    /// Check if an entity exists and is valid (not destroyed/recycled)
+    /// Returns whether an entity is alive.
     ///
-    /// Returns true if the entity exists in the world with the correct generation.
-    /// Returns false if the entity was destroyed or if its ID was recycled with a new generation.
+    /// True when the world holds the entity with that exact generation. False
+    /// when it was destroyed, or when its slot was reused with a new
+    /// generation.
     #[must_use]
     pub fn is_entity_valid(&self, entity: Entity) -> bool {
         self.entity_locations.contains_key(&entity)
     }
 
-    /// Allocate a new unique entity ID
+    /// Takes the next entity handle.
     ///
-    /// Reuses IDs from the free list when available, incrementing the generation
-    /// to invalidate any stale handles. Otherwise allocates a fresh ID.
+    /// It reuses a slot from the free list when one is there, with the
+    /// generation stored for it, so old handles to the slot stay invalid.
+    /// Otherwise it takes an id that was never used.
     pub(crate) fn allocate_entity(&mut self) -> Entity {
         let _zone = crate::profile_scope!(
             "allocate entity",
@@ -740,22 +724,22 @@ impl World {
         }
     }
 
-    /// Reserve a generation-checked handle for a deferred entity creation.
+    /// Reserves a handle for an entity a command will create later.
     ///
-    /// The returned entity is not visible to queries until a command inserts
-    /// it. This is the type-erased counterpart of [`Commands::create_entity`],
-    /// used by language bindings, the editor and the renderer to hold a handle
-    /// before the entity exists.
+    /// The handle carries a generation like any other, but no query can see the
+    /// entity until something inserts it. This is the type-erased counterpart
+    /// of [`Commands::create_entity`]. Language bindings, the editor and the
+    /// renderer use it to hold a handle before the entity exists.
     pub fn reserve_entity(&mut self) -> Entity {
         self.allocate_entity()
     }
 
     /// The stable id of a live entity, or `None` once it is destroyed.
     ///
-    /// A handle names a slot; an [`EntityId`] names the entity itself and is
-    /// what data written for a later run stores. Both indexes are dropped
-    /// together when the entity is destroyed, so an id stops resolving with
-    /// its entity and never names a later occupant of the slot.
+    /// A handle names a slot in the world. An [`EntityId`] names the entity
+    /// itself, which is what data saved for a later run stores. Destroying an
+    /// entity removes both entries, so the id stops working together with its
+    /// entity and never points at the next occupant of the slot.
     #[must_use]
     pub fn entity_id(&self, entity: Entity) -> Option<EntityId> {
         self.entity_ids.get(&entity).copied()
@@ -773,14 +757,14 @@ impl World {
         self.entity_handles.contains_key(&id)
     }
 
-    /// A fresh id for a newly inserted entity.
+    /// Makes a fresh id for an entity that is about to be inserted.
     ///
-    /// Random, so an id says nothing about the order entities were spawned in
-    /// and a stale reference names nothing rather than a later occupant. Four
-    /// attempts cover a collision; after that - or when the platform has no
-    /// random source at all - the fallback derives an id from a counter and
-    /// logs a warning, because a world that cannot spawn is worse than one
-    /// whose ids are predictable.
+    /// The id is random, so it says nothing about the order entities were
+    /// created in, and a stale reference points at nothing instead of at a
+    /// later entity. Four attempts are enough to avoid a collision. After that,
+    /// or when the platform has no random source at all, the id is derived from
+    /// a counter and a warning is logged: a world that cannot create entities
+    /// is worse than one with predictable ids.
     fn mint_entity_id(&mut self) -> EntityId {
         for _ in 0..4 {
             match EntityId::random() {
@@ -801,23 +785,23 @@ impl World {
         id
     }
 
-    /// Return a reserved entity handle that was never created.
+    /// Gives back a reserved handle that never became an entity.
     ///
-    /// The handle must have come from [`Self::reserve_entity`] and must not
-    /// have been inserted into any archetype. Releasing an entity that is
-    /// visible to queries would allow its id to be handed out again with a
-    /// conflicting generation.
+    /// The handle must come from [`Self::reserve_entity`] and must not have
+    /// been inserted into an archetype. Releasing an entity that queries can
+    /// see would let its id be handed out again under a different generation,
+    /// while the old entity still exists.
     pub fn release_entity(&mut self, entity: Entity) {
         self.free_entity_ids.push((entity.id, entity.generation));
     }
 
-    /// Recycle the slot of a create the command flush refused.
+    /// Recycles the slot of a create that the command flush refused.
     ///
-    /// Unlike [`Self::release_entity`], the handle this takes had already been
-    /// handed out, so the slot comes back with the next generation - the rule
-    /// [`Self::destroy_entity`] follows - and a handle the caller kept cannot
-    /// name whatever occupies the slot next. A slot at `u32::MAX` is retired
-    /// rather than wrapped, for the reason given there.
+    /// Unlike [`Self::release_entity`], this handle had already been given out,
+    /// so the slot goes back with the next generation, the same rule
+    /// [`Self::destroy_entity`] follows. A handle the caller kept then cannot
+    /// point at whatever uses the slot next. A slot at `u32::MAX` is retired
+    /// instead of wrapping; see there for why.
     pub(crate) fn recycle_refused_entity(&mut self, entity: Entity) {
         if entity.generation != u32::MAX {
             self.free_entity_ids
@@ -825,10 +809,11 @@ impl World {
         }
     }
 
-    /// Get or create an archetype for a given set of components
+    /// Finds the archetype for a component set, creating it if it is new.
     ///
-    /// Archetypes are cached and reused for entities with the same component set.
-    /// The lookup uses ComponentMask for O(1) hash lookup, avoiding repeated sorting.
+    /// Archetypes are reused by every entity with the same component set. The
+    /// lookup goes through the `ComponentMask`, so it is a single hash lookup
+    /// and does not sort the ids again.
     pub(crate) fn get_or_create_archetype(
         &mut self,
         component_ids: Vec<ComponentId>,
@@ -837,8 +822,8 @@ impl World {
             "get or create archetype",
             [("Component types in archetype: {}", component_ids.len())]
         );
-        // Build component mask first - this is used for the fast lookup path
-        // The mask uniquely identifies the component set regardless of order
+        // Build the component mask first; it is what the fast lookup uses. The
+        // mask identifies the component set whatever order the ids arrive in.
         let mut component_mask = ComponentMask::empty();
         for component_id in &component_ids {
             if let Some(bit) = self.component_registry.get_bit(component_id) {
@@ -850,14 +835,14 @@ impl World {
         // identifies the component set, so no separate lookup table is needed.
         let archetype_id = ArchetypeId(component_mask.bits());
 
-        // Hot path: archetype already exists (most common case).
+        // Hot path: the archetype already exists, which is the common case.
         //
-        // A hit is trusted on the strength of the bit-release rule: a bit only
-        // returns to the pool once every archetype carrying it has been
-        // dropped, so the cached component set cannot be a different one. The
-        // assertion holds that invariant here if the release path is ever
-        // bypassed - the mask *is* the id, so an alias would serve the wrong
-        // columns with no other symptom.
+        // The hit is trusted because of how bits are released: a bit goes back
+        // to the pool only after every archetype that carries it has been
+        // dropped, so the cached component set cannot belong to a different
+        // set. The assertion below checks that rule here in case the release
+        // path is ever bypassed. It matters because the mask is the id, so an
+        // alias would serve the wrong columns and nothing else would show it.
         if let Some(existing) = self.archetypes.get(&archetype_id) {
             debug_assert!(
                 existing.component_types.len() == component_ids.len()
@@ -869,7 +854,8 @@ impl World {
             return archetype_id;
         }
 
-        // Cold path: create new archetype (only sort when actually creating)
+        // Cold path: create a new archetype, sorting the ids only now that one
+        // is needed.
         let mut sorted_component_ids = component_ids;
         sorted_component_ids.sort();
 
@@ -893,9 +879,10 @@ impl World {
         archetype_id
     }
 
-    /// Start building a new entity
+    /// Starts building a new entity.
     ///
-    /// Returns an EntityBuilder that allows fluent API for adding components.
+    /// Returns an [`EntityBuilder`] to add components to and then insert the
+    /// entity.
     pub fn create_entity(&'_ mut self) -> EntityBuilder<'_> {
         let entity = self.allocate_entity();
         EntityBuilder {
@@ -910,23 +897,24 @@ impl World {
         }
     }
 
-    /// Insert an entity with its components into the appropriate archetype
+    /// Adds an entity and its components to the archetype for that component
+    /// set.
     ///
-    /// `stable_id` is the id the creator supplied, or `None` to mint a fresh
-    /// one. The caller that supplies an id has already checked it is free;
-    /// the command path always passes `None`.
+    /// `stable_id` is the id the caller chose, or `None` to make a fresh one. A
+    /// caller that passes an id has already checked that it is free; the command
+    /// path always passes `None`.
     ///
-    /// Note: the archetype's columns are type-erased, so pushing a component
-    /// still needs its concrete type. Components are added via EntityBuilder,
-    /// which has access to those types.
+    /// The archetype's columns are type-erased, so pushing a component needs its
+    /// concrete type. That is why components arrive through `insert_fn`, which
+    /// [`EntityBuilder`] fills in with the types it captured.
     ///
     /// # Panics
     ///
-    /// Panics in a debug build when `component_ids` repeats an id. Each caller
-    /// refuses that before it gets here - the builder and the deferred command
-    /// executor both return a duplicate-component error, and
-    /// `create_descriptor_entity` de-duplicates - so this only names the state
-    /// the archetype's one-column-per-id addressing cannot survive.
+    /// Panics in a debug build when `component_ids` repeats an id. Every caller
+    /// refuses that first - the builder and the deferred command executor both
+    /// return a duplicate-component error, and `create_descriptor_entity`
+    /// removes duplicates - so this names the one state that the archetype's
+    /// one-column-per-id addressing cannot survive.
     pub(crate) fn insert_entity_with_components<F>(
         &mut self,
         entity: Entity,
@@ -969,7 +957,6 @@ impl World {
         // component's concrete value into its column.
         archetype.entities.push(entity);
 
-        // Use the provided closure to insert components with their concrete types
         insert_fn(&mut archetype.component_storages);
 
         // Step 3: Type-erased components have no concrete Rust value for
@@ -982,13 +969,13 @@ impl World {
                 continue;
             }
             if let Some(column) = archetype.component_storages.get_mut(component_id) {
-                // The layout reached storage only after validation, so this
-                // can fail only after pushing roughly 2^60 rows of one
-                // component: out of address space rather than out of layout.
-                // The fallible paths - `move_entity_to_archetype` and
-                // `relayout_descriptor_component` - hand the error back instead;
-                // this one returns nothing, so it names the one state it
-                // cannot survive.
+                // The layout was checked before it reached storage, so this can
+                // only fail after roughly 2^60 rows of one component have been
+                // pushed: it would run out of address space first. The fallible
+                // paths - `move_entity_to_archetype` and
+                // `relayout_descriptor_component` - return that error to their
+                // caller instead; this function returns nothing, so a panic is
+                // the only report it can give.
                 column
                     .push_zeroed()
                     .expect("descriptor column growth cannot exhaust the address space");
@@ -996,7 +983,7 @@ impl World {
         }
 
         // Step 4: Stamp the arrival tick on the row every column just grew by.
-        // A column carries its own ticks, so the row is already there; what it
+        // The column stores its own ticks, so the row exists; the one thing it
         // cannot know is which tick the world is on.
         for &component_id in &archetype.component_types {
             if let Some(column) = archetype.component_storages.get_mut(component_id) {
@@ -1013,41 +1000,41 @@ impl World {
             },
         );
 
-        // Step 6: give the entity its stable id, indexed both ways. The id is
-        // minted here rather than when the handle was reserved, so a handle
-        // that is reserved and never inserted costs nothing.
+        // Step 6: Give the entity its stable id and index it in both directions.
+        // The id is minted here rather than when the handle was reserved, so a
+        // handle that is reserved and never inserted costs nothing.
         let stable_id = stable_id.unwrap_or_else(|| self.mint_entity_id());
         self.entity_ids.insert(entity, stable_id);
         self.entity_handles.insert(stable_id, entity);
     }
 
-    /// Move an entity to a new archetype, carrying every component it keeps.
+    /// Moves an entity to another archetype, keeping every component it keeps.
     ///
-    /// Every column the two archetypes share is moved bitwise: the row's bytes
-    /// travel to the destination and the source releases them without running
-    /// drop glue, because ownership went with the bytes. There is one lane for
-    /// every component, native or descriptor - a component holding a `Vec` pays
-    /// a pointer copy rather than a deep clone followed by a deep drop, and no
-    /// `Clone` impl runs during what the engine calls a relocation.
+    /// Each column the two archetypes share moves bitwise: the row's bytes go
+    /// to the destination, and the source gives up the row without running drop
+    /// glue, because ownership moved with the bytes. There is one path for every
+    /// component, native or descriptor, so a component holding a `Vec` costs a
+    /// pointer copy instead of a deep clone followed by a deep drop. No `Clone`
+    /// impl runs during what the engine calls a relocation.
     ///
-    /// `attach` fills the columns the destination has and the source does not,
-    /// which is exactly the component being added, or nothing for a removal. It
-    /// runs before the carried rows move, because that is the only part of the
-    /// migration that can still fail: a refusal there costs nothing but the
-    /// entity's place in the destination's list, while one afterwards would
+    /// `attach` fills the columns that the destination has and the source does
+    /// not, which is exactly the component being added, or nothing for a
+    /// removal. It runs before any row moves, because it is the only part of the
+    /// migration that can still fail. A refusal there costs only the entity's
+    /// place in the destination's list; a failure after the rows moved would
     /// leave rows in two archetypes at once.
     ///
     /// # Errors
     ///
     /// Returns [`WorldError::EntityNotFound`] when the entity has no location
-    /// record, [`WorldError::ArchetypeMissing`] when either the source or the
-    /// destination archetype is absent from the world,
+    /// record, [`WorldError::ArchetypeMissing`] when the source or the
+    /// destination archetype is missing from the world,
     /// [`WorldError::DescriptorStorageMissing`] when a component named by an
     /// archetype has no storage column - the desync a partially applied hot
-    /// reload can leave behind - [`WorldError::DescriptorSizeMismatch`] when
-    /// two columns claiming one component id disagree on their row width, and
-    /// whatever `attach` reports. Every one of them is raised before the first
-    /// row moves, so a refused migration leaves the entity where it was.
+    /// reload can leave behind - [`WorldError::DescriptorSizeMismatch`] when two
+    /// columns for one component id disagree on their row width, and whatever
+    /// `attach` returns. Every one of these is raised before the first row
+    /// moves, so a refused migration leaves the entity where it was.
     pub(crate) fn move_entity_to_archetype<F>(
         &mut self,
         entity: Entity,
@@ -1065,7 +1052,7 @@ impl World {
                 new_component_ids.len()
             )]
         );
-        // Step 1: Resolve where the entity currently lives.
+        // Step 1: Find where the entity currently lives.
         let old_location = match self.entity_locations.get(&entity) {
             Some(location) => *location,
             None => return Err(WorldError::EntityNotFound),
@@ -1074,11 +1061,12 @@ impl World {
         let old_archetype_id = old_location.archetype_id;
         let old_index = old_location.index_in_archetype;
 
-        // Step 2: Get or create the destination archetype and bail out if
-        // the entity already lives there.
+        // Step 2: Get or create the destination archetype, and stop here if the
+        // entity already lives in it.
         let new_archetype_id = self.get_or_create_archetype(new_component_ids);
 
-        // If same archetype, nothing to do (shouldn't happen for add_component)
+        // The same archetype means there is nothing to do. Adding a component
+        // should never end up here.
         if old_archetype_id == new_archetype_id {
             warn!(
                 target: pill_core::telemetry::telemetry_target::ECS,
@@ -1089,11 +1077,10 @@ impl World {
             return Ok(());
         }
 
-        // Step 3: Take the source archetype out of the map for the duration of
-        // the move. Moving a row needs `&mut` on both archetypes at once, which
-        // the borrow checker cannot express through one `HashMap`; owning one
-        // of them outright states the aliasing rule instead of leaving it to
-        // the caller.
+        // Step 3: Take the source archetype out of the map while the move runs.
+        // Moving a row needs `&mut` on both archetypes at once, and the borrow
+        // checker cannot express that through one `HashMap`. Owning one of them
+        // outright makes the aliasing rule explicit here.
         let Some(mut old_archetype) = self.archetypes.remove(&old_archetype_id) else {
             return Err(WorldError::ArchetypeMissing {
                 entity,
@@ -1101,9 +1088,9 @@ impl World {
             });
         };
 
-        // Step 4: Move the row. Every step that can refuse runs in the helper
-        // below, against the archetype it was handed, so this one exit accounts
-        // for the source whatever the helper returns.
+        // Step 4: Move the row. Every check that can refuse runs in the helper
+        // below, which has the source archetype in hand, so this single exit
+        // point puts the source back whatever the helper returns.
         let outcome = self.move_row_into_destination(
             &mut old_archetype,
             entity,
@@ -1112,10 +1099,10 @@ impl World {
             attach,
         );
 
-        // Step 5: Account for the source archetype. A move that succeeded and
-        // emptied it drops it, so its columns do not hold allocations for a
-        // component set nothing uses; every other exit - a refusal, or rows
-        // still in it - puts it back exactly as it was found.
+        // Step 5: Put the source archetype back, or drop it. A move that
+        // succeeded and left it empty drops it, so its columns do not keep memory
+        // for a component set nothing uses. Every other exit - a refusal, or
+        // rows still in it - puts it back exactly as it was found.
         if outcome.is_ok() && old_archetype.entities.is_empty() {
             self.archetype_generation = self.archetype_generation.wrapping_add(1);
         } else {
@@ -1125,20 +1112,21 @@ impl World {
         outcome
     }
 
-    /// Move one entity's row into `new_archetype_id`.
+    /// Moves one entity's row into the archetype `new_archetype_id`.
     ///
-    /// Split out of [`Self::move_entity_to_archetype`], which removed the source
-    /// archetype from the world first: a refusal here returns freely because the
-    /// caller accounts for that archetype at its single exit, not here.
+    /// This is part of [`Self::move_entity_to_archetype`], which has already
+    /// taken the source archetype out of the world. A refusal can return
+    /// immediately because the caller puts that archetype back at its single
+    /// exit, not here.
     ///
     /// # Errors
     ///
     /// Returns [`WorldError::ArchetypeMissing`] when the destination archetype
-    /// is absent, [`WorldError::DescriptorStorageMissing`] when a component named
-    /// by an archetype has no storage column - the desync a partially applied hot
-    /// reload can leave behind - [`WorldError::DescriptorSizeMismatch`] when two
-    /// columns claiming one component id disagree on their row width, and
-    /// whatever `attach` reports.
+    /// is missing, [`WorldError::DescriptorStorageMissing`] when a component
+    /// named by an archetype has no storage column - the desync a partially
+    /// applied hot reload can leave behind -
+    /// [`WorldError::DescriptorSizeMismatch`] when two columns for one component
+    /// id disagree on their row width, and whatever `attach` returns.
     fn move_row_into_destination<F>(
         &mut self,
         old_archetype: &mut Archetype,
@@ -1150,16 +1138,16 @@ impl World {
     where
         F: FnOnce(&mut ComponentColumns) -> Result<(), WorldError>,
     {
-        // Step 1: Verify the destination and reserve its rows before anything
-        // moves. A component the destination archetype has no column for is the
-        // manifest/storage desync `DescriptorStorageMissing` reports, and two
-        // columns claiming one id at different widths is the reload equivalent;
-        // finding both here is what keeps a failed migration atomic, because the
-        // destination would otherwise already hold part of the entity's row
-        // while the source still holds the entity. The reservation is here for
-        // the same reason: afterwards no carried row can fail to land. Nothing
-        // has moved when this refuses, so the caller's restored archetype is the
-        // world exactly as this was handed over.
+        // Step 1: Check that the destination can take the row and reserve its
+        // space before anything moves. A component the destination has no column
+        // for is the manifest/storage desync that `DescriptorStorageMissing`
+        // reports, and two columns for one id at different widths is its reload
+        // equivalent. Finding both here keeps a failed migration atomic:
+        // otherwise the destination would already hold part of the row while the
+        // source still holds the entity. Reserving the space here has the same
+        // reason, because afterwards no carried row can fail to land. Nothing
+        // has moved when this refuses, so the archetype the caller puts back is
+        // the world exactly as it was handed over.
         Self::prepare_destination_columns(
             &mut self.archetypes,
             old_archetype,
@@ -1208,15 +1196,15 @@ impl World {
                 break;
             }
         }
-        // Unreachable after Step 1: the widths agree, the row exists and every
-        // destination column has room. The caller reports the broken invariant
-        // instead of the move being swallowed.
+        // Unreachable after Step 1: the widths agree, the row exists, and every
+        // destination column has room. If it happens anyway, the caller reports
+        // the broken invariant instead of the move failing silently.
         carried_result?;
 
-        // Stamp the arrival tick on the component this migration attached.
-        // A carried row brought its ticks with it - they are part of the row
-        // the destination column took - so a component the source had needs
-        // nothing here.
+        // Stamp the arrival tick on the component this migration added. A
+        // carried row brought its own ticks along, because they are part of the
+        // row the destination column took, so a component the source already had
+        // needs nothing here.
         let current_tick = Tick::new(self.change_tick);
         for &component_id in &new_archetype.component_types {
             if old_archetype.component_storages.contains(component_id) {
@@ -1227,9 +1215,9 @@ impl World {
             }
         }
 
-        // Every destination column grew by exactly one row. A miss means
-        // `attach` left a column it was responsible for short a row, which is
-        // the desync Step 4 rules out for every other cause.
+        // Every destination column grew by exactly one row. A miss means `attach`
+        // left a column it was responsible for one row short, which is the desync
+        // Step 1 rules out for every other cause.
         debug_assert_eq!(
             new_archetype.entities.len(),
             new_index + 1,
@@ -1253,16 +1241,16 @@ impl World {
             },
         );
 
-        // Step 3: Remove the entity from the old archetype with swap_remove for
-        // O(1) removal. A carried column was already swap-removed by the move
-        // that took its row, so what is left is the entity list and the columns
-        // the destination did not take - the components this migration drops,
-        // which are the only rows that still need releasing.
+        // Step 3: Remove the entity from the old archetype with `swap_remove`,
+        // which is O(1). A carried column already had its row removed by the
+        // move that took it, so what is left is the entity list and the columns
+        // the destination did not take. Those columns hold the components this
+        // migration drops, and they are the only rows still to release.
         if old_index < old_archetype.entities.len() {
-            // The columns first, while the destination is still reachable:
-            // whether it has a column for a component is the same condition the
-            // move above branched on, so it is what tells a carried column
-            // apart from a dropped one.
+            // Remove the columns first, while the destination is still
+            // reachable. Whether it has a column for a component is the same
+            // condition the move above branched on, so it tells a carried
+            // column apart from a dropped one.
             let destination_columns = self
                 .archetypes
                 .get(&new_archetype_id)
@@ -1291,23 +1279,23 @@ impl World {
         Ok(())
     }
 
-    /// Check that the destination archetype can host the entity's row, and
-    /// reserve the space it needs, before the migration moves anything.
+    /// Checks that the destination archetype can hold the entity's row, and
+    /// reserves the space it needs, before the migration moves anything.
     ///
-    /// Split out of [`Self::move_entity_to_archetype`] so the destination can
-    /// be borrowed mutably while the source archetype - already out of the map
-    /// by then - is borrowed immutably beside it.
+    /// This is part of [`Self::move_entity_to_archetype`]. It is separate so the
+    /// destination can be borrowed mutably while the source archetype, already
+    /// out of the map by then, is borrowed immutably beside it.
     ///
     /// # Errors
     ///
     /// Returns [`WorldError::ArchetypeMissing`] when the destination archetype
-    /// is absent, [`WorldError::DescriptorStorageMissing`] when it names a
+    /// is missing, [`WorldError::DescriptorStorageMissing`] when it names a
     /// component it has no column for, [`WorldError::DescriptorSizeMismatch`]
     /// when a carried column's row width disagrees with the destination's,
     /// [`WorldError::DescriptorRowInvalid`] when the entity's recorded row is
     /// not in a carried column, and [`WorldError::DescriptorLayoutInvalid`]
-    /// when a column cannot grow. Nothing is moved in any case; a reservation
-    /// that already succeeded only grows a buffer, which no reader observes.
+    /// when a column cannot grow. Nothing moves in any case; a reservation that
+    /// already succeeded only grows a buffer, which no reader can observe.
     fn prepare_destination_columns(
         archetypes: &mut HashMap<ArchetypeId, Archetype>,
         old_archetype: &Archetype,
@@ -1326,13 +1314,13 @@ impl World {
         let component_type_ids: &[ComponentId] = &new_archetype.component_types;
         for &component_id in component_type_ids {
             let source = old_archetype.component_storages.get(component_id);
-            // A component both archetypes name but the source has no column for
-            // cannot be carried, and nothing else would write it, so the
+            // A component both archetypes name, but the source has no column
+            // for, cannot be carried, and nothing else would write it, so the
             // destination would end the migration one row short. That is the
-            // desync a partially applied reload leaves behind, and it is the
-            // one shape of it this migration cannot route around - unlike a
-            // component being dropped, whose missing column simply has nothing
-            // left to release.
+            // desync a partially applied reload leaves behind, and this
+            // migration cannot work around this shape of it. A component being
+            // dropped is different: its missing column simply has nothing left
+            // to release.
             if source.is_none() && old_archetype.component_types.contains(&component_id) {
                 return Err(WorldError::DescriptorStorageMissing {
                     component_id,
@@ -1358,10 +1346,10 @@ impl World {
         Ok(())
     }
 
-    /// Remove an entity from the world completely
+    /// Removes an entity from the world completely.
     ///
-    /// This removes the entity from its archetype and updates all tracking structures.
-    /// Returns true if the entity was found and removed, false otherwise.
+    /// The entity leaves its archetype and every tracking structure is updated.
+    /// Returns `true` if the entity was found and removed, `false` otherwise.
     #[must_use]
     pub fn destroy_entity(&mut self, entity: Entity) -> bool {
         let _zone = crate::profile_scope!(
@@ -1401,22 +1389,22 @@ impl World {
                 }
             }
 
-            // Also swap_remove from all component storages. A column releases
-            // its own change ticks with the row, so this is one pass rather
-            // than two. `component_types` and `component_storages` are separate
-            // fields - Rust's split-borrow allows the shared slice alongside
-            // mutable access to the columns - so no clone is needed.
+            // Also swap_remove the entity's row from every column. A column
+            // releases its own change ticks together with the row, so one pass
+            // is enough. Rust's split borrow lets the shared `component_types`
+            // slice be read while the columns are borrowed mutably, so the ids
+            // do not have to be cloned.
             let component_type_ids: &[ComponentId] = &archetype.component_types;
             for component_id in component_type_ids {
                 if let Some(column) = archetype.component_storages.get_mut(*component_id) {
                     column.swap_remove_discard(old_index);
                 } else {
                     // A component with no column has no data to remove, so
-                    // skipping is safe. The missing column is the
-                    // manifest/storage desync reported by
-                    // `WorldError::DescriptorStorageMissing`; report rather
-                    // than panic, because this runs inside `process_frame`
-                    // for managed projects.
+                    // skipping it is safe. The missing column is the
+                    // manifest/storage desync that
+                    // `WorldError::DescriptorStorageMissing` reports. It is
+                    // logged rather than panicked on, because this runs inside
+                    // `process_frame` for managed projects.
                     warn!(
                         target: pill_core::telemetry::telemetry_target::ECS,
                         component_id = ?component_id,
@@ -1435,14 +1423,14 @@ impl World {
             self.archetype_generation = self.archetype_generation.wrapping_add(1);
         }
 
-        // Step 4: Recycle the entity ID with an incremented generation so
-        // the ID can be reused while stale handles are invalidated.
+        // Step 4: Put the entity id back with the next generation, so the slot
+        // can be used again while old handles to it stop working.
         //
         // A slot whose generation has reached `u32::MAX` is retired instead of
-        // wrapping back to zero: wrapping would resurrect every stale handle
-        // from 2^32 recycles ago - the classic ABA failure. Retirement is
-        // effectively unreachable in practice (2^32 recycles of one slot), but
-        // it is cheap to make the wrap impossible rather than silent.
+        // wrapping back to zero. Wrapping would make every handle from 2^32
+        // recycles ago valid again, which is the classic ABA problem. It is not
+        // reachable in practice, but it is cheap to make the wrap impossible
+        // instead of silent.
         if entity.generation != u32::MAX {
             self.free_entity_ids
                 .push((entity.id, entity.generation + 1));
@@ -1451,10 +1439,11 @@ impl World {
         true
     }
 
-    /// Remove all empty archetypes from the world
+    /// Removes every archetype that has no entities left.
     ///
-    /// This cleans up archetypes that no longer contain any entities.
-    /// Usually not necessary as empty archetypes can be reused, but useful for memory cleanup.
+    /// This is rarely needed, because an empty archetype is reused when an
+    /// entity with the same component set appears again. It is useful when the
+    /// memory its columns hold should be given back.
     pub fn cleanup_empty_archetypes(&mut self) {
         let empty_archetype_ids: Vec<ArchetypeId> = self
             .archetypes
@@ -1481,16 +1470,17 @@ impl World {
         self.entity_locations.len()
     }
 
-    /// Iterate every archetype in the world, for read-only column access.
+    /// Iterates over every archetype in the world, for read-only column
+    /// access.
     ///
-    /// The narrow seam an out-of-crate renderer needs. Collecting drawable
-    /// entities means walking each archetype's columns, and `archetypes` is
-    /// crate-private so the ECS internals cannot be mutated from outside. This
-    /// hands out `&Archetype` only: the map itself, and every mutation path on
-    /// it, stays sealed in this crate.
+    /// This is the narrow opening a renderer outside this crate needs. Finding
+    /// the entities to draw means reading each archetype's columns, and
+    /// `archetypes` is crate-private so nothing outside can change the ECS
+    /// internals. It hands out `&Archetype` only; the map itself and every way
+    /// of changing it stay sealed in this crate.
     ///
-    /// Pairs with [`World::component_registry`], which resolves the columns
-    /// found here by stable type name and size.
+    /// It goes together with [`World::component_registry`], which finds the
+    /// columns seen here by stable type name and size.
     #[inline]
     pub fn archetypes_iter(&self) -> impl Iterator<Item = &Archetype> {
         self.archetypes.values()
@@ -1507,11 +1497,11 @@ impl Default for World {
 // ComponentInserter
 // =============================================================================
 
-/// Type-erased interface for pushing a single component value into storage.
+/// Type-erased way to push one component value into storage.
 ///
-/// `EntityBuilder` boxes one `ComponentInserter` per `.with(...)` call so
-/// that the concrete component type is captured without the builder itself
-/// being generic over every possible component.
+/// `EntityBuilder` boxes one `ComponentInserter` for each `.with(...)` call.
+/// That way the concrete component type is captured, and the builder itself
+/// does not have to be generic over every component type.
 trait ComponentInserter {
     /// Push the captured component value into the given storage.
     fn insert(self: Box<Self>, storage: &mut ComponentColumns);
@@ -1519,7 +1509,8 @@ trait ComponentInserter {
     fn component_id(&self) -> ComponentId;
 }
 
-/// Implementation of [`ComponentInserter`] that captures a concrete component type.
+/// The [`ComponentInserter`] implementation that holds one concrete component
+/// type.
 struct TypedComponentInserter<T: Component> {
     /// The component value to insert when the entity is built.
     component: T,
@@ -1539,13 +1530,13 @@ impl<T: Component> ComponentInserter for TypedComponentInserter<T> {
 // EntityBuilder
 // =============================================================================
 
-/// Builder for constructing entities with components using a fluent API.
+/// Builds an entity by adding one component at a time.
 ///
-/// Returned by [`World::create_entity`]. Components are added with
-/// [`with`](Self::with) and the entity is inserted into the world when
-/// [`build`](Self::build) is called.
+/// [`World::create_entity`] returns one. Add components with
+/// [`with`](Self::with), then insert the entity into the world with
+/// [`build`](Self::build).
 ///
-/// # Example
+/// # Examples
 ///
 /// ```
 /// # use pill_engine::*;
@@ -1573,17 +1564,18 @@ pub struct EntityBuilder<'w> {
 }
 
 impl<'w> EntityBuilder<'w> {
-    /// Build the entity with an id the caller already chose.
+    /// Builds the entity with an id the caller already chose.
     ///
-    /// What a scene load does: the id written in the file has to be the id the
-    /// loaded entities carry, or every reference inside the scene would dangle.
-    /// [`build`](Self::build) refuses an id a live entity already holds.
+    /// A scene load uses this: the id written in the file has to be the id the
+    /// loaded entities carry, or every reference inside the scene would point at
+    /// nothing. [`build`](Self::build) refuses an id that a live entity already
+    /// holds.
     pub fn with_id(mut self, id: EntityId) -> Self {
         self.stable_id = Some(id);
         self
     }
 
-    /// Add a component to the entity being built
+    /// Adds a component to the entity being built.
     pub fn with<T>(mut self, component: T) -> Self
     where
         T: Component,
@@ -1593,15 +1585,15 @@ impl<'w> EntityBuilder<'w> {
         self
     }
 
-    /// Finish building and insert the entity into the world.
+    /// Finishes the build and inserts the entity into the world.
     ///
     /// # Errors
     ///
-    /// Returns [`BuildError::ComponentNotRegistered`] if any of the component
-    /// types added via [`.with()`](Self::with) were not registered with the
-    /// world beforehand, [`BuildError::DuplicateComponent`] when one type was
-    /// added more than once, and [`BuildError::DuplicateEntityId`] when the id
-    /// given to [`with_id`](Self::with_id) belongs to a live entity.
+    /// Returns [`BuildError::ComponentNotRegistered`] when a component type
+    /// added with [`.with()`](Self::with) was not registered with the world
+    /// first, [`BuildError::DuplicateComponent`] when one type was added more
+    /// than once, and [`BuildError::DuplicateEntityId`] when the id given to
+    /// [`with_id`](Self::with_id) already belongs to a live entity.
     pub fn build(self) -> Result<Entity, BuildError> {
         let mut component_ids: Vec<ComponentId> = self
             .component_inserters
@@ -1615,12 +1607,11 @@ impl<'w> EntityBuilder<'w> {
         let entity = self.entity;
 
         // Refuse a repeated id before the row exists. The set defines the
-        // archetype's columns, so a second value of one type would grow one
-        // column by two rows for one entity row: the archetype panics on the
-        // repeated column when it is being created, and when it is already
-        // cached it accepts both and leaves every later entity reading the row
-        // before its own. The deferred path refuses the same way in
-        // `commands::execute_create_entity`.
+        // archetype's columns, so a second value of one type would add two rows to
+        // one column for one entity row. A new archetype panics on the repeated
+        // column, and a cached one accepts both values and leaves every later
+        // entity reading the row before its own. The deferred path refuses the same
+        // way in `commands::execute_create_entity`.
         component_ids.sort_unstable();
         if let Some(duplicate) = component_ids
             .windows(2)
@@ -1640,9 +1631,9 @@ impl<'w> EntityBuilder<'w> {
             }
         }
 
-        // A supplied id has to be free: two live entities under one id would
-        // make a saved reference ambiguous, and the reverse index keeps only
-        // one of them.
+        // A supplied id has to be free. Two live entities under one id would make a
+        // saved reference ambiguous, and the reverse index can hold only one of
+        // them.
         if let Some(id) = self.stable_id {
             if self.world.entity_id_is_taken(id) {
                 self.world.release_entity(entity);
@@ -1660,6 +1651,74 @@ impl<'w> EntityBuilder<'w> {
             });
         Ok(entity)
     }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+//
+// Per-thread ticks. In parallel mode several systems run at the same time on
+// different threads. Each one needs its own idea of which tick its last run
+// started at, so change filters such as `Changed<T>` compare against the right
+// baseline. A field on `World` would be shared and would race, so the value is
+// thread-local. The engine's parallel dispatch stores the baseline before a
+// system runs and puts the previous value back afterwards. In sequential mode
+// both overrides are `None`, and queries read the shared fields on `World`
+// instead.
+//
+// The same thread-local storage also holds the tick reserved for the current
+// run. A parallel batch runs every system against one world, so increasing the
+// shared counter there would be an unsynchronized read-modify-write. Instead
+// the engine gives each member of the batch its own tick, taken on the dispatch
+// thread, and installs it here.
+//
+// The values live in `pill_core::system_ticks`, not in this crate. `Query` is
+// generic, so a system's queries read the thread-local from the DLL that
+// declares the system. A copy in this rlib would exist once per DLL, and a
+// module's systems would never see the values the engine wrote.
+
+/// The tick this thread's system last started at, or `None` when no parallel
+/// batch is running on this thread.
+#[inline]
+fn per_thread_last_run_tick() -> Option<Tick> {
+    pill_core::system_ticks::last_run_tick().map(Tick::new)
+}
+
+/// The tick the engine reserved for the system running on this thread.
+///
+/// `None` means the caller should increase the shared counter on `World`.
+#[inline]
+fn per_thread_this_run_tick() -> Option<Tick> {
+    pill_core::system_ticks::this_run_tick().map(Tick::new)
+}
+
+/// Stores this thread's last-run tick and returns the previous one, so the
+/// caller can put it back when the system finishes.
+#[inline]
+pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> {
+    pill_core::system_ticks::replace_last_run_tick(value.map(Tick::get)).map(Tick::new)
+}
+
+/// Stores the tick reserved for the system about to run on this thread and
+/// returns the previous one, so the caller can put it back afterwards.
+#[inline]
+pub(crate) fn set_per_thread_this_run_tick(value: Option<Tick>) -> Option<Tick> {
+    pill_core::system_ticks::replace_this_run_tick(value.map(Tick::get)).map(Tick::new)
+}
+
+/// Whether a size and alignment can describe a foreign resource's allocation.
+///
+/// A foreign resource is one that another language declares. Both
+/// [`World::register_foreign_resource`] and
+/// [`World::relayout_foreign_resource`] need this check, and keeping it in one
+/// place means the two cannot disagree. If a declaration passed but its later
+/// relayout did not, the world would hold a resource shape it can no longer
+/// store.
+fn is_valid_foreign_layout(size: usize, align: usize) -> bool {
+    size != 0
+        && align != 0
+        && align.is_power_of_two()
+        && std::alloc::Layout::from_size_align(size, align).is_ok()
 }
 
 // =============================================================================

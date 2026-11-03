@@ -16,25 +16,26 @@
 //!
 //! # Design
 //!
-//! The document uses the field layer's names, not the component types' own
-//! serde: a handle field is saved as its guid and an entity field as its
-//! stable id. A component whose own serde writes a handle as a slot pair
-//! cannot be written straight into a file meant for a later run, so the field
-//! layer - which knows what a reference *is* - is the writer.
+//! The field layer - the engine code that reads and writes a component's
+//! fields by name - writes the document, not each component's own serde. A
+//! handle field is saved as its guid and an entity field as its stable id. A
+//! component that serializes a handle as a slot index and a generation would
+//! write numbers that mean nothing in a later run, so the field layer, which
+//! knows what a reference is, is the writer.
 //!
-//! A field the field layer can only summarise (a `vec:` or `dynbuf:`
-//! container, a `string`) is not written; [`SceneSave::skipped_fields`] names
-//! each one, so a save that loses data says so instead of looking complete. A
-//! field it can find but not interpret (a `struct:` with no known layout) is
-//! written as its raw bytes, which are written back unchanged into the same
-//! layout. A whole component it cannot reach - no layout, or a row it cannot
-//! read - is left out and named in [`SceneSave::skipped_components`], which
-//! the caller has to report.
+//! A field the field layer can describe but not read out (a `vec:` or
+//! `dynbuf:` container, or a `string`) is not written, and
+//! [`SceneSave::skipped_fields`] names it, so a save that loses data says so
+//! instead of looking complete. A field it can find but not interpret (a
+//! `struct:` with no known layout) is saved as its raw bytes and written back
+//! unchanged. A whole component it cannot reach - one it cannot resolve, one
+//! with no layout, or a row it cannot read - is left out and named in
+//! [`SceneSave::skipped_components`], which the caller has to report.
 //!
 //! Loading runs four passes in this order: create every entity, attach every
 //! component, write every field, then resolve the entity references. A
 //! component and its fields must exist before a reference is written into
-//! them, and an entity reference may name an entity that comes later in the
+//! them. An entity reference may also name an entity that comes later in the
 //! file, so the last pass waits until every entity exists.
 
 // Standard library
@@ -66,7 +67,7 @@ use crate::world::World;
 /// One entity in a scene document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SceneEntity {
-    /// The entity's stable id; a reference to it in the same document names
+    /// The entity's stable id. A reference to it in the same document names
     /// this id.
     pub id: EntityId,
     /// Its components by registered type name, each a map of field name to the
@@ -83,8 +84,8 @@ pub struct SceneDocument {
     pub entities: Vec<SceneEntity>,
 }
 
-/// A scene asset: the document it was loaded from, so code and other data can
-/// name it with a `Handle<Scene>`.
+/// A scene asset. It holds the document it was loaded from, and components
+/// can name it with a `Handle<Scene>`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Scene {
     /// The document the file held.
@@ -99,14 +100,14 @@ impl Scene {
     }
 }
 
-/// The pinned shared name of [`Scene`]: the key the import registry files the
-/// type under, and the type a `Handle<Scene>` field records.
+/// The shared name of [`Scene`], written as a literal: the key the import
+/// registry files the type under, and the name a `Handle<Scene>` field records
+/// as its asset type.
 const SCENE_SHARED_NAME: &str = "pill_engine::scene::Scene";
 
-// Shared identity: when two binaries each compile this type, each gets its own
-// `TypeId` for it. The pinned name is what makes them one asset column, and
-// what a `Handle<Scene>` field records as its asset type. Keep it verbatim
-// when moving the type.
+// Shared identity: each binary that compiles this type gets its own `TypeId`
+// for it, and the shared name is what gives the copies one asset column
+// instead of one each. Keep the name verbatim when moving the type.
 impl Asset for Scene {
     fn shared_name() -> Option<&'static str> {
         Some(SCENE_SHARED_NAME)
@@ -143,11 +144,11 @@ pub struct SceneSave {
     /// One entry per field the field layer could not write, by
     /// `<entity>: <component>.<field>`.
     pub skipped_fields: Vec<String>,
-    /// One entry per component the save left out, by `<entity>: <component>`
-    /// and the reason. The save writes components through the field layer, so
-    /// a component with no layout of its own has no fields to write. The
-    /// document then holds the entity without that component, which is a loss
-    /// the caller has to see.
+    /// One entry per component the save left out, naming the entity, the
+    /// component and the reason. The save writes components through the field
+    /// layer, so a component with no field layout has nothing to write. The
+    /// entity is then written without that component, which is a loss the
+    /// caller has to see.
     pub skipped_components: Vec<String>,
     /// How many component entries the document holds.
     pub components: usize,
@@ -155,17 +156,19 @@ pub struct SceneSave {
 
 /// Writes a world's entities into a scene document.
 ///
-/// `entities` names the entities to write; `None` writes every live entity.
-/// A component is written when the field layer can read it, which is also
-/// what a load needs to write it back. Persistability is deliberately not the
-/// gate: that is a serde registration, and a component holding an `Entity` -
-/// the very thing a scene exists to carry - cannot have one.
+/// `entities` names the entities to write, and `None` writes every live
+/// entity. A component is written when the field layer can read it, which is
+/// also what a load needs to write it back. Persistability is not required:
+/// it is the serde registration that migrates a type's rows across a reload.
+/// A component holding an `Entity` - the very thing a scene exists to carry -
+/// cannot be serde-serialized at all.
 pub fn save_scene(
     world: &World,
     assets: &AssetManager,
     registry: &ImportRegistry,
     entities: Option<&[Entity]>,
 ) -> (SceneDocument, SceneSave) {
+    // Step 1: take the chosen entities, or every live entity.
     let entities: Vec<Entity> = match entities {
         Some(chosen) => chosen.to_vec(),
         None => world
@@ -174,6 +177,8 @@ pub fn save_scene(
             .map(|row| row.entity)
             .collect(),
     };
+    // Step 2: write each entity's components, field by field, and record what
+    // the field layer could not write.
     let mut document = SceneDocument::default();
     let mut report = SceneSave::default();
     for entity in entities {
@@ -223,26 +228,26 @@ pub fn save_scene(
     (document, report)
 }
 
-/// Returns one field value the way a scene document stores it, or `None` for
-/// a value the field layer can only summarise (a heap container) or a float
-/// that JSON cannot hold.
+/// Returns one field value the way a scene document stores it, or `None` when
+/// it has no saved form. That is a heap container, which the field layer
+/// cannot read out, and a float JSON cannot hold (NaN or an infinity).
 ///
-/// `Text` is `None` for the same reason `List` is: the field layer cannot
-/// write a heap-backed field, so a value stored here would never reach a
-/// component on load.
+/// `Text` and `List` both return `None` for the same reason: the field layer
+/// cannot write a heap-backed field, so a value saved here would never reach
+/// a component on load.
 fn encode_field_value(
     world: &World,
     assets: &AssetManager,
     registry: &ImportRegistry,
     field_value: &FieldValue,
 ) -> Option<serde_json::Value> {
-    /// A JSON number holding `value`; `None` for NaN and the infinities.
-    fn number(value: f64) -> Option<serde_json::Value> {
+    /// Returns `value` as a JSON number, or `None` for NaN and the infinities.
+    fn json_number(value: f64) -> Option<serde_json::Value> {
         serde_json::Number::from_f64(value).map(serde_json::Value::Number)
     }
     match field_value {
-        FieldValue::F32(value) => number(f64::from(*value)),
-        FieldValue::F64(value) => number(*value),
+        FieldValue::F32(value) => json_number(f64::from(*value)),
+        FieldValue::F64(value) => json_number(*value),
         FieldValue::I8(value) => Some(serde_json::json!(value)),
         FieldValue::I16(value) => Some(serde_json::json!(value)),
         FieldValue::I32(value) => Some(serde_json::json!(value)),
@@ -281,8 +286,8 @@ fn encode_field_value(
     }
 }
 
-/// Whether `field_value` names something; only the two reference variants
-/// can.
+/// Returns whether `field_value` names an asset or an entity. Only the two
+/// reference variants can.
 fn is_set_reference(field_value: &FieldValue) -> bool {
     match field_value {
         FieldValue::Asset { .. } | FieldValue::Entity { .. } => !field_value.references_nothing(),
@@ -320,7 +325,7 @@ fn bytes_of(text: &str) -> Option<Vec<u8>> {
 
 /// What [`load_scene`] made of a document.
 ///
-/// Each bucket admits one kind of loss:
+/// Each list below records one kind of loss:
 ///
 /// - [`unknown_components`](Self::unknown_components): the world knows no
 ///   component of that name, so nothing could be attached.
@@ -329,8 +334,8 @@ fn bytes_of(text: &str) -> Option<Vec<u8>> {
 ///   own message.
 /// - [`skipped_entities`](Self::skipped_entities): a document entry was dropped
 ///   because its id repeats or is already taken.
-/// - [`skipped_fields`](Self::skipped_fields): one field of an attached
-///   component could not be written, by `<entity>: <component>.<field>`.
+/// - [`skipped_fields`](Self::skipped_fields): a field could not be written,
+///   by `<entity>: <component>.<field>`.
 /// - [`unresolved_references`](Self::unresolved_references): an entity
 ///   reference was not written into its field, because the id names no entity
 ///   of the document or the field refused the write.
@@ -345,21 +350,21 @@ pub struct SceneLoad {
     /// Components that failed to attach although the type is registered, each
     /// entry naming the entity, the component and the reason.
     pub failed_components: Vec<String>,
-    /// Entity references that were not written: the id names no entity of the
-    /// document, or the field refused the write.
+    /// Entity references that were not written, because the id names no
+    /// entity of the document or the field refused the write.
     pub unresolved_references: usize,
     /// Document entries whose entity was not created, with the reason.
     pub skipped_entities: Vec<String>,
-    /// Fields the document named that could not be written, by
-    /// `<entity>: <component>.<field>`.
+    /// Fields that could not be written, by `<entity>: <component>.<field>`.
     pub skipped_fields: Vec<String>,
 }
 
-/// Instantiate a scene document into a world.
+/// Instantiates a scene document into a world.
 ///
 /// The entities are created under the ids the document carries, so a reference
 /// between them resolves. A component the world does not know is reported and
-/// skipped; so is a field the layout no longer has or refuses.
+/// skipped. A field the layout does not have, or a value the field layer
+/// refuses, is reported the same way.
 pub fn load_scene(
     engine: &mut Engine,
     database: &AssetDatabase,
@@ -371,11 +376,13 @@ pub fn load_scene(
         .get_resource::<ImportRegistry>()
         .cloned()
         .unwrap_or_default();
+    // Step 1: create every entity under the id the document carries, so a
+    // reference can resolve to it later.
     let mut created_entities: Vec<(Entity, &SceneEntity)> =
         Vec::with_capacity(document.entities.len());
-    let mut seen = HashSet::with_capacity(document.entities.len());
+    let mut seen_ids = HashSet::with_capacity(document.entities.len());
     for scene_entity in &document.entities {
-        if !seen.insert(scene_entity.id) {
+        if !seen_ids.insert(scene_entity.id) {
             report
                 .skipped_entities
                 .push(format!("{}: the id repeats in this scene", scene_entity.id));
@@ -397,7 +404,7 @@ pub fn load_scene(
         }
     }
 
-    // Step 1: attach every component, so its fields can be written into it.
+    // Step 2: attach every component, so its fields can be written into it.
     let mut freshly_attached: HashSet<(Entity, String)> = HashSet::new();
     for (entity, scene_entity) in &created_entities {
         for component_name in scene_entity.components.keys() {
@@ -418,17 +425,16 @@ pub fn load_scene(
         }
     }
 
-    // Step 2: write every field; entity references wait for their entity.
+    // Step 3: write every field. Entity references wait for their entity.
     let mut links = SavedEntityLinks::default();
     for (entity, scene_entity) in &created_entities {
         for (component_name, fields) in &scene_entity.components {
-            // The tags are copied out first: the field loop below writes
-            // through `engine.world_mut()`, which cannot run while the layout
-            // borrows the world.
+            // The tags are copied out first, because the field loop below
+            // writes through `engine.world_mut()`, which cannot run while the
+            // layout borrows the world.
             let tags: BTreeMap<String, &'static str> = {
                 let world = engine.world();
-                let Some(component_id) =
-                    world.resolve_entity_component_id(*entity, component_name)
+                let Some(component_id) = world.resolve_entity_component_id(*entity, component_name)
                 else {
                     continue;
                 };
@@ -441,8 +447,9 @@ pub fn load_scene(
                     .collect()
             };
             // A freshly attached component is a zero-filled image, and a zeroed
-            // reference names slot 0 - a real entity or asset. Every reference
-            // the document does not name is therefore cleared explicitly.
+            // reference points at slot 0, which can hold a real entity or
+            // asset. So every reference the document does not name is cleared
+            // explicitly.
             if freshly_attached.contains(&(*entity, component_name.clone())) {
                 for (field_name, tag) in &tags {
                     if fields.contains_key(field_name.as_str()) {
@@ -455,7 +462,7 @@ pub fn load_scene(
                         *entity,
                         component_name,
                         field_name,
-                        cleared_field(tag),
+                        cleared_reference_value(tag),
                     ) {
                         report.skipped_fields.push(format!(
                             "{entity}: {component_name}.{field_name} was refused: {error}"
@@ -483,11 +490,11 @@ pub fn load_scene(
                         links.push(*entity, component_name, field_name, id);
                         continue;
                     }
-                    Ok(DecodedField::Cleared) => cleared_field(tag),
+                    Ok(DecodedField::Cleared) => cleared_reference_value(tag),
                     Err(reason) => {
-                        report.skipped_fields.push(format!(
-                            "{entity}: {component_name}.{field_name} {reason}"
-                        ));
+                        report
+                            .skipped_fields
+                            .push(format!("{entity}: {component_name}.{field_name} {reason}"));
                         continue;
                     }
                 };
@@ -505,7 +512,8 @@ pub fn load_scene(
         }
     }
 
-    // Step 3: the entity references, once every entity of the document exists.
+    // Step 4: write the entity references, once every entity of the document
+    // exists.
     let (_, unresolved_links) = links.resolve(engine.world_mut());
     report.unresolved_references = unresolved_links.len();
     report
@@ -516,7 +524,7 @@ pub fn load_scene(
 enum AttachError {
     /// The world knows no component of that name.
     UnknownType,
-    /// The world knows the type but could not attach it; the message is the
+    /// The world knows the type but could not attach it. The message is the
     /// field layer's or a command's own reason.
     Failed(String),
 }
@@ -530,31 +538,32 @@ impl std::fmt::Display for AttachError {
     }
 }
 
-/// Attach `component_name` with its defaults to `entity`, reporting whether the
-/// image was freshly attached.
+/// Attaches `component_name` to `entity` with a zero-filled image, and reports
+/// whether the component was newly attached.
 ///
 /// # Errors
 ///
-/// [`AttachError::UnknownType`] when the world knows no component of that
-/// name; [`AttachError::Failed`] when it knows the type but the image cannot be
-/// built or the add command is refused, carrying that layer's own reason.
+/// [`AttachError::UnknownType`] when the world has no component of that name,
+/// or when two registrations claim it and there is no single one to attach.
+/// [`AttachError::Failed`] when the world knows the type but the image cannot
+/// be built or the add command is refused, carrying that layer's own reason.
 fn attach_component(
     engine: &mut Engine,
     entity: Entity,
     component_name: &str,
 ) -> Result<bool, AttachError> {
+    // Step 1: a component the entity already carries needs no add. Its fields
+    // are written all the same, but its references are not the zero-filled
+    // ones, so they are left alone.
     if engine
         .world()
         .resolve_entity_component_id(entity, component_name)
         .is_some()
     {
-        // Already attached: the document listed it twice, or the entity was
-        // created with it. Its fields are written all the same, but its
-        // references are not the zero-filled ones, so they are left alone.
         return Ok(false);
     }
-    // The type is resolved first so "unknown" and "known but unbuildable" stay
-    // separate answers: only the first is an unknown component.
+    // Step 2: resolve the type before building the image, so "unknown" and
+    // "known but unbuildable" stay separate answers.
     let component_id = engine
         .world()
         .resolve_component_id_by_name_any(component_name)
@@ -564,6 +573,8 @@ fn attach_component(
         .world()
         .build_component_image(component_name, &[])
         .map_err(|error| AttachError::Failed(error.to_string()))?;
+    // Step 3: queue the add and apply it now, so the field writes that follow
+    // find the new row.
     engine.queue_deferred_commands(move |_world, queue| {
         if component_id.is_native_storage() {
             queue.add_component_adder_to_entity(
@@ -597,15 +608,15 @@ enum DecodedField {
     Asset(SavedAssetReference),
     /// An entity reference to resolve after every entity exists.
     Entity(EntityId),
-    /// `null` in a reference field: the cleared handle.
+    /// A `null` in a reference field, meaning the cleared handle.
     Cleared,
 }
 
-/// Decode one document value for the field tagged `tag`.
+/// Decodes one document value for the field tagged `tag`.
 ///
-/// `Err` carries the reason the value cannot be written, which the load report
-/// names next to the field: a shape a field cannot read, or a number that does
-/// not fit the field's type.
+/// `Err` carries the reason the value cannot be written, and the load report
+/// prints it next to the field. The reason is a shape the field cannot read,
+/// or a number that does not fit the field's type.
 fn decoded_field(
     tag: &'static str,
     document_value: &serde_json::Value,
@@ -631,10 +642,10 @@ fn decoded_field(
             .ok_or_else(|| "does not read".to_owned());
     }
     if let Some(element_tag) = tag.strip_prefix("array:") {
-        // The element tag is a prefix of the field's own `'static` tag, so the
-        // same decoder applies to every element. A handle element decodes to an
-        // asset reference and an `entity` element to an entity id, and this
-        // branch takes only plain values, so it refuses an array of either.
+        // The element tag is the tail of the field's own `'static` tag, so the
+        // same decoder works for every element. This branch builds a plain
+        // array, so an element that decodes to an asset reference or an entity
+        // id is refused.
         let elements = document_value
             .as_array()
             .ok_or_else(|| "does not read".to_owned())?;
@@ -695,9 +706,9 @@ fn decoded_field(
 
 /// A whole number narrowed to a signed field's own type.
 ///
-/// A value that does not fit is refused rather than cast: `as i8` would wrap 300
-/// into 44 and leave the world holding a number the document never said. The
-/// report names the refused value.
+/// A value that does not fit is refused, not cast. A cast would wrap 300 into
+/// 44 with `as i8`, and leave the world holding a number the document never
+/// said. The report names the refused value.
 fn narrow_to_signed<T: TryFrom<i64>>(
     tag: &'static str,
     document_value: &serde_json::Value,
@@ -721,7 +732,7 @@ fn narrow_to_unsigned<T: TryFrom<u64>>(
 }
 
 /// A number narrowed to an `f32`, refusing the one cast that changes its kind:
-/// a finite value whose magnitude exceeds `f32::MAX` became `inf`. Rounding
+/// a finite value whose magnitude exceeds `f32::MAX` becomes `inf`. Rounding
 /// within range is what the type is for, so it is not a refusal.
 fn narrow_to_f32(tag: &'static str, document_value: &serde_json::Value) -> Result<f32, String> {
     let number = document_value
@@ -734,8 +745,9 @@ fn narrow_to_f32(tag: &'static str, document_value: &serde_json::Value) -> Resul
     Ok(narrowed)
 }
 
-/// The raw bytes an opaque field was written from, tagged with the layout's own
-/// `'static` tag: a document cannot introduce a tag the layout does not have.
+/// Returns the raw bytes an opaque field was written from, tagged with the
+/// layout's own `'static` tag. A document can therefore never introduce a tag
+/// the layout does not have.
 fn decode_opaque_field(
     tag: &'static str,
     document_value: &serde_json::Value,
@@ -750,8 +762,8 @@ fn decode_opaque_field(
     })
 }
 
-/// The value a `null` written for a reference field restores.
-fn cleared_field(tag: &str) -> FieldValue {
+/// The value that restores a reference field the document wrote as `null`.
+fn cleared_reference_value(tag: &str) -> FieldValue {
     if tag == "entity" {
         FieldValue::Entity {
             id: Entity::NULL.id(),
@@ -761,6 +773,10 @@ fn cleared_field(tag: &str) -> FieldValue {
         FieldValue::unset_asset()
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -911,8 +927,8 @@ mod tests {
     }
 
     /// A world saves to a `.scene` file with a fresh guid, and loading that file
-    /// into an empty engine brings back the same components and references -
-    /// the asset by guid, the entity by stable id.
+    /// into an empty engine brings back the same components and references. The
+    /// asset resolves by guid and the entity by stable id.
     #[test]
     fn a_scene_round_trips_through_a_file() {
         // Step 1: the world that saves.
@@ -984,7 +1000,10 @@ mod tests {
         // the scene type the project registered.
         let mut scratch = Scratch::new("load");
         scratch.note("notes/a.note", NOTE_GUID);
-        scratch.write("scenes/a.scene", &String::from_utf8(scene_file_bytes).unwrap());
+        scratch.write(
+            "scenes/a.scene",
+            &String::from_utf8(scene_file_bytes).unwrap(),
+        );
         let database = scratch.database();
         // Relative, because an asset's name is its path below the project's
         // asset directory.
@@ -1047,10 +1066,10 @@ mod tests {
 
     /// Whatever `save_scene` writes, `load_scene` restores.
     ///
-    /// A heap-backed field is read-only through the field layer - its buffer is
-    /// reached through the type's own accessors, not through raw row bytes - so
-    /// the saver leaves one out and reports it. Writing a `string` would put a
-    /// value in the file that no load could restore.
+    /// A heap-backed field is read-only through the field layer: its buffer is
+    /// reached through the type's own accessors, not through the raw row bytes.
+    /// So the saver leaves one out and reports it, because writing a `string`
+    /// would put a value in the file that no load could restore.
     #[test]
     fn a_saved_field_is_one_the_loader_accepts() {
         static LABELED_FIELDS: &[ComponentFieldDescriptor] = &[
@@ -1083,7 +1102,7 @@ mod tests {
         impl Component for Labeled {}
 
         // Step 1: a world holding both heap kinds saves.
-        let (document, save) = {
+        let (document, save_report) = {
             let mut scratch = Scratch::new("heap-save");
             scratch
                 .engine
@@ -1113,11 +1132,12 @@ mod tests {
         );
         for field in ["label", "points"] {
             assert!(
-                save.skipped_fields
+                save_report
+                    .skipped_fields
                     .iter()
                     .any(|skipped| skipped.ends_with(&format!(".{field}"))),
                 "{field} is reported as skipped: {:?}",
-                save.skipped_fields
+                save_report.skipped_fields
             );
         }
     }
@@ -1125,9 +1145,9 @@ mod tests {
     /// A component the world knows but has no field layout for is not written,
     /// and the report says so instead of dropping it.
     ///
-    /// The field layer is what writes a scene, so a component without a layout
-    /// has no fields to write; keeping quiet about it would put gameplay state
-    /// silently out of the file.
+    /// The field layer writes the scene, so a component without a layout has no
+    /// fields to write. Keeping quiet about it would silently leave gameplay
+    /// state out of the file.
     #[test]
     fn a_component_without_a_layout_is_reported_as_not_written() {
         #[repr(C)]
@@ -1215,12 +1235,12 @@ mod tests {
     }
 
     /// A component the world knows but cannot build an image for is reported
-    /// in its own bucket with the reason, not as an unknown type.
+    /// in its own list with the reason, not as an unknown type.
     ///
-    /// The two failures mean different things to whoever reads the report: an
-    /// unknown name is a missing registration, while an unbuildable image is a
-    /// registered type the field layer cannot build, which in practice means a
-    /// component with no field layout.
+    /// The two failures mean different things to whoever reads the report. An
+    /// unknown name is a missing registration. An image that cannot be built is
+    /// a registered type the field layer cannot build, which in practice means
+    /// a component with no field layout.
     #[test]
     fn a_registered_component_that_cannot_be_attached_is_reported_with_its_reason() {
         #[repr(C)]
@@ -1259,10 +1279,11 @@ mod tests {
             "one component failed to attach: {:?}",
             report.failed_components
         );
-        let said = &report.failed_components[0];
+        let failure_message = &report.failed_components[0];
         assert!(
-            said.contains("could not attach") && said.contains("no registered field layout"),
-            "the entry carries the field layer's reason: {said}"
+            failure_message.contains("could not attach")
+                && failure_message.contains("no registered field layout"),
+            "the entry carries the field layer's reason: {failure_message}"
         );
         assert_eq!(report.components, 0);
     }
@@ -1274,7 +1295,7 @@ mod tests {
         let mut scratch = Scratch::new("repeated-id");
         let id = EntityId::from_name("hero");
         let components = BTreeMap::from([(
-            actor_component(),
+            actor_component_name(),
             BTreeMap::from([("speed".to_string(), serde_json::json!(1.0))]),
         )]);
         let document = SceneDocument {

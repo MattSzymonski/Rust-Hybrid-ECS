@@ -8,25 +8,27 @@
 //!
 //! # Design
 //!
-//! Resources are singletons, fetched by type through
-//! [`Res`](crate::query::Res); a mesh or a texture is one of hundreds, and the
-//! type alone does not name one, so assets get their own store rather than a
-//! reinterpretation of [`Resource`](crate::resource::Resource).
-//! [`AssetManager`] is itself a plain resource, so `Res<AssetManager>` /
-//! `ResMut<AssetManager>` reach it and the scheduler's resource-conflict
-//! analysis already covers it.
+//! A [`Resource`](crate::resource::Resource) holds one value per type, and code
+//! fetches it by type through [`Res`](crate::query::Res). A mesh or a texture
+//! is one of many values of the same type, so the type alone cannot name one.
+//! Assets therefore get their own store instead of a second reading of
+//! [`Resource`]. [`AssetManager`] is itself an ordinary resource, so
+//! `Res<AssetManager>` and `ResMut<AssetManager>` reach it, and the scheduler
+//! already keeps two systems from using it at once when their uses conflict.
 //!
-//! Storage mirrors how components are held - an erased column per type in a
-//! `TraitTypeMap` - minus archetypes, which group *entities* by component set
-//! and mean nothing for an asset. The column is an `ErasedVecStorage` from
-//! `trait_type_map`, so its per-type behaviour is a replaceable data table
-//! rather than a trait-object vtable: a handle keeps its slot index across an
-//! unload, and a column can be re-pointed at whichever generation is still
-//! mapped (see [`AssetManager::rehome`]).
+//! Storage works like component storage - one type-erased column per type in a
+//! `TraitTypeMap` - without archetypes. Archetypes group entities by their set
+//! of components, and that grouping means nothing for an asset.
 //!
-//! A [`Handle<T>`] is generational: freeing a slot bumps that slot's generation,
-//! so a handle kept across an unload resolves to `None` rather than silently
-//! addressing whatever was loaded into the slot next.
+//! Each column is an `ErasedVecStorage` from `trait_type_map`. The operations
+//! the column runs on its values are a table of function pointers that this
+//! store owns, so loading new code can replace the table (see
+//! [`AssetManager::rehome`]). Values and handle indices stay where they are
+//! across that swap.
+//!
+//! A [`Handle<T>`] is generational. Freeing a slot adds one to that slot's
+//! generation, so a handle kept across an unload returns `None` instead of
+//! quietly naming whatever was loaded into the slot next.
 
 // Standard library
 use std::any::TypeId;
@@ -47,15 +49,15 @@ use crate::resource::Resource;
 // Asset
 // =============================================================================
 
-/// Marker for data stored many-per-type in the [`AssetManager`].
+/// Marks data that is stored many-per-type in the [`AssetManager`].
 ///
-/// Implement this for meshes, textures, materials, shaders and the like - any
+/// Implement this for meshes, textures, materials, shaders and the like: any
 /// type a world holds several of, where the type alone does not identify one
 /// value. Use [`Resource`](crate::resource::Resource) instead for genuine
 /// singletons such as a clock or an input snapshot.
 ///
-/// `Send + Sync` for the same reason resources are: systems are dispatched
-/// across threads, and the store is reachable from any of them.
+/// The `Send + Sync` bound has the same reason resources have it: systems run
+/// on several threads, and any of them may reach the store.
 ///
 /// # Examples
 ///
@@ -74,13 +76,17 @@ pub trait Asset: Send + Sync + 'static {
     /// A stable name that identifies this asset type across binaries, or
     /// `None` to be identified by its `TypeId` alone.
     ///
-    /// The asset counterpart of [`Component::shared_name`](crate::Component::shared_name).
-    /// Each binary that compiles its own copy of the defining crate - a module
-    /// and the crates that link it, say - gets its own `TypeId` for the same
-    /// type, so a shared name keys them to one column, checked by layout.
+    /// This is the asset version of
+    /// [`Component::shared_name`](crate::Component::shared_name).
     ///
-    /// Pin a literal rather than deriving it from the module path, so moving
-    /// the type does not change its identity.
+    /// Every binary that compiles its own copy of the crate defining the type
+    /// - a module and the crates that link it, for example - gets its own
+    /// `TypeId` for that type. A shared name gives those copies one column
+    /// instead of one each; registration also checks that the copies agree on
+    /// the type's size and alignment.
+    ///
+    /// Write a fixed string rather than building one from the module path, so
+    /// moving the type does not change its identity.
     fn shared_name() -> Option<&'static str>
     where
         Self: Sized,
@@ -88,10 +94,11 @@ pub trait Asset: Send + Sync + 'static {
         None
     }
 
-    /// The stable identity [`Self::shared_name`] hashes to, or `None`.
+    /// The stable identity that [`Self::shared_name`] hashes to, or `None`.
     ///
-    /// The same hash shared components use. Override it only with that
-    /// function of `Self::shared_name()`.
+    /// This is the same hash a shared component uses. Override it only when
+    /// you also override `Self::shared_name()`, and keep the two based on the
+    /// same string.
     fn shared_identity() -> Option<u128>
     where
         Self: Sized,
@@ -104,40 +111,51 @@ pub trait Asset: Send + Sync + 'static {
 // AssetLoader
 // =============================================================================
 
-/// Source used to initialize an asset from a project file or embedded bytes.
+/// Where an asset's bytes come from: a file of the project, or bytes already
+/// in memory.
 ///
-/// A relative path names a file of the project's `res` directory and resolves
-/// through the asset store's mount points ([`crate::asset_store`]): a packed
-/// copy in a shipping or web build, the file itself in development. Loading
-/// code is the same on every target.
+/// A relative path names a file below the project's `res` directory. The asset
+/// store looks for it in the packs first - a shipping or web build carries a
+/// packed copy - and then on disk, so a development run reads the file itself.
+/// The loading code is the same on every target.
 #[derive(Debug, Clone)]
 pub enum AssetLoader {
+    /// A file of the project, named relative to its asset directory.
     Path(PathBuf),
+    /// Bytes already in memory, such as an asset embedded at build time.
     Bytes(Box<[u8]>),
 }
 
-/// Failure to load an asset: its source cannot be resolved, read or decoded,
-/// or a metadata or standalone file cannot be used or written.
+/// Something went wrong while loading an asset.
+///
+/// The asset's source could not be found, read or decoded, or its metadata file
+/// or a standalone document could not be used or written.
 #[derive(Debug, thiserror::Error)]
 pub enum AssetLoadError {
+    /// No pack or directory holds the path.
     #[error("asset path was not found: {path}")]
     PathNotFound { path: PathBuf },
+    /// The file was found but could not be read.
     #[error("failed to read asset {path}: {source}")]
     Read {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+    /// The bytes read are not valid UTF-8 text.
     #[error("asset {label} is not valid UTF-8: {source}")]
     Utf8 {
         label: String,
         #[source]
         source: std::string::FromUtf8Error,
     },
+    /// The bytes read do not hold the asset or document they should.
     #[error("failed to decode asset {label}: {detail}")]
     Decode { label: String, detail: String },
     /// The metadata layer cannot read, build or write an asset's metadata
-    /// file: it does not parse, names another asset type, was written by a
+    /// file.
+    ///
+    /// The file does not parse, names another asset type, was written by a
     /// newer format version, or holds settings that do not fit the type.
     #[error("asset metadata {path} cannot be used: {detail}")]
     Metadata {
@@ -157,15 +175,15 @@ pub enum AssetLoadError {
     },
 }
 
-/// Result of an asset file operation: reading, decoding or writing an asset
-/// source or document.
+/// The result of any asset file operation: reading, decoding or writing a
+/// source or a document.
 pub type AssetLoadResult<T> = Result<T, AssetLoadError>;
 
-/// Refusal of a binding operation: a name another asset already answers to,
-/// or a handle whose asset is gone.
+/// Why the store refused to bind a name or a guid to an asset.
 ///
-/// Kept apart from [`AssetLoadError`]: nothing failed to load, the store
-/// refused the request.
+/// Either the name already addresses a live asset, or the handle no longer
+/// addresses one. This is a separate type from [`AssetLoadError`] because
+/// nothing failed to load: the store refused a request.
 #[derive(Debug, thiserror::Error)]
 pub enum AssetBindingError {
     /// The name already addresses a live asset.
@@ -179,25 +197,32 @@ pub enum AssetBindingError {
     StaleHandle,
 }
 
-/// Result of a binding operation that can hit an occupied name.
+/// The result of a binding operation, which can be refused by an occupied name
+/// or a stale handle.
 pub type AssetBindingResult<T> = Result<T, AssetBindingError>;
 
 impl AssetLoader {
-    /// Mount the project's asset directory, which relative [`Self::Path`]
-    /// values resolve beneath; see [`crate::asset_store::mount_directory`].
+    /// Mounts the project's asset directory. Relative [`Self::Path`] values are
+    /// looked up below it; see [`crate::asset_store::mount_directory`].
     pub fn set_root(path: impl Into<PathBuf>) {
         crate::asset_store::mount_directory(path);
     }
 
-    /// Return the currently mounted asset directory, if one was set.
+    /// Returns the asset directory that is currently mounted, if one is set.
     pub fn root() -> Option<PathBuf> {
         crate::asset_store::mounted_directory()
     }
 
-    /// Read this source into owned bytes.
+    /// Reads this source into owned bytes.
     ///
-    /// A path is read through the asset store's mount points: packs first,
-    /// then the filesystem - see [`crate::asset_store::read`].
+    /// A path is looked up the way [`crate::asset_store::read`] does it: in the
+    /// packs first, then on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetLoadError::PathNotFound`] when no pack or directory
+    /// holds the path, and [`AssetLoadError::Read`] when the file was found
+    /// but could not be read.
     pub fn load(&self) -> AssetLoadResult<Vec<u8>> {
         match self {
             Self::Bytes(bytes) => Ok(bytes.to_vec()),
@@ -205,7 +230,12 @@ impl AssetLoader {
         }
     }
 
-    /// Read this source as UTF-8 text.
+    /// Reads this source as UTF-8 text.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::load`], and [`AssetLoadError::Utf8`]
+    /// when the bytes are not valid UTF-8.
     pub fn load_string(&self) -> AssetLoadResult<String> {
         let label = match self {
             Self::Path(path) => path.display().to_string(),
@@ -221,15 +251,15 @@ impl AssetLoader {
 
 /// A typed, generational reference to one asset in the [`AssetManager`].
 ///
-/// Cheap to copy and free of any borrow, so handles live inside components,
-/// inside other assets, and inside project state without tying anything to the
-/// lifetime of the store.
+/// A handle is cheap to copy and holds no borrow, so one can live inside a
+/// component, inside another asset or inside project state without keeping the
+/// store alive.
 ///
-/// A handle is only meaningful to the [`AssetManager`] that issued it. Handing
-/// one to a different manager is a programming error; it resolves to `None`
-/// or - if that manager happens to have a live slot at the same index and
-/// generation - to an unrelated asset. Worlds hold one manager, so this does
-/// not arise in ordinary use.
+/// A handle is only meaningful to the [`AssetManager`] that issued it. Passing
+/// one to a different manager is a programming error. It returns `None`, or -
+/// if that manager happens to have a live slot at the same index and
+/// generation - it names an unrelated asset. Worlds hold one manager, so this
+/// does not happen in ordinary use.
 #[repr(C)]
 pub struct Handle<T: Asset> {
     /// Slot index within this type's column.
@@ -243,14 +273,15 @@ pub struct Handle<T: Asset> {
     _marker: PhantomData<fn() -> T>,
 }
 
-/// The slot index [`Handle::INVALID`] carries.
+/// The slot index that [`Handle::INVALID`] carries.
 ///
-/// Named rather than written inline: the field layer stores a reference as a
-/// bare index/generation pair, so the "points at nothing" sentinel has to be
-/// spelled the same way wherever a reference is saved, restored or cleared.
+/// This is a named constant rather than a value written inline because the
+/// field layer saves a reference as a plain index and generation pair. The
+/// sentinel for "no asset" has to be the same value everywhere a reference is
+/// saved, restored or cleared.
 pub const INVALID_ASSET_INDEX: u32 = u32::MAX;
 
-/// The generation [`Handle::INVALID`] carries.
+/// The generation that [`Handle::INVALID`] carries.
 pub const INVALID_ASSET_GENERATION: u32 = u32::MAX;
 
 impl<T: Asset> Handle<T> {
@@ -261,12 +292,12 @@ impl<T: Asset> Handle<T> {
         _marker: PhantomData,
     };
 
-    /// Reconstructs a handle from a raw index/generation pair.
+    /// Builds a handle from a raw index and generation.
     ///
-    /// The same trust model [`Deserialize`](serde::Deserialize) already
-    /// applies: the caller vouches that the pair came from a handle this
-    /// asset manager issued, most often across an FFI boundary that carries
-    /// only the two integers rather than a live handle value.
+    /// This trusts its arguments the way [`Deserialize`](serde::Deserialize)
+    /// does: the caller promises the pair came from a handle this asset manager
+    /// issued. It exists for boundaries that carry only the two integers
+    /// instead of a live handle value, such as the C# mirror.
     #[inline]
     pub fn from_raw(index: u32, generation: u32) -> Self {
         Self {
@@ -276,13 +307,13 @@ impl<T: Asset> Handle<T> {
         }
     }
 
-    /// Slot index this handle addresses.
+    /// Returns the slot index this handle addresses.
     #[inline]
     pub fn index(self) -> u32 {
         self.index
     }
 
-    /// Generation this handle was issued against.
+    /// Returns the generation this handle was issued against.
     #[inline]
     pub fn generation(self) -> u32 {
         self.generation
@@ -353,21 +384,21 @@ impl<T: Asset> std::fmt::Debug for Handle<T> {
 // AssetColumn
 // =============================================================================
 
-/// One key namespace of an asset column: key to slot, and slot back to key.
+/// One kind of key - names or guids - in an asset column, mapped both ways.
 ///
-/// Every namespace has to drop its key when the slot is freed without scanning
-/// the whole map, so each is this pair. Keeping the pair in one type means the
-/// reverse half cannot be forgotten at one of the sites that bind or release a
-/// key - the failure that would let a freed name resolve to whatever refilled
-/// the slot.
+/// It maps each key to its slot and each slot back to its key. Freeing a slot
+/// has to remove that slot's key without searching the whole map, so both
+/// directions are kept. Keeping them in one type stops a caller from updating
+/// one direction and forgetting the other; if that happened, a freed name could
+/// still point at whatever asset took the slot.
 #[derive(Debug)]
 struct KeyIndex<K> {
     slots_by_key: HashMap<K, u32>,
     keys_by_slot: HashMap<u32, K>,
 }
 
-// Written out rather than derived: the derive would require `K: Default`, which
-// no key type here has - an empty map needs nothing from its key.
+// Written by hand rather than derived: the derive would require `K: Default`,
+// which no key type here has - an empty map needs nothing from its key.
 impl<K> Default for KeyIndex<K> {
     fn default() -> Self {
         Self {
@@ -381,11 +412,11 @@ impl<K> KeyIndex<K>
 where
     K: std::hash::Hash + Eq + Clone,
 {
-    /// Bind `key` to `slot`, dropping the key the slot held and the slot the
-    /// key named: one key, one slot, one slot, one key.
+    /// Points `key` at `slot`, removing whatever the two held before: the key's
+    /// old slot and the slot's old key.
     ///
-    /// Shared by every binding site, so a displaced reverse entry cannot be
-    /// left behind. Callers still refuse a key another live asset holds where
+    /// Every binding site calls this, so neither direction can keep a stale
+    /// entry. Callers still refuse a key that another live asset holds where
     /// that is an error rather than a move.
     fn bind(&mut self, key: K, slot: u32) {
         if let Some(previous) = self.keys_by_slot.insert(slot, key.clone()) {
@@ -396,14 +427,14 @@ where
         }
     }
 
-    /// Drop `slot`'s key, returning it.
+    /// Removes and returns the key that `slot` holds, if any.
     fn release(&mut self, slot: u32) -> Option<K> {
         let key = self.keys_by_slot.remove(&slot)?;
         self.slots_by_key.remove(&key);
         Some(key)
     }
 
-    /// The slot `key` names, when it is bound.
+    /// Returns the slot that `key` is bound to, if any.
     fn slot_of<Q>(&self, key: &Q) -> Option<u32>
     where
         K: std::borrow::Borrow<Q>,
@@ -412,21 +443,23 @@ where
         self.slots_by_key.get(key).copied()
     }
 
-    /// The key `slot` holds, when it holds one.
+    /// Returns the key that `slot` holds, if any.
     fn key_of(&self, slot: u32) -> Option<&K> {
         self.keys_by_slot.get(&slot)
     }
 }
 
-/// Per-type slot bookkeeping that sits alongside one asset column.
+/// Bookkeeping for the slots of one asset column.
 ///
-/// The column in the [`TraitTypeMap`] holds the values; this holds everything
-/// needed to hand out and validate handles for them. Kept separate because the
-/// map stores type-erased columns and cannot carry per-type metadata of its own.
+/// The column in the [`TraitTypeMap`] holds the values. This holds everything
+/// else needed to hand out and check handles for those values. The two are
+/// separate because the map stores columns with their type erased and cannot
+/// carry metadata of its own.
 #[derive(Default)]
 struct AssetColumn {
     /// Size and alignment of the column's element type, as the first
-    /// registration declared it; what a later shared registrant must match.
+    /// registration declared them. A later registration of the same shared type
+    /// must match both.
     element_layout: (usize, usize),
     /// Generation of each slot, one entry per slot that has ever existed.
     ///
@@ -435,42 +468,45 @@ struct AssetColumn {
     generations: Vec<u32>,
     /// Content version of each slot, one entry per slot that has ever existed.
     ///
-    /// Bumped whenever the stored value is mutably borrowed, so a consumer
-    /// that mirrors assets - the renderer's GPU uploads - can tell an edited
-    /// asset from an untouched one instead of rebuilding everything when any
-    /// asset changes. A freed slot keeps its last entry; the handle that
-    /// refills it carries a new generation, so a version only ever compares
-    /// within one handle.
+    /// Adds one whenever the stored value is borrowed mutably. A consumer that
+    /// mirrors assets - the renderer's GPU uploads - can then rebuild just the
+    /// asset that changed instead of all of them. A freed slot keeps its last
+    /// entry, and the handle that refills the slot has a new generation, so
+    /// versions are only compared through one handle.
     content_versions: Vec<u64>,
     /// Slots freed by `remove`, refilled before the column grows.
     free_slots: Vec<u32>,
     /// Row the live slot at this index occupies in the packed column.
     ///
-    /// Rows are packed, so removing one swaps the last row into the hole. This
-    /// map and `row_slots` are what keep the *slot* index stable through that
-    /// swap, and the slot index is what a handle addresses. An entry for a free
-    /// slot holds whatever the last occupant left.
+    /// Rows are packed, so removing one moves the last row into the hole. This
+    /// map and `row_slots` keep the *slot* index stable through that move, and
+    /// the slot index is what a handle addresses. An entry for a free slot holds
+    /// whatever the last occupant left.
     slot_rows: Vec<u32>,
-    /// Slot owning each row; the reverse of `slot_rows`.
+    /// The slot that owns each row; the reverse of `slot_rows`.
     row_slots: Vec<u32>,
-    /// Name lookup for assets added with one, and its reverse.
+    /// Name lookup for assets that were added with a name, and its reverse.
     ///
-    /// Holds the slot index only; the generation is read from `generations` at
-    /// lookup time, and `remove` releases the name, so a dead name never
-    /// reaches whatever refilled the slot.
+    /// It holds only the slot index. A lookup reads the current generation from
+    /// `generations`, and `remove` releases the name, so a dead name never
+    /// reaches the asset that refilled the slot.
     name_index: KeyIndex<String>,
     /// Guid lookup, and its reverse.
     ///
-    /// A namespace of its own rather than hashing the name at lookup time: a
-    /// guid may be assigned without a name (an asset cooked to an id), and the
-    /// two namespaces must not alias.
+    /// This is a map of its own rather than a hash of the name computed at
+    /// lookup time. An asset may have a guid and no name - a cooked asset
+    /// identified by an id - and a name must never answer a guid lookup, or the
+    /// other way round.
     guid_index: KeyIndex<AssetGuid>,
-    /// Import settings each slot was decoded with, as JSON.
+    /// The import settings each slot was decoded with, stored as JSON.
     ///
-    /// Only an asset decoded without a metadata file has an entry: that is the
-    /// one a later `ensure_metadata` would otherwise give the type's defaults.
-    /// JSON because `ImportSettings` needs only `Serialize + DeserializeOwned`
-    /// and the column is erased; keyed by slot, so freeing the slot drops it.
+    /// Only an asset decoded without a metadata file has an entry. Without it,
+    /// a later `ensure_metadata` would write the type's default settings over
+    /// the ones the asset was actually decoded with. JSON is used because the
+    /// column is type-erased and `ImportSettings` only has to be
+    /// `Serialize + DeserializeOwned` (the trait also requires
+    /// `Default + Clone`). Entries are keyed by slot, so freeing the slot drops
+    /// its entry.
     import_settings: HashMap<u32, serde_json::Value>,
 }
 
@@ -478,47 +514,50 @@ struct AssetColumn {
 // AssetGuid
 // =============================================================================
 
-/// Stable 128-bit identity of one asset.
+/// A stable 128-bit identity for one asset.
 ///
-/// A name is what a human writes and a scene file carries; a guid is what
-/// survives a rename. Both address the same slot - [`AssetManager`] keeps an
-/// index for each - and an asset may carry either, both, or neither.
+/// A name is what a person writes and what a scene file carries. A guid is what
+/// still identifies the asset after it is renamed. [`AssetManager`] keeps an
+/// index for each, and both point at the same slot. An asset may have a name, a
+/// guid, both or neither.
 ///
-/// [`AssetGuid::from_name`] derives one from a string with the same FNV-1a
-/// construction a shared component identity uses, so a cooking step and the
-/// runtime compute the same value from the same canonical name without
-/// exchanging anything. A guid assigned by a pipeline, from a file or a
-/// database, is passed to [`AssetGuid::new`] instead and is not required to
-/// relate to any name.
+/// [`AssetGuid::from_name`] builds a guid from a string with the same FNV-1a
+/// hash that a shared component identity uses. A cooking step and the runtime
+/// therefore compute the same value from the same fixed name without exchanging
+/// anything. A guid that a pipeline, a file or a database already assigned is
+/// passed to [`AssetGuid::new`] instead, and it does not have to relate to any
+/// name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AssetGuid(u128);
 
 impl AssetGuid {
-    /// Wrap a guid a cooking pipeline or content database already assigned.
+    /// Wraps a guid that a cooking pipeline or a content database already
+    /// assigned.
     pub const fn new(raw_bits: u128) -> Self {
         Self(raw_bits)
     }
 
-    /// Derive a guid from a name, reusing the shared-identity hash.
+    /// Derives a guid from a name with the shared-identity hash.
     ///
-    /// The same function components use for their stable names, so one
-    /// canonical string yields one identity everywhere: in a build step, in
-    /// the host, and in a module compiled separately from either.
+    /// This is the same function components use for their stable names, so one
+    /// fixed string gives one identity everywhere: in a build step, in the host,
+    /// and in a module that was compiled separately from either.
     pub const fn from_name(name: &str) -> Self {
         Self(crate::component::shared_component_identity(name))
     }
 
-    /// The raw 128-bit value.
+    /// Returns the raw 128-bit value.
     pub const fn value(self) -> u128 {
         self.0
     }
 
-    /// A new guid from the operating system's random source.
+    /// Builds a new guid from the operating system's random source.
     ///
-    /// What an asset's metadata file is given when it is first written. It is
-    /// deliberately unrelated to the asset's path: a guid derived from the path
-    /// would be handed to whatever file later took that path, and a stale
-    /// reference would then resolve to the wrong asset instead of to nothing.
+    /// This is what an asset's metadata file gets when it is first written. The
+    /// guid is deliberately unrelated to the asset's path: a guid derived from
+    /// the path would be handed to whatever file took that path later, and a
+    /// stale reference would then point at the wrong asset instead of at
+    /// nothing.
     ///
     /// # Errors
     ///
@@ -530,11 +569,13 @@ impl AssetGuid {
         Ok(Self(u128::from_le_bytes(bytes)))
     }
 
-    /// Parse 32 hexadecimal digits, the form [`Display`](std::fmt::Display)
-    /// writes, or `None` for any other text. Either letter case is accepted.
+    /// Parses exactly 32 hexadecimal digits, the form
+    /// [`Display`](std::fmt::Display) writes.
+    ///
+    /// Returns `None` for any other text; either letter case is accepted.
     pub fn parse(text: &str) -> Option<Self> {
-        // Exactly 32 hex digits: `from_str_radix` alone would also accept a
-        // sign and a shorter string.
+        // `from_str_radix` on its own would also accept a sign and a shorter
+        // string, so the length and the digits are checked first.
         if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return None;
         }
@@ -571,25 +612,8 @@ impl<'de> serde::Deserialize<'de> for AssetGuid {
 // AssetManager
 // =============================================================================
 
-/// Rebuild one asset type's function table from the calling generation's code.
-///
-/// The address of this function is what [`AssetManager::register`] records per
-/// type. Calling it from a freshly loaded generation re-points that type's
-/// column at that generation, which is what keeps the column usable after the
-/// generation that filled it is evicted from the reload graveyard.
-fn refresh_column_ops<T>(
-    columns: &mut TraitTypeMap<dyn Asset, ErasedVecFamily>,
-    storage_key: TypeId,
-) where
-    T: Asset + TraitAccessible<dyn Asset>,
-{
-    if let Some(column) = columns.get_trait_storage_mut(storage_key) {
-        column.refresh_ops(ErasedVecStorageOps::of::<T>());
-    }
-}
-
-/// How to refresh one asset type's column, given its storage key; see
-/// [`refresh_column_ops`].
+/// The function that refreshes one asset type's column, given its storage key;
+/// see [`refresh_column_ops`].
 type AssetOpsRefresher = fn(&mut TraitTypeMap<dyn Asset, ErasedVecFamily>, TypeId);
 
 /// Stores many assets per type, each addressed by a [`Handle`].
@@ -625,28 +649,32 @@ pub struct AssetManager {
     metadata: HashMap<TypeId, AssetColumn>,
     /// The storage key of each shared asset type, by its shared identity.
     ///
-    /// Recorded by the first registration and never replaced, so every binary's
-    /// copy of the type reaches the one column. A `TypeId` is only a value
+    /// Written by the first registration and never replaced, so every binary's
+    /// copy of the type reaches the same column. A `TypeId` is only a value
     /// here: it stays a valid key after the binary it came from is unloaded.
     shared_keys: HashMap<u128, TypeId>,
-    /// How to rebuild each registered type's table from the generation that
-    /// last registered it; see [`Self::rehome`].
+    /// The function that rebuilds each registered type's table, as recorded by
+    /// the last registration of that type; see [`Self::rehome`].
     ops_refreshers: HashMap<TypeId, AssetOpsRefresher>,
-    /// Each registered type's registered name - its shared name, or its Rust
-    /// type name without one - by its Rust type path, so a caller that knows
-    /// only the path (a C# mirror, which carries `std::any::type_name`) finds
-    /// the name references use. Owned copies.
+    /// The name each asset type is registered under, looked up by its Rust type
+    /// path.
+    ///
+    /// The name is the type's shared name, or its Rust type name when it has
+    /// none. A caller that knows only the path - the C# mirror, which carries
+    /// `std::any::type_name` - uses this to find the name that asset references
+    /// use. The strings are owned copies.
     registered_names: HashMap<String, String>,
-    /// Changes whenever stored asset data may have changed.
+    /// The change counter that renderer upload caches compare against.
     revision: u64,
 }
 
-/// The shared name the store's C# mirror registers under
+/// The shared name that the store's C# mirror registers the manager under
 /// (`[NativeResource("pill_engine::asset::AssetManager")]`).
 ///
-/// Shared rather than `TypeId`-keyed so both languages compute one identity: the
-/// managed mirror hashes the same string, and every artifact that links the
-/// engine agrees on it without comparing `TypeId`s.
+/// The name is shared instead of being keyed by `TypeId`, so both languages end
+/// up with the same identity: the managed mirror hashes the same string, and
+/// every artifact that links the engine agrees on the identity without comparing
+/// `TypeId`s.
 pub const ASSET_MANAGER_SHARED_NAME: &str = "pill_engine::asset::AssetManager";
 
 impl Resource for AssetManager {
@@ -656,15 +684,15 @@ impl Resource for AssetManager {
 }
 
 impl AssetManager {
-    /// The registered name of the asset type whose Rust type path is
-    /// `type_path` (`std::any::type_name`), if one registered: what a
-    /// `Handle<T>` field's asset type is recorded as.
+    /// Returns the registered name of the asset type whose Rust type path is
+    /// `type_path` (`std::any::type_name`), if a type with that path registered.
+    /// This is the name a `Handle<T>` field's asset type is recorded as.
     pub fn registered_asset_type(&self, type_path: &str) -> Option<&str> {
         self.registered_names.get(type_path).map(String::as_str)
     }
 
-    /// The storage key `T`'s column is kept under, or `None` when `T` is a
-    /// shared type no binary has registered yet.
+    /// Returns the storage key that `T`'s column is kept under, or `None` when
+    /// `T` is a shared type that no binary has registered yet.
     #[inline]
     fn key_of<T: Asset>(&self) -> Option<TypeId> {
         match T::shared_identity() {
@@ -686,7 +714,11 @@ impl AssetManager {
         self.metadata.get_mut(&key)
     }
 
-    /// `T`'s column. Panics when `T` has none: callers check first.
+    /// `T`'s column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `T` has no column: every caller checks first.
     #[inline]
     fn column<T: Asset>(&self) -> &ErasedVecStorage<dyn Asset> {
         let key = self.key_of::<T>().expect("the asset type is registered");
@@ -695,7 +727,11 @@ impl AssetManager {
             .expect("the asset type's column exists")
     }
 
-    /// `T`'s column, mutably. Panics when `T` has none: callers check first.
+    /// `T`'s column, mutably.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `T` has no column: every caller checks first.
     #[inline]
     fn column_mut<T: Asset>(&mut self) -> &mut ErasedVecStorage<dyn Asset> {
         let key = self.key_of::<T>().expect("the asset type is registered");
@@ -704,28 +740,32 @@ impl AssetManager {
             .expect("the asset type's column exists")
     }
 
-    /// Create an empty manager holding no asset types.
+    /// Creates an empty manager with no asset types.
     ///
-    /// Types register themselves on first use, so nothing needs declaring up
-    /// front - a project that loads no meshes carries no mesh column. Declaring
-    /// a type with [`Self::register`] is for types whose owning artifact
-    /// reloads; see that method for why it matters there.
+    /// Types register themselves on first use, so nothing has to be declared in
+    /// advance: a project that loads no meshes carries no mesh column. Declaring
+    /// a type with [`Self::register`] is for types owned by a part of the code
+    /// that reloads; see that method for why it matters there.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Monotonic change counter used by renderer upload caches.
+    /// The change counter that renderer upload caches compare against.
+    ///
+    /// It moves on every operation that may change stored asset data: adding an
+    /// asset, borrowing one mutably, and removing one.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    /// Content version of the slot `handle` names, or `None` when stale.
+    /// Returns the content version of the slot that `handle` names, or `None`
+    /// when the handle is stale.
     ///
-    /// Bumped whenever the value is mutably borrowed, so a consumer that
-    /// mirrors assets can rebuild the one asset that changed instead of every
-    /// asset. Meaningful only within one handle: a refilled slot keeps the
-    /// counter its previous occupant left, so versions from two handles never
-    /// compare.
+    /// The version adds one whenever the value is borrowed mutably, so a
+    /// consumer that mirrors assets can rebuild the one asset that changed
+    /// instead of all of them. A version is only meaningful through one handle:
+    /// a refilled slot keeps the counter its previous occupant left, so versions
+    /// from two different handles cannot be compared.
     pub fn content_version<T>(&self, handle: Handle<T>) -> Option<u64>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -738,17 +778,19 @@ impl AssetManager {
             .copied()
     }
 
-    /// Store `asset` and return a handle to it.
+    /// Stores `asset` and returns a handle to it.
     ///
-    /// Registers `T` first: adding an asset type is also when its column,
-    /// metadata and function table are created or refreshed, and the shared
-    /// column's layout is checked. Reuses a slot freed by [`Self::remove`] when
-    /// one is available, so a project that repeatedly loads and unloads does
-    /// not grow the column without bound.
+    /// The type is registered first. That is also when its column, its metadata
+    /// and its function table are created or refreshed, and when the layout of a
+    /// shared column is checked. A slot freed by [`Self::remove`] is reused when
+    /// one is free, so a project that loads and unloads repeatedly does not grow
+    /// the column without bound.
     pub fn add<T>(&mut self, asset: T) -> Handle<T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
+        // Step 1: Create the type's column and metadata if this is its first
+        // asset, or refresh them if it is not.
         self.register::<T>();
 
         let key = self.key_of::<T>().expect("register created the type");
@@ -761,9 +803,8 @@ impl AssetManager {
             .get_mut(&key)
             .expect("column metadata is created alongside the column");
 
-        // Refill a freed slot when one exists; otherwise append one and give it
-        // generation 0. The value always lands in a fresh row, so a refilled
-        // slot never inherits the row its previous occupant occupied.
+        // Step 2: Reuse a freed slot when one exists; otherwise add one and
+        // give it generation 0.
         let index = match metadata.free_slots.pop() {
             Some(index) => index,
             None => {
@@ -774,6 +815,8 @@ impl AssetManager {
                 index
             }
         };
+        // Step 3: Put the value in a new row and point the slot at it. A
+        // refilled slot never keeps the row its previous occupant used.
         let row = storage.len() as u32;
         storage.push(asset);
         metadata.slot_rows[index as usize] = row;
@@ -788,18 +831,18 @@ impl AssetManager {
         }
     }
 
-    /// Store `asset` under `name` and return a handle to it.
+    /// Stores `asset` under `name` and returns a handle to it.
     ///
-    /// The name is a lookup key for code that resolves assets by string - a
-    /// scene file naming a mesh, say. A name that already addresses a live asset
-    /// is refused rather than rebound, so a second load of the same key is
-    /// reported instead of quietly adding a copy nothing looks up; remove the
-    /// first with [`Self::remove`] when a deliberate replacement is wanted.
+    /// The name is a lookup key for code that finds assets by string, such as a
+    /// scene file naming a mesh. A name that already addresses a live asset is
+    /// refused rather than rebound, so loading the same key twice is reported
+    /// instead of quietly adding a copy that nothing looks up. Remove the first
+    /// asset with [`Self::remove`] when a replacement is intended.
     ///
     /// # Errors
     ///
-    /// [`AssetBindingError::NameInUse`] when `name` already addresses a live
-    /// asset. Nothing is stored and no handle is issued.
+    /// Returns [`AssetBindingError::NameInUse`] when `name` already addresses a
+    /// live asset. Nothing is stored and no handle is issued.
     pub fn add_named<T>(
         &mut self,
         name: impl Into<String>,
@@ -823,16 +866,16 @@ impl AssetManager {
         Ok(handle)
     }
 
-    /// Give the live asset `handle` a new name, keeping its handle, guid and
-    /// value.
+    /// Renames the live asset `handle`, keeping its handle, guid and value.
     ///
-    /// What following a moved source file needs: everything that holds the
-    /// handle or the guid keeps working, and only lookups by the old name stop
-    /// resolving. Renaming an asset to the name it already has is a no-op.
+    /// This is what following a moved source file needs: everything that holds
+    /// the handle or the guid keeps working, and only lookups by the old name
+    /// stop resolving. Renaming an asset to the name it already has does
+    /// nothing.
     ///
     /// # Errors
     ///
-    /// [`AssetBindingError::NameInUse`] when another live asset has
+    /// Returns [`AssetBindingError::NameInUse`] when another live asset has
     /// `new_name`, and [`AssetBindingError::StaleHandle`] when `handle` is
     /// stale. Nothing changes on an error.
     pub fn rename<T>(
@@ -859,11 +902,11 @@ impl AssetManager {
         Ok(())
     }
 
-    /// Store `asset` under `guid` and return a handle to it.
+    /// Stores `asset` under `guid` and returns a handle to it.
     ///
-    /// Unlike [`Self::add_named`], a guid already in use is rebound: it points
-    /// at the new asset and leaves the old one reachable by its handle. Nothing
-    /// is unloaded.
+    /// Unlike [`Self::add_named`], a guid that is already in use is rebound: it
+    /// points at the new asset and leaves the old one reachable by its handle.
+    /// Nothing is unloaded.
     pub fn add_with_guid<T>(&mut self, guid: AssetGuid, asset: T) -> Handle<T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -873,10 +916,10 @@ impl AssetManager {
         handle
     }
 
-    /// Store `asset` under both a name and a guid.
+    /// Stores `asset` under both a name and a guid.
     ///
-    /// The usual shape for a cooked asset: the name is what a scene file
-    /// writes, the guid is what survives the name changing.
+    /// This is the usual shape for a cooked asset: the name is what a scene file
+    /// writes, and the guid is what survives the name changing.
     ///
     /// # Errors
     ///
@@ -896,9 +939,9 @@ impl AssetManager {
         Ok(handle)
     }
 
-    /// Point `guid` at the asset already living in `slot_index`.
+    /// Points `guid` at the asset that already lives in `slot_index`.
     ///
-    /// Shared by the two guid-assigning entry points.
+    /// Both guid-assigning entry points call this.
     fn bind_guid<T>(&mut self, guid: AssetGuid, slot_index: u32)
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -909,7 +952,8 @@ impl AssetManager {
         metadata.guid_index.bind(guid, slot_index);
     }
 
-    /// Borrow the asset `handle` refers to, or `None` when it is stale.
+    /// Borrows the asset that `handle` refers to, or returns `None` when the
+    /// handle is stale.
     pub fn get<T>(&self, handle: Handle<T>) -> Option<&T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -921,7 +965,8 @@ impl AssetManager {
         Some(self.column::<T>().get::<T>(row as usize))
     }
 
-    /// Mutably borrow the asset `handle` refers to, or `None` when it is stale.
+    /// Mutably borrows the asset that `handle` refers to, or returns `None` when
+    /// the handle is stale.
     pub fn get_mut<T>(&mut self, handle: Handle<T>) -> Option<&mut T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -930,9 +975,9 @@ impl AssetManager {
             return None;
         }
         self.revision = self.revision.wrapping_add(1);
-        // One counter per slot, not per column: it is what tells a mirrored
-        // consumer which single asset moved, and borrowing one value must not
-        // look like a change to every asset.
+        // One counter per slot, not one per column. It tells a mirrored
+        // consumer which single asset changed, so borrowing one value does not
+        // look like a change to all of them.
         let version = &mut self
             .metadata_of_mut::<T>()
             .expect("a live handle implies existing metadata")
@@ -942,7 +987,7 @@ impl AssetManager {
         Some(self.column_mut::<T>().get_mut::<T>(row as usize))
     }
 
-    /// Resolve a name to a live handle, or `None` when nothing holds it.
+    /// Returns a live handle for `name`, or `None` when nothing holds it.
     pub fn handle_by_name<T>(&self, name: &str) -> Option<Handle<T>>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -956,7 +1001,8 @@ impl AssetManager {
         })
     }
 
-    /// Borrow an asset by name, or `None` when nothing holds it.
+    /// Borrows the asset stored under `name`, or returns `None` when nothing
+    /// holds it.
     pub fn get_by_name<T>(&self, name: &str) -> Option<&T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -964,7 +1010,7 @@ impl AssetManager {
         self.get(self.handle_by_name::<T>(name)?)
     }
 
-    /// Resolve a guid to a live handle, or `None` when nothing holds it.
+    /// Returns a live handle for `guid`, or `None` when nothing holds it.
     pub fn handle_by_guid<T>(&self, guid: AssetGuid) -> Option<Handle<T>>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -978,7 +1024,8 @@ impl AssetManager {
         })
     }
 
-    /// Borrow an asset by guid, or `None` when nothing holds it.
+    /// Borrows the asset stored under `guid`, or returns `None` when nothing
+    /// holds it.
     pub fn get_by_guid<T>(&self, guid: AssetGuid) -> Option<&T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -986,7 +1033,8 @@ impl AssetManager {
         self.get(self.handle_by_guid::<T>(guid)?)
     }
 
-    /// Mutably borrow an asset by name, or `None` when nothing holds it.
+    /// Mutably borrows the asset stored under `name`, or returns `None` when
+    /// nothing holds it.
     pub fn get_by_name_mut<T>(&mut self, name: &str) -> Option<&mut T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -994,7 +1042,8 @@ impl AssetManager {
         self.get_mut(self.handle_by_name::<T>(name)?)
     }
 
-    /// Mutably borrow an asset by guid, or `None` when nothing holds it.
+    /// Mutably borrows the asset stored under `guid`, or returns `None` when
+    /// nothing holds it.
     pub fn get_by_guid_mut<T>(&mut self, guid: AssetGuid) -> Option<&mut T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -1002,7 +1051,8 @@ impl AssetManager {
         self.get_mut(self.handle_by_guid::<T>(guid)?)
     }
 
-    /// The name `handle` was stored under, or `None` when it has none.
+    /// Returns the name that `handle` was stored under, or `None` when it has
+    /// none.
     pub fn name_of<T>(&self, handle: Handle<T>) -> Option<&str>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -1016,7 +1066,8 @@ impl AssetManager {
             .map(String::as_str)
     }
 
-    /// The guid `handle` was stored under, or `None` when it has none.
+    /// Returns the guid that `handle` was stored under, or `None` when it has
+    /// none.
     pub fn guid_of<T>(&self, handle: Handle<T>) -> Option<AssetGuid>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -1024,15 +1075,18 @@ impl AssetManager {
         if !self.is_live(handle) {
             return None;
         }
-        self.metadata_of::<T>()?.guid_index.key_of(handle.index).copied()
+        self.metadata_of::<T>()?
+            .guid_index
+            .key_of(handle.index)
+            .copied()
     }
 
-    /// Record the import settings `handle` was decoded with, as the JSON a
-    /// metadata file carries; see `asset_metadata`.
+    /// Records the import settings that `handle` was decoded with, as the JSON
+    /// that a metadata file carries; see `asset_metadata`.
     ///
     /// The metadata layer calls this when it decoded an asset with settings of
-    /// its own - no metadata file supplied them - so a later `ensure_metadata`
-    /// writes those instead of the type's defaults.
+    /// its own because no metadata file supplied any. A later `ensure_metadata`
+    /// then writes those settings instead of the type's defaults.
     pub(crate) fn set_import_settings<T>(&mut self, handle: Handle<T>, settings: serde_json::Value)
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -1045,8 +1099,8 @@ impl AssetManager {
         }
     }
 
-    /// The import settings `handle` was decoded with, when they were recorded;
-    /// see [`Self::set_import_settings`].
+    /// Returns the import settings that `handle` was decoded with, when they
+    /// were recorded; see [`Self::set_import_settings`].
     pub(crate) fn import_settings<T>(&self, handle: Handle<T>) -> Option<&serde_json::Value>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -1057,12 +1111,12 @@ impl AssetManager {
         self.metadata_of::<T>()?.import_settings.get(&handle.index)
     }
 
-    /// Remove and return the asset `handle` refers to.
+    /// Removes the asset that `handle` refers to and returns it.
     ///
-    /// The slot is freed and its generation bumped, so every outstanding handle
-    /// to it - including this one - now resolves to `None`. Returns `None` when
-    /// the handle was already stale, which makes a double removal a no-op
-    /// rather than an error.
+    /// The slot is freed and its generation increases, so every outstanding
+    /// handle to it - including this one - now resolves to `None`. Returns
+    /// `None` when the handle was already stale, so removing twice does nothing
+    /// instead of failing.
     pub fn remove<T>(&mut self, handle: Handle<T>) -> Option<T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -1071,6 +1125,8 @@ impl AssetManager {
             return None;
         }
 
+        // Step 1: Find the row the slot occupies and take the value out of the
+        // packed column.
         let storage_key = self
             .key_of::<T>()
             .expect("a live handle implies a registered type");
@@ -1085,9 +1141,9 @@ impl AssetManager {
             .get_trait_storage_mut(storage_key)
             .expect("a live handle implies an existing column");
         let asset = storage.swap_remove::<T>(row as usize);
-        // A packed column moves its last row into the hole; that row's slot
-        // takes over the vacated index below, so handles follow the slot and
-        // not the row.
+        // Step 2: A packed column moves its last row into the hole. The slot
+        // that owned that row takes over the vacated slot index below, so
+        // handles follow the slot, not the row.
         let row_moved = (row as usize) < storage.len();
 
         let metadata = self
@@ -1096,22 +1152,24 @@ impl AssetManager {
             .expect("a live handle implies existing metadata");
 
         // The popped entry is the slot of the row that moved in, or the removed
-        // slot's own when the last row went - which needs no fix-up either way.
+        // slot itself when the last row went out; neither case needs a fix-up.
         let last_row_slot = metadata.row_slots.pop().expect("a live slot owns a row");
         if row_moved {
             metadata.slot_rows[last_row_slot as usize] = row;
             metadata.row_slots[row as usize] = last_row_slot;
         }
 
-        // Bump the generation so this handle, and every copy of it, stops
-        // resolving. Saturating rather than wrapping: at u32::MAX the slot is
-        // retired instead of silently validating ancient handles again.
+        // Step 3: Increase the generation so this handle, and every copy of it,
+        // stops resolving. It saturates instead of wrapping: at u32::MAX the
+        // slot is retired rather than allowed to validate old handles again.
         let generation = &mut metadata.generations[handle.index as usize];
         *generation = generation.saturating_add(1);
         if *generation < u32::MAX {
             metadata.free_slots.push(handle.index);
         }
 
+        // Step 4: Drop the name, guid and import settings that belonged to the
+        // slot.
         metadata.name_index.release(handle.index);
         metadata.guid_index.release(handle.index);
         metadata.import_settings.remove(&handle.index);
@@ -1121,7 +1179,7 @@ impl AssetManager {
         Some(asset)
     }
 
-    /// Whether `handle` still refers to a live asset.
+    /// Returns whether `handle` still refers to a live asset.
     pub fn contains<T>(&self, handle: Handle<T>) -> bool
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -1129,7 +1187,7 @@ impl AssetManager {
         self.is_live(handle) && self.slot_row::<T>(handle.index).is_some()
     }
 
-    /// Number of live assets of type `T`.
+    /// Returns the number of live assets of type `T`.
     pub fn len<T>(&self) -> usize
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -1140,7 +1198,7 @@ impl AssetManager {
         self.column::<T>().len()
     }
 
-    /// Whether no asset of type `T` is stored.
+    /// Returns whether the store holds no asset of type `T`.
     pub fn is_empty<T>(&self) -> bool
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -1148,17 +1206,17 @@ impl AssetManager {
         self.len::<T>() == 0
     }
 
-    /// Iterate every live asset of type `T`.
+    /// Iterates over every live asset of type `T`.
     ///
-    /// Order is row order, which is insertion order until the first removal
-    /// and arbitrary afterwards; callers needing a stable order must impose
-    /// one themselves.
+    /// The order is row order: insertion order until the first removal, and
+    /// arbitrary after that. A caller that needs a stable order has to impose
+    /// one.
     pub fn iter<T>(&self) -> impl Iterator<Item = &T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
-        // An unregistered type yields nothing rather than needing the column
-        // to exist.
+        // An unregistered type yields nothing; the column does not have to
+        // exist.
         self.metadata_of::<T>()
             .is_some()
             .then(|| self.column::<T>().iter::<T>())
@@ -1166,7 +1224,7 @@ impl AssetManager {
             .flatten()
     }
 
-    /// Iterate every live asset of type `T` with its handle.
+    /// Iterates over every live asset of type `T`, together with its handle.
     pub fn iter_handles<T>(&self) -> impl Iterator<Item = (Handle<T>, &T)>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -1178,8 +1236,9 @@ impl AssetManager {
                     .iter::<T>()
                     .enumerate()
                     .map(move |(row, asset)| {
-                        // Rows are packed; the handle names the slot the row
-                        // lives in, which is the index that survives a swap.
+                        // Rows are packed. The handle names the slot that the
+                        // row lives in, because the slot index is what survives
+                        // a swap.
                         let slot = metadata.row_slots[row];
                         (
                             Handle {
@@ -1195,48 +1254,56 @@ impl AssetManager {
             .flatten()
     }
 
-    /// Whether `handle`'s generation still matches its slot.
+    /// Returns whether `handle`'s generation still matches its slot's.
     ///
-    /// The single place a handle is validated, so every accessor agrees on what
-    /// "stale" means.
+    /// Every accessor checks handles here, so they all agree on what "stale"
+    /// means.
     fn is_live<T: Asset>(&self, handle: Handle<T>) -> bool {
         self.metadata_of::<T>()
             .and_then(|metadata| metadata.generations.get(handle.index as usize))
             .is_some_and(|generation| *generation == handle.generation)
     }
 
-    /// Row the live slot at `index` occupies, or `None` when nothing lives there.
+    /// Returns the row that the live slot at `index` occupies, or `None` when
+    /// nothing lives there.
     ///
-    /// The reverse lookup is what proves occupancy: a freed slot's stale row
-    /// entry answers to a different slot (or to no row), so even a handle that
-    /// guessed a freed slot's generation cannot reach another asset's row.
+    /// The check through `row_slots` is what proves the slot is occupied. A
+    /// freed slot's row entry belongs to another slot or to no row, so even a
+    /// handle that guessed a freed slot's generation cannot reach another
+    /// asset's row.
     fn slot_row<T: Asset>(&self, index: u32) -> Option<u32> {
         let metadata = self.metadata_of::<T>()?;
         let row = *metadata.slot_rows.get(index as usize)?;
         (metadata.row_slots.get(row as usize) == Some(&index)).then_some(row)
     }
 
-    /// Declare `T` as an asset type and re-point its column at this generation.
+    /// Declares `T` as an asset type and points its column at the code that is
+    /// running now.
     ///
-    /// Creating the column is implicit in using the type, but a *declaration*
-    /// also matters across a reload: the column's per-type table is code from
-    /// the artifact that filled it, so a generation that owns an asset type
-    /// should declare it in registration even when it adds no instance this run.
-    /// Declaring twice is harmless; the second call only refreshes it.
+    /// Using a type creates its column anyway, but an explicit declaration also
+    /// matters across a reload. The column's function table is code from the
+    /// copy that filled it, so the copy that owns an asset type should declare
+    /// the type when it registers, even if it adds no asset this run. Declaring
+    /// twice is harmless: the second call only refreshes the table.
     ///
     /// A shared asset type ([`Asset::shared_name`]) is keyed by the `TypeId` of
-    /// the first binary that registers it; a later registrant whose copy has
-    /// another size or alignment is refused with a panic before it can read a
-    /// row.
+    /// the first binary that registered it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a later registrant of a shared type has a copy of another
+    /// size or alignment, before that copy can read a row.
     pub fn register<T>(&mut self)
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
+        // Step 1: Record the name this type is registered under.
         let type_path = std::any::type_name::<T>();
         self.registered_names.insert(
             type_path.to_owned(),
             T::shared_name().unwrap_or(type_path).to_owned(),
         );
+        // Step 2: Find the storage key, creating it for a shared type.
         let key = match T::shared_identity() {
             Some(identity) => *self
                 .shared_keys
@@ -1244,9 +1311,10 @@ impl AssetManager {
                 .or_insert_with(TypeId::of::<T>),
             None => TypeId::of::<T>(),
         };
+        // Step 3: Refresh an existing column, or create one.
         if let Some(metadata) = self.metadata.get(&key) {
-            // Checked here, where a mismatch is a registration problem with
-            // one clear cause, rather than at the first read of a row.
+            // Checked here, where a mismatch is a registration problem with one
+            // clear cause, rather than at the first read of a row.
             assert!(
                 metadata.element_layout == (std::mem::size_of::<T>(), std::mem::align_of::<T>()),
                 "asset type {} does not match the layout of the shared column it is registered to",
@@ -1274,18 +1342,39 @@ impl AssetManager {
         );
     }
 
-    /// Re-point every registered asset column at its newest function table.
+    /// Points every registered asset column at its newest function table.
     ///
-    /// The reload transaction calls this beside the component and resource
-    /// re-homing passes, after the arriving generation registered and before
-    /// any retiring image can be evicted: a column keeps working only while its
-    /// table points at code that is still mapped. A type the arriving
-    /// generation neither declared nor used keeps the table it has - there is
+    /// The reload transaction calls this next to the component and resource
+    /// re-homing passes, after the new copy of the code registered and before
+    /// the old copy can be unloaded. A column keeps working only while its table
+    /// points at code that is still loaded. A type that the new copy neither
+    /// declared nor used keeps the table it already has, because there is
     /// nothing newer to point it at.
     pub fn rehome(&mut self) {
         for (key, refresher) in &self.ops_refreshers {
             refresher(&mut self.columns, *key);
         }
+    }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Rebuilds one asset type's function table from the code that is running now.
+///
+/// [`AssetManager::register`] records this function's address for each type. A
+/// freshly loaded copy of the code calls it to point that type's column at its
+/// own functions. Without that, the column would still call into the copy that
+/// filled it and stop working once that copy is unloaded.
+fn refresh_column_ops<T>(
+    columns: &mut TraitTypeMap<dyn Asset, ErasedVecFamily>,
+    storage_key: TypeId,
+) where
+    T: Asset + TraitAccessible<dyn Asset>,
+{
+    if let Some(column) = columns.get_trait_storage_mut(storage_key) {
+        column.refresh_ops(ErasedVecStorageOps::of::<T>());
     }
 }
 
@@ -1298,8 +1387,8 @@ mod tests {
     use super::*;
     use trait_type_map::impl_trait_accessible;
 
-    /// A rename keeps the handle and guid, moves the name, and refuses a name
-    /// another asset has or a stale handle.
+    /// A rename keeps the handle and the guid, moves the name, and refuses a
+    /// name that another asset holds or a stale handle.
     #[test]
     fn rename_keeps_the_handle_and_guid_and_refuses_a_taken_name() {
         let mut assets = AssetManager::new();
@@ -1379,9 +1468,10 @@ mod tests {
     }
     impl_trait_accessible!(dyn Asset; MismatchedMesh);
 
-    /// Two copies of one shared asset type reach one column: what one stores,
-    /// the other finds by handle, name and iteration, and can add to and
-    /// remove from.
+    /// Two copies of one shared asset type reach one column.
+    ///
+    /// What one copy stores, the other finds by handle, by name and by
+    /// iteration, and it can add to and remove from the same column.
     #[test]
     fn copies_of_a_shared_asset_type_share_one_column() {
         let mut assets = AssetManager::new();
@@ -1457,8 +1547,10 @@ mod tests {
         assert_eq!(assets.len::<Texture>(), 0);
     }
 
-    /// A guid resolves to the asset stored under it, and the two namespaces
-    /// are independent: a name lookup does not answer a guid and vice versa.
+    /// A guid resolves to the asset stored under it.
+    ///
+    /// The name and the guid are looked up separately: a name lookup does not
+    /// answer a guid, and the other way round.
     #[test]
     fn resolves_an_asset_by_guid() {
         let mut assets = AssetManager::new();
@@ -1486,9 +1578,9 @@ mod tests {
         assert_eq!(assets.guid_of(handle), Some(guid));
     }
 
-    /// Freeing a slot must drop its guid entry, or the next asset to land in
-    /// that slot would answer the dead guid - the wrong-asset failure the
-    /// generational handle exists to prevent, reintroduced through the index.
+    /// Freeing a slot must drop its guid entry. Otherwise the next asset to
+    /// take that slot would answer the dead guid - the wrong-asset failure that
+    /// the generational handle prevents, coming back through the index.
     #[test]
     fn removing_an_asset_releases_its_guid() {
         let mut assets = AssetManager::new();
@@ -1506,9 +1598,11 @@ mod tests {
     }
 
     /// Rebinding points the guid at the new asset and leaves the old one
-    /// reachable by handle. Guids rebind where names refuse, because a guid is
-    /// the identity a cook step pins an asset to rather than a lookup key a
-    /// second load can collide on.
+    /// reachable by its handle.
+    ///
+    /// Guids rebind where names are refused. A guid is the identity that a cook
+    /// step pins an asset to, not a lookup key that a second load can collide
+    /// on.
     #[test]
     fn rebinding_a_guid_moves_it_to_the_new_asset() {
         let mut assets = AssetManager::new();
@@ -1646,8 +1740,8 @@ mod tests {
         assert_ne!(assets.revision(), after_mutation);
     }
 
-    /// The per-slot content counter is what lets a GPU uploader rebuild one
-    /// edited asset instead of every asset: only a mutable borrow moves it.
+    /// The per-slot content counter lets a GPU uploader rebuild the one asset
+    /// that was edited instead of all of them. Only a mutable borrow moves it.
     #[test]
     fn content_version_moves_only_on_a_mutable_borrow() {
         let mut assets = AssetManager::new();
@@ -1738,7 +1832,7 @@ mod tests {
     }
 
     /// A name that is already bound is refused, and the asset holding it is
-    /// left exactly as it was - the collision is reported, not swallowed.
+    /// left exactly as it was - the collision is reported, not ignored.
     #[test]
     fn a_taken_name_is_refused() {
         let mut assets = AssetManager::new();
@@ -1944,12 +2038,14 @@ mod tests {
         );
     }
 
+    /// A loader over embedded bytes hands them back unchanged.
     #[test]
     fn asset_loader_returns_embedded_bytes() {
         let loader = AssetLoader::Bytes(vec![1, 2, 3].into_boxed_slice());
         assert_eq!(loader.load().unwrap(), [1, 2, 3]);
     }
 
+    /// A path is looked up below the mounted asset directory.
     #[test]
     fn asset_loader_resolves_paths_below_its_root() {
         let _mounted = crate::asset_store::mounted_directory_test_lock();

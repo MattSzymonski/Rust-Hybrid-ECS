@@ -20,26 +20,26 @@
 //!
 //! [`AssetManager::import`] is generic, so the type is fixed where it is called.
 //! A caller holding only `textures/a.png` needs the step from an extension to a
-//! type, which is what [`World::register_imported_asset`] records: each
+//! type. That step is what [`World::register_imported_asset`] records: each
 //! registration stores function pointers monomorphized for that type, in the
 //! binary that registered it.
 //!
-//! Those pointers are code from the registering DLL, which is unmapped some time
-//! after a reload retires it, so each registration's liveness rides on a marker
-//! resource the registering generation inserts:
+//! Those pointers are code from the registering DLL. The DLL is unmapped some
+//! time after a reload retires it, so each registration holds only a weak
+//! reference to a marker resource and stays callable only while that marker
+//! lives:
 //!
 //! - A reload's `init` registers again, which records fresh pointers into the
 //!   new image and replaces the marker.
-//! - A generation that stops registering a type, or a subject that is unloaded,
+//! - A generation that stops registering a type, or a module that is unloaded,
 //!   loses its claim on the marker. The host drops unclaimed resources while the
-//!   image is still mapped, which ends the registration: an entry holds only a
-//!   weak reference to the marker's token.
+//!   image is still mapped, which ends the registration.
 //!
 //! Several binaries can register one type: a project calls
 //! `pill_master_renderer_data::register` in its own `init`, and so does the data
-//! crate's own module. Each keeps its own registration and the newest live one is
-//! used, so a project that stops registering a type falls back to the module's
-//! registration instead of losing the type.
+//! crate's own module. Each keeps its own registration, and the newest live one
+//! is used. A project that stops registering a type therefore falls back to the
+//! module's registration instead of losing the type.
 //!
 //! [`World::register_imported_asset`]: crate::World::register_imported_asset
 
@@ -76,24 +76,26 @@ pub struct ErasedImportOutcome {
     pub type_name: String,
     /// The asset's name: its normalized path.
     pub name: String,
-    /// The asset's guid, or `None` when it has none - a path already loaded
-    /// under a name with no metadata file to draw one from.
+    /// The asset's guid, or `None` when it has none. That happens for a path
+    /// that was already loaded and has no metadata file.
     pub guid: Option<AssetGuid>,
-    /// The slot index of the asset's handle: with [`Self::generation`], the
-    /// handle a typed caller rebuilds with [`Handle::from_raw`](crate::Handle::from_raw).
+    /// The slot index of the asset's handle. Together with [`Self::generation`]
+    /// it is the raw pair a typed caller turns back into a handle with
+    /// [`Handle::from_raw`](crate::Handle::from_raw).
     pub index: u32,
     /// The generation of the asset's handle.
     pub generation: u32,
     /// Where the guid and settings came from.
     pub metadata: MetadataSource,
-    /// What the call did with a value that was already there, which is what a
-    /// consumer asking "did this change?" needs - and, unlike a bare bool, it
-    /// keeps loading from replacing.
+    /// What the call did with a value that was already there. A consumer that
+    /// asks "did this change?" needs this, and a plain bool could not tell
+    /// loading an existing value apart from replacing it.
     pub change: ImportChange,
     /// The asset's content version after the call.
     pub content_version: Option<u64>,
-    /// The asset's content version before the call, when it was loaded: a
-    /// reimport moves it, an import of a loaded path leaves it.
+    /// The asset's content version before the call, when it was loaded. A
+    /// reimport moves the version; an import of a path that was already loaded
+    /// leaves it as it was.
     pub previous_content_version: Option<u64>,
 }
 
@@ -167,7 +169,8 @@ impl ErasedImportOutcome {
     }
 }
 
-/// What a call did with the path's value, or with the path when it had none.
+/// What a call did with the value under a path, including the case where
+/// nothing was there yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportChange {
     /// Nothing was there: the asset was decoded and added.
@@ -190,11 +193,13 @@ type NormalizeSettingsFunction = fn(serde_json::Value) -> AssetLoadResult<serde_
 type IsLoadedFunction = fn(&AssetManager, &Path) -> bool;
 /// Drop the asset loaded under a path's name; `true` when one went.
 type RemoveLoadedFunction = fn(&mut AssetManager, &Path) -> bool;
-/// Follow a source moved with its metadata file; the old name, if it was one.
+/// Follow a source that was moved together with its metadata file, and return
+/// the name it had before the move, if any.
 type FollowMoveFunction = fn(&mut AssetManager, &Path) -> Result<Option<String>, AssetImportError>;
 /// A standalone type's default document, as JSON.
 type DefaultDocumentFunction = fn() -> AssetLoadResult<serde_json::Value>;
-/// Write a sourced asset's missing metadata file; the guid written, if any.
+/// Write a sourced asset's metadata file when it has none, and return the guid
+/// it wrote, if any.
 type EnsureMetadataFunction =
     fn(&AssetManager, &Path) -> Result<Option<AssetGuid>, AssetImportError>;
 /// What a handle of the type addresses, from its index and generation.
@@ -267,7 +272,7 @@ impl ImportFunctions {
     }
 
     /// The entry points for the standalone type `T`, compiled into the calling
-    /// binary. "Settings" are the asset's own document here.
+    /// binary. For this kind the import settings are the asset's own document.
     fn for_standalone_type<T: StandaloneAsset>() -> Self {
         Self {
             import: import_standalone_erased::<T>,
@@ -288,8 +293,8 @@ impl ImportFunctions {
     }
 }
 
-/// [`AssetManager::import_standalone`] for `T`; the policy does not apply, as
-/// a standalone file is never written by an import.
+/// [`AssetManager::import_standalone`] for `T`. The metadata policy does not
+/// apply here, because importing a standalone file never writes a file.
 fn import_standalone_erased<T: StandaloneAsset>(
     assets: &mut AssetManager,
     path: &Path,
@@ -363,11 +368,7 @@ where
 
 /// The live asset a `T` handle with `index` and `generation` addresses, or
 /// `None` when the handle is stale.
-fn asset_identity_of<T>(
-    assets: &AssetManager,
-    index: u32,
-    generation: u32,
-) -> Option<AssetIdentity>
+fn asset_identity_of<T>(assets: &AssetManager, index: u32, generation: u32) -> Option<AssetIdentity>
 where
     T: Asset + TraitAccessible<dyn Asset>,
 {
@@ -447,12 +448,6 @@ fn reimport_erased<T: ImportedAsset>(assets: &mut AssetManager, path: &Path) -> 
 // Errors
 // =============================================================================
 
-/// ` with guid <guid>` for an asset that has one, empty otherwise: a
-/// wrong-type message names a guid only when the caller's answer carries one.
-fn guid_clause(guid: &Option<AssetGuid>) -> String {
-    guid.map_or_else(String::new, |guid| format!(" with guid {guid}"))
-}
-
 /// Why an erased import, reimport or settings call did not run.
 #[derive(Debug, thiserror::Error)]
 pub enum ErasedImportError {
@@ -524,6 +519,13 @@ pub enum ImportRegistrationError {
     },
 }
 
+/// Builds the ` with guid <guid>` part of a wrong-type message. It is empty
+/// when there is no guid, so the message names one only when the caller's
+/// answer carries one.
+fn guid_clause(guid: &Option<AssetGuid>) -> String {
+    guid.map_or_else(String::new, |guid| format!(" with guid {guid}"))
+}
+
 // =============================================================================
 // ImportRegistry
 // =============================================================================
@@ -531,7 +533,8 @@ pub enum ImportRegistrationError {
 /// One binary's registration of a type.
 #[derive(Clone)]
 struct Registration {
-    /// Alive while the registering generation's marker resource is.
+    /// A weak reference that stays valid while the registering generation's
+    /// marker resource lives.
     alive: Weak<()>,
     /// The extensions that binary's copy of the type declared.
     extensions: Vec<String>,
@@ -568,33 +571,36 @@ impl ImportedTypeEntry {
 /// extension.
 ///
 /// Filled by [`World::register_imported_asset`](crate::World::register_imported_asset)
-/// in each module's registration; see the module docs for why an entry can
-/// outlive neither the binary it points into nor that binary's claim.
+/// when a module or project registers its types. The module docs explain why an
+/// entry cannot outlive the binary it points into, nor that binary's claim on
+/// it.
 ///
-/// Cloning is cheap - a few entries of weak references and function pointers -
-/// and is how host code calls it against the world's
+/// Cloning is cheap: the type holds a few entries of weak references and
+/// function pointers. Host code clones it to call it against the world's
 /// [`AssetManager`](crate::AssetManager), which is another resource of the
-/// same world. A clone follows the same liveness: a registration retired
-/// after the clone was taken is skipped by the clone too.
+/// same world. A clone keeps the same rule: it skips a registration that is
+/// retired after the clone was taken.
 #[derive(Default, Clone)]
 pub struct ImportRegistry {
+    /// One entry per imported asset type, in the order the type was first
+    /// registered.
     entries: Vec<ImportedTypeEntry>,
-    /// The reference fields each type declares, by owner type name: the field
-    /// key a settings document uses and the type name it points at. A key that
-    /// ends in `.*` covers a family - `textures.*` is every texture slot the
-    /// asset's shader declares.
+    /// The reference fields each type declares, by owner type name. Each pair
+    /// is the field key a settings document uses and the type name it points
+    /// at. A key that ends in `.*` covers a whole family: `textures.*` is every
+    /// texture slot the asset's shader declares.
     references: std::collections::BTreeMap<String, Vec<(String, String)>>,
 }
 
 impl Resource for ImportRegistry {}
 
 impl ImportRegistry {
-    /// Record `T`'s entry points, alive for as long as `alive` has a strong
-    /// reference.
+    /// Record `T`'s entry points. They stay callable for as long as `alive`
+    /// has a strong reference.
     ///
     /// Registering a type again (a reload, or a second binary) adds a newer
-    /// registration that takes precedence; the older one is pruned once it
-    /// dies.
+    /// registration that takes precedence. The older one is dropped by the next
+    /// prune once it is no longer alive.
     ///
     /// # Errors
     ///
@@ -639,13 +645,13 @@ impl ImportRegistry {
         alive: Weak<()>,
     ) -> Result<(), ImportRegistrationError> {
         self.prune();
+        // Step 1: Normalize the extensions and refuse a clash with a live type.
+        // Two types sharing an extension would make a file's type depend on
+        // registration order, so the error names both.
         let extensions: Vec<String> = extensions
             .iter()
             .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
             .collect();
-
-        // Two types sharing an extension would make a file's type depend on
-        // registration order; refuse it with both names instead.
         for extension in &extensions {
             if let Some(other) = self.type_for_extension(extension) {
                 if other != type_name {
@@ -658,6 +664,8 @@ impl ImportRegistry {
             }
         }
 
+        // Step 2: Add the registration to the type's entry, creating the entry
+        // when the type is registered for the first time.
         let registration = Registration {
             alive,
             extensions,
@@ -684,8 +692,9 @@ impl ImportRegistry {
             entry.registrations.retain(Registration::is_alive);
         }
         self.entries.retain(|entry| !entry.registrations.is_empty());
-        // A reference declaration belongs to the type that made it: a type no
-        // generation registers any more takes its declarations with it.
+        // A reference declaration belongs to the type that made it. When no
+        // generation registers a type any more, its declarations are dropped
+        // too.
         let live: std::collections::BTreeSet<String> = self
             .entries
             .iter()
@@ -694,14 +703,15 @@ impl ImportRegistry {
         self.references.retain(|owner, _| live.contains(owner));
     }
 
-    /// Record the reference fields `owner_type` declares: `(field key, target
-    /// type name)` pairs.
+    /// Record the reference fields `owner_type` declares, as `(field key,
+    /// target type name)` pairs.
     ///
-    /// A registry call rather than a schema in the file: the target is the Rust
-    /// type the field holds, named by [`ImportedAsset::metadata_type_name`] or
-    /// [`StandaloneAsset::metadata_type_name`], so a renamed type moves here
-    /// with the code instead of drifting. Declaring again replaces the owner's
-    /// whole list, which is what a reload does.
+    /// The target is the Rust type the field holds, named by
+    /// [`ImportedAsset::metadata_type_name`] or
+    /// [`StandaloneAsset::metadata_type_name`]. Because the name comes from the
+    /// code, a renamed type changes here with it instead of drifting away.
+    /// Declaring again replaces the owner's whole list, which is what a reload
+    /// does.
     pub fn declare_references(&mut self, owner_type: &str, references: &[(&str, &str)]) {
         let declared: Vec<(String, String)> = references
             .iter()
@@ -711,8 +721,8 @@ impl ImportRegistry {
     }
 
     /// The reference fields `owner_type` declares, as `(field key, target type
-    /// name)` pairs in declaration order. A key ending in `.*` is the family a
-    /// caller expands from its own document.
+    /// name)` pairs in declaration order. A key that ends in `.*` names a
+    /// family; a caller turns it into the concrete keys its own document uses.
     pub fn reference_fields(&self, owner_type: &str) -> &[(String, String)] {
         self.references
             .get(owner_type)
@@ -861,8 +871,9 @@ impl ImportRegistry {
     ///
     /// # Errors
     ///
-    /// [`ErasedImportError::UnknownExtension`] and its siblings when no type
-    /// is chosen, and [`ErasedImportError::Import`] when the import fails.
+    /// [`ErasedImportError::UnknownExtension`], [`ErasedImportError::NoExtension`]
+    /// or [`ErasedImportError::MetadataFile`] when no type can be chosen, and
+    /// [`ErasedImportError::Import`] when the import fails.
     pub fn import(
         &self,
         assets: &mut AssetManager,
@@ -1108,9 +1119,10 @@ impl ImportRegistry {
             .is_ok_and(|functions| (functions.is_loaded)(assets, path))
     }
 
-    /// Drop the asset loaded under `path`'s name, if any: what a delete calls
-    /// once the file is gone, so re-creating the path does not collide with the
-    /// old asset on its guid. `false` for a path nothing has loaded.
+    /// Drop the asset loaded under `path`'s name, if there is one. A delete
+    /// calls this once the file is gone, so a new file at the same path does
+    /// not collide with the old asset's guid. Returns `false` when no asset was
+    /// loaded.
     pub fn remove_loaded(&self, assets: &mut AssetManager, path: &Path) -> bool {
         self.functions_for_path(path)
             .is_ok_and(|functions| (functions.remove_loaded)(assets, path))
@@ -1188,7 +1200,7 @@ impl ImportRegistry {
     /// and each file is imported by its path relative to it, exactly as loading
     /// code names it. Metadata files are skipped (they are read with their
     /// source), as are dot-files such as the temporary files a metadata write
-    /// leaves for an instant. A file of an unknown extension is not an error:
+    /// leaves behind briefly. A file of an unknown extension is not an error:
     /// the extension is reported once in the result, however many files carry
     /// it.
     ///
@@ -1202,14 +1214,18 @@ impl ImportRegistry {
     ) -> ScanReport {
         let mut report = ScanReport::default();
         let mut unknown = BTreeSet::new();
-        // Standalone files last: they refer to other assets by guid, and a
-        // reference to an asset not loaded yet resolves to nothing.
+        // Step 1: Split the files into sourced and standalone ones. Standalone
+        // files are imported last, because they refer to other assets by guid
+        // and a reference to an asset that is not loaded yet resolves to
+        // nothing.
         let (standalone, sourced): (Vec<PathBuf>, Vec<PathBuf>) =
             source_files(root).into_iter().partition(|path| {
                 path.extension()
                     .and_then(|extension| extension.to_str())
                     .is_some_and(|extension| self.is_standalone_extension(extension))
             });
+        // Step 2: Import each file and record it by what happened to it:
+        // imported, already loaded, or failed.
         for relative in sourced.into_iter().chain(standalone) {
             let name = relative.to_string_lossy().replace('\\', "/");
             match self.import(assets, &relative, policy) {
@@ -1292,6 +1308,10 @@ impl<T> ImportRegistrationMarker<T> {
 }
 
 impl<T: 'static> Resource for ImportRegistrationMarker<T> {}
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1538,9 +1558,9 @@ mod tests {
         ));
     }
 
-    /// The world-level registration: the marker is a resource of the world,
-    /// so removing it - which is what the host does to a resource a retired
-    /// generation no longer claims - ends the registration.
+    /// The world-level registration: the marker is a resource of the world.
+    /// Removing it ends the registration, and that is what the host does to a
+    /// resource a retired generation no longer claims.
     #[test]
     fn the_world_registration_lives_as_long_as_its_marker_resource() {
         let mut world = World::new();
@@ -1576,7 +1596,8 @@ mod tests {
             None
         );
 
-        // The reload's re-homing pass drops the dead entry outright.
+        // The reload's re-homing pass removes the entry that has no live
+        // registration left.
         world.rehome_assets();
         assert!(world
             .get_resource::<ImportRegistry>()
@@ -1677,8 +1698,8 @@ mod tests {
         }
     }
 
-    /// A path's guid and a guid's name and handle answer for what the store
-    /// holds, and a guid no type loaded answers nothing. The loaded list names
+    /// A path's guid and a guid's name and handle come back as the store holds
+    /// them, and a guid no type loaded returns nothing. The loaded list names
     /// every asset of the type, which is how a picker learns about an asset
     /// built in code.
     #[test]

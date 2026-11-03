@@ -6,18 +6,19 @@
 //! - Provides [`SystemAccess`] for declaring what a system reads and writes.
 //! - Builds the conflict matrix and the parallel batches from the registered
 //!   systems' access patterns.
-//! - Tracks whether that derived data is out of date
-//!   ([`SystemScheduler::invalidate`]).
+//! - Tracks when those results need rebuilding, through
+//!   [`SystemScheduler::invalidate`] and [`SystemScheduler::clear`].
 //! - Defines [`TypeKey`], a [`TypeId`] wrapper for callers that key native
 //!   types by identity.
 //!
 //! # Design
 //!
 //! Each system declares which components and resources it reads and writes.
-//! The scheduler compares every pair of systems (an O(n²) check): two systems
-//! conflict when one writes something the other reads or writes. Systems that
-//! do not conflict share a parallel batch. A system that uses
-//! [`Commands`](crate::Commands) conflicts with every other system, so it
+//! The scheduler compares every pair of systems, so the cost grows with the
+//! square of the system count (O(n²)). Two systems conflict when one writes
+//! something the other reads or writes. Systems that do not conflict share a
+//! parallel batch. A system that uses [`Commands`](crate::Commands) needs
+//! exclusive access to the world, so it conflicts with every other system and
 //! always runs alone.
 //!
 //! The scheduler keeps no list of systems of its own. The engine owns the
@@ -62,23 +63,25 @@ impl TypeKey {
 
 /// What a system reads and writes: its component and resource access.
 ///
-/// The sets are filled with [`add_read`](SystemAccess::add_read),
+/// Call [`add_read`](SystemAccess::add_read),
 /// [`add_write`](SystemAccess::add_write),
 /// [`add_resource_read`](SystemAccess::add_resource_read) and
-/// [`add_resource_write`](SystemAccess::add_resource_write) while the system is
-/// registered, then compared directly by
-/// [`conflicts_with`](SystemAccess::conflicts_with).
+/// [`add_resource_write`](SystemAccess::add_resource_write) before the system
+/// is registered. [`conflicts_with`](SystemAccess::conflicts_with) then
+/// compares the sets directly.
 ///
-/// These sets are the only record of what a system touches: there is no
-/// derived cache that could fall out of step with them. Declare every access
-/// before the system is registered; the engine owns the pattern from then on.
+/// The sets are the only record of what a system touches, so no cached answer
+/// can disagree with them. The engine keeps the copy it was given when the
+/// system was registered, so an access added afterwards never reaches the
+/// batches.
 #[derive(Debug, Clone, Default)]
 pub struct SystemAccess {
     /// Components read immutably (`&T`).
     component_reads: HashSet<ComponentId>,
     /// Components written mutably (`&mut T`).
     component_writes: HashSet<ComponentId>,
-    /// Whether the system uses Commands (requires exclusive world access).
+    /// Whether the system uses `Commands`, which needs exclusive access to the
+    /// world.
     pub uses_commands: bool,
     /// Resources read immutably (`Res<T>`).
     resource_reads: HashSet<ResourceId>,
@@ -133,8 +136,8 @@ impl SystemAccess {
 
     /// How many components this system reads.
     ///
-    /// Reporting only; the ids themselves stay private so nothing can mutate
-    /// the set behind a registered system's back.
+    /// Reporting only: the ids stay private, so nothing outside this type can
+    /// change the set after registration.
     pub fn reads_count(&self) -> usize {
         self.component_reads.len()
     }
@@ -159,13 +162,12 @@ impl SystemAccess {
     /// Two systems conflict when either one uses [`Commands`](crate::Commands),
     /// or when one writes a component or resource the other reads or writes.
     /// The sets answer directly, so the result always matches what the systems
-    /// actually touch. A check that read a cached answer could miss an access
-    /// the cache did not know about, and then run two writers of one component
-    /// on different threads.
+    /// really touch. A cached answer could miss an access it never saw, and two
+    /// writers of one component would then run on different threads.
     ///
-    /// The sets are small - a handful of ids per system - so the comparisons
-    /// are cheap. The scheduler records the answer in its conflict matrix when
-    /// it rebuilds, and the frame reads the batches derived from that matrix.
+    /// The sets hold only a handful of ids per system, so the comparisons are
+    /// cheap. The scheduler stores the answer in its conflict matrix when it
+    /// rebuilds, and the frame runs the batches built from that matrix.
     #[inline]
     pub fn conflicts_with(&self, other: &SystemAccess) -> bool {
         // Step 1: Commands require exclusive world access, so a system that
@@ -174,8 +176,8 @@ impl SystemAccess {
             return true;
         }
 
-        // Step 2: Component conflicts: any write shared with the other side's
-        // reads or writes, in either direction.
+        // Step 2: A component write shared with the other side's reads or
+        // writes is a conflict, in either direction.
         if !self.component_writes.is_disjoint(&other.component_writes) {
             return true;
         }
@@ -186,8 +188,8 @@ impl SystemAccess {
             return true;
         }
 
-        // Step 3: Resource conflicts compare ids, not set sizes: two sets of
-        // the same size still conflict when they share an id.
+        // Step 3: Resource conflicts follow the same rule: a write shared with
+        // the other side's reads or writes is a conflict.
         if !self.resource_writes.is_disjoint(&other.resource_writes) {
             return true;
         }
@@ -211,16 +213,17 @@ impl SystemAccess {
 /// The matrix depends only on the access patterns it was built from, and the
 /// batches depend only on the matrix. Both are rebuilt together by
 /// [`ensure_execution_graph`](SystemScheduler::ensure_execution_graph) after
-/// [`invalidate`](SystemScheduler::invalidate), so one flag answers "is the
-/// graph current?" and no caller has to remember a rule.
+/// [`invalidate`](SystemScheduler::invalidate), so a single flag says whether
+/// the graph is current and no caller has to work that out.
 pub struct SystemScheduler {
     /// `conflict_matrix[i][j]` is true when system `i` conflicts with system
-    /// `j`. Rebuilt from the access patterns, never filtered in place.
+    /// `j`. Rebuilt from scratch from the access patterns, never edited in
+    /// place.
     conflict_matrix: Vec<Vec<bool>>,
-    /// Batches of system indices; each batch can run in parallel because no
-    /// two of its members conflict.
+    /// Batches of system indices. No two systems in one batch conflict, so a
+    /// batch can run in parallel.
     execution_graph: Vec<Vec<usize>>,
-    /// Whether the matrix and the graph predate the current system set.
+    /// Whether the matrix and the graph are older than the current system set.
     ///
     /// Starts true: a fresh scheduler has built nothing yet.
     needs_rebuild: bool,
@@ -235,26 +238,18 @@ impl SystemScheduler {
             needs_rebuild: true,
         }
     }
-}
 
-impl Default for SystemScheduler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SystemScheduler {
     /// Marks the conflict matrix and the batches stale.
     ///
-    /// Registrations and removals go through here; removing every system goes
-    /// through [`clear`](SystemScheduler::clear), which marks the graph stale
+    /// Registrations and removals call this. Removing every system calls
+    /// [`clear`](SystemScheduler::clear) instead, which marks the graph stale
     /// the same way. The rebuild itself happens once, in
     /// [`ensure_execution_graph`](SystemScheduler::ensure_execution_graph),
     /// so a module that registers many systems in its `init` pays for one
-    /// rebuild rather than one per registration.
+    /// rebuild, not one per registration.
     ///
-    /// A system's enabled state is not conflict data: disabled systems stay in
-    /// the batches they were assigned and are skipped at dispatch.
+    /// Enabled state is not conflict data: a disabled system stays in the batch
+    /// it was given and is skipped at dispatch.
     pub fn invalidate(&mut self) {
         self.needs_rebuild = true;
     }
@@ -264,16 +259,16 @@ impl SystemScheduler {
     ///
     /// `accesses` must yield every registered system's access pattern in
     /// registration order, and its length must be the number of registered
-    /// systems - the graph's indices are positions in that list. Does nothing
-    /// when nothing was invalidated since the last build.
+    /// systems, because the graph's indices are positions in that list. The
+    /// call does nothing when nothing was invalidated since the last build.
     ///
-    /// Batches are filled first-fit in registration order: each system joins
-    /// the earliest batch that holds nothing it conflicts with, and opens a new
-    /// batch at the end when no batch fits. Registration order is the only
-    /// ordering signal the engine offers (there is no `before`/`after`), so it
-    /// decides which of two conflicting systems runs first. The two are never
-    /// merged, and a later system cannot join any batch an earlier conflicting
-    /// system already occupies.
+    /// Batches are filled first-fit (each system takes the first batch it can
+    /// join): a system joins the earliest batch that holds nothing it conflicts
+    /// with, and opens a new batch at the end when no batch fits. Registration
+    /// order is the only ordering signal the engine offers (there is no
+    /// `before`/`after`), so it decides which of two conflicting systems runs
+    /// first. A later system can never join a batch that holds a system it
+    /// conflicts with.
     pub fn ensure_execution_graph<'a>(
         &mut self,
         accesses: impl ExactSizeIterator<Item = &'a SystemAccess>,
@@ -287,9 +282,9 @@ impl SystemScheduler {
         );
         let accesses: Vec<&SystemAccess> = accesses.collect();
 
-        // Step 1: The conflict matrix is a pure function of the access list.
-        // Each unordered pair is compared once and written to both cells, so
-        // the matrix stays symmetric.
+        // Step 1: Build the conflict matrix from the access list. Each unordered
+        // pair is compared once and the answer is written to both cells, so the
+        // matrix stays symmetric.
         self.conflict_matrix = vec![vec![false; accesses.len()]; accesses.len()];
         for (first, access) in accesses.iter().enumerate() {
             for (second, other) in accesses.iter().enumerate().take(first) {
@@ -299,10 +294,10 @@ impl SystemScheduler {
             }
         }
 
-        // Step 2: Fill the batches first-fit in registration order. The graph
-        // is moved out first so this loop can read the conflict matrix while it
-        // appends: a batch's members are decided by the systems already in it,
-        // never by the ones still to come.
+        // Step 2: Fill the batches first-fit in registration order. The previous
+        // graph is taken out first so the loop can push into a plain local while
+        // it reads the conflict matrix; a batch's members are decided by the
+        // systems already in it, never by the ones still to come.
         let mut batches = std::mem::take(&mut self.execution_graph);
         batches.clear();
         for system_index in 0..accesses.len() {
@@ -341,50 +336,58 @@ impl SystemScheduler {
     }
 }
 
+impl Default for SystemScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // =============================================================================
 // Conflict-detection regression tests
 // =============================================================================
 
-/// Conflict detection must depend only on what two systems touch.
+/// Confirms that conflict detection depends only on what two systems touch.
 ///
-/// These tests cover the shortcuts a cached answer could hide: an access added
-/// after a comparison, and two resource sets of equal size that share an id.
+/// The tests cover the ways a cached answer would go wrong: an access added
+/// after a comparison, two resource sets of equal size that still share an id,
+/// a read paired with a write in either direction, and systems that touch
+/// nothing in common.
 #[cfg(test)]
 mod conflict_detection_tests {
     use super::SystemAccess;
     use crate::component::Component;
     use crate::ComponentId;
 
-    struct Foo;
-    impl Component for Foo {}
-    struct Bar;
-    impl Component for Bar {}
-    struct ResOne;
-    impl crate::resource::Resource for ResOne {}
-    struct ResTwo;
-    impl crate::resource::Resource for ResTwo {}
-    struct ResThree;
-    impl crate::resource::Resource for ResThree {}
+    struct ComponentA;
+    impl Component for ComponentA {}
+    struct ComponentB;
+    impl Component for ComponentB {}
+    struct ResourceX;
+    impl crate::resource::Resource for ResourceX {}
+    struct ResourceY;
+    impl crate::resource::Resource for ResourceY {}
+    struct ResourceZ;
+    impl crate::resource::Resource for ResourceZ {}
 
     /// An access added after an earlier comparison is seen by the next one:
     /// the sets are read live, so no cached answer can go stale behind them.
     #[test]
     fn an_access_added_after_a_comparison_still_conflicts() {
-        let mut a = SystemAccess::new();
-        a.add_write(ComponentId::of::<Foo>());
+        let mut writes_a = SystemAccess::new();
+        writes_a.add_write(ComponentId::of::<ComponentA>());
 
-        let mut b = SystemAccess::new();
-        b.add_write(ComponentId::of::<Bar>());
+        let mut writes_b = SystemAccess::new();
+        writes_b.add_write(ComponentId::of::<ComponentB>());
         assert!(
-            !a.conflicts_with(&b),
+            !writes_a.conflicts_with(&writes_b),
             "disjoint while neither shares a write"
         );
 
         // The set grows after the two were compared; the next comparison has
         // to see the shared write.
-        a.add_write(ComponentId::of::<Bar>());
+        writes_a.add_write(ComponentId::of::<ComponentB>());
         assert!(
-            a.conflicts_with(&b),
+            writes_a.conflicts_with(&writes_b),
             "the sets are the source of truth and report the shared write"
         );
     }
@@ -396,14 +399,14 @@ mod conflict_detection_tests {
         use crate::resource::ResourceId;
 
         let mut reader = SystemAccess::new();
-        reader.add_read(ComponentId::of::<Foo>());
-        reader.add_resource_read(ResourceId::of::<ResOne>());
-        reader.add_resource_read(ResourceId::of::<ResTwo>());
+        reader.add_read(ComponentId::of::<ComponentA>());
+        reader.add_resource_read(ResourceId::of::<ResourceX>());
+        reader.add_resource_read(ResourceId::of::<ResourceY>());
 
         let mut writer = SystemAccess::new();
-        writer.add_write(ComponentId::of::<Bar>());
-        writer.add_resource_write(ResourceId::of::<ResTwo>());
-        writer.add_resource_write(ResourceId::of::<ResThree>());
+        writer.add_write(ComponentId::of::<ComponentB>());
+        writer.add_resource_write(ResourceId::of::<ResourceY>());
+        writer.add_resource_write(ResourceId::of::<ResourceZ>());
 
         assert_eq!(
             reader.resource_reads.len(),
@@ -421,7 +424,7 @@ mod conflict_detection_tests {
     /// much a conflict as two writes.
     #[test]
     fn a_read_paired_with_a_write_conflicts_in_both_directions() {
-        let id = ComponentId::of::<Foo>();
+        let id = ComponentId::of::<ComponentA>();
 
         let mut reader = SystemAccess::new();
         reader.add_read(id);
@@ -437,20 +440,20 @@ mod conflict_detection_tests {
     /// parallel, and two readers of one component never conflict.
     #[test]
     fn disjoint_systems_do_not_conflict() {
-        let mut a = SystemAccess::new();
-        a.add_write(ComponentId::of::<Foo>());
+        let mut writes_a = SystemAccess::new();
+        writes_a.add_write(ComponentId::of::<ComponentA>());
 
-        let mut b = SystemAccess::new();
-        b.add_write(ComponentId::of::<Bar>());
+        let mut writes_b = SystemAccess::new();
+        writes_b.add_write(ComponentId::of::<ComponentB>());
         assert!(
-            !a.conflicts_with(&b),
+            !writes_a.conflicts_with(&writes_b),
             "disjoint systems must still be allowed to run in parallel"
         );
 
         let mut reader = SystemAccess::new();
-        reader.add_read(ComponentId::of::<Foo>());
+        reader.add_read(ComponentId::of::<ComponentA>());
         let mut other_reader = SystemAccess::new();
-        other_reader.add_read(ComponentId::of::<Foo>());
+        other_reader.add_read(ComponentId::of::<ComponentA>());
         assert!(!reader.conflicts_with(&other_reader));
     }
 }
@@ -461,14 +464,15 @@ mod conflict_detection_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::BuildHasher;
+
     use super::*;
     use crate::component::{Component, ComponentId};
-    use std::hash::BuildHasher;
 
     // The scheduler only compares component ids for equality, so a test
     // component needs nothing but a distinct identity. `ComponentId::of` takes
-    // `T: Component`, which stops a caller from skipping a shared component's
-    // declared identity, so the stand-ins are declared here.
+    // `T: Component`, so each stand-in has to be declared here and implement
+    // the trait.
     macro_rules! test_components {
         ($($name:ident),* $(,)?) => {$(
             #[derive(Debug)]
@@ -554,8 +558,8 @@ mod tests {
 
     /// Two systems reading different components share one batch.
     #[test]
-    fn test_no_conflicts() {
-        // System 1: reads A. System 2: reads B.
+    fn two_readers_of_different_components_share_a_batch() {
+        // The first system reads A, the second reads B.
         let mut reads_a = SystemAccess::new();
         reads_a.add_read(ComponentId::of::<TestComponentA>());
         let mut reads_b = SystemAccess::new();
@@ -567,15 +571,15 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 2);
 
-        // Both systems should be in the same batch (no conflicts)
+        // Reading different components is no conflict, so both share a batch.
         assert_eq!(scheduler.execution_graph().len(), 1);
         assert_eq!(scheduler.execution_graph()[0].len(), 2);
     }
 
     /// Two systems writing the same component land in separate batches.
     #[test]
-    fn test_write_conflict() {
-        // System 1 and System 2 both write A.
+    fn two_writers_of_one_component_get_separate_batches() {
+        // Both systems write A.
         let mut writes_a = SystemAccess::new();
         writes_a.add_write(ComponentId::of::<TestComponentA>());
         let mut also_writes_a = SystemAccess::new();
@@ -587,14 +591,14 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 2);
 
-        // Systems must be in different batches (write-write conflict)
+        // Two writers of one component can never share a batch.
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
 
     /// A reader and a writer of the same component land in separate batches.
     #[test]
-    fn test_read_write_conflict() {
-        // System 1: reads A. System 2: writes A.
+    fn a_reader_and_a_writer_of_one_component_get_separate_batches() {
+        // The first system reads A, the second writes it.
         let mut reads_a = SystemAccess::new();
         reads_a.add_read(ComponentId::of::<TestComponentA>());
         let mut writes_a = SystemAccess::new();
@@ -606,7 +610,7 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 2);
 
-        // Systems must be in different batches (read-write conflict)
+        // A reader and a writer of one component can never share a batch.
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
 
@@ -643,8 +647,8 @@ mod tests {
     /// A system using Commands conflicts with everything, including a
     /// read-only one.
     #[test]
-    fn test_commands_exclusive() {
-        // System 1 uses commands; System 2 reads A.
+    fn a_commands_system_shares_no_batch() {
+        // The first system uses Commands, the second only reads A.
         let mut uses_commands = SystemAccess::new();
         uses_commands.set_uses_commands(true);
         let mut reads_a = SystemAccess::new();
@@ -656,14 +660,14 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 2);
 
-        // Systems must be in different batches (Commands require exclusive access)
+        // Commands need exclusive access, so the two cannot share a batch.
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
 
     /// Five readers of the same component share one batch.
     #[test]
-    fn test_multiple_readers_parallel() {
-        // 5 systems all reading the same component.
+    fn five_readers_of_one_component_share_a_batch() {
+        // Five systems, each reading A.
         let accesses: Vec<SystemAccess> = (0..5)
             .map(|_| {
                 let mut access = SystemAccess::new();
@@ -677,15 +681,15 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 5);
 
-        // All readers can run in parallel (read-read is OK)
+        // Readers never conflict with each other, so all five share one batch.
         assert_eq!(scheduler.execution_graph().len(), 1);
         assert_eq!(scheduler.execution_graph()[0].len(), 5);
     }
 
     /// One writer keeps every reader of the same component out of its batch.
     #[test]
-    fn test_single_writer_blocks_all() {
-        // 4 readers, then 1 writer of the same component.
+    fn a_writer_keeps_every_reader_of_its_component_out_of_its_batch() {
+        // Four readers first, then one writer of the same component.
         let mut accesses: Vec<SystemAccess> = (0..4)
             .map(|_| {
                 let mut access = SystemAccess::new();
@@ -702,33 +706,34 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 5);
 
-        // Writer must be in a separate batch from all readers
+        // The writer conflicts with every reader, so it gets a batch of its own.
         assert!(scheduler.execution_graph().len() >= 2);
     }
 
     /// A read-then-write chain (A→B→C) serializes the systems that disagree and
     /// batches the ones that do not.
     #[test]
-    fn test_complex_dependency_graph() {
-        // System 0: reads A, writes B
-        let mut access0 = SystemAccess::new();
-        access0.add_read(ComponentId::of::<TestComponentA>());
-        access0.add_write(ComponentId::of::<TestComponentB>());
+    fn a_read_write_chain_serializes_only_the_systems_that_disagree() {
+        // The first system reads A and writes B.
+        let mut reads_a_writes_b = SystemAccess::new();
+        reads_a_writes_b.add_read(ComponentId::of::<TestComponentA>());
+        reads_a_writes_b.add_write(ComponentId::of::<TestComponentB>());
 
-        // System 1: reads B, writes C
-        let mut access1 = SystemAccess::new();
-        access1.add_read(ComponentId::of::<TestComponentB>());
-        access1.add_write(ComponentId::of::<TestComponentC>());
+        // The second reads B and writes C.
+        let mut reads_b_writes_c = SystemAccess::new();
+        reads_b_writes_c.add_read(ComponentId::of::<TestComponentB>());
+        reads_b_writes_c.add_write(ComponentId::of::<TestComponentC>());
 
-        // System 2: reads A (can run with system 1)
-        let mut access2 = SystemAccess::new();
-        access2.add_read(ComponentId::of::<TestComponentA>());
+        // The third only reads A, so it can share a batch with the first.
+        let mut reads_a = SystemAccess::new();
+        reads_a.add_read(ComponentId::of::<TestComponentA>());
 
-        // System 3: reads C (can run with systems 0 and 2)
-        let mut access3 = SystemAccess::new();
-        access3.add_read(ComponentId::of::<TestComponentC>());
+        // The fourth only reads C, so it can share a batch with the first and
+        // the third.
+        let mut reads_c = SystemAccess::new();
+        reads_c.add_read(ComponentId::of::<TestComponentC>());
 
-        let accesses = vec![access0, access1, access2, access3];
+        let accesses = vec![reads_a_writes_b, reads_b_writes_c, reads_a, reads_c];
         let scheduler = scheduler_for(&accesses);
 
         assert_no_batch_conflicts(&scheduler, &accesses);
@@ -737,7 +742,7 @@ mod tests {
 
     /// Three writers of three different components share one batch.
     #[test]
-    fn test_disjoint_component_sets() {
+    fn writers_of_three_different_components_share_a_batch() {
         let accesses: Vec<SystemAccess> = [
             ComponentId::of::<TestComponentA>(),
             ComponentId::of::<TestComponentB>(),
@@ -756,15 +761,15 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 3);
 
-        // All can run in parallel (disjoint writes)
+        // Writing different components is no conflict, so all three share a batch.
         assert_eq!(scheduler.execution_graph().len(), 1);
         assert_eq!(scheduler.execution_graph()[0].len(), 3);
     }
 
     /// Three Commands systems get one batch each.
     #[test]
-    fn test_multiple_commands_sequential() {
-        // 3 systems all using commands.
+    fn three_commands_systems_get_one_batch_each() {
+        // Three systems, each using Commands.
         let accesses: Vec<SystemAccess> = (0..3)
             .map(|_| {
                 let mut access = SystemAccess::new();
@@ -778,15 +783,16 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 3);
 
-        // Each command system must be in its own batch
+        // Commands need exclusive access, so each system gets its own batch.
         assert_eq!(scheduler.execution_graph().len(), 3);
     }
 
     /// Commands systems and read-only systems interleave without sharing a
     /// batch.
     #[test]
-    fn test_mixed_commands_and_queries() {
-        // Reads A, commands, reads B, commands.
+    fn commands_and_readers_interleave_without_sharing_a_batch() {
+        // The systems read A, use Commands, read B and use Commands, in that
+        // order.
         let mut read_a = SystemAccess::new();
         read_a.add_read(ComponentId::of::<TestComponentA>());
         let mut commands_first = SystemAccess::new();
@@ -803,17 +809,17 @@ mod tests {
         assert_all_systems_scheduled(&scheduler, 4);
     }
 
-    /// Verifies that an empty scheduler produces an empty execution graph.
+    /// An empty system list produces an empty execution graph.
     #[test]
-    fn test_empty_scheduler() {
+    fn an_empty_system_list_gives_an_empty_graph() {
         let scheduler = scheduler_for(&[]);
 
         assert_eq!(scheduler.execution_graph().len(), 0);
     }
 
-    /// Verifies that a single-system scheduler produces one batch with one system.
+    /// A single system produces one batch that holds it.
     #[test]
-    fn test_single_system() {
+    fn a_single_system_forms_one_batch() {
         let mut writes_a = SystemAccess::new();
         writes_a.add_write(ComponentId::of::<TestComponentA>());
         let accesses = vec![writes_a];
@@ -830,20 +836,20 @@ mod tests {
     /// A chain of read-write dependencies (A → B → C) batches only the systems
     /// that do not disagree.
     #[test]
-    fn test_chain_dependencies() {
-        // Chain: writes A -> reads A, writes B -> reads B, writes C.
-        let mut access0 = SystemAccess::new();
-        access0.add_write(ComponentId::of::<TestComponentA>());
+    fn a_three_system_chain_batches_only_the_systems_that_do_not_disagree() {
+        // The chain: write A, then read A and write B, then read B and write C.
+        let mut writes_a = SystemAccess::new();
+        writes_a.add_write(ComponentId::of::<TestComponentA>());
 
-        let mut access1 = SystemAccess::new();
-        access1.add_read(ComponentId::of::<TestComponentA>());
-        access1.add_write(ComponentId::of::<TestComponentB>());
+        let mut reads_a_writes_b = SystemAccess::new();
+        reads_a_writes_b.add_read(ComponentId::of::<TestComponentA>());
+        reads_a_writes_b.add_write(ComponentId::of::<TestComponentB>());
 
-        let mut access2 = SystemAccess::new();
-        access2.add_read(ComponentId::of::<TestComponentB>());
-        access2.add_write(ComponentId::of::<TestComponentC>());
+        let mut reads_b_writes_c = SystemAccess::new();
+        reads_b_writes_c.add_read(ComponentId::of::<TestComponentB>());
+        reads_b_writes_c.add_write(ComponentId::of::<TestComponentC>());
 
-        let accesses = vec![access0, access1, access2];
+        let accesses = vec![writes_a, reads_a_writes_b, reads_b_writes_c];
         let scheduler = scheduler_for(&accesses);
 
         assert_no_batch_conflicts(&scheduler, &accesses);
@@ -857,9 +863,9 @@ mod tests {
         assert!(scheduler.execution_graph().len() <= 3);
     }
 
-    /// Verifies that five systems writing five different components form one batch.
+    /// Five systems writing five different components form one batch.
     #[test]
-    fn test_large_parallel_batch() {
+    fn five_writers_of_five_different_components_share_a_batch() {
         // Five systems, each writing a component no other one touches.
         let accesses: Vec<SystemAccess> = [
             ComponentId::of::<TestComponentD>(),
@@ -881,7 +887,7 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 5);
 
-        // All can run in parallel
+        // No two of them touch the same component, so all five share one batch.
         assert_eq!(scheduler.execution_graph().len(), 1);
         assert_eq!(scheduler.execution_graph()[0].len(), 5);
     }
@@ -890,10 +896,10 @@ mod tests {
     // Resource Conflict Tests
     // -------------------------------------------------------------------------
 
-    /// Verifies that two systems reading the same resource can run in parallel.
+    /// Two systems reading the same resource run in parallel.
     #[test]
-    fn test_resource_read_read_parallel() {
-        // Two systems both reading the same resource.
+    fn two_readers_of_one_resource_share_a_batch() {
+        // Both systems read the same resource.
         let accesses: Vec<SystemAccess> = (0..2)
             .map(|_| {
                 let mut access = SystemAccess::new();
@@ -907,15 +913,15 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 2);
 
-        // Both can run in parallel (read-read is OK)
+        // Two readers never conflict, so both share one batch.
         assert_eq!(scheduler.execution_graph().len(), 1);
         assert_eq!(scheduler.execution_graph()[0].len(), 2);
     }
 
-    /// Verifies that two systems writing the same resource must run sequentially.
+    /// Two systems writing the same resource run one after the other.
     #[test]
-    fn test_resource_write_write_conflict() {
-        // Two systems both writing the same resource.
+    fn two_writers_of_one_resource_get_separate_batches() {
+        // Both systems write the same resource.
         let accesses: Vec<SystemAccess> = (0..2)
             .map(|_| {
                 let mut access = SystemAccess::new();
@@ -929,14 +935,14 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 2);
 
-        // Must be in different batches (write-write conflict)
+        // Two writers of one resource can never share a batch.
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
 
-    /// Verifies that a resource reader and writer of the same resource conflict.
+    /// A reader and a writer of the same resource conflict.
     #[test]
-    fn test_resource_read_write_conflict() {
-        // System 1 reads a resource, System 2 writes the same one.
+    fn a_resource_reader_and_writer_get_separate_batches() {
+        // The first system reads the resource, the second writes it.
         let mut reads = SystemAccess::new();
         reads.add_resource_read(ResourceId::of::<TestResourceA>());
         let mut writes = SystemAccess::new();
@@ -948,14 +954,14 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 2);
 
-        // Must be in different batches (read-write conflict)
+        // A reader and a writer of one resource can never share a batch.
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
 
-    /// Verifies that writers of different resources can run in parallel.
+    /// Writers of different resources run in parallel.
     #[test]
-    fn test_resource_disjoint_writes_parallel() {
-        // Two systems writing different resources.
+    fn writers_of_different_resources_share_a_batch() {
+        // The systems write different resources.
         let mut writes_a = SystemAccess::new();
         writes_a.add_resource_write(ResourceId::of::<TestResourceA>());
         let mut writes_d = SystemAccess::new();
@@ -967,37 +973,42 @@ mod tests {
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 2);
 
-        // Can run in parallel (different resources)
+        // Writing different resources is no conflict, so both share one batch.
         assert_eq!(scheduler.execution_graph().len(), 1);
         assert_eq!(scheduler.execution_graph()[0].len(), 2);
     }
 
-    /// Verifies correct conflict detection when both component and resource access patterns mix.
+    /// Component and resource conflicts are both found in one graph.
     #[test]
-    fn test_resource_and_component_mixed() {
-        // System 1: reads component A, writes resource C.
-        let mut access1 = SystemAccess::new();
-        access1.add_read(ComponentId::of::<TestComponentA>());
-        access1.add_resource_write(ResourceId::of::<TestResourceC>());
+    fn component_and_resource_conflicts_are_detected_together() {
+        // The first system reads component A and writes resource C.
+        let mut reads_a_writes_resource_c = SystemAccess::new();
+        reads_a_writes_resource_c.add_read(ComponentId::of::<TestComponentA>());
+        reads_a_writes_resource_c.add_resource_write(ResourceId::of::<TestResourceC>());
 
-        // System 2: reads component A, reads resource C.
-        let mut access2 = SystemAccess::new();
-        access2.add_read(ComponentId::of::<TestComponentA>());
-        access2.add_resource_read(ResourceId::of::<TestResourceC>());
+        // The second reads component A and resource C.
+        let mut reads_a_and_resource_c = SystemAccess::new();
+        reads_a_and_resource_c.add_read(ComponentId::of::<TestComponentA>());
+        reads_a_and_resource_c.add_resource_read(ResourceId::of::<TestResourceC>());
 
-        // System 3: writes component B, reads resource B (no conflicts with either).
-        let mut access3 = SystemAccess::new();
-        access3.add_write(ComponentId::of::<TestComponentB>());
-        access3.add_resource_read(ResourceId::of::<TestResourceB>());
+        // The third writes component B and reads resource B, so it has no
+        // conflict with either of the others.
+        let mut writes_b_reads_resource_b = SystemAccess::new();
+        writes_b_reads_resource_b.add_write(ComponentId::of::<TestComponentB>());
+        writes_b_reads_resource_b.add_resource_read(ResourceId::of::<TestResourceB>());
 
-        let accesses = vec![access1, access2, access3];
+        let accesses = vec![
+            reads_a_writes_resource_c,
+            reads_a_and_resource_c,
+            writes_b_reads_resource_b,
+        ];
         let scheduler = scheduler_for(&accesses);
 
         assert_no_batch_conflicts(&scheduler, &accesses);
         assert_all_systems_scheduled(&scheduler, 3);
 
-        // System 1 and 2 conflict on resource C (write vs read)
-        // System 3 doesn't conflict with either
+        // The first two conflict on resource C, one writing it and one reading
+        // it. The third conflicts with neither, so at least two batches result.
         assert!(scheduler.execution_graph().len() >= 2);
     }
 
@@ -1005,11 +1016,11 @@ mod tests {
     // Empirical verification: exhaustive enumeration and random fuzzing
     // -------------------------------------------------------------------------
     //
-    // These tests are empirical checks, not a mathematical proof. They run the
-    // implementation against a large but finite set of input patterns that
-    // covers every conflict category (components, resources, Commands and
-    // combinations of them), which gives high confidence that the scheduler
-    // never puts conflicting systems in one batch.
+    // These are empirical checks, not a mathematical proof. They run the
+    // scheduler on a large but finite set of inputs that covers every conflict
+    // category (components, resources, Commands and combinations of them). That
+    // makes it very unlikely that the scheduler ever puts conflicting systems
+    // in one batch.
 
     /// Models every conflict category the scheduler handles.
     ///
@@ -1020,14 +1031,14 @@ mod tests {
     enum AccessKind {
         None,      // accesses nothing - free to run in any batch
         ReadA,     // reads component A
-        WriteA,    // writes component A - conflicts with ReadA, WriteA
+        WriteA,    // writes component A - conflicts with any other ReadA or WriteA
         ReadB,     // reads component B
-        WriteB,    // writes component B - conflicts with ReadB, WriteB
+        WriteB,    // writes component B - conflicts with any other ReadB or WriteB
         Commands,  // uses Commands - conflicts with everything
         ResReadX,  // reads resource X
-        ResWriteX, // writes resource X - conflicts with ResReadX, ResWriteX
+        ResWriteX, // writes resource X - conflicts with any other ResReadX or ResWriteX
         ResReadY,  // reads resource Y
-        ResWriteY, // writes resource Y - conflicts with ResReadY, ResWriteY
+        ResWriteY, // writes resource Y - conflicts with any other ResReadY or ResWriteY
     }
 
     /// Converts an `AccessKind` into a `SystemAccess` the scheduler can process.
@@ -1051,23 +1062,21 @@ mod tests {
         access
     }
 
-    /// Exhaustive verification for small system counts.
+    /// Runs every possible combination of accesses for one to six systems.
     ///
-    /// Enumerates every possible n-tuple of access kinds for n = 1..=6. With 10
-    /// access kinds that is 10 + 100 + 1,000 + 10,000 + 100,000 + 1,000,000 =
-    /// 1,111,110 unique input configurations. Each one runs through
-    /// `ensure_execution_graph` and is checked for two invariants:
+    /// With 10 access kinds, one to six systems give 1,111,110 inputs
+    /// (10 + 100 + 1,000 + 10,000 + 100,000 + 1,000,000). Each one is scheduled
+    /// and checked for two properties:
     ///
-    /// 1. No batch contains conflicting systems (the core safety guarantee).
-    /// 2. Every system appears in exactly one batch (no omissions, no
-    ///    duplicates).
+    /// 1. No batch holds two systems that conflict (the safety guarantee).
+    /// 2. Every system appears in exactly one batch, so none is dropped or
+    ///    scheduled twice.
     ///
-    /// The tuples are generated by counting in base 10: counter 0 is [None,
-    /// None, ...], counter 1 is [ReadA, None, ...], and so on. This covers
-    /// every combination with repetition, so several systems may share one
-    /// access kind.
+    /// The combinations are counted in base 10: counter 0 is [None, None, ...],
+    /// counter 1 is [ReadA, None, ...], and so on. Every combination is covered,
+    /// including ones where several systems share an access kind.
     #[test]
-    fn proof_exhaustive_small_n() {
+    fn every_combination_of_one_to_six_systems_has_no_conflicting_batch() {
         let kinds: Vec<AccessKind> = vec![
             AccessKind::None,
             AccessKind::ReadA,
@@ -1086,11 +1095,11 @@ mod tests {
             let combination_count = (kinds.len() as u32).pow(system_count);
             let mut kind_indices = vec![0u8; system_count as usize];
 
-            // Enumerate all n-tuples by counting in base kinds.len()
+            // Decode the counter into one access kind per system.
             for counter in 0..combination_count {
                 let mut counter_value = counter;
                 // `i` is the digit position being decoded out of `counter`, so
-                // the loop is about the position itself, not about walking the
+                // the loop is about the position itself, not about walking a
                 // slice. That is why the lint is allowed here.
                 #[allow(clippy::needless_range_loop)]
                 for i in 0..system_count as usize {
@@ -1098,14 +1107,14 @@ mod tests {
                     counter_value /= kinds.len() as u32;
                 }
 
-                // Build a fresh scheduler with this specific combination
+                // Build the accesses this combination describes.
                 let accesses: Vec<SystemAccess> = kind_indices
                     .iter()
                     .map(|&kind_index| kind_to_access(kinds[kind_index as usize]))
                     .collect();
                 let scheduler = scheduler_for(&accesses);
 
-                // Verify both correctness invariants
+                // Check the two properties above.
                 assert_no_batch_conflicts(&scheduler, &accesses);
                 assert_all_systems_scheduled(&scheduler, system_count as usize);
             }
@@ -1116,7 +1125,7 @@ mod tests {
     ///
     /// Exhaustive enumeration grows exponentially (10^20 cases at 20 systems),
     /// so this test samples instead: 500 seeds, each with a random system count
-    /// from 1 to 20. Every graph is checked for the same two invariants as the
+    /// from 1 to 20. Every graph is checked for the same two properties as the
     /// exhaustive test.
     ///
     /// The generator is a simple LCG (linear congruential generator) whose
@@ -1124,7 +1133,7 @@ mod tests {
     /// That makes the sequences varied but not reproducible: a failure cannot
     /// be replayed from its seed alone.
     #[test]
-    fn proof_random_fuzz_large_n() {
+    fn random_combinations_of_up_to_twenty_systems_have_no_conflicting_batch() {
         let kinds: Vec<AccessKind> = vec![
             AccessKind::None,
             AccessKind::ReadA,
@@ -1162,7 +1171,7 @@ mod tests {
                 .collect();
             let scheduler = scheduler_for(&accesses);
 
-            // Same invariants as the exhaustive test
+            // Check the same two properties as the exhaustive test.
             assert_no_batch_conflicts(&scheduler, &accesses);
             assert_all_systems_scheduled(&scheduler, system_count);
         }

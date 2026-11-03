@@ -3,15 +3,14 @@
 //!
 //! # Responsibilities
 //!
-//! - Keep what systems asked to see this frame or for a set time, in
+//! - Keep what systems ask to see, for one frame or for a set time, in
 //!   [`DebugDraw`], a world resource: line segments, shapes turned into line
 //!   segments, text labels placed in the world or on the screen, and gizmo
 //!   lines and triangles that carry a handle id.
 //! - Count down how long each item stays and return one frame of plain data
-//!   for the renderer ([`DebugDraw::collect_frame`] returning a
-//!   [`DebugFrame`]).
-//! - Turn everything off: while drawing is disabled, every drawing call
-//!   returns without recording anything, so nothing reaches the renderer.
+//!   for the renderer. [`DebugDraw::collect_frame`] builds a [`DebugFrame`].
+//! - Turn everything off. While drawing is disabled, no drawing call records
+//!   anything, so nothing reaches the renderer.
 //!
 //! # Design
 //!
@@ -66,9 +65,9 @@ pub struct DebugStyle {
     /// Whether scene geometry in front of it hides it (`true`), or it draws
     /// over everything (`false`).
     pub depth_test: bool,
-    /// Whether this belongs to the editor's own drawing - a drag guide, a
-    /// constraint line - and not to the game. Editor views draw it; a game
-    /// surface does not.
+    /// Whether this is the editor's own drawing - a drag guide, a constraint
+    /// line - rather than the game's. An editor view draws it. A game surface
+    /// does not.
     pub chrome: bool,
     /// How long it stays.
     pub lifetime: DebugLifetime,
@@ -242,7 +241,7 @@ pub struct DebugDraw {
 }
 
 impl DebugDraw {
-    /// Creates an empty debug drawing, enabled or disabled as asked.
+    /// Creates an empty debug drawing in the requested state.
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
@@ -466,19 +465,21 @@ impl DebugDraw {
     /// Returns the items to draw this frame and counts the lifetime of the
     /// others down by `delta_seconds`.
     ///
-    /// Items that last one frame and all gizmo geometry are handed over once
-    /// and not kept. Items with a timed lifetime are copied out and kept until
-    /// their time runs out. A disabled drawing returns an empty frame.
+    /// Items that last one frame, and all gizmo geometry, are returned once
+    /// and then dropped. Items with a timed lifetime are copied out and kept
+    /// until their time runs out. A disabled drawing returns an empty frame.
     pub fn collect_frame(&mut self, delta_seconds: f32) -> DebugFrame {
         if !self.enabled {
             return DebugFrame::default();
         }
+        // Step 1: build the frame from the items waiting to be drawn.
         let frame = DebugFrame {
             lines: self.lines.iter().map(|timed| timed.item).collect(),
             labels: self.labels.iter().map(|timed| timed.item.clone()).collect(),
             gizmo_lines: std::mem::take(&mut self.gizmo_lines),
             gizmo_triangles: std::mem::take(&mut self.gizmo_triangles),
         };
+        // Step 2: age the items that stay, which drops the one-frame ones.
         age_timed_items(&mut self.lines, delta_seconds);
         age_timed_items(&mut self.labels, delta_seconds);
         frame
@@ -486,7 +487,8 @@ impl DebugDraw {
 }
 
 impl Default for DebugDraw {
-    /// Creates the resource enabled, which is the development default.
+    /// Creates an enabled drawing, which is the state a development host
+    /// starts with.
     fn default() -> Self {
         Self::new(true)
     }
@@ -521,8 +523,8 @@ fn plane_axes(normal: [f32; 3]) -> ([f32; 3], [f32; 3]) {
     } else {
         [0.0, 1.0, 0.0]
     };
-    // The cross product of the normal with a vector that is not parallel to it
-    // gives the first axis.
+    // The reference axis must not be parallel to the normal, or the cross
+    // product would be zero. X works unless the normal points mostly along X.
     let reference_axis = if normal[0].abs() < 0.9 {
         [1.0, 0.0, 0.0]
     } else {
@@ -574,7 +576,7 @@ fn normalize_vector(vector: [f32; 3]) -> [f32; 3] {
 mod tests {
     use super::*;
 
-    /// A disabled drawing records nothing and hands over nothing.
+    /// A disabled drawing records nothing and returns an empty frame.
     #[test]
     fn a_disabled_drawing_records_nothing() {
         let mut draw = DebugDraw::new(false);

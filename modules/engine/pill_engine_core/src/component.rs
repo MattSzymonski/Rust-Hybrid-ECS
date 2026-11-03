@@ -30,23 +30,45 @@ use crate::component_registry::ComponentFieldDescriptor;
 use crate::error::WorldError;
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// Half the tick range, which is where the wrapping comparison stops telling
+/// "ahead" from "behind".
+///
+/// A distance larger than this half is read as a tick in the other direction,
+/// so two ticks more than `u32::MAX / 2` apart cannot be ordered. That is the
+/// limit the wrapping comparison accepts, and it is far longer than any single
+/// frame.
+const TICK_WRAP_HALF_RANGE: u32 = u32::MAX / 2;
+
+/// Salts that keep the two 128-bit identity variants apart when they hold the
+/// same value.
+///
+/// The values are arbitrary odd constants; only the fact that they differ
+/// matters.
+const DESCRIPTOR_HASH_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
+const SHARED_HASH_SALT: u64 = 0xbf58_476d_1ce4_e5b9;
+
+// =============================================================================
 // Component
 // =============================================================================
 
-/// Component marker trait - all components must be `'static` and [`Send`].
+/// Marker trait that every ECS component type implements.
 ///
-/// A mutable query only needs `Send`. The scheduler never runs two systems that
-/// touch the same component at the same time, and a parallel batch gives each
-/// thread its own rows. A read query is different: two readers of one component
-/// do not conflict, so they may run at the same time. That is why
+/// A component is `Send` and `'static`, nothing more. `Send` is enough for a
+/// mutable query because the scheduler never runs two systems that write the
+/// same component at the same time, and inside one system each thread works on
+/// its own rows. A read query is different: two readers of one component do not
+/// conflict, so they can run at the same time. That is why
 /// [`QueryTarget`](crate::query::QueryTarget) is implemented for `&T` only when
 /// `T: Sync`. The bound sits on the query rather than on this trait, because a
-/// component that is only ever used mutably never needs to be `Sync`.
+/// component that is only ever written never needs to be `Sync`.
 ///
 /// A component with interior mutability ([`Cell`](std::cell::Cell),
-/// [`RefCell`](std::cell::RefCell), ...) therefore cannot be read through an
-/// `&T` query. Keep the mutable part in a separate component and reach it with
-/// `&mut T` queries.
+/// [`RefCell`](std::cell::RefCell), ...) is not `Sync`, so it cannot be read
+/// through an `&T` query. Keep the mutable part in a separate component and
+/// reach it with a `&mut T` query.
 ///
 /// An `&T` query over such a component does not compile:
 ///
@@ -73,30 +95,31 @@ use crate::error::WorldError;
 /// impl Component for Position {}
 /// ```
 pub trait Component: Send + 'static {
-    /// Stable, cross-binary name for this component, or `None` for the
-    /// ordinary per-binary identity.
+    /// The stable name this component is known by across binaries, or `None`
+    /// for the ordinary per-binary identity.
     ///
     /// A component type linked into more than one binary in the same process -
-    /// the host, the project, a module DLL - gets a different [`TypeId`] in
-    /// each binary. `TypeId` is built from the crate name, its `-C metadata`
-    /// disambiguator and the type path, so every build gets its own value. One
-    /// type then becomes several components with several columns, and neither
-    /// binary sees the entities the other created. Declaring a name replaces
-    /// that identity with one derived from the name itself. Every binary
-    /// computes it the same way, so all of them resolve to one [`ComponentId`],
-    /// one mask bit and one column.
+    /// the host, the project, a module DLL - gets a different [`TypeId`] in each
+    /// binary. `TypeId` is built from the crate name, its `-C metadata`
+    /// disambiguator and the type path, so every build produces its own value.
+    /// One type then becomes several components with several columns, and
+    /// neither binary sees the entities the other created. Declaring a name
+    /// replaces that identity with one derived from the name itself. Every
+    /// binary computes it the same way, so all of them end up with one
+    /// [`ComponentId`], one mask bit and one column.
     ///
-    /// The name must be unique across the process (`"pill_spline::Spline"`,
-    /// not `"Spline"`) and must stay the same forever. It is written down by
-    /// hand rather than taken from [`std::any::type_name`], because that output
-    /// is not guaranteed to stay the same across compiler versions.
+    /// The name must be unique across the process (`"pill_spline::Spline"`, not
+    /// `"Spline"`) and must never change. It is written down by hand rather than
+    /// taken from [`std::any::type_name`], because that output is not guaranteed
+    /// to stay the same across compiler versions.
     ///
     /// Set it with `#[pill(shared)]` on `#[derive(PillComponent)]` rather than
-    /// by hand. See [`ComponentId::of`] for what changes once a name is set.
+    /// by hand. See [`ComponentId::of`] for what a name changes.
     ///
-    /// This is a `where Self: Sized` method, not an associated constant. An
-    /// associated constant would make `Component` unusable as a trait object,
-    /// and the storage layer does move components as `dyn Component`.
+    /// The method is gated on `where Self: Sized` instead of being an associated
+    /// constant: an associated constant would make `Component` unusable as a
+    /// trait object, and the storage layer does move components as
+    /// `dyn Component`.
     fn shared_name() -> Option<&'static str>
     where
         Self: Sized,
@@ -104,13 +127,14 @@ pub trait Component: Send + 'static {
         None
     }
 
-    /// The stable identity [`Self::shared_name`] hashes to, or `None`.
+    /// The stable identity that [`Self::shared_name`] hashes to, or `None`.
     ///
-    /// The default is built from `shared_name`, so an implementor only writes
-    /// the name and the two cannot disagree. `#[derive(PillComponent)]`
-    /// replaces it with a compile-time constant. `ComponentId::of` runs on
-    /// every `get_component`, and hashing the name there costs measurable time.
-    /// A constant costs one load, the same as `TypeId::of`.
+    /// The default builds it from `shared_name`, so an implementor only writes
+    /// the name and the two cannot disagree. `#[derive(PillComponent)]` replaces
+    /// the default with a compile-time constant. That matters because
+    /// `ComponentId::of` runs on every `get_component`: hashing the name there
+    /// costs measurable time, while a constant costs one load, the same as
+    /// `TypeId::of`.
     ///
     /// Override it only with `shared_component_identity(Self::shared_name())`.
     /// Any other value silently gives the component an identity that no other
@@ -122,21 +146,20 @@ pub trait Component: Send + 'static {
         Self::shared_name().map(shared_component_identity)
     }
 
-    /// The structural hash of the field layout *this binary's* type declares,
-    /// or `None` when it declares none.
+    /// The structural hash of the field layout that *this binary's* type
+    /// declares, or `None` when it declares none.
     ///
-    /// A query that binds a shared component compares this hash with the one
-    /// the registry holds (see [`crate::Query::new`]). The column itself can
-    /// only check size and alignment, and those cannot tell
-    /// `{x: f32, y: f32}` from `{y: f32, x: f32}`. Without the hash, a binary
-    /// still running code built against an older layout - a module whose data
-    /// crate was reloaded under it - would read the new rows through the old
-    /// field offsets.
+    /// A query that targets a shared component compares this hash with the one
+    /// the registry holds (see [`crate::Query::new`]). The column itself can only
+    /// check size and alignment, and those cannot tell `{x: f32, y: f32}` from
+    /// `{y: f32, x: f32}`. Without the hash, a binary still running code built
+    /// against an older layout - a module whose data crate was reloaded under
+    /// it - would read the new rows through the old field offsets.
     ///
     /// `#[derive(PillComponent)]` overrides it using the type's field
-    /// descriptors, the same ones registration hashes. A hand-written impl
-    /// calls `component_schema_hash(Self::FIELD_LAYOUT)`. The default declares
-    /// nothing, which leaves the size-and-alignment check only.
+    /// descriptors, the same ones registration hashes. A hand-written impl calls
+    /// `component_schema_hash(Self::FIELD_LAYOUT)`. The default declares nothing,
+    /// which leaves the size-and-alignment check as the only check.
     fn declared_schema_hash() -> Option<u64>
     where
         Self: Sized,
@@ -149,23 +172,16 @@ pub trait Component: Send + 'static {
 // Tick
 // =============================================================================
 
-/// Counter used to decide whether a component is new or changed.
+/// A counter that says whether a component is new or changed.
 ///
-/// The world keeps one counter and increases it each frame, and also on
-/// demand. Each component row carries its own `ComponentTicks`, which record
-/// when the row was added and when it was last mutated. A system later compares
-/// those ticks with its own `last_run` tick to find new or changed rows.
+/// The world keeps one counter and increases it once per frame, and also when a
+/// write happens between frames. Each component row carries its own
+/// `ComponentTicks`, which record when the row was added and when it was last
+/// changed. A system later compares those ticks with its own `last_run` tick to
+/// find new or changed rows.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Tick(pub u32);
-
-/// Half the tick range: the boundary between "ahead of the baseline" and
-/// "behind it" once the counter wraps.
-///
-/// A distance larger than this is read as the other direction, so two ticks
-/// more than `u32::MAX / 2` apart cannot be ordered. That is the resolution the
-/// wrap-safe comparison trades for, and it is far longer than any single frame.
-const TICK_WRAP_HALF_RANGE: u32 = u32::MAX / 2;
 
 impl Tick {
     // -------------------------------------------------------------------------
@@ -188,13 +204,13 @@ impl Tick {
         self.0
     }
 
-    /// Returns true when this tick is strictly newer than `last_run` and not
+    /// Returns `true` when this tick is strictly newer than `last_run` and not
     /// in the future relative to `this_run`.
     ///
-    /// The counter is a `u32` that wraps, so both comparisons use the unsigned
-    /// distance from the baseline, not the numbers themselves. A tick written
-    /// just after a wrap is *smaller* than the baseline, but only a few ticks
-    /// ahead of it. A distance in the upper half of the range means the other
+    /// The counter is a `u32` that wraps, so both comparisons use the distance
+    /// from the baseline instead of the numbers themselves. A tick written just
+    /// after a wrap is *smaller* than the baseline, but only a few ticks ahead
+    /// of it. A distance in the upper half of the range means the other
     /// direction. That is how the comparison tells the two directions apart
     /// without knowing where the counter is.
     #[inline]
@@ -211,10 +227,10 @@ impl Tick {
 // ComponentTicks
 // =============================================================================
 
-/// Change-detection metadata for one component row.
+/// The change-detection ticks of one component row.
 ///
 /// Each component column keeps a `Vec<ComponentTicks>` beside its row data, so
-/// the metadata for row `i` is at index `i`.
+/// the ticks for row `i` sit at index `i`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ComponentTicks {
@@ -238,13 +254,15 @@ impl ComponentTicks {
         }
     }
 
-    /// Was this component added between `last_run` and `this_run`?
+    /// Returns `true` when this component was added between `last_run` and
+    /// `this_run`.
     #[inline]
     pub fn is_added(&self, last_run: Tick, this_run: Tick) -> bool {
         self.added.is_newer_than(last_run, this_run)
     }
 
-    /// Was this component changed (or added) between `last_run` and `this_run`?
+    /// Returns `true` when this component changed, or was added, between
+    /// `last_run` and `this_run`.
     #[inline]
     pub fn is_changed(&self, last_run: Tick, this_run: Tick) -> bool {
         self.changed.is_newer_than(last_run, this_run)
@@ -265,10 +283,10 @@ impl ComponentTicks {
 // ComponentId
 // =============================================================================
 
-/// Type-erased identifier for a registered component type.
+/// Identifier for a registered component type, with the Rust type erased.
 ///
-/// Native components keep their Rust [`TypeId`]. Runtime-defined components
-/// use the stable 128-bit identity their external manifest supplies. A native
+/// A native component keeps its Rust [`TypeId`]. A runtime-defined component
+/// uses the stable 128-bit identity its external manifest supplies. A native
 /// component that declares [`Component::shared_name`] uses a stable identity
 /// derived from that name instead of its `TypeId`, so every binary that links
 /// the type reaches the same id.
@@ -286,12 +304,12 @@ pub enum ComponentId {
     Shared(u128),
 }
 
-/// Computes one 64-bit half of a stable component identity from its name.
+/// Hashes a name to one 64-bit half of a stable component identity.
 ///
-/// This is FNV-1a: the result depends only on the bytes of the name, with no
-/// seed, no runtime state and no dependence on the compiler version or the
-/// process. Two separately compiled binaries - and the managed runtime, which
-/// derives the same value from the same name - can therefore agree on an
+/// This is FNV-1a, so the result depends only on the bytes of the name: there
+/// is no seed, no runtime state and no dependence on the compiler version or on
+/// the process. Two separately compiled binaries - and the managed runtime,
+/// which derives the same value from the same name - can therefore agree on an
 /// identity without exchanging anything.
 pub const fn component_name_hash(name: &str, offset_basis: u64) -> u64 {
     let bytes = name.as_bytes();
@@ -315,16 +333,15 @@ pub const fn shared_component_identity(name: &str) -> u128 {
     ((high as u128) << 64) | low as u128
 }
 
-/// `Hash` is written by hand rather than derived, so a 128-bit identity reaches
-/// the hasher as 64 bits.
+/// Hashes a 128-bit identity as 64 bits.
 ///
-/// [`TypeId`] does the same: it holds 128 bits and hashes only half, because a
-/// hash map settles collisions with `Eq`, which still compares every bit.
-/// Hashing the second 8-byte block buys no correctness and costs a compression
-/// round.
+/// [`TypeId`] does the same: it holds 128 bits and hashes only half. Hashing
+/// part of a value stays correct because a hash map resolves a collision with
+/// `Eq`, which still compares every bit. Hashing the second 8-byte block buys
+/// no correctness and costs a compression round.
 ///
-/// The variant is mixed in as a salt rather than hashed as its own value, which
-/// keeps telling the variants apart free.
+/// The variant is mixed in as a salt instead of being hashed as a value of its
+/// own, which keeps the variants apart for free.
 impl std::hash::Hash for ComponentId {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -336,12 +353,6 @@ impl std::hash::Hash for ComponentId {
         }
     }
 }
-
-/// Salts keeping the two 128-bit-identity variants from colliding with each
-/// other on identical values. Arbitrary odd constants; only their difference
-/// matters.
-const DESCRIPTOR_HASH_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
-const SHARED_HASH_SALT: u64 = 0xbf58_476d_1ce4_e5b9;
 
 impl ComponentId {
     /// Returns the [`ComponentId`] for the concrete Rust type `T`.
@@ -356,9 +367,11 @@ impl ComponentId {
     /// distinction cannot be bypassed: there is no second entry point that
     /// could forget to consult the declaration.
     ///
-    /// Either path costs the same as `TypeId::of`. A derived component's
-    /// `shared_identity` is a compile-time constant, so both branches are a
-    /// load, and neither hashes the name.
+    /// Either path costs the same as `TypeId::of`. For a derived component,
+    /// `shared_identity` is a compile-time constant, so the shared branch is a
+    /// load too and neither branch hashes the name. A type that writes
+    /// `shared_name` by hand without overriding `shared_identity` hashes its
+    /// name here on every call.
     #[inline]
     pub fn of<T: Component>() -> Self {
         match T::shared_identity() {
@@ -414,12 +427,12 @@ impl ComponentId {
 // ComponentRegistration
 // =============================================================================
 
-/// The layout record of one component registration.
+/// What one component registration declared about its layout.
 ///
 /// Stored per [`ComponentId`] so a later registration of the same component can
-/// be compared with the first. A shared component must match, because two
-/// binaries reach one column through it and nothing else proves they agree
-/// about what a row contains. An ordinary component's record is only
+/// be compared with the first. A shared component's record must match, because
+/// two binaries reach one column through it and nothing else proves that they
+/// agree about what a row contains. An ordinary component's record is simply
 /// refreshed; a redefined type is handled by the persistence migration.
 ///
 /// This is the layout the type declared, not the layout of the stored column.
@@ -467,7 +480,9 @@ impl ComponentRegistration {
             return false;
         }
         match (self.schema_hash, other.schema_hash) {
-            (Some(left), Some(right)) => left == right,
+            (Some(own_schema_hash), Some(other_schema_hash)) => {
+                own_schema_hash == other_schema_hash
+            }
             _ => true,
         }
     }
@@ -475,17 +490,17 @@ impl ComponentRegistration {
 
 /// Structural hash over a component's declared field layout.
 ///
-/// The hash is FNV-1a over the field descriptors, not a `DefaultHasher`,
-/// because this value is compared *between separately compiled binaries*. The
-/// standard hasher's algorithm is explicitly unspecified and may change
-/// between Rust releases, while this is a fixed function of the bytes.
+/// The hash is FNV-1a over the field descriptors rather than a `DefaultHasher`,
+/// because the value is compared between separately compiled binaries. The
+/// standard hasher's algorithm is explicitly unspecified and may change between
+/// Rust releases, while this is a fixed function of the bytes.
 ///
 /// Every field's name, type tag, offset, size, alignment and element count is
-/// included, so a field that is reordered, retyped, repadded or resized changes
-/// the result even when the struct's total size does not.
+/// included, so a field that is reordered, retyped, padded differently or
+/// resized changes the result even when the struct's total size does not.
 pub fn component_schema_hash(fields: &[ComponentFieldDescriptor]) -> u64 {
-    // FNV-1a offset basis. `component_name_hash` continues from this value, so
-    // names and numbers end up in one running hash.
+    // Start from the FNV-1a offset basis. `component_name_hash` continues from
+    // this value, so a field's text and its numbers end up in one running hash.
     let mut hash = 0xcbf29ce484222325u64;
     for field in fields {
         hash = component_name_hash(field.name, hash);
@@ -504,10 +519,10 @@ pub fn component_schema_hash(fields: &[ComponentFieldDescriptor]) -> u64 {
 // ComponentMask
 // =============================================================================
 
-/// Bitmask that represents a set of component types.
+/// A set of component types, one bit per type.
 ///
-/// One `u128` caps the ECS at 128 unique component types. That is the price of
-/// O(1) archetype matching by bitwise AND, and of masks that stay on the stack
+/// One `u128` caps the ECS at 128 component types. That is the price of O(1)
+/// archetype matching with a bitwise AND, and of masks that stay on the stack
 /// and are `Copy`. Registration reports the ceiling as
 /// [`WorldError::ComponentTypeLimitExceeded`] instead of panicking; a project
 /// stays under it by keeping related fields in one component.
@@ -586,45 +601,48 @@ impl ComponentMask {
 // ComponentRegistry
 // =============================================================================
 
-/// Registry that maps component types to bit indices in the component mask.
+/// Maps component types to bit indices in the component mask.
 ///
-/// It registers component types and keeps the mapping from [`ComponentId`] to
-/// bit positions that mask operations need.
+/// It registers component types and keeps the [`ComponentId`] to bit index
+/// mapping that mask operations need.
 pub struct ComponentRegistry {
     /// Maps each registered [`ComponentId`] to its assigned bit index.
-    id_to_bit: HashMap<ComponentId, u8>,
-    /// Registered name of each component type, keyed by component id, used for
-    /// diagnostics and tooling.
+    bit_indices_by_id: HashMap<ComponentId, u8>,
+    /// Registered name of each component type, by id. Diagnostics print it, and
+    /// so do the name-keyed lookups persistence and the C# bindings make.
     names_by_id: HashMap<ComponentId, String>,
-    /// Layout record of each registered component type, keyed by component id.
+    /// Layout record of each registered component type, by id.
     layouts_by_id: HashMap<ComponentId, ComponentRegistration>,
-    /// Rust type name that claimed each shared identity, so a second claim by a
-    /// *different* type can be told apart from the same type compiled twice.
+    /// The Rust type name that claimed each shared identity, so a second claim
+    /// by a *different* type can be told apart from the same type compiled
+    /// twice.
     ///
-    /// Owned rather than the `&'static str` `type_name` returns: that pointer
-    /// lives in the declaring artifact's read-only data and dangles once a
-    /// module DLL is unloaded, while the registry outlives every module.
+    /// Owned rather than the `&'static str` that `type_name` returns: that
+    /// pointer lives in the declaring artifact's read-only data and dangles once
+    /// a module DLL is unloaded, while the registry outlives every module.
     shared_declaring_types: HashMap<ComponentId, String>,
     /// Shared components already reported as registered without field
     /// descriptors, so the warning fires once per id rather than once per
-    /// registration - a reload re-registers the same types every time.
+    /// registration - a reload registers the same types again every time.
     shared_without_layout_reported: std::collections::HashSet<ComponentId>,
     /// Next bit index to assign to a newly registered component.
-    next_bit: u8,
-    /// Bit indices reclaimed by [`Self::remove`]. They are reused before
-    /// `next_bit` advances. Without this pool, a descriptor manifest that
-    /// retires and introduces types across reloads would keep increasing
-    /// `next_bit` until the 128-type limit refused further registrations, even
-    /// though only a handful of components are alive at a time.
+    next_bit_index: u8,
+    /// Bit indices reclaimed by [`Self::remove`], reused before `next_bit_index`
+    /// advances.
+    ///
+    /// Without this pool, a descriptor manifest that retires and introduces
+    /// types across reloads would keep increasing `next_bit_index` until the
+    /// 128-type limit refused further registrations, even though only a handful
+    /// of components are alive at a time.
     free_bits: Vec<u8>,
 }
 
-/// Outcome of registering a component type.
+/// What a registration call found and did.
 ///
-/// Registration is idempotent, so "registered" and "was already registered"
-/// are both successes - but they are different facts, and collapsing them is
-/// how a stale recorded layout goes unnoticed after a reload replaces a
-/// component's definition.
+/// Registration is idempotent, so "registered" and "was already registered" are
+/// both successes. They are still different facts, and collapsing them is how a
+/// stale recorded layout goes unnoticed after a reload replaces a component's
+/// definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "registration reports whether the type was already present; use `register_bit` if only the bit index is wanted"]
 pub enum Registration {
@@ -654,47 +672,42 @@ impl ComponentRegistry {
     /// Creates an empty registry with no components registered.
     pub fn new() -> Self {
         Self {
-            id_to_bit: HashMap::new(),
+            bit_indices_by_id: HashMap::new(),
             names_by_id: HashMap::new(),
             layouts_by_id: HashMap::new(),
             shared_declaring_types: HashMap::new(),
             shared_without_layout_reported: std::collections::HashSet::new(),
-            next_bit: 0,
+            next_bit_index: 0,
             free_bits: Vec::new(),
         }
     }
 }
 
-impl Default for ComponentRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ComponentRegistry {
-    /// Registers a component type and assigns it a bit index.
+    /// Registers a component type and gives it a bit index.
     ///
-    /// Returns [`Registration::Created`] with the assigned bit, or
-    /// [`Registration::AlreadyPresent`] with the existing one. Idempotent by
-    /// design - the reload path re-runs `init`, which re-registers every type -
-    /// and the two cases stay distinguishable for a caller that cares.
-    /// [`Self::register_bit`] discards the distinction for callers that do not.
+    /// Returns [`Registration::Created`] with the new bit, or
+    /// [`Registration::AlreadyPresent`] with the existing one. It is idempotent
+    /// by design: a reload re-runs `init`, which registers every type again, and
+    /// the two cases stay distinguishable for a caller that cares.
+    /// [`Self::register_bit`] throws the distinction away for callers that do
+    /// not.
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::ComponentTypeLimitExceeded`] when the 128-type
-    /// limit is reached and no bit has been reclaimed by
-    /// [`Self::remove`](ComponentRegistry::remove). Registration is driven by
-    /// user data, so exceeding the limit is a configuration outcome, not a
-    /// programming error - it is reported rather than panicked on.
+    /// Returns [`WorldError::ComponentTypeLimitExceeded`] when all 128 bits are
+    /// taken and [`Self::remove`](ComponentRegistry::remove) has not reclaimed
+    /// one. Component types come from user data, so reaching the limit is a
+    /// configuration outcome rather than a programming error - it is reported
+    /// instead of panicking.
     pub fn register<T: Component>(&mut self) -> Result<Registration, WorldError> {
         self.register_with_layout::<T>(&[])
     }
 
-    /// Registers a component type together with its declared field layout.
+    /// Registers a component type together with the field layout it declares.
     ///
-    /// The layout is recorded so a later registration of the same component -
-    /// a hot-reload generation, or a second binary that linked the same shared
+    /// The layout is recorded so a later registration of the same component - a
+    /// hot-reload generation, or a second binary that linked the same shared
     /// type - can be checked against it.
     ///
     /// # Errors
@@ -715,12 +728,12 @@ impl ComponentRegistry {
     /// previous generation of the same subject.
     ///
     /// With `supersedes` set, a shared component whose layout differs from the
-    /// recorded one gets the new layout instead of being refused. The host has
-    /// said that this registration comes from a reload of a subject that
-    /// registered the component before, and the reload moves the component's
-    /// rows to the new layout. Every other binary still built against the old
-    /// layout is now stale. Its queries are refused by the declared schema
-    /// check, and the host suspends its systems until it is rebuilt.
+    /// recorded one takes the new layout instead of being refused. The host has
+    /// announced that this registration is a reload of a subject that registered
+    /// the component before, and the reload moves the component's rows to the
+    /// new layout. Every other binary still built against the old layout is now
+    /// stale: its queries are refused by the declared schema check, and the host
+    /// suspends its systems until it is rebuilt.
     ///
     /// # Errors
     ///
@@ -732,11 +745,11 @@ impl ComponentRegistry {
         supersedes: bool,
     ) -> Result<Registration, WorldError> {
         // Step 1: Return the existing bit index when the type is already
-        // registered, after checking that both registrations describe the
-        // same memory shape.
+        // registered, after checking that both registrations describe the same
+        // memory shape.
         let component_id = ComponentId::of::<T>();
         let layout = ComponentRegistration::of::<T>(fields);
-        if let Some(&bit) = self.id_to_bit.get(&component_id) {
+        if let Some(&bit) = self.bit_indices_by_id.get(&component_id) {
             // A shared name is a process-wide identity, so two types that hold
             // it are one component: one bit, one column, and every write
             // through either type reaches the other's rows. When their layouts
@@ -762,13 +775,13 @@ impl ComponentRegistry {
                     }
                 }
             }
-            // A shared component registered without field descriptors cannot
-            // be checked structurally: `is_compatible_with` compares only size
-            // and alignment, which agree for `{f32,f32}` and `{u32,u32}` alike.
-            // The fallback is deliberate - a hand-registered component carries
-            // no evidence either way - but it must not happen silently, because
-            // the point of shared identity is that two binaries agree about the
-            // contents of one row. Reported once per component id.
+            // A shared component registered without field descriptors cannot be
+            // checked structurally: `is_compatible_with` compares only size and
+            // alignment, which agree for `{f32,f32}` and `{u32,u32}` alike. The
+            // fallback is deliberate - a hand-registered component carries no
+            // evidence either way - but it must not happen silently, because the
+            // point of shared identity is that two binaries agree about the
+            // contents of one row. The warning is logged once per component id.
             if let Some(shared_name) = T::shared_name() {
                 if layout.schema_hash.is_none()
                     && self.shared_without_layout_reported.insert(component_id)
@@ -784,14 +797,14 @@ impl ComponentRegistry {
             let recorded_layout = self.layouts_by_id.get(&component_id).copied();
             match (recorded_layout, T::shared_name()) {
                 // A shared component reaching this branch is the normal
-                // cross-binary case: a second binary registers a type the
-                // first one already owns. Both will read and write the same
-                // rows through their own `T`, so a layout disagreement is a
-                // misread waiting to happen and must stop the registration.
-                // A reload of a subject that registered this component before
-                // is the one case where the new layout wins. The host moves
-                // the rows after `init`, and binaries still built against the
-                // old layout are refused by the declared schema check.
+                // cross-binary case: a second binary registers a type the first
+                // one already owns. Both will read and write the same rows
+                // through their own `T`, so a layout disagreement would make
+                // them read rows at the wrong offsets; it stops the registration
+                // instead. A reload of a subject that registered this component
+                // before is the one case where the new layout wins. The host
+                // moves the rows after `init`, and binaries still built against
+                // the old layout are refused by the declared schema check.
                 (Some(recorded), Some(shared_name))
                     if supersedes && !recorded.is_compatible_with(&layout) =>
                 {
@@ -822,11 +835,11 @@ impl ComponentRegistry {
                 _ => {}
             }
             // A layout-less re-registration (`register::<T>()`, fields `&[]`)
-            // records no schema hash of its own. A recorded hash is carried
+            // records no schema hash of its own, so a recorded hash is carried
             // forward: the record may gain a hash, but it must never lose one.
             // Otherwise the shared-layout check above would accept any layout
             // forever, and two binaries that disagree about a component's
-            // fields would register silently.
+            // fields would register without a warning.
             let mut merged_layout = layout;
             if merged_layout.schema_hash.is_none() {
                 if let Some(recorded) = recorded_layout {
@@ -842,15 +855,15 @@ impl ComponentRegistry {
         let Some(bit) = self.allocate_bit() else {
             return Err(WorldError::ComponentTypeLimitExceeded {
                 type_name: std::any::type_name::<T>().to_string(),
-                count: self.id_to_bit.len() as u8,
+                count: self.bit_indices_by_id.len() as u8,
             });
         };
         // Step 3: Record the type's metadata under the assigned bit.
-        self.id_to_bit.insert(component_id, bit);
+        self.bit_indices_by_id.insert(component_id, bit);
         // A shared component is recorded under its declared name, not
         // `std::any::type_name`: the declared name is what both binaries agree
         // on, and it is what every name-keyed lookup - persistence, the C#
-        // bindings, the editor - must find it by.
+        // bindings, the editor - has to find it by.
         self.names_by_id
             .insert(component_id, Self::registered_name::<T>());
         self.layouts_by_id.insert(component_id, layout);
@@ -889,8 +902,8 @@ impl ComponentRegistry {
 
     /// The Rust type's own name, without its module path.
     ///
-    /// `pill_spline::Spline` and `tests::module_copy::Spline` both yield
-    /// `Spline`. The module path is deliberately dropped: it is what differs
+    /// `pill_spline::Spline` and `tests::module_copy::Spline` both give
+    /// `Spline`. The module path is dropped on purpose: it is what differs
     /// between an in-process stand-in for the cross-binary case and the real
     /// thing, while the type's name is what two copies of one type always
     /// share.
@@ -902,10 +915,10 @@ impl ComponentRegistry {
     /// The name a component type is registered under.
     ///
     /// Its declared shared name when it has one, otherwise its
-    /// [`stable_type_name`](crate::type_names::stable_type_name) (the engine's
-    /// own types read `pill_engine::...`). A shared component must be findable by the
-    /// name both binaries wrote down rather than by one binary's rendering of
-    /// its Rust path.
+    /// [`stable_type_name`](crate::type_names::stable_type_name); the engine's
+    /// own types read `pill_engine::...`. A shared component has to be findable
+    /// by the name both binaries wrote down, not by one binary's rendering of
+    /// its own Rust path.
     pub fn registered_name<T: Component>() -> String {
         T::shared_name()
             .map(str::to_string)
@@ -928,9 +941,10 @@ impl ComponentRegistry {
         stable_id: u128,
         name: impl Into<String>,
     ) -> Result<u8, WorldError> {
-        // Step 1: Return the existing bit index when the stable ID is already registered.
+        // Step 1: Return the existing bit index when the stable ID is already
+        // registered.
         let component_id = ComponentId::descriptor(stable_id);
-        if let Some(&bit) = self.id_to_bit.get(&component_id) {
+        if let Some(&bit) = self.bit_indices_by_id.get(&component_id) {
             return Ok(bit);
         }
 
@@ -940,12 +954,12 @@ impl ComponentRegistry {
         let Some(bit) = self.allocate_bit() else {
             return Err(WorldError::ComponentTypeLimitExceeded {
                 type_name: name,
-                count: self.id_to_bit.len() as u8,
+                count: self.bit_indices_by_id.len() as u8,
             });
         };
 
         // Step 3: Record the descriptor component's identity.
-        self.id_to_bit.insert(component_id, bit);
+        self.bit_indices_by_id.insert(component_id, bit);
         self.names_by_id.insert(component_id, name);
         Ok(bit)
     }
@@ -959,9 +973,9 @@ impl ComponentRegistry {
         if let Some(bit) = self.free_bits.pop() {
             return Some(bit);
         }
-        if self.next_bit < 128 {
-            let bit = self.next_bit;
-            self.next_bit += 1;
+        if self.next_bit_index < 128 {
+            let bit = self.next_bit_index;
+            self.next_bit_index += 1;
             return Some(bit);
         }
         None
@@ -969,14 +983,17 @@ impl ComponentRegistry {
 
     /// Unregisters a component type and returns its bit to the reclaim pool.
     ///
-    /// Called when a reloaded module or project stops registering a type
-    /// entirely and its orphaned data is dropped. A later registration takes a
-    /// bit from the pool first, so the freed bit is normally handed out again.
-    /// The pool is what keeps a descriptor manifest that retires and introduces
-    /// types across reloads from increasing `next_bit` toward the 128-type
-    /// ceiling.
+    /// The caller must have removed every row of the type first. An archetype's
+    /// mask is also its id, so a bit that is handed out again while an archetype
+    /// still maps it would let the next component of that bit reach the stale
+    /// archetype and read its columns.
+    ///
+    /// A later registration takes a bit from the pool first, so the freed bit
+    /// is normally handed out again. The pool is what keeps a descriptor
+    /// manifest that retires and introduces types across reloads from
+    /// increasing `next_bit_index` toward the 128-type ceiling.
     pub fn remove(&mut self, component_id: &ComponentId) {
-        if let Some(bit) = self.id_to_bit.remove(component_id) {
+        if let Some(bit) = self.bit_indices_by_id.remove(component_id) {
             self.free_bits.push(bit);
         }
         self.names_by_id.remove(component_id);
@@ -991,12 +1008,12 @@ impl ComponentRegistry {
     /// The host reports this so a project sees the ceiling coming before
     /// registrations start failing.
     pub fn available_slots(&self) -> usize {
-        self.free_bits.len() + (128 - usize::from(self.next_bit))
+        self.free_bits.len() + (128 - usize::from(self.next_bit_index))
     }
 
     /// Returns the bit index of a registered component, or `None`.
     pub fn get_bit(&self, component_id: &ComponentId) -> Option<u8> {
-        self.id_to_bit.get(component_id).copied()
+        self.bit_indices_by_id.get(component_id).copied()
     }
 
     /// Returns the registered name of a component, or `None`.
@@ -1020,15 +1037,16 @@ impl ComponentRegistry {
     ///
     /// Returns `true` if `T` has been registered via [`register`](Self::register).
     pub fn is_registered<T: Component>(&self) -> bool {
-        self.id_to_bit.contains_key(&ComponentId::of::<T>())
+        self.bit_indices_by_id.contains_key(&ComponentId::of::<T>())
     }
 
     /// Iterates over all registered components.
     ///
     /// Yields `(ComponentId, bit_index, type_name)` for each registered
-    /// component type. Used for debugging and tooling.
+    /// component type, in no particular order. Used to turn an id back into its
+    /// name, to dump the registry, and to count registrations.
     pub fn registered_components(&self) -> impl Iterator<Item = (ComponentId, u8, &str)> {
-        self.id_to_bit.iter().map(|(id, &bit)| {
+        self.bit_indices_by_id.iter().map(|(id, &bit)| {
             (
                 *id,
                 bit,
@@ -1040,13 +1058,19 @@ impl ComponentRegistry {
     /// Number of registered component types.
     #[inline]
     pub fn len(&self) -> usize {
-        self.id_to_bit.len()
+        self.bit_indices_by_id.len()
     }
 
     /// Returns `true` if no component types are registered.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.id_to_bit.is_empty()
+        self.bit_indices_by_id.is_empty()
+    }
+}
+
+impl Default for ComponentRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1083,9 +1107,12 @@ mod tests {
         let mut registry = ComponentRegistry::new();
         let component_id = ComponentId::of::<ReRegisterTestComponent>();
 
-        let first = registry.register::<ReRegisterTestComponent>().unwrap();
-        assert!(first.is_new(), "the first registration creates the bit");
-        let first_bit = first.bit();
+        let first_registration = registry.register::<ReRegisterTestComponent>().unwrap();
+        assert!(
+            first_registration.is_new(),
+            "the first registration creates the bit"
+        );
+        let first_bit = first_registration.bit();
         assert!(registry.is_registered::<ReRegisterTestComponent>());
         assert_eq!(registry.get_bit(&component_id), Some(first_bit));
 
@@ -1103,11 +1130,14 @@ mod tests {
 
         // Re-registering works and reuses the freed bit: `remove` returns the
         // bit to the reclaim pool, so a descriptor manifest that retires and
-        // introduces types across reloads does not increase `next_bit` toward
-        // the 128-type ceiling.
-        let second = registry.register::<ReRegisterTestComponent>().unwrap();
-        assert!(second.is_new(), "after removal it is a fresh registration");
-        let second_bit = second.bit();
+        // introduces types across reloads does not increase `next_bit_index`
+        // toward the 128-type ceiling.
+        let second_registration = registry.register::<ReRegisterTestComponent>().unwrap();
+        assert!(
+            second_registration.is_new(),
+            "after removal it is a fresh registration"
+        );
+        let second_bit = second_registration.bit();
         assert!(registry.is_registered::<ReRegisterTestComponent>());
         assert_eq!(registry.get_bit(&component_id), Some(second_bit));
         assert_eq!(first_bit, second_bit, "the freed bit is reused");
@@ -1122,9 +1152,9 @@ mod tests {
         // the test does not need 129 real Rust types.
         let mut registry = ComponentRegistry::new();
         for index in 0..128 {
-            let result =
+            let registration =
                 registry.register_descriptor(index as u128 + 1, format!("Project.FakeType{index}"));
-            assert!(result.is_ok(), "slot {index} must register");
+            assert!(registration.is_ok(), "slot {index} must register");
         }
 
         // One more than the ceiling: the registry reports the limit, naming
@@ -1150,8 +1180,8 @@ mod tests {
         assert_eq!(reused_bit, 0, "the reclaimed bit is handed out again");
     }
 
-    /// Reclaimed bits keep the registry from increasing its bit counter toward
-    /// the 128-type ceiling during a churn-heavy editing session.
+    /// Reclaimed bits keep the registry's bit counter from growing toward the
+    /// 128-type ceiling while a project keeps adding and removing types.
     #[test]
     fn removed_bits_are_reclaimed_and_reported_as_headroom() {
         let mut registry = ComponentRegistry::new();
@@ -1170,8 +1200,11 @@ mod tests {
 
         // New registrations reuse the reclaimed bits (LIFO: the most recently
         // freed first) rather than consuming fresh ones.
-        let new_bit = registry.register_descriptor(999, "Project.New").unwrap();
-        assert_eq!(new_bit, 3, "the most recently freed bit is reused first");
+        let new_registration_bit = registry.register_descriptor(999, "Project.New").unwrap();
+        assert_eq!(
+            new_registration_bit, 3,
+            "the most recently freed bit is reused first"
+        );
         assert_eq!(registry.available_slots(), 123);
     }
 
@@ -1182,13 +1215,14 @@ mod tests {
     /// layout.
     #[test]
     fn schema_hash_survives_layout_less_reregistration() {
-        // Two copies of one shared type, as two binaries compile them: same
-        // final type name (so the name check passes) and same size, differing
-        // only in the declared field shape the schema hash covers.
+        // Two copies of one shared type, as two binaries compile them: the same
+        // final type name (so the name check passes) and the same size. Only
+        // the field descriptors they declare differ, and those are what the
+        // schema hash covers.
         mod first_copy {
             use crate::component::Component;
 
-            /// A copy of the shared type as one binary would declare it.
+            /// The first copy of the shared type, as one binary declares it.
             #[derive(Clone, Debug)]
             pub struct SharedProbe {
                 // The declared shape is what the schema hash covers; no code
@@ -1206,8 +1240,8 @@ mod tests {
         mod second_copy {
             use crate::component::Component;
 
-            /// The same type as another binary would declare it: same name,
-            /// different field shape.
+            /// The second copy of the same type, as another binary declares it:
+            /// the same name and the same fields.
             #[derive(Clone, Debug)]
             pub struct SharedProbe {
                 // Only the declared shape reaches the schema hash; nothing reads
@@ -1222,6 +1256,9 @@ mod tests {
             }
         }
 
+        // The two copies are identical in Rust; what differs is the field name
+        // in the descriptors each binary passes, which is one of the inputs to
+        // the schema hash.
         static FIELDS_A: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
             name: "first",
             type_tag: "u32",
@@ -1246,7 +1283,7 @@ mod tests {
             .register_with_layout::<first_copy::SharedProbe>(FIELDS_A)
             .expect("the first declaration is recorded");
 
-        // This registration carries no fields. The recorded hash must survive
+        // This registration carries no fields. The recorded hash has to survive
         // it, or the later check would accept any layout.
         let _re_registration = registry
             .register::<first_copy::SharedProbe>()

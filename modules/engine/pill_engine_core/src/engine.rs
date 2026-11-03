@@ -1,28 +1,29 @@
-//! System registration, frame execution, and parallel dispatch orchestration.
+//! System registration, frame processing and parallel dispatch.
 //!
 //! # Responsibilities
 //!
-//! - Registers systems by name and manages their lifecycle (enable/disable).
-//! - Orchestrates the two-phase frame: execute systems in parallel batches,
-//!   then apply deferred commands from the queue.
-//! - Manages frame-rate limiting via `set_fps_limit`.
-//! - Tracks per-system execution duration for profiling and utilization
+//! - Registers systems by name and enables or disables them.
+//! - Runs the frame: the update systems in parallel batches, then the command
+//!   flush, then the post-update systems.
+//! - Limits the frame rate through `set_fps_limit`.
+//! - Measures how long each system takes, for profiling and utilization
 //!   metrics.
-//! - Provides `world()` and `world_mut()` accessors for ad-hoc queries.
+//! - Provides `world()` and `world_mut()` for queries outside the frame.
 //!
 //! # Design
 //!
-//! The engine owns the [`World`], [`SystemScheduler`], and [`CommandQueue`].
-//! Each frame: (1) bump the world tick, (2) walk the scheduler's execution
-//! graph running systems in parallel batches via Rayon, (3) flush deferred
-//! commands, then run the post-update systems on the flushed world. Systems
-//! that use [`Commands`] always run sequentially due to their
-//! exclusive-world-access requirement.
+//! The engine owns the [`World`], the [`SystemScheduler`] and the
+//! [`CommandQueue`]. A frame bumps the world tick, runs the update systems
+//! from the scheduler's batches (in parallel on Rayon threads), then applies
+//! the commands the systems queued and runs the post-update systems on the
+//! result. A system that uses [`Commands`] always runs alone, because it
+//! needs exclusive access to the world.
 //!
-//! The engine is the one owner of the registered systems, and each record
-//! carries the access pattern the scheduler derives its conflict data from.
-//! Every structural change - a registration, a removal, a clear - invalidates
-//! the scheduler; the frame rebuilds the batches once, before it dispatches.
+//! The engine is the only owner of the registered systems, and each record
+//! carries the access pattern the scheduler builds its conflict data from.
+//! Any structural change - a registration, a removal, a clear - marks the
+//! scheduler's graph as out of date; the next frame rebuilds the batches
+//! once, before it dispatches.
 
 // Standard library
 use std::sync::Mutex;
@@ -44,38 +45,40 @@ use crate::system::{IntoSystem, System, SystemParam};
 use crate::world::{set_per_thread_last_run_tick, set_per_thread_this_run_tick, World};
 
 // =============================================================================
-// RegisteredSystem
+// SystemOwner
 // =============================================================================
 
-/// Identifies what registered a system: the project, an extension, the
-/// renderer or the engine.
+/// Says who registered a system: the project, an extension, the renderer or
+/// the engine.
 ///
 /// A hot reload replaces one module's code while the rest of the process keeps
 /// running. The systems of the module being swapped must be removed, because
-/// their function pointers refer to the retired library, but the systems of
-/// every other module and of the project must survive untouched. Tagging each
-/// registration with its owner is what makes that separation possible.
+/// their function pointers still point into the old library, but the systems
+/// of every other module and of the project must keep running. Recording the
+/// owner on each registration is what makes that separation possible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SystemOwner(pub u64);
 
 impl SystemOwner {
-    /// Owner of systems registered by the host or by the project module.
+    /// Owner of systems the project registers, and of any system registered
+    /// outside a module scope.
     pub const PROJECT: Self = Self(0);
 
-    /// Owner of systems the engine registers for itself.
+    /// Owner of the systems the engine registers for itself, such as the
+    /// periodic ECS report.
     ///
-    /// No reload path clears these: the host retires systems with
-    /// [`Engine::clear_systems_owned_by`], naming the project or one module,
-    /// and an engine-owned system is neither. That is what it is for - the
-    /// function pointer lives in `pill_engine_core.dll`, which is never
-    /// unloaded, so there is nothing to retire.
+    /// A reload never clears these systems: the host retires systems by
+    /// naming the project or one module in [`Engine::clear_systems_owned_by`],
+    /// and an engine-owned system is neither. That suits them, because their
+    /// code lives in `pill_engine_core.dll`, which is never unloaded, so
+    /// there is nothing to retire.
     ///
-    /// `u64::MAX`, which no [`Self::extension`] index reaches.
+    /// The value is `u64::MAX`, which no [`Self::extension`] index reaches.
     pub const ENGINE: Self = Self(u64::MAX);
 
     /// Owner of the extension loaded at `index`.
     ///
-    /// Offset by one so that no extension can collide with
+    /// The value is one above `index`, so no extension owner can equal
     /// [`Self::PROJECT`].
     pub const fn extension(index: usize) -> Self {
         Self(index as u64 + 1)
@@ -83,16 +86,18 @@ impl SystemOwner {
 
     /// Owner of the systems a renderer registers.
     ///
-    /// Reserved rather than taken from the extension range. A host that skips an
-    /// extension keeps that module's owner in reserve until it loads - the
-    /// editor's safe mode retries it - so a count of the extensions that *did*
-    /// load does not name the next free index, and an owner derived from it can
-    /// alias the pending module's. Two subjects under one owner would let a
-    /// reload of either clear the other's systems, and let a stale-suspension
-    /// resume reach a renderer paused against a replaced component layout.
+    /// This value is reserved instead of taken from the extension range. A
+    /// host can skip an extension and keep that module's owner reserved until
+    /// the module loads (the editor's safe mode retries a failed module), so
+    /// counting the extensions that did load does not give the next free
+    /// index. An owner derived from that count could therefore equal the
+    /// skipped module's owner. Two different subjects under one owner would
+    /// let a reload of either clear the other's systems, and would let a
+    /// suspension meant for the module resume a renderer that is paused
+    /// against a replaced component layout.
     ///
-    /// `u64::MAX - 1`, which no [`Self::extension`] index reaches, nor
-    /// [`Self::PROJECT`] nor [`Self::ENGINE`].
+    /// The value is `u64::MAX - 1`, which no [`Self::extension`] index
+    /// reaches, and which differs from [`Self::PROJECT`] and [`Self::ENGINE`].
     pub const RENDERER: Self = Self(u64::MAX - 1);
 
     /// The extension index this owner encodes, or `None` for the project, the
@@ -107,8 +112,8 @@ impl SystemOwner {
 }
 
 impl std::fmt::Display for SystemOwner {
-    /// `project`, `renderer`, `engine`, or `extension <n>` - the one place a
-    /// consumer turns an owner into text.
+    /// Writes `project`, `renderer`, `engine` or `extension <n>`; this is the
+    /// one place an owner becomes text.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.extension_index() {
             None if *self == Self::PROJECT => formatter.write_str("project"),
@@ -119,50 +124,59 @@ impl std::fmt::Display for SystemOwner {
     }
 }
 
+// =============================================================================
+// RegisteredSystem
+// =============================================================================
+
 /// One registered system with its runtime bookkeeping.
 ///
-/// Holds the system's name, boxed instance, access pattern, enabled state,
-/// and the per-frame timing data the Tracy span and the utilization metrics
-/// read.
+/// Holds the system's name, its boxed instance, its access pattern, whether
+/// it is enabled, and the per-frame timing data that the Tracy span and the
+/// utilization metrics read.
 struct RegisteredSystem {
-    /// Run after deferred commands, including while paused.
+    /// Whether the system runs in the post-update phase: after the command
+    /// flush, and even while the engine is paused.
     post_update: bool,
     /// Name used for registration, debugging, and profiling.
     name: String,
-    /// Module that registered this system, used to scope a hot reload.
+    /// Who registered this system; a hot reload removes systems by owner.
     system_owner: SystemOwner,
     /// Boxed system instance, invoked with the world and command queue.
     system: Box<dyn System>,
     /// The components and resources this system touches.
     ///
-    /// Owned here rather than by the scheduler so the access list and the
-    /// system list cannot fall out of step: there is one list, and the
-    /// scheduler derives its conflict data from it on demand.
+    /// The engine keeps this list here, not in the scheduler, so the two
+    /// cannot drift apart: there is only one list, and the scheduler builds
+    /// its conflict data from it when it needs it.
     system_access: SystemAccess,
     /// World tick at which this system was last executed.
     ///
-    /// Used to seed `World::system_last_run` so change-detection filters
-    /// (`Changed<T>`, `Added<T>`) inside the system see only mutations
-    /// that happened since its last run.
+    /// Set as `World::system_last_run` before the system runs, so
+    /// change-detection filters (`Changed<T>`, `Added<T>`) inside it see only
+    /// the changes made since its previous run.
     last_run_tick: u32,
-    /// Whether this system participates in frame execution.
+    /// Whether this system is enabled, and so runs when the frame dispatches
+    /// systems.
     enabled: bool,
-    /// Exponential moving average of this system's wall-clock execution
-    /// duration (nanoseconds). Shown in the system's Tracy span as the
-    /// splitting hint; the parallel iterators keep their own per-label timing
-    /// table. Smoothing factor ≈ 1/32 gives a ~32-frame averaging window.
+    /// Running average of this system's execution time in nanoseconds,
+    /// smoothed over about the last 32 frames. It is shown in the system's
+    /// Tracy span as the splitting hint; the parallel iterators keep their own
+    /// per-label timing.
     average_duration: u64,
-    /// Wall-clock duration (nanoseconds) from the most recent frame.
-    /// Populated during `run_systems_sequential` / `run_systems_parallel`
-    /// and consumed by the parallel-utilization metrics.
+    /// Execution time in nanoseconds from the most recent frame, used by the
+    /// parallel-utilization metrics.
     last_duration: u64,
 }
 
-/// One member of a parallel batch, as the worker closure sees it.
+// =============================================================================
+// BatchMember
+// =============================================================================
+
+/// A batch member's data, as the parallel worker closure sees it.
 ///
-/// One record per member keeps the member's index, its ticks, its name and
-/// whether it runs together, so the alignment is a field rather than a rule a
-/// reader has to remember.
+/// One record per member keeps the index, the two ticks, the name and the run
+/// flag together, so the worker reads them from one place instead of
+/// matching separate lists by position.
 struct BatchMember<'a> {
     /// Position in the engine's registered-system vector.
     system_index: usize,
@@ -176,6 +190,10 @@ struct BatchMember<'a> {
     runs: bool,
 }
 
+// =============================================================================
+// SystemSnapshot
+// =============================================================================
+
 /// A read-only snapshot of one registered system.
 ///
 /// `index` is the position in the registration vector and is the stable key
@@ -183,9 +201,11 @@ struct BatchMember<'a> {
 /// [`Engine::set_system_enabled`] matches the first system with a given name.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SystemSnapshot {
-    /// Position in the registration vector; the un-ambiguous toggle key.
+    /// Position in the registration vector, which is the key that names
+    /// exactly one system.
     pub index: usize,
-    /// Registration name used for display, profiling, and (ambiguous) lookup.
+    /// Registration name, shown in the UI and used by the name-keyed calls,
+    /// which match the first system that has it.
     pub name: String,
     /// What registered this system: the project, the renderer, the engine, or
     /// one extension.
@@ -205,10 +225,11 @@ pub struct SystemSnapshot {
 
 /// The main engine that drives the ECS.
 ///
-/// Owns the [`World`], [`SystemScheduler`], and [`CommandQueue`] and drives
-/// the two-phase frame: systems execute (in parallel batches when enabled),
-/// then deferred commands are applied, and the post-update systems run last.
-/// Systems are registered by name and can be enabled or disabled at runtime.
+/// It owns the [`World`], the [`SystemScheduler`] and the [`CommandQueue`],
+/// and runs every frame: the update systems run in parallel batches when
+/// parallel execution is on, then the queued commands are applied, then the
+/// post-update systems run. Systems are registered by name and can be
+/// enabled or disabled while the game runs.
 ///
 /// # Examples
 /// ```no_run
@@ -223,76 +244,75 @@ pub struct SystemSnapshot {
 /// engine.process_frame().unwrap();
 /// ```
 pub struct Engine {
-    /// All registered systems with their names and states
+    /// Every registered system, in registration order.
     systems: Vec<RegisteredSystem>,
-    /// Command queue for deferred operations
+    /// The commands the systems queued; the frame applies them at its flush.
     command_queue: CommandQueue,
     /// The ECS world
     world: World,
-    /// System scheduler for parallel execution
+    /// Builds the parallel batches from the systems' access patterns.
     scheduler: SystemScheduler,
-    /// Failures recorded by systems during the most recent frames, drained
-    /// once per frame by the reporting boundary. A failing system never
-    /// aborts its batch or the frame.
+    /// Failures the systems reported since the last drain. The reporting
+    /// boundary drains them once per frame, and a failing system never aborts
+    /// its batch or the frame.
     system_failures: Vec<SystemFailure>,
-    /// Whether parallel execution is enabled
+    /// Whether the frame runs the systems in parallel batches.
     parallel_execution_enabled: bool,
-    /// When true, `process_frame` skips the update systems (but still bumps the
+    /// When true, `process_frame` skips the update systems but still bumps the
     /// world tick, updates scripts, flushes deferred commands and runs the
-    /// post-update systems).
+    /// post-update systems.
     ///
-    /// Deliberately a field rather than a host-side convention: an editor
-    /// needs the engine itself to keep ticking and flushing while the update
-    /// systems are frozen so it can mutate a paused world and observe the
-    /// result.
+    /// This lives on the engine, not in each host: an editor needs the engine
+    /// itself to keep ticking and flushing while the update systems are
+    /// paused, so it can change a paused world and see the result.
     systems_paused: bool,
     /// When true, the next `process_frame` runs the system phase once even if
     /// the engine is paused. Set by [`Engine::request_single_step`]; the frame
     /// clears it.
     single_step_pending: bool,
     /// If true, `process_frame` returns every deferred-command failure it
-    /// collected. When false (default), failures are logged and the frame
+    /// collected. When false (the default), failures are logged and the frame
     /// reports success.
     ///
-    /// Set through [`Engine::set_should_exit_on_error`], like every other knob
-    /// on this type.
+    /// [`Engine::set_should_exit_on_error`] changes it.
     should_exit_on_error: bool,
     /// Optional frame rate limit. When set, `process_frame` sleeps the
     /// remaining budget after completing the frame's work.
     frame_budget: Option<Duration>,
-    /// When true, the FPS limiter sleep is wrapped in a Tracy zone
-    /// (`frame wait`). Turn off to declutter the timeline.
+    /// When true, the sleep that waits for the frame budget is wrapped in a
+    /// Tracy zone named `frame wait`; turn it off to keep the timeline tidy.
     ///
-    /// Set through [`Engine::set_trace_frame_wait`].
+    /// [`Engine::set_trace_frame_wait`] changes it.
     should_trace_frame_wait: bool,
-    /// Last seen archetype generation, used to detect when archetypes are
-    /// added or removed so we can emit per-archetype memory breakdowns.
+    /// The archetype generation seen on the previous frame. Comparing it with
+    /// the current one tells the frame when archetypes appeared or went away,
+    /// so it can log one memory breakdown per change.
     last_archetype_generation: u64,
-    /// Owner assigned to systems registered from now on.
+    /// The owner given to systems registered from now on.
     ///
-    /// The host scopes each module's initialization between
+    /// The host wraps a module's initialization in
     /// [`Engine::begin_module_registration`] and
     /// [`Engine::end_module_registration`], so module code keeps registering
-    /// systems by name and still ends up correctly attributed.
+    /// systems by name and the engine still records the right owner for each.
     active_owner: SystemOwner,
-    /// Owners whose systems are suspended by
+    /// The owners whose systems are currently suspended, set by
     /// [`Engine::set_systems_enabled_for_owner`].
     ///
-    /// Kept as a set of owners rather than only as the systems' flags, so a
-    /// system registered *while* its owner is suspended starts disabled: a new
-    /// module generation initializing during a suspension must not run early.
-    /// A `Vec` because only a handful of owners ever exist.
+    /// The owners are kept in their own list, not only as flags on the
+    /// systems, so a system registered while its owner is suspended starts
+    /// disabled: a new module generation that initializes during a suspension
+    /// must not run before it is resumed. A `Vec` is enough because only a
+    /// handful of owners ever exist.
     disabled_owners: Vec<SystemOwner>,
     /// Dispatch slots for hot-patchable systems, keyed by registration name
-    /// and, when it differs, by the function's qualified path.
+    /// and, when that differs, by the function's qualified path.
     ///
-    /// Deliberately NOT behind `#[cfg(feature = "hot_patch")]`. Gating the field
-    /// would change this struct's layout between feature configurations, and a
-    /// module built with the other configuration reconstructs `&mut Engine` from
-    /// a raw pointer through [`EngineApi`](crate::EngineApi) - so a layout
-    /// difference would be memory corruption rather than a compile error. An
-    /// unused empty map costs a few bytes once; the divergence would cost
-    /// correctness.
+    /// This field must NOT be behind `#[cfg(feature = "hot_patch")]`. The
+    /// feature would change the struct's layout, and a module built with the
+    /// other setting rebuilds `&mut Engine` from a raw pointer through
+    /// [`EngineApi`](crate::EngineApi). A layout difference would then corrupt
+    /// memory instead of failing to compile. An unused empty map costs a few
+    /// bytes; the difference would cost correctness.
     hot_patch_registry: crate::hot_patch::HotPatchRegistry,
 }
 
@@ -301,15 +321,16 @@ impl Engine {
     // Construction
     // -------------------------------------------------------------------------
 
-    /// Creates an engine with no registered systems, the engine-owned
-    /// resources every build assumes (`Time`, `Input`, `AssetManager`) and the
-    /// `Scene` asset type registered before any generation starts, so a reload
-    /// cannot retire it.
+    /// Creates an engine with no registered systems.
+    ///
+    /// It adds the resources every build expects (`Time`, `Input`,
+    /// `AssetManager`) and registers the `Scene` asset type before any
+    /// generation starts, so a reload cannot retire that registration.
     pub fn new() -> Self {
-        // !!! Order matters: name the main thread in Tracy BEFORE any zone
-        // is emitted on it.  Tracy auto-registers a thread the first time
-        // it sees a zone, and thread list ordering follows registration
-        // order.  Naming first ensures "main" sits at the top.
+        // Name the main thread before any zone runs on it. Tracy registers a
+        // thread the first time it sees a zone on it, and the thread list
+        // follows registration order, so naming the thread first keeps "main"
+        // at the top.
         crate::profile_thread!("main");
 
         // Wrap initialization in a non-continuous Tracy frame.
@@ -343,18 +364,18 @@ impl Engine {
         // Print the active parallel-iteration knobs.
         crate::config::print_parallel_config();
 
-        // Engine-owned resources, present before any project or module runs so
-        // nothing has to check whether they exist. All are advanced or owned
-        // by the engine itself rather than by a registered system, so a hot
-        // reload - which retires systems by owner - cannot take them away.
+        // Resources the engine owns. They exist before any project or module
+        // runs, so nothing has to check for them. The engine advances or owns
+        // them itself instead of through a registered system, so a hot reload,
+        // which removes systems by owner, cannot take them away.
         let mut world = World::new();
         world.insert_resource(crate::time::Time::new());
         world.insert_resource(crate::input::Input::new());
         world.insert_resource(crate::asset::AssetManager::new());
-        // The scene type is the engine's own, so every build lists and loads a
-        // `.scene` file without a module or a project registering it. This runs
-        // before any generation starts, so its registration sequence is older
-        // than every sequence a reload captures - which is what keeps a reload
+        // The scene type belongs to the engine, so every build can list and
+        // load a `.scene` file without a module or a project registering it.
+        // This runs before any generation starts, so its registration is older
+        // than any sequence a reload records, which is what keeps a reload
         // from retiring it.
         world.register_standalone_asset::<crate::scene::Scene>();
 
@@ -376,13 +397,13 @@ impl Engine {
             hot_patch_registry: crate::hot_patch::HotPatchRegistry::new(),
         };
 
-        // The ECS state report is opt-in: `set_ecs_diagnostics_interval` is the
-        // only thing that registers it. It is not registered here because it
-        // reads the whole world under exclusive access - a scheduler barrier
-        // every frame - and prints a multi-line block once per interval, which
-        // a shipping build must not pay for and no suite should have to filter
-        // out. Engine-owned when it is registered, attributed to
-        // `SystemOwner::ENGINE`, which no reload retires.
+        // The ECS state report is opt-in: only `set_ecs_diagnostics_interval`
+        // registers it. It is not created here because it reads the whole world
+        // under exclusive access, which forces a scheduler barrier on every
+        // frame, and it prints several lines once per interval. A shipping
+        // build must not pay that cost, and no test should have to filter the
+        // output. When it is registered it belongs to `SystemOwner::ENGINE`, so
+        // no reload retires it.
         engine
     }
 }
@@ -399,7 +420,7 @@ impl Engine {
         self.parallel_execution_enabled = enabled;
     }
 
-    /// How often the built-in ECS state report prints.
+    /// Sets how often the built-in ECS state report prints.
     ///
     /// The report is opt-in: [`Engine::new`] registers nothing, and this is the
     /// call that registers it. `None` turns it off again, removing the system.
@@ -413,21 +434,23 @@ impl Engine {
     /// engine.set_ecs_diagnostics_interval(None);                           // off
     /// ```
     ///
-    /// Each call re-registers, so exactly one such system is registered however
-    /// many times it is called. A registered report costs one `Duration`
-    /// comparison on the frames it does not print, plus the scheduler barrier
-    /// its exclusive world access makes every frame; `None` removes both.
+    /// Each call registers the system again, so exactly one report system
+    /// exists no matter how often it is called. While registered, it costs one
+    /// `Duration` comparison on the frames it does not print, plus the
+    /// scheduler barrier its exclusive world access forces on every frame;
+    /// `None` removes both.
     pub fn set_ecs_diagnostics_interval(&mut self, interval: Option<Duration>) {
-        // Re-register rather than mutate: the interval is captured by the
-        // closure, and replacing it keeps exactly one such system registered.
+        // Register again instead of changing the existing system: the interval
+        // lives inside the closure, so replacing the closure is what keeps
+        // exactly one report system registered.
         self.clear_systems_owned_by(SystemOwner::ENGINE);
         self.register_ecs_diagnostics_system(interval);
     }
 
-    /// Register the periodic ECS state report under
+    /// Registers the periodic ECS state report under
     /// [`SystemOwner::ENGINE`].
     ///
-    /// `None`, or a zero interval, registers nothing - which is how the report
+    /// `None`, or a zero interval, registers nothing, which is how the report
     /// is disabled.
     fn register_ecs_diagnostics_system(&mut self, interval: Option<Duration>) {
         let Some(interval) = interval.filter(|interval| !interval.is_zero()) else {
@@ -435,28 +458,30 @@ impl Engine {
         };
 
         let mut system_access = SystemAccess::new();
-        // The report reads the entire world - every archetype, the registry,
-        // the resources - which no per-component declaration can describe.
-        // Declaring exclusive world access is what makes that sound: the
-        // scheduler never places a system that conflicts with everything into a
-        // parallel batch, so nothing else is touching the world while it runs.
+        // The report reads the whole world: every archetype, the registry and
+        // the resources. No per-component declaration can describe that, so
+        // the access is declared as exclusive world access. That declaration
+        // is what keeps it sound: the scheduler never puts a system that
+        // conflicts with everything into a parallel batch, so nothing else
+        // touches the world while it runs.
         system_access.set_uses_commands(true);
 
-        // Schedule state lives in the closure, which the registration takes as
-        // an `FnMut`.
+        // The next report time lives in the closure; the registration takes it
+        // as an `FnMut`.
         let mut next_report: Option<Duration> = None;
         let previous_owner = self.active_owner;
         self.active_owner = SystemOwner::ENGINE;
-        // SAFETY: `system_access` declares exclusive world access, which is a superset
-        // of everything the system touches; it only reads, and never retains a
-        // borrow past the call.
+        // SAFETY: `system_access` declares exclusive world access, which covers
+        // everything the system touches. The closure only reads the world and
+        // keeps no borrow after it returns.
         unsafe {
             self.register_system_with_access(
                 crate::diagnostics::SYSTEM_NAME,
                 system_access,
-                // The closure owns the schedule. `None` until the first
-                // frame, so the first report lands one interval in rather than
-                // immediately at startup, when the world has just been built.
+                // The closure keeps its own schedule. It starts as `None`, so
+                // the first report comes one interval after the first frame
+                // instead of immediately at startup, when the world has just
+                // been built.
                 move |world: &mut World, _queue: &mut CommandQueue| {
                     let elapsed = world
                         .get_resource::<crate::time::Time>()
@@ -469,9 +494,9 @@ impl Engine {
                             return Ok(());
                         }
                     }
-                    // Measured from now rather than from the time that was
-                    // due, so a stalled frame does not leave a backlog that
-                    // prints several reports in a row to catch up.
+                    // Count the next interval from now, not from the time the
+                    // report was due, so one slow frame cannot leave a backlog
+                    // that prints several reports in a row.
                     next_report = Some(elapsed + interval);
                     pill_core::info!(
                         target: pill_core::telemetry::telemetry_target::ECS,
@@ -485,31 +510,32 @@ impl Engine {
         self.active_owner = previous_owner;
     }
 
-    /// Stops the update phase without stopping the frame.
+    /// Pauses or resumes the update systems without stopping the frame.
     ///
     /// A paused engine still bumps the world tick, still updates scripts and
-    /// still flushes deferred commands, so an editor can mutate a frozen world
-    /// and see the result. The post-update phase still runs after the flush;
+    /// still flushes deferred commands, so an editor can change a frozen world
+    /// and see the result. The post-update systems still run after the flush;
     /// only the update systems are skipped.
     pub fn set_systems_paused(&mut self, paused: bool) {
         self.systems_paused = paused;
         if !paused {
-            // Resuming also cancels any pending single step: there is nothing
-            // to step one frame of if systems are running freely.
+            // Resuming also drops a pending single step: with the systems
+            // running freely, there is nothing left to step.
             self.single_step_pending = false;
         }
     }
 
-    /// Whether the update systems are currently skipped.
+    /// Returns whether the update systems are currently skipped.
     pub fn systems_paused(&self) -> bool {
         self.systems_paused
     }
 
-    /// Run exactly one more system phase on the next `process_frame`.
+    /// Runs the update systems once on the next `process_frame`.
     ///
-    /// Used by the editor's step control. While the engine is paused, the next
-    /// frame runs the system phase once and leaves the engine paused; while
-    /// the engine runs freely, the call adds nothing to the normal frame.
+    /// The editor's step control uses it. While the engine is paused, the next
+    /// frame runs the update systems once and leaves the engine paused. While
+    /// the engine is running, the call changes nothing, because the next frame
+    /// runs the systems anyway.
     pub fn request_single_step(&mut self) {
         self.single_step_pending = true;
     }
@@ -533,7 +559,7 @@ impl Engine {
         };
     }
 
-    /// Chooses whether a deferred-command failure fails the frame.
+    /// Sets whether a deferred-command failure fails the frame.
     ///
     /// When `true`, `process_frame` returns every failure it collected and the
     /// caller decides what to do; when `false` (the default), failures are
@@ -542,14 +568,14 @@ impl Engine {
         self.should_exit_on_error = should_exit_on_error;
     }
 
-    /// Whether a deferred-command failure fails the frame.
+    /// Returns whether a deferred-command failure fails the frame.
     pub fn should_exit_on_error(&self) -> bool {
         self.should_exit_on_error
     }
 
-    /// Chooses whether the frame-rate limiter's sleep is traced.
+    /// Sets whether the frame-rate limiter's sleep is traced.
     ///
-    /// The zone is named `frame wait`; turn it off to declutter the timeline.
+    /// The zone is named `frame wait`; turn it off to keep the timeline tidy.
     pub fn set_trace_frame_wait(&mut self, should_trace_frame_wait: bool) {
         self.should_trace_frame_wait = should_trace_frame_wait;
     }
@@ -605,11 +631,11 @@ impl Engine {
             .map(|s| s.enabled)
     }
 
-    /// Whether a system with this name is registered.
+    /// Checks whether any system carries this name.
     ///
-    /// The existence question on its own; [`Self::is_system_enabled`] also
-    /// answers it, but reads as a predicate about enabled-ness. Names are not
-    /// unique, so this says `true` for any registration carrying the name.
+    /// This asks only about existence. [`Self::is_system_enabled`] answers the
+    /// same question but reads as one about being enabled. Names are not
+    /// unique, so this returns `true` if any registration has the name.
     pub fn is_registered(&self, name: &str) -> bool {
         self.system_index(name).is_some()
     }
@@ -623,7 +649,7 @@ impl Engine {
         self.systems.iter().position(|s| s.name == name)
     }
 
-    /// Snapshot of every registered system, in registration order.
+    /// Takes a snapshot of every registered system, in registration order.
     ///
     /// The editor's Systems tab reads this; it never requires knowing the
     /// concrete system type. `hot_patchable` reports whether the system has a
@@ -652,10 +678,10 @@ impl Engine {
             .collect()
     }
 
-    /// Enable or disable a system by registration index, unambiguously.
+    /// Enables or disables the system at `index`.
     ///
-    /// Unlike [`Self::set_system_enabled`], which matches by name and therefore
-    /// hits the first of several same-named systems, this targets exactly one
+    /// Unlike [`Self::set_system_enabled`], which matches by name and so hits
+    /// the first of several same-named systems, this targets exactly one
     /// registration. Returns `false` when the index is out of range.
     pub fn set_system_enabled_at(&mut self, index: usize, enabled: bool) -> bool {
         let Some(system) = self.systems.get_mut(index) else {
@@ -723,16 +749,16 @@ impl Engine {
     // Input
     // -------------------------------------------------------------------------
 
-    /// Queue an input event from the frontend; it takes effect at the start of
-    /// the next frame. See [`crate::input`].
+    /// Queues an input event from the frontend. The event takes effect at the
+    /// start of the next frame. See [`crate::input`].
     pub fn push_input_event(&mut self, event: crate::input::InputEvent) {
         if let Some(input) = self.world.get_resource_mut::<crate::input::Input>() {
             input.push_event(event);
         }
     }
 
-    /// Take the rumble requests systems queued, for the frontend that owns the
-    /// gamepads to play.
+    /// Takes the rumble requests the systems queued, so the frontend that owns
+    /// the gamepads can play them.
     pub fn take_rumble_requests(&mut self) -> Vec<crate::input::RumbleRequest> {
         self.world
             .get_resource_mut::<crate::input::Input>()
@@ -773,7 +799,8 @@ impl Engine {
         self.push_system(system_name, system_access, boxed_system, false);
     }
 
-    /// Register a post-flush system. Commands emitted here apply next frame.
+    /// Registers a system that runs after the command flush. The commands it
+    /// queues apply on the next frame.
     pub fn register_post_update_system<F, Input>(&mut self, name: impl Into<String>, system: F)
     where
         F: IntoSystem<Input>,
@@ -785,10 +812,10 @@ impl Engine {
 
     /// Derives a registration's access pattern and boxes its system.
     ///
-    /// The half both name-registering entry points share: report the access
-    /// the parameter tuple declares, then box the system - through a hot-patch
-    /// dispatch slot when that feature is on, so a later patch is one atomic
-    /// store rather than a re-registration.
+    /// The part both name-registering entry points share: it records the
+    /// access the parameter tuple declares, then boxes the system. With hot
+    /// patching on, the box goes through a dispatch slot, so a later patch
+    /// replaces one pointer instead of registering the system again.
     fn prepare_system<F, Input>(
         &mut self,
         name: impl Into<String>,
@@ -802,9 +829,9 @@ impl Engine {
         Input::report_access(&mut system_access);
         let system_name: String = name.into();
 
-        // Box the system. With hot patching enabled the call to the user's
-        // function goes through a dispatch slot the engine keeps a handle to,
-        // so a later patch is one atomic store rather than a re-registration.
+        // Box the system. With hot patching on, calls to the user's function
+        // go through a dispatch slot the engine keeps a handle to, so a patch
+        // replaces one pointer instead of registering the system again.
         #[cfg(feature = "hot_patch")]
         let boxed_system = {
             let slot = std::sync::Arc::new(crate::hot_patch::HotSlot::new());
@@ -815,12 +842,12 @@ impl Engine {
             let faults_key = function_path.clone().unwrap_or_else(|| system_name.clone());
             let hot_system = system.into_hot_system(std::sync::Arc::clone(&slot), faults_key);
 
-            // Registered under BOTH names. The display name is what callers and
-            // logs use; the function's real path is what `#[pill_hot]` derives
-            // and what a generated patch reports. They routinely differ - the
-            // `native` test project registers `physics_system` as
-            // `"ball_physics"` - and a patch pipeline that only knew one of
-            // them would fail to find the slot.
+            // Register the slot under both names. Callers and logs use the
+            // display name; `#[pill_hot]` and a generated patch use the
+            // function's full path. The two often differ (the `native` test
+            // project registers `physics_system` as `"ball_physics"`), and a
+            // patch pipeline that knew only one of them would not find the
+            // slot.
             self.hot_patch_registry
                 .insert(system_name.clone(), std::sync::Arc::clone(&slot));
             if let Some(path) = function_path {
@@ -840,23 +867,26 @@ impl Engine {
     // Hot patching
     // -------------------------------------------------------------------------
 
-    /// Replace one registered system's implementation without re-registering it.
+    /// Replaces one registered system's implementation without registering it
+    /// again.
     ///
-    /// The system keeps its identity, its position in the scheduler graph, its
-    /// access metadata and its change-detection ticks; the `World` is untouched.
-    /// The replacement takes effect on the system's next invocation, so callers
-    /// should apply patches at a frame boundary, where no system is running.
+    /// The system keeps its identity, its place in the scheduler graph, its
+    /// access metadata and its change-detection ticks. The [`World`] is
+    /// untouched. The replacement is used from the system's next run, so a
+    /// caller should apply patches at a frame boundary, when no system is
+    /// running.
     ///
     /// `signature_hash` must be the value
-    /// [`hot_patch::signature_hash`](crate::hot_patch::signature_hash) produces
-    /// for the replacement's parameter tuple and return type. A mismatch is
-    /// refused, because the running call site was compiled for the old shape.
+    /// [`hot_patch::signature_hash`](crate::hot_patch::signature_hash) returns
+    /// for the replacement's parameter tuple and return type. A different hash
+    /// is refused, because the running call site was compiled for the old
+    /// shape.
     ///
     /// # Errors
     ///
     /// Returns [`HotPatchError`](crate::hot_patch::HotPatchError) when no
     /// hot-patchable system is registered under `name` (`UnknownSystem`), when
-    /// the signature moved (`SignatureMismatch`), or for a null replacement
+    /// the signature changed (`SignatureMismatch`), or when `address` is null
     /// (`NullAddress`). In every case the running implementation stays in
     /// place.
     pub fn hot_patch(
@@ -873,11 +903,12 @@ impl Engine {
         slot.install(name, address, signature_hash)
     }
 
-    /// The implementation a system was registered with, and its signature.
+    /// Returns the implementation a system was registered with, and its
+    /// signature.
     ///
-    /// A host uses this to roll a patched system back to generation zero: the
-    /// code the running artifact was actually built with. `None` when no such
-    /// system is registered, or when it is not hot-patchable.
+    /// A host uses this to undo a patch and go back to the code the running
+    /// build was compiled with. `None` when no such system is registered, or
+    /// when it is not hot-patchable.
     pub fn hot_patch_baseline(&self, name: &str) -> Option<(usize, u64)> {
         let slot = self.hot_patch_registry.get(name)?;
         let original = slot.original();
@@ -912,17 +943,17 @@ impl Engine {
         self.push_system(name.into(), system_access, Box::new(system), false);
     }
 
-    /// Pushes one registered system and invalidates the scheduler's graph.
+    /// Adds one system to the list and marks the scheduler out of date.
     ///
-    /// Every registration entry point ends here, so a system's owner, its
-    /// phase, its suspended-at-registration state and the invalidation cannot
-    /// drift between them. `post_update` is a parameter rather than a field
-    /// written after the push, so a record never exists with a phase that
-    /// disagrees with the batches it was placed in.
+    /// Every registration entry point ends here, so they all set the owner,
+    /// the phase and the enabled state the same way, and they all invalidate
+    /// the graph. `post_update` is passed in rather than written after the
+    /// push, so no record ever exists with a phase that disagrees with the
+    /// batches it was placed in.
     ///
-    /// The batches themselves are not built here: the frame rebuilds them once
-    /// from the whole list, so a module registering many systems pays for one
-    /// rebuild rather than one per registration.
+    /// The batches are not built here: the next frame rebuilds them once from
+    /// the whole list, so a module that registers many systems pays for one
+    /// rebuild, not one per system.
     fn push_system(
         &mut self,
         name: String,
@@ -936,7 +967,8 @@ impl Engine {
             system_owner: self.active_owner,
             system,
             system_access,
-            // Starts suspended when its owner is (see `disabled_owners`).
+            // Starts disabled when its owner is suspended (see
+            // `disabled_owners`).
             enabled: !self.disabled_owners.contains(&self.active_owner),
             last_run_tick: 0,
             average_duration: 0,
@@ -944,6 +976,7 @@ impl Engine {
         });
         self.scheduler.invalidate();
     }
+
     /// Attributes every system registered from now on to `system_owner`.
     ///
     /// The host wraps a module's initialization in this call and
@@ -960,17 +993,17 @@ impl Engine {
 
     /// Suspends or resumes every system registered by `system_owner`.
     ///
-    /// Disabling also covers systems `system_owner` registers later, until it
-    /// is enabled again: a module generation that initializes during a
-    /// suspension registers its systems disabled. The suspension outlives
-    /// [`Self::clear_systems_owned_by`], which removes systems but not the
-    /// owner's state. Enabling turns every system of `system_owner` back on,
-    /// including any disabled individually with [`Self::set_system_enabled`]
-    /// meanwhile.
+    /// Suspending also covers systems `system_owner` registers later, until it
+    /// is resumed: a module generation that initializes during a suspension
+    /// registers its systems disabled. The suspension survives
+    /// [`Self::clear_systems_owned_by`], which removes the systems but not the
+    /// owner's state. Resuming turns on every system of `system_owner`,
+    /// including any that [`Self::set_system_enabled`] disabled in the
+    /// meantime.
     ///
-    /// Returns the number of systems `system_owner` currently has. The batch
-    /// graph is not touched: it lists every registered system and a disabled
-    /// one is skipped at dispatch.
+    /// Returns how many systems `system_owner` has now. The batches are not
+    /// rebuilt: they list every registered system, and a disabled system is
+    /// skipped at dispatch.
     pub fn set_systems_enabled_for_owner(
         &mut self,
         system_owner: SystemOwner,
@@ -997,8 +1030,8 @@ impl Engine {
         owned_system_count
     }
 
-    /// Whether systems of `system_owner` are allowed to run, i.e. it isn't
-    /// suspended by [`Self::set_systems_enabled_for_owner`].
+    /// Checks whether the systems of `system_owner` may run, that is, whether
+    /// the owner is not suspended by [`Self::set_systems_enabled_for_owner`].
     pub fn is_owner_enabled(&self, system_owner: SystemOwner) -> bool {
         !self.disabled_owners.contains(&system_owner)
     }
@@ -1012,8 +1045,9 @@ impl Engine {
     ///
     /// Returns the number of systems removed.
     pub fn clear_systems_owned_by(&mut self, system_owner: SystemOwner) -> usize {
-        // Forget the dispatch slots of the systems about to be removed, so a
-        // later patch can never install into a system that no longer runs.
+        // Step 1: Remove the dispatch slots of the systems that are about to
+        // go, so a later patch cannot install into a system that no longer
+        // runs.
         let mut removed_count = 0;
         for registered_system in &self.systems {
             if registered_system.system_owner == system_owner {
@@ -1025,10 +1059,11 @@ impl Engine {
             return 0;
         }
 
+        // Step 2: Remove the systems. The graph's indices address the system
+        // list, whose positions have shifted, so the next frame rebuilds it
+        // from the survivors.
         self.systems
             .retain(|registered_system| registered_system.system_owner != system_owner);
-        // The graph's indices address the system list, whose positions have
-        // shifted; the next frame rebuilds it from the survivors.
         self.scheduler.invalidate();
         removed_count
     }
@@ -1042,7 +1077,7 @@ impl Engine {
     /// only systems are affected. The world state persists.
     pub fn clear_systems(&mut self) {
         self.systems.clear();
-        // Every system is gone, so no dispatch slot may remain patchable.
+        // With every system gone, no dispatch slot may stay patchable.
         self.hot_patch_registry = crate::hot_patch::HotPatchRegistry::new();
         // The graph and its conflict matrix describe systems that no longer
         // exist; the next frame derives an empty one from the empty list.
@@ -1051,9 +1086,9 @@ impl Engine {
 
     /// Drains the system failures recorded since the previous drain.
     ///
-    /// The reporting boundary calls this once per frame and logs each
-    /// failure's semantic message. A failed system never aborts its batch,
-    /// so the remaining systems still complete the frame.
+    /// The reporting boundary calls this once per frame and logs each failure
+    /// as a message. A failed system never aborts its batch, so the rest still
+    /// finish the frame.
     pub fn drain_system_failures(&mut self) -> Vec<SystemFailure> {
         std::mem::take(&mut self.system_failures)
     }
@@ -1084,7 +1119,8 @@ impl Engine {
         produce_commands(&mut self.world, &mut self.command_queue);
         // One-shot startup has no following frame in which to surface a
         // failure, so always return command errors to its caller.
-        self.command_queue.execute_queued_commands(&mut self.world, true)
+        self.command_queue
+            .execute_queued_commands(&mut self.world, true)
     }
 
     /// Runs a command-producing closure without applying its commands.
@@ -1106,7 +1142,8 @@ impl Engine {
     ///
     /// Returns one entry per command that could not be applied.
     pub fn flush_deferred_commands(&mut self) -> Result<(), Vec<CommandError>> {
-        self.command_queue.execute_queued_commands(&mut self.world, true)
+        self.command_queue
+            .execute_queued_commands(&mut self.world, true)
     }
 
     /// Discards every command queued since the last flush without applying it.
@@ -1114,16 +1151,18 @@ impl Engine {
         self.command_queue.clear();
     }
 
-    /// Processes one frame: executes all systems, then applies deferred commands.
+    /// Runs one frame: the update systems, the command flush and the
+    /// post-update systems.
     ///
-    /// This is the main loop of the ECS:
-    /// 1. Execute all registered systems (in parallel batches if enabled)
-    /// 2. Systems can queue commands (create, destroy, add component, etc.)
-    /// 3. After the update systems run, apply the queued commands, then run
-    ///    the post-update systems on the result
+    /// A frame goes like this:
+    /// 1. The update systems run, in parallel batches when that is enabled.
+    /// 2. While they run, systems queue commands (create, destroy, add a
+    ///    component and so on) instead of changing the world directly.
+    /// 3. After the update systems finish, the queued commands are applied and
+    ///    the post-update systems run on the result.
     ///
-    /// This two-phase approach ensures structural changes don't interfere
-    /// with systems that are still running.
+    /// Splitting the frame this way keeps structural changes from disturbing
+    /// systems that are still running.
     ///
     /// # Errors
     ///
@@ -1146,23 +1185,23 @@ impl Engine {
                 ]
             );
 
-            // Step 1: Bump the world change tick and reset per-frame debug state.
+            // Step 1: Bump the world change tick and reset the per-frame debug
+            // state.
             //
-            // Bump the world tick so that any change-detection comparisons
-            // performed by mutable queries during this frame use a fresh value.
+            // Bumping the tick first means every change-detection comparison a
+            // mutable query makes during this frame uses a fresh value.
             self.world.increment_change_tick();
 
             // Advance the clock before anything reads it, so every system in
-            // this frame sees the same values and none sees last frame's.
+            // this frame sees the same time and none sees last frame's.
             //
-            // Done here rather than in a registered system because
-            // `ensure_execution_graph` batches in registration order: a time
-            // system would only be ordered ahead of its readers if every
-            // project registered it first, and a project that registers one
-            // late would hand its earlier systems stale values with nothing in
-            // the API to reveal it. `get_resource_mut` rather than the tracked
-            // variant, since bumping a change tick for a resource that changes
-            // every single frame tells a reader nothing.
+            // This is done here rather than by a registered system because the
+            // scheduler batches systems in registration order. A time system
+            // would only run before its readers if every project registered it
+            // first; a project that registered one late would give its earlier
+            // systems stale values, and nothing in the API would show it. The
+            // untracked `get_resource_mut` is deliberate: a change tick for a
+            // resource that changes on every frame tells a reader nothing.
             if let Some(time) = self.world.get_resource_mut::<crate::time::Time>() {
                 time.advance();
             }
@@ -1193,12 +1232,13 @@ impl Engine {
             // set changed since the last frame.
             self.emit_archetype_memory_breakdown();
 
-            // Step 4: Run all systems (parallel batches or sequential fallback).
+            // Step 4: Run the update systems, in parallel batches or one after
+            // another.
             //
             // A paused engine skips this phase but still bumps the world tick
-            // (Step 1), still updates scripts (Step 5), and still flushes
-            // deferred commands (Step 6). `request_single_step` runs exactly
-            // one phase and re-pauses by clearing the pending flag here.
+            // (Step 1), still updates scripts (Step 5) and still flushes
+            // deferred commands (Step 6). A single step runs the systems once;
+            // clearing the pending flag here is what pauses the engine again.
             if !self.systems_paused || self.single_step_pending {
                 if self.parallel_execution_enabled && self.systems.len() > 1 {
                     self.run_systems_parallel();
@@ -1220,8 +1260,8 @@ impl Engine {
                 );
             }
 
-            // Step 5: Update scripts: each one reads the world, mutates only
-            // its own component, and queues deferred commands.
+            // Step 5: Update the scripts. Each script reads the world, changes
+            // only its own component and queues its other changes as commands.
             {
                 let _zone = crate::profile_scope!("update scripts");
                 self.world.update_scripts(&mut self.command_queue);
@@ -1232,7 +1272,10 @@ impl Engine {
             {
                 let _zone = crate::profile_scope!(
                     "execute commands",
-                    [("Commands queued this frame: {}", !self.command_queue.is_empty())]
+                    [(
+                        "Commands queued this frame: {}",
+                        !self.command_queue.is_empty()
+                    )]
                 );
                 deferred_command_flush = self
                     .command_queue
@@ -1241,15 +1284,18 @@ impl Engine {
             crate::profile_secondary_frame_mark!("commands");
             self.run_systems_sequential(true);
 
-            // Step 7: Check for duplicate iterator labels within this frame and
-            // emit the per-frame time-series plots and metrics.
+            // Step 7: Warn about duplicate parallel-iterator labels seen this
+            // frame, then emit the per-frame plots and metrics.
             {
                 let mut iterator_timings = self
                     .world
                     .iterator_timings
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if !iterator_timings.visited_duplicated_iterator_labels.is_empty() {
+                if !iterator_timings
+                    .visited_duplicated_iterator_labels
+                    .is_empty()
+                {
                     let duplicates =
                         std::mem::take(&mut iterator_timings.visited_duplicated_iterator_labels);
                     crate::profile_warn!(
@@ -1270,13 +1316,13 @@ impl Engine {
             self.emit_frame_telemetry(frame_start);
         } // <- frame zone ends here
 
-        // FPS limiter - sleep remaining budget OUTSIDE the frame zone
+        // Wait out the rest of the frame budget outside the frame zone.
         self.wait_for_frame_budget(frame_start);
 
         deferred_command_flush
     }
 
-    /// Emit the per-frame Tracy plots and metrics-reporter gauges.
+    /// Emits the per-frame Tracy plots and the metrics-reporter gauges.
     #[cfg_attr(not(feature = "profiling"), allow(unused_variables))]
     fn emit_frame_telemetry(&self, frame_start: Instant) {
         // Emit per-frame time-series plots for Tracy (native plot API).
@@ -1302,15 +1348,16 @@ impl Engine {
             self.world.commands_executed_this_frame as f64
         );
 
-        // The same numbers also flow through the shared `metrics` recorder,
-        // which forwards them to Tracy's plot API when a profiler is attached.
-        // It keeps no copy of its own: a reader that wants these values reads
-        // Tracy or logs them.
+        // The same numbers also go through the shared `metrics` recorder,
+        // which passes them to Tracy's plot API while a profiler is attached.
+        // The recorder keeps no copy, so a reader that wants these values reads
+        // Tracy or the logs.
         //
-        // The time here is this pass's own span, so it is named for the world
-        // state beside it rather than for the frame: `engine.frame_time_ms` is
-        // the frontend's frame, which also covers whatever it draws between two
-        // of these and is a different number.
+        // The time recorded here measures this pass only, which is why it is
+        // named beside the world numbers rather than as the frame time:
+        // `engine.frame_time_ms` is the frontend's frame, which also covers
+        // whatever it draws between two of these passes, so the two numbers
+        // differ.
         #[cfg(feature = "metrics")]
         {
             metrics::gauge!("ecs.entities").set(self.world.entity_count() as f64);
@@ -1322,7 +1369,7 @@ impl Engine {
         }
     }
 
-    /// Emit one memory-breakdown block when the archetype set has changed.
+    /// Emits one memory-breakdown block when the archetype set has changed.
     #[cfg_attr(not(feature = "profiling"), allow(unused_variables))]
     fn emit_archetype_memory_breakdown(&mut self) {
         let current_generation = self.world.archetype_generation;
@@ -1346,7 +1393,7 @@ impl Engine {
         );
     }
 
-    /// Sleep off whatever remains of the frame budget, outside the frame zone.
+    /// Waits out whatever remains of the frame budget, outside the frame zone.
     fn wait_for_frame_budget(&self, frame_start: Instant) {
         let Some(budget) = self.frame_budget else {
             return;
@@ -1373,9 +1420,9 @@ impl Engine {
     // Internal: Sequential Execution
     // -------------------------------------------------------------------------
 
-    /// Runs systems sequentially: when parallel execution is disabled, when
+    /// Runs systems one after another: when parallel execution is off, when
     /// only one system is registered, and for the post-update phase, which
-    /// always follows the command flush on the calling thread.
+    /// always runs on the calling thread after the command flush.
     fn run_systems_sequential(&mut self, post_update: bool) {
         let _zone = crate::profile_scope!(
             "systems sequential",
@@ -1403,19 +1450,20 @@ impl Engine {
     // Internal: Parallel Execution
     // -------------------------------------------------------------------------
 
-    /// Runs systems in parallel batches based on the scheduler's dependency analysis.
+    /// Runs the update systems in parallel batches, using the scheduler's
+    /// conflict analysis.
     ///
-    /// Each batch is proven by the scheduler to access disjoint components and
-    /// resources, so its systems can run concurrently on Rayon worker threads.
-    /// Systems that use [`Commands`] run exclusively (never in parallel with
-    /// anything) because they require exclusive access to the world.
+    /// The scheduler guarantees that the systems in one batch touch disjoint
+    /// components and resources, so they can run at the same time on Rayon
+    /// worker threads. A system that uses [`Commands`] always runs alone,
+    /// because it needs exclusive access to the world.
     ///
     /// # Safety
     ///
-    /// This function contains `unsafe` code that rebuilds `&mut` references from
-    /// raw pointers. Its soundness rests on the scheduler's guarantees: systems
-    /// in one batch access disjoint state, command-using systems run alone, and
-    /// every batch index stays within the `systems` vector.
+    /// This function contains `unsafe` code that rebuilds `&mut` references
+    /// from raw pointers. It is sound because of the scheduler's guarantees:
+    /// systems in one batch access disjoint state, command-using systems run
+    /// alone, and every batch index stays within the `systems` vector.
     fn run_systems_parallel(&mut self) {
         let _zone = crate::profile_scope!(
             "run systems parallel",
@@ -1460,23 +1508,20 @@ impl Engine {
                     );
                 }
             } else {
-                // Multiple systems - run in parallel using rayon.
+                // Several systems, so run them in parallel with Rayon.
                 //
-                // For change-detection: every system in the batch has, by
-                // construction, disjoint component access from every other
-                // system. This means each system's filter only inspects
-                // ticks the scheduler has reserved for that system, so it
-                // is safe to share `system_last_run` even though several
-                // systems read it concurrently. We pre-compute each
-                // system's `last_run_tick` and seed it via a per-thread local,
-                // sidestepping the world-level field for parallel batches.
+                // Change detection is safe here because the scheduler puts only
+                // systems with disjoint component access in one batch. Each
+                // system's filters look at ticks reserved for that system, so
+                // several systems may read `system_last_run` at the same time.
+                // Each system's `last_run_tick` is copied into a per-thread
+                // value at dispatch, instead of going through the world field.
                 let started_at_tick = self.world.change_tick().get();
 
-                // Step 1: Collect per-system data and raw pointers for disjoint
-                // parallel access. One record per batch member keeps a
-                // member's index, its ticks, its name and whether it runs
-                // together, so the alignment is structural rather than a
-                // comment.
+                // Step 1: Collect one record per batch member, plus the raw
+                // pointer the workers need. The record keeps the member's
+                // index, its ticks, its name and whether it runs, so the
+                // worker never has to line up separate lists.
                 let _zone = crate::profile_scope!("setup systems batch ({} systems)", batch_size);
                 let systems_ptr = crate::query::ptr::SendPtrMut::new(self.systems.as_mut_ptr());
                 let mut members: Vec<BatchMember<'_>> = Vec::with_capacity(batch_size);
@@ -1485,48 +1530,48 @@ impl Engine {
                     members.push(BatchMember {
                         system_index,
                         last_run_tick: registered_system.last_run_tick,
-                        // Reserve one tick per batch member on this thread,
-                        // before any pointer is handed out: this is the last
-                        // point where `&mut self.world` is legitimately held,
-                        // and it is what keeps the workers from
-                        // read-modify-writing the shared counter. Disabled
-                        // members reserve too, so every member carries the
-                        // tick its index reserved.
+                        // Reserve one tick per member here, on this thread,
+                        // before any pointer is handed out. This is the last
+                        // point where `&mut self.world` is still valid, and
+                        // reserving here keeps the workers from updating the
+                        // shared counter themselves. Disabled members reserve a
+                        // tick too, so every member carries the tick of its own
+                        // index.
                         this_run_tick: self.world.increment_change_tick().get(),
                         name: registered_system.name.as_str(),
                         runs: registered_system.enabled && !registered_system.post_update,
                     });
                 }
 
-                // - Prepare raw pointers for parallel access -
+                // Prepare the raw pointers the workers share.
                 //
-                // Rust's borrow checker prevents us from passing `&mut self.world`,
-                // `&mut self.command_queue`, and `&mut self.systems[idx]` into a Rayon
-                // closure, even though the scheduler has *proven* that these
-                // accesses are disjoint.  We sidestep the checker with raw
-                // pointers, which carry no borrow obligations.
+                // Rust's borrow checker does not allow passing `&mut self.world`,
+                // `&mut self.command_queue` and `&mut self.systems[idx]` into one
+                // Rayon closure, even though the scheduler has shown that the
+                // accesses are disjoint. Raw pointers carry no borrow obligations,
+                // so they get around that check.
                 //
                 // Each pointer is wrapped in `SendPtrMut` so the closure can be
-                // sent (`Send`) and shared (`Sync`) across Rayon worker threads.
-                // The wrapper is zero-cost: a single `*mut T` field that LLVM
-                // inlines away at any optimisation level.
+                // `Send` and `Sync` across Rayon worker threads. The wrapper costs
+                // nothing: it holds a single `*mut T` field that LLVM inlines away
+                // at any optimisation level.
                 //
-                // `addr_of_mut!` is used instead of `&mut ... as *mut T` because
-                // it never forms a reference first: a `&mut` to memory the
-                // workers are about to write through would assert the exclusive
-                // access this function cannot uphold. Deriving the pointer
-                // directly also keeps its provenance tied to the allocation,
-                // which strict-provenance targets (CHERI, Arm MTE) rely on.
+                // `addr_of_mut!` is used instead of `&mut ... as *mut T` because it
+                // never creates a reference first. A `&mut` to memory the workers
+                // are about to write through would claim exclusive access that
+                // this function cannot uphold. Building the pointer directly also
+                // keeps its provenance tied to the allocation, which
+                // strict-provenance targets (CHERI, Arm MTE) rely on.
                 let world_ptr =
                     crate::query::ptr::SendPtrMut::new(std::ptr::addr_of_mut!(self.world));
                 let command_queue_ptr =
                     crate::query::ptr::SendPtrMut::new(std::ptr::addr_of_mut!(self.command_queue));
                 drop(_zone);
 
-                // Step 2: Dispatch all systems in the batch across Rayon workers.
-                // Use a single indexed parallel iterator instead of chained
-                // zip() - avoids deep iterator nesting that causes Rayon
-                // to spend more time splitting than executing on small batches.
+                // Step 2: Run the batch's systems on Rayon worker threads. One
+                // indexed parallel iterator is used instead of chained `zip()`
+                // calls: deep iterator nesting makes Rayon spend more time
+                // splitting work than running it on small batches.
                 let _zone = crate::profile_scope!(
                     "dispatch systems batch ({} systems across rayon)",
                     batch_size
@@ -1556,22 +1601,22 @@ impl Engine {
                     let previous_this_run_tick =
                         set_per_thread_this_run_tick(Some(Tick::new(member.this_run_tick)));
 
-                    // SAFETY: The scheduler proved that the systems in this
-                    // batch access disjoint components and resources, so no two
-                    // worker threads alias the same world, command queue, or
-                    // system state; command-using systems never share a batch. Each
-                    // pointer was derived from `self` while `&mut self` was held
-                    // for the whole batch, so the underlying allocations outlive
-                    // every closure invocation. `member.system_index` comes from
-                    // `systems_batch`, which the scheduler built from
-                    // `self.systems`, so `add(system_index)` stays within the
-                    // `systems` allocation. The only shared mutable buffer,
-                    // `batch_failures`, is guarded by a `Mutex`, and per-thread
-                    // last-run ticks are stored thread-locally. Rebuilding
-                    // `&mut World`, `&mut CommandQueue`, and `&mut
-                    // RegisteredSystem` from these pointers is therefore valid:
-                    // disjoint, in-bounds, alive for the duration of use, and
-                    // type-valid.
+                    // SAFETY: The scheduler put only systems with disjoint
+                    // component and resource access in one batch, and a system
+                    // that uses commands never shares a batch, so no two worker
+                    // threads touch the same world, command queue or system
+                    // state. Each pointer comes from `self` while `&mut self`
+                    // is held for the whole batch, so the data it points at
+                    // outlives every closure call. `member.system_index` comes
+                    // from `systems_batch`, which the scheduler built from
+                    // `self.systems`, so `add(system_index)` stays inside the
+                    // `systems` allocation. The one shared mutable buffer,
+                    // `batch_failures`, is behind a `Mutex`, and the last-run
+                    // ticks are thread-local. Rebuilding `&mut World`, `&mut
+                    // CommandQueue` and `&mut RegisteredSystem` from these
+                    // pointers is therefore sound: the accesses are disjoint,
+                    // in bounds, alive for as long as they are used, and hold
+                    // valid values.
                     unsafe {
                         let world = &mut *world_ptr.as_ptr();
                         let system_start = Instant::now();
@@ -1616,8 +1661,8 @@ impl Engine {
                         .map(|(system, error)| SystemFailure::new(system, error)),
                 );
 
-                // After the batch finishes, advance every system's
-                // last_run_tick to the tick we observed at batch start.
+                // After the batch finishes, move every system's
+                // `last_run_tick` to the tick recorded when the batch started.
                 let _advance_zone =
                     crate::profile_scope!("batch advance ticks ({} systems)", systems_batch.len());
                 for &system_index in systems_batch {
@@ -1629,16 +1674,26 @@ impl Engine {
     }
 }
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Runs one registered system on the calling thread.
 ///
-/// The one definition of a run - the change-detection baseline, the timing,
-/// the failure record and the bookkeeping - shared by the sequential loop, the
-/// single-system batch lane and the post-flush phase. The parallel closure
-/// keeps its own body: its bookkeeping goes through thread-local ticks and a
-/// shared failure buffer.
+/// The sequential loop, the single-system batch lane and the post-flush phase
+/// all come here, so the change-detection baseline, the timing, the failure
+/// record and the bookkeeping exist once. The parallel closure has its own
+/// body, because its bookkeeping goes through thread-local ticks and a shared
+/// failure buffer.
 ///
-/// Takes the engine's fields rather than `&mut Engine` so the caller can hold
-/// the scheduler's execution graph borrowed for its loop.
+/// It takes the engine's fields instead of `&mut Engine` so the caller can keep
+/// the scheduler's execution graph borrowed while it loops.
 fn run_registered_system(
     world: &mut World,
     command_queue: &mut CommandQueue,
@@ -1668,16 +1723,15 @@ fn run_registered_system(
     );
 }
 
-/// Apply the bookkeeping every dispatch path owes a system that just ran.
+/// Records what every dispatch path owes a system that just ran.
 ///
-/// One definition for the sequential path, the single-system batch lane and
-/// the parallel batch closure: the change-detection baseline advances to the
-/// tick captured at system entry (so the next run sees mutations that
-/// happened during this run), the splitting hint tracks the observed
-/// duration with the configured smoothing window, and the instantaneous
-/// duration feeds the utilization metric. The batch-wide `last_run_tick`
-/// advance after the closure stays where it is: it also covers disabled
-/// members, which never enter a worker task.
+/// The sequential path, the single-system batch lane and the parallel batch
+/// closure all use this one function. It moves the change-detection baseline
+/// to the tick captured when the system started, so the next run sees the
+/// changes made during this one. It feeds the observed duration into the
+/// smoothed average, and it stores the duration for the utilization metric.
+/// The batch-wide `last_run_tick` update after the closure stays where it is,
+/// because it also covers disabled members, which never enter a worker task.
 fn record_system_run(
     registered_system: &mut RegisteredSystem,
     started_at_tick: u32,
@@ -1692,12 +1746,6 @@ fn record_system_run(
         as u64;
     // Store instantaneous duration for utilization metric.
     registered_system.last_duration = elapsed_nanos;
-}
-
-impl Default for Engine {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 // =============================================================================
@@ -1749,12 +1797,13 @@ mod tests {
         assert!(engine.system_failures().is_empty());
     }
 
-    /// A panicking system is contained: it becomes a recorded failure, the
-    /// frame survives, and three consecutive panics queue one fault report for
-    /// the host to roll the function back with.
+    /// A system that panics is contained: the panic is recorded as a failure,
+    /// the frame keeps going, and three panics in a row queue one fault report
+    /// the host can roll the function back with.
     ///
-    /// Hot-patch only: containment lives in the dispatch slot a patched system
-    /// calls through, and without the feature there is no patch to roll back.
+    /// This test only exists with hot patching on: the containment lives in the
+    /// dispatch slot a patched system calls through, and without the feature
+    /// there is no patch to roll back.
     #[cfg(feature = "hot_patch")]
     #[test]
     fn a_panicking_system_is_contained_and_reports_a_fault() {
@@ -1870,9 +1919,9 @@ mod tests {
         );
     }
 
-    /// Every parallel batch member gets exactly one reserved tick: queries
-    /// inside one system see the same tick however often they ask, and two
-    /// systems in one batch never share one - which is what keeps the shared
+    /// Every member of a parallel batch gets its own reserved tick: a query
+    /// inside one system sees the same tick however often it asks, and two
+    /// systems in one batch never share a tick, which is what keeps the shared
     /// counter out of the workers' hands.
     #[test]
     fn parallel_batch_systems_receive_one_tick_each() {
@@ -2141,8 +2190,8 @@ mod tests {
         engine.process_frame().unwrap();
         assert_eq!(counter.load(AtomicOrdering::SeqCst), 1);
 
-        // Paused: frames still process (tick bump, command flush) but no
-        // system runs.
+        // Paused: frames still run (the tick advances and commands are
+        // flushed) but no system runs.
         engine.set_systems_paused(true);
         engine.process_frame().unwrap();
         engine.process_frame().unwrap();
@@ -2162,16 +2211,15 @@ mod tests {
         assert!(!engine.systems_paused());
     }
 
-    /// `system_snapshots` reports owners, enabled state, and name ambiguity,
-    /// and `set_system_enabled_at` toggles exactly one of two same-named
-    /// systems.
+    /// Checks that `system_snapshots` reports owners, enabled state and name
+    /// ambiguity, and that `set_system_enabled_at` toggles exactly one of two
+    /// same-named systems.
     #[test]
     fn system_snapshots_report_owners_and_toggle_by_index() {
         let mut engine = Engine::new();
-        // This test is about project and module ownership and indexes the
-        // snapshot list directly. The ECS report is opt-in and nothing here
-        // turns it on; the call keeps the indices meaning what they would if a
-        // project did so first.
+        // The snapshot indices below assume that no other system is registered.
+        // The ECS report is opt-in, and this call makes sure it stays off
+        // rather than relying on the default.
         engine.set_ecs_diagnostics_interval(None);
         engine.register_system("duplicate", || {});
         engine.begin_module_registration(SystemOwner::extension(0));

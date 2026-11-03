@@ -4,50 +4,69 @@
 //!
 //! - Exercises the world's own behaviour: entity lifecycle and recycling,
 //!   archetype migration, descriptor registration, relayout and remap, change
-//!   ticks, and the diagnostics that read all of it back.
+//!   ticks, resource re-homing, shared and foreign resources, zero-sized
+//!   components, and script dispatch.
+//! - Checks the readback the editor and the other tools use: component names
+//!   and resolution, the registry listing and the editor's entity rows.
 //!
 //! # Design
 //!
-//! One test module that can reach every one of the world's private pieces, so
-//! a test builds a world out of whichever of them it needs instead of
-//! re-declaring the fixtures.
+//! One test module that can reach every private part of the world, so a test
+//! builds a world out of the parts it needs instead of declaring its own
+//! fixtures.
 
+// Current crate
 use super::*;
 use crate::archetype::{FieldSource, LayoutField};
 use crate::test_fixtures::{setup_world, Health, Position, Velocity};
 
-/// The change-detection ticks of one entity's row for one component.
-fn ticks_of_row(world: &World, entity: Entity, component: ComponentId) -> ComponentTicks {
+/// Returns the change-detection ticks of one entity's row for one component.
+fn ticks_of_row(world: &World, entity: Entity, component_id: ComponentId) -> ComponentTicks {
     let location = world.entity_locations[&entity];
     *world.archetypes[&location.archetype_id]
         .component_storages
-        .get(component)
+        .get(component_id)
         .expect("the archetype owns the column")
         .row_ticks(location.index_in_archetype)
         .expect("the row exists")
 }
 
-/// Two u32 fields: the two-field shape the relayout tests start from.
-fn two_u32_row(first: u32, second: u32) -> Vec<u8> {
-    let mut bytes = first.to_ne_bytes().to_vec();
-    bytes.extend_from_slice(&second.to_ne_bytes());
+/// Builds a row of two `u32` fields, the shape the relayout tests start from.
+fn two_u32_row(first_field_value: u32, second_field_value: u32) -> Vec<u8> {
+    let mut bytes = first_field_value.to_ne_bytes().to_vec();
+    bytes.extend_from_slice(&second_field_value.to_ne_bytes());
     bytes
 }
 
-/// A resource used to pin registration-stamp behaviour.
+/// A resource with a marker value, so a test can see which insertion left the
+/// value it reads back.
 #[derive(Debug, Default)]
 struct AccountedResource {
-    value: u32,
+    registration_marker: u32,
 }
 impl crate::resource::Resource for AccountedResource {}
 
-/// A second one, so a fresh registration can be told from a replacement.
+/// A second resource type, so a test can tell a fresh registration from a
+/// replacement of an existing one.
 #[derive(Debug, Default)]
 struct FreshAccountedResource {
-    value: u32,
+    registration_marker: u32,
 }
 impl crate::resource::Resource for FreshAccountedResource {}
 
+/// Returns a component type's registered name straight from the type, so the
+/// tests below do not depend on the order types were registered in.
+fn type_name_of<T: 'static>() -> String {
+    crate::type_names::stable_type_name::<T>().to_string()
+}
+
+// =============================================================================
+// Descriptor component storage
+// =============================================================================
+
+/// Three descriptor components can be registered next to each other, and an
+/// entity's rows and its stable id survive the archetype migrations that
+/// adding and removing one of them causes.
 #[test]
 fn descriptor_components_coexist_and_survive_archetype_migration() {
     let mut world = World::new();
@@ -95,21 +114,21 @@ fn descriptor_components_coexist_and_survive_archetype_migration() {
     assert!(world.descriptor_component_bytes(entity, b).is_none());
     assert_eq!(world.descriptor_component_bytes(entity, c).unwrap(), [0; 8]);
 
-    // The archetype migrations above are what a reload's remap does to an
-    // entity's row; the stable id is world metadata and rides along.
+    // The migrations above change an entity's archetype the way a reload's
+    // remap does. The stable id is world metadata, so the move leaves it alone.
     let id = world
         .entity_id(entity)
         .expect("a descriptor-created entity has an id");
     assert_eq!(world.entity_by_id(id), Some(entity));
 }
 
-/// A relayout rewrites rows where they are: entities keep their rows, values
-/// follow their field names, and a field the old layout did not have starts
-/// zeroed instead of holding a byte from the previous shape.
+/// A relayout rewrites each row in place. Entities keep their rows, values
+/// follow their field names, and a field that the previous layout did not have
+/// starts at zero instead of reusing a byte of the old shape.
 #[test]
 fn relayout_migrates_rows_and_keeps_entities_in_their_rows() {
     let mut world = World::new();
-    let component = world
+    let component_id = world
         .register_component_descriptor(
             0xD4,
             "Project.Relayout",
@@ -120,21 +139,22 @@ fn relayout_migrates_rows_and_keeps_entities_in_their_rows() {
         )
         .unwrap();
     let first = world
-        .create_descriptor_entity(&[(component, two_u32_row(1, 2))])
+        .create_descriptor_entity(&[(component_id, two_u32_row(1, 2))])
         .unwrap();
     let second = world
-        .create_descriptor_entity(&[(component, two_u32_row(3, 4))])
+        .create_descriptor_entity(&[(component_id, two_u32_row(3, 4))])
         .unwrap();
 
-    let archetype = world.entity_locations[&first].archetype_id;
-    let first_row = world.entity_locations[&first].index_in_archetype;
-    let second_row = world.entity_locations[&second].index_in_archetype;
+    let archetype_id = world.entity_locations[&first].archetype_id;
+    let first_row_index = world.entity_locations[&first].index_in_archetype;
+    let second_row_index = world.entity_locations[&second].index_in_archetype;
     assert_eq!(
-        world.entity_locations[&second].archetype_id, archetype,
+        world.entity_locations[&second].archetype_id, archetype_id,
         "identical component sets share one archetype"
     );
 
-    // `b` first, then `a`, then an eight-byte field that did not exist.
+    // The new layout is `b`, then `a`, then an eight-byte field that the old
+    // one did not have.
     let plan = FieldPlan::between(
         &[
             LayoutField {
@@ -172,41 +192,48 @@ fn relayout_migrates_rows_and_keeps_entities_in_their_rows() {
         ],
     );
 
-    let migrated = world
-        .relayout_descriptor_component(component, 16, 8, 200, &plan)
+    let migrated_row_count = world
+        .relayout_descriptor_component(component_id, 16, 8, 200, &plan)
         .unwrap();
 
-    assert_eq!(migrated, 2);
+    assert_eq!(migrated_row_count, 2);
     let mut expected_first = two_u32_row(2, 1);
     expected_first.extend_from_slice(&[0_u8; 8]);
     assert_eq!(
-        world.descriptor_component_bytes(first, component).unwrap(),
+        world
+            .descriptor_component_bytes(first, component_id)
+            .unwrap(),
         expected_first.as_slice()
     );
     let mut expected_second = two_u32_row(4, 3);
     expected_second.extend_from_slice(&[0_u8; 8]);
     assert_eq!(
-        world.descriptor_component_bytes(second, component).unwrap(),
+        world
+            .descriptor_component_bytes(second, component_id)
+            .unwrap(),
         expected_second.as_slice()
     );
     assert_eq!(
-        world.entity_locations[&first].archetype_id, archetype,
+        world.entity_locations[&first].archetype_id, archetype_id,
         "a relayout moves no entity between archetypes"
     );
-    assert_eq!(world.entity_locations[&first].index_in_archetype, first_row);
+    assert_eq!(
+        world.entity_locations[&first].index_in_archetype,
+        first_row_index
+    );
     assert_eq!(
         world.entity_locations[&second].index_in_archetype,
-        second_row
+        second_row_index
     );
-    assert_eq!(world.component_layout(component), Some((16, 8)));
+    assert_eq!(world.component_layout(component_id), Some((16, 8)));
 }
 
-/// A relayout is a structural edit, not an add: rows keep their ticks, so no
-/// `Added` filter fires and a row that was already changed stays changed.
+/// A relayout is a structural edit, not an add, so rows keep their ticks. No
+/// `Added` filter fires, and a row that was already changed stays changed.
 #[test]
 fn relayout_leaves_change_ticks_alone() {
     let mut world = World::new();
-    let component = world
+    let component_id = world
         .register_component_descriptor(
             0xD5,
             "Project.Ticks",
@@ -217,7 +244,7 @@ fn relayout_leaves_change_ticks_alone() {
         )
         .unwrap();
     let entity = world
-        .create_descriptor_entity(&[(component, two_u32_row(1, 2))])
+        .create_descriptor_entity(&[(component_id, two_u32_row(1, 2))])
         .unwrap();
 
     let changed_tick = world.increment_change_tick();
@@ -227,30 +254,30 @@ fn relayout_leaves_change_ticks_alone() {
         .get_mut(&location.archetype_id)
         .unwrap()
         .component_storages
-        .get_mut(component)
+        .get_mut(component_id)
         .unwrap()
         .row_ticks_mut(location.index_in_archetype)
         .unwrap()
         .set_changed(changed_tick);
-    let before = ticks_of_row(&world, entity, component);
+    let before = ticks_of_row(&world, entity, component_id);
 
     world
-        .relayout_descriptor_component(component, 16, 8, 200, &FieldPlan::new())
+        .relayout_descriptor_component(component_id, 16, 8, 200, &FieldPlan::new())
         .unwrap();
 
-    let after = ticks_of_row(&world, entity, component);
+    let after = ticks_of_row(&world, entity, component_id);
     assert_eq!(after.added, before.added);
     assert_eq!(after.changed, changed_tick);
 }
 
-/// A remap carries rows from the predecessor registration to the
-/// successor: the values move, the successor answers to its own name, the
-/// predecessor's registration is retired, and an entity whose only
-/// component this is survives the move.
+/// A remap moves the rows from the predecessor registration to the successor.
+/// The values move with them, the successor answers to its own name, and the
+/// predecessor's registration is retired. An entity whose only component this
+/// is survives the move.
 #[test]
 fn remap_moves_rows_to_the_successor_and_retires_the_source() {
     let mut world = World::new();
-    let old = world
+    let source_component_id = world
         .register_component_descriptor(
             0xE5,
             "Project.OldName",
@@ -260,7 +287,7 @@ fn remap_moves_rows_to_the_successor_and_retires_the_source() {
             Blittability::engine_verified(),
         )
         .unwrap();
-    let new = world
+    let successor_component_id = world
         .register_component_descriptor(
             0xF6,
             "Project.NewName",
@@ -280,19 +307,19 @@ fn remap_moves_rows_to_the_successor_and_retires_the_source() {
             Blittability::engine_verified(),
         )
         .unwrap();
-    // One entity carries only the component being moved: the
-    // add-before-remove order is what keeps it alive.
+    // One entity carries only the component being moved. The remap adds the
+    // new column before it removes the old one, which is what keeps it alive.
     let alone = world
-        .create_descriptor_entity(&[(old, two_u32_row(7, 8))])
+        .create_descriptor_entity(&[(source_component_id, two_u32_row(7, 8))])
         .unwrap();
     let paired = world
         .create_descriptor_entity(&[
-            (old, two_u32_row(1, 2)),
+            (source_component_id, two_u32_row(1, 2)),
             (companion, 3_u32.to_ne_bytes().to_vec()),
         ])
         .unwrap();
 
-    let fields = vec![
+    let layout_fields = vec![
         LayoutField {
             name: "a",
             type_tag: "u32",
@@ -306,16 +333,22 @@ fn remap_moves_rows_to_the_successor_and_retires_the_source() {
             size: 4,
         },
     ];
-    let plan = FieldPlan::between(&fields, &fields);
-    let moved = world.remap_descriptor_component(old, new, &plan).unwrap();
+    let plan = FieldPlan::between(&layout_fields, &layout_fields);
+    let moved_row_count = world
+        .remap_descriptor_component(source_component_id, successor_component_id, &plan)
+        .unwrap();
 
-    assert_eq!(moved, 2);
+    assert_eq!(moved_row_count, 2);
     assert_eq!(
-        world.descriptor_component_bytes(alone, new).unwrap(),
+        world
+            .descriptor_component_bytes(alone, successor_component_id)
+            .unwrap(),
         two_u32_row(7, 8)
     );
     assert_eq!(
-        world.descriptor_component_bytes(paired, new).unwrap(),
+        world
+            .descriptor_component_bytes(paired, successor_component_id)
+            .unwrap(),
         two_u32_row(1, 2)
     );
     assert_eq!(
@@ -323,9 +356,11 @@ fn remap_moves_rows_to_the_successor_and_retires_the_source() {
         3_u32.to_ne_bytes(),
         "the companion column survives the move"
     );
-    assert!(world.descriptor_component_bytes(alone, old).is_none());
+    assert!(world
+        .descriptor_component_bytes(alone, source_component_id)
+        .is_none());
     assert!(
-        !world.storage_factories.contains_key(&old),
+        !world.storage_factories.contains_key(&source_component_id),
         "the predecessor's registration is retired"
     );
     assert_eq!(
@@ -339,17 +374,17 @@ fn remap_moves_rows_to_the_successor_and_retires_the_source() {
         world
             .resolve_component_id_by_name_any("Project.NewName")
             .unwrap(),
-        Some(new)
+        Some(successor_component_id)
     );
 }
 
-/// The plan's field mapping is what moves, not the bytes: a shape with a
-/// moved field and an added one reorders and zero-fills, exactly as a
-/// relayout would.
+/// The plan's field mapping decides what moves, not the raw bytes. A shape
+/// with a moved field and an added one is reordered and zero-filled, just as a
+/// relayout would do it.
 #[test]
 fn remap_reshapes_rows_through_the_plan() {
     let mut world = World::new();
-    let old = world
+    let source_component_id = world
         .register_component_descriptor(
             0xE6,
             "Project.PlanOld",
@@ -359,7 +394,7 @@ fn remap_reshapes_rows_through_the_plan() {
             Blittability::engine_verified(),
         )
         .unwrap();
-    let new = world
+    let successor_component_id = world
         .register_component_descriptor(
             0xF7,
             "Project.PlanNew",
@@ -370,7 +405,7 @@ fn remap_reshapes_rows_through_the_plan() {
         )
         .unwrap();
     let entity = world
-        .create_descriptor_entity(&[(old, two_u32_row(1, 2))])
+        .create_descriptor_entity(&[(source_component_id, two_u32_row(1, 2))])
         .unwrap();
 
     let plan = FieldPlan::between(
@@ -409,24 +444,28 @@ fn remap_reshapes_rows_through_the_plan() {
             },
         ],
     );
-    world.remap_descriptor_component(old, new, &plan).unwrap();
+    world
+        .remap_descriptor_component(source_component_id, successor_component_id, &plan)
+        .unwrap();
 
     let mut expected = 2_u32.to_ne_bytes().to_vec();
     expected.extend_from_slice(&1_u32.to_ne_bytes());
     expected.extend_from_slice(&0_u32.to_ne_bytes());
     assert_eq!(
-        world.descriptor_component_bytes(entity, new).unwrap(),
+        world
+            .descriptor_component_bytes(entity, successor_component_id)
+            .unwrap(),
         expected.as_slice()
     );
 }
 
-/// A plan default rides the plan: an added field is filled with the
-/// supplied bytes instead of zero, and setting one on a copied field is a
-/// no-op rather than an overwrite.
+/// A plan can carry default bytes. An added field is filled with them instead
+/// of zero, and a default set on a copied field is accepted but ignored, so it
+/// does not overwrite a value that was copied.
 #[test]
 fn a_plan_default_fills_an_added_field_and_never_overrides_a_copied_one() {
     let mut world = World::new();
-    let component = world
+    let component_id = world
         .register_component_descriptor(
             0xD8,
             "Project.Defaults",
@@ -437,7 +476,7 @@ fn a_plan_default_fills_an_added_field_and_never_overrides_a_copied_one() {
         )
         .unwrap();
     let entity = world
-        .create_descriptor_entity(&[(component, two_u32_row(1, 2))])
+        .create_descriptor_entity(&[(component_id, two_u32_row(1, 2))])
         .unwrap();
 
     let mut plan = FieldPlan::between(
@@ -478,32 +517,34 @@ fn a_plan_default_fills_an_added_field_and_never_overrides_a_copied_one() {
     );
     plan.set_default(8, &6_u32.to_ne_bytes())
         .expect("the added field has a planned slot");
-    // A default on a copied field is accepted and ignored, so the carried
-    // value survives even a default declared for it.
+    // A default on a copied field is accepted and then ignored, so the value
+    // that was copied survives.
     plan.set_default(0, &9_u32.to_ne_bytes())
         .expect("setting on a copied field is accepted");
 
     world
-        .relayout_descriptor_component(component, 12, 4, 101, &plan)
+        .relayout_descriptor_component(component_id, 12, 4, 101, &plan)
         .unwrap();
 
     let mut expected = 1_u32.to_ne_bytes().to_vec();
     expected.extend_from_slice(&2_u32.to_ne_bytes());
     expected.extend_from_slice(&6_u32.to_ne_bytes());
     assert_eq!(
-        world.descriptor_component_bytes(entity, component).unwrap(),
+        world
+            .descriptor_component_bytes(entity, component_id)
+            .unwrap(),
         expected.as_slice(),
         "the added field takes its default and the copied fields keep their values"
     );
 }
 
 /// Retiring a descriptor component's storage removes its rows and its
-/// registration, and frees the name and the bit for a later declaration -
-/// the contract a managed manifest's removed type rides on.
+/// registration, and frees the name and the bit for a later declaration. A
+/// managed manifest relies on this when a type is removed.
 #[test]
 fn retire_component_storage_frees_a_descriptor_component() {
     let mut world = World::new();
-    let component = world
+    let component_id = world
         .register_component_descriptor(
             0xB9,
             "Project.Retired",
@@ -525,16 +566,16 @@ fn retire_component_storage_frees_a_descriptor_component() {
         .unwrap();
     let entity = world
         .create_descriptor_entity(&[
-            (component, 5_u32.to_ne_bytes().to_vec()),
+            (component_id, 5_u32.to_ne_bytes().to_vec()),
             (companion, 6_u32.to_ne_bytes().to_vec()),
         ])
         .unwrap();
 
-    let affected = world.retire_component_storage(&[component]);
+    let affected_row_count = world.retire_component_storage(&[component_id]);
 
-    assert_eq!(affected, 1, "the retired component's row went");
+    assert_eq!(affected_row_count, 1, "the retired component's row went");
     assert!(world
-        .descriptor_component_bytes(entity, component)
+        .descriptor_component_bytes(entity, component_id)
         .is_none());
     assert_eq!(
         world.descriptor_component_bytes(entity, companion).unwrap(),
@@ -542,7 +583,7 @@ fn retire_component_storage_frees_a_descriptor_component() {
         "the companion column survives the retirement"
     );
     assert!(
-        !world.storage_factories.contains_key(&component),
+        !world.storage_factories.contains_key(&component_id),
         "the registration is forgotten"
     );
     assert_eq!(
@@ -572,28 +613,29 @@ fn retire_component_storage_frees_a_descriptor_component() {
     );
 }
 
-/// The resource twin: the value moves onto the successor's id, claims
-/// travel with it, and the source declaration is dropped once they have.
+/// The resource version of the remap. The value moves to the successor's id,
+/// the claims move with it, and the source declaration is dropped after they
+/// do.
 #[test]
 fn remap_foreign_resource_moves_the_value_and_the_claim() {
     let mut world = World::new();
-    let old = world
+    let source_resource_id = world
         .register_foreign_resource("Project.OldSettings", "Project.OldSettings", 8, 4, 77)
         .unwrap();
     world
-        .insert_foreign_resource_bytes(old, &two_u32_row(5, 6))
+        .insert_foreign_resource_bytes(source_resource_id, &two_u32_row(5, 6))
         .unwrap();
-    let new = world
+    let successor_resource_id = world
         .register_foreign_resource("Project.NewSettings", "Project.NewSettings", 8, 4, 77)
         .unwrap();
-    // The host seeds a fresh declaration with zeroes; the moved value
+    // The host seeds a fresh declaration with zero bytes. The moved value
     // replaces that seed.
     world
-        .insert_foreign_resource_bytes(new, &[0_u8; 8])
+        .insert_foreign_resource_bytes(successor_resource_id, &[0_u8; 8])
         .unwrap();
-    world.retain_resource_claims(&[old]);
+    world.retain_resource_claims(&[source_resource_id]);
 
-    let fields = vec![
+    let layout_fields = vec![
         LayoutField {
             name: "a",
             type_tag: "u32",
@@ -607,29 +649,39 @@ fn remap_foreign_resource_moves_the_value_and_the_claim() {
             size: 4,
         },
     ];
-    let plan = FieldPlan::between(&fields, &fields);
-    let moved = world.remap_foreign_resource(old, new, &plan).unwrap();
+    let plan = FieldPlan::between(&layout_fields, &layout_fields);
+    let moved_value_count = world
+        .remap_foreign_resource(source_resource_id, successor_resource_id, &plan)
+        .unwrap();
 
-    assert_eq!(moved, 1);
+    assert_eq!(moved_value_count, 1);
     assert_eq!(
-        world.foreign_resource_bytes(new).unwrap(),
+        world.foreign_resource_bytes(successor_resource_id).unwrap(),
         two_u32_row(5, 6)
     );
     assert!(
-        world.foreign_resource_layout(old).is_none(),
+        world.foreign_resource_layout(source_resource_id).is_none(),
         "the source declaration is dropped once its claims moved"
     );
-    assert_eq!(world.resource_claim_counts.get(&new).copied(), Some(1));
-    assert!(!world.resource_claim_counts.contains_key(&old));
+    assert_eq!(
+        world
+            .resource_claim_counts
+            .get(&successor_resource_id)
+            .copied(),
+        Some(1)
+    );
+    assert!(!world
+        .resource_claim_counts
+        .contains_key(&source_resource_id));
 }
 
-/// The id and the registry bit survive, because they are baked into
-/// archetype masks and scheduled access masks: a relayout must update the
-/// layout in place, never re-register the component.
+/// The id and the registry bit survive a relayout, because archetype masks and
+/// the scheduler's access sets hold them. A relayout must update the layout in
+/// place and never register the component again.
 #[test]
 fn relayout_keeps_the_component_id_and_its_bit() {
     let mut world = World::new();
-    let component = world
+    let component_id = world
         .register_component_descriptor(
             0xD6,
             "Project.Bit",
@@ -639,28 +691,28 @@ fn relayout_keeps_the_component_id_and_its_bit() {
             Blittability::engine_verified(),
         )
         .unwrap();
-    let bit = world.component_registry().get_bit(&component).unwrap();
+    let bit = world.component_registry().get_bit(&component_id).unwrap();
 
     world
-        .relayout_descriptor_component(component, 16, 8, 200, &FieldPlan::new())
+        .relayout_descriptor_component(component_id, 16, 8, 200, &FieldPlan::new())
         .unwrap();
 
     // The same id still names the same component; only its size moved.
-    assert_eq!(world.component_registry().get_bit(&component), Some(bit));
-    assert_eq!(world.component_layout(component), Some((16, 8)));
+    assert_eq!(world.component_registry().get_bit(&component_id), Some(bit));
+    assert_eq!(world.component_layout(component_id), Some((16, 8)));
     assert_eq!(
-        world.component_registry().get_name(&component),
+        world.component_registry().get_name(&component_id),
         Some("Project.Bit")
     );
 }
 
-/// A relayout has to reach archetypes whose last row is gone: the next
-/// entity added there must be stored at the new size. The push only
-/// succeeds when the column there really was rewritten.
+/// A relayout must also reach an archetype whose last row is gone. The next
+/// entity added there has to be stored at the new size, so the push below only
+/// succeeds when that column really was rewritten.
 #[test]
 fn relayout_reaches_an_archetype_that_lost_its_last_row() {
     let mut world = World::new();
-    let component = world
+    let component_id = world
         .register_component_descriptor(
             0xD7,
             "Project.Empty",
@@ -671,24 +723,26 @@ fn relayout_reaches_an_archetype_that_lost_its_last_row() {
         )
         .unwrap();
     let disposable = world
-        .create_descriptor_entity(&[(component, two_u32_row(1, 2))])
+        .create_descriptor_entity(&[(component_id, two_u32_row(1, 2))])
         .unwrap();
-    let archetype = world.entity_locations[&disposable].archetype_id;
+    let archetype_id = world.entity_locations[&disposable].archetype_id;
     assert!(world.destroy_entity(disposable));
 
     world
-        .relayout_descriptor_component(component, 16, 8, 200, &FieldPlan::new())
+        .relayout_descriptor_component(component_id, 16, 8, 200, &FieldPlan::new())
         .unwrap();
 
     let entity = world
-        .create_descriptor_entity(&[(component, vec![7_u8; 16])])
+        .create_descriptor_entity(&[(component_id, vec![7_u8; 16])])
         .unwrap();
     assert_eq!(
-        world.entity_locations[&entity].archetype_id, archetype,
+        world.entity_locations[&entity].archetype_id, archetype_id,
         "the empty archetype is reused, so its column is the one being tested"
     );
     assert_eq!(
-        world.descriptor_component_bytes(entity, component).unwrap(),
+        world
+            .descriptor_component_bytes(entity, component_id)
+            .unwrap(),
         [7_u8; 16].as_slice()
     );
 }
@@ -720,7 +774,7 @@ fn relayout_refuses_what_it_cannot_migrate() {
         Err(WorldError::DescriptorComponentNotRegistered { .. })
     ));
 
-    let component = world
+    let component_id = world
         .register_component_descriptor(
             0xD8,
             "Project.Refused",
@@ -733,11 +787,11 @@ fn relayout_refuses_what_it_cannot_migrate() {
     let mut too_wide = FieldPlan::new();
     too_wide.push(4, 8, FieldSource::OldOffset(0));
     assert!(matches!(
-        world.relayout_descriptor_component(component, 8, 4, 100, &too_wide),
+        world.relayout_descriptor_component(component_id, 8, 4, 100, &too_wide),
         Err(WorldError::DescriptorRowInvalid)
     ));
     assert_eq!(
-        world.component_layout(component),
+        world.component_layout(component_id),
         Some((8, 4)),
         "a refused plan leaves the registered layout as it was"
     );
@@ -746,40 +800,41 @@ fn relayout_refuses_what_it_cannot_migrate() {
     // so the archetypes holding rows keep them. The destination archetype
     // is made to list the component without storing a column for it.
     let holder = world
-        .create_descriptor_entity(&[(component, 8_u64.to_ne_bytes().to_vec())])
+        .create_descriptor_entity(&[(component_id, 8_u64.to_ne_bytes().to_vec())])
         .unwrap();
-    let stripped = world.get_or_create_archetype(vec![component, ComponentId::of::<Position>()]);
+    let stripped = world.get_or_create_archetype(vec![component_id, ComponentId::of::<Position>()]);
     assert!(world
         .archetypes
         .get_mut(&stripped)
         .unwrap()
         .component_storages
-        .remove(component)
+        .remove(component_id)
         .is_some());
-    let row_before = world
-        .descriptor_component_bytes(holder, component)
+    let row_bytes_before = world
+        .descriptor_component_bytes(holder, component_id)
         .expect("the entity has a row")
         .to_vec();
     assert!(matches!(
-        world.relayout_descriptor_component(component, 8, 4, 100, &FieldPlan::new()),
+        world.relayout_descriptor_component(component_id, 8, 4, 100, &FieldPlan::new()),
         Err(WorldError::DescriptorStorageMissing { .. })
     ));
     assert_eq!(
-        world.descriptor_component_bytes(holder, component),
-        Some(row_before.as_slice()),
+        world.descriptor_component_bytes(holder, component_id),
+        Some(row_bytes_before.as_slice()),
         "a refused relayout left the row it would have migrated alone"
     );
 
-    // Put the stripped column back, then drift one behind the factory's
-    // back: the size mismatch is reported too, and the column keeps its
-    // drifted shape instead of being silently rewritten.
+    // Put the stripped column back, then give the live column a shape the
+    // factory does not know about: 16 bytes while the factory still says 8.
+    // The mismatch is reported too, and the column keeps its shape instead of
+    // being silently rewritten.
     world
         .archetypes
         .get_mut(&stripped)
         .unwrap()
         .component_storages
         .insert(
-            component,
+            component_id,
             crate::archetype::ComponentColumn::new(ColumnLayout {
                 size: 8,
                 align: 4,
@@ -795,7 +850,7 @@ fn relayout_refuses_what_it_cannot_migrate() {
             .get_mut(&location.archetype_id)
             .unwrap()
             .component_storages
-            .get_mut(component)
+            .get_mut(component_id)
             .unwrap();
         column.relayout_validated(
             ColumnLayout {
@@ -809,27 +864,27 @@ fn relayout_refuses_what_it_cannot_migrate() {
         );
     }
     assert!(matches!(
-        world.relayout_descriptor_component(component, 8, 4, 100, &FieldPlan::new()),
+        world.relayout_descriptor_component(component_id, 8, 4, 100, &FieldPlan::new()),
         Err(WorldError::ComponentColumnLayoutMismatch { .. })
     ));
     assert_eq!(
         world.archetypes[&world.entity_locations[&holder].archetype_id]
             .component_storages
-            .get(component)
+            .get(component_id)
             .expect("column")
             .element_size(),
         16,
         "the mismatched column was reported, not rewritten"
     );
     assert_eq!(
-        world.component_layout(component),
+        world.component_layout(component_id),
         Some((8, 4)),
         "the factory still carries the registered layout"
     );
 }
 
-/// A failed migration is atomic: the pre-flight refuses the destination
-/// before the entity's row, its columns or its location move anywhere.
+/// A failed migration changes nothing. The pre-flight check refuses the
+/// destination before the entity's row, its columns or its location move.
 #[test]
 fn migration_failure_leaves_both_archetypes_untouched() {
     let mut world = World::new();
@@ -855,8 +910,8 @@ fn migration_failure_leaves_both_archetypes_untouched() {
         )
         .unwrap();
 
-    // Make the {first, second} destination exist, then manufacture the
-    // desync: it lists `second` without storing a column for it.
+    // Create the `{first, second}` destination first, then break it on
+    // purpose: it lists `second` without storing a column for it.
     let destination = world.get_or_create_archetype(vec![first, second]);
     assert!(world
         .archetypes
@@ -904,20 +959,22 @@ fn migration_failure_leaves_both_archetypes_untouched() {
     );
 }
 
+/// Adding and removing a descriptor component leave the other columns' change
+/// ticks alone, and the new column starts with the tick of the add.
 #[test]
 fn descriptor_component_ticks_survive_archetype_migration() {
-    fn ticks_for(world: &World, entity: Entity, component: ComponentId) -> ComponentTicks {
+    fn ticks_for(world: &World, entity: Entity, component_id: ComponentId) -> ComponentTicks {
         let location = world.entity_locations[&entity];
         *world.archetypes[&location.archetype_id]
             .component_storages
-            .get(component)
+            .get(component_id)
             .expect("the archetype owns the column")
             .row_ticks(location.index_in_archetype)
             .expect("the row exists")
     }
 
     let mut world = World::new();
-    let retained = world
+    let retained_component_id = world
         .register_component_descriptor(
             0xA1,
             "Project.Retained",
@@ -927,7 +984,7 @@ fn descriptor_component_ticks_survive_archetype_migration() {
             Blittability::engine_verified(),
         )
         .unwrap();
-    let removed = world
+    let removed_component_id = world
         .register_component_descriptor(
             0xB2,
             "Project.Removed",
@@ -937,7 +994,7 @@ fn descriptor_component_ticks_survive_archetype_migration() {
             Blittability::engine_verified(),
         )
         .unwrap();
-    let added = world
+    let added_component_id = world
         .register_component_descriptor(
             0xC3,
             "Project.Added",
@@ -949,13 +1006,13 @@ fn descriptor_component_ticks_survive_archetype_migration() {
         .unwrap();
     let entity = world
         .create_descriptor_entity(&[
-            (retained, 10_u32.to_ne_bytes().to_vec()),
-            (removed, 20_u32.to_ne_bytes().to_vec()),
+            (retained_component_id, 10_u32.to_ne_bytes().to_vec()),
+            (removed_component_id, 20_u32.to_ne_bytes().to_vec()),
         ])
         .unwrap();
 
-    let original_retained_ticks = ticks_for(&world, entity, retained);
-    let original_removed_ticks = ticks_for(&world, entity, removed);
+    let original_retained_ticks = ticks_for(&world, entity, retained_component_id);
+    let original_removed_ticks = ticks_for(&world, entity, removed_component_id);
     let changed_tick = world.increment_change_tick();
     let location = world.entity_locations[&entity];
     world
@@ -963,12 +1020,12 @@ fn descriptor_component_ticks_survive_archetype_migration() {
         .get_mut(&location.archetype_id)
         .unwrap()
         .component_storages
-        .get_mut(retained)
+        .get_mut(retained_component_id)
         .unwrap()
         .row_ticks_mut(location.index_in_archetype)
         .unwrap()
         .set_changed(changed_tick);
-    let retained_before_migration = ticks_for(&world, entity, retained);
+    let retained_before_migration = ticks_for(&world, entity, retained_component_id);
     assert_eq!(
         retained_before_migration.added,
         original_retained_ticks.added
@@ -977,12 +1034,12 @@ fn descriptor_component_ticks_survive_archetype_migration() {
 
     let addition_tick = world.increment_change_tick();
     world
-        .add_descriptor_component_default(entity, added)
+        .add_descriptor_component_default(entity, added_component_id)
         .unwrap();
 
-    let retained_after_add = ticks_for(&world, entity, retained);
-    let removed_after_add = ticks_for(&world, entity, removed);
-    let added_after_add = ticks_for(&world, entity, added);
+    let retained_after_add = ticks_for(&world, entity, retained_component_id);
+    let removed_after_add = ticks_for(&world, entity, removed_component_id);
+    let added_after_add = ticks_for(&world, entity, added_component_id);
     assert_eq!(retained_after_add.added, retained_before_migration.added);
     assert_eq!(
         retained_after_add.changed,
@@ -994,15 +1051,19 @@ fn descriptor_component_ticks_survive_archetype_migration() {
     assert_eq!(added_after_add.changed, addition_tick);
 
     world.increment_change_tick();
-    world.remove_component_by_id(entity, removed).unwrap();
+    world
+        .remove_component_by_id(entity, removed_component_id)
+        .unwrap();
 
-    let retained_after_remove = ticks_for(&world, entity, retained);
-    let added_after_remove = ticks_for(&world, entity, added);
+    let retained_after_remove = ticks_for(&world, entity, retained_component_id);
+    let added_after_remove = ticks_for(&world, entity, added_component_id);
     assert_eq!(retained_after_remove.added, retained_after_add.added);
     assert_eq!(retained_after_remove.changed, retained_after_add.changed);
     assert_eq!(added_after_remove.added, added_after_add.added);
     assert_eq!(added_after_remove.changed, added_after_add.changed);
-    assert!(world.descriptor_component_bytes(entity, removed).is_none());
+    assert!(world
+        .descriptor_component_bytes(entity, removed_component_id)
+        .is_none());
 }
 
 /// The native byte-chunk accessor exposes a native column's rows as raw
@@ -1019,9 +1080,9 @@ fn native_component_chunk_mut_exposes_raw_rows() {
         .build()
         .unwrap();
     let component_id = ComponentId::of::<Position>();
-    // Copy the raw facts out while the mutable chunk borrow is still
-    // scoped, so the world can be re-borrowed below.
-    let (archetype_id, data, len, element_size, ticks_len) = {
+    // Copy the chunk's fields out inside a short scope, so the mutable borrow
+    // ends before the world is borrowed again below.
+    let (archetype_id, rows_pointer, row_count, element_size, tick_count) = {
         let chunk = world
             .native_component_chunk_mut(component_id, 0)
             .expect("one archetype column should exist");
@@ -1034,17 +1095,17 @@ fn native_component_chunk_mut_exposes_raw_rows() {
         )
     };
     assert_eq!(archetype_id, world.entity_locations[&entity].archetype_id);
-    assert_eq!(len, 1);
+    assert_eq!(row_count, 1);
     assert_eq!(element_size, std::mem::size_of::<Position>());
-    assert_eq!(ticks_len, 1);
-    // SAFETY: `len` is 1 and `element_size` is the Position size, so the
+    assert_eq!(tick_count, 1);
+    // SAFETY: `row_count` is 1 and `element_size` is the Position size, so the
     // returned buffer holds exactly one valid Position.
-    let row = unsafe { &*data.cast::<Position>() };
+    let row = unsafe { &*rows_pointer.cast::<Position>() };
     assert_eq!(row.x, 1.0);
     assert_eq!(row.y, 2.0);
 
     // Descriptor components are served by the descriptor accessor, not this one.
-    let descriptor = world
+    let descriptor_component_id = world
         .register_component_descriptor(
             0xD1,
             "NativeChunkTest.Descriptor",
@@ -1054,9 +1115,11 @@ fn native_component_chunk_mut_exposes_raw_rows() {
             Blittability::engine_verified(),
         )
         .unwrap();
-    assert!(world.native_component_chunk_mut(descriptor, 0).is_none());
-    // An unknown native id is rejected too.
-    let unknown = world
+    assert!(world
+        .native_component_chunk_mut(descriptor_component_id, 0)
+        .is_none());
+    // A registered descriptor id with no rows is refused too.
+    let unused_descriptor_id = world
         .register_component_descriptor(
             0xD2,
             "NativeChunkTest.Unknown",
@@ -1066,12 +1129,14 @@ fn native_component_chunk_mut_exposes_raw_rows() {
             Blittability::engine_verified(),
         )
         .unwrap();
-    assert!(world.native_component_chunk_mut(unknown, 0).is_none());
+    assert!(world
+        .native_component_chunk_mut(unused_descriptor_id, 0)
+        .is_none());
 }
 
-/// A byte component adder writes raw ABI bytes into a native column, which
-/// is how the C# backend creates or adds extension components whose
-/// concrete Rust type the host never names.
+/// A byte component adder writes raw ABI bytes into a native column. The C#
+/// backend uses it to create or add extension components whose concrete Rust
+/// type the host never names.
 #[test]
 fn byte_component_adder_writes_native_bytes() {
     use crate::commands::{ByteComponentAdder, CommandQueue, ComponentAdder};
@@ -1081,7 +1146,7 @@ fn byte_component_adder_writes_native_bytes() {
     let entity = world.reserve_entity();
     let component_id = ComponentId::of::<Position>();
 
-    // ABI payload: x = 7.5, y = -3.25, little-endian f32s.
+    // ABI payload: x = 7.5, y = -3.25, as native-endian f32s.
     let mut bytes = Vec::with_capacity(std::mem::size_of::<Position>());
     bytes.extend_from_slice(&7.5_f32.to_ne_bytes());
     bytes.extend_from_slice(&(-3.25_f32).to_ne_bytes());
@@ -1102,9 +1167,10 @@ fn byte_component_adder_writes_native_bytes() {
     assert_eq!(position.y, -3.25);
 }
 
-/// The id-keyed sweep releases a column whose factory was purged, empty
-/// or not: the archetype stops listing the id and no column without a
-/// table maker is left behind for a graveyard eviction to invalidate.
+/// The sweep by id frees a column whose factory is gone, whether the column
+/// still holds rows or not. The archetype stops listing the id, so the host
+/// can unmap a retired image without leaving a column whose drop code lived in
+/// it.
 #[test]
 fn a_column_whose_factory_vanished_is_dropped_before_eviction() {
     let mut world = World::new();
@@ -1120,9 +1186,9 @@ fn a_column_whose_factory_vanished_is_dropped_before_eviction() {
         .build()
         .unwrap();
 
-    // What `forget_component_type` leaves when a rebuilt image re-registers
-    // the name under a fresh id: the archetype keeps the id and its column,
-    // while the factory that describes them is gone.
+    // This is what `forget_component_type` leaves behind when a rebuilt image
+    // registers the name again under a fresh id. The archetype keeps the old id
+    // and its column, while the factory that describes them is gone.
     world.storage_factories.remove(&component_id);
     assert_eq!(
         world.columns_without_factory(),
@@ -1130,8 +1196,8 @@ fn a_column_whose_factory_vanished_is_dropped_before_eviction() {
         "the column is the only one without a factory"
     );
 
-    let dropped = world.drop_columns_without_factory();
-    assert_eq!(dropped, 1, "the orphaned id was the one swept");
+    let dropped_column_count = world.drop_columns_without_factory();
+    assert_eq!(dropped_column_count, 1, "the orphaned id was the one swept");
     assert_eq!(
         world.columns_without_factory(),
         0,
@@ -1151,6 +1217,9 @@ fn a_column_whose_factory_vanished_is_dropped_before_eviction() {
     );
 }
 
+/// A descriptor declaration with a zero width, a bad alignment, an oversized
+/// width, a reused id or a reused schema hash is refused, and so is a row
+/// whose payload does not match the declared size.
 #[test]
 fn invalid_descriptor_component_layouts_are_rejected() {
     let mut world = World::new();
@@ -1187,14 +1256,18 @@ fn invalid_descriptor_component_layouts_are_rejected() {
         .register_component_descriptor(3, "SchemaB", 8, 8, 20, Blittability::engine_verified())
         .is_err());
 
-    let valid = world
+    let valid_component_id = world
         .register_component_descriptor(5, "Valid", 4, 4, 30, Blittability::engine_verified())
         .unwrap();
     assert!(world
-        .create_descriptor_entity(&[(valid, vec![0; 3])])
+        .create_descriptor_entity(&[(valid_component_id, vec![0; 3])])
         .is_err());
     assert_eq!(world.entity_count(), 0);
 }
+
+// =============================================================================
+// Entity lifecycle
+// =============================================================================
 
 /// One entity per component combination, one archetype per combination, and
 /// every entity tracked in `entity_locations`.
@@ -1232,14 +1305,12 @@ fn test_create_entities_with_different_components() {
     assert!(world.entity_locations.contains_key(&entity2));
     assert!(world.entity_locations.contains_key(&entity3));
 
-    // Print archetype information
     world.print_archetypes();
 
     // Verify each archetype's component mask matches expected components
     for (archetype_id, archetype) in world.archetypes.iter() {
         println!("\n--- Verifying Archetype {:?} ---", archetype_id);
 
-        // Get component names
         let comp_names: Vec<String> = archetype
             .component_types
             .iter()
@@ -1269,7 +1340,6 @@ fn test_create_entities_with_different_components() {
             }
         }
 
-        // Verify masks match
         assert_eq!(
             archetype.component_mask, expected_mask,
             "Archetype {:?} mask mismatch!\nActual:   {:?}\nExpected: {:?}",
@@ -1301,13 +1371,13 @@ fn test_add_component_to_entity() {
         "Should have 1 archetype initially"
     );
 
-    // Add Health component
-    let result = world.add_component(entity, Health(50));
+    let add_result = world.add_component(entity, Health(50));
 
-    assert!(result.is_ok(), "Should successfully add component");
+    assert!(add_result.is_ok(), "Should successfully add component");
     assert!(world.entity_locations.contains_key(&entity));
 
-    // Since this is the only entity, the old archetype should be automatically removed
+    // This is the only entity, so the archetype it leaves is empty and is
+    // removed at once.
     assert_eq!(
         world.archetypes.len(),
         1,
@@ -1324,11 +1394,11 @@ fn test_add_component_to_nonexistent_entity() {
     let mut world = World::new();
     world.register_component::<Position>();
 
-    let fake_entity = crate::Entity::new_for_test(9999, 0);
-    let result = world.add_component(fake_entity, Position { x: 0.0, y: 0.0 });
+    let unissued_entity = crate::Entity::new_for_test(9999, 0);
+    let add_result = world.add_component(unissued_entity, Position { x: 0.0, y: 0.0 });
 
     assert_eq!(
-        result,
+        add_result,
         Err(AddComponentError::EntityNotFound),
         "Should fail to add component to non-existent entity"
     );
@@ -1340,16 +1410,15 @@ fn test_add_component_to_nonexistent_entity() {
 /// type must be refused rather than silently resolved back to the source
 /// archetype.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Unregistered(pub u32);
-impl crate::component::Component for Unregistered {}
+struct UnregisteredComponent(pub u32);
+impl crate::component::Component for UnregisteredComponent {}
 
 /// Adding a component whose type the world never registered is refused.
 ///
 /// The destination archetype is derived from component bits, so an
 /// unregistered type contributes none and the destination resolves to the
-/// entity's current archetype. The migration then short-circuits and the add
-/// reports success while storing nothing - a release-profile build silently loses the
-/// component.
+/// entity's current archetype. Without the refusal the migration would
+/// short-circuit, and the add would report success while storing nothing.
 #[test]
 fn test_add_component_refuses_unregistered_type() {
     let mut world = setup_world();
@@ -1359,17 +1428,19 @@ fn test_add_component_refuses_unregistered_type() {
         .build()
         .unwrap();
 
-    let result = world.add_component(entity, Unregistered(7));
+    let add_result = world.add_component(entity, UnregisteredComponent(7));
 
     assert_eq!(
-        result,
+        add_result,
         Err(AddComponentError::ComponentNotRegistered {
-            id: ComponentId::of::<Unregistered>(),
+            id: ComponentId::of::<UnregisteredComponent>(),
         }),
         "adding an unregistered component must be refused"
     );
     assert!(
-        world.get_component::<Unregistered>(entity).is_none(),
+        world
+            .get_component::<UnregisteredComponent>(entity)
+            .is_none(),
         "the refused component must not be stored"
     );
     assert!(
@@ -1392,26 +1463,27 @@ fn test_remove_component_from_entity() {
         .build()
         .unwrap();
 
-    // Remove Velocity component
-    let result = world.remove_component::<Velocity>(entity);
+    let remove_result = world.remove_component::<Velocity>(entity);
 
     assert_eq!(world.archetypes.len(), 1, "Should have 1 archetype");
 
-    assert!(result.is_ok(), "Should successfully remove component");
+    assert!(
+        remove_result.is_ok(),
+        "Should successfully remove component"
+    );
     assert!(world.entity_locations.contains_key(&entity));
 
     let location = world.entity_locations.get(&entity).unwrap();
     let archetype = world.archetypes.get(&location.archetype_id).unwrap();
 
-    // Archetype should now only have Position and Health
     assert_eq!(
         archetype.component_types.len(),
         2,
         "Should have 2 component types"
     );
 
-    // Archetype should contain Position and Health, but not Velocity. Checking component IDs.
-    // Verify component IDs are as expected
+    // The archetype lists Position and Health but not Velocity. The ids below
+    // carry those three types.
     let position_id = ComponentId::of::<Position>();
     let health_id = ComponentId::of::<Health>();
     let velocity_id = ComponentId::of::<Velocity>();
@@ -1437,11 +1509,11 @@ fn test_remove_component_from_nonexistent_entity() {
     let mut world = World::new();
     world.register_component::<Velocity>();
 
-    let fake_entity = crate::Entity::new_for_test(9999, 0);
-    let result = world.remove_component::<Velocity>(fake_entity);
+    let unissued_entity = crate::Entity::new_for_test(9999, 0);
+    let remove_result = world.remove_component::<Velocity>(unissued_entity);
 
     assert_eq!(
-        result,
+        remove_result,
         Err(RemoveComponentError::EntityNotFound),
         "Should fail to remove component from non-existent entity"
     );
@@ -1462,10 +1534,13 @@ fn test_remove_last_component_destroys_entity() {
 
     assert_eq!(world.entity_locations.len(), 1);
 
-    // Remove the only component - should destroy entity
-    let result = world.remove_component::<Position>(entity);
+    // The component is the only one, so removing it destroys the entity.
+    let remove_result = world.remove_component::<Position>(entity);
 
-    assert!(result.is_ok(), "Should successfully remove component");
+    assert!(
+        remove_result.is_ok(),
+        "Should successfully remove component"
+    );
     assert_eq!(
         world.entity_locations.len(),
         0,
@@ -1499,10 +1574,9 @@ fn test_destroy_entity() {
 
     assert_eq!(world.entity_locations.len(), 2);
 
-    // Destroy entity1
-    let result = world.destroy_entity(entity1);
+    let destroy_result = world.destroy_entity(entity1);
 
-    assert!(result, "Should successfully destroy entity");
+    assert!(destroy_result, "Should successfully destroy entity");
     assert_eq!(world.entity_locations.len(), 1);
     assert!(!world.entity_locations.contains_key(&entity1));
     assert!(world.entity_locations.contains_key(&entity2));
@@ -1513,11 +1587,14 @@ fn test_destroy_entity() {
 #[test]
 fn test_destroy_nonexistent_entity() {
     let mut world = World::new();
-    let fake_entity = crate::Entity::new_for_test(9999, 0);
+    let unissued_entity = crate::Entity::new_for_test(9999, 0);
 
-    let result = world.destroy_entity(fake_entity);
+    let destroy_result = world.destroy_entity(unissued_entity);
 
-    assert!(!result, "Should fail to destroy non-existent entity");
+    assert!(
+        !destroy_result,
+        "Should fail to destroy non-existent entity"
+    );
 }
 
 /// A second destroy of the same handle is refused, so a double destroy cannot
@@ -1533,11 +1610,9 @@ fn test_destroy_already_destroyed_entity() {
         .build()
         .unwrap();
 
-    // First destroy should succeed
     let result1 = world.destroy_entity(entity);
     assert!(result1);
 
-    // Second destroy should fail
     let result2 = world.destroy_entity(entity);
     assert!(!result2, "Should fail to destroy already-destroyed entity");
 }
@@ -1550,7 +1625,6 @@ fn test_cleanup_empty_archetypes() {
     world.register_component::<Position>();
     world.register_component::<Velocity>();
 
-    // Create some entities
     let entity1 = world
         .create_entity()
         .with(Position { x: 10.0, y: 20.0 })
@@ -1570,15 +1644,14 @@ fn test_cleanup_empty_archetypes() {
     // Destroy one entity, leaving one archetype empty
     let _ = world.destroy_entity(entity1);
 
-    // Cleanup should remove empty archetype
     world.cleanup_empty_archetypes();
 
     assert!(world.archetypes.len() < initial_archetypes);
     assert!(world.entity_locations.contains_key(&entity2));
 }
 
-/// Each add and each remove moves the entity to another archetype, and no two
-/// steps of the migration land in the same one.
+/// Each add and each remove moves the entity to a different archetype, and no
+/// two steps of the migration end in the same one.
 #[test]
 fn test_entity_archetype_migration() {
     let mut world = setup_world();
@@ -1593,7 +1666,7 @@ fn test_entity_archetype_migration() {
 
     let initial_location = *world.entity_locations.get(&entity).unwrap();
 
-    // Add Health - should migrate to new archetype
+    // Adding Health moves the entity to an archetype that has it.
     world.add_component(entity, Health(100)).unwrap();
 
     let after_add_location = *world.entity_locations.get(&entity).unwrap();
@@ -1602,7 +1675,7 @@ fn test_entity_archetype_migration() {
         "Entity should be in different archetype after adding component"
     );
 
-    // Remove Velocity - should migrate to another archetype
+    // Removing Velocity moves the entity again.
     world.remove_component::<Velocity>(entity).unwrap();
 
     let after_remove_location = *world.entity_locations.get(&entity).unwrap();
@@ -1632,8 +1705,8 @@ fn test_automatic_empty_archetype_cleanup() {
         "Should have 1 archetype initially"
     );
 
-    // Add Health - this should move entity to new archetype
-    // The old archetype should be automatically removed since it becomes empty
+    // Adding Health moves the entity to a new archetype. The one it leaves
+    // becomes empty, so it is removed at once.
     world.add_component(entity, Health(100)).unwrap();
 
     assert_eq!(
@@ -1655,15 +1728,14 @@ fn test_automatic_empty_archetype_cleanup() {
     println!("âœ“ Empty archetype automatically cleaned up after entity migration");
 }
 
-/// Prints the archetype report and checks the component names and entity count
-/// behind it.
+/// Prints the archetype report, then checks the entity count, the archetype's
+/// rows and the component names it printed.
 #[test]
 fn test_archetype_print_info() {
     let mut world = World::new();
     world.register_component::<Position>();
     world.register_component::<Velocity>();
 
-    // Create some entities
     world
         .create_entity()
         .with(Position { x: 10.0, y: 20.0 })
@@ -1678,14 +1750,11 @@ fn test_archetype_print_info() {
         .build()
         .unwrap();
 
-    // Print info using the world helper method
     world.print_archetypes();
 
-    // Verify archetype structure
     assert_eq!(world.entity_locations.len(), 2, "Should have 2 entities");
     assert_eq!(world.archetypes.len(), 1, "Should have 1 archetype");
 
-    // Get the archetype and verify its contents
     let archetype = world.archetypes.values().next().unwrap();
     assert_eq!(
         archetype.entities.len(),
@@ -1698,7 +1767,6 @@ fn test_archetype_print_info() {
         "Archetype should have 2 component types"
     );
 
-    // Verify component names are registered and retrievable
     let comp_names: Vec<String> = archetype
         .component_types
         .iter()
@@ -1712,7 +1780,6 @@ fn test_archetype_print_info() {
 
     assert_eq!(comp_names.len(), 2, "Should have 2 component names");
 
-    // Check that both expected component names are present
     let has_position = comp_names.iter().any(|name| name.contains("Position"));
     let has_velocity = comp_names.iter().any(|name| name.contains("Velocity"));
 
@@ -1738,7 +1805,6 @@ fn test_entity_generations() {
     world.register_component::<Position>();
     world.register_component::<Velocity>();
 
-    // Create first entity
     let entity1 = world
         .create_entity()
         .with(Position { x: 10.0, y: 20.0 })
@@ -1752,18 +1818,15 @@ fn test_entity_generations() {
         "First entity should have generation 0"
     );
 
-    // Verify entity1 exists and has component
     assert!(world.is_entity_valid(entity1), "Entity1 should be valid");
     assert!(
         world.get_component::<Position>(entity1).is_some(),
         "Entity1 should have Position"
     );
 
-    // Destroy entity1
     let destroyed = world.destroy_entity(entity1);
     assert!(destroyed, "Entity1 should be destroyed successfully");
 
-    // Verify entity1 is no longer valid
     assert!(
         !world.is_entity_valid(entity1),
         "Entity1 should be invalid after destruction"
@@ -1773,7 +1836,7 @@ fn test_entity_generations() {
         "Destroyed entity should not have components"
     );
 
-    // Create a new entity - should reuse ID 0 with generation 1
+    // The next entity reuses id 0 with generation 1.
     let entity2 = world
         .create_entity()
         .with(Velocity { x: 5.0, y: 10.0 })
@@ -1784,14 +1847,14 @@ fn test_entity_generations() {
     assert_eq!(entity2.id, 0, "New entity should reuse ID 0");
     assert_eq!(entity2.generation, 1, "New entity should have generation 1");
 
-    // Verify entity2 is valid
     assert!(world.is_entity_valid(entity2), "Entity2 should be valid");
     assert!(
         world.get_component::<Velocity>(entity2).is_some(),
         "Entity2 should have Velocity"
     );
 
-    // Critical: Old handle (entity1) should NOT access entity2's data
+    // The old handle must not reach the new entity's data, which is what the
+    // generation check is for.
     assert!(
         !world.is_entity_valid(entity1),
         "Old handle should still be invalid"
@@ -1805,7 +1868,6 @@ fn test_entity_generations() {
         "Old handle should not access any components"
     );
 
-    // Verify they are different entities (different hash/eq)
     assert_ne!(
         entity1, entity2,
         "Entities with different generations should not be equal"
@@ -1821,7 +1883,6 @@ fn test_multiple_entity_recycling_rounds() {
     let mut world = World::new();
     world.register_component::<Position>();
 
-    // Create and destroy the same ID multiple times
     let mut last_entity = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
@@ -1850,9 +1911,7 @@ fn test_multiple_entity_recycling_rounds() {
             round, round
         );
 
-        // Old handle should be invalid
         assert!(!world.is_entity_valid(old_entity));
-        // New handle should be valid
         assert!(world.is_entity_valid(new_entity));
 
         last_entity = new_entity;
@@ -1894,8 +1953,8 @@ fn test_free_list_lifo_order() {
     let _ = world.destroy_entity(entity1);
     let _ = world.destroy_entity(entity2);
 
-    // Free list should be: [(0, 1), (1, 1), (2, 1)]
-    // Pop order (LIFO): entity2's ID first, then entity1's, then entity0's
+    // The free list now holds `(0, 1)`, `(1, 1)` and `(2, 1)`. A LIFO pop
+    // returns id 2 first, then 1, then 0.
 
     let new_entity1 = world
         .create_entity()
@@ -1921,7 +1980,6 @@ fn test_free_list_lifo_order() {
     assert_eq!(new_entity3.id, 0, "Should pop ID 0 third");
     assert_eq!(new_entity3.generation, 1);
 
-    // Next entity should get a fresh ID
     let new_entity4 = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
@@ -1936,10 +1994,9 @@ fn test_free_list_lifo_order() {
 /// A slot whose generation reaches `u32::MAX` is retired instead of wrapped
 /// back to zero.
 ///
-/// Wrapping would resurrect every stale handle from 2^32 recycles ago - the
-/// ABA failure where a handle silently addresses an unrelated entity. The free
-/// list drops the slot instead, so a stale handle can never validate against a
-/// recycled entity.
+/// Wrapping would let a handle from 2^32 recycles ago name an unrelated
+/// entity, which is the ABA problem. The free list drops the slot instead, so
+/// a stale handle can never pass the validity check against a recycled entity.
 #[test]
 fn slot_at_generation_max_is_retired_not_wrapped() {
     let mut world = World::new();
@@ -1949,7 +2006,8 @@ fn slot_at_generation_max_is_retired_not_wrapped() {
     // second-highest representable generation.
     world.free_entity_ids.push((7, u32::MAX - 1));
 
-    // First life of the slot: a real entity near the ceiling.
+    // Start the slot's first life with a real entity one generation below the
+    // ceiling.
     let stale = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
@@ -1962,7 +2020,7 @@ fn slot_at_generation_max_is_retired_not_wrapped() {
     assert!(world.destroy_entity(stale));
     assert_eq!(world.free_entity_ids.as_slice(), &[(7, u32::MAX)]);
 
-    // Second life at the ceiling itself.
+    // The slot's second life starts at the ceiling itself.
     let ceiling = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
@@ -2033,12 +2091,13 @@ fn test_generations_with_multiple_archetypes_and_component_removal() {
     assert_eq!(entity3.id, 2);
     assert_eq!(world.archetypes.len(), 2, "Should have 2 archetypes");
 
-    // Remove Velocity from entity1 - moves it to Position-only archetype
+    // Removing Velocity from entity1 moves it to the Position-only archetype.
     let old_entity1 = entity1;
-    let removed = world.remove_component::<Velocity>(entity1);
-    assert!(removed.is_ok(), "Should remove Velocity from entity1");
+    let remove_result = world.remove_component::<Velocity>(entity1);
+    assert!(remove_result.is_ok(), "Should remove Velocity from entity1");
 
-    // entity1 should still be valid with same id and generation (entity wasn't destroyed)
+    // entity1 stays valid with the same id and generation, because removal is
+    // not destruction.
     assert!(
         world.is_entity_valid(entity1),
         "entity1 should still be valid after component removal"
@@ -2068,10 +2127,10 @@ fn test_generations_with_multiple_archetypes_and_component_removal() {
         "entity3 should be invalid after destruction"
     );
 
-    // Free list should now have: [(1, 1), (2, 1)] (LIFO order)
-    // entity1 (id=0) is still alive
+    // The free list now holds `(1, 1)` and `(2, 1)`. entity1 keeps id 0, so
+    // that slot is not free.
 
-    // Create new entity - should reuse ID 2 (last destroyed)
+    // The next create reuses id 2, the last slot destroyed.
     let new_entity1 = world.create_entity().with(Health(50)).build().unwrap();
 
     println!(
@@ -2081,7 +2140,7 @@ fn test_generations_with_multiple_archetypes_and_component_removal() {
     assert_eq!(new_entity1.id, 2, "Should reuse ID 2 (LIFO)");
     assert_eq!(new_entity1.generation, 1, "Should have generation 1");
 
-    // Old entity3 handle should NOT access new_entity1's data
+    // The old entity3 handle must not reach the new entity's data.
     assert!(
         !world.is_entity_valid(old_entity3),
         "Old entity3 handle should be invalid"
@@ -2091,7 +2150,7 @@ fn test_generations_with_multiple_archetypes_and_component_removal() {
         "Old handle should not access new entity"
     );
 
-    // Create another entity - should reuse ID 1
+    // The next create reuses the other freed slot, id 1.
     let new_entity2 = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
@@ -2106,13 +2165,12 @@ fn test_generations_with_multiple_archetypes_and_component_removal() {
     assert_eq!(new_entity2.id, 1, "Should reuse ID 2");
     assert_eq!(new_entity2.generation, 1, "Should have generation 1");
 
-    // Old entity2 handle should NOT access new_entity2's data
+    // The old entity2 handle must not reach this entity either.
     assert!(
         !world.is_entity_valid(old_entity2),
         "Old entity2 handle should be invalid"
     );
 
-    // Verify entity1 (never destroyed) still works with original handle
     assert!(
         world.is_entity_valid(old_entity1),
         "Original entity1 should still be valid"
@@ -2120,7 +2178,8 @@ fn test_generations_with_multiple_archetypes_and_component_removal() {
     let pos = world.get_component::<Position>(old_entity1).unwrap();
     assert_eq!(pos.x, 1.0, "entity1 Position should be preserved");
 
-    // Destroy entity1 and verify recycling
+    // Destroy entity1, the last live entity, and check that its id is recycled
+    // too.
     let _ = world.destroy_entity(entity1);
     assert!(
         !world.is_entity_valid(old_entity1),
@@ -2178,7 +2237,8 @@ fn test_component_swap_remove_on_destroy() {
     // row at index 0 stays entity0's stale Position and entity2 reads it.
     let _ = world.destroy_entity(entity0);
 
-    // entity1 should still have its original position (index 1 unchanged)
+    // entity1 sits at index 1, which the removal did not touch, so its values
+    // stay.
     let pos1 = world.get_component::<Position>(entity1).unwrap();
     assert_eq!(pos1.x, 1.0, "entity1 Position.x should be 1.0");
     assert_eq!(pos1.y, 1.0, "entity1 Position.y should be 1.0");
@@ -2247,8 +2307,8 @@ fn test_component_cleanup_on_archetype_migration() {
     assert_eq!(world.get_component::<Position>(entity2).unwrap().x, 2.0);
     assert_eq!(world.get_component::<Velocity>(entity2).unwrap().x, 102.0);
 
-    // Adding Health moves entity0 to its own archetype; the one it leaves
-    // swap-removes its row and swaps entity2 into the freed index 0.
+    // Adding Health moves entity0 to its own archetype. The archetype it
+    // leaves swap-removes its row, which puts entity2 into the freed index 0.
     world.add_component(entity0, Health(50)).unwrap();
 
     assert!(world.get_component::<Position>(entity0).is_some());
@@ -2258,8 +2318,8 @@ fn test_component_cleanup_on_archetype_migration() {
     assert_eq!(world.get_component::<Velocity>(entity0).unwrap().x, 100.0);
     assert_eq!(world.get_component::<Health>(entity0).unwrap().0, 50);
 
-    // entity1 and entity2 must still read their own rows: entity2 now sits at
-    // the index entity0 left, so a column that did not swap-remove would hand
+    // entity1 and entity2 must still read their own rows. entity2 now sits at
+    // the index entity0 left, so a column that did not swap-remove would give
     // it entity0's data.
 
     let pos1 = world.get_component::<Position>(entity1).unwrap();
@@ -2282,10 +2342,12 @@ fn test_component_cleanup_on_archetype_migration() {
 
     assert_eq!(world.archetypes.len(), 2, "Should have 2 archetypes now");
 
-    // Now remove Velocity from entity1 - moves to Position-only archetype
+    // Remove Velocity from entity1, so it moves to the Position-only
+    // archetype.
     world.remove_component::<Velocity>(entity1).unwrap();
 
-    // entity2 should still have correct data (it's now alone in Position+Velocity archetype)
+    // entity2 is now alone in the Position+Velocity archetype, and its values
+    // must be unchanged.
     let pos2 = world.get_component::<Position>(entity2).unwrap();
     let vel2 = world.get_component::<Velocity>(entity2).unwrap();
     assert_eq!(pos2.x, 2.0, "entity2 Position.x should still be 2.0");
@@ -2298,60 +2360,75 @@ fn test_component_cleanup_on_archetype_migration() {
     println!("âœ“ Component cleanup on archetype migration works correctly!");
 }
 
-/// Two iterators sharing a label corrupt the per-label splitting hint, so
-/// `IteratorTimings` records the duplicate.
+// =============================================================================
+// Query timings, editor rows and the registry
+// =============================================================================
+
+/// Two iterators with the same label would overwrite each other's average
+/// duration, so `IteratorTimings` records the duplicate.
 ///
-/// The test replays the bookkeeping `ParQueryIter::for_each` does.
+/// The test repeats the bookkeeping `ParQueryIter::for_each` does.
 #[test]
 fn test_per_label_duplicate_detection() {
     let timing = std::sync::Mutex::new(IteratorTimings::new());
 
     // Simulate iterator-1 with label "physics".
     {
-        let mut t = timing.lock().unwrap();
-        assert!(!t
+        let mut timings = timing.lock().unwrap();
+        assert!(!timings
             .visited_iterator_labels
             .iter()
             .any(|label| label == "physics"));
-        t.visited_iterator_labels.push("physics".to_owned());
-        t.per_iterator_label_average_duration
+        timings.visited_iterator_labels.push("physics".to_owned());
+        timings
+            .per_iterator_label_average_duration
             .insert("physics".to_owned(), 120_000);
     }
 
     // Simulate iterator-2 with label "ai" - different label, no duplicate.
     {
-        let mut t = timing.lock().unwrap();
-        assert!(!t.visited_iterator_labels.iter().any(|label| label == "ai"));
-        t.visited_iterator_labels.push("ai".to_owned());
-        t.per_iterator_label_average_duration
+        let mut timings = timing.lock().unwrap();
+        assert!(!timings
+            .visited_iterator_labels
+            .iter()
+            .any(|label| label == "ai"));
+        timings.visited_iterator_labels.push("ai".to_owned());
+        timings
+            .per_iterator_label_average_duration
             .insert("ai".to_owned(), 50_000);
     }
 
-    // Simulate a second "physics" iterator - same label, DUPLICATE.
+    // A second iterator with the label "physics" is the duplicate case.
     {
-        let mut t = timing.lock().unwrap();
-        assert!(t
+        let mut timings = timing.lock().unwrap();
+        assert!(timings
             .visited_iterator_labels
             .iter()
             .any(|label| label == "physics"));
-        t.visited_duplicated_iterator_labels
+        timings
+            .visited_duplicated_iterator_labels
             .push("physics".to_owned());
-        // Overwrites the splitting hint - exactly the problem we're detecting.
-        t.per_iterator_label_average_duration
+        // This write replaces the first average, which is the problem the
+        // duplicate flag records.
+        timings
+            .per_iterator_label_average_duration
             .insert("physics".to_owned(), 800_000);
     }
 
-    let t = timing.lock().unwrap();
-    assert_eq!(t.visited_duplicated_iterator_labels, vec!["physics"]);
-    assert_eq!(t.visited_iterator_labels, vec!["physics", "ai"]);
-    // "physics" splitting hint was corrupted by the second write.
-    assert_eq!(t.per_iterator_label_average_duration["physics"], 800_000);
+    let timings = timing.lock().unwrap();
+    assert_eq!(timings.visited_duplicated_iterator_labels, vec!["physics"]);
+    assert_eq!(timings.visited_iterator_labels, vec!["physics", "ai"]);
+    // The average stored for "physics" is now the second write's value.
+    assert_eq!(
+        timings.per_iterator_label_average_duration["physics"],
+        800_000
+    );
 
     println!("âœ“ Duplicate label detection works correctly!");
 }
 
 /// The editor's Hierarchy source: `entity_rows` lists every live entity
-/// with its component names, sorted by entity id.
+/// with its component names, sorted by the entity's slot id.
 #[test]
 fn entity_rows_list_live_entities_with_components() {
     let mut world = World::new();
@@ -2372,7 +2449,7 @@ fn entity_rows_list_live_entities_with_components() {
 
     let rows = world.entity_rows();
     assert_eq!(rows.len(), 2);
-    // Deterministic ordering by entity id: `a` was created first (id 0).
+    // The order follows the slot id, and `a` was created first with slot id 0.
     assert_eq!(rows[0].entity, a);
     assert_eq!(rows[0].components.len(), 2);
     assert!(rows[0]
@@ -2398,7 +2475,7 @@ fn entity_rows_list_live_entities_with_components() {
 fn descriptor_components_appear_and_resolution_is_archetype_scoped() {
     let mut world = World::new();
     world.register_component::<Position>();
-    let descriptor = world
+    let descriptor_component_id = world
         .register_component_descriptor(
             0xABCD,
             "Demo.Thing",
@@ -2410,7 +2487,7 @@ fn descriptor_components_appear_and_resolution_is_archetype_scoped() {
         .unwrap();
 
     let with_descriptor = world
-        .create_descriptor_entity(&[(descriptor, 7_u32.to_ne_bytes().to_vec())])
+        .create_descriptor_entity(&[(descriptor_component_id, 7_u32.to_ne_bytes().to_vec())])
         .unwrap();
     let with_position = world
         .create_entity()
@@ -2423,11 +2500,11 @@ fn descriptor_components_appear_and_resolution_is_archetype_scoped() {
         .expect("entity alive");
     assert_eq!(names, vec!["Demo.Thing"]);
 
-    // Resolution is per-entity: the descriptor component only resolves on
-    // the entity that carries it, and Position only on its own entity.
+    // Resolution is per entity. The descriptor component resolves only on the
+    // entity that carries it, and Position only on its own entity.
     assert_eq!(
         world.resolve_entity_component_id(with_descriptor, "Demo.Thing"),
-        Some(descriptor)
+        Some(descriptor_component_id)
     );
     assert_eq!(
         world.resolve_entity_component_id(with_position, "Demo.Thing"),
@@ -2458,29 +2535,23 @@ fn registered_components_lists_every_type_sorted() {
 
     let registered = world.registered_components();
     assert_eq!(registered.len(), 3);
-    // Sorted by name (full type paths sort before the demo name here).
+    // Sorted by name: the uppercase demo name sorts before the full type paths.
     let names: Vec<String> = registered.iter().map(|(name, _)| name.clone()).collect();
     assert_eq!(names[0], "Demo.Alpha");
     assert!(names[1].contains("Position"));
     assert!(names[2].contains("Velocity"));
 }
 
-/// A tiny helper to get a component's registered type name without
-/// depending on the registry ordering in this test module.
-fn type_name_of<T: 'static>() -> String {
-    crate::type_names::stable_type_name::<T>().to_string()
-}
-
-// -------------------------------------------------------------------------
+// =============================================================================
 // Resource re-homing
-// -------------------------------------------------------------------------
+// =============================================================================
 
 /// Counts its own drops, so a re-home that corrupted the stored function
 /// table shows up as a missing or doubled drop rather than as silence.
 ///
 /// The counter is owned per instance rather than being a `static`: the
 /// harness runs these tests in parallel, and a shared counter makes every
-/// `before + 1` assertion race with the others.
+/// drop-count assertion race with the others.
 #[derive(Debug)]
 struct RehomeProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 impl crate::resource::Resource for RehomeProbe {}
@@ -2493,13 +2564,16 @@ impl Drop for RehomeProbe {
 
 /// A fresh probe and the counter watching it.
 fn rehome_probe() -> (RehomeProbe, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    (RehomeProbe(std::sync::Arc::clone(&drops)), drops)
+    let drop_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    (
+        RehomeProbe(std::sync::Arc::clone(&drop_counter)),
+        drop_counter,
+    )
 }
 
 /// Reads one probe's counter.
-fn drops_of(counter: &std::sync::atomic::AtomicUsize) -> usize {
-    counter.load(std::sync::atomic::Ordering::SeqCst)
+fn drops_of(drop_counter: &std::sync::atomic::AtomicUsize) -> usize {
+    drop_counter.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Inserting a resource records its function table, so a later reload has
@@ -2533,7 +2607,7 @@ fn registering_a_resource_records_the_table_without_a_value() {
 /// Re-homing leaves the value intact and still droppable exactly once.
 #[test]
 fn rehoming_resources_preserves_the_value_and_its_drop() {
-    let (probe, drops) = rehome_probe();
+    let (probe, drop_counter) = rehome_probe();
     let mut world = World::new();
     world.insert_resource(probe);
 
@@ -2542,11 +2616,11 @@ fn rehoming_resources_preserves_the_value_and_its_drop() {
     world.rehome_resources();
 
     assert!(world.has_resource::<RehomeProbe>(), "the value survives");
-    assert_eq!(drops_of(&drops), 0, "nothing was dropped");
+    assert_eq!(drops_of(&drop_counter), 0, "nothing was dropped");
 
     drop(world);
     assert_eq!(
-        drops_of(&drops),
+        drops_of(&drop_counter),
         1,
         "the value is dropped exactly once after a re-home"
     );
@@ -2578,13 +2652,17 @@ fn the_registration_log_reports_what_one_generation_claimed() {
 /// the host must do while the owning image is still mapped.
 #[test]
 fn dropping_a_retired_owners_resource_releases_its_value() {
-    let (probe, drops) = rehome_probe();
+    let (probe, drop_counter) = rehome_probe();
     let mut world = World::new();
     world.insert_resource(probe);
     let id = crate::resource::ResourceId::of::<RehomeProbe>();
 
     assert_eq!(world.drop_resources(&[id]), 1);
-    assert_eq!(drops_of(&drops), 1, "the value was dropped, not leaked");
+    assert_eq!(
+        drops_of(&drop_counter),
+        1,
+        "the value was dropped, not leaked"
+    );
     assert!(!world.has_resource::<RehomeProbe>());
     // Its bookkeeping goes too, so a later insert starts clean.
     assert!(!world.resource_factories.contains_key(&id));
@@ -2613,20 +2691,20 @@ fn removing_a_resource_forgets_its_function_table() {
     assert!(!world.resource_factories.contains_key(&id));
 }
 
-// -------------------------------------------------------------------------
+// =============================================================================
 // Shared resource identity
-// -------------------------------------------------------------------------
+// =============================================================================
 
-// A shared resource type, standing for one artifact's copy. The
-// cross-artifact behaviour itself lives in
-// `tests/shared_resource_identity.rs`; what stays here needs access to the
-// world's private bookkeeping, which an integration test cannot reach.
+// A shared resource type, standing in for one artifact's copy of it. The
+// behaviour across two artifacts lives in the `pill_engine` crate's
+// `tests/shared_resource_identity.rs`. The tests here need the world's private
+// bookkeeping, which an integration test cannot reach.
 mod artifact_a {
     /// `demo::Settings` as one artifact compiled it.
     #[derive(Debug)]
     pub struct Settings {
-        // The shape is what the identity checks carry; nothing reads the
-        // value.
+        // The identity checks compare shapes, not values, so nothing reads
+        // this field.
         #[allow(dead_code)]
         pub value: u32,
     }
@@ -2637,8 +2715,8 @@ mod artifact_a {
     }
 }
 
-/// An ordinary resource is untouched: its id is its `TypeId`, and the box
-/// still checks that exactly.
+/// An ordinary resource keeps its strict identity check: its id is its
+/// `TypeId`, and the box compares that exactly.
 #[test]
 fn an_ordinary_resource_keeps_the_strict_identity_check() {
     let mut world = World::new();
@@ -2652,9 +2730,9 @@ fn an_ordinary_resource_keeps_the_strict_identity_check() {
     assert!(world.take_registration_error().is_none());
 }
 
-/// A released bit cannot alias two component sets: the archetype that
-/// carried it is gone before the bit is reusable, so the next type to take
-/// it gets its own column and its own archetype.
+/// A released bit cannot stand for two component sets. The archetype that
+/// carried it is gone before the bit can be used again, so the next type to
+/// take it gets its own column and its own archetype.
 #[test]
 fn recycled_bit_does_not_alias_archetypes() {
     let mut world = World::new();
@@ -2665,17 +2743,20 @@ fn recycled_bit_does_not_alias_archetypes() {
         .component_registry()
         .get_bit(&velocity_id)
         .expect("registered");
-    let kept = world
+    let kept_entity = world
         .create_entity()
         .with(Position { x: 1.0, y: 2.0 })
         .with(Velocity { x: 0.0, y: 0.0 })
         .build()
         .unwrap();
 
-    let dropped = world.drop_forgotten_components(&[
+    let dropped_row_count = world.drop_forgotten_components(&[
         crate::type_names::stable_type_name::<Velocity>().to_string(),
     ]);
-    assert_eq!(dropped, 1, "the entity's velocity row was rehomed out");
+    assert_eq!(
+        dropped_row_count, 1,
+        "the entity's velocity row was rehomed out"
+    );
     assert_eq!(
         world.component_registry().get_bit(&velocity_id),
         None,
@@ -2709,23 +2790,32 @@ fn recycled_bit_does_not_alias_archetypes() {
     let archetype = &world.archetypes[&location.archetype_id];
     assert!(archetype.component_types.contains(&health_id));
     assert!(!archetype.component_types.contains(&velocity_id));
-    assert!(world.entity_locations.contains_key(&kept));
+    assert!(world.entity_locations.contains_key(&kept_entity));
 }
 
-/// A re-registration updates the id's stamp instead of adding an entry:
-/// the window stays proportional to distinct resources, and a generation
-/// that re-registers its resources is exactly what the host's reload diff
-/// has to see.
+/// A re-registration updates the id's stamp instead of adding an entry. The
+/// log then stays proportional to the number of distinct resources, and a
+/// generation that registers its resources again still shows up once in the
+/// host's reload diff.
 #[test]
 fn a_re_registered_resource_stays_one_registration() {
     let mut world = World::new();
-    world.insert_resource(AccountedResource { value: 1 });
+    world.insert_resource(AccountedResource {
+        registration_marker: 1,
+    });
     let sequence = world.resource_registration_sequence();
 
-    world.insert_resource(AccountedResource { value: 2 });
-    world.insert_resource(AccountedResource { value: 3 });
+    world.insert_resource(AccountedResource {
+        registration_marker: 2,
+    });
+    world.insert_resource(AccountedResource {
+        registration_marker: 3,
+    });
     assert_eq!(
-        world.get_resource::<AccountedResource>().unwrap().value,
+        world
+            .get_resource::<AccountedResource>()
+            .unwrap()
+            .registration_marker,
         3,
         "the replacement really replaced the value"
     );
@@ -2736,12 +2826,14 @@ fn a_re_registered_resource_stays_one_registration() {
         "a re-registration inside the window is reported, exactly once"
     );
 
-    world.insert_resource(FreshAccountedResource { value: 4 });
+    world.insert_resource(FreshAccountedResource {
+        registration_marker: 4,
+    });
     assert_eq!(
         world
             .get_resource::<FreshAccountedResource>()
             .unwrap()
-            .value,
+            .registration_marker,
         4
     );
     let mut claimed = world.resource_ids_registered_since(sequence);
@@ -2762,20 +2854,23 @@ fn a_re_registered_resource_stays_one_registration() {
     );
 }
 
-/// A resource another subject still claims is not dropped by one subject's
-/// retirement: the claim refcount keeps the value alive until the last
-/// claimant lets go.
+/// One subject's retirement does not drop a resource that another subject
+/// still claims. The claim count keeps the value alive until the last claimant
+/// releases it.
 #[test]
 fn a_shared_claim_survives_one_subjects_retirement() {
     let mut world = World::new();
     let id = crate::resource::ResourceId::of::<AccountedResource>();
-    world.insert_resource(AccountedResource { value: 1 });
+    world.insert_resource(AccountedResource {
+        registration_marker: 1,
+    });
 
     // Two subjects registered it.
     world.retain_resource_claims(&[id]);
     world.retain_resource_claims(&[id]);
 
-    // One retires it: the value stays, claim and all.
+    // The first release leaves the value in place, because one claim is still
+    // held.
     world.release_resource_claims(&[id]);
     assert_eq!(
         world.drop_resources(&[id]),
@@ -2792,10 +2887,8 @@ fn a_shared_claim_survives_one_subjects_retirement() {
 
 /// A relayout moves the factory, the live column and the schema hash together.
 ///
-/// The registry used to keep a second copy of a descriptor component's shape -
-/// a placeholder at registration that a relayout then repaired. Storage shape
-/// has one owner now, so this pins the factory to the column that allocates the
-/// rows and to the size readers consult.
+/// Storage shape has one owner, so this pins the factory to the column that
+/// allocates the rows and to the size readers consult.
 #[test]
 fn relayout_moves_the_factory_and_the_column_together() {
     let mut world = World::new();
@@ -2843,14 +2936,14 @@ fn relayout_moves_the_factory_and_the_column_together() {
     );
 }
 
-// -------------------------------------------------------------------------
+// =============================================================================
 // Foreign resources
-// -------------------------------------------------------------------------
+// =============================================================================
 
-/// A declared name hashes the engine's way, so a declaration from another
-/// language and a Rust type that writes down the same string are one
-/// resource - which is the whole point of the name being declared rather
-/// than derived.
+/// A declared name is hashed the way the engine hashes type names, so a
+/// declaration from another language and a Rust type that writes the same
+/// string are one resource. That is why the name is declared instead of
+/// derived.
 #[test]
 fn a_foreign_declaration_hashes_to_the_rust_types_id() {
     let mut world = World::new();
@@ -2875,8 +2968,8 @@ fn a_foreign_declaration_hashes_to_the_rust_types_id() {
     );
 }
 
-/// The claim guard keeps its Rust-versus-Rust name check and takes the
-/// layout as the cross-language one: a matching declaration joins, a
+/// The claim guard keeps the name check for two Rust registrations and uses
+/// the layout for a cross-language join. A matching declaration joins, and a
 /// mismatched one is refused.
 #[test]
 fn a_foreign_declaration_joins_by_layout_and_is_refused_by_a_mismatch() {
@@ -2947,8 +3040,8 @@ fn foreign_bytes_round_trip_and_stamp_the_change_tick() {
     assert_eq!(world.foreign_resource_bytes(id).unwrap()[0], 9);
 }
 
-/// A private resource has no byte view: its id is a `TypeId`, which no
-/// other language can name, so there is nothing for one to address.
+/// A private resource has no byte view. Its id is a `TypeId`, which no other
+/// language can name, so there is no id for one to address.
 #[test]
 fn a_private_resource_has_no_foreign_view() {
     let mut world = World::new();
@@ -3050,18 +3143,18 @@ fn relayout_refuses_a_rust_value_and_a_plan_that_leaves_the_payload() {
         .register_foreign_resource("demo::Settings", "Project.Settings", 4, 4, 1)
         .expect("the same layout joins");
 
-    // A Rust value stored under the id brings its own table with it, so the
-    // declaration is the Rust type's from then on and a foreign relayout is
-    // no longer even addressed to one.
+    // A Rust value stored under the id brings its own function table. From
+    // then on the declaration belongs to the Rust type, so a foreign relayout
+    // finds no declaration to write to.
     world.insert_resource(artifact_a::Settings { value: 3 });
     assert!(matches!(
         world.relayout_foreign_resource(id, 8, 4, 2, &FieldPlan::new()),
         Err(WorldError::ForeignResourceNotRegistered { .. })
     ));
 
-    // Declaring it foreign again - what the managed side does on every
-    // reload - is refused: the stored value's destructor is the price of
-    // admitting the declaration, so it is not admitted.
+    // Declaring the id foreign again, which the managed side does on every
+    // reload, is refused. Admitting the declaration would mean dropping the
+    // stored value through the foreign table, so it is not admitted.
     assert!(matches!(
         world.register_foreign_resource("demo::Settings", "Project.Settings", 4, 4, 1),
         Err(WorldError::ForeignResourceHoldsRustValue { .. })
@@ -3072,29 +3165,29 @@ fn relayout_refuses_a_rust_value_and_a_plan_that_leaves_the_payload() {
         "the Rust value's table still owns the id"
     );
 
-    // A declaration that was foreign from the start keeps its payload
-    // checks: there, only the plan is in the way of a resize.
-    let fresh = world
+    // A declaration that was foreign from the start still checks its payload,
+    // so there only the plan can refuse a resize.
+    let fresh_resource_id = world
         .register_foreign_resource("demo::Other", "Project.Other", 4, 4, 1)
         .expect("a fresh name is claimed");
     world
-        .insert_foreign_resource_bytes(fresh, &3_u32.to_ne_bytes())
+        .insert_foreign_resource_bytes(fresh_resource_id, &3_u32.to_ne_bytes())
         .expect("the payload matches the size");
     let mut too_wide = FieldPlan::new();
     too_wide.push(2, 4, FieldSource::OldOffset(0));
     assert!(matches!(
-        world.relayout_foreign_resource(fresh, 4, 4, 2, &too_wide),
+        world.relayout_foreign_resource(fresh_resource_id, 4, 4, 2, &too_wide),
         Err(WorldError::ForeignResourcePlanOutOfBounds { .. })
     ));
     assert_eq!(
-        world.foreign_resource_layout(fresh),
+        world.foreign_resource_layout(fresh_resource_id),
         Some((4, 4, 1)),
         "a refused relayout leaves the declaration as it was"
     );
 }
 
-/// Re-homing leaves a foreign box's table alone: those bytes are not the
-/// Rust type's to drop, even when it shares their name.
+/// Re-homing leaves a foreign box's table alone. The bytes are not the Rust
+/// type's to drop, even when the two share a name.
 #[test]
 fn rehoming_leaves_a_foreign_box_alone() {
     let mut world = World::new();
@@ -3106,9 +3199,9 @@ fn rehoming_leaves_a_foreign_box_alone() {
         .expect("the payload matches the size");
 
     // The Rust owner registers the same name, which makes the declaration
-    // Rust's while the stored bytes stay foreign - the split a re-home has
-    // to respect. Without the skip it would hand these bytes the Rust
-    // type's destructor, freeing memory that type never allocated.
+    // Rust's while the stored bytes stay foreign. A re-home has to respect that
+    // split: without the skip it would hand these bytes the Rust type's
+    // destructor, which frees memory that type never allocated.
     world.register_resource::<artifact_a::Settings>();
     assert!(world.resources[&id].is_foreign());
     assert_eq!(
@@ -3130,9 +3223,9 @@ fn rehoming_leaves_a_foreign_box_alone() {
     );
 }
 
-/// A foreign declaration cannot take over an id that stores a Rust value:
-/// the value's destructor is bound to its type, so its bytes are never
-/// reinterpreted - and the table that would have dropped nothing stays out.
+/// A foreign declaration cannot take over an id that stores a Rust value. The
+/// value's destructor belongs to its type, so its bytes are never read as
+/// foreign, and a table that would have dropped nothing is not installed.
 #[test]
 fn foreign_registration_refuses_a_stored_rust_value() {
     let mut world = World::new();
@@ -3158,9 +3251,9 @@ fn foreign_registration_refuses_a_stored_rust_value() {
     );
 }
 
-/// Byte views are for foreign payloads only: a Rust value that declares a
-/// shared name is not served as bytes, and the refusal costs nothing - no
-/// tick is stamped and no payload is displaced.
+/// Byte views exist for foreign payloads only. A Rust value that declares a
+/// shared name is not served as bytes, and the refusal changes nothing: no
+/// tick is stamped and no payload is replaced.
 #[test]
 fn foreign_byte_views_refuse_a_rust_owned_resource() {
     let mut world = World::new();
@@ -3182,6 +3275,10 @@ fn foreign_byte_views_refuse_a_rust_owned_resource() {
         "the value survived the refusals"
     );
 }
+
+// =============================================================================
+// Zero-sized components
+// =============================================================================
 
 /// A zero-sized Rust type is a component like any other.
 ///
@@ -3220,15 +3317,15 @@ fn a_zero_sized_component_lives_a_full_life() {
 
     // Column contents: a marker is a filter, which is the whole reason to
     // declare one, so both rows have to be in the column the filter reads.
-    let marker = ComponentId::of::<Enemy>();
-    let rows: usize = world
+    let marker_id = ComponentId::of::<Enemy>();
+    let row_count: usize = world
         .archetypes
         .values()
-        .filter_map(|archetype| archetype.component_storages.get(marker))
+        .filter_map(|archetype| archetype.component_storages.get(marker_id))
         .map(|column| column.len())
         .sum();
     assert_eq!(
-        rows, 2,
+        row_count, 2,
         "both markers occupy a row in the zero-sized column"
     );
 
@@ -3284,12 +3381,11 @@ fn an_over_aligned_zero_sized_component_is_addressable() {
     assert!(world.get_component::<AlignedTag>(entity).is_some());
 }
 
-/// A zero-width *descriptor* declaration stays refused.
+/// A zero-width *descriptor* declaration is still refused.
 ///
-/// The verdict is split, not loosened: a descriptor's width arrives from a
-/// manifest another language wrote, where zero means that declaration is wrong.
-/// Pinned so the two rules stay separate and a malformed manifest keeps being
-/// refused.
+/// The rule differs by source: a descriptor's width comes from a manifest
+/// another language wrote, where zero means the declaration is wrong. The test
+/// keeps the two rules separate, so a malformed manifest stays refused.
 #[test]
 fn a_zero_width_descriptor_component_is_still_refused() {
     let mut world = World::new();
@@ -3308,6 +3404,10 @@ fn a_zero_width_descriptor_component_is_still_refused() {
         "a zero-width manifest declaration is a declaration error, not a marker"
     );
 }
+
+// =============================================================================
+// Resource field layouts
+// =============================================================================
 
 /// A foreign resource's declared fields are stored and served back.
 ///
@@ -3410,8 +3510,8 @@ fn an_impossible_resource_field_layout_is_refused() {
 /// A relayout drops the layout it described.
 ///
 /// Serving the previous generation's offsets over migrated bytes would be
-/// worse than serving nothing, so the engine forgets and the declarer
-/// re-publishes - which is what the host does on the same pass.
+/// worse than serving nothing. The engine therefore forgets the layout, and
+/// the declarer publishes it again, as the host does in the same pass.
 #[test]
 fn a_relayout_drops_the_stored_resource_field_layout() {
     let mut world = World::new();
@@ -3466,9 +3566,13 @@ fn a_relayout_drops_the_stored_resource_field_layout() {
     );
 }
 
-/// The stable-id index: every created entity gets an id, the id resolves back
-/// to the entity, and destroying the entity drops both directions - so a stale
-/// id names nothing rather than a later occupant of the recycled slot.
+// =============================================================================
+// Entity creation and identity
+// =============================================================================
+
+/// The stable-id index. Every created entity gets an id, the id resolves back
+/// to the entity, and destroying the entity drops both directions, so a stale
+/// id names nothing instead of a later occupant of the recycled slot.
 #[test]
 fn a_created_entity_has_an_id_that_dies_with_it() {
     let mut world = World::new();
@@ -3504,8 +3608,8 @@ fn a_created_entity_has_an_id_that_dies_with_it() {
     assert_ne!(recycled_id, id);
 }
 
-/// A creator that supplies the id keeps it, which is what a scene load needs;
-/// a second entity claiming the same id is refused before it is inserted.
+/// A creator that supplies the id keeps it, which is what a scene load needs.
+/// A second entity claiming the same id is refused before it is inserted.
 #[test]
 fn a_supplied_id_is_kept_and_a_duplicate_is_refused() {
     let mut world = World::new();
@@ -3537,12 +3641,12 @@ fn a_supplied_id_is_kept_and_a_duplicate_is_refused() {
 
 /// A builder handed one component type twice is refused before the row exists.
 ///
-/// The columns are keyed by component id, so the second inserter pushes into
-/// the column the first one already grew: one entity row, two component rows.
-/// Every later entity then reads the row before its own - which is what the
-/// assertion at the end measures. The archetype is built first, because on a
-/// fresh component set the duplicate panics inside it instead, so only the
-/// cached path shows the silent corruption.
+/// The columns are keyed by component id, so a second inserter would push into
+/// the column the first one already grew: one entity row and two component
+/// rows. Every later entity would then read the row before its own, which is
+/// what the assertion at the end measures. The archetype is created first,
+/// because on a fresh component set the duplicate panics inside it instead, so
+/// only the cached path shows the silent corruption.
 #[test]
 fn a_component_the_builder_is_given_twice_is_refused() {
     let mut world = World::new();
@@ -3582,6 +3686,10 @@ fn a_component_the_builder_is_given_twice_is_refused() {
     );
 }
 
+// =============================================================================
+// Change ticks
+// =============================================================================
+
 /// A tick counter that wrapped is not "nothing changed".
 ///
 /// A row written after the counter wrapped carries a small tick, so a plain
@@ -3591,7 +3699,7 @@ fn a_component_the_builder_is_given_twice_is_refused() {
 #[test]
 fn a_wrapped_tick_counter_still_reports_a_change() {
     let mut world = World::new();
-    let component = world
+    let component_id = world
         .register_component_descriptor(
             0xDA,
             "Project.Wrapped",
@@ -3602,13 +3710,13 @@ fn a_wrapped_tick_counter_still_reports_a_change() {
         )
         .unwrap();
 
-    // Step 1: the system's last run lands just below the top of the counter.
+    // Step 1: the system's last run sits just below the top of the counter.
     world.change_tick = u32::MAX - 2;
     let last_run = world.increment_change_tick();
     assert_eq!(last_run, Tick::new(u32::MAX - 1));
 
-    // Step 2: three bumps carry the counter past `u32::MAX`, so the run that
-    // sees the write is tick 1 - numerically smaller than the last run.
+    // Step 2: three increments carry the counter past `u32::MAX`, so the run
+    // that sees the write is tick 1, a smaller number than the last run.
     world.increment_change_tick();
     world.increment_change_tick();
     let this_run = world.increment_change_tick();
@@ -3616,9 +3724,9 @@ fn a_wrapped_tick_counter_still_reports_a_change() {
 
     // Step 3: a row written now carries the small tick.
     let entity = world
-        .create_descriptor_entity(&[(component, two_u32_row(1, 2))])
+        .create_descriptor_entity(&[(component_id, two_u32_row(1, 2))])
         .unwrap();
-    let ticks = ticks_of_row(&world, entity, component);
+    let ticks = ticks_of_row(&world, entity, component_id);
     assert_eq!(ticks.changed, this_run);
 
     assert!(
@@ -3633,11 +3741,14 @@ fn a_wrapped_tick_counter_still_reports_a_change() {
     );
 }
 
+// =============================================================================
+// Resource removal
+// =============================================================================
+
 /// A removal drops every per-id record, the declared field layout included.
 ///
-/// The two removal sweeps used to enumerate their own subset, and
-/// `remove_resource` left `resource_field_layouts` behind, so a value
-/// re-registered under the same id inherited the previous value's offsets.
+/// A value re-registered under the same id must not inherit the previous
+/// value's offsets, so the layout record goes with the value.
 #[test]
 fn removing_a_resource_drops_its_declared_field_layout() {
     #[derive(Debug, PartialEq)]
@@ -3663,15 +3774,19 @@ fn removing_a_resource_drops_its_declared_field_layout() {
         .expect("the field fits the registered size");
     assert!(world.resource_field_layout(id).is_some());
 
-    let removed = world
+    let removed_value = world
         .remove_resource::<RemovedProbe>()
         .expect("the value is a RemovedProbe");
-    assert_eq!(removed, Some(RemovedProbe(7)));
+    assert_eq!(removed_value, Some(RemovedProbe(7)));
     assert!(
         world.resource_field_layout(id).is_none(),
         "a removal must drop the id's layout record, not leave it for the next registration"
     );
 }
+
+// =============================================================================
+// Script components
+// =============================================================================
 
 /// A script component that counts its own dispatches, so a double
 /// registration is visible as a count above one after a single frame.
@@ -3688,7 +3803,7 @@ impl ScriptComponent for CountingScript {
     }
 }
 
-/// Reads the counting script's own dispatch count back out of the world.
+/// Returns the counting script's dispatch count as the world holds it.
 fn dispatches_of(world: &World, entity: Entity) -> u32 {
     world
         .get_component::<CountingScript>(entity)
@@ -3696,8 +3811,8 @@ fn dispatches_of(world: &World, entity: Entity) -> u32 {
         .dispatches
 }
 
-/// Registering one script type twice must still dispatch it once per frame:
-/// the updater table replaces its entry instead of queueing a second one.
+/// Registering one script type twice must still dispatch it once per frame.
+/// The updater table replaces its entry instead of queueing a second one.
 #[test]
 fn registering_a_script_component_twice_dispatches_it_once_per_frame() {
     let mut world = World::new();
@@ -3719,8 +3834,8 @@ fn registering_a_script_component_twice_dispatches_it_once_per_frame() {
     );
 }
 
-/// A retired script type that registers again may land on another bit;
-/// dispatch reads the current one, so the script keeps running.
+/// A retired script type that registers again may get a different bit.
+/// Dispatch reads the current bit, so the script keeps running.
 #[test]
 fn a_re_registered_script_component_dispatches_on_its_new_bit() {
     let mut world = World::new();

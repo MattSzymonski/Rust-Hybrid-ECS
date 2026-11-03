@@ -11,20 +11,20 @@
 //!   [`AssetManager::follow_move`].
 //! - Hold the file-name rule every editor's create dialog shares
 //!   ([`standalone_file_name`]): which base names and characters Windows
-//!   refuses. It lives here so one rule serves them all; a standalone file
-//!   is what such a name is usually for.
+//!   refuses. It lives here so every editor builds the same name, and a
+//!   standalone asset file is the usual user.
 //! - Hold the path check every tool-side asset path goes through
-//!   ([`checked_relative`]): relative, inside the asset directory, and
-//!   naming something.
+//!   ([`checked_relative`]): relative, inside the asset directory, and not
+//!   empty.
 //!
 //! # Design
 //!
 //! A source file in a project's `res` directory (`textures/helmet.jpg`) can
-//! carry a metadata file beside it holding what the source does not say for
-//! itself - the asset's stable guid and its import settings, never the decoded
-//! payload. The extension is kept rather than replaced, so `helmet.png` and
-//! `helmet.obj` never share one, and a `.meta` file is never an asset of its
-//! own.
+//! carry a metadata file beside it. It holds what the source does not say for
+//! itself: the asset's stable guid and its import settings. It never holds
+//! the decoded payload. The metadata name keeps the source's extension
+//! instead of replacing it, so `helmet.png` and `helmet.obj` get different
+//! metadata files, and a `.meta` file is never an asset itself.
 //!
 //! The file is JSON with a small header the engine owns and the settings the
 //! asset type owns:
@@ -40,15 +40,15 @@
 //!
 //! An asset loaded this way is named by its normalized path relative to `res`
 //! and keyed by the guid in its metadata. One path is one asset, which is what
-//! a project reload re-running its loading code needs; a guid claimed by a
-//! second path (a source copied together with its `.meta`) is refused rather
-//! than silently moved, because the store would otherwise rebind it.
+//! a project reload needs when it runs its loading code again. A guid claimed
+//! by a second path (a source copied together with its `.meta`) is refused
+//! rather than silently moved, because the store would otherwise rebind it.
 //!
 //! Nothing here stores a function pointer: [`AssetManager::import`] is generic,
 //! so each call is compiled into the binary that makes it and a reload has
 //! nothing to re-point. Code that does not know an asset's type goes through
 //! [`ImportRegistry`](crate::asset_import_registry::ImportRegistry), which does
-//! store them and handles the reload hazard that brings.
+//! store function pointers and handles the reload hazard that comes with them.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -62,20 +62,27 @@ use trait_type_map::TraitAccessible;
 use crate::asset::{Asset, AssetGuid, AssetLoadError, AssetLoadResult, AssetManager, Handle};
 use crate::asset_store::{self, pack_key};
 
+// =============================================================================
+// Metadata files
+// =============================================================================
+
 /// The extension every metadata file carries, appended to its source's name.
 pub const METADATA_EXTENSION: &str = "meta";
 
-/// The metadata header layout this engine writes, and the newest it reads.
+/// The metadata format version this engine writes, and the newest one it
+/// reads.
 pub const METADATA_FORMAT_VERSION: u32 = 1;
 
 /// The metadata file for the source asset at `source_path`, relative to the
 /// project's asset directory, or `None` when `source_path` cannot have one.
 ///
 /// The path is normalized the way an asset name is (`/`-separated, `.`
-/// removed, by the same rules as the asset store's pack key) and `.meta` is
+/// removed, by the same rules as the asset store's pack key), and `.meta` is
 /// appended to the full file name: `textures\helmet.jpg` gives
-/// `textures/helmet.jpg.meta`. `None` for a path that does not normalize (absolute, or climbing out with `..`), and for one
-/// that is already a metadata file.
+/// `textures/helmet.jpg.meta`.
+///
+/// Returns `None` for a path that does not normalize (an absolute path, or one
+/// that climbs out with `..`), and for one that is already a metadata file.
 pub fn metadata_path_for(source_path: &Path) -> Option<PathBuf> {
     let name = pack_key(source_path)?;
     if is_metadata_file(&name) {
@@ -91,32 +98,11 @@ fn is_metadata_file(name: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(METADATA_EXTENSION))
 }
 
-/// `path` checked to stay inside the asset directory: relative, without
-/// `..`, and naming something. Returns it as a `PathBuf`.
-///
-/// The one validator every tool-side asset path goes through, so a path that
-/// would escape the directory is refused before it reaches the file system.
-///
-/// # Errors
-///
-/// A message when the path is absolute, climbs out with `..`, or is empty.
-pub fn checked_relative(path: &str) -> Result<PathBuf, String> {
-    let candidate = PathBuf::from(path.replace('\\', "/"));
-    let mut normal = PathBuf::new();
-    for component in candidate.components() {
-        match component {
-            std::path::Component::Normal(part) => normal.push(part),
-            std::path::Component::CurDir => {}
-            _ => return Err(format!("`{path}` is not a path inside the asset directory")),
-        }
-    }
-    if normal.as_os_str().is_empty() {
-        return Err("the path is empty".to_owned());
-    }
-    Ok(normal)
-}
+// =============================================================================
+// Asset file names and paths
+// =============================================================================
 
-/// Names Windows refuses as a file's base name, whatever the extension.
+/// Base names Windows refuses, whatever the extension.
 const RESERVED_NAMES: [&str; 22] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
@@ -125,17 +111,24 @@ const RESERVED_NAMES: [&str; 22] = [
 /// Characters Windows refuses in a file name.
 const INVALID_CHARACTERS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
 
-/// The file name a new asset called `name` gets with `extension`:
-/// `name.extension`, unless `name` already ends with that extension.
+/// The file name a new asset called `name` gets with `extension`: the name
+/// with `.extension` appended, unless it already ends with that extension in
+/// some letter case.
 ///
-/// The naming rule a "create asset" dialog validates against, kept here so
-/// every editor builds the same name.
+/// It is the naming rule a "create asset" dialog checks, kept here so every
+/// editor builds the same name, and it only states the rule: nothing here
+/// creates or checks a file.
 ///
 /// # Errors
 ///
-/// A message when `name` is empty, contains a path separator or a character
-/// Windows refuses, contains `..`, ends with a dot or a space, or is a
-/// reserved Windows name (`CON`, `NUL`, `COM1`, ...).
+/// A message when `name`:
+///
+/// - is empty;
+/// - contains a path separator or a character Windows refuses, including
+///   control characters;
+/// - contains `..`;
+/// - ends with a dot or a space;
+/// - is a reserved Windows name (`CON`, `NUL`, `COM1`, ...).
 pub fn standalone_file_name(name: &str, extension: &str) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -172,6 +165,32 @@ pub fn standalone_file_name(name: &str, extension: &str) -> Result<String, Strin
     Ok(file_name)
 }
 
+/// Checks that `path` stays inside the asset directory and returns it as a
+/// `PathBuf`: relative, without `..`, and not empty.
+///
+/// This is the one check every tool-side asset path goes through, so a path
+/// that would escape the directory is refused before it reaches the file
+/// system.
+///
+/// # Errors
+///
+/// A message when the path is absolute, climbs out with `..`, or is empty.
+pub fn checked_relative(path: &str) -> Result<PathBuf, String> {
+    let candidate = PathBuf::from(path.replace('\\', "/"));
+    let mut normal = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::Normal(part) => normal.push(part),
+            std::path::Component::CurDir => {}
+            _ => return Err(format!("`{path}` is not a path inside the asset directory")),
+        }
+    }
+    if normal.as_os_str().is_empty() {
+        return Err("the path is empty".to_owned());
+    }
+    Ok(normal)
+}
+
 // =============================================================================
 // ImportedAsset
 // =============================================================================
@@ -179,13 +198,13 @@ pub fn standalone_file_name(name: &str, extension: &str) -> Result<String, Strin
 /// An asset built from a source file in `res`, with import settings that can
 /// live in an `<asset_name>.meta` file beside it.
 ///
-/// Implemented by the crate that owns the asset type, next to its other
-/// constructors; [`AssetManager::import`] and [`AssetManager::reimport`] are
-/// its only callers.
+/// Implemented by the crate that owns the asset type, next to that type's own
+/// constructors. [`AssetManager::import`] and [`AssetManager::reimport`] are
+/// the only callers.
 pub trait ImportedAsset: Asset + TraitAccessible<dyn Asset> + Sized {
     /// Everything the source bytes do not say for themselves.
     ///
-    /// Every field becomes an on-disk contract, so keep the list short, mark
+    /// Every field becomes an on-disk contract, so keep the list short. Mark
     /// the struct `#[serde(default)]` so a file written before a field existed
     /// still reads, and use `BTreeMap` rather than `HashMap` for any map: a
     /// value stored in the world outlives the binary that built it, and an
@@ -196,9 +215,9 @@ pub trait ImportedAsset: Asset + TraitAccessible<dyn Asset> + Sized {
     /// without the dot (`["png", "jpg"]`).
     ///
     /// The [`ImportRegistry`](crate::asset_import_registry::ImportRegistry)
-    /// maps a file to its asset type by these, so the mapping comes from the
-    /// types themselves rather than from a list in the engine. Two types may
-    /// not claim one extension.
+    /// maps a file to its asset type by these extensions, so the mapping comes
+    /// from the types themselves rather than from a list in the engine. Two
+    /// types may not claim one extension.
     const SOURCE_EXTENSIONS: &'static [&'static str];
 
     /// The stable name written to a metadata file's `asset_type`, which a
@@ -277,7 +296,7 @@ pub enum MetadataSource {
     ReadFromFile,
     /// No file existed; this import wrote one.
     CreatedOnDisk,
-    /// No file existed and none was written: the policy did not ask for one,
+    /// No file existed and none was written. The policy did not ask for one,
     /// or the source is not on a writable filesystem. The guid lasts only for
     /// this run.
     InMemoryOnly,
@@ -287,15 +306,18 @@ pub enum MetadataSource {
 pub struct ImportOutcome<T: Asset> {
     /// The asset's handle.
     pub handle: Handle<T>,
-    /// The asset's guid, or `None` when it has none: a path that is already
-    /// loaded and was registered under a name alone - [`AssetManager::add_named`]
-    /// rather than [`AssetManager::add_named_with_guid`] - with no metadata
-    /// file to draw one from. Every other import reads a guid or draws one.
+    /// The asset's guid, or `None` when it has none.
+    ///
+    /// The only import without a guid is a path that is already loaded and
+    /// was registered under its name alone ([`AssetManager::add_named`]
+    /// rather than [`AssetManager::add_named_with_guid`]) when there is also
+    /// no metadata file to take one from. Every other import reads a guid or
+    /// draws one.
     pub guid: Option<AssetGuid>,
     /// Where the guid and settings came from.
     pub metadata: MetadataSource,
     /// `true` when the path was already loaded and its existing handle was
-    /// returned; the source is not decoded and nothing is written.
+    /// returned. The source is not decoded and nothing is written.
     pub already_loaded: bool,
 }
 
@@ -315,22 +337,24 @@ impl<T: Asset> std::fmt::Debug for ImportOutcome<T> {
 
 /// The result of a successful [`AssetManager::reimport`].
 pub struct ReimportOutcome<T: Asset> {
-    /// The asset's handle: the one it already had when it was loaded.
+    /// The asset's handle. It is the handle the asset already had when it was
+    /// loaded.
     pub handle: Handle<T>,
     /// The asset's guid, or `None` under the same conditions as
-    /// [`ImportOutcome::guid`]: a path imported afresh always has one, a path
+    /// [`ImportOutcome::guid`]. A path imported afresh always has one. A path
     /// already loaded without one still has none.
     pub guid: Option<AssetGuid>,
-    /// Where the settings came from: [`MetadataSource::ReadFromFile`], or
-    /// [`MetadataSource::InMemoryOnly`] when the source has no metadata file
-    /// and the type's default settings were used.
+    /// Where the settings came from. It is [`MetadataSource::ReadFromFile`],
+    /// or [`MetadataSource::InMemoryOnly`] when the source has no metadata
+    /// file and the type's default settings were used.
     pub metadata: MetadataSource,
-    /// `true` when the loaded value was replaced in its slot; `false` when the
+    /// `true` when the loaded value was replaced in its slot. `false` when the
     /// path was not loaded and was imported fresh instead.
     pub replaced: bool,
 }
 
-// Written out by hand for the same reason as `ImportOutcome`'s.
+// Written out by hand for the same reason: a derive would need `T: Debug`,
+// and a handle stores no `T`.
 impl<T: Asset> std::fmt::Debug for ReimportOutcome<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -350,8 +374,8 @@ pub enum AssetImportError {
     #[error(transparent)]
     Load(#[from] AssetLoadError),
     /// The path is already loaded, but not under the guid its metadata file
-    /// now holds - the file was edited, or the name was taken by an asset
-    /// added without metadata (`loaded` is then `None`).
+    /// now holds. Either the file was edited, or the name was taken by an
+    /// asset that was added without metadata (`loaded` is then `None`).
     #[error("asset `{path}` is loaded under guid {}, but its metadata says {metadata}", display_guid(.loaded))]
     PathBoundToOtherGuid {
         /// The asset's normalized path.
@@ -362,7 +386,7 @@ pub enum AssetImportError {
         metadata: AssetGuid,
     },
     /// The metadata file's guid already belongs to another live asset of this
-    /// type - usually a source copied together with its `.meta`.
+    /// type. It is usually a source copied together with its `.meta`.
     #[error(
         "asset `{path}` claims guid {guid}, which `{other_path}` already has; \
          was it copied together with its .meta file?"
@@ -386,7 +410,8 @@ fn display_guid(guid: &Option<AssetGuid>) -> String {
 // The metadata file
 // =============================================================================
 
-/// The metadata file as written: the header, then the type's settings.
+/// The metadata file as written, holding the engine's header and then the
+/// type's settings.
 #[derive(Serialize)]
 struct MetadataDocument<'settings, S> {
     format_version: u32,
@@ -431,16 +456,16 @@ pub(crate) struct RawHeader {
     pub guid: AssetGuid,
 }
 
-/// Read the header every asset file shares - a `.meta` sidecar or a standalone
-/// asset - refusing one this engine cannot read.
+/// Reads the header that a `.meta` sidecar and a standalone asset share, and
+/// refuses one this engine cannot read.
 ///
 /// This is the one statement of the on-disk contract: the format version range
 /// and the 32-digit guid rule. The type the caller expected is checked by
 /// [`parse_header`], because the asset index reads the same header without
 /// expecting one particular type.
 ///
-/// The error is the detail sentence alone; [`parse_header`] re-attaches the
-/// path it knows.
+/// The error carries only the detail sentence. [`parse_header`] adds the path
+/// it knows.
 pub(crate) fn read_header(
     bytes: &[u8],
 ) -> Result<(RawHeader, serde_json::Map<String, serde_json::Value>), String> {
@@ -515,7 +540,7 @@ fn same_settings<T: ImportedAsset>(left: &T::ImportSettings, right: &T::ImportSe
     }
 }
 
-/// The bytes of a metadata file for `T` holding `guid` and `settings`.
+/// Returns the bytes of a metadata file for `T` holding `guid` and `settings`.
 fn render_metadata<T: ImportedAsset>(
     path: &Path,
     guid: AssetGuid,
@@ -544,12 +569,12 @@ impl AssetManager {
     /// Load the source asset at `request.path` through its metadata file.
     ///
     /// The asset is named by its normalized path and keyed by the guid in its
-    /// metadata: an existing file's guid and settings win, otherwise the
-    /// request's initial settings and a new random guid are used, and with
+    /// metadata. An existing metadata file's guid and settings win; otherwise
+    /// the request's initial settings and a new random guid are used. With
     /// [`MetadataPolicy::CreateIfMissing`] the file is written beside the
-    /// source - after the source decoded, so a broken source never leaves one
-    /// behind. An existing file is never overwritten, even when it cannot be
-    /// read.
+    /// source, and only after the source decoded, so a broken source never
+    /// leaves one behind. An existing file is never overwritten, even when it
+    /// cannot be read.
     ///
     /// Importing a path that is already loaded returns its existing handle
     /// with [`ImportOutcome::already_loaded`] set, and decodes nothing.
@@ -590,9 +615,9 @@ impl AssetManager {
         };
 
         // Step 3: a path that is already loaded is either this same asset or a
-        // conflict. Without a metadata file there is no guid to disagree with,
-        // so the loaded asset's own guid stands - and when it has none either,
-        // there is nothing to report but the handle.
+        // conflict. Without a metadata file there is no guid to disagree
+        // with, so the loaded asset's own guid stands. When it has none
+        // either, there is nothing to report but the handle.
         if let Some(handle) = self.handle_by_name::<T>(&asset_name) {
             let loaded = self.guid_of(handle);
             return match (&stored, loaded) {
@@ -636,7 +661,8 @@ impl AssetManager {
             }
         };
 
-        // Step 4: the store would silently rebind a guid another asset holds.
+        // Step 4: refuse a guid another asset already holds - the store would
+        // otherwise rebind it without a word.
         if let Some(other) = self.handle_by_guid::<T>(guid) {
             return Err(AssetImportError::DuplicateGuid {
                 guid,
@@ -650,9 +676,10 @@ impl AssetManager {
         let mut asset = T::import(&asset_name, &source_bytes, &settings)?;
         let mut guid = guid;
 
-        // Step 6: record the guid and settings when asked to and possible. A
-        // write failure costs only the persistence of this run's guid, so it is
-        // reported but does not refuse an asset that decoded.
+        // Step 6: record the guid and settings when the policy asks for it and
+        // the source allows it. A failed write only costs the persistence of
+        // this run's guid, so it is reported but does not refuse an asset that
+        // decoded.
         let mut metadata = if has_metadata_file {
             MetadataSource::ReadFromFile
         } else {
@@ -694,12 +721,13 @@ impl AssetManager {
             }
         }
 
-        // Step 7: steps 3 and 4 ruled out both conflicts.
+        // Step 7: steps 3 and 4 ruled out both guid conflicts, so this cannot
+        // fail.
         let handle = self
             .add_named_with_guid(asset_name, guid, asset)
             .expect("the path was checked to be unloaded before decoding");
         // Step 8: the settings are this run's own rather than a file's, so
-        // remember them - a later `ensure_metadata` writes what actually
+        // remember them. A later `ensure_metadata` then writes what actually
         // decoded the asset instead of the type's defaults.
         if metadata == MetadataSource::InMemoryOnly {
             self.set_import_settings(handle, settings_to_json::<T>(&metadata_path, &settings)?);
@@ -722,8 +750,8 @@ impl AssetManager {
     /// slot, after its source or its metadata file changed.
     ///
     /// The handle, name and guid stay what they were, and the slot's content
-    /// version moves, so whatever holds the handle sees the new value and a
-    /// renderer re-uploads only this asset. The settings come from the
+    /// version moves. Whatever holds the handle therefore sees the new value,
+    /// and a renderer re-uploads only this asset. The settings come from the
     /// metadata file, or are the type's defaults when there is none. Nothing
     /// is written. A path that is not loaded is imported instead, with
     /// [`MetadataPolicy::ReadIfPresent`], and `replaced` is `false`.
@@ -738,6 +766,8 @@ impl AssetManager {
         &mut self,
         path: &Path,
     ) -> Result<ReimportOutcome<T>, AssetImportError> {
+        // Step 1: name the path. A path nothing has loaded is imported, not
+        // reimported.
         let asset_name = pack_key(path).ok_or_else(|| AssetLoadError::PathNotFound {
             path: path.to_owned(),
         })?;
@@ -751,15 +781,15 @@ impl AssetManager {
                 replaced: false,
             });
         };
+
+        // Step 2: the metadata file decides the settings. A guid it changed
+        // under a loaded asset is refused rather than followed, because
+        // handles and references elsewhere still name the old one.
         let metadata_path =
             metadata_path_for(Path::new(&asset_name)).ok_or_else(|| AssetLoadError::Metadata {
                 path: path.to_owned(),
                 detail: "a .meta file describes an asset; it is not one".to_owned(),
             })?;
-
-        // The metadata file decides the settings; a guid it changed under a
-        // loaded asset is refused rather than followed, because handles and
-        // references elsewhere still name the old one.
         let loaded = self.guid_of(handle);
         let (settings, metadata) = match asset_store::read(&metadata_path) {
             Ok(bytes) => {
@@ -779,15 +809,16 @@ impl AssetManager {
             Err(error) => return Err(error.into()),
         };
 
-        // Decode fully before touching the slot, so a failure leaves it as is.
+        // Step 3: decode fully before touching the slot, so a failure leaves
+        // it as it is.
         let source_bytes = asset_store::read(Path::new(&asset_name))?;
         let asset = T::import(&asset_name, &source_bytes, &settings)?;
         *self
             .get_mut(handle)
             .expect("the handle was looked up by name just above") = asset;
-        // Without a metadata file the type's defaults decoded it, so that is
-        // what a sidecar created now has to say; an earlier record would name
-        // settings the loaded value no longer has.
+        // Step 4: without a metadata file the type's defaults decoded this
+        // asset, so that is what a sidecar created now has to say. An earlier
+        // record would name settings the loaded value no longer has.
         if metadata == MetadataSource::InMemoryOnly {
             self.set_import_settings(handle, settings_to_json::<T>(&metadata_path, &settings)?);
         }
@@ -806,15 +837,18 @@ impl AssetManager {
 
 impl AssetManager {
     /// Write the metadata file of the source at `path` when it has none, and
-    /// return the guid written; `None` when the file already exists, when the
-    /// source is not on a writable filesystem (a packed asset), or when
-    /// another writer's file carries a different guid.
+    /// return the guid written.
     ///
-    /// Nothing is decoded: a source nothing has loaded gets `T`'s default
-    /// settings, one already loaded under `path`'s name the settings it was
-    /// decoded with, so a `.meta` deleted while it ran comes back describing
-    /// the same value. A loaded asset keeps its own guid and anything else
-    /// gets a new random one. An existing file is never touched.
+    /// Returns `None` when the file already exists, when the source is not on
+    /// a writable filesystem (a packed asset), or when another writer's file
+    /// carries a different guid.
+    ///
+    /// Nothing is decoded. A source nothing has loaded gets `T`'s default
+    /// settings, while one already loaded under `path`'s name gets the
+    /// settings it was decoded with. This way a `.meta` deleted while the
+    /// program ran comes back describing the same value. A loaded asset keeps
+    /// its own guid, and anything else gets a new random one. An existing file
+    /// is never touched.
     ///
     /// # Errors
     ///
@@ -833,11 +867,14 @@ impl AssetManager {
                 path: path.to_owned(),
                 detail: "a .meta file describes an asset; it is not one".to_owned(),
             })?;
+        // Step 1: an existing metadata file is never touched.
         match asset_store::read(&metadata_path) {
             Ok(_) => return Ok(None),
             Err(AssetLoadError::PathNotFound { .. }) => {}
             Err(error) => return Err(error.into()),
         }
+        // Step 2: a loaded asset keeps its own guid; anything else gets a new
+        // random one.
         let loaded_handle = self.handle_by_name::<T>(&asset_name);
         let guid = match loaded_handle.and_then(|handle| self.guid_of(handle)) {
             Some(guid) => guid,
@@ -846,12 +883,11 @@ impl AssetManager {
                 detail: format!("no random source for a new guid: {error}"),
             })?,
         };
-        // An asset this run already decoded knows the settings it was decoded
-        // with; a source nothing has loaded gets the type's defaults. Writing
-        // defaults over a loaded asset's own settings would change how the
-        // asset decodes on the next run - a normal map read as sRGB.
-        let recorded_settings =
-            loaded_handle.and_then(|handle| self.import_settings::<T>(handle));
+        // Step 3: an asset this run already decoded knows the settings it was
+        // decoded with; a source nothing has loaded gets the type's defaults.
+        // Writing defaults over a loaded asset's own settings would change how
+        // the asset decodes on the next run - a normal map read as sRGB.
+        let recorded_settings = loaded_handle.and_then(|handle| self.import_settings::<T>(handle));
         let settings = match recorded_settings {
             Some(settings) => serde_json::from_value(settings.clone()).map_err(|error| {
                 AssetLoadError::Metadata {
@@ -861,10 +897,12 @@ impl AssetManager {
             })?,
             None => T::ImportSettings::default(),
         };
+        // Step 4: write the file, then read it back to learn which guid it
+        // ended up with.
         let document = render_metadata::<T>(&metadata_path, guid, &settings)?;
         match asset_store::write_beside(Path::new(&asset_name), &metadata_path, &document)? {
-            // Another writer may have created the file meanwhile; its guid is
-            // the file's truth, and it was not written here.
+            // Another writer may have created the file in the meantime. Its guid
+            // is the file's truth, and it was not written here.
             Some(written_path) => {
                 pill_core::debug!(
                     "metadata for `{asset_name}` written with {}",
@@ -873,10 +911,11 @@ impl AssetManager {
                         None => "the type's defaults",
                     }
                 );
-                let bytes = std::fs::read(&written_path).map_err(|source| AssetLoadError::Read {
-                    path: written_path.clone(),
-                    source,
-                })?;
+                let bytes =
+                    std::fs::read(&written_path).map_err(|source| AssetLoadError::Read {
+                        path: written_path.clone(),
+                        source,
+                    })?;
                 let on_disk = parse_metadata::<T>(&metadata_path, &bytes)?;
                 Ok((on_disk.guid == guid).then_some(guid))
             }
@@ -894,15 +933,15 @@ impl AssetManager {
     /// together with its metadata file, rename that asset to `path` and
     /// return its old name.
     ///
-    /// A move is recognized by the guid: `path`'s metadata file holds the guid
-    /// of a loaded asset that has another name, and that asset's source is no
-    /// longer where its name says. The asset keeps its handle, guid and value -
-    /// nothing is decoded - so whatever holds it is unaffected.
+    /// A move is recognized by the guid. The metadata file at `path` holds the
+    /// guid of a loaded asset that has another name, and that asset's source
+    /// file is gone from its old path. The asset keeps its handle, guid and
+    /// value, and nothing is decoded, so whatever holds it is unaffected.
     ///
-    /// Returns `Ok(None)` - and changes nothing - when `path` is already
-    /// loaded, has no metadata file, holds a guid no loaded asset has, or when
-    /// the other asset's source still exists: that is a copy, which importing
-    /// reports as [`AssetImportError::DuplicateGuid`].
+    /// Returns `Ok(None)` and changes nothing when `path` is already loaded,
+    /// has no metadata file, holds a guid no loaded asset has, or when the
+    /// other asset's source still exists. That last case is a copy, which
+    /// importing reports as [`AssetImportError::DuplicateGuid`].
     ///
     /// # Errors
     ///
@@ -912,6 +951,8 @@ impl AssetManager {
         &mut self,
         path: &Path,
     ) -> Result<Option<String>, AssetImportError> {
+        // Step 1: a path that is already loaded, or has no metadata file, is
+        // not a move.
         let asset_name = pack_key(path).ok_or_else(|| AssetLoadError::PathNotFound {
             path: path.to_owned(),
         })?;
@@ -921,6 +962,8 @@ impl AssetManager {
         let Some(metadata_path) = metadata_path_for(Path::new(&asset_name)) else {
             return Ok(None);
         };
+        // Step 2: read the guid from the metadata file and let
+        // `follow_move_of` decide.
         let stored = match asset_store::read(&metadata_path) {
             Ok(bytes) => parse_metadata::<T>(&metadata_path, &bytes)?,
             Err(AssetLoadError::PathNotFound { .. }) => return Ok(None),
@@ -931,11 +974,11 @@ impl AssetManager {
 
     /// Follow a move once the path's identity is known.
     ///
-    /// The two lanes read the guid differently - a `.meta` sidecar, or the
-    /// file's own header - and agree on everything after that: the asset must
-    /// already be loaded under another name, the old source must be gone, and
-    /// the loaded asset takes the new name. Keeping the decision here means a
-    /// new precondition is added once.
+    /// A sourced asset reads its guid from a `.meta` sidecar and a standalone
+    /// asset reads it from its own header; both agree on everything after
+    /// that. The asset must already be loaded under another name, the old
+    /// source must be gone, and the loaded asset takes the new name. Keeping
+    /// the decision here means a new precondition is added in one place.
     ///
     /// `identity_path` is what the error names when the rename fails: the
     /// sidecar for a sourced asset, the source itself for a standalone one.
@@ -971,11 +1014,11 @@ impl AssetManager {
 // Settings as JSON
 // =============================================================================
 
-/// The import settings `T` would use for the source at `path`, as JSON: the
-/// metadata file's, or the type's defaults when there is none.
+/// Returns the import settings `T` would use for the source at `path`, as
+/// JSON: the metadata file's, or the type's defaults when there is none.
 ///
 /// For code that edits settings without knowing `T` (an editor's inspector),
-/// through the import registry.
+/// reached through the import registry.
 ///
 /// # Errors
 ///
@@ -993,8 +1036,8 @@ pub fn settings_json_for<T: ImportedAsset>(path: &Path) -> AssetLoadResult<serde
     settings_to_json::<T>(path, &settings)
 }
 
-/// `settings_document` read as `T`'s import settings and written back, which
-/// fills every missing field with its default and drops unknown ones.
+/// Reads `settings_document` as `T`'s import settings and writes it back,
+/// which fills every missing field with its default and drops unknown ones.
 ///
 /// # Errors
 ///
@@ -1012,12 +1055,13 @@ pub fn normalize_settings_json<T: ImportedAsset>(
     settings_to_json::<T>(type_name_path, &settings)
 }
 
-/// `settings` as a JSON value, with `path` naming the failure.
+/// Returns `settings` as a JSON value, with `path` naming the failure.
 ///
 /// The one serializer behind every entry point that reports a type's settings:
-/// [`settings_json_for`] reads them from the metadata file or the defaults, and
-/// [`normalize_settings_json`] round-trips a read-modify-write. Fields the type
-/// does not declare are dropped by the round-trip, not by this serializer.
+/// [`settings_json_for`] reads them from the metadata file or the defaults,
+/// and [`normalize_settings_json`] round-trips a read-modify-write. Fields the
+/// type does not declare are dropped by that round-trip, not by this
+/// serializer.
 fn settings_to_json<T: ImportedAsset>(
     path: &Path,
     settings: &T::ImportSettings,
@@ -1027,6 +1071,10 @@ fn settings_to_json<T: ImportedAsset>(
         detail: format!("the settings cannot be written as JSON: {error}"),
     })
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1221,6 +1269,30 @@ mod tests {
 
     const GUID_A: &str = "0000000000000000000000000000000a";
     const GUID_B: &str = "0000000000000000000000000000000b";
+
+    /// An asset pack holding `files`, in the layout `AssetPack::parse` reads:
+    /// a magic, a version, a file count, one index entry per file, then the
+    /// bytes of every file in turn.
+    fn pack_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use crate::asset_store::{ASSET_PACK_MAGIC, ASSET_PACK_VERSION};
+        let index_length: usize = files.iter().map(|(path, _)| 4 + path.len() + 16).sum();
+        let mut offset = (8 + 4 + 4 + index_length) as u64;
+        let mut pack = Vec::new();
+        pack.extend_from_slice(ASSET_PACK_MAGIC);
+        pack.extend_from_slice(&ASSET_PACK_VERSION.to_le_bytes());
+        pack.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for (path, bytes) in files {
+            pack.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            pack.extend_from_slice(path.as_bytes());
+            pack.extend_from_slice(&offset.to_le_bytes());
+            pack.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            offset += bytes.len() as u64;
+        }
+        for (_, bytes) in files {
+            pack.extend_from_slice(bytes);
+        }
+        pack
+    }
 
     // -------------------------------------------------------------------------
     // Import
@@ -1426,8 +1498,8 @@ mod tests {
         assert_eq!(assets.handle_by_guid::<Note>(guid), Some(outcome.handle));
     }
 
-    /// What a project reload does: re-run its loading code against a store
-    /// that already holds the assets.
+    /// A project reload runs its loading code again against a store that
+    /// already holds the assets.
     #[test]
     fn importing_a_loaded_path_returns_its_handle_without_decoding() {
         let res = ScratchRes::new("reimport");
@@ -1453,8 +1525,8 @@ mod tests {
         assert_eq!(assets.len::<Note>(), 1);
     }
 
-    /// The same, for a source with no metadata file: the loaded asset's guid
-    /// stands instead of a new random one being drawn and disagreeing.
+    /// The same, for a source with no metadata file. The loaded asset's guid
+    /// stands, instead of a new random one being drawn and disagreeing.
     #[test]
     fn importing_a_loaded_path_without_metadata_returns_its_handle() {
         let res = ScratchRes::new("reimport-no-metadata");
@@ -1473,8 +1545,8 @@ mod tests {
     }
 
     /// An asset a project registered by name alone carries no guid, so
-    /// re-importing its path has nothing to disagree with: the import is the
-    /// same asset, not a guid conflict.
+    /// re-importing its path has nothing to disagree with. The import returns
+    /// the same asset rather than a guid conflict.
     #[test]
     fn importing_a_named_asset_that_has_no_guid_is_not_a_conflict() {
         let res = ScratchRes::new("reimport-named-no-guid");
@@ -1585,9 +1657,9 @@ mod tests {
         ));
     }
 
-    /// Writers racing to create one metadata file - two hosts, parallel tests -
-    /// all end up holding the guid of the file that won, never a private one
-    /// that the next import would then report as a conflict.
+    /// Writers racing to create one metadata file (two hosts, parallel tests)
+    /// all end up holding the guid of the file that won. None of them keeps a
+    /// private guid that the next import would report as a conflict.
     #[test]
     fn racing_first_imports_agree_on_the_written_guid() {
         let res = ScratchRes::new("race");
@@ -1734,7 +1806,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// A source without metadata gets a file with default settings and a new
-    /// guid, without being decoded; an existing file is left alone.
+    /// guid, without being decoded. An existing file is left alone.
     #[test]
     fn ensure_metadata_writes_a_missing_file_without_decoding() {
         let res = ScratchRes::new("ensure");
@@ -1780,9 +1852,9 @@ mod tests {
         assert!(assets.reimport::<Note>(Path::new("a.note")).is_ok());
     }
 
-    /// The settings a loaded asset was decoded with, not the type's defaults,
-    /// are what its missing metadata file is created with: the file must not
-    /// change how the asset decodes on the next run.
+    /// A missing metadata file is created with the settings the asset was
+    /// decoded with, not the type's defaults. The file must not change how the
+    /// asset decodes on the next run.
     #[test]
     fn ensure_metadata_writes_the_settings_the_asset_was_loaded_with() {
         let res = ScratchRes::new("ensure-loaded-settings");
@@ -1848,7 +1920,11 @@ mod tests {
             assets.handle_by_guid::<Note>(first.guid.expect("an imported source has a guid")),
             Some(first.handle)
         );
-        assert_eq!(decode_count(), decode_count_before, "a move decodes nothing");
+        assert_eq!(
+            decode_count(),
+            decode_count_before,
+            "a move decodes nothing"
+        );
     }
 
     /// A copy - the old source is still there - is not a move.
@@ -1870,7 +1946,8 @@ mod tests {
         assert!(assets.handle_by_name::<Note>("a.note").is_some());
     }
 
-    /// A loaded path, a path without metadata, or an unknown guid is no move.
+    /// A path that is already loaded, one without metadata, and an unknown guid
+    /// all report no move.
     #[test]
     fn unrelated_paths_are_not_moves() {
         let res = ScratchRes::new("follow-none");
@@ -1896,11 +1973,11 @@ mod tests {
     // Settings as JSON
     // -------------------------------------------------------------------------
 
-    /// The index and the importer read one header contract.
+    /// The index and the importer share one header contract.
     ///
-    /// A format the engine cannot read is refused by both, which is what
-    /// sharing the reader buys: a version bump is one edit, and the two cannot
-    /// end up disagreeing about whether a file is an asset.
+    /// Both refuse a format the engine cannot read. Because they share the
+    /// reader, changing the format version is one edit, and the two cannot
+    /// disagree about whether a file is an asset.
     #[test]
     fn a_newer_format_is_refused_by_the_reader_and_the_parser() {
         let bytes = format!(
@@ -1946,26 +2023,5 @@ mod tests {
 
         let misfit = normalize_settings_json::<Note>(serde_json::json!({"volume": "loud"}));
         assert!(matches!(misfit, Err(AssetLoadError::Metadata { .. })));
-    }
-
-    fn pack_of(files: &[(&str, &[u8])]) -> Vec<u8> {
-        use crate::asset_store::{ASSET_PACK_MAGIC, ASSET_PACK_VERSION};
-        let index_length: usize = files.iter().map(|(path, _)| 4 + path.len() + 16).sum();
-        let mut offset = (8 + 4 + 4 + index_length) as u64;
-        let mut pack = Vec::new();
-        pack.extend_from_slice(ASSET_PACK_MAGIC);
-        pack.extend_from_slice(&ASSET_PACK_VERSION.to_le_bytes());
-        pack.extend_from_slice(&(files.len() as u32).to_le_bytes());
-        for (path, bytes) in files {
-            pack.extend_from_slice(&(path.len() as u32).to_le_bytes());
-            pack.extend_from_slice(path.as_bytes());
-            pack.extend_from_slice(&offset.to_le_bytes());
-            pack.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            offset += bytes.len() as u64;
-        }
-        for (_, bytes) in files {
-            pack.extend_from_slice(bytes);
-        }
-        pack
     }
 }

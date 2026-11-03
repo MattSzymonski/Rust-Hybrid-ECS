@@ -5,8 +5,14 @@
 //! - Defines [`HotSlot`], the stable indirection a registered system dispatches
 //!   through, so its implementation can be replaced without re-registering it.
 //! - Defines [`HotPatchRegistry`], the engine-owned map from system name to slot.
-//! - Computes [`signature_hash`], the signature identity the install gate
-//!   compares, so a patch whose ABI moved is refused.
+//! - Defines [`PlainSlot`], the dispatch slot that lets `#[pill_hot_fn]` patch an
+//!   ordinary function.
+//! - Computes [`signature_hash`], the identity of a system's signature, which
+//!   [`HotSlot::install`] compares before it accepts a patch.
+//! - Counts a patched system's panics and queues a [`FaultReport`] for the host,
+//!   which rolls the system back to its earlier code.
+//! - Rewrites a function's first bytes on Windows x86-64 ([`patch_prologue`] and
+//!   [`restore_prologue`]), and refuses to do so on every other target.
 //! - Provides [`verify_abi`], the self-check for the one platform assumption
 //!   the design rests on.
 //!
@@ -23,7 +29,7 @@
 //! monomorphized closure in [`crate::system`], where `F` and `Input` are both
 //! known.
 //!
-//! ## The ZST stand-in
+//! ## The zero-sized stand-in
 //!
 //! A slot holds the address of a `fn(&mut F, Input) -> F::Output`, where `F` is
 //! the zero-sized fn-item type of the user's system. A separately compiled patch
@@ -62,41 +68,43 @@ use crate::system::{SystemParam, SystemParamFunction};
 /// Consecutive panicking invocations after which a patched function's host
 /// rolls it back.
 ///
-/// A system runs once per frame, so three consecutive invocations are three
-/// consecutive frames. Counting invocations rather than frames keeps the
-/// decision where the panic is observable at all: this layer has no frame
-/// identity, and the dispatcher is the only place that knows which function
-/// failed.
+/// A system runs once per frame, so three panicking invocations in a row are
+/// three panicking frames. This code counts invocations because it has no
+/// frame counter of its own, and the dispatcher is the only place that knows
+/// which function failed.
 pub const PANIC_ROLLBACK_FRAMES: u32 = 3;
 
-/// One function whose patched body kept panicking, queued for its host.
+/// One function whose patched body panicked repeatedly, waiting for its host
+/// to roll it back.
 #[derive(Clone, Debug)]
 pub struct FaultReport {
-    /// The function's qualified path: the identity a rollback resolves.
+    /// The function's fully qualified path, which a rollback uses to find the
+    /// function.
     pub function: String,
     /// The panic message, quoted in the host's rollback log line.
     pub message: String,
 }
 
-/// Consecutive panics per function, with the last message seen.
+/// Consecutive panic count per function, with the last message seen.
 ///
-/// Touched only on a panicking call or while some function is mid-streak, so
-/// the steady state pays nothing but one relaxed load (see [`record_success`]).
+/// This map is only locked while some function has panicked at least once, so a
+/// process where nothing panics pays nothing for it but one relaxed load (see
+/// [`record_success`]).
 static PANIC_STREAKS: Mutex<Option<HashMap<String, (u32, String)>>> = Mutex::new(None);
 
-/// How many functions currently hold a non-zero streak.
+/// How many functions currently have a panic count above zero.
 static FLAKY_FUNCTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Reports waiting for the host's next frame boundary.
 static FAULT_REPORTS: Mutex<Vec<FaultReport>> = Mutex::new(Vec::new());
 
-/// Count one panicking invocation of `function`.
+/// Counts one panicking invocation of `function`.
 ///
-/// A function reports a [`FaultReport`] exactly once per streak: when the
-/// streak reaches [`PANIC_ROLLBACK_FRAMES`]. Counting stops there, so a host
-/// that could not roll the function back is told once rather than every
-/// frame, and only a later successful invocation (a rollback, or a new patch)
-/// starts a fresh streak.
+/// On the [`PANIC_ROLLBACK_FRAMES`]-th panic in a row, the function is queued
+/// once in a [`FaultReport`]. Reporting stops at that number, so a host that
+/// could not roll the function back is told once instead of every frame. Only
+/// a call that does not panic (a rollback, or a fresh patch) clears the count
+/// and lets a new report happen.
 pub fn record_panic(function: &str, message: &str) {
     let mut panic_streaks_guard = PANIC_STREAKS
         .lock()
@@ -123,10 +131,10 @@ pub fn record_panic(function: &str, message: &str) {
     }
 }
 
-/// Clear a function's streak after an invocation that did not panic.
+/// Clears a function's panic count after an invocation that did not panic.
 ///
-/// The check is one relaxed load: a process where nothing has panicked - the
-/// ordinary one - never touches the map.
+/// A process where nothing has panicked - the ordinary one - never locks the
+/// map: one relaxed load of the count above is all this costs.
 #[inline]
 pub fn record_success(function: &str) {
     if FLAKY_FUNCTION_COUNT.load(Ordering::Relaxed) == 0 {
@@ -143,12 +151,13 @@ pub fn record_success(function: &str) {
     }
 }
 
-/// Turn a caught panic payload into the system failure the engine records.
+/// Turns a caught panic payload into the system failure the engine records.
 ///
-/// The payload came from another artifact's copy of `std`, so only the two
-/// shapes `panic!` produces are read; anything else is reported by kind rather
-/// than dropped. Recording the panic here keeps attribution in one place: the
-/// dispatcher knows the function's name, the host only reads the reports.
+/// The payload comes from another artifact's copy of `std`, so only the two
+/// shapes `panic!` produces are read: `&'static str` and `String`. Any other
+/// payload still counts as a panic and is recorded as `non-string panic
+/// payload`. Recording it here keeps attribution in one place: the dispatcher
+/// knows the function's name, and the host only reads the reports.
 pub fn panic_into_failure(name: &str, payload: Box<dyn Any + Send>) -> crate::error::SystemError {
     let message = payload
         .downcast_ref::<&'static str>()
@@ -161,7 +170,7 @@ pub fn panic_into_failure(name: &str, payload: Box<dyn Any + Send>) -> crate::er
     }
 }
 
-/// Take the fault reports queued since the last call, oldest first.
+/// Takes the fault reports queued since the last call, oldest first.
 ///
 /// The host calls this at a frame boundary and rolls each function back to its
 /// previous generation.
@@ -233,24 +242,24 @@ impl std::error::Error for HotPatchError {}
 // HotSlot
 // =============================================================================
 
-/// The stable indirection one registered system dispatches through.
+/// The stable indirection through which one registered system dispatches.
 ///
-/// Created when the system is registered and owned jointly by the system's
-/// closure and the engine's [`HotPatchRegistry`], so a patch installed through
-/// the registry is observed by the closure on its next invocation.
+/// The slot is created when the system is registered and shared by the
+/// system's closure and the engine's [`HotPatchRegistry`]. A patch installed
+/// through the registry is therefore seen by the closure on its next call.
 #[derive(Debug)]
 pub struct HotSlot {
-    /// Address of the currently active
-    /// `fn(&mut F, Input) -> F::Output` monomorphization.
+    /// Address of the function this slot currently calls, a
+    /// `fn(&mut F, Input) -> F::Output`.
     current: AtomicUsize,
     /// Signature identity of the system this slot was created for.
     signature_hash: AtomicU64,
-    /// The implementation recorded at registration, kept so a patch can be
-    /// rolled back to the code the running artifact was actually built with.
+    /// The implementation recorded at registration, kept so a rollback can
+    /// return to the code the registering artifact was built with.
     ///
-    /// Separate from `current` because `current` is overwritten by every
-    /// install, and without this the original address would be unrecoverable
-    /// after the first patch.
+    /// This is a separate field because `current` is overwritten by every
+    /// install; without it, the first patch would make the original address
+    /// unreachable.
     original: AtomicUsize,
 }
 
@@ -264,15 +273,16 @@ impl HotSlot {
         }
     }
 
-    /// Record the baseline implementation and the signature to gate against.
+    /// Records the baseline implementation and the signature to compare
+    /// against.
     ///
     /// Called once, from the boxing code in [`crate::system`], where the
     /// concrete `F` and `Input` are known.
     pub fn initialize(&self, address: usize, signature_hash: u64) {
         self.current.store(address, Ordering::Release);
         self.signature_hash.store(signature_hash, Ordering::Release);
-        // Unconditionally, not only when unset: a reload builds a fresh slot
-        // for the new artifact, and its baseline is that artifact's code.
+        // Stored unconditionally, not only when empty: a reload builds a fresh
+        // slot for the new artifact, and its baseline is that artifact's code.
         self.original.store(address, Ordering::Release);
     }
 
@@ -287,11 +297,11 @@ impl HotSlot {
 
     /// The implementation to call now.
     ///
-    /// `Acquire` pairs with the `Release` in [`Self::install`] so a freshly
-    /// loaded patch library's code is visible to whichever thread runs the
-    /// system next. x86-64 is total-store-ordered and would tolerate a relaxed
-    /// load, but the ordering is what carries the guarantee to any target the
-    /// engine grows rather than making it a property of this one.
+    /// `Acquire` pairs with the `Release` in [`Self::install`], so whichever
+    /// thread runs the system next sees the code of a freshly loaded patch
+    /// library. On x86-64 a relaxed load would be enough, but the ordering
+    /// keeps the guarantee on any target the engine grows to, instead of tying
+    /// it to this one.
     #[inline]
     pub fn current(&self) -> usize {
         self.current.load(Ordering::Acquire)
@@ -302,7 +312,8 @@ impl HotSlot {
         self.signature_hash.load(Ordering::Acquire)
     }
 
-    /// Replace the implementation, refusing anything whose signature moved.
+    /// Replaces the implementation, refusing a replacement whose signature
+    /// differs.
     ///
     /// # Errors
     ///
@@ -362,7 +373,7 @@ impl HotPatchRegistry {
         }
     }
 
-    /// Record a system's slot under its registration name.
+    /// Records a system's slot under its registration name.
     ///
     /// A repeated name replaces the previous entry, matching the engine's
     /// behaviour of allowing duplicate system names.
@@ -370,7 +381,7 @@ impl HotPatchRegistry {
         self.slots.insert(name.into(), slot);
     }
 
-    /// Forget one system's slot, so a cleared system can never be patched.
+    /// Forgets one system's slot, so a cleared system can never be patched.
     ///
     /// Every entry referring to the same slot is dropped, not just the one
     /// matching `name`. A system is registered under both its display name and
@@ -380,7 +391,8 @@ impl HotPatchRegistry {
         let Some(target_slot) = self.slots.get(name).cloned() else {
             return;
         };
-        self.slots.retain(|_, slot| !Arc::ptr_eq(slot, &target_slot));
+        self.slots
+            .retain(|_, slot| !Arc::ptr_eq(slot, &target_slot));
     }
 
     /// The slot registered for `name`, if any.
@@ -388,7 +400,8 @@ impl HotPatchRegistry {
         self.slots.get(name)
     }
 
-    /// Names of every hot-patchable system, for diagnostics and tooling.
+    /// Every name a hot-patchable system is registered under, for diagnostics
+    /// and tooling.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.slots.keys().map(|name| name.as_str())
     }
@@ -410,13 +423,15 @@ impl HotPatchRegistry {
 
 /// Stable identity of a system's call signature.
 ///
-/// Derived from the parameter tuple and return type names, which is exactly
-/// what changes when a signature changes. Computed once per registration, so
-/// its cost never reaches the frame loop.
+/// The value is hashed from the parameter tuple's type name and the return
+/// type's type name, the two things that change when a signature changes. It
+/// is computed once per registration, so its cost never reaches the frame
+/// loop.
 ///
-/// Type names rather than [`TypeId`](std::any::TypeId) because a patch is a
-/// separately compiled artifact: it must be able to compute the same value from
-/// the same source text, and `type_name` is what both sides can agree on.
+/// Type names are used rather than [`TypeId`](std::any::TypeId) because a patch
+/// is a separately compiled artifact: it must be able to compute the same
+/// value from the same source text, and `type_name` is what both sides can
+/// agree on.
 pub fn signature_hash<F, Input>() -> u64
 where
     F: SystemParamFunction<Input>,
@@ -431,9 +446,9 @@ where
 
 /// Signature identity of a system, inferred from the function itself.
 ///
-/// The turbofish form of [`signature_hash`] cannot infer a function-item type
-/// from nothing, so this takes the function by reference instead. Convenient
-/// wherever the function is in scope as a value.
+/// [`signature_hash`] called with a turbofish cannot infer the function-item
+/// type, so this version takes the function by reference instead. It is the
+/// convenient form wherever the function is in scope as a value.
 pub fn signature_hash_of<F, Input>(_function: &F) -> u64
 where
     F: SystemParamFunction<Input>,
@@ -442,31 +457,31 @@ where
     signature_hash::<F, Input>()
 }
 
-/// The fully-qualified path of a system function, as `#[pill_hot]` names it.
+/// The fully qualified path of a system function, as `#[pill_hot]` names it.
 ///
-/// A function-item type's name is its path - `project::physics_system` - which
-/// is exactly what `module_path!() + "::" + fn name` produces in the attribute.
-/// That agreement is what lets the host patch by the function's real path even
-/// though [`Engine::register_system`](crate::Engine::register_system) also
-/// records a separate, arbitrary display name (`"ball_physics"`).
+/// A function-item type's name is its path, such as `project::physics_system`.
+/// That is the same text the attribute builds from `module_path!() + "::" + fn
+/// name`, which lets the host patch a system by its real path even though
+/// [`Engine::register_system`](crate::Engine::register_system) also records a
+/// separate, arbitrary display name (`"ball_physics"`).
 ///
 /// Returns `None` for anything that is not a plain function item - a closure,
 /// for instance, whose `type_name` is a compiler-generated placeholder with no
 /// stable path a patch could name.
 pub fn function_path<F>() -> Option<String> {
     let type_name = std::any::type_name::<F>();
-    // Closures render as `crate::outer::{{closure}}`, and generic instantiations
-    // carry angle brackets; neither is a name a patch can be keyed by.
+    // Closures render as `crate::outer::{{closure}}` and generic instantiations
+    // carry angle brackets. Neither is a name a patch can be keyed by.
     if type_name.contains('{') || type_name.contains('<') || !type_name.contains("::") {
         return None;
     }
     Some(type_name.to_string())
 }
 
-/// Address of the dispatch entry point for a locally compiled system function.
+/// Address of the entry point for a locally compiled system function.
 ///
-/// This is the value [`HotSlot::install`] expects. A real patch resolves the
-/// equivalent address from a freshly compiled library's exports instead; this
+/// This is the address [`HotSlot::install`] expects. A real patch resolves the
+/// same kind of address from a freshly compiled library's exports instead; this
 /// helper covers the in-process case, which is what tests and any statically
 /// linked replacement need.
 pub fn local_implementation_address<F, Input>(_function: &F) -> usize
@@ -483,11 +498,11 @@ where
 
 /// A dispatch slot for an ordinary function marked `#[pill_hot_fn]`.
 ///
-/// Systems get their indirection for free: the engine holds their boxed closure
-/// and can swap what it calls. An ordinary `pub fn` has no such holder - callers
-/// call it directly - so the indirection has to live inside the function itself.
-/// `#[pill_hot_fn]` renames the real body and turns the public name into a
-/// dispatcher that reads this slot.
+/// A system does not need one: the engine holds its boxed closure and can swap
+/// what the closure calls. An ordinary `pub fn` has no such holder, since
+/// callers call it directly, so the indirection has to live inside the
+/// function itself. `#[pill_hot_fn]` renames the real body and turns the public
+/// name into a dispatcher that reads this slot.
 ///
 /// Unlike [`HotSlot`], this is a `static` inside whichever artifact compiled the
 /// function, not a registry entry on the engine. That is deliberate: a crate
@@ -520,7 +535,7 @@ impl PlainSlot {
         }
     }
 
-    /// Install a replacement implementation.
+    /// Installs a replacement implementation.
     pub fn install(&self, address: usize) {
         self.current.store(address, Ordering::Release);
     }
@@ -535,7 +550,7 @@ impl PlainSlot {
         self.current.load(Ordering::Acquire)
     }
 
-    /// Empty the slot, so calls fall back to the body compiled into this
+    /// Empties the slot, so calls fall back to the body compiled into this
     /// artifact.
     ///
     /// A plain function has no single baseline address the host could reinstall:
@@ -561,20 +576,33 @@ impl Default for PlainSlot {
 // Prologue patching (Windows x86-64 only)
 // =============================================================================
 
+/// Bytes an absolute jump occupies: `mov rax, imm64` followed by `jmp rax`.
+///
+/// The absolute form is used instead of a 5-byte `E9 rel32` because ASLR
+/// usually loads a patch image several gigabytes away from the base image, so
+/// the relative form would need a trampoline for almost every patch. The price
+/// is that twelve bytes of the function must be overwritten instead of five.
+#[cfg(all(windows, target_arch = "x86_64"))]
+const ABSOLUTE_JUMP_LENGTH: usize = 12;
+
+/// Read/write/execute page protection.
+#[cfg(all(windows, target_arch = "x86_64"))]
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
 /// The thread allowed to rewrite live code, declared by the host each frame.
 ///
 /// Patching assumes no thread is executing inside the bytes being overwritten.
-/// The host upholds that by patching at a frame boundary with no system
-/// running - but that is a convention, and a convention that is only ever
-/// stated in a comment is one that quietly stops being true. Recording the
-/// thread turns it into something checkable: a second thread attempting a patch
-/// is refused rather than racing the first.
+/// The host meets that by patching at a frame boundary with no system running,
+/// but nothing enforces the rule if it is only written down. Recording the
+/// thread makes it checkable: a second thread that attempts a patch is refused
+/// instead of racing the first.
 static PATCHING_THREAD_TOKEN: AtomicU64 = AtomicU64::new(0);
 
-/// A stable-ish numeric identity for the current thread.
+/// A numeric identity for the current thread.
 ///
 /// `ThreadId` has no stable integer form on stable Rust, so the address of a
-/// thread-local is used instead: distinct per thread, constant within one.
+/// thread-local is used instead. It is different for each thread and stays the
+/// same within one.
 fn current_thread_token() -> u64 {
     thread_local! {
         static MARKER: u8 = const { 0 };
@@ -582,7 +610,7 @@ fn current_thread_token() -> u64 {
     MARKER.with(|marker| marker as *const u8 as u64)
 }
 
-/// Declare the calling thread the only one permitted to rewrite live code.
+/// Declares the calling thread the only one permitted to rewrite live code.
 ///
 /// A host calls this from its frame loop. Idempotent, and cheap enough to call
 /// every frame: one relaxed load in the common case.
@@ -596,7 +624,7 @@ pub fn declare_patching_thread() {
     }
 }
 
-/// Refuse a patch attempted from anywhere but the declared thread.
+/// Refuses a patch attempted from anywhere but the declared thread.
 ///
 /// # Errors
 ///
@@ -615,20 +643,6 @@ fn check_patching_thread() -> Result<(), String> {
     )
 }
 
-/// Bytes an absolute jump occupies: `mov rax, imm64` then `jmp rax`.
-///
-/// The absolute form is used rather than a 5-byte `E9 rel32` because ASLR
-/// routinely places a freshly loaded patch image several gigabytes from the
-/// base image, so the relative form would need a trampoline on essentially
-/// every patch. Twelve bytes is more of the function to overwrite, which is
-/// the trade.
-#[cfg(all(windows, target_arch = "x86_64"))]
-const ABSOLUTE_JUMP_LENGTH: usize = 12;
-
-/// Read/write/execute page protection.
-#[cfg(all(windows, target_arch = "x86_64"))]
-const PAGE_EXECUTE_READWRITE: u32 = 0x40;
-
 /// One entry in the x86-64 exception directory: a function's exact extent.
 ///
 /// Windows requires every function that touches the stack to publish one of
@@ -645,6 +659,7 @@ struct RuntimeFunction {
     _unwind_data: u32,
 }
 
+// The Win32 calls that make a page writable and find a function's extent.
 #[cfg(all(windows, target_arch = "x86_64"))]
 extern "system" {
     fn VirtualProtect(
@@ -666,14 +681,14 @@ extern "system" {
     ) -> *const RuntimeFunction;
 }
 
-/// Where the function containing `address` begins and how long it is.
+/// Returns where the function containing `address` begins and how long it is.
 ///
-/// Read from the running image's exception directory, so the answer is the
-/// linker's own record rather than a guess. Returns `None` when the address has
-/// no entry, which is the case for a leaf function small enough that Windows
-/// permits omitting its unwind data - exactly the functions too short to
-/// overwrite safely, so an absent entry is treated as "refuse", never as
-/// "assume it is long enough".
+/// The answer is read from the running image's exception directory, so it is
+/// the linker's own record rather than a guess. The result is `None` when the
+/// address has no entry, which is the case for a leaf function small enough
+/// that Windows allows it to omit its unwind data. Those are exactly the
+/// functions too short to overwrite safely, so a missing entry means "refuse",
+/// never "assume it is long enough".
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub fn function_extent(address: usize) -> Option<(usize, usize)> {
     let mut image_base: u64 = 0;
@@ -697,14 +712,25 @@ pub fn function_extent(address: usize) -> Option<(usize, usize)> {
     Some((begin, end - begin))
 }
 
-/// Overwrite a function's first bytes with an absolute jump to `replacement`.
+/// Overwrites a function's first bytes with an absolute jump to `replacement`.
 ///
 /// Returns the original bytes, so the patch can be undone by writing them back.
 ///
-/// The function's own length is checked against the exception directory first,
-/// so a function too short to hold the jump is refused rather than overwritten
-/// past its end - which would corrupt whichever function the linker placed
-/// next.
+/// The function's length is checked against the exception directory first, so a
+/// function too short for the jump is refused instead of being overwritten past
+/// its end, which would corrupt whichever function the linker placed next.
+///
+/// # Errors
+///
+/// Returns a message naming the reason when:
+///
+/// - `target` or `replacement` is null, or both name the same address;
+/// - the call comes from a thread other than the declared patching thread;
+/// - `target` has no exception-directory entry, which is how Windows treats a
+///   leaf function small enough to omit its unwind data;
+/// - `target` is not the first byte of its function;
+/// - the function is shorter than `ABSOLUTE_JUMP_LENGTH`;
+/// - `VirtualProtect` refuses to make the page writable.
 ///
 /// # Safety
 ///
@@ -715,6 +741,7 @@ pub fn function_extent(address: usize) -> Option<(usize, usize)> {
 /// function. `target` is validated here rather than assumed.
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8>, String> {
+    // Step 1: Reject the arguments that cannot be patched at all.
     if target == 0 || replacement == 0 {
         return Err("cannot patch a null address".to_string());
     }
@@ -723,9 +750,10 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
     }
     check_patching_thread()?;
 
-    // How much room there actually is. Without this the write runs past a short
-    // function and into whatever the linker placed after it, which is usually
-    // another live function - a corruption that surfaces far from its cause.
+    // Step 2: Find how much room the function really has, and check that the
+    // jump fits. Without this the write would run past a short function into
+    // whatever the linker placed after it, usually another live function, and
+    // the corruption would show up far from its cause.
     let Some((begin, length)) = function_extent(target) else {
         return Err(format!(
             "0x{target:016x} is a leaf function with no entry in the exception \
@@ -747,11 +775,12 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
         ));
     }
 
+    // Step 3: Make the page writable and keep the bytes the jump replaces.
     let target_pointer = target as *mut u8;
     let mut previous_protection: u32 = 0;
 
-    // SAFETY: the caller guarantees `target` addresses executable code; making
-    // its page writable is exactly what this function exists to do.
+    // SAFETY: `target` is a function entry inside a mapped image, as the extent
+    // check above established, so the page exists and can be made writable.
     let protection_changed = unsafe {
         VirtualProtect(
             target_pointer as *mut core::ffi::c_void,
@@ -768,7 +797,10 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
     let original =
         unsafe { core::slice::from_raw_parts(target_pointer, ABSOLUTE_JUMP_LENGTH) }.to_vec();
 
-    // mov rax, imm64 ; jmp rax
+    // Step 4: Write the jump, restore the page's protection and flush the
+    // instruction cache.
+    //
+    // The jump is `mov rax, imm64` followed by `jmp rax`.
     let mut instructions = [0u8; ABSOLUTE_JUMP_LENGTH];
     instructions[0] = 0x48;
     instructions[1] = 0xB8;
@@ -801,7 +833,20 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
     Ok(original)
 }
 
-/// Write saved prologue bytes back, undoing a patch.
+/// Writes saved prologue bytes back, undoing a patch.
+///
+/// # Errors
+///
+/// Returns a message naming the reason when:
+///
+/// - `target` is null;
+/// - the call comes from a thread other than the declared patching thread;
+/// - `target` has no exception-directory entry, or is not the first byte of
+///   its function;
+/// - the function at `target` is shorter than the saved bytes, which usually
+///   means the image was replaced;
+/// - the bytes at `target` do not begin with the jump `patch_prologue` writes;
+/// - `VirtualProtect` refuses to make the page writable.
 ///
 /// # Safety
 ///
@@ -809,19 +854,21 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
 /// bytes came from, and no thread may be executing inside them.
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), String> {
+    // Step 1: Reject a null address and a restore from the wrong thread.
     if target == 0 {
         return Err("cannot restore a null address".to_string());
     }
-    // The same guard `patch_prologue` carries, for the same reason: this writes
-    // twelve bytes over live code and no twelve-byte write is atomic, so a
-    // thread executing inside those bytes could observe a torn instruction
-    // stream. Restoring is not the gentler operation it sounds like - it is the
-    // identical hazard in the other direction, and the doc comment above already
-    // claims the contract. Enforced here rather than assumed.
+    // This is the same guard `patch_prologue` carries, for the same reason:
+    // twelve bytes of live code are overwritten here, and no twelve-byte write
+    // is atomic. A thread executing inside those bytes could see half of the
+    // old jump and half of the restored code, so a restore is just as dangerous
+    // as a patch. The `# Safety` section above states the contract; this call
+    // enforces it instead of trusting the caller.
     check_patching_thread()?;
-    // The same bound the patch was checked against. A restore aimed at an
-    // address whose image has since been replaced would otherwise write into
-    // whatever now occupies it, so the extent is re-read rather than trusted.
+    // Step 2: Re-read the extent and check that the function still has room for
+    // the saved bytes. A restore aimed at an address whose image has since been
+    // replaced would otherwise write into whatever now occupies it, so the
+    // extent is re-read rather than trusted.
     let Some((begin, length)) = function_extent(target) else {
         return Err(format!(
             "0x{target:016x} has no entry in the exception directory; refusing to \
@@ -837,11 +884,11 @@ pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), Str
     }
     let target_pointer = target as *mut u8;
 
-    // The bytes there now must be the jump this module installed. Extent alone
-    // is not enough: an image can be unloaded and a different one mapped over
-    // the same address, and that lookup would succeed. Writing the saved bytes
-    // then corrupts an unrelated live function - during a rollback, when the
-    // developer is already recovering from something.
+    // Step 3: Check that the bytes there now are the jump this module
+    // installed. The extent check alone is not enough: an image can be unloaded
+    // and another one mapped over the same address, and the extent lookup would
+    // still succeed. Writing the saved bytes then corrupts an unrelated live
+    // function, during a rollback the developer is already recovering from.
     //
     // SAFETY: the extent check above established that `target` is the entry of a
     // mapped function at least `original.len()` bytes long, so this many bytes
@@ -855,8 +902,11 @@ pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), Str
         ));
     }
 
+    // Step 4: Make the page writable, write the saved bytes back, restore the
+    // protection and flush the instruction cache.
     let mut previous_protection: u32 = 0;
-    // SAFETY: as documented on this function.
+    // SAFETY: `target` is a mapped function entry, as the extent check above
+    // established, and making its page writable is what this function does.
     let protection_changed = unsafe {
         VirtualProtect(
             target_pointer as *mut core::ffi::c_void,
@@ -891,31 +941,34 @@ pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), Str
 // Prologue patching (other targets)
 // =============================================================================
 //
-// The implementation above is Windows x86-64 only: it hand-encodes an absolute
-// jump and reads the exception directory through `RtlLookupFunctionEntry`, and
-// neither has a portable equivalent, so every other target gets the stubs
+// The implementation above is Windows x86-64 only: it writes an absolute jump
+// by hand and reads the exception directory through `RtlLookupFunctionEntry`,
+// and neither has a portable equivalent. Every other target gets the stubs
 // below.
 //
-// The stubs refuse rather than pretend. Everything that does not depend on
-// rewriting live code - the dispatch slots, the registries, whole-module
-// reloading - is portable Rust and works unchanged, so a non-Windows target
-// keeps `#[pill_hot]` and `#[pill_hot_fn]` and loses only the macro-free route.
+// The stubs return an error instead of pretending to patch. Everything that
+// does not depend on rewriting live code - the dispatch slots, the registries,
+// whole-module reloading - is portable Rust and works unchanged, so a
+// non-Windows target keeps `#[pill_hot]` and `#[pill_hot_fn]` and loses only
+// the route that patches a function without a dispatch slot.
 
-/// Where the function containing `address` begins and how long it is.
+/// Returns where the function containing `address` begins and how long it is.
 ///
-/// Always `None` off Windows x86-64: no supported way to establish a function's
-/// extent, and guessing is how a patch corrupts the function after it.
+/// Always `None` off Windows x86-64: there is no supported way to establish a
+/// function's extent, and a guess would let a patch corrupt the function that
+/// follows it.
 #[cfg(not(all(windows, target_arch = "x86_64")))]
 pub fn function_extent(_address: usize) -> Option<(usize, usize)> {
     None
 }
 
-/// Overwrite a function's first bytes with a jump to `replacement`.
+/// Overwrites a function's first bytes with a jump to `replacement`.
 ///
 /// # Errors
 ///
-/// Always, off Windows x86-64. Annotating the function with `#[pill_hot_fn]`
-/// gives it a dispatch slot, which is portable and needs no code rewriting.
+/// Always returns an error off Windows x86-64. Annotating the function with
+/// `#[pill_hot_fn]` gives it a dispatch slot, which is portable and needs no
+/// code rewriting.
 ///
 /// # Safety
 ///
@@ -930,12 +983,12 @@ pub unsafe fn patch_prologue(_target: usize, _replacement: usize) -> Result<Vec<
     )
 }
 
-/// Write saved prologue bytes back.
+/// Writes saved prologue bytes back.
 ///
 /// # Errors
 ///
-/// Always, off Windows x86-64: nothing can have been patched, so there is
-/// nothing to restore.
+/// Always returns an error off Windows x86-64: nothing can have been patched,
+/// so there is nothing to restore.
 ///
 /// # Safety
 ///
@@ -949,17 +1002,17 @@ pub unsafe fn restore_prologue(_target: usize, _original: &[u8]) -> Result<(), S
 // ABI self-check
 // =============================================================================
 
-/// Verify that a `&mut ZST` parameter can be received as `&mut ()`.
+/// Verifies that a `&mut ZST` parameter can be received as `&mut ()`.
 ///
 /// This is the one platform assumption the dispatch slot rests on. Both are
 /// references to zero-sized types, so both are a single non-null pointer-sized
 /// argument, and every ABI the engine targets passes them identically - but
 /// that is an observation, not a guarantee Rust makes.
 ///
-/// Returns `true` when arguments survive the substitution intact. Calling this
-/// once at startup - in debug builds, where a broken assumption must not wait
-/// for a patch to surface - turns a silent argument shift into a failure at
-/// initialization.
+/// Returns `true` when the arguments arrive intact. A host can call it once at
+/// startup, in debug builds, where a broken assumption must fail straight away
+/// instead of waiting for the first patch: a silent argument shift becomes an
+/// initialization failure.
 pub fn verify_abi() -> bool {
     /// Stands in for a system's zero-sized fn-item type.
     struct ZeroSized;
@@ -994,40 +1047,45 @@ pub fn verify_abi() -> bool {
 /// have its implementation replaced, and that everything around it stays put.
 #[cfg(all(test, feature = "hot_patch"))]
 mod integration_tests {
+    // External crates
+    use pill_core::error::EngineMessage;
+
+    // Current crate
     use super::*;
     use crate::error::SystemError;
     use crate::{Engine, SystemOwner};
-    use pill_core::error::EngineMessage;
 
-    /// Declares an isolated observable counter plus the two system bodies that
+    /// Declares an isolated observable counter plus the system bodies that
     /// drive it.
     ///
-    /// One set per test: the harness runs tests in parallel, so a single shared
-    /// counter would see other tests' increments and make any assertion about
-    /// how many times a system ran meaningless.
+    /// One set per test: the harness runs tests in parallel, so one shared
+    /// counter would also see other tests' increments and make an assertion
+    /// about how many times a system ran meaningless.
     macro_rules! isolated_systems {
         ($name:ident) => {
-            // Each instantiation uses only the helpers its own test needs.
+            // A test uses only some of these helpers, so unused ones are
+            // allowed.
             #[allow(dead_code)]
             mod $name {
                 use std::sync::atomic::{AtomicU32, Ordering};
 
                 static OBSERVED: AtomicU32 = AtomicU32::new(0);
 
-                /// The body every caller starts out pointing at; counts calls.
+                /// The body every caller starts out pointing at. Counts one per
+                /// call.
                 pub fn original() {
                     OBSERVED.fetch_add(1, Ordering::SeqCst);
                 }
 
-                /// The patched body; counts tenfold so a test can tell which
-                /// one actually ran.
+                /// The patched body. Counts ten per call, so a test can tell
+                /// which body ran.
                 pub fn replacement() {
                     OBSERVED.fetch_add(10, Ordering::SeqCst);
                 }
 
-                /// A patched body that panics on every call: the containment
-                /// and the fault streak are what the host's automatic rollback
-                /// acts on.
+                /// A patched body that panics on every call. The containment and
+                /// the panic count are what the host's automatic rollback acts
+                /// on.
                 pub fn panicking() {
                     panic!("patched body panicked");
                 }
@@ -1062,7 +1120,7 @@ mod integration_tests {
 
     /// A patch whose body panics is contained by the dispatcher: each frame
     /// records one system failure instead of unwinding through the engine, and
-    /// the third consecutive one queues the fault report a host rolls back
+    /// the third frame in a row queues the fault report a host rolls back
     /// from.
     #[test]
     fn a_panicking_patch_is_contained_and_reported() {
@@ -1105,7 +1163,7 @@ mod integration_tests {
         assert!(reports[0].message.contains("patched body panicked"));
     }
 
-    /// The headline behavior: a patched system runs new code on the next frame.
+    /// The central promise: a patched system runs new code on the next frame.
     #[test]
     fn patch_replaces_behavior_on_the_next_frame() {
         use replaces_behavior as systems;
@@ -1131,8 +1189,8 @@ mod integration_tests {
         );
     }
 
-    /// The system's slot count and enabled state survive a patch: only the
-    /// implementation moved.
+    /// The registry's slot count and the system's enabled state survive a
+    /// patch; only the implementation changed.
     #[test]
     fn patch_leaves_the_registration_intact() {
         use registration_intact as systems;
@@ -1181,6 +1239,8 @@ mod integration_tests {
         );
     }
 
+    /// A name the registry never saw is refused instead of resolved to
+    /// anything.
     #[test]
     fn patching_an_unregistered_system_is_refused() {
         use unknown_refused as systems;
@@ -1250,7 +1310,7 @@ mod integration_tests {
         let path = function_path::<fn()>();
         assert!(path.is_none(), "a bare fn pointer type has no path");
 
-        // The path the engine recorded for this registration.
+        // Collect the names the engine recorded for this registration.
         let recorded_names: Vec<String> = engine
             .hot_patch_registry()
             .names()
@@ -1364,7 +1424,7 @@ mod integration_tests {
         value + 1000
     }
 
-    /// The headline behaviour: callers of a patched function reach the
+    /// The main behaviour: callers of a patched function reach the
     /// replacement, and restoring the saved bytes puts the original back.
     ///
     /// One test rather than three, because the bytes are process-wide state and
@@ -1430,8 +1490,8 @@ mod integration_tests {
             "the second patch must have saved the first patch's jump, not the original"
         );
 
-        // Restoring from the NEWEST saved bytes reinstates generation one - the
-        // mistake this test exists to pin down.
+        // Restoring from the NEWEST saved bytes puts generation one back, which
+        // is the mistake this test exists to catch.
         // SAFETY: the address these bytes were saved from, unchanged since.
         unsafe { restore_prologue(target, &generation_two) }.expect("restore");
         assert_eq!(
@@ -1460,10 +1520,9 @@ mod integration_tests {
     /// A restore is refused when the bytes there are not the jump this module
     /// installed.
     ///
-    /// Extent alone is not enough: an image can be unloaded and another mapped
-    /// over the same address, and the extent lookup would succeed. Writing the
-    /// saved bytes then corrupts an unrelated live function - during a rollback,
-    /// when the developer is already recovering from something.
+    /// The extent check alone would accept the address: an image can be
+    /// unloaded and another mapped over it. The bytes are the only proof that
+    /// this is still the function the saved bytes came from.
     #[test]
     fn restoring_over_code_that_is_not_our_jump_is_refused() {
         let target = patch_restore_guard as *const () as usize;
@@ -1618,6 +1677,7 @@ mod tests {
         );
     }
 
+    /// A slot reports the address and signature it was initialized with.
     #[test]
     fn slot_reports_its_baseline() {
         let slot = HotSlot::new();
@@ -1626,6 +1686,7 @@ mod tests {
         assert_eq!(slot.signature_hash(), 0xABCD);
     }
 
+    /// An accepted install becomes the address the slot reports.
     #[test]
     fn install_replaces_the_implementation() {
         let slot = HotSlot::new();
@@ -1634,7 +1695,7 @@ mod tests {
         assert_eq!(slot.current(), 0x2000);
     }
 
-    /// The gate must refuse a moved signature and leave the running code alone.
+    /// A changed signature must be refused, and the current address must stay.
     #[test]
     fn install_refuses_a_signature_mismatch() {
         let slot = HotSlot::new();
@@ -1652,6 +1713,7 @@ mod tests {
         assert_eq!(slot.current(), 0x1000, "refused patch must not be applied");
     }
 
+    /// A null replacement is refused and the registered address keeps running.
     #[test]
     fn install_refuses_a_null_address() {
         let slot = HotSlot::new();
@@ -1660,6 +1722,8 @@ mod tests {
         assert_eq!(slot.current(), 0x1000);
     }
 
+    /// A registry finds the slot it was given, rejects an unknown name, and
+    /// forgets a slot once it is removed.
     #[test]
     fn registry_round_trips_and_forgets() {
         let mut registry = HotPatchRegistry::new();
@@ -1696,8 +1760,7 @@ mod tests {
         assert_eq!(slot.current(), 0x2000, "the closure's handle must see it");
     }
 
-    /// Two systems with different signatures hash differently; the same
-    /// signature hashes identically across calls.
+    /// The same signature hashes identically on every call.
     #[test]
     fn signature_hash_distinguishes_signatures() {
         fn takes_nothing() {}

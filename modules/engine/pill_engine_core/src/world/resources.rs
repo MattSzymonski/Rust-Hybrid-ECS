@@ -13,12 +13,13 @@
 //!
 //! # Design
 //!
-//! A resource is a singleton, so it has no archetype and no row: the store is a
-//! map from id to a box that holds the value behind a small table of function
-//! pointers (drop, size, alignment), not a trait object's vtable. Component
-//! columns work the same way and for the same reason: the table can be
-//! re-pointed at the newest generation, so the destructor that runs always
-//! belongs to code that is still mapped.
+//! A resource is a singleton, so it has no archetype and no row. The store is a
+//! map from id to a box that holds the value together with plain data about its
+//! type: a drop function, size, alignment, an optional schema hash and a
+//! foreign flag. That data is not a trait object's vtable. Component columns
+//! work the same way and for the same reason: the table can be re-pointed at
+//! the newest generation, so the destructor that runs always belongs to code
+//! that is still mapped.
 //!
 //! A foreign resource is the same store with no Rust type behind it: plain
 //! bytes plus a declared layout. That is what lets managed code own a resource
@@ -30,6 +31,9 @@ use trait_type_map::TraitAccessible;
 // Current crate
 use super::*;
 use crate::asset::{Asset, AssetManager};
+use crate::asset_import_registry::{
+    ImportRegistrationError, ImportRegistrationMarker, ImportRegistry,
+};
 
 // =============================================================================
 // World - Resource Management
@@ -46,10 +50,10 @@ impl World {
     ///
     /// Replaces an existing value of the same type. If another type has already
     /// claimed this resource's shared name, the claim is refused instead: the
-    /// error is recorded for the caller to drain, and **nothing is stored**.
-    /// Storing it anyway would leave a live resource with a shape no reader
-    /// accepts, or - when the two layouts happen to match - let one type read
-    /// another type's bytes.
+    /// error is recorded, so the registering `init` fails, and **nothing is
+    /// stored**. Storing it anyway would leave a live resource with a shape no
+    /// reader accepts. When the two layouts happen to match, it would also let
+    /// one type read another type's bytes.
     pub fn insert_resource<T: Resource>(&mut self, resource: T) {
         let _zone = crate::profile_scope!(
             "insert resource",
@@ -59,21 +63,25 @@ impl World {
             )]
         );
         let id = ResourceId::of::<T>();
+        // Step 1: Check the claim, and stop before storing anything when it was
+        // refused.
         if !self.claim_shared_resource_name::<T>() {
             return;
         }
+        // Step 2: Store the value with its change tick, and stamp the
+        // registration.
         let tick = Tick::new(self.change_tick);
         self.note_resource_registration(id);
         self.resources.insert(id, ErasedResource::new(resource));
         self.resource_ticks.insert(id, ComponentTicks::new(tick));
-        // Record the table too, so a later reload can re-home this value even
-        // if the next generation never inserts it again.
+        // Step 3: Record the table too, so a later reload can re-home this
+        // value even if the next generation never inserts it again.
         self.resource_factories
             .insert(id, ErasedResourceOps::of::<T>());
     }
 
-    /// Returns a shared reference to the resource, or `None` when it is not
-    /// stored.
+    /// Returns a shared reference to the resource, or `None` when nothing is
+    /// stored under its id or the stored value cannot be read as `T`.
     pub fn get_resource<T: Resource>(&self) -> Option<&T> {
         let _zone = crate::profile_scope!(
             "get resource",
@@ -87,8 +95,8 @@ impl World {
             .and_then(ErasedResource::get::<T>)
     }
 
-    /// Returns a mutable reference to the resource, or `None` when it is not
-    /// stored.
+    /// Returns a mutable reference to the resource, or `None` when nothing is
+    /// stored under its id or the stored value cannot be read as `T`.
     ///
     /// Prefer [`get_resource_mut_tracked`] for system parameters: it also marks
     /// the resource changed when the value is mutated.
@@ -98,7 +106,9 @@ impl World {
             .and_then(ErasedResource::get_mut::<T>)
     }
 
-    /// Returns the resource mutably, with change tracking.
+    /// Returns the resource mutably, with change tracking, or `None` when
+    /// nothing is stored under its id or the stored value cannot be read as
+    /// `T`.
     ///
     /// The result is a [`Mut<'_, T>`] wrapping the value and its
     /// [`ComponentTicks`]. Mutating through `DerefMut` sets `ticks.changed` to
@@ -149,18 +159,19 @@ impl World {
     /// Call it from a module's `init` for every resource type the module owns.
     /// It is idempotent, so a reload that re-runs `init` can call it again. A
     /// refused claim records its error and leaves the stored table alone, so a
-    /// generation that disagrees about a name's owner or shape cannot re-point
-    /// the live resource at its own code before its init fails.
+    /// generation that disagrees about who owns a name, or about the name's
+    /// shape, cannot re-point the live resource at its own code before its init
+    /// fails.
     pub fn register_resource<T: Resource>(&mut self) {
         self.register_resource_claiming::<T>();
     }
 
     /// [`Self::register_resource`], reporting whether the claim was accepted.
     ///
-    /// The public call drops the refusal because its callers cannot act on one:
-    /// the error is recorded, and the `init` that raised it fails. The
-    /// persistable registration does care, because a refused generation must not
-    /// install a serializer that reads the live value through code that is
+    /// The public call ignores the result because its callers cannot act on a
+    /// refusal: the error is recorded, and the `init` that raised it fails. The
+    /// persistable registration checks it, because a refused generation must
+    /// not install a serializer that reads the live value through code that is
     /// about to be discarded.
     pub(crate) fn register_resource_claiming<T: Resource>(&mut self) -> bool {
         let id = ResourceId::of::<T>();
@@ -178,10 +189,10 @@ impl World {
     ///
     /// The foreign-language counterpart of [`Self::register_resource`], for a
     /// type this process has no Rust definition of. The id is a hash of the
-    /// declared name, the same value [`Resource::shared_name`] produces for a
-    /// Rust type, so a managed declaration and a Rust type that write the same
-    /// string share one resource. The scheduler sees them as one too, because
-    /// it tracks resources by id.
+    /// declared name. [`Resource::shared_identity`] hashes a Rust type's name
+    /// the same way, so a managed declaration and a Rust type that write the
+    /// same string share one resource. The scheduler sees them as one too,
+    /// because it tracks resources by id.
     ///
     /// The payload is blittable bytes (plain bytes that can be copied as they
     /// are), described by `size` and `align` and stored by
@@ -189,8 +200,10 @@ impl World {
     /// so a foreign value outlives the assembly that produced it.
     ///
     /// `declaring_type` is the declaring language's own name for the type (the
-    /// managed full name, for the C# path), recorded and compared only against
-    /// another Rust declaration (see [`Self::claim_shared_resource`]).
+    /// managed full name, for the C# path). It is recorded so that a later Rust
+    /// declaration can be compared against it; two declarations from another
+    /// language are never compared by name (see
+    /// [`Self::claim_shared_resource`]).
     ///
     /// # Errors
     ///
@@ -207,22 +220,25 @@ impl World {
     /// stored under the id.
     pub fn register_foreign_resource(
         &mut self,
-        name: &str,
+        shared_name: &str,
         declaring_type: &str,
         size: usize,
         align: usize,
         schema_hash: u64,
     ) -> Result<ResourceId, WorldError> {
-        if name.is_empty() {
+        // Step 1: Check the declaration itself.
+        if shared_name.is_empty() {
             return Err(WorldError::ForeignResourceNameEmpty);
         }
         if !is_valid_foreign_layout(size, align) {
             return Err(WorldError::ForeignResourceLayoutInvalid { size, align });
         }
-        let id = ResourceId::Shared(crate::component::shared_component_identity(name));
+        // Step 2: Claim the name, which also checks the layout and the schema
+        // hash against an earlier declaration.
+        let id = ResourceId::Shared(crate::component::shared_component_identity(shared_name));
         if let Some(error) = self.claim_shared_resource(
             id,
-            name,
+            shared_name,
             declaring_type,
             size,
             align,
@@ -231,17 +247,19 @@ impl World {
         ) {
             return Err(error);
         }
-        // A stored Rust value fixes what is under the id - its destructor is
-        // bound to its type - so a foreign declaration cannot take the id over.
+        // Step 3: Refuse an id that already holds a Rust value. Such a value
+        // fixes what is under the id - its destructor is bound to its type - so
+        // a foreign declaration cannot take the id over.
         // `relayout_foreign_resource` refuses the same state; refusing here too
         // means the disagreement never reaches `rehome_resources`.
         if self
             .resources
             .get(&id)
-            .is_some_and(|value| !value.is_foreign())
+            .is_some_and(|resource| !resource.is_foreign())
         {
             return Err(WorldError::ForeignResourceHoldsRustValue { id });
         }
+        // Step 4: Record the table and the registration.
         self.resource_factories
             .insert(id, ErasedResourceOps::foreign(size, align, schema_hash));
         self.note_resource_registration(id);
@@ -299,8 +317,8 @@ impl World {
     ///
     /// `None` when the id is not a registered shared resource, when nothing is
     /// stored under it yet, or when the stored value is a Rust one. Bytes are
-    /// only handed out for foreign payloads, where the declared layout is all
-    /// the meaning a value has.
+    /// only handed out for foreign payloads, because their declared layout is
+    /// the only description they have.
     pub fn foreign_resource_bytes(&self, id: ResourceId) -> Option<&[u8]> {
         self.foreign_resource_ops(id)?;
         self.resources
@@ -343,16 +361,20 @@ impl World {
     /// The counterpart of [`Self::foreign_resource_bytes_mut`] for Rust values:
     /// the caller does not get bytes to interpret. It gets the address of the
     /// value, which a generated forwarding function casts back to the type it
-    /// was compiled against. A `write` borrow sets the `changed` tick when it is
-    /// handed out, for the same reason the foreign view does.
+    /// was compiled against. A write access sets the `changed` tick when the
+    /// pointer is handed out, for the same reason the foreign view does.
     ///
     /// `None` when nothing is stored under `id`, or when the stored value is a
     /// foreign payload - there is no Rust type there to cast to.
-    pub fn native_resource_pointer(&mut self, id: ResourceId, write: bool) -> Option<*mut u8> {
+    pub fn native_resource_pointer(
+        &mut self,
+        id: ResourceId,
+        is_write_access: bool,
+    ) -> Option<*mut u8> {
         if self.resources.get(&id)?.is_foreign() {
             return None;
         }
-        if write {
+        if is_write_access {
             let changed = Tick::new(self.change_tick);
             if let Some(ticks) = self.resource_ticks.get_mut(&id) {
                 ticks.set_changed(changed);
@@ -426,7 +448,7 @@ impl World {
         if self
             .resources
             .get(&id)
-            .is_some_and(|value| !value.is_foreign())
+            .is_some_and(|resource| !resource.is_foreign())
         {
             return Err(WorldError::ForeignResourceHoldsRustValue { id });
         }
@@ -444,12 +466,12 @@ impl World {
         }
         // Step 3: Reshape a stored payload, or record the new table alone when
         // no value is stored yet.
-        let Some(value) = self.resources.get_mut(&id) else {
+        let Some(stored_resource) = self.resources.get_mut(&id) else {
             self.resource_factories.insert(id, next_resource_ops);
             self.resource_field_layouts.remove(&id);
             return Ok(0);
         };
-        value
+        stored_resource
             .migrate_bytes(size, align, plan)
             .map_err(|_error| WorldError::ForeignResourcePlanOutOfBounds { id })?;
         self.resource_factories.insert(id, next_resource_ops);
@@ -464,23 +486,24 @@ impl World {
     /// declaration.
     ///
     /// The resource counterpart of [`Self::remap_descriptor_component`], and
-    /// the rename step of a managed resource manifest: a renamed type declares
-    /// a new name, and with it a new id, so the stored value is reshaped through
-    /// `plan` (built from the source's field list and the successor's), written
-    /// under the successor, and the source is then dropped. A payload the
-    /// successor already holds is replaced; in the common case the successor is
-    /// freshly declared and holds an all-zero seed.
+    /// the rename step of a managed resource manifest. A renamed type declares
+    /// a new name, and with it a new id, so the stored value is reshaped
+    /// through `plan` (built from the source's field list and the successor's)
+    /// and written under the successor. The source is then dropped. A payload
+    /// the successor already holds is replaced; in the common case the
+    /// successor is freshly declared and holds an all-zero seed.
     ///
     /// The source's claim count moves to the successor, so the value is released
-    /// only when no other subject still declares the old name, and the successor
-    /// ends up protected exactly as the source was.
+    /// only when no other artifact still declares the source's name, and the
+    /// successor ends up protected exactly as the source was.
     ///
     /// Returns 1 when a value was moved and 0 when the source had none stored,
     /// which is the case for a resource nobody has written yet.
     ///
     /// # Errors
     ///
-    /// [`WorldError::ForeignResourceRemapSelf`] when both ids are equal,
+    /// [`WorldError::ForeignResourceRemapSelf`] when the source and the
+    /// successor are the same id,
     /// [`WorldError::ForeignResourceNotRegistered`] when either id is not a
     /// registered foreign declaration,
     /// [`WorldError::ForeignResourcePlanOutOfBounds`] when the plan does not
@@ -489,29 +512,29 @@ impl World {
     /// stored under either id.
     pub fn remap_foreign_resource(
         &mut self,
-        old_id: ResourceId,
-        new_id: ResourceId,
+        source_id: ResourceId,
+        successor_id: ResourceId,
         plan: &FieldPlan,
     ) -> Result<usize, WorldError> {
-        if old_id == new_id {
+        if source_id == successor_id {
             return Err(WorldError::ForeignResourceRemapSelf);
         }
-        let Some((old_size, _, _)) = self.foreign_resource_layout(old_id) else {
-            return Err(WorldError::ForeignResourceNotRegistered { id: old_id });
+        let Some((source_size, _, _)) = self.foreign_resource_layout(source_id) else {
+            return Err(WorldError::ForeignResourceNotRegistered { id: source_id });
         };
-        let Some((new_size, _, _)) = self.foreign_resource_layout(new_id) else {
-            return Err(WorldError::ForeignResourceNotRegistered { id: new_id });
+        let Some((successor_size, _, _)) = self.foreign_resource_layout(successor_id) else {
+            return Err(WorldError::ForeignResourceNotRegistered { id: successor_id });
         };
         if self
             .resources
-            .get(&old_id)
-            .is_some_and(|value| !value.is_foreign())
+            .get(&source_id)
+            .is_some_and(|resource| !resource.is_foreign())
             || self
                 .resources
-                .get(&new_id)
-                .is_some_and(|value| !value.is_foreign())
+                .get(&successor_id)
+                .is_some_and(|resource| !resource.is_foreign())
         {
-            return Err(WorldError::ForeignResourceHoldsRustValue { id: old_id });
+            return Err(WorldError::ForeignResourceHoldsRustValue { id: source_id });
         }
 
         // Step 1: Read and reshape the stored value before anything moves.
@@ -519,34 +542,35 @@ impl World {
         // component rows), so the refusal is translated into the resource's
         // variant here.
         let mut moved_value_count = 0;
-        if let Some(old_bytes) = self.foreign_resource_bytes(old_id).map(<[u8]>::to_vec) {
-            plan.validate(old_size, new_size)
-                .map_err(|_| WorldError::ForeignResourcePlanOutOfBounds { id: old_id })?;
-            let mut new_bytes = vec![0_u8; new_size];
-            plan.apply(&old_bytes, &mut new_bytes);
+        if let Some(source_bytes) = self.foreign_resource_bytes(source_id).map(<[u8]>::to_vec) {
+            plan.validate(source_size, successor_size)
+                .map_err(|_| WorldError::ForeignResourcePlanOutOfBounds { id: source_id })?;
+            let mut successor_bytes = vec![0_u8; successor_size];
+            plan.apply(&source_bytes, &mut successor_bytes);
             // Step 2: Write it under the successor. The insert stamps the
-            // change tick, so a reader observes the move as the change it is.
-            self.insert_foreign_resource_bytes(new_id, &new_bytes)?;
+            // change tick, so a reader sees the move as a change.
+            self.insert_foreign_resource_bytes(successor_id, &successor_bytes)?;
             moved_value_count = 1;
         }
 
         // Step 3: Move the claims and drop the source. The count moves in one
         // step rather than being released one claim at a time: whoever declared
-        // the old name still needs the resource under its new one.
-        let claims = self.resource_claim_counts.remove(&old_id).unwrap_or(0);
-        if claims > 0 {
-            *self.resource_claim_counts.entry(new_id).or_insert(0) += claims;
+        // the source's name still needs the value under the successor's id.
+        let claim_count = self.resource_claim_counts.remove(&source_id).unwrap_or(0);
+        if claim_count > 0 {
+            *self.resource_claim_counts.entry(successor_id).or_insert(0) += claim_count;
         }
-        self.drop_resources(&[old_id]);
+        self.drop_resources(&[source_id]);
         Ok(moved_value_count)
     }
 
     /// The per-type table of a registered shared resource, if the id names one.
     ///
-    /// Only a shared id has a table another language can reach: a private
-    /// resource is identified by its `TypeId`, which no other language can name,
-    /// so it also has no byte view to hand out. The `?` on
-    /// [`ResourceId::shared_identity`] is what returns `None` for a private id.
+    /// Only a shared id has a table another language can reach. An ordinary
+    /// resource is identified by its `TypeId`, which no other language can
+    /// name, so it also has no byte view to hand out. The `?` on
+    /// [`ResourceId::shared_identity`] is what makes an ordinary id return
+    /// `None` here.
     fn shared_resource_ops(&self, id: ResourceId) -> Option<ErasedResourceOps> {
         id.shared_identity()?;
         self.resource_factories.get(&id).copied()
@@ -556,11 +580,11 @@ impl World {
     /// belongs to foreign bytes.
     ///
     /// The byte accessors go through this one. `shared_resource_ops` only says
-    /// whether the id is shared at all, which is all the foreign insert needs to
-    /// tell a private id from one whose table belongs to a Rust type. A byte
-    /// view needs more: it is only meaningful for a payload with no Rust type
-    /// anywhere, so the table must say foreign here, and the stored box is
-    /// checked as well before any bytes are handed out.
+    /// whether the id is shared at all, which is all the foreign insert needs:
+    /// it tells an ordinary id apart from one whose table belongs to a Rust
+    /// type. A byte view needs more. It only makes sense for a payload with no
+    /// Rust type anywhere, so the table must say foreign here, and the callers
+    /// also check the stored box before they hand out any bytes.
     fn foreign_resource_ops(&self, id: ResourceId) -> Option<ErasedResourceOps> {
         self.shared_resource_ops(id)
             .filter(|resource_ops| resource_ops.foreign)
@@ -658,10 +682,10 @@ impl World {
         ) {
             None => true,
             Some(error) => {
-                // Recorded here rather than in the core: the Rust path is the
-                // one whose refusal has to fail the init that raised it. A
-                // foreign declaration's caller gets the error back and acts on
-                // it itself.
+                // Recorded here rather than in `claim_shared_resource`: the
+                // Rust path is the one whose refusal has to fail the init that
+                // raised it. A foreign declaration's caller gets the error back
+                // and acts on it itself.
                 self.record_registration_error(error);
                 false
             }
@@ -673,19 +697,22 @@ impl World {
     /// A declaration from another language has no Rust type to ask, so it hands
     /// over the same facts its manifest carries. `foreign` decides one thing:
     /// whether the declaring names are compared. A foreign declaration has no
-    /// Rust name to compare with a final path segment, and writing the shared
-    /// name down is itself its statement of which resource it means, so for it
-    /// the layout is the check.
+    /// Rust name to compare with the last segment of a type path, and writing
+    /// the shared name down is itself a statement of which resource it means.
+    /// For a foreign declaration, then, the layout is the check.
     ///
     /// The recorded claim keeps its Rust declarer when a foreign declaration
-    /// joins, since that record is what a later Rust arrival is compared
-    /// against; a Rust arrival to a foreign claim does take the record, for the
-    /// same reason in reverse. This function does not record the error it
-    /// returns: the Rust wrapper above records it as a registration error,
-    /// while a foreign declaration's caller acts on the refusal itself.
-    // Seven facts describe one declaration, each read from the manifest or the
-    // Rust type, and none can be derived from the others, so the caller passes
-    // every one of them.
+    /// joins, because that record is what a later Rust declaration is compared
+    /// against. A Rust declaration that arrives at a foreign claim does take the
+    /// record, for the same reason in reverse. This function does not record the
+    /// error it returns: the Rust wrapper above records it as a registration
+    /// error, while a foreign declaration's caller acts on the refusal itself.
+
+    // Seven arguments describe one declaration. The name, the declaring type,
+    // the layout, the foreign flag and the schema hash all come from the
+    // manifest or the Rust type, and the caller passes each one because none
+    // can be worked out from the others. `id` is the exception: it is the
+    // name's hash, but the caller has already built it.
     #[allow(clippy::too_many_arguments)]
     fn claim_shared_resource(
         &mut self,
@@ -792,9 +819,10 @@ impl World {
                 self.shared_resource_claims.insert(id, incoming);
             }
             // A foreign declaration does not overwrite the record: keeping a
-            // Rust declarer's name is what lets a later Rust arrival still be
-            // compared against one. A Rust arrival to a foreign claim does take
-            // it, because from then on there is a Rust name worth comparing.
+            // Rust declarer's name is what lets a later Rust declaration still
+            // be compared against it. A Rust declaration joining a foreign claim
+            // does take the record, because from then on there is a Rust name
+            // worth comparing.
             Some(existing) if existing.foreign && !incoming.foreign => {
                 self.shared_resource_claims.insert(id, incoming);
             }
@@ -806,21 +834,22 @@ impl World {
     /// Re-homes every stored resource's per-type function table.
     ///
     /// The resource counterpart of [`Self::rehome_native_columns`], called at
-    /// the same point in the reload: a resource's drop function belongs to
+    /// the same point in the reload. A resource's drop function belongs to
     /// whichever artifact inserted it, and that artifact's image is about to be
-    /// evicted from the reload graveyard, so the table is refreshed while every
-    /// image is still mapped.
+    /// released from the reload graveyard (the retired images the host keeps
+    /// mapped for a while). The table is refreshed here, while every image is
+    /// still mapped.
     ///
     /// Three cases are left alone. A type that no artifact registered this
-    /// generation has nothing newer to point at - a retired owner's resource,
-    /// which [`Self::drop_resources`] releases while the retiring image is still
-    /// mapped. A foreign box's table drops nothing and points at this crate's
-    /// code; refreshing it from the factories would let a Rust type sharing the
-    /// name hand its destructor to bytes it does not own. And a table that
-    /// claims foreign ownership over a Rust value - a state the registration
-    /// paths refuse, though a stale table could still reach it - is reported
-    /// rather than installed, since the value would otherwise leak without a
-    /// word.
+    /// generation has nothing newer to point at - a resource whose owning
+    /// artifact retired, which [`Self::drop_resources`] releases while that
+    /// image is still mapped. A foreign box's table drops nothing and points at
+    /// this crate's code; refreshing it from the factories would let a Rust type
+    /// sharing the name hand its destructor to bytes it does not own. And a
+    /// table that claims foreign ownership over a Rust value - a state the
+    /// registration paths refuse, though a stale table could still reach it - is
+    /// reported rather than installed, since the value would otherwise leak
+    /// without a word.
     pub fn rehome_resources(&mut self) {
         for (id, resource) in &mut self.resources {
             if resource.is_foreign() {
@@ -843,22 +872,22 @@ impl World {
     /// Declares an asset type the calling generation owns.
     ///
     /// The asset counterpart of [`Self::register_component`]: an asset column's
-    /// per-type table is code from the artifact that filled it, so an owner that
-    /// can be reloaded declares its asset types during registration, and
-    /// [`Self::rehome_assets`] later points those columns at the generation that
-    /// is still mapped. Using the type ([`AssetManager::add`]) declares it too,
-    /// so this call only matters for a type the generation owns but does not
-    /// touch in this run.
+    /// per-type table is code from the artifact that filled it. An artifact that
+    /// can be reloaded therefore declares the asset types it owns during
+    /// registration, and [`Self::rehome_assets`] later points those columns at
+    /// the generation that is still mapped. Using the type
+    /// ([`AssetManager::add`]) declares it too, so this call only matters for a
+    /// type the generation owns but does not touch in this run.
     pub fn register_asset<T>(&mut self)
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
         match self.get_resource_mut::<AssetManager>() {
-            Some(assets) => assets.register::<T>(),
+            Some(asset_manager) => asset_manager.register::<T>(),
             None => {
-                let mut assets = AssetManager::new();
-                assets.register::<T>();
-                self.insert_resource(assets);
+                let mut asset_manager = AssetManager::new();
+                asset_manager.register::<T>();
+                self.insert_resource(asset_manager);
             }
         }
     }
@@ -871,7 +900,7 @@ impl World {
     /// import entry points, which are compiled into the calling binary. Call it
     /// in the registration of the module that owns `T`, on every generation.
     ///
-    /// The entry points point into the calling binary, so this also inserts a
+    /// The entry points live in the calling binary, so this also inserts a
     /// marker resource that the calling generation claims. When the host retires
     /// that claim - because the module stopped registering `T` or was unloaded -
     /// it drops the marker while the image is still mapped, and the registry
@@ -905,38 +934,36 @@ impl World {
         });
     }
 
-    /// Records one import registration of `T` with `register`, behind a fresh
-    /// liveness marker this generation claims.
+    /// Records one import registration of `T` with `register_import`, behind a
+    /// fresh liveness marker this generation claims.
     fn record_import_registration<T: 'static>(
         &mut self,
-        register: impl FnOnce(
+        register_import: impl FnOnce(
             &mut crate::asset_import_registry::ImportRegistry,
             std::sync::Weak<()>,
-        )
-            -> Result<(), crate::asset_import_registry::ImportRegistrationError>,
+        ) -> Result<
+            (),
+            crate::asset_import_registry::ImportRegistrationError,
+        >,
     ) {
-        use crate::asset_import_registry::{
-            ImportRegistrationError, ImportRegistrationMarker, ImportRegistry,
-        };
-
-        let marker = ImportRegistrationMarker::<T>::new();
+        let import_registration_marker = ImportRegistrationMarker::<T>::new();
         // The registry is claimed on every generation, not only by the first
         // insert. A reload that kept the registry but did not claim it would
-        // read as this module no longer owning it, and the host would drop it
-        // once the init finished.
+        // look like this module had stopped owning it, and the host would drop
+        // it when the init finished.
         self.register_resource::<ImportRegistry>();
         if self.get_resource::<ImportRegistry>().is_none() {
             self.insert_resource(ImportRegistry::default());
         }
-        let import_registration = register(
+        let import_registration = register_import(
             self.get_resource_mut::<ImportRegistry>()
                 .expect("inserted just above"),
-            marker.alive(),
+            import_registration_marker.alive(),
         );
         match import_registration {
             // Replacing a previous generation's marker ends that generation's
             // registration; the one just recorded holds this marker instead.
-            Ok(()) => self.insert_resource(marker),
+            Ok(()) => self.insert_resource(import_registration_marker),
             Err(ImportRegistrationError::ExtensionClaimedTwice {
                 extension,
                 registered_type,
@@ -964,13 +991,13 @@ impl World {
     /// never called either way, so this only stops the registry from holding
     /// stale entries.
     pub fn rehome_assets(&mut self) {
-        if let Some(assets) = self.get_resource_mut::<AssetManager>() {
-            assets.rehome();
+        if let Some(asset_manager) = self.get_resource_mut::<AssetManager>() {
+            asset_manager.rehome();
         }
-        if let Some(registry) =
+        if let Some(import_registry) =
             self.get_resource_mut::<crate::asset_import_registry::ImportRegistry>()
         {
-            registry.prune();
+            import_registry.prune();
         }
     }
 
@@ -986,16 +1013,16 @@ impl World {
     /// The host uses it when a reloaded module stops registering a resource
     /// type the retiring generation owned. Compare
     /// [`resource_ids_registered_since`](Self::resource_ids_registered_since)
-    /// across the two generations to find those ids. An id that another subject
+    /// across the two generations to find those ids. An id that another artifact
     /// still claims through [`retain_resource_claims`](Self::retain_resource_claims)
     /// is skipped, because the value's drop function belongs to the generation
-    /// that inserted it, not necessarily to the subject retiring now.
+    /// that inserted it, not necessarily to the artifact retiring now.
     ///
     /// Returns how many were actually present and dropped.
     pub fn drop_resources(&mut self, ids: &[ResourceId]) -> usize {
         let mut dropped_resource_count = 0;
         for id in ids {
-            // Another subject's claim keeps the value alive.
+            // Another artifact's claim keeps the value alive.
             if self
                 .resource_claim_counts
                 .get(id)
@@ -1013,12 +1040,12 @@ impl World {
         dropped_resource_count
     }
 
-    /// Records one claim per id on a resource this subject registered.
+    /// Records one claim per id on a resource the calling artifact registered.
     ///
     /// [`drop_resources`](Self::drop_resources) consults these counts before
-    /// releasing an id that one subject retired. A shared name can be registered
-    /// by several subjects, and only the last of them to let go should destroy
-    /// the value.
+    /// releasing an id that one artifact retired. A shared name can be
+    /// registered by several artifacts, and only the last of them to let go
+    /// should destroy the value.
     pub fn retain_resource_claims(&mut self, ids: &[ResourceId]) {
         for id in ids {
             *self.resource_claim_counts.entry(*id).or_insert(0) += 1;
@@ -1062,19 +1089,19 @@ impl World {
     ///
     /// Returns [`WorldError::SharedResourceHoldsAnotherType`] when the id holds
     /// a value this `T` cannot be read as - the case a shared, name-derived id
-    /// makes reachable. The value is taken first and the box is put back on a
-    /// refusal, so nothing about the stored resource changes: not its value, its
-    /// ticks, its factory or its claim.
+    /// makes reachable. The box is taken out first and put back on a refusal, so
+    /// nothing about the stored resource changes: not its value, its ticks, its
+    /// factory or its claim.
     pub fn remove_resource<T: Resource>(&mut self) -> Result<Option<T>, WorldError> {
         let id = ResourceId::of::<T>();
         let Some(erased_resource) = self.resources.remove(&id) else {
             return Ok(None);
         };
-        let value = match erased_resource.take::<T>() {
-            Ok(value) => value,
+        let resource_value = match erased_resource.take::<T>() {
+            Ok(resource_value) => resource_value,
             Err(erased_resource) => {
-                // Put the box back unchanged: dropping it here would take the
-                // value, its ticks, its factory and its claim with it.
+                // Put the box back unchanged: a refused take must leave the
+                // value, and every record of it, exactly as it was.
                 self.resources.insert(id, erased_resource);
                 return Err(WorldError::SharedResourceHoldsAnotherType {
                     id,
@@ -1083,7 +1110,7 @@ impl World {
             }
         };
         self.remove_resource_records(id);
-        Ok(Some(value))
+        Ok(Some(resource_value))
     }
 
     /// Checks whether a resource exists *and* can be read as `T`.
@@ -1102,9 +1129,9 @@ impl World {
 
     /// The stored box under `T`'s resource id, whatever shape it holds.
     ///
-    /// For a caller whose id exists but whose type does not read: the box itself
-    /// answers `holds::<T>()` and `has_shared_identity()`. `None` means the id
-    /// has no resource at all.
+    /// This is for a caller that needs the box itself when `T` does not read the
+    /// stored value: the box answers `holds::<T>()` and `has_shared_identity()`.
+    /// `None` means the id has no resource at all.
     #[must_use]
     pub fn resource_holder<T: Resource>(&self) -> Option<&crate::resource::ErasedResource> {
         self.resources.get(&ResourceId::of::<T>())

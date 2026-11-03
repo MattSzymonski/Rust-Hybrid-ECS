@@ -3,23 +3,28 @@
 //!
 //! # Responsibilities
 //!
-//! - Exercises the shared [`Position`], [`Velocity`], and [`Health`] fixture
-//!   components through sequential and parallel query iteration, including
-//!   tracked batch statistics.
-//! - Verifies change-detection semantics of `Mut<T>` and the [`Added`] and
-//!   [`Changed`] filters.
-//! - Verifies archetype-scoping behaviour of the [`With`], [`Without`], and
-//!   [`Or`] filter combinators.
+//! - Runs queries over the shared [`Position`], [`Velocity`] and [`Health`]
+//!   fixture components, both one row at a time and in parallel. It also
+//!   checks the batch statistics a tracked parallel query reports, including
+//!   a zero batch size.
+//! - Checks how change detection behaves for `Mut<T>` and for the [`Added`]
+//!   and [`Changed`] filters.
+//! - Checks which archetypes the [`With`], [`Without`] and [`Or`] filters
+//!   select.
+//! - Checks that a query whose type declares a different layout of a shared
+//!   component is refused, and that the refusal is reported once.
 //!
 //! # Design
 //!
-//! Most tests build a fresh [`World`] through [`setup_world`] with the three
-//! fixture components registered; the registration and shared-layout tests
-//! build one directly. Filters are exercised at the archetype level ([`With`],
-//! [`Without`], [`Or`]) and the row level ([`Added`], [`Changed`]), including
-//! nested and mixed combinations that exercise [`Or`] short-circuiting. The
-//! target-tuple tests cover the aliasing check that refuses a target reading
-//! and writing one component.
+//! Most tests build a fresh [`World`] through [`setup_world`], with the three
+//! fixture components registered. The registration, aliasing and shared-layout
+//! tests build one directly.
+//!
+//! The filter tests work at two levels: the archetype level ([`With`],
+//! [`Without`], [`Or`]) and the row level ([`Added`], [`Changed`]). Some of
+//! them combine nested and mixed filters, and check that [`Or`] stops at the
+//! first branch that matches. The target-tuple tests cover the aliasing check,
+//! which refuses a target that reads and writes the same component.
 
 // External crates
 use pill_core::rayon;
@@ -32,17 +37,13 @@ use crate::test_fixtures::{setup_world, Health, Position, Velocity};
 use crate::world::World;
 
 // =============================================================================
-// Tests
-// =============================================================================
-
-// =============================================================================
 // Basic Query Tests
 // =============================================================================
 
-/// A query whose target component is never registered matches nothing and
-/// panics nowhere: the unresolved id is recorded instead of dropped from the
-/// mask, because a dropped id would make "not registered" mean "matches
-/// everything".
+/// A query whose target component was never registered matches nothing and
+/// does not panic. The unknown id stays in the query's component mask (the
+/// set of components it requires) instead of being dropped, because a dropped
+/// id would make "not registered" mean "matches everything".
 #[test]
 fn query_before_registration_matches_nothing() {
     let mut world = World::new();
@@ -50,7 +51,7 @@ fn query_before_registration_matches_nothing() {
     let mut query = Query::<&Position>::new(&mut world);
     assert_eq!(query.iter_mut().count(), 0);
 
-    // The mutable shape takes the same path.
+    // The mutable query type (`&mut Position`) takes the same path.
     let mut query = Query::<&mut Position>::new(&mut world);
     assert_eq!(query.iter_mut().count(), 0);
 }
@@ -75,7 +76,7 @@ fn an_unregistered_with_filter_matches_nothing() {
         "an unregistered With<T> cannot match"
     );
 
-    // Once the component is registered the filter answers its real question.
+    // Once the component is registered, the filter matches what the world holds.
     world.register_component::<Health>();
     let mut query = Query::<(Entity,), With<Health>>::new(&mut world);
     assert_eq!(query.iter_mut().count(), 0, "the entity does not carry it");
@@ -139,14 +140,12 @@ fn every_matching_entity_is_visited_once() {
 fn an_entity_missing_a_requested_component_is_skipped() {
     let mut world = setup_world();
 
-    // Entity with Position only
     world
         .create_entity()
         .with(Position { x: 1.0, y: 1.0 })
         .build()
         .unwrap();
 
-    // Entity with Position and Velocity
     world
         .create_entity()
         .with(Position { x: 2.0, y: 2.0 })
@@ -154,7 +153,6 @@ fn an_entity_missing_a_requested_component_is_skipped() {
         .build()
         .unwrap();
 
-    // Query for entities with both Position and Velocity
     let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
     let matching_rows: Vec<_> = query.iter_mut().collect();
 
@@ -217,9 +215,9 @@ fn first_is_none_when_nothing_matches() {
 /// `first()` agrees with `iter_mut().next()` even with several matching
 /// archetypes.
 ///
-/// Both read the same cached matching-archetype list, so `first` always names
-/// the row `iter_mut().next()` returns; the sort keeps that order the same in
-/// every run.
+/// Both read the same cached list of matching archetypes, so `first` always
+/// names the row `iter_mut().next()` returns. The cache sorts the archetype
+/// ids, so that order is the same in every run.
 #[test]
 fn first_agrees_with_iteration_order() {
     let mut world = setup_world();
@@ -256,10 +254,11 @@ fn first_agrees_with_iteration_order() {
     );
 }
 
-/// A filter with a row-level predicate and no archetype scoping produces no
-/// filter pairs, which would read as "accepts everything" if the row-level
-/// predicate were skipped: a filter rejecting every row must still answer
-/// nothing from `first`, `is_empty` and `entity_count`.
+/// A filter can reject rows without naming any component. Such a filter
+/// produces no archetype filter pairs, and an empty pair list would read as
+/// "accepts everything" if the row check were skipped. So a filter that
+/// rejects every row must still make `first`, `is_empty` and `entity_count`
+/// report nothing.
 #[test]
 fn row_only_filters_are_not_skipped() {
     /// Rejects every row without declaring any component scope.
@@ -335,19 +334,20 @@ fn parallel_iteration_reaches_every_matching_row() {
         position.x += 1.0;
     });
 
-    // Verify all were modified
+    // Every row must hold the incremented value now.
     let mut verify_query = Query::<(&Position,)>::new(&mut world);
     for (position,) in verify_query.iter_mut() {
         assert!(position.x >= 1.0);
     }
 }
 
-/// Verifies that explicit batch sizes are respected during parallel iteration.
+/// Checks that parallel iteration uses the batch size it is given.
 ///
-/// The world is sized from the pool so the parallel path runs at all (a world
-/// under `threads × MINIMUM_SLICE_SIZE` takes the sequential fallback), which
-/// makes the geometry arithmetic instead of a lower bound: slices of exactly
-/// 100, grouped contiguously across the pool.
+/// The world is sized from the pool, so the parallel path always runs. A world
+/// under `threads × MINIMUM_SLICE_SIZE` would take the sequential fallback
+/// instead. That makes the expected numbers exact rather than a lower bound:
+/// every slice is exactly 100 entities long, and the slices run in contiguous
+/// groups, one per pool thread.
 #[test]
 fn an_explicit_batch_size_controls_the_slices() {
     let mut world = setup_world();
@@ -375,12 +375,12 @@ fn an_explicit_batch_size_controls_the_slices() {
     let batch_stats = batch_stats.unwrap();
     assert_eq!(batch_stats.total_entities, entity_count);
 
-    // With every slice exactly `batch_size` long and the slices grouped
-    // contiguously across the pool, each thread group's processed count is
+    // Every slice is exactly `batch_size` long, and the slices sit next to
+    // each other in one group per thread. So each group processed
     // `batch_size × (its slice count)`: `base_slice_count` slices each, plus
-    // one more for the first `extra_group_count` groups. Ignoring
-    // `with_batch_size` changes the slice lengths (the default spans
-    // 256..4096), so both equalities catch it.
+    // one more in the first `extra_group_count` groups. With the default
+    // span of 256..4096, a batch size that was ignored would break both
+    // equalities.
     let slice_count = entity_count / batch_size;
     let base_slice_count = slice_count / thread_count;
     let extra_group_count = slice_count % thread_count;
@@ -395,7 +395,9 @@ fn an_explicit_batch_size_controls_the_slices() {
     );
 }
 
-/// Verifies that tracked parallel iteration returns valid `BatchStats`.
+/// Checks the statistics a tracked parallel iteration reports: the entity
+/// count, a non-zero batch and thread count, and a positive average batch
+/// size.
 #[test]
 fn tracked_parallel_iteration_reports_its_batches() {
     let mut world = setup_world();
@@ -460,7 +462,7 @@ fn a_parallel_iterator_counts_its_entities() {
 // BatchStats Tests
 // =============================================================================
 
-/// Verifies that `BatchStats` Display implementation produces readable output.
+/// Checks that `BatchStats` prints a readable summary.
 #[test]
 fn batch_stats_render_their_counts() {
     let batch_stats = BatchStats {
@@ -491,21 +493,20 @@ fn a_query_reports_the_component_ids_it_matches() {
     assert!(component_ids.contains(&ComponentId::of::<Velocity>()));
 }
 
-/// The mask a query builds and the access a system reports come from one
-/// description: `component_ids()` is exactly `reads ++ writes`.
+/// The components a query matches and the access a system reports come from
+/// one description: `component_ids()` is exactly `reads ++ writes`.
 #[test]
 fn the_reported_access_matches_the_component_ids() {
     let component_ids = <(&Position, &mut Velocity)>::component_ids();
     let (reads, writes) = <(&Position, &mut Velocity)>::report_component_access();
 
-    let derived_component_ids: Vec<ComponentId> =
-        reads.into_iter().chain(writes).collect();
+    let derived_component_ids: Vec<ComponentId> = reads.into_iter().chain(writes).collect();
     assert_eq!(component_ids, derived_component_ids);
     assert!(component_ids.contains(&ComponentId::of::<Position>()));
     assert!(component_ids.contains(&ComponentId::of::<Velocity>()));
 }
 
-/// Verifies that `report_component_access` correctly reports read-only access.
+/// Checks that `report_component_access` reports a read-only target as a read.
 #[test]
 fn a_read_access_is_reported_as_read() {
     let (reads, writes) = <(&Position,)>::report_component_access();
@@ -513,7 +514,8 @@ fn a_read_access_is_reported_as_read() {
     assert_eq!(writes.len(), 0);
 }
 
-/// Verifies that `report_component_access` correctly reports write access.
+/// Checks that `report_component_access` reports a write-only target as a
+/// write.
 #[test]
 fn a_write_access_is_reported_as_write() {
     let (reads, writes) = <(&mut Position,)>::report_component_access();
@@ -521,7 +523,8 @@ fn a_write_access_is_reported_as_write() {
     assert_eq!(writes.len(), 1);
 }
 
-/// Verifies that `report_component_access` correctly reports mixed read/write access.
+/// Checks that a target reading one component and writing another reports one
+/// read and one write.
 #[test]
 fn a_mixed_query_reports_both_access_modes() {
     let (reads, writes) = <(&Position, &mut Velocity)>::report_component_access();
@@ -540,29 +543,42 @@ fn two_writable_views_of_one_component_are_refused() {
     let _ = <(&mut Position, &mut Position)>::report_component_access();
 }
 
-/// Verifies the aliasing predicate: two writes of one id, or a read beside a
-/// write, are found; duplicate reads are not aliasing.
+/// Checks what the aliasing check reports. Two writes of one component, or a
+/// read beside a write of it, are found. Two reads of one component are not
+/// aliasing and report nothing.
 #[test]
-fn finding_a_component_detects_an_aliasing_target() {
+fn the_aliasing_check_reports_the_aliasing_component() {
     use crate::query::target::find_aliasing_component;
-    let id = ComponentId::of::<Position>();
-    let other_component_id = ComponentId::of::<Velocity>();
+    let position_component_id = ComponentId::of::<Position>();
+    let velocity_component_id = ComponentId::of::<Velocity>();
     assert_eq!(find_aliasing_component(&[], &[]), None);
-    assert_eq!(find_aliasing_component(&[], &[id]), None);
-    assert_eq!(find_aliasing_component(&[id, other_component_id], &[]), None);
+    assert_eq!(find_aliasing_component(&[], &[position_component_id]), None);
     assert_eq!(
-        find_aliasing_component(&[id, id], &[]),
+        find_aliasing_component(&[position_component_id, velocity_component_id], &[]),
+        None
+    );
+    assert_eq!(
+        find_aliasing_component(&[position_component_id, position_component_id], &[]),
         None,
         "two reads of one component are not aliasing"
     );
-    assert_eq!(find_aliasing_component(&[], &[id, id]), Some(id));
-    assert_eq!(find_aliasing_component(&[id], &[id]), Some(id));
-    assert_eq!(find_aliasing_component(&[other_component_id], &[id]), None);
+    assert_eq!(
+        find_aliasing_component(&[], &[position_component_id, position_component_id]),
+        Some(position_component_id)
+    );
+    assert_eq!(
+        find_aliasing_component(&[position_component_id], &[position_component_id]),
+        Some(position_component_id)
+    );
+    assert_eq!(
+        find_aliasing_component(&[velocity_component_id], &[position_component_id]),
+        None
+    );
 }
 
-/// Construction is where aliasing is refused: `Query::new` runs the same
-/// predicate the tuple's access report does, so a directly built query cannot
-/// skip it.
+/// Aliasing is refused when the query is built: `Query::new` runs the same
+/// check the tuple's access report does, so a query constructed directly
+/// cannot skip it.
 #[test]
 #[should_panic(expected = "reads and writes the same component")]
 fn a_read_write_alias_is_refused_when_the_query_is_built() {
@@ -571,7 +587,7 @@ fn a_read_write_alias_is_refused_when_the_query_is_built() {
     let _ = Query::<(&Position, &mut Position)>::new(&mut world);
 }
 
-/// A duplicated read is not aliasing and must keep constructing fine.
+/// A duplicated read is not aliasing, and such a query must still build.
 #[test]
 fn two_read_views_of_one_component_are_allowed() {
     let mut world = World::new();
@@ -591,7 +607,7 @@ fn an_entity_only_query_names_no_component() {
 // Change Detection Tests
 // =============================================================================
 
-/// Verifies that `DerefMut` on `Mut<T>` bumps the changed tick.
+/// Checks that `DerefMut` on `Mut<T>` advances the changed tick.
 #[test]
 fn writing_through_a_mutable_view_bumps_the_changed_tick() {
     let mut world = setup_world();
@@ -601,16 +617,16 @@ fn writing_through_a_mutable_view_bumps_the_changed_tick() {
         .build()
         .unwrap();
 
-    // Step 1: capture the tick at which the component was added (insert
-    // happened with whatever world.change_tick was at the time).
+    // Step 1: record the tick at which the component was added (the insert
+    // used whatever `world.change_tick` was at the time).
     let added_tick = {
         let mut query = Query::<(&mut Position,)>::new(&mut world);
         let (position,) = query.first().unwrap();
         position.last_added()
     };
 
-    // Step 2: mutate via DerefMut - should bump `changed` to the
-    // iterator's this_run, which is strictly newer than `added`.
+    // Step 2: write through `DerefMut`, which moves `changed` to the
+    // iterator's `this_run` tick. That tick is strictly newer than `added`.
     let changed_tick = {
         let mut query = Query::<(&mut Position,)>::new(&mut world);
         let (mut position,) = query.first().unwrap();
@@ -626,7 +642,8 @@ fn writing_through_a_mutable_view_bumps_the_changed_tick() {
     );
 }
 
-/// Verifies that immutable `Deref` on `Mut<T>` does not bump the changed tick.
+/// Checks that `Deref` on `Mut<T>`, which only reads, leaves the changed tick
+/// alone.
 #[test]
 fn reading_through_a_shared_view_leaves_the_changed_tick() {
     let mut world = setup_world();
@@ -655,10 +672,10 @@ fn reading_through_a_shared_view_leaves_the_changed_tick() {
     assert_eq!(baseline_tick, after_read_tick);
 }
 
-/// Verifies that `bypass_change_detection()` provides raw access without
-/// bumping change-detection ticks.
+/// Checks that `bypass_change_detection()` gives raw access without moving
+/// the change-detection ticks.
 #[test]
-fn a_bypassing_read_leaves_the_changed_tick() {
+fn a_bypassing_write_leaves_the_changed_tick() {
     let mut world = setup_world();
     world
         .create_entity()
@@ -675,14 +692,14 @@ fn a_bypassing_read_leaves_the_changed_tick() {
 
     // Step 2: mutate through `bypass_change_detection` - the changed
     // tick must not advance.
-    let after_bypass_tick = {
+    let after_bypass_write_tick = {
         let mut query = Query::<(&mut Position,)>::new(&mut world);
         let (mut position,) = query.first().unwrap();
         position.bypass_change_detection().x = 99.0;
         position.last_changed()
     };
 
-    assert_eq!(baseline_tick, after_bypass_tick);
+    assert_eq!(baseline_tick, after_bypass_write_tick);
 
     // Step 3: verify the raw mutation still took effect.
     let mut verify_query = Query::<(&Position,)>::new(&mut world);
@@ -737,7 +754,7 @@ fn the_added_tick_survives_an_archetype_move() {
 // QueryFilter Tests
 // =============================================================================
 
-/// Verifies that `With<T>` filter only matches archetypes containing T.
+/// Checks that `With<T>` matches only archetypes that contain `T`.
 #[test]
 fn a_with_filter_skips_archetypes_without_the_component() {
     let mut world = setup_world();
@@ -759,7 +776,7 @@ fn a_with_filter_skips_archetypes_without_the_component() {
     assert_eq!(matching_x_values, vec![1.0]);
 }
 
-/// Verifies that `Without<T>` filter excludes archetypes containing T.
+/// Checks that `Without<T>` skips archetypes that contain `T`.
 #[test]
 fn a_without_filter_skips_archetypes_that_have_the_component() {
     let mut world = setup_world();
@@ -780,8 +797,8 @@ fn a_without_filter_skips_archetypes_that_have_the_component() {
     assert_eq!(matching_x_values, vec![2.0]);
 }
 
-/// Verifies that `Changed<T>` filter only yields rows whose component changed
-/// since the last run, whether it was mutated or just added.
+/// Checks that `Changed<T>` yields only the rows whose component changed since
+/// the last run, whether it was written to or just added.
 #[test]
 fn a_changed_filter_sees_only_mutated_rows() {
     let mut world = setup_world();
@@ -821,7 +838,8 @@ fn a_changed_filter_sees_only_mutated_rows() {
     assert_eq!(matched_entities, vec![mutated_entity]);
 }
 
-/// Verifies that `Added<T>` filter only yields rows whose component was newly inserted.
+/// Checks that `Added<T>` yields only rows whose component was inserted since
+/// the last run.
 #[test]
 fn an_added_filter_sees_only_new_rows() {
     let mut world = setup_world();
@@ -831,12 +849,12 @@ fn an_added_filter_sees_only_new_rows() {
         .build()
         .unwrap();
 
-    // Step 1: lock in the current tick as the baseline so the existing
-    // entity is NOT considered "added" relative to it.
+    // Step 1: take the current tick as the baseline, so the existing entity
+    // does not count as added.
     world.set_system_last_run(world.change_tick());
 
-    // Step 2: bump the tick (simulating a frame boundary) and insert a
-    // new entity - it should be the only `Added<Position>` hit.
+    // Step 2: advance the tick (as a frame boundary does) and insert a new
+    // entity. It should be the only `Added<Position>` hit.
     world.increment_change_tick();
     let new_entity = world
         .create_entity()
@@ -849,7 +867,7 @@ fn an_added_filter_sees_only_new_rows() {
     assert_eq!(matched_entities, vec![new_entity]);
 }
 
-/// Verifies that `Or` filter combines predicates with logical OR semantics.
+/// Checks that an `Or` matches a row when either branch matches.
 #[test]
 fn an_or_filter_matches_either_branch() {
     let mut world = setup_world();
@@ -885,8 +903,7 @@ fn an_or_filter_matches_either_branch() {
     // Step 2: query with `Or<(Changed<Position>, Changed<Velocity>)>` -
     // both entities should match via their respective branches.
     let mut query = Query::<(Entity,), Or<(Changed<Position>, Changed<Velocity>)>>::new(&mut world);
-    let mut matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let mut matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     matched_entities.sort_by_key(|entity| entity.id());
     let mut expected = vec![position_mutated_entity, velocity_mutated_entity];
     expected.sort_by_key(|entity| entity.id());
@@ -896,9 +913,10 @@ fn an_or_filter_matches_either_branch() {
 /// Verifies that `Or<(With<A>, With<B>)>` matches entities with either component.
 #[test]
 fn an_or_of_two_with_filters_matches_either_component() {
-    // `Or<(With<A>, With<B>)>` must match archetypes containing A *or* B (not
-    // just both): the pairs are `({A},{})` and `({B},{})`, so unioning the
-    // inner includes into one pair would wrongly require both.
+    // `Or<(With<A>, With<B>)>` must match archetypes that contain A or B, not
+    // only those that contain both. The two inner filters each have their own
+    // required set ({A} and {B}); combining them into one required set would
+    // wrongly ask for both.
     let mut world = setup_world();
     let position_entity = world
         .create_entity()
@@ -922,10 +940,8 @@ fn an_or_of_two_with_filters_matches_either_component() {
     // This entity has neither A nor B - should be excluded.
     let _neither_component_entity = world.create_entity().with(Health(10)).build().unwrap();
 
-    // Query for entities that have Position OR Velocity (via With filter).
     let mut query = Query::<(Entity,), Or<(With<Position>, With<Velocity>)>>::new(&mut world);
-    let mut matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let mut matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     matched_entities.sort_by_key(|entity| entity.id());
 
     let mut expected = vec![position_entity, velocity_entity, both_components_entity];
@@ -936,7 +952,8 @@ fn an_or_of_two_with_filters_matches_either_component() {
     );
 }
 
-/// Verifies that `Or` with `With` and `Without` filters correct archetypes.
+/// Verifies that an `Or` mixing `With` and `Without` picks the right
+/// archetypes.
 #[test]
 fn an_or_of_with_and_without_filters_picks_the_right_archetypes() {
     // Or<(With<A>, Without<B>)>: match archetypes containing A, *or*
@@ -959,26 +976,26 @@ fn an_or_of_with_and_without_filters_picks_the_right_archetypes() {
     let health_only_entity = world.create_entity().with(Health(10)).build().unwrap();
 
     let mut query = Query::<(Entity,), Or<(With<Position>, Without<Velocity>)>>::new(&mut world);
-    let mut matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let mut matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     matched_entities.sort_by_key(|entity| entity.id());
 
-    // The Position+Velocity entity has Position → matches via With<Position>
-    // The Velocity-only entity is excluded by Without<Velocity> and has no
-    //   Position → does NOT match either branch → excluded
-    // The health-only entity has neither Position nor Velocity → matches via
-    //   Without<Velocity>
+    // Expected matches:
+    // - Position+Velocity: has Position, so With<Position> matches.
+    // - Velocity only: no Position, so that branch fails, and it has
+    //   Velocity, so Without<Velocity> fails too. Excluded.
+    // - Health only: has neither component, so Without<Velocity> matches.
     let mut expected = vec![position_and_velocity_entity, health_only_entity];
     expected.sort_by_key(|entity| entity.id());
     assert_eq!(matched_entities, expected);
 }
 
-/// Verifies that `Or` mixed with `Changed` correctly combines archetype and row-level filtering.
+/// Checks that an `Or` mixing `With` (archetype level) with `Changed` (row
+/// level) applies both rules.
 #[test]
 fn an_or_branch_combined_with_changed_keeps_both_rules() {
-    // Or<(With<A>, Changed<B>)>: mixed archetype-level (With) and
-    // row-level (Changed) filters. An archetype with A but not B must
-    // NOT panic in Changed<B>::init_state.
+    // Or<(With<A>, Changed<B>)>: one branch filters by archetype (With),
+    // the other by row (Changed). An archetype with A but not B must not
+    // panic when the Changed<B> branch builds its state.
     let mut world = setup_world();
     let position_only_entity = world
         .create_entity()
@@ -1014,16 +1031,14 @@ fn an_or_branch_combined_with_changed_keeps_both_rules() {
         }
     }
 
-    // position_only_entity: has Position (With<Position> matches) → included by
-    //      branch 1. Changed<Velocity> init_state must not panic (Velocity
-    //      absent).
-    // velocity_only_entity: has Velocity, and Velocity was changed → matches
-    //      branch 2.
-    // both_components_entity: has Position → matches branch 1 (also has
-    //      Velocity changed but short-circuits before checking).
+    // Expected matches:
+    // - position_only_entity: has Position, so branch 1 matches. Branch 2
+    //   asks about Velocity, which it does not have, and must not panic.
+    // - velocity_only_entity: Velocity was written to, so branch 2 matches.
+    // - both_components_entity: has Position, so branch 1 matches. Its
+    //   Velocity also changed, but the `Or` stops at the first match.
     let mut query = Query::<(Entity,), Or<(With<Position>, Changed<Velocity>)>>::new(&mut world);
-    let mut matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let mut matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     matched_entities.sort_by_key(|entity| entity.id());
 
     let mut expected = vec![
@@ -1065,15 +1080,19 @@ fn an_or_of_two_without_filters_matches_everything_else() {
     let health_only_entity = world.create_entity().with(Health(10)).build().unwrap();
 
     let mut query = Query::<(Entity,), Or<(Without<Position>, Without<Velocity>)>>::new(&mut world);
-    let mut matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let mut matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     matched_entities.sort_by_key(|entity| entity.id());
 
-    // position_only_entity: lacks Velocity → matches Without<Velocity>
-    // velocity_only_entity: lacks Position → matches Without<Position>
-    // both_components_entity: has both → excluded
-    // health_only_entity: lacks both → matches both branches
-    let mut expected = vec![position_only_entity, velocity_only_entity, health_only_entity];
+    // Expected matches:
+    // - position_only_entity: no Velocity, so Without<Velocity> matches.
+    // - velocity_only_entity: no Position, so Without<Position> matches.
+    // - both_components_entity: has both, so both branches fail.
+    // - health_only_entity: has neither, so both branches match.
+    let mut expected = vec![
+        position_only_entity,
+        velocity_only_entity,
+        health_only_entity,
+    ];
     expected.sort_by_key(|entity| entity.id());
     assert_eq!(
         matched_entities, expected,
@@ -1100,8 +1119,7 @@ fn a_three_way_or_matches_any_branch() {
 
     let mut query =
         Query::<(Entity,), Or<(With<Position>, With<Velocity>, With<Health>)>>::new(&mut world);
-    let mut matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let mut matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     matched_entities.sort_by_key(|entity| entity.id());
 
     assert_eq!(
@@ -1123,34 +1141,35 @@ fn an_or_nested_inside_an_and_tuple_still_applies() {
     // (Or<(With<A>, With<B>)>, Without<C>): Or inside an AND tuple.
     // Match archetypes that (have A or B) AND do NOT have C.
     let mut world = setup_world();
-    // Archetype: Position + Health  (has A, no B, has C=Health → excluded by Without<Health>)
+    // Archetype Position + Health: has A, no B, and has C, so Without<Health>
+    // excludes it.
     let _position_and_health_entity = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
         .with(Health(10))
         .build()
         .unwrap();
-    // Archetype: Position only (has A, no B, no C) → matches
+    // Archetype Position only: has A and no C, so it matches.
     let position_entity = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
         .build()
         .unwrap();
-    // Archetype: Velocity only (no A, has B, no C) → matches
+    // Archetype Velocity only: has B and no C, so it matches.
     let velocity_entity = world
         .create_entity()
         .with(Velocity { x: 0.0, y: 0.0 })
         .build()
         .unwrap();
-    // Archetype: Health only (no A, no B, has C) → OR branch fails, Without fails
+    // Archetype Health only: has no A and no B, and it has C, so both filters
+    // fail.
     let _health_only_entity = world.create_entity().with(Health(10)).build().unwrap();
 
-    let mut query = Query::<
-        (Entity,),
-        (Or<(With<Position>, With<Velocity>)>, Without<Health>),
-    >::new(&mut world);
-    let mut matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let mut query =
+        Query::<(Entity,), (Or<(With<Position>, With<Velocity>)>, Without<Health>)>::new(
+            &mut world,
+        );
+    let mut matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     matched_entities.sort_by_key(|entity| entity.id());
 
     let mut expected = vec![position_entity, velocity_entity];
@@ -1178,8 +1197,7 @@ fn an_entity_only_target_lets_the_or_decide() {
     let _neither_component_entity = world.create_entity().with(Health(10)).build().unwrap();
 
     let mut query = Query::<(Entity,), Or<(With<Position>, With<Velocity>)>>::new(&mut world);
-    let mut matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let mut matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     matched_entities.sort_by_key(|entity| entity.id());
 
     let mut expected = vec![position_entity, velocity_entity];
@@ -1187,7 +1205,7 @@ fn an_entity_only_target_lets_the_or_decide() {
     assert_eq!(matched_entities, expected);
 }
 
-/// Verifies that `Or` filters do not double-count entities matching multiple branches.
+/// Checks that an entity matching several `Or` branches is visited once.
 #[test]
 fn an_or_matching_both_branches_visits_a_row_once() {
     // An entity in an archetype that matches multiple Or branches must
@@ -1201,8 +1219,7 @@ fn an_or_matching_both_branches_visits_a_row_once() {
         .unwrap();
 
     let mut query = Query::<(Entity,), Or<(With<Position>, With<Velocity>)>>::new(&mut world);
-    let matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     assert_eq!(
         matched_entities.len(),
         1,
@@ -1211,12 +1228,12 @@ fn an_or_matching_both_branches_visits_a_row_once() {
     assert_eq!(matched_entities[0], both_components_entity);
 }
 
-/// Verifies that `Or` filters work correctly with parallel iteration.
+/// Checks that an `Or` filter also works on the parallel path.
 #[test]
 fn an_or_filter_applies_on_the_parallel_path() {
-    // Parallel iteration with Or filter - smoke test for correctness.
-    // Uses for_each with a Mutex since ParQueryIter doesn't implement
-    // rayon::ParallelIterator directly.
+    // A `Mutex` collects the results because `ParQueryIter` is not a
+    // `rayon::ParallelIterator` itself; the filter still runs on the worker
+    // threads inside `for_each`.
     use std::sync::Mutex;
 
     let mut world = setup_world();
@@ -1253,9 +1270,9 @@ fn an_or_filter_applies_on_the_parallel_path() {
         50,
         "Or filter with par_iter should find all entities"
     );
-    // Every matching entity exactly once: this is the test that runs the `Or`
-    // filter's row test on the worker threads, so a slice visited twice or
-    // skipped altogether changes the count above.
+    // Every matching entity must appear once. This is the test that runs the
+    // `Or` filter's row check on worker threads, so a slice visited twice, or
+    // not at all, changes the count above.
     let mut seen_entity_ids = std::collections::HashSet::new();
     for entity in &matched_entities {
         assert!(
@@ -1265,7 +1282,8 @@ fn an_or_filter_applies_on_the_parallel_path() {
     }
 }
 
-/// Verifies that `Or` with a unit `()` branch is always true.
+/// Checks that an `Or` with a `()` branch matches every row, because `()`
+/// always matches.
 #[test]
 fn an_or_with_a_unit_branch_matches_every_row() {
     // Or<(With<A>, ())>: the () branch has no restrictions and always
@@ -1285,8 +1303,7 @@ fn an_or_with_a_unit_branch_matches_every_row() {
         .unwrap();
 
     let mut query = Query::<(Entity,), Or<(With<Position>, ())>>::new(&mut world);
-    let mut matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let mut matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     matched_entities.sort_by_key(|entity| entity.id());
 
     // All entities should match because the () branch has no restrictions.
@@ -1298,7 +1315,8 @@ fn an_or_with_a_unit_branch_matches_every_row() {
     );
 }
 
-/// Verifies that `Or` with `()` as the first branch correctly short-circuits.
+/// Checks that `Or` with `()` as its first branch still matches every row. A
+/// branch that restricts nothing makes the whole `Or` restrict nothing.
 #[test]
 fn a_unit_branch_first_still_matches_every_row() {
     // Or<((), With<A>)>: order of branches shouldn't matter. The ()
@@ -1307,17 +1325,16 @@ fn a_unit_branch_first_still_matches_every_row() {
     let health_only_entity = world.create_entity().with(Health(10)).build().unwrap();
 
     let mut query = Query::<(Entity,), Or<((), With<Position>)>>::new(&mut world);
-    let matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     assert_eq!(matched_entities.len(), 1);
     assert_eq!(matched_entities[0], health_only_entity);
 }
 
-/// Verifies that `Or` with duplicate inner filters still produces correct results.
+/// Checks that repeating a filter inside an `Or` changes nothing.
 #[test]
 fn a_repeated_inner_filter_matches_once() {
-    // Or<(With<A>, With<A>)>: redundant inner filters - should behave
-    // identically to a single With<A> (no double-counting, no panic).
+    // Or<(With<A>, With<A>)>: the same filter twice. It should behave like one
+    // With<A> filter: no panic, and no entity counted twice.
     let mut world = setup_world();
     let position_entity = world
         .create_entity()
@@ -1327,8 +1344,7 @@ fn a_repeated_inner_filter_matches_once() {
     let _health_only_entity = world.create_entity().with(Health(10)).build().unwrap();
 
     let mut query = Query::<(Entity,), Or<(With<Position>, With<Position>)>>::new(&mut world);
-    let matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     assert_eq!(
         matched_entities.len(),
         1,
@@ -1337,15 +1353,14 @@ fn a_repeated_inner_filter_matches_once() {
     assert_eq!(matched_entities[0], position_entity);
 }
 
-/// Verifies that AND of two `Or` filters correctly intersects their result sets.
+/// Checks that two `Or` filters in one tuple keep only the rows both accept.
 #[test]
 fn an_and_of_two_ors_requires_both() {
-    // (Or<(With<A>, With<B>)>, Or<(Without<A>, Without<B>)>)
-    // Cross-product: (A or B) AND (not-A or not-B)
-    // = (A and not-B) or (B and not-A)
-    // Entities with only A match; entities with only B match;
-    // entities with both A and B do NOT match (A fails Without<A>,
-    // B fails Without<B>, neither branch of second Or passes).
+    // The tuple is (A or B) AND (not A or not B), which is the same as
+    // (A and not B) or (B and not A). So an entity with only A matches, and
+    // one with only B matches. An entity with both components matches
+    // neither: A fails Without<A> and B fails Without<B>, so the second `Or`
+    // rejects it.
     let mut world = setup_world();
     let position_only_entity = world
         .create_entity()
@@ -1371,16 +1386,16 @@ fn an_and_of_two_ors_requires_both() {
         Or<(Without<Position>, Without<Velocity>)>,
     );
     let mut query = Query::<(Entity,), BothOrsFilter>::new(&mut world);
-    let mut matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let mut matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     matched_entities.sort_by_key(|entity| entity.id());
 
-    // position_only_entity: has A, lacks B → first Or via With<Position>,
-    //     second Or via Without<Velocity> → match
-    // velocity_only_entity: lacks A, has B → first Or via With<Velocity>,
-    //     second Or via Without<Position> → match
-    // both_components_entity: has both → first Or matches (both branches), but
-    //     second Or fails both branches → no match
+    // Expected matches:
+    // - position_only_entity: has A and not B, so the first `Or` matches
+    //   through With<Position> and the second through Without<Velocity>.
+    // - velocity_only_entity: has B and not A, so the first `Or` matches
+    //   through With<Velocity> and the second through Without<Position>.
+    // - both_components_entity: the first `Or` matches, but both branches of
+    //   the second fail, so it does not match.
     let mut expected = vec![position_only_entity, velocity_only_entity];
     expected.sort_by_key(|entity| entity.id());
     assert_eq!(matched_entities, expected);
@@ -1389,7 +1404,7 @@ fn an_and_of_two_ors_requires_both() {
 /// Verifies that a single-element filter tuple works identically to the bare filter.
 #[test]
 fn a_one_element_filter_tuple_still_filters() {
-    // (With<A>,) - single-element filter tuple should behave same as With<A>.
+    // (With<A>,): a one-element filter tuple should behave like With<A> alone.
     let mut world = setup_world();
     let position_entity = world
         .create_entity()
@@ -1398,8 +1413,7 @@ fn a_one_element_filter_tuple_still_filters() {
         .unwrap();
 
     let mut query = Query::<(Entity,), (With<Position>,)>::new(&mut world);
-    let matched_entities: Vec<Entity> =
-        query.iter_mut().map(|(entity,)| entity).collect();
+    let matched_entities: Vec<Entity> = query.iter_mut().map(|(entity,)| entity).collect();
     assert_eq!(matched_entities.len(), 1);
     assert_eq!(matched_entities[0], position_entity);
 }
@@ -1423,11 +1437,11 @@ fn a_changed_filter_is_empty_when_nothing_was_written() {
 }
 
 // =============================================================================
-// Stale shared readers
+// Stale Shared Readers
 // =============================================================================
 
-/// The shared name the three point types below all register under, as the
-/// same component compiled into different binaries would.
+/// The name all three point types below register under. One component
+/// compiled into two binaries would share such a name.
 const SHARED_POINT: &str = "query_tests::SharedPoint";
 
 /// The layout the registry holds: `x`, then `y`.
@@ -1446,8 +1460,9 @@ impl Component for CurrentPoint {
     }
 }
 
-/// A reader built against an older layout of the same component: same size and
-/// alignment, fields swapped - what size and alignment alone cannot catch.
+/// A reader built against an older layout of the same component. The size and
+/// alignment match and only the field order is swapped, so a check on size and
+/// alignment alone would miss it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, pill_engine_macros::PillLayout)]
 struct StalePoint {
@@ -1490,8 +1505,9 @@ fn world_with_a_current_point() -> World {
 }
 
 /// A query whose type declares a different layout of a shared component than
-/// the registered one is refused and matches nothing, alone, mutable, or inside
-/// a tuple; the current layout's query still sees the row.
+/// the registered one is refused and matches nothing. That holds alone, in
+/// mutable form and inside a tuple. A query using the current layout still
+/// sees the row.
 #[test]
 fn a_stale_shared_reader_is_refused() {
     let mut world = world_with_a_current_point();
@@ -1503,7 +1519,10 @@ fn a_stale_shared_reader_is_refused() {
     );
 
     let mut stale_query = Query::<&StalePoint>::new(&mut world);
-    assert_eq!(stale_query.stale_shared_component(), Some(point_component_id));
+    assert_eq!(
+        stale_query.stale_shared_component(),
+        Some(point_component_id)
+    );
     assert_eq!(stale_query.iter_mut().count(), 0);
 
     let mut stale_mutable_query = Query::<&mut StalePoint>::new(&mut world);
@@ -1551,10 +1570,10 @@ fn a_stale_reader_is_reported_once() {
 
 /// A zero batch size cannot reach the slice arithmetic.
 ///
-/// The requested size becomes `entities_per_slice`, which divides every
-/// archetype's rows into slices, so a caller-computed zero would divide by zero
-/// inside `for_each` and take the host down mid-frame. `with_batch_size` raises
-/// the value to one, the finest split the executor can make.
+/// The requested size becomes `entities_per_slice`, the length used to cut
+/// every archetype's rows into slices. A zero from the caller would divide by
+/// zero inside `for_each` and crash the host mid-frame. `with_batch_size`
+/// raises the value to one, the smallest slice the executor can make.
 #[test]
 fn a_zero_batch_size_does_not_panic() {
     let mut world = setup_world();
