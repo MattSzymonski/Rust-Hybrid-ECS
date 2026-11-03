@@ -18,7 +18,6 @@ pill_core = { path = "../pill_core" }
 inventory = "0.3"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
 serde = { version = "1", features = ["derive"] }
 
 # Every feature is the core's; they live here so dependents keep naming
@@ -31,38 +30,6 @@ profiling-minimal = ["pill_engine_core/profiling-minimal"]
 profiling-verify = ["profiling", "pill_engine_core/profiling-verify"]
 hot_patch = ["pill_engine_core/hot_patch"]
 metrics = ["pill_engine_core/metrics"]
-
-[[bench]]
-name = "entity_lifecycle"
-harness = false
-
-[[bench]]
-name = "minimal"
-harness = false
-
-[[bench]]
-name = "query_iteration"
-harness = false
-
-[[bench]]
-name = "shared_component_identity"
-harness = false
-
-[[bench]]
-name = "archetype_migration"
-harness = false
-
-[[bench]]
-name = "scheduler_graph"
-harness = false
-
-[[bench]]
-name = "frame_loop"
-harness = false
-
-[[bench]]
-name = "resource_commands"
-harness = false
 
 [lib]
 name = "pill_engine"
