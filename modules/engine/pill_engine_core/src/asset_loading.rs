@@ -2,8 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - [`World::load_asset`]: the one call a project makes to get a typed handle
-//!   for a file under `res`, with its guid recorded so references can save.
+//! - [`World::load_asset`]: turns a path below `res` into a typed handle, with
+//!   the guid recorded so references can save.
 //! - [`Engine::load_scene_file`]: a `.scene` file instantiated into the world
 //!   from code, through the same [`load_scene`] pass the editor's Open and the
 //!   startup scene run.
@@ -12,10 +12,10 @@
 //!
 //! Assets are named by path: a project writes `"models/helmet.obj"` and gets a
 //! `Handle<Mesh>`, instead of decoding the bytes itself and inventing a name for
-//! the result. The path is resolved through the mounted asset directory, the
-//! type through the file's extension, and the guid is written to the file's
-//! `.meta` when it has none - so the handle a game holds is the same identity a
-//! scene reference saves.
+//! the result. The path is found through the mounted asset directory and the
+//! type comes from the file's extension. A file with no `.meta` gets one with a
+//! new guid, when its directory can be written, so a scene reference saves the
+//! same identity the game holds.
 
 // Standard library
 use std::path::Path;
@@ -30,19 +30,24 @@ use crate::engine::Engine;
 use crate::scene::{load_scene, Scene, SceneDocument, SceneLoad};
 use crate::world::World;
 
+// =============================================================================
+// World
+// =============================================================================
+
 impl World {
-    /// Load the asset at `path` as `T` and return its handle.
+    /// Loads the asset at `path` as `T` and returns its handle.
     ///
-    /// `path` is below the project's asset directory (`res` in a checkout, the
-    /// embedded pack in a shipping build). A file that has no `.meta` gets one
-    /// with a fresh guid, so the handle can be saved as a reference later; a
-    /// path that is already loaded returns its existing handle and decodes
-    /// nothing.
+    /// `path` is below the project's asset directory: `res` in a checkout, the
+    /// embedded pack in a shipping build. A file with no `.meta` gets one
+    /// holding a new guid when its directory can be written, so the handle can
+    /// be saved as a reference later. A path that is already loaded returns its
+    /// existing handle and decodes nothing.
     ///
     /// # Errors
     ///
-    /// Returns why the file could not be read, did not decode as `T`, or named
-    /// an asset of another type.
+    /// Returns the reason when no asset types are registered, when the engine
+    /// has no asset manager, when the file cannot be read or decoded as `T`,
+    /// and when the path names an asset of another type.
     pub fn load_asset<T: ImportedAsset>(&mut self, path: &str) -> Result<Handle<T>, String> {
         let registry = self
             .get_resource::<ImportRegistry>()
@@ -57,9 +62,15 @@ impl World {
     }
 }
 
+// =============================================================================
+// Engine
+// =============================================================================
+
 impl Engine {
-    /// [`World::load_asset`] through the engine, for code that owns the engine
-    /// rather than the world.
+    /// Loads an asset through the engine, for code that owns the engine rather
+    /// than the world.
+    ///
+    /// Behaves as [`World::load_asset`].
     ///
     /// # Errors
     ///
@@ -68,41 +79,47 @@ impl Engine {
         self.world_mut().load_asset::<T>(path)
     }
 
-    /// Instantiate the scene at `path` into this engine's world.
+    /// Loads the scene at `path` into this engine's world.
     ///
-    /// See [`load_scene_asset`], the one scene loader this and every other
-    /// scene entry point share. Entities are created under the stable ids the
-    /// file carries, so references between them resolve.
+    /// Loads through [`load_scene_asset`], which the startup scene also uses.
+    /// Entities are created under the stable ids the file carries, so
+    /// references between them resolve.
     ///
     /// # Errors
     ///
-    /// Returns why the file could not be read or named another asset type.
+    /// As [`load_scene_asset`].
     pub fn load_scene_file(&mut self, path: &str) -> Result<SceneLoad, String> {
         load_scene_asset(self, path)
     }
 }
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Reads the `.scene` at `path` and returns its document and the guid the file
 /// carries.
 ///
-/// The one import step behind every scene launcher - the engine's
-/// [`Engine::load_scene_file`], the startup scene and the editor's Open - so
-/// they cannot disagree about what a scene document is or which asset types it
-/// needs.
+/// Every scene entry point starts here: [`Engine::load_scene_file`], the
+/// startup scene and the editor's Open. Sharing one import step means they
+/// agree on what a scene document is and which asset types it needs.
 ///
 /// # Errors
 ///
-/// Returns why no asset types are registered, why `path` is not a scene file,
-/// or why it could not be imported and kept loaded.
+/// Returns the reason when no asset types are registered, when the engine has
+/// no asset manager, when `path` is not a scene file, or when the file cannot
+/// be imported or does not stay loaded.
 pub fn import_scene_document(
     engine: &mut Engine,
     path: &str,
 ) -> Result<(SceneDocument, Option<AssetGuid>), String> {
+    // Step 1: Find the registry that knows which types import which files.
     let registry = engine
         .world()
         .get_resource::<ImportRegistry>()
         .cloned()
         .ok_or_else(|| format!("no asset types are registered (loading `{path}`)"))?;
+    // Step 2: Refuse a path that is not a scene file.
     if !registry.is_standalone_extension(extension_of(path)) {
         return Err(format!("`{path}` is not a scene file"));
     }
@@ -110,11 +127,11 @@ pub fn import_scene_document(
         .world_mut()
         .get_resource_mut::<crate::asset::AssetManager>()
         .ok_or_else(|| "the engine has no AssetManager".to_string())?;
+    // Step 3: Import the scene and read its document back out. The guid comes
+    // from the file's own header, which a standalone scene always carries.
     let imported = assets
         .import_standalone::<Scene>(Path::new(path))
         .map_err(|error| format!("`{path}` did not load: {error}"))?;
-    // A standalone scene carries its guid in the file's own header; a file with
-    // no header yet has none.
     let guid = imported.guid;
     let document = assets
         .get(imported.handle)
@@ -123,13 +140,13 @@ pub fn import_scene_document(
     Ok((document, guid))
 }
 
-/// The asset index a scene load resolves its references through.
+/// Returns the asset index a scene load resolves its references through.
 ///
-/// The world's [`AssetDatabase`] when the host built one - a shipped pack's
-/// index, or a host that indexed the project - otherwise an index built from
-/// the mounted asset directory, otherwise an empty one. Preferring the resource
-/// is what lets a guid-only reference resolve in a pack build, where no
-/// directory is mounted.
+/// The world's [`AssetDatabase`] comes first, when the host built one: a
+/// shipped pack's index, or an index of the project's files. Without it, the
+/// index is built from the mounted asset directory, and it is empty when
+/// nothing is mounted. That preference is what lets a guid-only reference
+/// resolve in a pack build, where no directory is mounted.
 pub fn scene_database(engine: &Engine) -> AssetDatabase {
     let world = engine.world();
     if let Some(database) = world.get_resource::<AssetDatabase>() {
@@ -144,12 +161,13 @@ pub fn scene_database(engine: &Engine) -> AssetDatabase {
     }
 }
 
-/// Instantiates the `.scene` at `path` into the engine's world.
+/// Loads the `.scene` at `path` into the engine's world.
 ///
-/// The one scene loader: the document comes from [`import_scene_document`] and
-/// the references resolve through [`scene_database`], so every entry point -
-/// the engine's own, the startup scene and the editor's Open - resolves an
-/// asset reference by guid under the same rules.
+/// The document comes from [`import_scene_document`] and the references
+/// resolve through [`scene_database`]. [`Engine::load_scene_file`] and the
+/// startup scene load through here, so both resolve a reference by guid under
+/// the same rules. The editor's Open calls those two helpers as well, but
+/// replaces the world itself because it keeps the scene's guid.
 ///
 /// # Errors
 ///
@@ -160,13 +178,17 @@ pub fn load_scene_asset(engine: &mut Engine, path: &str) -> Result<SceneLoad, St
     Ok(load_scene(engine, &database, &document))
 }
 
-/// The extension of `path`, lowercase and without the dot.
+/// Returns the extension of `path` without the dot, or `""` when it has none.
 fn extension_of(path: &str) -> &str {
     Path::new(path)
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -199,34 +221,34 @@ mod tests {
     }
 
     /// A scratch asset directory, mounted while the test holds the lock.
-    struct Scratch {
-        root: std::path::PathBuf,
+    struct ScratchAssetDirectory {
+        root_directory: std::path::PathBuf,
         _mounted: std::sync::MutexGuard<'static, ()>,
     }
 
-    impl Scratch {
+    impl ScratchAssetDirectory {
         fn new(label: &str) -> Self {
             let mounted = mounted_directory_test_lock();
-            let root = std::env::temp_dir()
+            let root_directory = std::env::temp_dir()
                 .join(format!("pill-load-asset-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            mount_directory(&root);
+            let _ = std::fs::remove_dir_all(&root_directory);
+            std::fs::create_dir_all(&root_directory).unwrap();
+            mount_directory(&root_directory);
             Self {
-                root,
+                root_directory,
                 _mounted: mounted,
             }
         }
 
-        fn write(&self, relative: &str, text: &str) {
-            let path = self.root.join(relative);
+        fn write(&self, relative_path: &str, text: &str) {
+            let path = self.root_directory.join(relative_path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
 
-        fn write_meta(&self, relative: &str, guid: AssetGuid) {
+        fn write_meta(&self, relative_path: &str, guid: AssetGuid) {
             self.write(
-                &format!("{relative}.meta"),
+                &format!("{relative_path}.meta"),
                 &format!(
                     r#"{{"format_version": 1, "asset_type": "pill_engine_core::asset_loading::tests::Prop", "guid": "{guid}", "settings": null}}"#
                 ),
@@ -234,17 +256,18 @@ mod tests {
         }
     }
 
-    impl Drop for Scratch {
+    impl Drop for ScratchAssetDirectory {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.root_directory);
         }
     }
 
-    /// A project loads an asset by path, the guid it was given is the one the
-    /// file's sidecar carries, and loading it again returns the same handle.
+    /// A project loads an asset by path. The guid it was given is the one the
+    /// file's sidecar carries, and a second load of the same path returns the
+    /// same handle.
     #[test]
     fn a_project_loads_an_asset_by_path_and_keeps_its_guid() {
-        let scratch = Scratch::new("by-path");
+        let scratch = ScratchAssetDirectory::new("by-path");
         let guid = AssetGuid::random().expect("a fresh guid");
         scratch.write("props/a.prop", "a note");
         scratch.write_meta("props/a.prop", guid);
@@ -271,12 +294,12 @@ mod tests {
     /// when the host built one, even with a directory mounted.
     ///
     /// A pack build mounts nothing, so its index exists only as the world
-    /// resource; preferring the mounted directory would leave every guid in a
-    /// shipped startup scene unresolved.
+    /// resource. If the lookup preferred the mounted directory, every guid in a
+    /// shipped startup scene would go unresolved.
     #[test]
     fn the_scene_database_prefers_the_worlds_index() {
         // The mounted directory maps the guid to one path...
-        let scratch = Scratch::new("database-preference");
+        let scratch = ScratchAssetDirectory::new("database-preference");
         let guid = AssetGuid::random().expect("a fresh guid");
         scratch.write("props/a.prop", "a note");
         scratch.write_meta("props/a.prop", guid);
@@ -291,21 +314,21 @@ mod tests {
 
         // ...and the index the host would insert maps it to another, so which
         // one a load used is visible in the record it finds.
-        let other_root =
+        let other_root_directory =
             std::env::temp_dir().join(format!("pill-load-asset-other-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&other_root);
-        std::fs::create_dir_all(other_root.join("props")).unwrap();
-        std::fs::write(other_root.join("props/other.prop"), "a note").unwrap();
+        let _ = std::fs::remove_dir_all(&other_root_directory);
+        std::fs::create_dir_all(other_root_directory.join("props")).unwrap();
+        std::fs::write(other_root_directory.join("props/other.prop"), "a note").unwrap();
         std::fs::write(
-            other_root.join("props/other.prop.meta"),
+            other_root_directory.join("props/other.prop.meta"),
             format!(
                 r#"{{"format_version": 1, "asset_type": "pill_engine_core::asset_loading::tests::Prop", "guid": "{guid}", "settings": null}}"#
             ),
         )
         .unwrap();
-        let index = AssetDatabase::from_directory(&other_root, &registry);
+        let asset_index = AssetDatabase::from_directory(&other_root_directory, &registry);
 
-        engine.world_mut().insert_resource(index);
+        engine.world_mut().insert_resource(asset_index);
         let database = scene_database(&engine);
         assert_eq!(
             database.by_guid(guid).map(|record| record.path.as_str()),
@@ -313,14 +336,14 @@ mod tests {
             "the world's index is the one a scene load uses"
         );
 
-        let _ = std::fs::remove_dir_all(&other_root);
+        let _ = std::fs::remove_dir_all(&other_root_directory);
     }
 
     /// A file with no sidecar gets one, so the handle it returns can be saved
     /// as a reference later.
     #[test]
     fn a_source_without_a_sidecar_is_given_a_guid() {
-        let scratch = Scratch::new("no-meta");
+        let scratch = ScratchAssetDirectory::new("no-meta");
         scratch.write("props/b.prop", "another note");
 
         let mut world = World::new();
@@ -337,7 +360,7 @@ mod tests {
             "the load recorded a guid"
         );
         assert!(
-            scratch.root.join("props/b.prop.meta").is_file(),
+            scratch.root_directory.join("props/b.prop.meta").is_file(),
             "the sidecar was written beside the source"
         );
     }
@@ -346,7 +369,7 @@ mod tests {
     /// carries.
     #[test]
     fn a_scene_loads_from_code() {
-        let scratch = Scratch::new("scene");
+        let scratch = ScratchAssetDirectory::new("scene");
         let mut writer = Engine::new();
         let id = EntityId::from_name("crate");
         writer
@@ -373,8 +396,8 @@ mod tests {
         let bytes =
             render_standalone::<Scene>(AssetGuid::random().expect("a fresh guid"), &document)
                 .expect("the scene renders");
-        std::fs::create_dir_all(scratch.root.join("scenes")).unwrap();
-        std::fs::write(scratch.root.join("scenes/a.scene"), bytes).unwrap();
+        std::fs::create_dir_all(scratch.root_directory.join("scenes")).unwrap();
+        std::fs::write(scratch.root_directory.join("scenes/a.scene"), bytes).unwrap();
 
         let mut engine = Engine::new();
         let loaded = engine
@@ -387,18 +410,18 @@ mod tests {
         );
     }
 
-    /// The engine owns its scene type: a fresh engine lists it as a standalone
-    /// type and loads a `.scene` file with nothing else registered.
+    /// The engine registers its own scene type. A fresh engine lists it as a
+    /// standalone type and loads a `.scene` file with nothing else registered.
     #[test]
     fn the_engine_registers_its_own_scene_type() {
-        let scratch = Scratch::new("engine-scene");
+        let scratch = ScratchAssetDirectory::new("engine-scene");
         let bytes = render_standalone::<Scene>(
             AssetGuid::random().expect("a fresh guid"),
             &crate::scene::SceneDocument::default(),
         )
         .expect("the scene renders");
-        std::fs::create_dir_all(scratch.root.join("scenes")).unwrap();
-        std::fs::write(scratch.root.join("scenes/empty.scene"), bytes).unwrap();
+        std::fs::create_dir_all(scratch.root_directory.join("scenes")).unwrap();
+        std::fs::write(scratch.root_directory.join("scenes/empty.scene"), bytes).unwrap();
 
         let mut engine = Engine::new();
         let registry = engine

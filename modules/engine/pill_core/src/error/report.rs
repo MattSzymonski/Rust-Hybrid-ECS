@@ -1,35 +1,37 @@
-//! The miette presentation boundary: styled reports over plain errors.
+//! Turns engine errors into miette reports that print their message with
+//! terminal styling.
 //!
 //! # Responsibilities
 //!
-//! - Wrap one engine error so a miette report prints its message with semantic
-//!   terminal styling while keeping its codes, labels and sources.
-//! - Install the engine's report handler as miette's process-wide hook, and
-//!   turn one error into a report.
+//! - Wrap one engine error so a miette report prints its message with terminal
+//!   styling but still carries the error's codes, labels and sources.
+//! - Install the engine's report handler as miette's process-wide hook.
 //!
 //! # Design
 //!
-//! An error's own `Display` stays plain. Styling belongs to the reporting
-//! boundary, so it lives in an adapter that is only ever constructed here.
+//! An error's own `Display` stays plain text. [`engine_report`] adds the
+//! styling through [`StyledDiagnosticProxy`], so an error type never needs to
+//! know how it is printed.
 
+// Current crate
 use super::*;
 
 // =============================================================================
 // Miette Presentation
 // =============================================================================
 
-/// Presentation-only proxy that renders an engine error's primary message
-/// with semantic terminal styling while keeping its diagnostic metadata.
+/// Prints an engine error's message with terminal styling for a report.
 ///
-/// The original error's `Display` stays plain; this adapter is allowed to
-/// produce styled output because it is the reporting boundary, not the
-/// domain error itself.
+/// Only the message is styled. The error's code, help, labels, severity and
+/// source pass through unchanged. This adapter is allowed to add style because
+/// it is the reporting boundary, not the error type itself.
 pub struct StyledDiagnosticProxy<E> {
-    inner: E,
+    wrapped_error: E,
 }
 
 impl<E> StyledDiagnosticProxy<E> {
-    /// Wrap an engine error for styled terminal reporting.
+    /// Wraps an engine error so a report prints its message with terminal
+    /// styling.
     ///
     /// # Examples
     ///
@@ -39,13 +41,13 @@ impl<E> StyledDiagnosticProxy<E> {
     /// let proxy = StyledDiagnosticProxy::new(BuildError::Cancelled);
     /// assert!(matches!(proxy.into_inner(), BuildError::Cancelled));
     /// ```
-    pub fn new(inner: E) -> Self {
-        Self { inner }
+    pub fn new(wrapped_error: E) -> Self {
+        Self { wrapped_error }
     }
 
-    /// Unwrap the original error.
+    /// Returns the engine error this proxy wraps.
     pub fn into_inner(self) -> E {
-        self.inner
+        self.wrapped_error
     }
 }
 
@@ -54,21 +56,21 @@ where
     E: EngineMessage,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Step 1: Render the semantic message into a private buffer; the inner
-        // scope ends the mutable borrow before the formatter is written.
-        let mut buffer = String::new();
+        // Step 1: Render the styled message into a local string. The block ends
+        // the mutable borrow of that string before the next step writes it.
+        let mut styled_message = String::new();
         {
-            let mut renderer = TerminalMessageRenderer::new(&mut buffer);
-            self.inner.render_message(&mut renderer)?;
+            let mut renderer = TerminalMessageRenderer::new(&mut styled_message);
+            self.wrapped_error.render_message(&mut renderer)?;
         }
-        // Step 2: Emit the finished buffer to the caller's formatter.
-        formatter.write_str(&buffer)
+        // Step 2: Write the finished message to the caller's formatter.
+        formatter.write_str(&styled_message)
     }
 }
 
 impl<E: fmt::Debug> fmt::Debug for StyledDiagnosticProxy<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.inner, formatter)
+        fmt::Debug::fmt(&self.wrapped_error, formatter)
     }
 }
 
@@ -77,7 +79,7 @@ where
     E: EngineMessage + miette::Diagnostic,
 {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.inner.source()
+        self.wrapped_error.source()
     }
 }
 
@@ -86,52 +88,52 @@ where
     E: EngineMessage + miette::Diagnostic,
 {
     fn code<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
-        self.inner.code()
+        self.wrapped_error.code()
     }
 
     fn severity(&self) -> Option<miette::Severity> {
-        self.inner.severity()
+        self.wrapped_error.severity()
     }
 
     fn help<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
-        self.inner.help()
+        self.wrapped_error.help()
     }
 
     fn url<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
-        self.inner.url()
+        self.wrapped_error.url()
     }
 
     fn source_code(&self) -> Option<&dyn miette::SourceCode> {
-        self.inner.source_code()
+        self.wrapped_error.source_code()
     }
 
     fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
-        self.inner.labels()
+        self.wrapped_error.labels()
     }
 
     fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn miette::Diagnostic> + 'a>> {
-        self.inner.related()
+        self.wrapped_error.related()
     }
 
     fn diagnostic_source(&self) -> Option<&dyn miette::Diagnostic> {
-        self.inner.diagnostic_source()
+        self.wrapped_error.diagnostic_source()
     }
 }
 
-/// Terminal-aware report handler: miette's graphical rendering over the
-/// engine's diagnostic metadata.
+/// Prints a report in the terminal, using miette's graphical layout over the
+/// engine's diagnostic data.
 ///
-/// The styled primary message comes from [`engine_report`], which wraps the
-/// error in [`StyledDiagnosticProxy`] before it becomes a report.
+/// The styled message is set up by [`engine_report`], which wraps the error in
+/// [`StyledDiagnosticProxy`] before miette turns it into a report.
 #[derive(Debug)]
 pub struct EngineReportHandler {
-    inner: miette::GraphicalReportHandler,
+    graphical_report_handler: miette::GraphicalReportHandler,
 }
 
 impl Default for EngineReportHandler {
     fn default() -> Self {
         Self {
-            inner: miette::GraphicalReportHandler::new(),
+            graphical_report_handler: miette::GraphicalReportHandler::new(),
         }
     }
 }
@@ -142,7 +144,7 @@ impl miette::ReportHandler for EngineReportHandler {
         error: &dyn miette::Diagnostic,
         formatter: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        self.inner.debug(error, formatter)
+        self.graphical_report_handler.debug(error, formatter)
     }
 }
 
@@ -150,12 +152,13 @@ impl miette::ReportHandler for EngineReportHandler {
 // Free Functions
 // =============================================================================
 
-/// Install the engine report handler as miette's process-wide hook.
+/// Installs the engine report handler as miette's process-wide hook.
 ///
-/// Call once at the top-level reporting boundary, before any report is
-/// printed.
+/// Call it once at the top-level reporting boundary, before anything prints a
+/// report.
 pub fn install_engine_report_handler() {
-    // Every report gets the engine handler.
+    // miette keeps one hook per process, so a second call changes nothing and
+    // the first hook keeps formatting every report.
     let _ = miette::set_hook(Box::new(
         |_error: &(dyn miette::Diagnostic + 'static)| -> Box<dyn miette::ReportHandler> {
             Box::new(EngineReportHandler::default())
@@ -163,10 +166,11 @@ pub fn install_engine_report_handler() {
     ));
 }
 
-/// Convert one engine error into a miette report with semantic styling.
+/// Turns one engine error into a miette report whose message is printed with
+/// terminal styling.
 ///
-/// The report's primary message is the error's own semantic definition,
-/// rendered for a terminal; miette keeps the codes, help, labels and sources.
+/// The message is the one the error defines, rendered for a terminal. miette
+/// still carries the error's code, help, labels and source.
 pub fn engine_report<E>(error: E) -> miette::Report
 where
     E: EngineMessage + miette::Diagnostic + Send + Sync + 'static,

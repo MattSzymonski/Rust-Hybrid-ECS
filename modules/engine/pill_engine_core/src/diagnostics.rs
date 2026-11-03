@@ -4,24 +4,28 @@
 //! # Responsibilities
 //!
 //! - Gather a snapshot of world state: entities, archetypes, columns, the
-//!   component registry, systems and resources.
-//! - Render it as a fixed-width block and print it every interval.
-//! - Register that as an engine-owned system so it survives every hot reload.
+//!   component registry and resources.
+//! - Render it as a fixed-width block for the periodic system to log.
+//! - Supply the system name and the default interval a project registers the
+//!   report with.
 //!
 //! # Design
 //!
 //! Nothing is registered while the engine is built: the setter is the only
-//! call that registers it. It runs as a real scheduler system - listed,
-//! attributed like any other and disableable - registered through
+//! call that registers the report. It runs as a normal scheduler system, so it
+//! appears in the system list, has an owner like every other system, and can
+//! be switched off. The setter registers it through
 //! [`register_system_with_access`](crate::Engine::register_system_with_access)
-//! with an access declaring command use: it reads the whole world, which no
-//! [`SystemParam`](crate::system::SystemParam) exposes, and an access that
-//! conflicts with every other system keeps that read out of a parallel batch.
+//! with an access that declares it uses commands. That declaration makes the
+//! system conflict with every other one, so the scheduler never puts it in a
+//! parallel batch. This matters because the report reads the whole world, and
+//! no [`SystemParam`](crate::system::SystemParam) can describe that read.
+//!
 //! Its owner, [`SystemOwner::ENGINE`](crate::SystemOwner::ENGINE), is one no
 //! reload path clears, so the report survives project and module reloads. It
-//! cannot report `pill_development_host`'s reload graveyard - retired images kept mapped
-//! while their rows migrate - so recycled entity IDs and empty archetypes
-//! stand in for it.
+//! cannot see `pill_development_host`'s reload graveyard, where retired images
+//! stay mapped while their rows migrate, so the recycled entity ID count and
+//! the empty archetype count are the signs of a reload it can show.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -33,56 +37,72 @@ use crate::archetype::ColumnIdentity;
 use crate::component::ComponentId;
 use crate::world::World;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// How often the report prints when a project turns it on.
 ///
-/// Wall-clock rather than a frame count: a frame count prints at whatever rate
-/// the project happens to run at, while a duration reads the same everywhere.
-/// This is the interval [`Engine::set_ecs_diagnostics_interval`] is normally
-/// given; the engine itself registers nothing at it.
+/// This is a wall-clock interval, not a frame count. A frame count would print
+/// at whatever rate the project happens to run at, while a duration prints at
+/// the same rate in every project. It is the interval
+/// [`Engine::set_ecs_diagnostics_interval`] is normally given; the engine
+/// itself registers nothing until that setter is called.
 ///
 /// [`Engine::set_ecs_diagnostics_interval`]: crate::Engine::set_ecs_diagnostics_interval
 pub const DEFAULT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Name the diagnostics system is registered under.
+/// The name the report system is registered under.
 pub const SYSTEM_NAME: &str = "engine_ecs_diagnostics";
 
 // =============================================================================
-// Snapshot
+// ColumnReport
 // =============================================================================
 
-/// One stored component column within an archetype.
+/// One component column stored in one archetype.
 struct ColumnReport {
-    /// Registry bit this component occupies, which is the bit it contributes
-    /// to the owning archetype's mask.
-    bit: Option<u8>,
+    /// The registry bit this component occupies. It is also the bit the
+    /// component sets in the owning archetype's mask.
+    component_bit: Option<u8>,
     /// Registered name of the component.
     name: String,
     /// Bytes one row of this column occupies.
-    stride: usize,
-    /// Whether the column is byte-oriented storage owned by another language.
-    descriptor: bool,
+    row_bytes: usize,
+    /// Whether this column holds rows defined by another language, reached as
+    /// raw bytes rather than through a Rust type.
+    is_descriptor: bool,
 }
+
+// =============================================================================
+// ArchetypeReport
+// =============================================================================
 
 /// One archetype's contribution to the report.
 struct ArchetypeReport {
-    /// The archetype's packed component mask, which is its identity.
-    id: u128,
-    /// Entities currently stored in it.
-    entities: usize,
-    /// Its columns, ordered by mask bit so they read in the same order the
-    /// mask's set bits do.
+    /// The archetype's packed component mask. The mask is also the archetype's
+    /// identity, so this value names it uniquely.
+    component_mask_bits: u128,
+    /// How many entities the archetype currently holds.
+    entity_count: usize,
+    /// Its columns, ordered by mask bit so they read in the same order as the
+    /// mask's set bits.
     columns: Vec<ColumnReport>,
-    /// Bytes every column occupies together.
+    /// Bytes all its columns occupy together.
     total_bytes: usize,
 }
 
+// =============================================================================
+// EcsSnapshot
+// =============================================================================
+
 /// Everything the report shows, gathered in one pass over the world.
 ///
-/// Collected into an owned structure rather than formatted inline so the
-/// world borrow ends before any printing happens, and so the gathering can be
-/// tested without capturing stdout.
+/// The values are collected into an owned structure instead of being formatted
+/// as they are gathered. That ends the borrow of the world before anything is
+/// printed, and it lets a test check the gathered values without capturing
+/// stdout.
 pub struct EcsSnapshot {
-    /// Frame this snapshot was taken on.
+    /// Frame the snapshot was taken on.
     pub frame: u64,
     /// Seconds since startup.
     pub elapsed_seconds: f32,
@@ -102,11 +122,11 @@ pub struct EcsSnapshot {
     pub available_component_slots: usize,
     /// Registered components that declare a cross-binary shared identity.
     pub shared_components: Vec<String>,
-    /// Resources whose type declares a cross-binary shared identity, by
+    /// Resources whose type declares a cross-binary shared identity, listed by
     /// declared name.
     ///
-    /// A shared resource has no `TypeId` naming it in every artifact, so the
-    /// name it declared is the only thing there is to report.
+    /// No `TypeId` names a shared resource in every binary, so the name its
+    /// type declared is the only thing there is to print.
     pub shared_resources: Vec<String>,
     /// Registered components defined by another language at runtime.
     pub descriptor_components: Vec<String>,
@@ -121,20 +141,20 @@ pub struct EcsSnapshot {
 }
 
 impl EcsSnapshot {
-    /// Gather the report from a world.
+    /// Gathers the report from a world.
     ///
-    /// Read-only: nothing here touches a change tick, so the report cannot
-    /// itself make a `Changed<T>` filter fire.
+    /// This only reads: it never touches the change tick, so taking a report
+    /// cannot make a `Changed<T>` filter fire.
     pub fn gather(world: &World) -> Self {
         let registry = world.component_registry();
 
         // Step 1: Name every registered component once, and note which ones
-        // carry an identity other than a plain per-binary `TypeId`.
-        let mut names: BTreeMap<ComponentId, String> = BTreeMap::new();
+        // have an identity other than a plain per-binary `TypeId`.
+        let mut component_names: BTreeMap<ComponentId, String> = BTreeMap::new();
         let mut shared_components = Vec::new();
         let mut descriptor_components = Vec::new();
         for (component_id, _bit, name) in registry.registered_components() {
-            names.insert(component_id, name.to_string());
+            component_names.insert(component_id, name.to_string());
             match component_id {
                 ComponentId::Shared(_) => shared_components.push(name.to_string()),
                 ComponentId::Descriptor(_) => descriptor_components.push(name.to_string()),
@@ -144,9 +164,10 @@ impl EcsSnapshot {
         shared_components.sort();
         descriptor_components.sort();
 
-        // Step 2: Walk the archetypes, accumulating totals and per-archetype
-        // detail, and recording which components are actually stored anywhere.
-        let mut used: Vec<ComponentId> = Vec::new();
+        // Step 2: Visit every archetype. Add up the totals, build the
+        // per-archetype detail, and record which components are stored
+        // somewhere.
+        let mut stored_component_ids: Vec<ComponentId> = Vec::new();
         let mut archetype_reports = Vec::new();
         let mut entities = 0;
         let mut empty_archetypes = 0;
@@ -161,14 +182,14 @@ impl EcsSnapshot {
             let mut columns = Vec::with_capacity(archetype.component_types.len());
             let mut total_bytes = 0;
             for &component_id in &archetype.component_types {
-                if !used.contains(&component_id) {
-                    used.push(component_id);
+                if !stored_component_ids.contains(&component_id) {
+                    stored_component_ids.push(component_id);
                 }
-                // Row bytes, not capacity: what the stored rows actually
-                // occupy, so the total tracks entities rather than allocation.
-                // The column records which lane built it, so the marker comes
-                // from the column itself rather than from which map it is in.
-                let (stride, rows, descriptor) =
+                // Count the bytes the rows really occupy, not the column's
+                // capacity, so the total follows the entities rather than the
+                // allocation. The descriptor marker is read from the column's
+                // own identity, not from how the column was created.
+                let (row_bytes, row_count, is_descriptor) =
                     if let Some(column) = archetype.component_storages.get(component_id) {
                         (
                             column.element_size(),
@@ -178,38 +199,38 @@ impl EcsSnapshot {
                     } else {
                         (0, 0, false)
                     };
-                total_bytes += stride * rows;
+                total_bytes += row_bytes * row_count;
                 columns.push(ColumnReport {
-                    bit: registry.get_bit(&component_id),
-                    name: names
+                    component_bit: registry.get_bit(&component_id),
+                    name: component_names
                         .get(&component_id)
                         .cloned()
                         .unwrap_or_else(|| format!("{component_id:?}")),
-                    stride,
-                    descriptor,
+                    row_bytes,
+                    is_descriptor,
                 });
             }
-            // By mask bit, so the listing reads in the same order the set bits
-            // of the archetype's id do.
-            columns.sort_by_key(|column| (column.bit, column.name.clone()));
+            // Sorted by mask bit, so the listing reads in the same order as the
+            // set bits of the archetype's id.
+            columns.sort_by_key(|column| (column.component_bit, column.name.clone()));
 
             archetype_reports.push(ArchetypeReport {
-                id: archetype.id.0,
-                entities: entity_count,
+                component_mask_bits: archetype.id.0,
+                entity_count,
                 columns,
                 total_bytes,
             });
         }
 
-        // Largest first: a report that is truncated should keep the archetypes
-        // carrying the most rows.
-        archetype_reports.sort_by_key(|report| std::cmp::Reverse(report.entities));
+        // Largest first, so the archetypes holding the most entities are the
+        // ones read at the top.
+        archetype_reports.sort_by_key(|report| std::cmp::Reverse(report.entity_count));
 
-        // Step 3: A registered component no archetype stores is worth showing -
-        // it is either newly registered or orphaned by a reload.
-        let mut unused_components: Vec<String> = names
+        // Step 3: A registered component that no archetype stores is worth
+        // showing: either it was just registered, or a reload orphaned it.
+        let mut unused_components: Vec<String> = component_names
             .iter()
-            .filter(|(component_id, _)| !used.contains(component_id))
+            .filter(|(component_id, _)| !stored_component_ids.contains(component_id))
             .map(|(_, name)| name.clone())
             .collect();
         unused_components.sort();
@@ -224,8 +245,8 @@ impl EcsSnapshot {
                 None => (0, 0.0, 0.0),
             };
 
-        // Step 4: Resources carry no registry entry, so their shared identities
-        // come from the names their types declared.
+        // Step 4: Resources have no registry entry, so the shared ones are
+        // identified by the names their types declared.
         let shared_resources = world.shared_resource_names();
 
         Self {
@@ -248,18 +269,18 @@ impl EcsSnapshot {
         }
     }
 
-    /// Render the snapshot as the block the engine prints.
+    /// Renders the snapshot as the block the engine prints.
     ///
-    /// Returned as a `String` rather than printed directly so a caller can
-    /// route it somewhere other than stdout, and so it can be asserted on.
+    /// Returns a `String` instead of printing, so a caller can send the block
+    /// anywhere it likes and a test can assert on it.
     pub fn render(&self) -> String {
         /// Inner width of the block, in characters.
         const WIDTH: usize = 74;
 
-        // One helper pads every content line to the same width, so the borders
-        // line up whatever the content is. Hand-tuned per-field widths drift
-        // the moment a number grows a digit.
-        fn row(out: &mut String, content: &str) {
+        // Every content line is padded to the same width, so the borders line
+        // up whatever the content is. Widths tuned per field would drift as
+        // soon as a number grew a digit.
+        fn write_row(out: &mut String, content: &str) {
             let length = content.chars().count();
             if length >= WIDTH {
                 let clipped: String = content.chars().take(WIDTH - 1).collect();
@@ -269,13 +290,14 @@ impl EcsSnapshot {
             }
         }
 
-        // Two-part line: `left` runs from the margin, `right` is flushed to
-        // the far edge, and the gap between them absorbs the slack. The left
-        // side is what gets truncated, because the right side is the number
-        // and losing its digits would be worse than losing a name's prefix.
-        fn split_row(out: &mut String, left: &str, right: &str) {
-            // One space before the border, mirroring the margin the left side
-            // starts from, so the figure is not pressed against the edge.
+        // Writes a line in two parts: `left` starts at the margin, `right`
+        // sits against the far edge, and the gap between them takes up the
+        // slack. Only the left side is ever cut short, because the right side
+        // holds a number, and losing digits is worse than losing the start of
+        // a name.
+        fn write_split_row(out: &mut String, left: &str, right: &str) {
+            // One space before the border, matching the margin the left side
+            // starts from, so the number is not pressed against the edge.
             const RIGHT_MARGIN: usize = 1;
             let right_length = right.chars().count() + RIGHT_MARGIN;
             let available = WIDTH.saturating_sub(right_length + 2);
@@ -294,7 +316,7 @@ impl EcsSnapshot {
         let rule = "─".repeat(WIDTH);
 
         let _ = writeln!(out, "┌{rule}┐");
-        row(
+        write_row(
             &mut out,
             &format!(
                 " ECS state · frame {} · {:.1}s elapsed · last frame {:.2} ms",
@@ -303,15 +325,15 @@ impl EcsSnapshot {
         );
         let _ = writeln!(out, "├{rule}┤");
 
-        // Totals: the numbers worth seeing even when nothing else is read.
-        row(
+        // Totals, the numbers worth seeing even when nothing else is read.
+        write_row(
             &mut out,
             &format!(
                 "  entities {:<8} archetypes {:<7} components {:<6} resources {}",
                 self.entities, self.archetypes, self.registered_components, self.resources
             ),
         );
-        row(
+        write_row(
             &mut out,
             &format!(
                 "  recycled ids {:<4} empty arch {:<7} free slots {:<6} tick {}",
@@ -322,26 +344,26 @@ impl EcsSnapshot {
             ),
         );
 
-        // Archetypes, largest first. Each one is headed by a sentence rather
-        // than a column of bare numbers, so the line says what the hex id, the
-        // byte total and the indented names are.
+        // Archetypes, largest first. A line above the list explains the hex id
+        // and the bit of each column, so the per-archetype lines need no
+        // legend of their own.
         let _ = writeln!(out, "├{rule}┤");
         if self.archetype_reports.is_empty() {
-            row(&mut out, "  no archetypes");
+            write_row(&mut out, "  no archetypes");
         } else {
-            row(
+            write_row(
                 &mut out,
                 "  an archetype's id is its component mask; each column shows its bit",
             );
             for archetype in &self.archetype_reports {
                 let _ = writeln!(out, "├{rule}┤");
-                row(
+                write_row(
                     &mut out,
                     &format!(
                         "  archetype 0x{:x} · {} {} · {} in {} column{}",
-                        archetype.id,
-                        archetype.entities,
-                        if archetype.entities == 1 {
+                        archetype.component_mask_bits,
+                        archetype.entity_count,
+                        if archetype.entity_count == 1 {
                             "entity"
                         } else {
                             "entities"
@@ -356,25 +378,26 @@ impl EcsSnapshot {
                     ),
                 );
                 for column in &archetype.columns {
-                    // `rows x stride` rather than a product, so a column whose
-                    // element is unexpectedly large is visible as such.
+                    // Shows `rows × row size` instead of the product, so a
+                    // column whose element is unexpectedly large is visible on
+                    // its line.
                     let size = format!(
                         "{} × {}{}",
-                        archetype.entities,
-                        format_bytes(column.stride),
-                        if column.descriptor { " (desc)" } else { "" },
+                        archetype.entity_count,
+                        format_bytes(column.row_bytes),
+                        if column.is_descriptor { " (desc)" } else { "" },
                     );
-                    let bit = match column.bit {
+                    let bit_label = match column.component_bit {
                         Some(bit) => format!("bit {bit:>3}"),
                         None => "bit   ?".to_string(),
                     };
-                    split_row(&mut out, &format!("    {bit}  {}", column.name), &size);
+                    write_split_row(&mut out, &format!("    {bit_label}  {}", column.name), &size);
                 }
             }
         }
 
-        // Only show the identity breakdowns that have anything in them; an
-        // empty list is noise, not information.
+        // Only lists that have entries are shown, because an empty heading is
+        // noise rather than information.
         let mut sections: Vec<(&str, &Vec<String>)> = Vec::new();
         if !self.shared_components.is_empty() {
             sections.push(("shared identity", &self.shared_components));
@@ -390,9 +413,9 @@ impl EcsSnapshot {
         }
         for (label, entries) in sections {
             let _ = writeln!(out, "├{rule}┤");
-            row(&mut out, &format!("  {label}"));
+            write_row(&mut out, &format!("  {label}"));
             for name in entries {
-                row(&mut out, &format!("    · {name}"));
+                write_row(&mut out, &format!("    · {name}"));
             }
         }
 
@@ -401,7 +424,11 @@ impl EcsSnapshot {
     }
 }
 
-/// Format a byte count with a unit, so a column total reads at a glance.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Formats a byte count with a unit, so a column total reads at a glance.
 fn format_bytes(bytes: usize) -> String {
     const KIB: usize = 1024;
     const MIB: usize = KIB * 1024;
@@ -437,8 +464,8 @@ mod tests {
     }
     impl Component for Velocity {}
 
-    /// An empty world reports zeroes rather than failing, and says so in place
-    /// of printing an empty archetype list.
+    /// An empty world reports zeroes instead of failing, and the block says so
+    /// rather than printing an empty archetype list.
     #[test]
     fn an_empty_world_renders() {
         let world = World::new();
@@ -534,9 +561,9 @@ mod tests {
         );
     }
 
-    /// Gathering the report must not disturb change detection: it is called
-    /// every frame, and a report that bumped a tick would make every
-    /// `Changed<T>` filter fire.
+    /// Gathering the report must leave the world's change tick alone. The
+    /// report system runs during the frame, and every `Changed<T>` filter
+    /// compares row ticks against that counter.
     #[test]
     fn gathering_does_not_touch_the_change_tick() {
         let mut world = World::new();
@@ -552,8 +579,8 @@ mod tests {
         assert_eq!(world.change_tick(), before);
     }
 
-    /// A resource declaring a cross-binary shared identity, and an ordinary one
-    /// to show the listing distinguishes them.
+    /// A resource that declares a cross-binary shared identity, plus an
+    /// ordinary one so the test can show the listing keeps only the shared one.
     #[derive(Debug, Default)]
     struct SharedSettings {
         _value: u32,
@@ -570,8 +597,8 @@ mod tests {
     }
     impl crate::resource::Resource for PlainSettings {}
 
-    /// Only a shared resource is listed by name, because it is the only kind
-    /// whose identity is not already the count line's `TypeId`.
+    /// Only a shared resource is listed by name. An ordinary resource is known
+    /// by its `TypeId`, which has no stable name to print.
     #[test]
     fn only_shared_resources_are_listed_by_name() {
         let mut world = World::new();
@@ -585,8 +612,8 @@ mod tests {
         );
         assert!(snapshot.render().contains("shared resources"));
 
-        // Dropping the shared resource takes its claim with it, so the section
-        // disappears rather than naming a name the world no longer holds.
+        // Dropping the shared resource also drops its claim, so the section
+        // disappears instead of naming a resource the world no longer holds.
         let _ = world.remove_resource::<SharedSettings>();
         assert!(EcsSnapshot::gather(&world).shared_resources.is_empty());
     }

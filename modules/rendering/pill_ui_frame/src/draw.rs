@@ -2,23 +2,27 @@
 //!
 //! # Responsibilities
 //!
-//! - Defines the draw vocabulary a backend consumes: [`DrawList`] with
-//!   vertices, indices, clip rectangles and draw commands, plus the value
-//!   types those carry ([`UiVertex`], [`Color`], [`Rect`], [`TextureId`]).
+//! - Defines the data a backend draws: [`DrawList`], with its vertices, its
+//!   indices and the commands that use them (clip changes and draws), plus the
+//!   values those commands carry ([`UiVertex`], [`Color`], [`Rect`],
+//!   [`TextureId`]).
 //! - Batches consecutive quads that share a texture and no clip change into
 //!   one command, so a run of glyph quads is one draw.
 //!
 //! # Design
 //!
-//! The list is append-only within a frame and cleared between frames.
-//! Positions are logical pixels with the origin at the UI's top-left corner
-//! and y growing down; the backend applies the monitor's scale factor when it
-//! draws. Clips nest: [`DrawList::push_clip`] intersects the given rectangle
-//! with the current clip, and every draw between a push and its matching
-//! [`DrawList::pop_clip`] belongs clipped to it.
+//! The list only grows while a frame is built; the owner clears it before
+//! building the next frame. Positions are logical pixels with the origin at the
+//! UI's top-left corner and y growing down. The backend applies the monitor's
+//! scale factor when it draws.
 //!
-//! Every draw samples a texture its producer carried in the frame's texture
-//! set; a solid fill samples a white texel of one.
+//! Clips nest. The backend intersects each [`DrawList::push_clip`] rectangle
+//! with the clip already in force, and every draw between a push and its
+//! matching [`DrawList::pop_clip`] is clipped to the result.
+//!
+//! Every draw samples a texture that the producer put in the frame's texture
+//! set. A solid fill samples a white texel in one of those textures, because
+//! the format has no separate fill command.
 
 // External crates
 use pill_core::math::Vector2f;
@@ -27,7 +31,10 @@ use pill_core::math::Vector2f;
 // Color
 // =============================================================================
 
-/// A straight-alpha colour in sRGB, one `f32` per channel in `0.0..=1.0`.
+/// A colour in sRGB. Each channel is an `f32` in `0.0..=1.0`.
+///
+/// Alpha is straight, not premultiplied: it is stored on its own and is not
+/// multiplied into the colour channels.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Color {
     /// Red channel.
@@ -36,7 +43,7 @@ pub struct Color {
     pub g: f32,
     /// Blue channel.
     pub b: f32,
-    /// Alpha channel; `0.0` is fully transparent.
+    /// Alpha channel. `0.0` is fully transparent and `1.0` is opaque.
     pub a: f32,
 }
 
@@ -118,28 +125,33 @@ impl Rect {
 // Texture and vertex types
 // =============================================================================
 
-/// Which texture a draw samples: the number its producer carried it under in
-/// the frame's texture set.
+/// Identifies the texture a draw samples.
+///
+/// The number is the one the producer gave the texture in the frame's texture
+/// set.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TextureId(pub u64);
 
-/// One vertex: a position in logical pixels, a texture coordinate in
-/// `0.0..=1.0`, and a colour multiplied into the sampled texel.
+/// One vertex of a UI triangle.
+///
+/// `position` is in logical pixels, `uv` is a texture coordinate in
+/// `0.0..=1.0`, and `color` is multiplied into the sampled texel.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct UiVertex {
     /// Position in logical pixels, y down.
     pub position: Vector2f,
-    /// Texture coordinate; the texture's top-left corner is `(0.0, 0.0)`.
+    /// Texture coordinate. `(0.0, 0.0)` is the texture's top-left corner.
     pub uv: Vector2f,
     /// The vertex colour.
     pub color: Color,
 }
 
-/// One ordered draw operation.
+/// One entry in a [`DrawList`]'s command stream: open a clip, close a clip, or
+/// draw an index range from one texture.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DrawCommand {
-    /// Clip everything after this to `rect` intersected with the current
-    /// clip.
+    /// Clips every draw after this one to `rect`, intersected with the clip
+    /// already in force.
     PushClip(Rect),
     /// Return to the clip that was active before the matching push.
     PopClip,
@@ -158,11 +170,11 @@ pub enum DrawCommand {
 // DrawList
 // =============================================================================
 
-/// A frame's draw work: vertices, indices, and the commands that consume
-/// them, in order.
+/// Everything one frame of UI asks a backend to draw.
 ///
-/// Cleared and rebuilt every frame. The list never owns GPU resources; it is
-/// plain data any backend can read.
+/// It holds the vertices, the indices and the commands that use them, in
+/// submission order. The owner clears and rebuilds it every frame. The list
+/// owns no GPU resources and is plain data any backend can read.
 #[derive(Clone, Debug, Default)]
 pub struct DrawList {
     /// The frame's vertices, referenced by index.
@@ -171,7 +183,7 @@ pub struct DrawList {
     pub indices: Vec<u32>,
     /// Clip changes and draws, in submission order.
     pub commands: Vec<DrawCommand>,
-    /// How many clips are currently open; keeps pushes and pops balanced.
+    /// The number of clips that are currently open, which keeps pushes and pops balanced.
     clip_depth: u32,
 }
 
@@ -181,7 +193,7 @@ impl DrawList {
         DrawList::default()
     }
 
-    /// Whether nothing would be drawn: no vertices and no commands.
+    /// Returns `true` when nothing would be drawn, which means no vertices and no commands.
     pub fn is_empty(&self) -> bool {
         self.vertices.is_empty() && self.commands.is_empty()
     }
@@ -203,21 +215,28 @@ impl DrawList {
         self.commands.push(DrawCommand::PushClip(rect));
     }
 
-    /// Close the most recent [`Self::push_clip`].
+    /// Closes the most recent [`Self::push_clip`].
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when no clip is open, which means there is one
+    /// more pop than push. A release build still records the pop as a
+    /// [`DrawCommand::PopClip`].
     pub fn pop_clip(&mut self) {
         debug_assert!(self.clip_depth > 0, "pop_clip without a matching push_clip");
         self.clip_depth = self.clip_depth.saturating_sub(1);
         self.commands.push(DrawCommand::PopClip);
     }
 
-    /// A rectangle textured from `rect`'s corner-to-corner UV range.
+    /// Appends a rectangle that samples the part of `texture_id` between
+    /// `uv_min` and `uv_max`.
     ///
-    /// Vertices are appended in top-left, top-right, bottom-right,
-    /// bottom-left order, so `uv_min` and `uv_max` map to the corners named
-    /// by their coordinates whatever the texture's orientation.
+    /// The vertices go in top-left, top-right, bottom-right, bottom-left
+    /// order, so `uv_min` is on the rectangle's top-left corner and `uv_max` on
+    /// its bottom-right one, whatever the texture's orientation.
     pub fn push_quad(
         &mut self,
-        texture: TextureId,
+        texture_id: TextureId,
         rect: Rect,
         uv_min: Vector2f,
         uv_max: Vector2f,
@@ -241,26 +260,28 @@ impl DrawList {
         let first_index = self.indices.len() as u32;
         self.indices
             .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-        self.append_draw(texture, first_index, 6);
+        self.append_draw(texture_id, first_index, 6);
     }
 
-    /// Extend the previous draw when it is the same texture and the index
-    /// range is contiguous, else start a new one.
-    fn append_draw(&mut self, texture: TextureId, first_index: u32, index_count: u32) {
+    /// Extends the previous draw command when it samples the same texture and
+    /// the new indices follow the old ones directly. Otherwise it starts a new
+    /// draw command.
+    fn append_draw(&mut self, texture_id: TextureId, first_index: u32, index_count: u32) {
         if let Some(DrawCommand::Draw {
-            texture: previous,
-            first_index: previous_first,
-            index_count: previous_count,
+            texture: previous_texture_id,
+            first_index: previous_first_index,
+            index_count: previous_index_count,
         }) = self.commands.last_mut()
         {
-            if *previous == texture && previous_first.saturating_add(*previous_count) == first_index
+            if *previous_texture_id == texture_id
+                && previous_first_index.saturating_add(*previous_index_count) == first_index
             {
-                *previous_count += index_count;
+                *previous_index_count += index_count;
                 return;
             }
         }
         self.commands.push(DrawCommand::Draw {
-            texture,
+            texture: texture_id,
             first_index,
             index_count,
         });
@@ -275,14 +296,17 @@ impl DrawList {
 mod tests {
     use super::*;
 
-    fn quad_rect(min_x: f32, min_y: f32, size: f32) -> Rect {
-        Rect::from_min_size(Vector2f::new(min_x, min_y), Vector2f::new(size, size))
+    fn quad_rect(min_x: f32, min_y: f32, side_length: f32) -> Rect {
+        Rect::from_min_size(
+            Vector2f::new(min_x, min_y),
+            Vector2f::new(side_length, side_length),
+        )
     }
 
-    /// `push_quad` onto `list` with the whole texture and white colour.
-    fn push(list: &mut DrawList, texture: u64, rect: Rect) {
+    /// Pushes one quad onto `list` that samples the whole texture, in white.
+    fn push_white_quad(list: &mut DrawList, texture_id: u64, rect: Rect) {
         list.push_quad(
-            TextureId(texture),
+            TextureId(texture_id),
             rect,
             Vector2f::ZERO,
             Vector2f::new(1.0, 1.0),
@@ -293,7 +317,7 @@ mod tests {
     #[test]
     fn a_quad_adds_four_vertices_and_six_indices() {
         let mut list = DrawList::new();
-        push(&mut list, 1, quad_rect(0.0, 0.0, 10.0));
+        push_white_quad(&mut list, 1, quad_rect(0.0, 0.0, 10.0));
         assert_eq!(list.vertices.len(), 4);
         assert_eq!(list.indices, [0, 1, 2, 0, 2, 3]);
         assert_eq!(list.vertices[2].uv, Vector2f::new(1.0, 1.0));
@@ -311,8 +335,8 @@ mod tests {
     #[test]
     fn consecutive_quads_of_one_texture_share_a_command() {
         let mut list = DrawList::new();
-        push(&mut list, 3, quad_rect(0.0, 0.0, 8.0));
-        push(&mut list, 3, quad_rect(8.0, 0.0, 8.0));
+        push_white_quad(&mut list, 3, quad_rect(0.0, 0.0, 8.0));
+        push_white_quad(&mut list, 3, quad_rect(8.0, 0.0, 8.0));
         assert_eq!(list.vertices.len(), 8);
         assert_eq!(
             list.commands,
@@ -327,10 +351,10 @@ mod tests {
     #[test]
     fn a_texture_change_or_a_clip_change_starts_a_new_command() {
         let mut list = DrawList::new();
-        push(&mut list, 1, quad_rect(0.0, 0.0, 8.0));
-        push(&mut list, 7, quad_rect(8.0, 0.0, 8.0));
+        push_white_quad(&mut list, 1, quad_rect(0.0, 0.0, 8.0));
+        push_white_quad(&mut list, 7, quad_rect(8.0, 0.0, 8.0));
         list.push_clip(quad_rect(0.0, 0.0, 100.0));
-        push(&mut list, 7, quad_rect(16.0, 0.0, 8.0));
+        push_white_quad(&mut list, 7, quad_rect(16.0, 0.0, 8.0));
         assert_eq!(list.commands.len(), 4);
         assert!(matches!(list.commands[2], DrawCommand::PushClip(_)));
         assert!(matches!(
@@ -351,7 +375,7 @@ mod tests {
         list.clear();
         assert!(list.is_empty());
         assert_eq!(list.commands.len(), 0);
-        // A fresh frame can push again without tripping the balance check.
+        // After `clear`, a new frame can push a clip again without the debug assertion failing.
         list.push_clip(quad_rect(0.0, 0.0, 10.0));
         list.pop_clip();
     }

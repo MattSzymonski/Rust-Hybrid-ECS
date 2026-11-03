@@ -4,8 +4,8 @@
 //! # Responsibilities
 //!
 //! - [`SavedAssetReference`]: the guid that authorizes a reference, a
-//!   non-authoritative path hint beside it, and the sub-asset key the format
-//!   carries.
+//!   non-authoritative path hint beside it, and the sub-asset key it may
+//!   carry.
 //! - [`saved_reference`]: one field value as the form a saved document holds -
 //!   an asset's guid or an entity's stable id.
 //! - [`restore_asset_reference`]: the guid back to a field value, loading the
@@ -16,22 +16,25 @@
 //!
 //! # Design
 //!
-//! A [`crate::asset::Handle`] is a slot index and a generation: exact within
-//! one run, and meaningless in the next, where the same asset lands in whatever
-//! slot it gets. Hot-reload persistence depends on that in-run form, so it keeps the
-//! handle's own serde and never comes through here. Data meant for a later run
-//! - a scene, a material, project data - holds the saved form instead and
-//! resolves it when it is read.
+//! A [`crate::asset::Handle`] is a slot index plus a generation. That pair is
+//! exact while one run lasts, and means nothing in the next run, where the
+//! same asset may sit in a different slot. Hot-reload persistence depends on
+//! that in-run form, so it saves a handle with the handle's own serde and
+//! never passes through this module. Data meant for a later run - a scene, a
+//! material, a render pass - stores the saved form instead, and turns it back
+//! into a handle when the data is read.
 //!
-//! The rule is a pair of functions over [`FieldValue`] rather than a serde
-//! context, which could not do the job: it has no [`AssetManager`] to resolve a
-//! guid against, and a `Handle` cannot hold an unresolved guid because it is
-//! `#[repr(C)]` and `Copy`. Assets therefore resolve on demand, and entities
-//! once the whole document exists.
+//! Resolving a saved reference is a pair of functions over [`FieldValue`], not
+//! a serde context. A serialization context cannot do the job: it has no
+//! [`AssetManager`] to look a guid up in, and a `Handle` cannot hold a guid
+//! waiting to be resolved, because it is `#[repr(C)]` and `Copy`. So an asset
+//! reference is resolved on first use, and an entity reference once the whole
+//! document has been read.
 //!
-//! An unresolvable reference is a missing asset, not a broken program: it is
-//! reported once per guid and resolves to [`crate::asset::Handle::INVALID`],
-//! which the renderer's caches answer with their defaults.
+//! An unresolvable reference means a missing asset, not a broken program. It
+//! is reported once per guid and resolves to
+//! [`crate::asset::Handle::INVALID`], which the renderer's caches answer with
+//! their defaults.
 
 // Standard library
 use std::collections::HashSet;
@@ -56,23 +59,23 @@ use crate::world::World;
 
 /// A saved reference to one asset.
 ///
-/// The guid is what identifies the asset; `path` is a hint kept beside it for
-/// a reader whose database no longer knows the guid (a file copied into
-/// another project keeps working). `sub_asset` is the key a reference to part
-/// of a file names - written only when set, so a document that uses none is no
-/// larger for it.
+/// The guid identifies the asset. `path` is a hint stored beside it for a
+/// reader whose asset database no longer knows the guid, so a file copied into
+/// another project keeps working. `sub_asset` names one part of a file rather
+/// than the whole of it, and is written only when it is set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedAssetReference {
     /// The guid of the referenced asset.
     pub guid: AssetGuid,
     /// The asset's path when the writer knew it, as a non-authoritative hint.
     pub path: Option<String>,
-    /// The sub-asset key inside the file; no loader resolves it.
+    /// The sub-asset key inside the file. No loader reads it.
     pub sub_asset: Option<String>,
 }
 
 impl SavedAssetReference {
-    /// A reference to the asset with `guid`, with no hint and no sub-asset.
+    /// Creates a reference to the asset with `guid`, with no hint and no
+    /// sub-asset key.
     pub const fn new(guid: AssetGuid) -> Self {
         Self {
             guid,
@@ -81,14 +84,14 @@ impl SavedAssetReference {
         }
     }
 
-    /// The same reference carrying the path hint `path`.
+    /// Returns the same reference carrying the path hint `path`.
     #[must_use]
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
         self
     }
 
-    /// The same reference naming `key` inside the file.
+    /// Returns the same reference naming the sub-asset `key` inside the file.
     #[must_use]
     pub fn with_sub_asset(mut self, key: impl Into<String>) -> Self {
         self.sub_asset = Some(key.into());
@@ -96,10 +99,10 @@ impl SavedAssetReference {
     }
 }
 
-/// The object form's fields, as they are written and read.
+/// The fields of the object form, as they are written and read.
 #[derive(Serialize, Deserialize)]
 struct SavedAssetReferenceFields {
-    /// The 32-hex guid.
+    /// The guid, written as 32 hex digits.
     guid: AssetGuid,
     /// The path hint, when the writer knew one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,25 +124,25 @@ impl Serialize for SavedAssetReference {
 }
 
 impl<'de> Deserialize<'de> for SavedAssetReference {
-    /// Reads the object form and the bare hex string a file that carries no
-    /// hint holds.
+    /// Reads the object form, and the bare hex string an older file holds.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        /// Either spelling, told apart by the value's shape.
+        /// One of the two spellings a document may hold, told apart by the
+        /// value's shape.
         #[derive(Deserialize)]
         #[serde(untagged)]
-        enum Stored {
-            /// The current form.
+        enum StoredForm {
+            /// The object form this build writes.
             Object(SavedAssetReferenceFields),
-            /// The guid alone.
-            Bare(AssetGuid),
+            /// The guid alone, as older files write it.
+            BareGuid(AssetGuid),
         }
-        Ok(match Stored::deserialize(deserializer)? {
-            Stored::Object(fields) => Self {
+        Ok(match StoredForm::deserialize(deserializer)? {
+            StoredForm::Object(fields) => Self {
                 guid: fields.guid,
                 path: fields.path,
                 sub_asset: fields.sub_asset,
             },
-            Stored::Bare(guid) => Self::new(guid),
+            StoredForm::BareGuid(guid) => Self::new(guid),
         })
     }
 }
@@ -148,11 +151,12 @@ impl<'de> Deserialize<'de> for SavedAssetReference {
 // One reference field's saved value
 // =============================================================================
 
-/// One reference field's value in a saved document.
+/// The saved value of one reference field.
 ///
-/// An asset reference is an object (its guid, hint and sub-asset key); an
-/// entity reference is the entity's stable id as 32 hex digits. The two cannot
-/// be confused on the way back in: only the asset form is an object.
+/// An asset reference is an object holding its guid, its path hint and its
+/// sub-asset key. An entity reference is the entity's stable id, written as 32
+/// hex digits. Reading cannot confuse the two, because only the asset form is
+/// an object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum SavedReference {
@@ -163,10 +167,12 @@ pub enum SavedReference {
 }
 
 impl<'de> Deserialize<'de> for SavedReference {
-    /// An object is an asset reference; a string is an entity's id. A bare
-    /// string is never read as an asset here: this build always spells an asset
-    /// reference as an object, and the guid-only string a `.material` file
-    /// holds is read by [`AssetReference`](crate::AssetReference) itself.
+    /// Reads an asset reference from an object and an entity id from a string.
+    ///
+    /// A bare string is never read as an asset here. This build always writes
+    /// an asset reference as an object, and the guid-only string an older
+    /// `.material` file holds is read by
+    /// [`AssetReference`](crate::AssetReference) itself.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct ReferenceVisitor;
         impl<'de> serde::de::Visitor<'de> for ReferenceVisitor {
@@ -197,15 +203,15 @@ impl<'de> Deserialize<'de> for SavedReference {
     }
 }
 
-/// The saved form of one field value, or `None` for a value that references
-/// nothing: an unset handle, the null entity, or a field that is not a
-/// reference at all.
+/// Returns the saved form of one field value, or `None` when the value
+/// references nothing: an unset handle, the null entity, or a field that is
+/// not a reference at all.
 ///
-/// The world is what turns a stored handle into an [`EntityId`]; the asset
-/// manager and its registry are what turn a handle into the guid and the path
-/// an asset is known by. A handle whose asset has no guid cannot be saved, and
-/// reads as nothing here rather than as a reference that would later resolve
-/// to the wrong asset.
+/// The world turns a stored entity handle into an [`EntityId`]. The asset
+/// manager and the import registry turn an asset handle into the guid and the
+/// path that identify the asset. An asset handle whose asset has no guid
+/// cannot be saved, so it comes back as `None` here rather than as a reference
+/// that would later resolve to the wrong asset.
 pub fn saved_reference(
     world: &World,
     assets: &AssetManager,
@@ -245,34 +251,35 @@ pub fn saved_reference(
 // Resolving a saved asset back
 // =============================================================================
 
-/// Resolve `saved` to the field value an asset reference field holds, loading
-/// the asset on demand.
+/// Returns the field value that an asset reference field holds for `saved`,
+/// loading the asset on demand.
 ///
-/// The guid is tried first, through the project database. A guid nothing knows
-/// falls back to the path hint, which keeps a reference working after its asset
-/// was copied into another project that assigned it a different guid. That
-/// fallback is reported once per guid, as is a reference that resolves to
-/// nothing, which comes back invalid so one missing asset does not fail the
-/// document that names it.
+/// The guid is tried first, looked up in the project's asset database. A guid
+/// nothing knows falls back to the path hint, which keeps a reference working
+/// after its asset was copied into another project that gave it a different
+/// guid. That fallback is logged once per guid, and so is a reference that
+/// resolves to nothing: it comes back invalid, so one missing asset does not
+/// fail the document that names it.
 ///
-/// The caller writes the value: the manager this loads through and the world
-/// the field lives in cannot be borrowed at the same time.
+/// The caller writes the value into the field. Loading needs a mutable asset
+/// manager, and the world that holds the field cannot be borrowed mutably at
+/// the same time.
 pub fn restore_asset_reference(
     assets: &mut AssetManager,
     database: &AssetDatabase,
     registry: &ImportRegistry,
     saved: &SavedAssetReference,
 ) -> FieldValue {
-    // Try the guid, then the path hint. Written as three flat steps rather than
-    // one nested match: each miss reports once per guid and leaves the
-    // reference invalid rather than failing the document that names it.
+    // Try the guid first, then the path hint. The steps stay flat rather than
+    // nested, so each failure is handled once: every miss is logged once per
+    // guid and leaves the field invalid instead of failing the document.
     let guid_error =
         match registry.load_by_guid(assets, database, saved.guid, MetadataPolicy::ReadIfPresent) {
-            Ok(outcome) => return reference_to(&outcome),
+            Ok(outcome) => return asset_field_value_from_outcome(&outcome),
             Err(error) => error,
         };
     let Some(path) = saved.path.as_deref() else {
-        report_once(
+        report_unresolved_once(
             saved.guid,
             &format!(
                 "resolves to no asset ({guid_error}) and carries no path hint; \
@@ -283,14 +290,14 @@ pub fn restore_asset_reference(
     };
     match registry.load_by_path(assets, Path::new(path), MetadataPolicy::ReadIfPresent) {
         Ok(outcome) => {
-            report_once(
+            report_unresolved_once(
                 saved.guid,
                 &format!("is unknown here; resolved by its path hint `{path}` instead"),
             );
-            reference_to(&outcome)
+            asset_field_value_from_outcome(&outcome)
         }
         Err(path_error) => {
-            report_once(
+            report_unresolved_once(
                 saved.guid,
                 &format!(
                     "resolves to no asset ({guid_error}; the path hint `{path}`: \
@@ -302,8 +309,10 @@ pub fn restore_asset_reference(
     }
 }
 
-/// The reference value a loaded asset's outcome stands for.
-fn reference_to(outcome: &crate::asset_import_registry::ErasedImportOutcome) -> FieldValue {
+/// The asset field value that a loaded asset's outcome describes.
+fn asset_field_value_from_outcome(
+    outcome: &crate::asset_import_registry::ErasedImportOutcome,
+) -> FieldValue {
     FieldValue::Asset {
         asset_type: Some(outcome.type_name.clone()),
         index: outcome.index,
@@ -311,11 +320,12 @@ fn reference_to(outcome: &crate::asset_import_registry::ErasedImportOutcome) -> 
     }
 }
 
-/// Whether this is the first report of `guid` in this process, recording it.
+/// Returns whether this is the first report of `guid` in this process, and
+/// records the guid so later reports of it are not.
 ///
-/// One set serves every lane that reports an unresolvable reference, so a guid
-/// named by both a typed field and a scene entry produces one warning rather
-/// than one per lane.
+/// One set serves every place that reports an unresolvable reference, so a
+/// guid named by both a typed field and a scene entry produces one warning,
+/// not one per caller.
 pub(crate) fn first_report_of(guid: AssetGuid) -> bool {
     static REPORTED: OnceLock<Mutex<HashSet<AssetGuid>>> = OnceLock::new();
     REPORTED
@@ -325,7 +335,8 @@ pub(crate) fn first_report_of(guid: AssetGuid) -> bool {
         .insert(guid)
 }
 
-fn report_once(guid: AssetGuid, reason: &str) {
+/// Logs one warning for `guid`, unless this process already reported it.
+fn report_unresolved_once(guid: AssetGuid, reason: &str) {
     if first_report_of(guid) {
         pill_core::warn!("saved asset reference {guid} {reason}");
     }
@@ -350,11 +361,12 @@ pub struct SavedEntityLink {
 
 /// The entity references a document holds, resolved in one pass.
 ///
-/// A document is read in two steps because a reference may name an entity that
-/// comes later in it: every entity is created first, then the ids are resolved
-/// against the world that now holds them all. A link whose id resolves to no
-/// entity names something that was deleted before the document was written, so
-/// it comes back unresolved rather than being silently cleared.
+/// A document is read in two steps, because a reference may name an entity
+/// that comes later in the same document. Every entity is created first, and
+/// then the ids are resolved against a world that holds them all. A link whose
+/// id matches no entity names something that was deleted before the document
+/// was written, so it comes back unresolved instead of being silently
+/// cleared.
 #[derive(Debug, Default, Clone)]
 pub struct SavedEntityLinks {
     /// The links still waiting for their entity.
@@ -362,7 +374,7 @@ pub struct SavedEntityLinks {
 }
 
 impl SavedEntityLinks {
-    /// Record that `entity`'s `component.field` names the entity `id`.
+    /// Records that `entity`'s `component.field` names the entity `id`.
     pub fn push(&mut self, entity: Entity, component: &str, field: &str, id: EntityId) {
         self.links.push(SavedEntityLink {
             entity,
@@ -372,30 +384,30 @@ impl SavedEntityLinks {
         });
     }
 
-    /// How many links are waiting.
+    /// Returns how many links are waiting.
     #[must_use]
     pub fn len(&self) -> usize {
         self.links.len()
     }
 
-    /// Whether no link is waiting.
+    /// Returns whether no link is waiting.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.links.is_empty()
     }
 
-    /// Write every link into its field; returns how many were written and the
-    /// links whose id named no entity.
+    /// Writes every link into its field.
     ///
-    /// A field that cannot be written counts as unresolved and comes back in
-    /// the second half, because the document named a reference the world could
-    /// not take.
+    /// Returns how many links were written, and the links that stayed
+    /// unresolved. A link stays unresolved when its id names no entity, and
+    /// also when the field refuses the write, because the document named a
+    /// reference the world could not take.
     pub fn resolve(self, world: &mut World) -> (usize, Vec<SavedEntityLink>) {
-        let mut resolved = 0;
-        let mut unresolved = Vec::new();
+        let mut resolved_count = 0;
+        let mut unresolved_links = Vec::new();
         for link in self.links {
             let Some(target) = world.entity_by_id(link.id) else {
-                unresolved.push(link);
+                unresolved_links.push(link);
                 continue;
             };
             let value = FieldValue::Entity {
@@ -403,13 +415,17 @@ impl SavedEntityLinks {
                 generation: target.generation(),
             };
             match world.write_component_field(link.entity, &link.component, &link.field, value) {
-                Ok(()) => resolved += 1,
-                Err(_) => unresolved.push(link),
+                Ok(()) => resolved_count += 1,
+                Err(_) => unresolved_links.push(link),
             }
         }
-        (resolved, unresolved)
+        (resolved_count, unresolved_links)
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -430,7 +446,7 @@ mod tests {
     impl_trait_accessible!(dyn Asset; Text);
 
     impl Text {
-        /// The text the file held.
+        /// Returns the text the asset holds.
         fn text(&self) -> &str {
             &self.0
         }
@@ -480,55 +496,59 @@ mod tests {
         },
     ];
 
+    /// The guid the note's sidecar carries.
     const NOTE_GUID: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
 
     /// A scratch `res` directory, mounted while the test holds the lock, and a
     /// world with the text type and the reference component registered.
     struct Scratch {
-        root: PathBuf,
+        root_directory: PathBuf,
         world: World,
         _mounted: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Scratch {
+        /// Creates the scratch directory, mounts it, and builds a world that
+        /// knows the text type and the reference component.
         fn new(label: &str) -> Self {
             let mounted = mounted_directory_test_lock();
-            let root = std::env::temp_dir().join(format!(
+            let root_directory = std::env::temp_dir().join(format!(
                 "pill-saved-references-{label}-{}",
                 std::process::id()
             ));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            mount_directory(&root);
+            let _ = std::fs::remove_dir_all(&root_directory);
+            std::fs::create_dir_all(&root_directory).unwrap();
+            mount_directory(&root_directory);
             let mut world = World::new();
             world.register_imported_asset::<Text>();
             world.register_component_with_layout::<Refs>(REFS_FIELDS);
-            // The derive records this for a real component; the layout here is
-            // written by hand, so the field's asset type is recorded by hand
-            // too.
+            // A derive records the asset type of a handle field for a real
+            // component. This layout is written by hand, so the asset type is
+            // recorded by hand too.
             world.record_asset_field_type(
                 crate::component::ComponentId::of::<Refs>(),
                 "asset",
                 Text::metadata_type_name(),
             );
             Self {
-                root,
+                root_directory,
                 world,
                 _mounted: mounted,
             }
         }
 
-        fn write(&self, relative: &str, text: &str) {
-            let path = self.root.join(relative);
+        /// Writes `text` to `relative_path` under the scratch directory.
+        fn write(&self, relative_path: &str, text: &str) {
+            let path = self.root_directory.join(relative_path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
 
-        /// A source at `relative` whose sidecar carries `guid`.
-        fn text(&self, relative: &str, guid: &str) {
-            self.write(relative, "hello");
+        /// Writes a text asset at `relative_path` whose sidecar carries `guid`.
+        fn write_text_asset(&self, relative_path: &str, guid: &str) {
+            self.write(relative_path, "hello");
             self.write(
-                &format!("{relative}.meta"),
+                &format!("{relative_path}.meta"),
                 &format!(
                     r#"{{"format_version": 1, "asset_type": "pill_engine::saved_references::tests::Text", "guid": "{guid}", "settings": null}}"#
                 ),
@@ -539,46 +559,50 @@ mod tests {
             self.world.get_resource::<ImportRegistry>().unwrap().clone()
         }
 
+        /// Builds the asset database for the scratch directory.
         fn database(&self) -> AssetDatabase {
-            AssetDatabase::from_directory(&self.root, &self.registry())
+            AssetDatabase::from_directory(&self.root_directory, &self.registry())
         }
     }
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.root_directory);
         }
     }
 
-    fn refs_component() -> String {
+    /// Returns the registered name of the test's reference component.
+    fn refs_component_name() -> String {
         crate::component::ComponentRegistry::registered_name::<Refs>()
     }
 
-    fn guid(text: &str) -> AssetGuid {
+    /// Parses a 32 hex digit guid written in the test source.
+    fn parse_guid(text: &str) -> AssetGuid {
         AssetGuid::parse(text).expect("the test's guid is 32 hexadecimal digits")
     }
 
     /// A component holding a handle and an entity reference round-trips through
     /// the saved form into a fresh world, where it names the same asset and the
-    /// same entity through new handles.
+    /// same entity.
     #[test]
     fn references_round_trip_into_a_fresh_world() {
-        // Step 1: the first world, with the asset loaded and the fields set
-        // from code. The scratch directory is released before the second one
-        // is mounted, because a mounted directory is a process-wide lock.
+        // Step 1: the world that saves, with the asset loaded and the fields
+        // set from code. Its scratch directory is released before the second
+        // one is mounted, because the mounted directory is state shared by the
+        // whole process.
         let (saved_asset, saved_entity) = {
-            let mut first = Scratch::new("round-trip-first");
-            first.text("notes/a.txt", NOTE_GUID);
-            let registry = first.registry();
-            let database = first.database();
-            let world = &mut first.world;
-            let loaded = {
+            let mut saving_scratch = Scratch::new("round-trip-first");
+            saving_scratch.write_text_asset("notes/a.txt", NOTE_GUID);
+            let registry = saving_scratch.registry();
+            let database = saving_scratch.database();
+            let world = &mut saving_scratch.world;
+            let load_outcome = {
                 let assets = world.get_resource_mut::<AssetManager>().unwrap();
                 registry
                     .load_by_guid(
                         assets,
                         &database,
-                        guid(NOTE_GUID),
+                        parse_guid(NOTE_GUID),
                         MetadataPolicy::ReadIfPresent,
                     )
                     .unwrap()
@@ -586,7 +610,7 @@ mod tests {
             {
                 let assets = world.get_resource::<AssetManager>().unwrap();
                 let text = assets
-                    .get(Handle::<Text>::from_raw(loaded.index, loaded.generation))
+                    .get(Handle::<Text>::from_raw(load_outcome.index, load_outcome.generation))
                     .expect("the note loaded");
                 assert_eq!(text.text(), "hello");
             }
@@ -594,7 +618,7 @@ mod tests {
             let holder = world
                 .create_entity()
                 .with(Refs {
-                    asset: Handle::from_raw(loaded.index, loaded.generation),
+                    asset: Handle::from_raw(load_outcome.index, load_outcome.generation),
                     target,
                 })
                 .build()
@@ -602,10 +626,10 @@ mod tests {
 
             let assets = world.get_resource::<AssetManager>().unwrap();
             let asset_value = world
-                .read_component_field(holder, &refs_component(), "asset")
+                .read_component_field(holder, &refs_component_name(), "asset")
                 .unwrap();
             let entity_value = world
-                .read_component_field(holder, &refs_component(), "target")
+                .read_component_field(holder, &refs_component_name(), "target")
                 .unwrap();
             let saved_asset = match saved_reference(world, assets, &registry, &asset_value) {
                 Some(SavedReference::Asset(reference)) => reference,
@@ -615,18 +639,18 @@ mod tests {
                 Some(SavedReference::Entity(id)) => id,
                 other => panic!("the entity saved as {other:?}"),
             };
-            assert_eq!(saved_asset.guid, guid(NOTE_GUID));
+            assert_eq!(saved_asset.guid, parse_guid(NOTE_GUID));
             assert_eq!(saved_asset.path.as_deref(), Some("notes/a.txt"));
             (saved_asset, saved_entity)
         };
 
         // Step 2: a fresh world with its own manager. The asset loads on
         // demand and the entity is created before the link is resolved.
-        let mut second = Scratch::new("round-trip-second");
-        second.text("notes/a.txt", NOTE_GUID);
-        let registry = second.registry();
-        let database = second.database();
-        let world = &mut second.world;
+        let mut restoring_scratch = Scratch::new("round-trip-second");
+        restoring_scratch.write_text_asset("notes/a.txt", NOTE_GUID);
+        let registry = restoring_scratch.registry();
+        let database = restoring_scratch.database();
+        let world = &mut restoring_scratch.world;
         // The document carries the entity's stable id, so the loader builds the
         // entity under that id: that is what makes the link resolvable.
         let new_target = world.create_entity().with_id(saved_entity).build().unwrap();
@@ -643,12 +667,12 @@ mod tests {
             restore_asset_reference(assets, &database, &registry, &saved_asset)
         };
         world
-            .write_component_field(new_holder, &refs_component(), "asset", restored)
+            .write_component_field(new_holder, &refs_component_name(), "asset", restored)
             .unwrap();
         let mut links = SavedEntityLinks::default();
-        links.push(new_holder, &refs_component(), "target", saved_entity);
-        let (resolved, unresolved) = links.resolve(world);
-        assert_eq!((resolved, unresolved.len()), (1, 0));
+        links.push(new_holder, &refs_component_name(), "target", saved_entity);
+        let (resolved_count, unresolved_links) = links.resolve(world);
+        assert_eq!((resolved_count, unresolved_links.len()), (1, 0));
 
         let refreshed: Refs = *world.get_component::<Refs>(new_holder).unwrap();
         let assets = world.get_resource::<AssetManager>().unwrap();
@@ -667,7 +691,7 @@ mod tests {
     #[test]
     fn an_unknown_guid_resolves_by_its_path_hint() {
         let mut scratch = Scratch::new("path-fallback");
-        scratch.text("notes/moved.txt", "11111111111111111111111111111111");
+        scratch.write_text_asset("notes/moved.txt", "11111111111111111111111111111111");
         let registry = scratch.registry();
         let database = scratch.database();
         let world = &mut scratch.world;
@@ -680,21 +704,21 @@ mod tests {
             .build()
             .unwrap();
 
-        let stale = SavedAssetReference::new(guid("99999999999999999999999999999999"))
+        let stale = SavedAssetReference::new(parse_guid("99999999999999999999999999999999"))
             .with_path("notes/moved.txt");
         let restored = {
             let assets = world.get_resource_mut::<AssetManager>().unwrap();
             restore_asset_reference(assets, &database, &registry, &stale)
         };
         world
-            .write_component_field(holder, &refs_component(), "asset", restored)
+            .write_component_field(holder, &refs_component_name(), "asset", restored)
             .unwrap();
 
         let refreshed: Refs = *world.get_component::<Refs>(holder).unwrap();
         let assets = world.get_resource::<AssetManager>().unwrap();
         assert_eq!(
             assets.guid_of(refreshed.asset),
-            Some(guid("11111111111111111111111111111111")),
+            Some(parse_guid("11111111111111111111111111111111")),
             "the file's own guid wins over the document's unknown one"
         );
     }
@@ -707,7 +731,7 @@ mod tests {
         let registry = scratch.registry();
         let database = scratch.database();
         let world = &mut scratch.world;
-        let missing = SavedAssetReference::new(guid("88888888888888888888888888888888"));
+        let missing = SavedAssetReference::new(parse_guid("88888888888888888888888888888888"));
         let restored = {
             let assets = world.get_resource_mut::<AssetManager>().unwrap();
             restore_asset_reference(assets, &database, &registry, &missing)
@@ -715,11 +739,11 @@ mod tests {
         assert_eq!(restored, FieldValue::unset_asset());
     }
 
-    /// The stored forms: the object with a hint, the object without one, and
-    /// the bare hex an older file holds.
+    /// Reads both stored spellings: the object with a path hint, the object
+    /// without one, and the bare hex string an older file holds.
     #[test]
     fn the_saved_asset_reference_reads_both_spellings() {
-        let with_hint = SavedAssetReference::new(guid(NOTE_GUID)).with_path("notes/a.txt");
+        let with_hint = SavedAssetReference::new(parse_guid(NOTE_GUID)).with_path("notes/a.txt");
         let json = serde_json::to_string(&with_hint).unwrap();
         assert_eq!(
             json,
@@ -730,11 +754,11 @@ mod tests {
             with_hint
         );
 
-        let bare = serde_json::to_string(&SavedAssetReference::new(guid(NOTE_GUID))).unwrap();
+        let bare = serde_json::to_string(&SavedAssetReference::new(parse_guid(NOTE_GUID))).unwrap();
         assert_eq!(bare, format!(r#"{{"guid":"{NOTE_GUID}"}}"#));
         assert_eq!(
             serde_json::from_str::<SavedAssetReference>(&format!("\"{NOTE_GUID}\"")).unwrap(),
-            SavedAssetReference::new(guid(NOTE_GUID))
+            SavedAssetReference::new(parse_guid(NOTE_GUID))
         );
     }
 

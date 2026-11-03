@@ -1,4 +1,4 @@
-//! Query system - efficient iteration over entities with specific components.
+//! Queries: iterating the entities that hold a given set of components.
 //!
 //! # Responsibilities
 //!
@@ -10,18 +10,22 @@
 //!
 //! # Design
 //!
-//! A query is parameterized by a target (what data to fetch) and a filter
-//! (which entities to skip). The target folds its component ids into one
-//! [`ComponentMask`](crate::component::ComponentMask); the filter contributes
-//! `(include, exclude)` mask pairs that are OR-ed, and an archetype is skipped
-//! unless the target mask and some filter pair both pass their bitwise AND.
-//! Both levels resolve archetype storage once and hand worker threads raw
-//! pointers, so parallel iteration never repeats a lookup.
+//! A query has a target (the data it fetches for each row) and a filter (the
+//! rows it leaves out). The target turns its component ids into one
+//! [`ComponentMask`](crate::component::ComponentMask). The filter adds
+//! `(include, exclude)` pairs of masks. An archetype passes the filter when it
+//! holds every component in one pair's include mask and none in that pair's
+//! exclude mask. The query yields an archetype only when it passes the target
+//! mask and the filter. A filter with no restrictions adds no pairs, and then
+//! the target mask alone decides.
 //!
-//! [`query`] holds [`Query`] itself; the rest are [`target`], [`filter`],
-//! [`iter`], [`ptr`] (thread-safe raw-pointer wrappers), [`resource`] ([`Res`] /
-//! [`ResMut`]) and [`change_detection`] (the `Mut` smart pointer for tick
-//! tracking).
+//! The target and the filter resolve an archetype's storage once and hand
+//! worker threads raw pointers, so parallel iteration never repeats a lookup.
+//!
+//! [`query`] holds [`Query`] itself. The other modules are [`target`],
+//! [`filter`], [`iter`], [`ptr`] (thread-safe raw-pointer wrappers),
+//! [`resource`] ([`Res`] and [`ResMut`]), and [`change_detection`] (the `Mut`
+//! smart pointer for tick tracking).
 //!
 //! # Examples
 //!
@@ -46,13 +50,13 @@
 //! }
 //!
 //! // Filter on change detection
-//! fn react(mut q: Query<(Entity, &Transform), Changed<Transform>>) {
-//!     for (entity, t) in q.iter_mut() { /* ... */ }
+//! fn react(mut query: Query<(Entity, &Transform), Changed<Transform>>) {
+//!     for (entity, transform) in query.iter_mut() { /* ... */ }
 //! }
 //! ```
 
 /// [`Mut`](change_detection::Mut) smart pointer with tick-based change
-/// detection for components.
+/// detection for components and resources.
 pub(crate) mod change_detection;
 mod filter;
 mod iter;
@@ -64,8 +68,6 @@ mod query;
 mod resource;
 mod target;
 
-// Current crate
-
 // =============================================================================
 // Re-exports
 // =============================================================================
@@ -73,7 +75,7 @@ mod target;
 // Filter predicates and the query filter trait.
 pub use filter::{Added, Changed, Or, QueryFilter, With, Without};
 
-// Sequential and parallel query iterators.
+// Sequential and parallel query iterators, plus their batch statistics.
 pub use iter::{BatchStats, ParQueryIter, QueryIterMut};
 
 // Core query type and resource accessors.
@@ -87,11 +89,11 @@ pub use target::QueryTarget;
 
 /// Cached per-archetype state for parallel iteration.
 ///
-/// One record per matching archetype, built once per `par_iter_mut` call: the
-/// storage pointers the target and the filter resolved, and the row count they
-/// were resolved against.
+/// One record per matching archetype that holds at least one entity, built
+/// once per `par_iter_mut` call. It keeps the target and filter state resolved
+/// for that archetype, and the number of rows they were resolved against.
 pub(crate) struct FilteredArchetypeRange<TargetState, FilterState> {
-    /// Cached storage pointers for the queried components.
+    /// Cached storage pointers this target resolved for the archetype.
     pub(crate) target_state: TargetState,
     /// Cached state the row filter needs for this archetype.
     pub(crate) filter_state: FilterState,

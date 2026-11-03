@@ -25,9 +25,9 @@
 //!   must find exactly where the previous one left it. The executable never
 //!   writes these.
 //! - **pass scratch** - the dialog, the preferences draft, the toolbox, the
-//!   browser, the Inspector, the toasts, the palette and the previews: the
-//!   shell owns them, and they survive a reload only so a redraw continues
-//!   where it was.
+//!   browser, the Inspector, the menu bar, the toasts, the palette, the panel
+//!   windows and the previews: the shell owns them, and they survive a reload
+//!   only so a redraw continues where it was.
 //! - **measurements** - `frame_index`, `stats`, `panel_budget`: the shell
 //!   writes them around each pass; the Statistics tab and the log read them.
 //! - **requests** - `requests` (a pass's asks for the executable, drained onto
@@ -37,15 +37,16 @@
 //!   write it.
 //!
 //! The type lives in this shared `dylib`, not in the reloadable shell
-//! module, so its identity is stable across shell reloads: the arriving
-//! generation's `register` finds the same resource and keeps the context and
-//! the dock exactly where the user left them. A resource whose type the
-//! module defined would be reset by every reload - and the context's drop
-//! code would then run from an unloaded image.
+//! module, so its identity is stable across shell reloads: the reloaded shell
+//! registers the same resource type and keeps the value already in the world,
+//! context and dock included. A resource whose type the module defined would
+//! be reset by every reload - and the context's drop code would then run from
+//! an unloaded image.
 
-// External crates
+// Standard library
 use std::collections::{BTreeMap, BTreeSet};
 
+// External crates
 use egui::{Context, Pos2, Rect, TextureHandle, TextureOptions};
 use pill_engine::Resource;
 
@@ -57,6 +58,32 @@ use crate::layout::{EditorDock, EditorTab};
 use crate::notices::NoticeLevel;
 use crate::requests::ShellRequests;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// How many panel windows one session may have open at once.
+pub const PANEL_WINDOWS_MAX: usize = 8;
+
+/// How many toasts show at once; older ones drop off the stack.
+pub const TOASTS_MAX: usize = 5;
+
+/// Frames a toast stays up - about four seconds at 60 fps.
+pub const TOAST_FRAMES: u64 = 240;
+
+/// How long one panel body may take, in microseconds, before the editor says
+/// so.
+pub const PANEL_BUDGET_MICROS: f32 = 4000.0;
+
+/// How many frames in a row a panel must overshoot its budget before the
+/// editor says so - a single slow frame (a reload, a texture upload) is not a
+/// slow panel.
+pub const PANEL_BUDGET_FRAMES: u32 = 120;
+
+// =============================================================================
+// Types
+// =============================================================================
+
 /// The egui shell's session: the reload handle, the pass scratch, the
 /// measurements and the two requests the shell and the executable exchange.
 ///
@@ -67,21 +94,22 @@ use crate::requests::ShellRequests;
 pub struct EguiShellState {
     /// The egui context: fonts, memory and widget state.
     pub context: Context,
-    /// The dock layout; persisted across restarts.
+    /// The dock layout, persisted across restarts.
     pub dock: EditorDock,
-    /// Completed egui passes; the shell's log cadence reads it.
+    /// How many egui passes the shell has started; the shell's row heartbeat
+    /// and its toast expiry read it.
     pub frame_index: u64,
-    /// The executable's theme generation this session last installed. The
-    /// executable resolves the layers and publishes the
-    /// merged theme on the snapshot; the shell installs it when this moves, so
-    /// a reloaded shell picks up the theme already in force.
+    /// The theme generation this session last installed, as the executable
+    /// publishes it on the snapshot. The shell installs the merged theme
+    /// whenever this number moves, so a reloaded shell starts with the theme
+    /// already in force.
     pub applied_theme_generation: u64,
-    /// The asset dialog that is open, if one is: the create or rename
-    /// window's state, kept here so a shell reload keeps it.
+    /// The open asset dialog, if there is one: the create or rename window's
+    /// state, kept here so a shell reload finds it.
     pub asset_dialog: Option<AssetDialog>,
-    /// The Preferences tab's unsaved field buffers, keyed like the file;
-    /// `None` until the tab seeds them from the snapshot and after a save,
-    /// so the rows re-seed from the file the next frame.
+    /// The Preferences tab's unsaved field values, keyed like the file. It is
+    /// `None` until the tab seeds it from the snapshot and again after a save,
+    /// so the rows re-seed from the file on the next frame.
     pub preferences_draft: Option<BTreeMap<String, String>>,
     /// The floating viewport toolboxes' session state.
     pub toolbox: ToolboxSession,
@@ -91,10 +119,10 @@ pub struct EguiShellState {
     /// The brand mark's texture, uploaded on the first frame and kept for the
     /// session: the context owns it, so a shell reload reuses it.
     pub mark: Option<TextureHandle>,
-    /// The asset tiles' previews: the textures the executable read back and
-    /// uploaded, the tiles it answered without pixels, and the tiles this
-    /// pass drew - one value, because the three answer one question (may this
-    /// tile be asked for now?).
+    /// The asset tiles' previews. One value holds the textures the executable
+    /// sent back, the tiles it answered with no pixels, and the tiles this
+    /// pass drew, because the three together answer one question: may this
+    /// tile be asked for now?
     pub previews: PreviewStates,
     /// The menu bar's logged geometry and its open state.
     pub menubar: MenubarSession,
@@ -104,24 +132,24 @@ pub struct EguiShellState {
     pub toasts: ToastSession,
     /// The command palette's open state and query.
     pub palette: PaletteState,
-    /// The Console tab's filters: the tab edits these, and
-    /// the executable applies them to the history on the next frame.
+    /// The Console tab's filters. The tab edits them, and the executable copies
+    /// them into the Console history before the next snapshot.
     pub console_filters: crate::console::ConsoleFilterSettings,
     /// The asks this pass raised for the executable: a Problems row, an undo
-    /// or redo, a dock tab. `settle_pass` drains the value onto
-    /// [`crate::boundary::EguiShellFrame`] and the executable answers them at
-    /// its frame boundary, so nothing here is read from the session by the
-    /// executable itself.
+    /// or redo, a dock tab. `settle_pass` moves the value onto
+    /// [`crate::boundary::EguiShellFrame`], and the executable answers it at
+    /// its frame boundary, so the executable never reads these from the
+    /// session.
     pub requests: ShellRequests,
     /// The per-tab and whole-pass timings the Statistics tab shows.
     pub stats: StatisticsSession,
     /// Every module panel's build time, and which of them overshoots the
     /// budget.
     pub panel_budget: PanelBudget,
-    /// Whether this session already mapped the saved layout's module tabs
-    /// from the panel ids it carried to the slots the registry assigns today.
-    /// Once per session, not once per shell generation: a reload must not
-    /// undo a dock the user rearranged.
+    /// Whether this session has already mapped the saved layout's panel tabs
+    /// from the ids it was written with to the slots the registry uses today.
+    /// It happens once per session, not once per shell generation, so a
+    /// reload never undoes a dock the user rearranged.
     pub panels_remapped: bool,
     /// The windows the module panels asked for.
     pub panel_windows: PanelWindowSession,
@@ -130,16 +158,13 @@ pub struct EguiShellState {
     /// clears it only in the pass where that panel draws - a request must not
     /// be dropped by a frame where its tab was not on screen.
     pub pending_panel_window: Option<(u16, String)>,
-    /// One egui context per popped-out tab. A popped-out
-    /// window runs its own pass, so it owns its own context - the main one is
-    /// running the dock in the same frame. The map lives in the session for
-    /// the same reason the main context does: a shell reload must find each
-    /// window's widget state where it left it.
+    /// One egui context per popped-out tab: a popped-out window runs its own
+    /// pass, so it needs its own context while the main one runs the dock in
+    /// the same frame. The map lives in the session for the same reason the
+    /// main context does: a shell reload must find each window's widget state
+    /// where it left it.
     pub popout_contexts: std::collections::BTreeMap<EditorTab, Context>,
 }
-
-/// How many panel windows one session may have open at once.
-pub const PANEL_WINDOWS_MAX: usize = 8;
 
 /// One window a panel asked the shell for.
 #[derive(Clone, Debug, PartialEq)]
@@ -148,7 +173,8 @@ pub struct PanelWindowState {
     pub id: String,
     /// The title its bar shows.
     pub title: String,
-    /// The crate that asked for it: its panels' markers decide its lifetime.
+    /// The crate that asked for it. The window closes once that crate's panel
+    /// is no longer alive.
     pub source: String,
     /// The registry slot of the panel that draws it.
     pub slot: u16,
@@ -160,22 +186,23 @@ pub struct PanelWindowState {
     pub modal: bool,
 }
 
-/// The answer a modal window took: Enter accepts, Escape dismisses.
+/// The answer a modal window took: Apply or Enter accepts, Cancel or Escape
+/// dismisses.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PanelWindowAnswer {
-    /// The window that was answered.
+    /// The id of the window that was answered.
     pub window: String,
     /// The crate that owns it.
     pub source: String,
-    /// Whether the answer was Enter rather than Escape.
+    /// Whether the answer accepted rather than dismissed.
     pub accepted: bool,
 }
 
 /// The windows the module panels asked for.
 ///
-/// Session-scoped like the dock: a shell reload keeps every window open, and
-/// only the owning module's unload closes its windows - which is exactly why
-/// the source is recorded on each of them.
+/// Session-scoped like the dock, so a shell reload keeps every window open. A
+/// window closes when the user closes it, when its modal is answered, or when
+/// the panel that owns it is no longer alive.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PanelWindowSession {
     /// The open windows, oldest first.
@@ -186,7 +213,8 @@ pub struct PanelWindowSession {
 }
 
 impl PanelWindowSession {
-    /// Open a window, replacing one with the same id.
+    /// Open a window, replacing one with the same id. Past
+    /// [`PANEL_WINDOWS_MAX`] open windows, the oldest one closes first.
     pub fn open(&mut self, source: &str, slot: u16, request: &crate::panels::PanelWindowRequest) {
         if let Some(existing) = self
             .windows
@@ -227,7 +255,8 @@ impl PanelWindowSession {
         before - self.windows.len()
     }
 
-    /// Whether a modal window is on screen: the editor's input belongs to it.
+    /// The modal window that is on screen, if one is: the editor's input
+    /// belongs to it.
     pub fn modal(&self) -> Option<&PanelWindowState> {
         self.windows.iter().find(|window| window.modal)
     }
@@ -261,15 +290,15 @@ pub struct StatisticsSession {
 }
 
 impl StatisticsSession {
-    /// How strongly one pass moves the mean: a twentieth, so about twenty
-    /// passes settle a value without hiding a real regression for long.
+    /// How strongly one pass moves the mean: one twentieth, so the mean
+    /// catches up with a real change in about twenty passes.
     const WEIGHT: f64 = 0.05;
 
     /// Fold one tab body's time into its entry.
     pub fn record(&mut self, tab: EditorTab, micros: f64) {
         match self.tabs.iter_mut().find(|entry| entry.tab == tab) {
             Some(entry) => {
-                entry.micros = smoothing(entry.micros, micros, Self::WEIGHT);
+                entry.micros = smooth_sample(entry.micros, micros, Self::WEIGHT);
                 entry.passes += 1;
             }
             None => self.tabs.push(TabTiming {
@@ -282,7 +311,7 @@ impl StatisticsSession {
 
     /// Fold one whole shell pass's time in.
     pub fn record_shell(&mut self, micros: u64) {
-        self.shell_micros = smoothing(self.shell_micros, micros as f64, Self::WEIGHT);
+        self.shell_micros = smooth_sample(self.shell_micros, micros as f64, Self::WEIGHT);
         self.shell_passes += 1;
     }
 
@@ -292,15 +321,6 @@ impl StatisticsSession {
             .iter()
             .find(|entry| entry.tab == tab)
             .map_or(0.0, |entry| entry.micros)
-    }
-}
-
-/// One step of an exponential moving average, seeded by the first sample.
-fn smoothing(current: f64, sample: f64, weight: f64) -> f64 {
-    if current <= 0.0 {
-        sample
-    } else {
-        current * (1.0 - weight) + sample * weight
     }
 }
 
@@ -324,16 +344,16 @@ pub struct PaletteState {
     pub logged_query: Option<String>,
 }
 
-/// The floating viewport toolbox's session state: a drag parks
-/// one scene view's toolbox, and the log reports a placement once.
+/// The floating viewport toolbox's session state. A drag moves one scene
+/// view's toolbox, and the log reports each new placement once.
 ///
-/// Session-scoped, like the dock's floating tabs' positions: a restart
-/// starts every toolbox at its default corner.
+/// Session-scoped, like the dock's floating tabs' positions: a restart starts
+/// every toolbox at its default corner.
 pub struct ToolboxSession {
-    /// Per-scene-view panel origins in logical points; `None` until a drag
-    /// parks that view's toolbox, so the default anchor keeps following the
-    /// viewport until the user moves it. One slot per view index, however
-    /// many views the person opened.
+    /// One panel origin per scene view, in logical points. A view's entry
+    /// stays `None` until the user drags its toolbox, so the default anchor
+    /// keeps following the viewport until then; the list has a slot for every
+    /// view index, opened or not.
     pub origins: Vec<Option<Pos2>>,
     /// Per-scene-view panel rectangles whose rows the log already reported,
     /// so the rect lines appear once per placement and once per drag.
@@ -361,7 +381,7 @@ impl ToolboxSession {
         self.origins.get(view).copied().flatten()
     }
 
-    /// Park `view`'s toolbox at `origin`.
+    /// Move `view`'s toolbox to `origin`.
     pub fn set_origin(&mut self, view: usize, origin: Pos2) {
         if self.origins.len() <= view {
             self.origins.resize(view + 1, None);
@@ -369,8 +389,8 @@ impl ToolboxSession {
         self.origins[view] = Some(origin);
     }
 
-    /// Record `view`'s toolbox rectangle as logged, answering whether it is a
-    /// placement the log has not named yet.
+    /// Record `view`'s toolbox rectangle as logged, answering whether this is
+    /// a placement the log has not reported yet.
     ///
     /// Pixel-exact: the panel is dragged as a whole, so a fraction of a point
     /// is a move the user made.
@@ -403,9 +423,10 @@ pub enum MenubarSlot {
 }
 
 /// The menu bar's session state: the logged geometry of the strip, its titles
-/// and each open menu's entries, and which menu and windows are open.
+/// and each open menu's entries, which menu is open, and whether the About
+/// window is open.
 ///
-/// The log reports each placement once (the toolbox's pattern), so a suite can
+/// The log reports each placement once, as the toolbox does, so a suite can
 /// click the titles. The requests the menu items raise do not live here: a
 /// pass's asks for the executable are [`crate::requests::ShellRequests`], and
 /// a dock edit the pass cannot make while the dock draws is the shell's
@@ -439,12 +460,6 @@ pub struct Toast {
     pub expires_at_frame: u64,
 }
 
-/// How many toasts show at once; older ones drop off the stack.
-pub const TOASTS_MAX: usize = 5;
-
-/// Frames a toast stays up - about four seconds at 60 fps.
-pub const TOAST_FRAMES: u64 = 240;
-
 /// The toast stack's session state.
 #[derive(Default)]
 pub struct ToastSession {
@@ -458,11 +473,12 @@ pub struct ToastSession {
     /// How many toasts the shell queued itself, counted up from
     /// [`ToastSession::LOCAL_SEQ_BASE`] so a local toast can never collide
     /// with a host notice's id.
-    local_count: u64,
+    local_toast_count: u64,
 }
 
 impl ToastSession {
-    /// Where the shell's own toasts start their ids: past any host notice's.
+    /// The first id the shell's own toasts take, far above the host's notice
+    /// ids so the two can never collide.
     pub const LOCAL_SEQ_BASE: u64 = u64::MAX / 2;
 
     /// Queue one toast the shell itself produced - a panel over its budget,
@@ -471,8 +487,8 @@ impl ToastSession {
         if self.toasts.len() >= TOASTS_MAX {
             self.toasts.pop_front();
         }
-        let seq = Self::LOCAL_SEQ_BASE + self.local_count;
-        self.local_count += 1;
+        let seq = Self::LOCAL_SEQ_BASE + self.local_toast_count;
+        self.local_toast_count += 1;
         self.toasts.push_back(Toast {
             seq,
             level,
@@ -482,14 +498,6 @@ impl ToastSession {
         seq
     }
 }
-
-/// How long one panel may take before the editor says so.
-pub const PANEL_BUDGET_MICROS: f32 = 4000.0;
-
-/// How many frames in a row a panel must overshoot its budget before the
-/// editor says so - a single slow frame (a reload, a texture upload) is not a
-/// slow panel.
-pub const PANEL_BUDGET_FRAMES: u32 = 120;
 
 /// One panel's build time and how long it has been over budget.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -532,6 +540,7 @@ impl PanelBudget {
     /// sits just over budget every frame is slow, and a panel that is fast
     /// again resets the count, so only a sustained overshoot warns.
     pub fn record(&mut self, slot: u16, micros: f32) -> bool {
+        // Step 1: find the panel's entry, adding one on its first timed pass.
         let index = match self.entries.iter().position(|entry| entry.slot == slot) {
             Some(index) => index,
             None => {
@@ -543,12 +552,14 @@ impl PanelBudget {
             }
         };
         let entry = &mut self.entries[index];
+        // Step 2: fold this pass into the smoothed mean.
         entry.micros = if entry.passes == 0 {
             micros
         } else {
             entry.micros * (1.0 - Self::WEIGHT) + micros * Self::WEIGHT
         };
         entry.passes += 1;
+        // Step 3: count a run of slow passes and report it once.
         if micros > PANEL_BUDGET_MICROS {
             entry.slow_frames = entry.slow_frames.saturating_add(1);
         } else {
@@ -566,8 +577,8 @@ impl PanelBudget {
         self.entries.iter().find(|entry| entry.slot == slot)
     }
 
-    /// Whether the slot's panel is currently over budget and warned about it:
-    /// what the tab draws its badge from.
+    /// Whether the slot's panel has been reported as over budget. It stays
+    /// true for the session, and the dock's tab title adds `(slow)` from it.
     pub fn is_slow(&self, slot: u16) -> bool {
         self.get(slot).is_some_and(|entry| entry.warned)
     }
@@ -576,25 +587,25 @@ impl PanelBudget {
 /// The rectangles a pass last reported, so a placement reaches the log once
 /// rather than once a frame.
 ///
-/// One type for every "log this rectangle once" cache: the comparison rule is
-/// [`Self::remember`]'s, the prune is [`Self::forget_missing`]'s and dropping
-/// everything is [`Self::clear`]'s, so eleven collections cannot drift into
-/// eleven rules.
+/// One type serves every "log this rectangle once" cache: [`Self::remember`]
+/// decides whether a rectangle differs from the last one, [`Self::forget_missing`]
+/// drops keys that stopped drawing, and [`Self::clear`] drops everything, so
+/// the caches cannot drift into separate rules.
 ///
-/// A placement is compared **quantized** to whole points by default, because
+/// A placement is compared **rounded to whole points** by default, because
 /// egui lays a panel out in fractional points: a fraction of a point of jitter
 /// is the same place, and a line per frame of it is noise. A caller that needs
-/// the pixel-exact comparison says so with [`Self::remember_exact`].
+/// a pixel-exact comparison says so with [`Self::remember_exact`].
 #[derive(Clone, Debug)]
 pub struct LoggedRects<K: Ord + Clone> {
-    /// The rectangle last logged per key, as it was logged.
-    entries: BTreeMap<K, Rect>,
+    /// The rectangle last remembered per key.
+    rects_by_key: BTreeMap<K, Rect>,
 }
 
 impl<K: Ord + Clone> Default for LoggedRects<K> {
     fn default() -> Self {
         Self {
-            entries: BTreeMap::new(),
+            rects_by_key: BTreeMap::new(),
         }
     }
 }
@@ -603,10 +614,10 @@ impl<K: Ord + Clone> LoggedRects<K> {
     /// Record `rect` for `key`, answering whether it is a placement to log.
     pub fn remember(&mut self, key: K, rect: Rect) -> bool {
         let quantized = Self::quantize(rect);
-        match self.entries.get(&key) {
+        match self.rects_by_key.get(&key) {
             Some(logged) if Self::quantize(*logged) == quantized => false,
             _ => {
-                self.entries.insert(key, quantized);
+                self.rects_by_key.insert(key, quantized);
                 true
             }
         }
@@ -615,56 +626,56 @@ impl<K: Ord + Clone> LoggedRects<K> {
     /// [`Self::remember`] without the quantization: any pixel difference is a
     /// new placement.
     pub fn remember_exact(&mut self, key: K, rect: Rect) -> bool {
-        match self.entries.get(&key) {
+        match self.rects_by_key.get(&key) {
             Some(logged) if *logged == rect => false,
             _ => {
-                self.entries.insert(key, rect);
+                self.rects_by_key.insert(key, rect);
                 true
             }
         }
     }
 
-    /// The rectangle last logged for `key`.
+    /// The rectangle last remembered for `key`.
     #[must_use]
     pub fn get(&self, key: &K) -> Option<Rect> {
-        self.entries.get(key).copied()
+        self.rects_by_key.get(key).copied()
     }
 
     /// Every remembered key with its rectangle, in key order.
     pub fn iter(&self) -> impl Iterator<Item = (&K, Rect)> {
-        self.entries.iter().map(|(key, rect)| (key, *rect))
+        self.rects_by_key.iter().map(|(key, rect)| (key, *rect))
     }
 
     /// Whether `key` has a logged rectangle.
     #[must_use]
     pub fn contains(&self, key: &K) -> bool {
-        self.entries.contains_key(key)
+        self.rects_by_key.contains_key(key)
     }
 
-    /// Drop every key `seen` does not name.
+    /// Drop every key that `seen` does not name.
     ///
-    /// A row that stopped drawing is struck off instead of keeping its last
+    /// A row that stopped drawing is dropped instead of keeping its last
     /// placement forever: the geometry of everything a session has ever drawn
-    /// is not worth remembering, and an unbounded cache of it is a slow leak.
+    /// is not worth remembering, and a cache that never shrinks is a slow leak.
     pub fn forget_missing(&mut self, seen: &BTreeSet<K>) {
-        self.entries.retain(|key, _| seen.contains(key));
+        self.rects_by_key.retain(|key, _| seen.contains(key));
     }
 
     /// Drop every entry.
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.rects_by_key.clear();
     }
 
     /// How many rectangles are remembered.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.rects_by_key.len()
     }
 
     /// Whether nothing is remembered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.rects_by_key.is_empty()
     }
 
     /// Whether two rectangles are the same placement under [`Self::remember`]'s
@@ -687,14 +698,14 @@ impl<K: Ord + Clone> LoggedRects<K> {
 /// rather than once a frame.
 #[derive(Clone, Debug)]
 pub struct LoggedTexts<K: Ord + Clone> {
-    /// The text last logged per key.
-    entries: BTreeMap<K, String>,
+    /// The text last remembered per key.
+    texts_by_key: BTreeMap<K, String>,
 }
 
 impl<K: Ord + Clone> Default for LoggedTexts<K> {
     fn default() -> Self {
         Self {
-            entries: BTreeMap::new(),
+            texts_by_key: BTreeMap::new(),
         }
     }
 }
@@ -703,10 +714,10 @@ impl<K: Ord + Clone> LoggedTexts<K> {
     /// Record `text` for `key`, answering whether it changed since the last
     /// draw that reported it.
     pub fn remember(&mut self, key: K, text: &str) -> bool {
-        match self.entries.get(&key) {
+        match self.texts_by_key.get(&key) {
             Some(logged) if logged == text => false,
             _ => {
-                self.entries.insert(key, text.to_owned());
+                self.texts_by_key.insert(key, text.to_owned());
                 true
             }
         }
@@ -715,34 +726,36 @@ impl<K: Ord + Clone> LoggedTexts<K> {
     /// The text last logged for `key`.
     #[must_use]
     pub fn get(&self, key: &K) -> Option<&str> {
-        self.entries.get(key).map(String::as_str)
+        self.texts_by_key.get(key).map(String::as_str)
     }
 
     /// Every remembered key with its text, in key order.
     pub fn iter(&self) -> impl Iterator<Item = (&K, &str)> {
-        self.entries.iter().map(|(key, text)| (key, text.as_str()))
+        self.texts_by_key
+            .iter()
+            .map(|(key, text)| (key, text.as_str()))
     }
 
     /// Drop every key `seen` does not name; see [`LoggedRects::forget_missing`].
     pub fn forget_missing(&mut self, seen: &BTreeSet<K>) {
-        self.entries.retain(|key, _| seen.contains(key));
+        self.texts_by_key.retain(|key, _| seen.contains(key));
     }
 
     /// Drop every entry.
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.texts_by_key.clear();
     }
 
     /// How many texts are remembered.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.texts_by_key.len()
     }
 
     /// Whether nothing is remembered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.texts_by_key.is_empty()
     }
 }
 
@@ -782,9 +795,10 @@ pub struct InspectorSession {
     pub asset_row_rects: LoggedRects<String>,
     /// Whether the row and section rectangles reach the log.
     ///
-    /// The frontend sets it from the frame's [`crate::boundary::EguiShellInput`]:
-    /// a scripted run reads these rectangles to aim a click or a drop, and a
-    /// person's editor does not need a line per placement.
+    /// The shell sets it from the frame's `scripted` flag
+    /// ([`crate::boundary::EguiShellInput`]): a scripted run reads these
+    /// rectangles to aim a click or a drop, and a person's editor does not
+    /// need a line per placement.
     pub log_rects: bool,
     /// Each asset reference row's last logged text, keyed the same way: the
     /// row logs again whenever it draws a different asset.
@@ -849,10 +863,10 @@ impl InspectorSession {
     /// Start a frame of geometry reporting: drop the rows and badges the
     /// previous frame did not draw, then collect this frame's.
     ///
-    /// The seen sets accumulate every pass of a frame, the main dock pass and
-    /// the popped-out tabs', so a tab that draws in its own window still counts
-    /// as drawn. Without the prune the two caches grow with every entity the
-    /// session ever listed and never shrink again; a hidden row's rectangle is
+    /// The seen sets collect every pass of a frame, the main dock pass and the
+    /// popped-out tabs' passes, so a tab drawn in its own window still counts
+    /// as drawn. Without the prune the two caches would grow with every entity
+    /// the session ever listed and never shrink; a hidden row's rectangle is
     /// not one a suite can click, so forgetting it costs nothing - it logs
     /// again when the row comes back.
     pub fn begin_geometry_pass(&mut self) {
@@ -863,87 +877,88 @@ impl InspectorSession {
     }
 }
 
-/// The preview state of every asset tile, keyed by the panel's row key.
+/// The preview state of every asset tile, keyed by the tile's row key.
 ///
-/// One value instead of three parallel collections. A key is ready, refused or
-/// neither; the visible list is rebuilt every pass; and the two rules that have
-/// to agree live here rather than in a convention between the shell and the
-/// executable: a key is never both ready and refused ([`PreviewStates::mark_ready`]
-/// clears the refusal, [`PreviewStates::mark_refused`] drops the texture), and
-/// only a tile this pass drew is asked for ([`PreviewStates::wants`]).
+/// One value holds the three things the shell and the executable have to agree
+/// on: which tiles have a texture, which were answered with no pixels, and
+/// which this pass drew. The rules that keep them consistent live here: a key
+/// is never both ready and refused ([`PreviewStates::mark_ready`] clears the
+/// refusal, [`PreviewStates::mark_refused`] drops the texture), and only a tile
+/// this pass drew is asked for ([`PreviewStates::wants`]).
 #[derive(Default)]
 pub struct PreviewStates {
-    ready: BTreeMap<String, TextureHandle>,
-    refused: BTreeSet<String>,
-    visible: Vec<String>,
+    /// The textures ready to draw, by key.
+    ready_textures: BTreeMap<String, TextureHandle>,
+    /// The keys the executable answered without pixels.
+    refused_keys: BTreeSet<String>,
+    /// The keys the grid drew this pass, in draw order.
+    visible_keys: Vec<String>,
 }
 
 impl PreviewStates {
     /// Start a pass: the visible list is whatever this pass draws.
     pub fn begin_pass(&mut self) {
-        self.visible.clear();
+        self.visible_keys.clear();
     }
 
     /// Record one tile the grid drew, in draw order.
     pub fn push_visible(&mut self, key: &str) {
-        self.visible.push(key.to_string());
+        self.visible_keys.push(key.to_string());
     }
 
     /// The keys this pass drew, in draw order.
     #[must_use]
     pub fn visible(&self) -> &[String] {
-        &self.visible
+        &self.visible_keys
     }
 
     /// The rendered texture for `key`, when there is one.
     #[must_use]
     pub fn ready(&self, key: &str) -> Option<&TextureHandle> {
-        self.ready.get(key)
+        self.ready_textures.get(key)
     }
 
     /// Whether `key` may be requested now: drawn this pass, not ready, not
     /// refused.
     #[must_use]
     pub fn wants(&self, key: &str) -> bool {
-        self.visible.iter().any(|visible| visible == key)
-            && !self.ready.contains_key(key)
-            && !self.refused.contains(key)
+        self.visible_keys.iter().any(|visible| visible == key)
+            && !self.ready_textures.contains_key(key)
+            && !self.refused_keys.contains(key)
     }
 
     /// Record a rendered texture for `key`.
     pub fn mark_ready(&mut self, key: &str, texture: TextureHandle) {
-        self.refused.remove(key);
-        self.ready.insert(key.to_string(), texture);
+        self.refused_keys.remove(key);
+        self.ready_textures.insert(key.to_string(), texture);
     }
 
     /// Record that `key` was answered without pixels: an undecodable file or a
-    /// frame that drew nothing. The tile keeps its type icon and the grid asks
+    /// frame that drew nothing. The tile keeps its type icon, and the grid asks
     /// for the next one instead of waiting on this one forever.
     pub fn mark_refused(&mut self, key: &str) {
-        self.ready.remove(key);
-        self.refused.insert(key.to_string());
+        self.ready_textures.remove(key);
+        self.refused_keys.insert(key.to_string());
     }
 
-    /// Drop every preview whose key the listing still holds, when `unchanged`
-    /// says so.
+    /// Keep only the previews whose key is in `kept`; the listing passes the
+    /// rows that did not change, so only their textures survive a refresh.
     pub fn retain_keys(&mut self, kept: &BTreeSet<String>) {
-        self.ready.retain(|key, _| kept.contains(key));
-        self.refused.retain(|key| kept.contains(key));
+        self.ready_textures.retain(|key, _| kept.contains(key));
+        self.refused_keys.retain(|key| kept.contains(key));
     }
 
     /// Forget the refusals, so the next pass asks for those tiles again.
     pub fn clear_refused(&mut self) {
-        self.refused.clear();
+        self.refused_keys.clear();
     }
 
     /// Forget every preview.
     pub fn clear(&mut self) {
-        self.ready.clear();
-        self.refused.clear();
+        self.ready_textures.clear();
+        self.refused_keys.clear();
     }
 }
-
-impl Resource for EguiShellState {}
 
 /// What one generation's claim on the session's egui contexts cleared.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -955,20 +970,22 @@ pub struct ContextClaim {
 }
 
 impl EguiShellState {
-    /// Clear every egui context this session owns, answering what was cleared.
+    /// Clear every egui context this session owns and report what was cleared.
     ///
-    /// The set of contexts to clear is whatever the session owns - the main one
-    /// and one per popped-out tab - so a third kind of context joins this
-    /// method instead of gaining a flag of its own in the shell. A shell
-    /// generation calls it on its first frame, before its pass: a value the
-    /// previous generation left in `Memory::data` carries that image's drop
-    /// code, and touching it after the reload is a use-after-unmap.
+    /// The session owns the main context and one context per popped-out tab,
+    /// so a third kind of context joins this method instead of gaining a flag
+    /// of its own in the shell. A shell generation calls it on its first
+    /// frame, before its pass: a value the previous generation left in
+    /// `Memory::data` carries that image's drop code, and touching it after
+    /// the reload is a use-after-unmap.
     pub fn claim_generation(&mut self) -> ContextClaim {
+        // Step 1: the main context.
         let main_entries = self.context.memory_mut(|memory| {
             let entries = memory.data.len();
             memory.data.clear();
             entries
         });
+        // Step 2: every popped-out window's context.
         let mut popout_windows = 0;
         for context in self.popout_contexts.values() {
             let entries = context.memory_mut(|memory| {
@@ -1037,19 +1054,38 @@ impl EguiShellState {
     }
 }
 
+impl Resource for EguiShellState {}
+
 impl Default for EguiShellState {
     fn default() -> Self {
         Self::new()
     }
 }
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// One step of an exponential moving average, seeded by the first sample.
+fn smooth_sample(current_mean: f64, sample_value: f64, weight: f64) -> f64 {
+    if current_mean <= 0.0 {
+        sample_value
+    } else {
+        current_mean * (1.0 - weight) + sample_value * weight
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A cell of the log-token surface: a rectangle that repeats draws once, a
-    /// rectangle that moves draws again, and a key that stops drawing is
-    /// dropped so the cache cannot grow with everything the session ever drew.
+    /// A rectangle that repeats logs once, a rectangle that moves logs again,
+    /// and a key that stops drawing is dropped, so the cache does not grow with
+    /// everything the session ever drew.
     #[test]
     fn a_logged_rect_answers_once_per_placement() {
         let mut logged = LoggedRects::default();
@@ -1075,8 +1111,8 @@ mod tests {
         assert!(logged.is_empty(), "a key that stopped drawing is dropped");
     }
 
-    /// The strict comparison is the caller's choice, not the type's second
-    /// accidental rule: half a point is a new placement only for [`LoggedRects::remember_exact`].
+    /// The exact comparison is the caller's choice: half a point is a new
+    /// placement, and only [`LoggedRects::remember_exact`] treats it as one.
     #[test]
     fn the_exact_rule_takes_every_pixel() {
         let mut logged = LoggedRects::default();

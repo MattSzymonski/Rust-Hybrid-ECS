@@ -1,22 +1,26 @@
-//! The editor clipboard's structured payloads.
+//! The editor clipboard's structured payloads: the JSON documents a copy
+//! writes and a paste reads.
 //!
 //! # Responsibilities
-//! - One versioned JSON document that names components by type name and
-//!   fields by field name, values as token strings ([`format_value`] /
-//!   [`parse_value`]) - never pointers, registry ids or `ComponentId`s, so a
-//!   payload survives reloads and crosses processes (the cross-DLL rule).
-//! - Encoding from the snapshot's detail tier, and decoding into the seed
-//!   shapes paste needs (`CreateEntity`'s component seeds, `AddComponent` +
-//!   `SetField` for a single component).
 //!
-//! The same text is what a plain text editor sees when the payload is
-//! pasted outside the editor, which is why the document is JSON rather
-//! than a binary blob.
+//! - One versioned document that names a component by its registered type
+//!   name and a field by its field name, and carries each value as a token
+//!   string ([`format_value`] / [`parse_value`]). No pointer, registry id or
+//!   `ComponentId` is written, so a payload still means the same thing after
+//!   a reload and in another process.
+//! - Encoding a payload from the snapshot's detail tier, and decoding it back
+//!   into the shapes a paste needs: `CreateEntity`'s component seeds, or
+//!   `SetField`s (plus an `AddComponent` when the component is missing).
+//!
+//! The clipboard also carries this text as plain text, which is how another
+//! editor instance, or a text editor, reads it. That is why the document is
+//! JSON and not a binary blob.
 
 // Standard library
 use std::fmt::Write as _;
 
 // External crates
+use pill_engine::FieldValue;
 use serde_json::{json, Value};
 
 // Current crate
@@ -24,48 +28,56 @@ use crate::editor_state::{
     ComponentSeed, EditorCommand, EditorSelection, EditorSnapshot, EntityDetail,
 };
 
-// The shared dylib's value vocabulary.
-use pill_engine::FieldValue;
+// =============================================================================
+// Constants
+// =============================================================================
 
-/// The clipboard format name the structured payload is registered under
-/// (Windows: `RegisterClipboardFormatW`), alongside the readable text.
+/// The name of the clipboard format the structured payload is registered
+/// under. The executable registers the name with `RegisterClipboardFormatW`
+/// and writes the payload in that format beside the plain text.
 pub const FORMAT_NAME: &str = "PillEditor.Object";
 
-/// The payload document's version; a reader refuses anything else.
+/// The version of the payload document. A reader refuses any other version.
 pub const VERSION: u64 = 1;
 
-/// One decoded document.
+// =============================================================================
+// Types
+// =============================================================================
+
+/// One decoded payload document.
+///
+/// The variant is the document's `kind` member: a copy of an entity, of one
+/// component, of one field value, or of one asset reference.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Payload {
-    /// One entity: the components to seed a fresh entity with.
+    /// One entity, as the components a fresh entity is seeded with.
     Entity {
-        /// Components with their carried field values.
+        /// The components, each with the field values it carried.
         components: Vec<SeededComponent>,
     },
-    /// One component: the shape `AddComponent` + `SetField`s rebuilds.
+    /// One component, as the values a paste writes onto an entity.
     Component {
-        /// The component's type name and carried field values.
+        /// The component's type name and its carried field values.
         component: SeededComponent,
     },
-    /// One field value, carried as its token (the readable text a paste
-    /// into a text field uses).
+    /// One field value, carried as its token.
     Field {
         /// Registered component type name.
         component: String,
         /// Field name.
         field: String,
-        /// The value's token ([`format_value`]'s form).
+        /// The value's token, in the form [`format_value`] writes.
         value: String,
     },
     /// One asset reference, by project-relative path.
     Asset {
-        /// Project-relative path, forward slashes.
+        /// Project-relative path, with forward slashes.
         path: String,
     },
 }
 
 impl Payload {
-    /// The document's kind tag, for messages.
+    /// Returns the document's kind tag, for messages.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Entity { .. } => "entity",
@@ -79,15 +91,91 @@ impl Payload {
 /// One component in a payload: its type name and the fields it carried.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SeededComponent {
-    /// Registered component type name (the stable cross-reload key).
+    /// Registered component type name. This name, not a registry id, is the
+    /// key that survives a reload.
     pub type_name: String,
-    /// Field name to token value, in the component's layout order.
+    /// Each field's name and its token value, in the component's layout order.
     pub fields: Vec<(String, String)>,
 }
 
-/// The canonical token of a field value, or `None` for values the payload
-/// cannot carry (arrays, heap lists, text, opaque payloads, and asset or
-/// entity references, which address a slot of this process only).
+/// The three clipboard commands the Edit menu and the shortcuts run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardAction {
+    /// Put the selection on the clipboard.
+    Copy,
+    /// Put the selection on the clipboard and delete it.
+    Cut,
+    /// Read the clipboard and apply what it carries.
+    Paste,
+}
+
+/// What the executable should do with the OS clipboard.
+///
+/// The shell cannot reach the OS clipboard. It is a reloadable DLL, and the
+/// Win32 half belongs to the executable, which is the only binary that names
+/// the `windows` crate. The shell therefore queues one of these, and the
+/// executable carries it out at the frame boundary, the same way
+/// `PanelCommand` and `PendingEditorCommands` queue their work.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClipboardRequest {
+    /// Write this payload text to the clipboard, in the registered format and
+    /// as plain text.
+    Write(String),
+    /// Read the clipboard and apply it as a paste.
+    Read,
+}
+
+/// The shell's side of the clipboard: the request it queued and the text the
+/// executable last read back.
+#[derive(Default)]
+pub struct EditorClipboard {
+    /// The request waiting for the executable, which takes it at the frame
+    /// boundary.
+    pub request: Option<ClipboardRequest>,
+    /// The last text the executable read from the clipboard, kept even when
+    /// the text is not a payload.
+    pub text: String,
+}
+
+impl pill_engine::Resource for EditorClipboard {}
+
+impl EditorClipboard {
+    /// Takes the waiting request, if there is one.
+    pub fn take_request(&mut self) -> Option<ClipboardRequest> {
+        self.request.take()
+    }
+}
+
+/// The recorded step one paste produces, and what the paste could not carry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PastePlan {
+    /// The commands, in the order the batch applies them.
+    pub commands: Vec<EditorCommand>,
+    /// The history label the step is recorded under.
+    pub label: String,
+    /// What the paste skipped: a component type this build does not register,
+    /// or a field whose token it cannot read, each named `type.field`. The
+    /// caller reports them by name.
+    pub skipped: Vec<String>,
+    /// A note for the caller, shown as a notice. An asset paste sets it to the
+    /// asset it moved the selection to.
+    pub note: String,
+}
+
+/// A function that reads the digits in front of a type suffix and turns them
+/// into the field value of that suffix's type.
+type SuffixDigitsParser = fn(&str) -> Option<FieldValue>;
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns the token that stands for a field value, or `None` for a value the
+/// payload cannot carry.
+///
+/// Arrays, lists, text, opaque payloads, and asset and entity references have
+/// no token. The last two hold a slot of the world that issued them, so a
+/// token would mean nothing in another process.
 pub fn format_value(value: &FieldValue) -> Option<String> {
     Some(match value {
         FieldValue::F32(value) => format!("{value:?}f"),
@@ -112,20 +200,20 @@ pub fn format_value(value: &FieldValue) -> Option<String> {
     })
 }
 
-/// One suffix parser: the digits before a type suffix, read as that type.
-type SuffixParser = fn(&str) -> Option<FieldValue>;
-
-/// The [`FieldValue`] a token denotes, or `None` when it is not a token
-/// this payload understands.
+/// Returns the value a token stands for, or `None` when this build cannot read
+/// the token.
 pub fn parse_value(token: &str) -> Option<FieldValue> {
+    // Step 1: the two boolean tokens.
     match token {
         "true" => return Some(FieldValue::Bool(true)),
         "false" => return Some(FieldValue::Bool(false)),
         _ => {}
     }
-    // Longest suffixes first; every other suffix is unambiguous on its own
-    // (`usize`/`isize` end in 'e', so no shorter suffix can shadow them).
-    const SUFFIXED: [(&str, SuffixParser); 12] = [
+    // Step 2: a number with a type suffix. The suffixes are tried longest
+    // first. `usize` and `isize` end in `e`, so a shorter suffix cannot match
+    // their tail by accident. A token with no digits before its suffix (`f`)
+    // or with only a minus sign (`-i8`) is not a value.
+    const SUFFIX_PARSERS: [(&str, SuffixDigitsParser); 12] = [
         ("usize", |digits| digits.parse().ok().map(FieldValue::Usize)),
         ("isize", |digits| digits.parse().ok().map(FieldValue::Isize)),
         ("u64", |digits| digits.parse().ok().map(FieldValue::U64)),
@@ -139,7 +227,7 @@ pub fn parse_value(token: &str) -> Option<FieldValue> {
         ("f", |digits| digits.parse().ok().map(FieldValue::F32)),
         ("d", |digits| digits.parse().ok().map(FieldValue::F64)),
     ];
-    for (suffix, parse) in SUFFIXED {
+    for (suffix, parse) in SUFFIX_PARSERS {
         if let Some(digits) = token.strip_suffix(suffix) {
             if !digits.is_empty() && digits != "-" {
                 if let Some(value) = parse(digits) {
@@ -151,8 +239,8 @@ pub fn parse_value(token: &str) -> Option<FieldValue> {
     None
 }
 
-/// The payload document for one entity's detail: every editable component
-/// with the fields the payload can carry.
+/// Builds the payload document for one entity's detail: every editable
+/// component, with only the field values a payload can carry.
 pub fn encode_entity(detail: &EntityDetail) -> String {
     let mut components: Vec<Value> = Vec::new();
     for component in &detail.components {
@@ -172,7 +260,7 @@ pub fn encode_entity(detail: &EntityDetail) -> String {
     document.to_string()
 }
 
-/// The payload document for one component's current values.
+/// Builds the payload document for one component's current values.
 pub fn encode_component(type_name: &str, fields: &[(String, FieldValue)]) -> String {
     let document = json!({
         "pill": VERSION,
@@ -182,7 +270,8 @@ pub fn encode_component(type_name: &str, fields: &[(String, FieldValue)]) -> Str
     document.to_string()
 }
 
-/// The payload document for one field value.
+/// Builds the payload document for one field value, or returns `None` when the
+/// value has no token.
 pub fn encode_field(component: &str, field: &str, value: &FieldValue) -> Option<String> {
     let token = format_value(value)?;
     let document = json!({
@@ -195,7 +284,7 @@ pub fn encode_field(component: &str, field: &str, value: &FieldValue) -> Option<
     Some(document.to_string())
 }
 
-/// The payload document for one asset reference.
+/// Builds the payload document for one asset reference.
 pub fn encode_asset(path: &str) -> String {
     let document = json!({
         "pill": VERSION,
@@ -205,56 +294,10 @@ pub fn encode_asset(path: &str) -> String {
     document.to_string()
 }
 
-/// The clipboard commands the Edit menu and the shortcuts name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClipboardAction {
-    /// Put the selection on the clipboard.
-    Copy,
-    /// Put the selection on the clipboard and delete it.
-    Cut,
-    /// Read the clipboard and apply it.
-    Paste,
-}
-
-/// What the executable should do with the OS clipboard.
+/// Builds the payload text a copy takes from the current selection.
 ///
-/// The shell cannot touch the OS clipboard: it is a reloadable DLL, and the
-/// Win32 half belongs to the executable (the windows-crate rule). It queues
-/// one of these instead, and the executable carries it out at the frame
-/// boundary - the same shape `PanelCommand` and `PendingEditorCommands`
-/// follow.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ClipboardRequest {
-    /// Put this payload text on the clipboard, as the registered format and
-    /// as plain text.
-    Write(String),
-    /// Read the clipboard and apply it as a paste.
-    Read,
-}
-
-/// The shell's side of the clipboard: what it asked the executable to do, and
-/// the text the executable read back.
-#[derive(Default)]
-pub struct EditorClipboard {
-    /// The request waiting for the executable, taken at the frame boundary.
-    pub request: Option<ClipboardRequest>,
-    /// The last payload the clipboard carried, as the executable read it.
-    pub text: String,
-}
-
-impl pill_engine::Resource for EditorClipboard {}
-
-impl EditorClipboard {
-    /// Take the waiting request, if one is.
-    pub fn take_request(&mut self) -> Option<ClipboardRequest> {
-        self.request.take()
-    }
-}
-
-/// Build the payload text a copy cuts out of the current selection.
-///
-/// An entity wins over an asset when both slots hold - the entity is what the
-/// Inspector shows - and an empty selection is `None`.
+/// An entity wins over an asset when both slots hold, because a cut deletes
+/// the entity. `None` means the selection holds nothing a copy could write.
 pub fn selection_payload(selection: &EditorSelection, snapshot: &EditorSnapshot) -> Option<String> {
     if let Some(detail) = snapshot.detail.as_ref() {
         return Some(encode_entity(detail));
@@ -265,47 +308,53 @@ pub fn selection_payload(selection: &EditorSelection, snapshot: &EditorSnapshot)
     None
 }
 
-/// Whether the selection carries something a copy would write.
+/// Reports whether the selection holds something a copy would write.
 ///
-/// The boolean form of [`selection_payload`], and the one the Edit menu's Copy
-/// and Cut rows read: the row is offered exactly when the copy it runs would
-/// carry something. A selection whose detail has not been captured yet - the
-/// entity is selected but the snapshot still describes the last one - has no
-/// payload, so the row greys out instead of copying the asset the selection
-/// replaced.
+/// This is the boolean form of [`selection_payload`], and the Edit menu's Copy
+/// and Cut rows read it: a row is offered exactly when the copy it runs would
+/// carry something. An entity whose detail the snapshot has not captured yet
+/// has no payload, so the row stays unavailable until the next capture.
 pub fn can_copy(selection: &EditorSelection, snapshot: &EditorSnapshot) -> bool {
     selection_payload(selection, snapshot).is_some()
 }
 
-/// Queue one clipboard command from the shell.
+/// Queues one clipboard command from the shell.
 ///
-/// A copy writes the selection's payload; a cut writes it and queues the
-/// delete as the same recorded step the Entities tab's trash button queues; a
-/// paste asks the executable to read the clipboard. Returns the payload's
-/// one-line summary for the caller's log, or `None` when there is nothing to
-/// copy.
+/// A copy writes the selection's payload. A cut writes it and also queues the
+/// delete, as the same recorded step the Entities tab's trash button queues;
+/// that delete is queued even when the selection had no payload to write. A
+/// paste asks the executable to read the clipboard.
+///
+/// Returns a one-line summary of the payload for the caller's log line, or
+/// `None` when a copy or a cut found nothing to write.
 pub fn queue_action(
     clipboard: &mut EditorClipboard,
     action: ClipboardAction,
     selection: &EditorSelection,
     snapshot: &EditorSnapshot,
-    pending: &mut crate::commands::PendingEditorCommands,
+    pending_commands: &mut crate::commands::PendingEditorCommands,
 ) -> Option<String> {
+    // Step 1: queue the request the executable carries out.
     let summary = queue_request(clipboard, action, selection, snapshot);
+    // Step 2: a cut also queues its delete, recorded as one step.
     if action == ClipboardAction::Cut {
         if let Some((commands, label)) = cut_commands(selection) {
-            pending.push_recorded(commands, label, None);
+            pending_commands.push_recorded(commands, label, None);
         }
     }
     summary
 }
 
-/// Queue the request alone: the write a copy or a cut needs, or the read a
+/// Queues the request alone: the write a copy or a cut needs, or the read a
 /// paste needs.
 ///
-/// Split from [`queue_action`] because the executable reaches the two
-/// resources behind separate borrows: the request belongs to the clipboard
-/// resource, the recorded delete to the pending-command queue.
+/// It is split from [`queue_action`] because the caller reaches the two
+/// resources behind separate borrows: the request lives on the clipboard
+/// resource, and the recorded delete on the pending-command queue. Both cannot
+/// be borrowed mutably at once.
+///
+/// Returns the payload's one-line summary for the caller's log line, `read` for
+/// a paste, or `None` when a copy or a cut found nothing to write.
 pub fn queue_request(
     clipboard: &mut EditorClipboard,
     action: ClipboardAction,
@@ -314,11 +363,11 @@ pub fn queue_request(
 ) -> Option<String> {
     match action {
         ClipboardAction::Copy | ClipboardAction::Cut => {
-            let text = selection_payload(selection, snapshot)?;
-            let summary = decode(&text)
+            let payload_text = selection_payload(selection, snapshot)?;
+            let summary = decode(&payload_text)
                 .map(|payload| summarize(&payload))
                 .unwrap_or_else(|_| "payload".to_string());
-            clipboard.request = Some(ClipboardRequest::Write(text));
+            clipboard.request = Some(ClipboardRequest::Write(payload_text));
             Some(summary)
         }
         ClipboardAction::Paste => {
@@ -328,8 +377,12 @@ pub fn queue_request(
     }
 }
 
-/// The recorded step a cut queues: the same delete the Entities tab's trash
-/// button queues, so a cut undoes back to the entity.
+/// Builds the recorded step a cut queues: the same delete the Entities tab's
+/// trash button queues.
+///
+/// The step clears the selection and destroys the entity. Undoing it restores
+/// the entity with a new handle and selects that handle. `None` means the
+/// selection has no primary entity, so there is nothing to delete.
 pub fn cut_commands(selection: &EditorSelection) -> Option<(Vec<EditorCommand>, String)> {
     let entity = selection.primary()?;
     Some(crate::entities::entity_delete(
@@ -338,35 +391,31 @@ pub fn cut_commands(selection: &EditorSelection) -> Option<(Vec<EditorCommand>, 
     ))
 }
 
-/// The recorded step one paste produces, and what it could not carry.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PastePlan {
-    /// The commands, in the order the batch applies them.
-    pub commands: Vec<EditorCommand>,
-    /// The history label the step is recorded under.
-    pub label: String,
-    /// Component type names the paste skipped because nothing in this build
-    /// registers them; the caller reports them by name.
-    pub skipped: Vec<String>,
-    /// A note the step leaves behind for the caller (an asset paste that only
-    /// moved the selection).
-    pub note: String,
-}
-
-/// Build the recorded step a paste applies: one `CreateEntity` for an entity
-/// payload, `AddComponent` plus `SetField`s for a component, one `SetField`
-/// for a field, and no command for an asset (it only moves the selection).
+/// Builds the recorded step a paste applies.
 ///
-/// A component this build does not register (or cannot add) is skipped and
-/// named in [`PastePlan::skipped`]; a field the live layout does not carry is
-/// skipped the same way, because a paste across two versions of a component
-/// must not write garbage into a reordered image.
+/// An entity payload becomes one `CreateEntity`. A component payload becomes
+/// an `AddComponent` (only when the entity does not carry the component yet)
+/// plus one `SetField` per field. A field payload becomes one `SetField`. An
+/// asset payload queues no command, because it only moves the selection.
+///
+/// In an entity payload, a component this build does not register is skipped
+/// and named in [`PastePlan::skipped`]. A field whose token does not parse is
+/// skipped the same way in every payload kind that carries fields, so a paste
+/// never writes a value it could not read; the field keeps its current value,
+/// or the component's default when the component is new.
+///
+/// # Errors
+///
+/// Returns a message when a component payload names a component this build
+/// does not register or cannot add, when a component or field payload has no
+/// selected entity, or when a field payload's value is not a token this build
+/// parses.
 pub fn paste_plan(
     payload: &Payload,
     selection: &EditorSelection,
     snapshot: &EditorSnapshot,
 ) -> Result<PastePlan, String> {
-    let registered = |type_name: &str| {
+    let is_registered = |type_name: &str| {
         snapshot
             .components
             .iter()
@@ -375,23 +424,25 @@ pub fn paste_plan(
     let mut skipped = Vec::new();
     match payload {
         Payload::Entity { components } => {
-            let mut seeds = Vec::with_capacity(components.len());
+            let mut component_seeds = Vec::with_capacity(components.len());
             for component in components {
-                if !registered(&component.type_name) {
+                if !is_registered(&component.type_name) {
                     skipped.push(component.type_name.clone());
                     continue;
                 }
-                seeds.push(seeded_component(component, &mut skipped));
+                component_seeds.push(seeded_component(component, &mut skipped));
             }
             Ok(PastePlan {
-                commands: vec![EditorCommand::CreateEntity { components: seeds }],
+                commands: vec![EditorCommand::CreateEntity {
+                    components: component_seeds,
+                }],
                 label: "paste entity".to_string(),
                 skipped,
                 note: String::new(),
             })
         }
         Payload::Component { component } => {
-            if !registered(&component.type_name) {
+            if !is_registered(&component.type_name) {
                 return Err(format!(
                     "no component named `{}` is loaded",
                     component.type_name
@@ -401,10 +452,11 @@ pub fn paste_plan(
                 return Err("paste a component onto a selected entity".to_string());
             };
             // An entity that already carries the component takes the payload's
-            // values over it; the `AddComponent` is only for one that does not,
-            // because adding a component twice fails and would take the whole
-            // step's recording with it.
-            let carries = snapshot
+            // values over it. `AddComponent` is only for an entity that does
+            // not, because attaching a component twice fails. One failed
+            // command stops the batch from being recorded, so the step could
+            // not be undone.
+            let already_carries_component = snapshot
                 .selected_details
                 .iter()
                 .chain(snapshot.detail.iter())
@@ -416,7 +468,7 @@ pub fn paste_plan(
                         .any(|view| view.type_name == component.type_name)
                 });
             let mut commands = Vec::new();
-            if !carries {
+            if !already_carries_component {
                 commands.push(EditorCommand::AddComponent {
                     entity,
                     component: component.type_name.clone(),
@@ -473,12 +525,12 @@ pub fn paste_plan(
     }
 }
 
-/// One payload component as the seed a create or an add rebuilds.
+/// Turns one payload component into the seed a create rebuilds.
 ///
-/// A field whose token does not parse is left out and named in `skipped`,
-/// exactly as the single-component paste names it: a paste across two versions
-/// of a component creates the entity with the fields it could read and the
-/// component's defaults for the rest, and the person can see which.
+/// A field whose token does not parse is left out and named in `skipped` as
+/// `type.field`, the same form the component paste uses. The new entity then
+/// gets the component's default for that field, and a notice names what was
+/// skipped.
 fn seeded_component(component: &SeededComponent, skipped: &mut Vec<String>) -> ComponentSeed {
     let mut fields = Vec::with_capacity(component.fields.len());
     for (field, token) in &component.fields {
@@ -493,10 +545,18 @@ fn seeded_component(component: &SeededComponent, skipped: &mut Vec<String>) -> C
     }
 }
 
-/// Decode a payload document; an error names what did not parse.
-pub fn decode(text: &str) -> Result<Payload, String> {
-    let document: Value =
-        serde_json::from_str(text).map_err(|error| format!("payload is not JSON: {error}"))?;
+/// Decodes a payload document.
+///
+/// # Errors
+///
+/// Returns a message when the text is not JSON, when the document's version is
+/// not [`VERSION`], when its `kind` member is missing or unknown, or when a
+/// component entry is malformed: no type name, or a field entry that is not a
+/// name and a token.
+pub fn decode(document_text: &str) -> Result<Payload, String> {
+    // Step 1: read the document and refuse anything that is not this version.
+    let document: Value = serde_json::from_str(document_text)
+        .map_err(|error| format!("payload is not JSON: {error}"))?;
     let version = document.get("pill").and_then(Value::as_u64);
     if version != Some(VERSION) {
         return Err(format!(
@@ -504,6 +564,7 @@ pub fn decode(text: &str) -> Result<Payload, String> {
             version.map_or("missing".to_string(), |value| value.to_string())
         ));
     }
+    // Step 2: decode the members the kind names.
     let kind = document
         .get("kind")
         .and_then(Value::as_str)
@@ -545,7 +606,10 @@ pub fn decode(text: &str) -> Result<Payload, String> {
     }
 }
 
-/// The field pairs a payload carries for one component view.
+/// Pairs each field of one component view with its current value.
+///
+/// Every value is kept, including the ones a payload cannot carry. The caller
+/// drops those when it writes the document.
 pub fn component_field_pairs(
     component: &crate::editor_state::ComponentView,
 ) -> Vec<(String, FieldValue)> {
@@ -557,20 +621,28 @@ pub fn component_field_pairs(
         .collect()
 }
 
-/// The JSON object of one component: type name and the carryable fields.
+/// Builds the JSON object for one component: its type name and its carried
+/// fields, each written as a `[name, token]` pair.
 fn component_document(type_name: &str, fields: &[(String, FieldValue)]) -> Value {
-    let mut carried: Vec<Value> = Vec::new();
+    let mut carried_fields: Vec<Value> = Vec::new();
     for (name, value) in fields {
         if let Some(token) = format_value(value) {
-            carried.push(json!([name, token]));
+            carried_fields.push(json!([name, token]));
         }
     }
-    json!({ "type": type_name, "fields": carried })
+    json!({ "type": type_name, "fields": carried_fields })
 }
 
-/// Decode one component object into its seed; an unparseable field is an
-/// error here (the caller reports it), because a silently dropped field
-/// would make a paste quietly lossy.
+/// Decodes one component object into its seed.
+///
+/// A field entry is never dropped: losing one without a word would make the
+/// paste quietly lossy. A component with no `fields` member decodes with no
+/// fields.
+///
+/// # Errors
+///
+/// Returns a message when the object has no `type`, when a field entry is not
+/// a `[name, token]` pair, or when the name or the token is not a string.
 fn decode_component(component: &Value) -> Result<SeededComponent, String> {
     let type_name = component
         .get("type")
@@ -598,7 +670,11 @@ fn decode_component(component: &Value) -> Result<SeededComponent, String> {
     Ok(SeededComponent { type_name, fields })
 }
 
-/// One required string member of a document.
+/// Reads one required string member of a document.
+///
+/// # Errors
+///
+/// Returns a message naming the member when it is missing or is not a string.
 fn string_field(document: &Value, member: &str) -> Result<String, String> {
     document
         .get(member)
@@ -607,7 +683,7 @@ fn string_field(document: &Value, member: &str) -> Result<String, String> {
         .ok_or_else(|| format!("payload has no `{member}`"))
 }
 
-/// A compact one-line summary of a payload, for log lines.
+/// Builds a one-line summary of a payload, for a log line.
 pub fn summarize(payload: &Payload) -> String {
     let mut summary = String::new();
     match payload {
@@ -639,22 +715,29 @@ pub fn summarize(payload: &Payload) -> String {
     summary
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::editor_state::{ComponentFieldView, ComponentView, EntityDetail};
     use pill_engine::Entity;
 
-    fn view(name: &str) -> ComponentFieldView {
+    /// One field of a component view, with no decorators.
+    fn field_view(field_name: &str) -> ComponentFieldView {
         ComponentFieldView {
-            name: name.to_string(),
+            name: field_name.to_string(),
             decorators: Vec::new(),
         }
     }
 
-    fn detail() -> EntityDetail {
-        // A real handle from a real world; the payload only carries its
-        // components, but a test that invents handles tests nothing.
+    /// A detail carrying one editable component and one that is not.
+    ///
+    /// The entity comes from a real world: the payload only carries the
+    /// components, but a test that invents handles tests nothing.
+    fn sample_detail() -> EntityDetail {
         let mut engine = pill_engine::Engine::new();
         let entity = engine
             .world_mut()
@@ -670,7 +753,7 @@ mod tests {
                     type_name: "Position".to_string(),
                     persistable: true,
                     editable: true,
-                    fields: vec![view("x"), view("y")],
+                    fields: vec![field_view("x"), field_view("y")],
                     values: vec![FieldValue::F32(1.5), FieldValue::F32(-2.25)],
                 },
                 ComponentView {
@@ -686,9 +769,11 @@ mod tests {
         }
     }
 
+    /// An editable component and its values come back from the payload
+    /// unchanged, and a component that is not editable is left out.
     #[test]
     fn an_entity_round_trips_through_the_payload() {
-        let text = encode_entity(&detail());
+        let text = encode_entity(&sample_detail());
         match decode(&text).expect("round trip") {
             Payload::Entity { components } => {
                 assert_eq!(components.len(), 1, "only editable components are carried");
@@ -705,6 +790,8 @@ mod tests {
         }
     }
 
+    /// Every scalar value survives a trip through its token, and the values a
+    /// payload cannot carry get no token at all.
     #[test]
     fn every_scalar_token_round_trips() {
         let values = [
@@ -739,6 +826,8 @@ mod tests {
         }
     }
 
+    /// Text that is not JSON, another version and an unknown kind are each
+    /// refused, while a field payload decodes.
     #[test]
     fn versions_and_kinds_are_refused_by_name() {
         assert!(decode("not json").is_err());
@@ -748,13 +837,14 @@ mod tests {
         assert!(matches!(decode(&field), Ok(Payload::Field { .. })));
     }
 
-    /// A snapshot whose registry knows `names` and nothing else.
-    fn snapshot_with(names: &[&str]) -> EditorSnapshot {
+    /// A snapshot whose registry knows `component_type_names` and nothing
+    /// else.
+    fn snapshot_with(component_type_names: &[&str]) -> EditorSnapshot {
         EditorSnapshot {
-            components: names
+            components: component_type_names
                 .iter()
-                .map(|name| crate::editor_state::RegisteredComponent {
-                    type_name: name.to_string(),
+                .map(|type_name| crate::editor_state::RegisteredComponent {
+                    type_name: type_name.to_string(),
                     addable: true,
                 })
                 .collect(),
@@ -880,7 +970,7 @@ mod tests {
                 type_name: "Position".to_string(),
                 persistable: true,
                 editable: true,
-                fields: vec![view("x")],
+                fields: vec![field_view("x")],
                 values: vec![FieldValue::F32(1.0)],
             }],
         });

@@ -1,4 +1,4 @@
-//! Applying a command batch, one family per module.
+//! Applies a command batch, with one module per command family.
 //!
 //! # Responsibilities
 //!
@@ -9,14 +9,16 @@
 //!
 //! # Design
 //!
-//! `apply_one` is a dispatch, not a body: the arms live in `world`, `asset`,
-//! `selection`, `engine` and `document`, each a `match` over its own family
-//! that answers `unreachable!` for anything else. A family module needs nothing
-//! from the others, and a reviewer opening the asset commands reads only the
-//! asset commands.
+//! `apply_one` only dispatches: the arms live in `world`, `asset`,
+//! `selection`, `engine` and `document`. Each of those modules has one `match`
+//! over its own family and answers `unreachable!` for any other command, so a
+//! family module never calls another one, and a reviewer opening the asset
+//! commands reads only the asset commands.
 
+// External crates
 use pill_engine::Engine;
 
+// Current crate
 use super::*;
 
 mod asset;
@@ -26,83 +28,93 @@ mod selection;
 mod world;
 
 impl EditorCommand {
-    /// Apply a batch at the frame boundary.
+    /// Applies a batch at the frame boundary.
     ///
-    /// Returns one `(index, message)` per failed command so the Console panel
-    /// can surface it. A failure never aborts the rest of the batch. Engine
-    /// state is all-or-nothing per command, and structural commands validate
-    /// before they commit; the asset-file commands are the exception - a
-    /// rollback that cannot finish lists the files it left behind in the
-    /// message.
+    /// Returns one `(index, message)` per failed command, in batch order. The
+    /// drain logs each failure for the Console panel. A failure never stops
+    /// the rest of the batch. Engine state is all-or-nothing per command, and
+    /// the commands that change structure check their input before they
+    /// commit. The asset-file commands are the exception: a rollback that
+    /// cannot finish lists the files it left behind in the message.
     pub fn apply(engine: &mut Engine, commands: &[EditorCommand]) -> Vec<(usize, String)> {
         Self::apply_recorded(engine, commands).failures
     }
 
-    /// Apply a batch and compute the inverse of every edit it performed.
+    /// Applies a batch and computes the inverse of every edit it performed.
     ///
-    /// This is the single application path: [`Self::apply`] only discards
-    /// the recording. A command is recorded only when it succeeded and
-    /// produced an inverse, which [`RecordedApply::fully_invertible`] reports.
+    /// This is the single application path: [`Self::apply`] only discards the
+    /// recording. A batch becomes one history step only when every command is
+    /// an undoable edit that succeeded and produced an inverse;
+    /// [`RecordedApply::fully_invertible`] reports whether that held.
     ///
-    /// The batch runs against its own copy because a restore assigns a fresh
-    /// handle mid-batch: every command behind it - and every inverse already
-    /// collected - follows the entity, exactly like the history entries do.
-    /// Without that, a delete recorded as `destroy, clear the selection`
-    /// would undo its clear before the restore exists and the selection would
-    /// come back pointing at nothing.
+    /// The batch runs against its own copy because a restore gives its entity
+    /// a new handle mid-batch. The commands after it, and the inverses already
+    /// collected, are moved to that handle, exactly like the history entries
+    /// are. Without that, undoing a delete would restore the entity under a
+    /// new handle while the selection restore still named the destroyed one,
+    /// so the selection would come back pointing at nothing.
     pub fn apply_recorded(engine: &mut Engine, commands: &[EditorCommand]) -> RecordedApply {
-        let mut outcome = RecordedApply {
+        let mut recorded = RecordedApply {
             fully_invertible: true,
             ..RecordedApply::default()
         };
-        let mut working = commands.to_vec();
-        for index in 0..working.len() {
-            if !working[index].recordable() {
-                outcome.fully_invertible = false;
+        let mut working_commands = commands.to_vec();
+        // Step 1: Apply each command in order and record what undoes it. A
+        // restore gives its entity a new handle, so the commands after it and
+        // the inverses already collected are moved to that handle.
+        for index in 0..working_commands.len() {
+            if !working_commands[index].recordable() {
+                recorded.fully_invertible = false;
             }
-            match Self::apply_one(engine, &working[index]) {
-                Ok(applied) => {
-                    // An edit that succeeded is an unsaved change; the
-                    // document commands clear or set the marker themselves.
-                    if working[index].recordable() {
+            match Self::apply_one(engine, &working_commands[index]) {
+                Ok(command_outcome) => {
+                    // Only an undoable edit makes the document unsaved. Pause,
+                    // step, the gizmo tool and the grid leave the marker
+                    // alone, and the scene commands clear it themselves.
+                    if working_commands[index].recordable() {
                         crate::scene_workflow::mark_dirty(engine.world_mut());
                     }
-                    if let Some(inverse) = applied.inverse {
-                        outcome.inverses.push(inverse);
+                    if let Some(inverse) = command_outcome.inverse {
+                        recorded.inverses.push(inverse);
                     } else {
-                        outcome.fully_invertible = false;
+                        recorded.fully_invertible = false;
                     }
-                    if let Some((previous, assigned)) = applied.remap {
-                        for later in &mut working[index + 1..] {
+                    if let Some((previous, assigned)) = command_outcome.remap {
+                        for later in &mut working_commands[index + 1..] {
                             later.remap_entity(previous, assigned);
                         }
-                        for inverse in &mut outcome.inverses {
+                        for inverse in &mut recorded.inverses {
                             inverse.remap_entity(previous, assigned);
                         }
-                        outcome.remaps.push((previous, assigned));
+                        recorded.remaps.push((previous, assigned));
                     }
                 }
                 Err(message) => {
-                    outcome.failures.push((index, message));
-                    outcome.fully_invertible = false;
+                    recorded.failures.push((index, message));
+                    recorded.fully_invertible = false;
                 }
             }
         }
-        // Undo walks the batch backwards, so hand the inverses back reversed.
-        outcome.inverses.reverse();
-        outcome
+        // Step 2: Undo runs the batch backwards, so hand the inverses back
+        // reversed.
+        recorded.inverses.reverse();
+        recorded
     }
 
-    /// Capture a live entity's component images for a later restore.
+    /// Captures a live entity's component values as seeds for a later restore.
     ///
-    /// Only components with a field layout can be rebuilt; a layout-less
-    /// component is skipped, so restoring an entity that carried one brings
-    /// back everything the editor can read and describe.
+    /// Only components with a field layout can be rebuilt; a component without
+    /// one is skipped. Restoring an entity that carried one therefore brings
+    /// back every component the editor can read and describe.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the entity when it no longer exists.
     fn capture_seeds(engine: &Engine, entity: Entity) -> Result<Vec<ComponentSeed>, String> {
-        let detail = EditorSnapshot::capture_detail(engine, entity)
+        let entity_detail = EditorSnapshot::capture_detail(engine, entity)
             .ok_or_else(|| format!("entity {entity} is not alive"))?;
         let mut seeds = Vec::new();
-        for view in detail.components {
+        for view in entity_detail.components {
             if !view.editable {
                 continue;
             }
@@ -120,12 +132,17 @@ impl EditorCommand {
         Ok(seeds)
     }
 
-    /// Apply one command: what it changed, or the message saying why it could
-    /// not.
+    /// Applies one command and returns the outcome the recording layer keeps.
     ///
-    /// The `Err` carries the command's own failure and, for an asset-file
-    /// command whose rollback could not finish, the paths still on disk. Each
-    /// family's arms live in the module that owns it.
+    /// The outcome holds the inverse that undoes the command, if there is one,
+    /// and the `(previous, assigned)` handle pair when the command re-created
+    /// an entity. Each family's arms live in the module that owns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the command's own failure message. For an asset-file command
+    /// whose rollback could not finish, the message also names the paths still
+    /// on disk.
     fn apply_one(engine: &mut Engine, command: &EditorCommand) -> Result<CommandOutcome, String> {
         match command.family() {
             CommandFamily::World => world::apply(engine, command),

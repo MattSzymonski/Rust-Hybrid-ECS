@@ -2,26 +2,32 @@
 //!
 //! # Responsibilities
 //!
-//! - [`start`]: hand one project asset to OLE as a file drag, so it can be
+//! - [`start`]: hands one project asset to OLE as a file drag, so it can be
 //!   dropped into Explorer, another editor, or any `CF_HDROP` target.
 //! - [`EditorDropSource`]: the drop source that ends the drag when the mouse
 //!   button comes up and cancels it on Escape.
 //!
 //! # Design
 //!
-//! The shell cannot do this: `DoDragDrop` runs a modal loop on the thread that
-//! starts it, and only this executable names the `windows` crate. The shell
-//! reports the asset's path through the frame it hands back, and this module
-//! starts the drag from the frame boundary through `SHCreateDataObject`, which
-//! wraps the path's PIDL into an `IDataObject` offering `CF_HDROP`.
+//! The shell cannot start the drag itself. `DoDragDrop`, OLE's drag-and-drop
+//! call, runs a modal loop on the thread that calls it, and only this
+//! executable depends on the `windows` crate. Instead, the shell reports the
+//! asset's path in the frame it hands back, and this module starts the drag
+//! from the frame boundary.
 //!
-//! The drop source ends the drag "when in doubt": a drop as soon as the left
-//! button is not held, a cancel on Escape. Answering "continue" on a button it
-//! could not read would spin the modal loop with the editor's frame frozen.
+//! The path becomes the shell's item list first (a PIDL, a pointer to an item
+//! identifier list). `SHCreateDataObject` then wraps that list in a data object
+//! which offers the file under `CF_HDROP`, the format a file drop target reads.
 //!
-//! The same rule applies before the loop: `DoDragDrop` only asks its drop
-//! source for a verdict when input arrives, so a drag started with no button
-//! held would wait forever; [`start`] reads the button first and starts none.
+//! The drop source always ends the drag instead of keeping it running. It drops
+//! the file as soon as the left button is not held, and cancels on Escape.
+//! Answering "continue" on a button it could not read would spin the modal loop
+//! while the editor's frame stays frozen.
+//!
+//! The same rule applies before the loop. `DoDragDrop` only asks its drop
+//! source whether to continue when input arrives, so a drag started with no
+//! button held would leave the editor frozen until more input arrived.
+//! [`start`] reads the button first and starts no drag.
 
 // External crates
 use windows::core::implement;
@@ -33,16 +39,21 @@ use windows::Win32::System::Ole::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::Shell::{SHCreateDataObject, SHParseDisplayName};
 
+// =============================================================================
+// EditorDropSource
+// =============================================================================
+
 /// The drop source OLE calls while the drag runs.
 #[implement(IDropSource)]
 pub struct EditorDropSource;
 
 impl IDropSource_Impl for EditorDropSource_Impl {
-    /// Whether the drag goes on, ends in a drop, or is cancelled.
+    /// Reports whether the drag goes on, ends in a drop, or is cancelled.
     ///
-    /// `fescapepressed` is OLE's own reading of the keyboard; the button state
-    /// is this implementation's to read, and an unreadable button ends the
-    /// drag rather than spinning the loop.
+    /// `fescapepressed` is OLE's own reading of the keyboard, so Escape is
+    /// handled from it. The left mouse button is not part of the key state OLE
+    /// passes in, so this method reads it itself. A button that cannot be read
+    /// counts as released: the drag ends instead of spinning the loop.
     fn QueryContinueDrag(
         &self,
         fescapepressed: BOOL,
@@ -51,8 +62,8 @@ impl IDropSource_Impl for EditorDropSource_Impl {
         if fescapepressed.as_bool() {
             return DRAGDROP_S_CANCEL;
         }
-        // SAFETY: `GetAsyncKeyState` takes a virtual-key code and cannot fail;
-        // the high bit of the result is the key's held state.
+        // SAFETY: `GetAsyncKeyState` takes a virtual-key code and cannot fail.
+        // The high bit of the result is set while the key is held.
         let held = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16 & 0x8000 != 0;
         if held {
             S_OK
@@ -61,11 +72,15 @@ impl IDropSource_Impl for EditorDropSource_Impl {
         }
     }
 
-    /// The pointer feedback OLE draws from; the target's own effect is right.
+    /// Keeps OLE's own pointer feedback, which follows the drop target's effect.
     fn GiveFeedback(&self, _dweffect: DROPEFFECT) -> windows::core::HRESULT {
         S_OK
     }
 }
+
+// =============================================================================
+// DragOutOutcome
+// =============================================================================
 
 /// How a drag out ended, for the caller's log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,33 +95,41 @@ pub enum DragOutOutcome {
     Failed,
 }
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Whether the left button is held right now.
 fn left_button_held() -> bool {
     // SAFETY: `GetAsyncKeyState` takes a virtual-key code, reads no pointer and
-    // cannot fail; the high bit of its result is the key's held state.
+    // cannot fail. The high bit of its result is set while the key is held.
     (unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16) & 0x8000 != 0
 }
 
-/// Hand `absolute_path` to OLE as a file drag; blocks until the drag ends.
+/// Hands `absolute_path` to OLE as a file drag and blocks until the drag ends.
 ///
 /// Logs `[editor] drag out prepared` once the data object exists, and a warning
-/// naming the reason when a step fails; the runner logs the outcome. A drag
-/// started with no button held is refused rather than run, because the modal
-/// loop would never see the input that ends it.
+/// naming the reason when a step fails. The runner logs one line for each of
+/// the other outcomes, so every way a drag can end leaves a trace.
+///
+/// A drag started with no button held is refused rather than run, because the
+/// modal loop would freeze the editor until more input arrived.
 pub fn start(absolute_path: &str) -> DragOutOutcome {
+    // Step 1: make sure this thread has OLE, which `DoDragDrop` needs.
     if !initialize_ole() {
         return DragOutOutcome::Failed;
     }
-    let wide: Vec<u16> = absolute_path
+    let wide_path: Vec<u16> = absolute_path
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
     let mut pidl = std::ptr::null_mut();
-    // SAFETY: the name is a NUL-terminated UTF-16 buffer that outlives the
-    // call and the PIDL is written into `pidl`, which is freed below.
+    // Step 2: turn the path into the shell's item list.
+    // SAFETY: `wide_path` is a NUL-terminated UTF-16 buffer that stays alive
+    // for the whole call, and `pidl` is a valid out-pointer for the item list.
     if let Err(error) = unsafe {
         SHParseDisplayName(
-            windows::core::PCWSTR(wide.as_ptr()),
+            windows::core::PCWSTR(wide_path.as_ptr()),
             None,
             &mut pidl,
             0,
@@ -121,13 +144,13 @@ pub fn start(absolute_path: &str) -> DragOutOutcome {
         );
         return DragOutOutcome::Failed;
     }
-    // The Windows shell's data object over that one PIDL: `CF_HDROP` for every
-    // target that takes files, which is what a drag out of a project panel
-    // needs.
+    // Step 3: wrap the item list in the shell's data object, which offers the
+    // file to every target that takes files under `CF_HDROP`.
     let data_object: windows::core::Result<windows::Win32::System::Com::IDataObject> =
-        // SAFETY: `pidl` is the item list just parsed and stays alive for the
-        // whole call; the data object copies what it needs.
+        // SAFETY: `pidl` is the item list just parsed, and both it and the
+        // one-element array passed here stay alive for the whole call.
         unsafe { SHCreateDataObject(None, Some(&[pidl as *const _]), None) };
+    // Step 4: run the drag while the button is held, then free the item list.
     let outcome = match data_object {
         Ok(data_object) => {
             pill_core::info!(
@@ -135,12 +158,13 @@ pub fn start(absolute_path: &str) -> DragOutOutcome {
                 path = absolute_path,
                 "[editor] drag out prepared"
             );
-            // `DoDragDrop` only asks its drop source for a verdict when input
-            // arrives; with no button held, none ever would.
+            // `DoDragDrop` only asks the drop source whether to continue when
+            // input arrives, so a drag started without the button held would
+            // freeze the editor until more input arrived.
             if !left_button_held() {
                 DragOutOutcome::NoButtonHeld
             } else {
-                drag(data_object)
+                run_modal_drag(data_object)
             }
         }
         Err(error) => {
@@ -154,50 +178,49 @@ pub fn start(absolute_path: &str) -> DragOutOutcome {
         }
     };
     // SAFETY: `pidl` came from `SHParseDisplayName`, which allocates it with
-    // the COM task allocator; it is freed exactly once here.
+    // the COM task allocator. It is freed exactly once, here.
     unsafe { CoTaskMemFree(Some(pidl as *const core::ffi::c_void)) };
     outcome
 }
 
-/// Run the modal drag over one prepared data object.
+/// Runs the modal drag over one prepared data object.
 ///
-/// Blocks on OLE's loop until the drop source ends it; the effect OLE reports
-/// is the target's, and zero means nothing took the file.
-fn drag(data_object: windows::Win32::System::Com::IDataObject) -> DragOutOutcome {
-    let source: IDropSource = EditorDropSource.into();
+/// Blocks in OLE's loop until the drop source ends the drag. The effect OLE
+/// reports is the drop target's answer, and zero means no target took the file.
+fn run_modal_drag(data_object: windows::Win32::System::Com::IDataObject) -> DragOutOutcome {
+    let drop_source: IDropSource = EditorDropSource.into();
     let mut effect = DROPEFFECT(0);
-    // SAFETY: both interfaces are live for the call, and `effect` is a valid
-    // out-pointer; `DoDragDrop` runs its own modal loop and returns when the
-    // drag ends.
-    let result = unsafe {
+    // SAFETY: `data_object` and `drop_source` are live for the whole call, and
+    // `effect` points at a valid out-parameter slot.
+    let drag_result = unsafe {
         DoDragDrop(
             &data_object,
-            &source,
+            &drop_source,
             DROPEFFECT_COPY,
             &mut effect as *mut DROPEFFECT,
         )
     };
-    if result.is_err() {
+    if drag_result.is_err() {
         pill_core::warn!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
-            reason = %windows::core::Error::from_hresult(result),
+            reason = %windows::core::Error::from_hresult(drag_result),
             "[editor] drag out refused by OLE"
         );
         DragOutOutcome::Failed
     } else if effect.0 == 0 {
-        // A zero effect is a cancelled drag: the target refused, or the
-        // pointer came up over nothing that takes files.
+        // A zero effect means the drag was cancelled. The target refused the
+        // file, or the pointer came up over nothing that takes files.
         DragOutOutcome::Cancelled
     } else {
         DragOutOutcome::Dropped(effect)
     }
 }
 
-/// Initialise OLE on the calling thread, once.
+/// Initialises OLE on the calling thread, once.
 ///
-/// `DoDragDrop` needs an OLE-initialised thread; the editor's main thread is
-/// the one that owns the window, so that is where this runs. A failure leaves
-/// drag-out unavailable and is logged once.
+/// `DoDragDrop` needs an OLE-initialised thread. The editor's main thread owns
+/// the window, so that is where this runs. A failure leaves drag-out
+/// unavailable and is logged once.
 fn initialize_ole() -> bool {
     use std::sync::OnceLock;
     static INITIALISED: OnceLock<bool> = OnceLock::new();
@@ -206,8 +229,9 @@ fn initialize_ole() -> bool {
         match unsafe { OleInitialize(None) } {
             Ok(()) => true,
             Err(error) => {
-                // S_FALSE (already initialised) arrives as Ok; a real failure
-                // is what lands here.
+                // An already-initialised thread reports `S_FALSE`, which the
+                // `windows` crate turns into `Ok`. Only a real failure reaches
+                // this arm.
                 pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::ENGINE,
                     reason = %error,

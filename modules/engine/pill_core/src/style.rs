@@ -4,17 +4,22 @@
 //!
 //! - Own the [`PillStyle`] trait that maps semantic output roles (module
 //!   objects, general objects, specific objects, names, and severity
-//!   levels) to ANSI-styled strings for terminal rendering.
-//!
-//! The `&str` implementations live in the platform layer
-//! ([`crate::platform::styling`]), one per target: colored through the
-//! `colored` crate on native, plain text (names still quoted) on `wasm32`.
+//!   levels) to styled strings for terminal rendering.
 //!
 //! # Design
 //!
-//! The trait states the vocabulary; the platform layer picks the target's
-//! implementation. The trait is re-exported at the crate root and is what
-//! [`error`]'s terminal renderer styles through.
+//! The trait states the vocabulary. The platform layer supplies the
+//! implementation for the target. The `&str` implementations live in
+//! [`crate::platform::styling`], beside the other target splits, so this
+//! module holds no `cfg(target_arch)` gate and owns only the trait.
+//!
+//! There is one implementation per target. On native it colors the text
+//! through the `colored` crate; module objects and the severity levels also
+//! gain bold weight. On `wasm32` it returns plain text, keeping the quotation
+//! marks around names.
+//!
+//! The trait is re-exported at the crate root and is what [`error`]'s
+//! terminal renderer styles through.
 //!
 //! [`error`]: crate::error
 
@@ -22,12 +27,15 @@
 // PillStyle trait
 // =============================================================================
 
-/// Maps semantic output roles to ANSI-styled strings for terminal rendering.
+/// Maps semantic output roles to styled strings for terminal rendering.
 ///
-/// Implementors decide how each role — module objects, general objects,
-/// specific objects, names, and severity levels — is displayed. The crate
-/// provides an implementation for `&str` that colors and bolds text on
-/// native targets and returns plain text on `wasm32`.
+/// Every role gets its own style. The roles are module objects, general
+/// objects, specific objects, names, and the severity levels (error, warning
+/// and debug). Implementors decide how a role is displayed.
+///
+/// The crate provides one implementation for `&str` per target. On native it
+/// colors the text, and some roles also gain bold weight. On `wasm32` it
+/// returns plain text, with names still in quotation marks.
 ///
 /// # Examples
 ///
@@ -65,10 +73,3 @@ pub trait PillStyle {
     /// Style a debug message, changing the color and adding bold weight.
     fn debug_style(self) -> String;
 }
-
-// =============================================================================
-// PillStyle for &str
-// =============================================================================
-
-// The `&str` implementations live in `platform::styling`, beside the other
-// target splits; this module owns only the trait.

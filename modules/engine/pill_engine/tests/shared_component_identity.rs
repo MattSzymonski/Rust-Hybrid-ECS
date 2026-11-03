@@ -3,8 +3,10 @@
 //! # Responsibilities
 //!
 //! - Pin that one shared name binds two distinct types to one component.
-//! - Pin the peer-collision refusal when the name is removed, and the
-//!   two-registrant reload that competes for one column's function table.
+//! - Pin the refusals: a layout mismatch, and a second unrelated type claiming
+//!   the same name.
+//! - Pin that both copies' rows survive a reload's migration, and that only a
+//!   subject current for the component may re-lay it out.
 //!
 //! # What is being simulated
 //!
@@ -13,26 +15,34 @@
 //! into the same process, which is what gives that single type two `TypeId`s.
 //!
 //! Two distinct Rust types declaring the *same* `#[pill(shared = "...")]` name
-//! reproduce it faithfully, because that is exactly what the engine sees in the
-//! real case - two `TypeId`s, one declared identity, identical layouts - and it
-//! is the only thing the engine ever sees of it. `ProjectSpline` stands for the
-//! project's copy of the type and `ModuleSpline` for the module DLL's copy;
-//! everything below is written from that reading.
+//! reproduce it faithfully, because that is what the engine compares in the
+//! real case too: two `TypeId`s, one declared identity, the type's own name and
+//! identical layouts. `ProjectSpline` stands for the project's copy of the type
+//! and `ModuleSpline` for the module DLL's copy; everything below is written
+//! from that reading.
 
+// Standard library
 use std::collections::HashSet;
 
+// External crates
 use pill_engine::component::ComponentRegistry;
 use pill_engine::query::{Changed, Query};
 use pill_engine::{ComponentId, PillComponent, World};
+
+// Current crate
+use module_copy::Spline as ModuleSpline;
+use module_persisted::PersistedSpline as ModulePersistedSpline;
+use project_copy::Spline as ProjectSpline;
+use project_persisted::PersistedSpline as ProjectPersistedSpline;
 
 /// The shared name both stand-in types declare, spelled once so a test can
 /// assert against the identity it produces.
 const SHARED_NAME: &str = "pill_spline::Spline";
 
-// The two copies live in modules that stand for the two artifacts, and share
-// the type's own name - exactly as the real case does, where `Spline` is
-// `Spline` in whichever binary compiled it. Only the module path differs, which
-// is the one thing an in-process simulation cannot reproduce faithfully.
+// The two copies live in modules that stand for the two artifacts and share the
+// type's own name, as the real case does: `Spline` is `Spline` in whichever
+// binary compiled it. Only the module path differs, which is the one thing an
+// in-process simulation cannot reproduce.
 
 /// The project's copy of the shared component.
 pub mod project_copy {
@@ -58,9 +68,6 @@ pub mod module_copy {
         pub segments: u32,
     }
 }
-
-use module_copy::Spline as ModuleSpline;
-use project_copy::Spline as ProjectSpline;
 
 /// An ordinary component, to show the default identity is untouched.
 #[derive(Clone, Debug, Default, PillComponent)]
@@ -137,8 +144,8 @@ fn the_second_registration_binds_instead_of_allocating() {
     let mut world = World::new();
 
     world.register_component::<ProjectSpline>();
-    let after_first = world.component_registry().len();
-    let bit = world
+    let component_count_after_first_registration = world.component_registry().len();
+    let component_bit = world
         .component_registry()
         .get_bit(&ComponentId::of::<ProjectSpline>())
         .expect("the first registration creates the bit");
@@ -149,14 +156,14 @@ fn the_second_registration_binds_instead_of_allocating() {
 
     assert_eq!(
         world.component_registry().len(),
-        after_first,
+        component_count_after_first_registration,
         "binding must not add a second registry entry"
     );
     assert_eq!(
         world
             .component_registry()
             .get_bit(&ComponentId::of::<ModuleSpline>()),
-        Some(bit),
+        Some(component_bit),
         "both copies must resolve to one mask bit"
     );
     assert!(
@@ -173,7 +180,7 @@ fn entities_spawned_from_either_copy_share_one_archetype() {
     world.register_component::<ProjectSpline>();
     world.register_component::<ModuleSpline>();
 
-    let from_project = world
+    let entity_from_project = world
         .create_entity()
         .with(ProjectSpline {
             tension: 1.0,
@@ -181,7 +188,7 @@ fn entities_spawned_from_either_copy_share_one_archetype() {
         })
         .build()
         .unwrap();
-    let from_module = world
+    let entity_from_module = world
         .create_entity()
         .with(ModuleSpline {
             tension: 2.0,
@@ -200,8 +207,8 @@ fn entities_spawned_from_either_copy_share_one_archetype() {
         "two copies of one component must not produce two archetypes"
     );
     assert_eq!(archetypes[0].entities.len(), 2);
-    assert!(archetypes[0].entities.contains(&from_project));
-    assert!(archetypes[0].entities.contains(&from_module));
+    assert!(archetypes[0].entities.contains(&entity_from_project));
+    assert!(archetypes[0].entities.contains(&entity_from_module));
 
     // And both rows live in one column.
     assert_eq!(
@@ -232,16 +239,20 @@ fn a_write_through_one_copy_is_observed_through_the_other() {
         .build()
         .unwrap();
 
-    // The module's systems query the component under its own type.
+    // The module queries the component under its own type and writes through
+    // it.
     {
         let mut query = Query::<(&mut ModuleSpline,)>::new(&mut world);
-        let mut rows = 0;
+        let mut row_count = 0;
         for (mut spline,) in query.iter_mut() {
             spline.tension = 9.5;
             spline.segments = 16;
-            rows += 1;
+            row_count += 1;
         }
-        assert_eq!(rows, 1, "the module's query must see the project's entity");
+        assert_eq!(
+            row_count, 1,
+            "the module's query must see the project's entity"
+        );
     }
 
     // The project reads its own type back and sees the module's writes.
@@ -284,7 +295,7 @@ fn a_read_query_through_one_copy_sees_rows_created_by_the_other() {
 }
 
 /// A change tick written through one copy is seen by a `Changed` filter on the
-/// other, so change detection does not fragment along the binary boundary.
+/// other, so change detection does not split at the binary boundary.
 #[test]
 fn a_change_tick_written_by_one_copy_is_seen_by_the_other() {
     let mut world = World::new();
@@ -330,9 +341,10 @@ fn a_change_tick_written_by_one_copy_is_seen_by_the_other() {
 /// report a conflict, or the scheduler would batch them in parallel and they
 /// would race on the same rows.
 ///
-/// This is a soundness property rather than a correctness one, and it is why
-/// binding and conflict detection cannot be separated: both copies resolve to
-/// one id at the moment they resolve to one column, never later.
+/// This is about soundness, not only correctness: the scheduler runs systems
+/// that report no conflict in parallel, so batched writers would race on the
+/// same rows. It is also why the id and the column arrive together: both copies
+/// resolve to one id in the same registration step.
 #[test]
 fn two_systems_writing_through_different_copies_conflict() {
     use pill_engine::scheduler::SystemAccess;
@@ -375,7 +387,7 @@ fn a_disagreeing_layout_is_reported_instead_of_bound() {
     // the project still holds the old one.
     mod stale_copy {
         /// `pill_spline::Spline` as a module rebuilt against a changed
-        /// definition compiled it: same name, same declared identity, wider
+        /// definition declares it: same name, same declared identity, wider
         /// fields.
         #[derive(Clone, Debug, Default, pill_engine::PillComponent)]
         #[pill(shared = "pill_spline::Spline")]
@@ -411,15 +423,16 @@ fn a_disagreeing_layout_is_reported_instead_of_bound() {
     }
 }
 
-/// Size and alignment alone are not layout. Two shapes that agree on both but
-/// differ in field types must still be rejected, because binding them would
-/// reinterpret every row's bytes silently.
+/// Size and alignment alone are not layout: `{f32, f32}` and `{u32, u32}` agree
+/// on both, and binding them would reinterpret every row's bytes silently. The
+/// schema hash is what tells them apart, so this pins that a field's type
+/// changes it.
 #[test]
 fn a_same_sized_but_differently_typed_layout_is_still_rejected() {
     use pill_engine::component::component_schema_hash;
     use pill_engine::component_registry::ComponentFieldDescriptor;
 
-    const AS_FLOATS: &[ComponentFieldDescriptor] = &[
+    const FIELDS_AS_FLOATS: &[ComponentFieldDescriptor] = &[
         ComponentFieldDescriptor {
             name: "tension",
             type_tag: "f32",
@@ -439,7 +452,7 @@ fn a_same_sized_but_differently_typed_layout_is_still_rejected() {
             decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
-    const AS_INTEGERS: &[ComponentFieldDescriptor] = &[
+    const FIELDS_AS_INTEGERS: &[ComponentFieldDescriptor] = &[
         ComponentFieldDescriptor {
             name: "tension",
             type_tag: "f32",
@@ -461,13 +474,13 @@ fn a_same_sized_but_differently_typed_layout_is_still_rejected() {
     ];
 
     assert_ne!(
-        component_schema_hash(AS_FLOATS),
-        component_schema_hash(AS_INTEGERS),
+        component_schema_hash(FIELDS_AS_FLOATS),
+        component_schema_hash(FIELDS_AS_INTEGERS),
         "a field's type must change the schema hash even when its size does not"
     );
 
     // Reordering fields changes it too, though the struct's size does not.
-    const REORDERED: &[ComponentFieldDescriptor] = &[
+    const REORDERED_FIELDS: &[ComponentFieldDescriptor] = &[
         ComponentFieldDescriptor {
             name: "segments",
             type_tag: "u32",
@@ -488,8 +501,8 @@ fn a_same_sized_but_differently_typed_layout_is_still_rejected() {
         },
     ];
     assert_ne!(
-        component_schema_hash(AS_INTEGERS),
-        component_schema_hash(REORDERED),
+        component_schema_hash(FIELDS_AS_INTEGERS),
+        component_schema_hash(REORDERED_FIELDS),
         "a field reorder must change the schema hash"
     );
 }
@@ -523,12 +536,12 @@ fn ordinary_components_keep_separate_identities() {
         .build()
         .unwrap();
 
-    let populated = world
+    let populated_archetype_count = world
         .archetypes_iter()
         .filter(|archetype| !archetype.entities.is_empty())
         .count();
     assert_eq!(
-        populated, 2,
+        populated_archetype_count, 2,
         "unrelated components stay in their own columns"
     );
 }
@@ -537,10 +550,10 @@ fn ordinary_components_keep_separate_identities() {
 // Paths that move rows rather than read them
 // =============================================================================
 
-/// Moving an entity between archetypes hands its shared component's row to the
-/// destination column bitwise. Both copies resolve to one column, so a row
-/// written through either one travels the same way; this pins that a row
-/// written by one survives a move driven by the other.
+/// Moving an entity between archetypes copies its shared component's row to the
+/// destination column byte for byte. Both copies resolve to one column, so this
+/// pins that a row written through one copy survives a move and is still
+/// readable through the other.
 #[test]
 fn a_shared_row_survives_an_archetype_move() {
     let mut world = World::new();
@@ -563,21 +576,21 @@ fn a_shared_row_survives_an_archetype_move() {
         .add_component(entity, PlainMarker { value: 7 })
         .unwrap();
 
-    let moved = world
+    let moved_spline = world
         .get_component::<ProjectSpline>(entity)
         .expect("the row must survive the move");
-    assert_eq!(moved.tension, 3.25);
-    assert_eq!(moved.segments, 12);
+    assert_eq!(moved_spline.tension, 3.25);
+    assert_eq!(moved_spline.segments, 12);
 
     // And it is still the same single column, reachable from the other copy.
-    let seen = world
+    let seen_from_module_copy = world
         .get_component::<ModuleSpline>(entity)
         .expect("the other copy reaches the moved row too");
-    assert_eq!(seen.tension, 3.25);
+    assert_eq!(seen_from_module_copy.tension, 3.25);
 }
 
-/// Removing a shared component drops its row through the column's registered
-/// drop glue without disturbing the entity's other components.
+/// Removing a shared component drops its row with the column's registered
+/// destructor and leaves the entity's other components untouched.
 #[test]
 fn a_shared_row_can_be_removed_without_disturbing_its_neighbours() {
     let mut world = World::new();
@@ -638,9 +651,6 @@ pub mod module_persisted {
     }
 }
 
-use module_persisted::PersistedSpline as ModulePersistedSpline;
-use project_persisted::PersistedSpline as ProjectPersistedSpline;
-
 /// Rows survive a reload migration no matter which copy registered them.
 ///
 /// Both copies resolve to one identity, so the persist maps hold one
@@ -674,61 +684,67 @@ fn shared_rows_survive_a_migration_from_either_copy() {
         .build()
         .unwrap();
 
-    // The reload the host performs: capture the retiring generation's glue,
-    // let both copies register again exactly as their `init` functions would,
-    // and migrate the shared name. A name that resolved to two registrations
-    // would fail here rather than silently dropping one copy's rows.
-    let previous = world.capture_persist_type_metadata();
+    // The reload the host performs: capture the retiring generation's
+    // serializer, let both copies register again exactly as their `init`
+    // functions would, and migrate the shared name. If the copies had registered
+    // as two types, only one copy's rows could move, and the assertions below
+    // would show it.
+    let previous_metadata = world.capture_persist_type_metadata();
     world.register_persistable_component::<ProjectPersistedSpline>();
     world.register_persistable_component::<ModulePersistedSpline>();
-    let changed = HashSet::from(["pill_spline::PersistedSpline".to_string()]);
-    let report = world.migrate_changed_persistable_components(&previous, &changed, None);
+    let changed_type_names = HashSet::from(["pill_spline::PersistedSpline".to_string()]);
+    let migration_report =
+        world.migrate_changed_persistable_components(&previous_metadata, &changed_type_names, None);
     assert_eq!(
-        report.migrated_type_count, 1,
+        migration_report.migrated_type_count, 1,
         "the shared name migrates as one type"
     );
     assert!(
-        report.skipped_types.is_empty(),
+        migration_report.skipped_types.is_empty(),
         "no copy may be skipped: {:?}",
-        report.skipped_types
+        migration_report.skipped_types
     );
     assert_eq!(
-        report.migrated_entity_count, 2,
+        migration_report.migrated_entity_count, 2,
         "both copies' rows are carried across"
     );
 
     let mut query = Query::<(&ProjectPersistedSpline,)>::new(&mut world);
-    let mut migrated: Vec<(f32, u32)> = query
+    let mut migrated_rows: Vec<(f32, u32)> = query
         .iter_mut()
         .map(|(spline,)| (spline.tension, spline.segments))
         .collect();
-    migrated.sort_by(|left, right| left.0.total_cmp(&right.0));
+    migrated_rows.sort_by(|left, right| left.0.total_cmp(&right.0));
 
     assert_eq!(
-        migrated,
+        migrated_rows,
         vec![(1.0, 1), (2.0, 2)],
         "neither copy's rows may be dropped by the migration"
     );
 }
 
 /// The persistable manifest carries one entry for a shared component, under
-/// its declared name, so the reload path sees one type rather than two rival
-/// registrations of the same name.
+/// its declared name, so the reload path sees one type and not two
+/// registrations of one name.
 #[test]
 fn a_shared_persistable_component_appears_once_in_the_manifest() {
     let mut world = World::new();
     world.register_persistable_component::<ProjectPersistedSpline>();
     world.register_persistable_component::<ModulePersistedSpline>();
 
-    let entries: Vec<_> = world
+    let manifest_entries: Vec<_> = world
         .persist_type_manifest()
         .into_iter()
         .filter(|entry| entry.type_name == "pill_spline::PersistedSpline")
         .collect();
 
-    assert_eq!(entries.len(), 1, "one component, one manifest entry");
     assert_eq!(
-        entries[0].component_id,
+        manifest_entries.len(),
+        1,
+        "one component, one manifest entry"
+    );
+    assert_eq!(
+        manifest_entries[0].component_id,
         ComponentId::of::<ProjectPersistedSpline>()
     );
 }
@@ -738,10 +754,9 @@ fn a_shared_persistable_component_appears_once_in_the_manifest() {
 // =============================================================================
 
 // Two artifacts deliberately writing the *same qualified* name is the one
-// route into a collision the derive cannot close - it is indistinguishable, at
-// the macro, from the legitimate declaration two copies of one type make. A
-// bare `"Transform"` is a compile error, so a collision needs a qualified name
-// written on purpose.
+// collision the derive cannot catch: at the macro, it looks exactly like two
+// copies of one type declaring it. A bare `"Transform"` is a compile error, so
+// a collision needs a qualified name written on purpose.
 
 /// One crate's `Transform`.
 #[derive(Clone, Debug, Default, PillComponent)]
@@ -774,6 +789,7 @@ struct AudioTransform {
     z: f32,
 }
 
+/// The same qualified name with a wider layout is refused at registration.
 #[test]
 fn colliding_names_with_different_layouts_are_caught() {
     let mut world = World::new();
@@ -788,9 +804,9 @@ fn colliding_names_with_different_layouts_are_caught() {
 }
 
 /// Two different types claiming one shared name are rejected even when their
-/// layouts agree exactly - the case no layout check can catch, because every
-/// read through either type would succeed and silently return the other
-/// component's rows.
+/// layouts agree exactly. No layout check can catch that case: every read
+/// through either type would succeed and quietly return the other component's
+/// rows.
 ///
 /// The discriminator is the Rust type's own name: two copies of one type agree
 /// on it (`Spline` is `Spline` in whichever artifact compiled it), while two
@@ -852,7 +868,8 @@ pub mod relaid_current {
     }
 }
 
-/// The previous layout of [`relaid_current::Relaid`].
+/// The layout the same shared component had before [`relaid_current::Relaid`]
+/// replaced it.
 pub mod relaid_previous {
     /// The layout a stale binary declares, with the fields swapped.
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -900,22 +917,26 @@ static RELAID_CURRENT_FIELDS: [pill_engine::component_registry::ComponentFieldDe
 static RELAID_PREVIOUS_FIELDS: [pill_engine::component_registry::ComponentFieldDescriptor; 2] =
     relaid_fields("second", "first");
 
-/// A reload of a subject that was current for a shared component may re-lay
-/// it out; a subject already stale for it (a failed rebuild's rollback) may
-/// not take it back, and without the host's announcement the old layout is a
-/// plain mismatch.
+/// A reload may re-lay out a shared component only if the subject was current
+/// for it. A subject already stale for it - the rollback of a failed rebuild -
+/// may not put the old layout back. Without the host's announcement, an old
+/// layout is refused as the mismatch it is.
 #[test]
 fn only_a_current_subject_may_re_lay_out_a_shared_component() {
-    const NAME: &str = "audit::Relaid";
+    const RELAID_SHARED_NAME: &str = "audit::Relaid";
     let mut world = World::new();
+    // Step 1: register the previous layout, the one a stale binary declares.
     world.register_persistable_component_with_layout::<relaid_previous::Relaid>(
         &RELAID_PREVIOUS_FIELDS,
     );
     assert!(world.take_registration_error().is_none());
-    let previous_hash = world.persist_schema_hash(NAME).expect("registered");
+    let previous_hash = world
+        .persist_schema_hash(RELAID_SHARED_NAME)
+        .expect("registered");
 
-    // The reload of a subject current for the component: the new layout wins.
-    world.supersede_persist_registrations(&[NAME.to_owned()]);
+    // Step 2: a reload of a subject current for the component: the new layout
+    // wins.
+    world.supersede_persist_registrations(&[RELAID_SHARED_NAME.to_owned()]);
     world.register_persistable_component_with_layout::<relaid_current::Relaid>(
         &RELAID_CURRENT_FIELDS,
     );
@@ -924,12 +945,15 @@ fn only_a_current_subject_may_re_lay_out_a_shared_component() {
         world.take_registration_error().is_none(),
         "a superseding registration re-lays the component out"
     );
-    let current_hash = world.persist_schema_hash(NAME).expect("registered");
+    let current_hash = world
+        .persist_schema_hash(RELAID_SHARED_NAME)
+        .expect("registered");
     assert_ne!(current_hash, previous_hash, "the new layout is recorded");
 
-    // The rollback of a subject stale for it: skipped, the layout is kept.
-    world.supersede_persist_registrations(&[NAME.to_owned()]);
-    world.mark_stale_superseded_persist_registrations(&[NAME.to_owned()]);
+    // Step 3: the rollback of a subject stale for it: skipped, the layout is
+    // kept.
+    world.supersede_persist_registrations(&[RELAID_SHARED_NAME.to_owned()]);
+    world.mark_stale_superseded_persist_registrations(&[RELAID_SHARED_NAME.to_owned()]);
     world.register_persistable_component_with_layout::<relaid_previous::Relaid>(
         &RELAID_PREVIOUS_FIELDS,
     );
@@ -939,12 +963,12 @@ fn only_a_current_subject_may_re_lay_out_a_shared_component() {
         "a stale subject's registration is skipped, not failed"
     );
     assert_eq!(
-        world.persist_schema_hash(NAME),
+        world.persist_schema_hash(RELAID_SHARED_NAME),
         Some(current_hash),
         "a stale subject cannot take the layout back"
     );
 
-    // Unannounced, the old layout is the mismatch it always was.
+    // Step 4: unannounced, the old layout is the mismatch it always was.
     world.register_persistable_component_with_layout::<relaid_previous::Relaid>(
         &RELAID_PREVIOUS_FIELDS,
     );

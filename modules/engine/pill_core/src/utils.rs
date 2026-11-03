@@ -6,14 +6,14 @@
 //! - Define the error an asset loader reports for a refused path
 //!   ([`AssetPathError`]).
 //! - Construct and inspect fixed-width bitmasks.
-//! - Format project-level error chains for reporting.
+//! - Format errors and their cause chains for reporting.
 //!
 //! # Design
 //!
-//! Pure helpers with no engine state. The single error type,
-//! [`AssetPathError`], is defined locally with `thiserror` so callers can
-//! match on variants without depending on an engine crate. Bitmask helpers
-//! number bits from the most significant bit (index 0) to the least.
+//! The helpers here keep no engine state. The single error type,
+//! [`AssetPathError`], is defined here with `thiserror`, so a loader can
+//! match its variants without depending on an engine crate. The bitmask
+//! helpers number bits from the most significant bit (index 0) to the least.
 
 // Standard library
 use std::{
@@ -23,11 +23,39 @@ use std::{
 };
 
 // =============================================================================
+// Types
+// =============================================================================
+
+/// The reason an asset loader refused a path: it names nothing usable, or its
+/// format is not one the loader accepts.
+///
+/// Loaders that check a path before reading it report this type;
+/// `pill_audio`'s `Sound::load` is one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AssetPathError {
+    /// The path names nothing usable: it does not exist, or it carries no file
+    /// extension.
+    #[error("asset path is not usable: {path}")]
+    InvalidPath {
+        /// The offending path, for diagnostics.
+        path: String,
+    },
+    /// The file extension is not among the allowed formats.
+    #[error("asset format `{extension}` is not allowed (expected one of: {allowed})")]
+    InvalidFormat {
+        /// The file extension that was rejected.
+        extension: String,
+        /// Comma-separated list of allowed formats.
+        allowed: String,
+    },
+}
+
+// =============================================================================
 // Type-name reflection
 // =============================================================================
 
-/// Short name of `T`: its full name with everything up to and including the
-/// last `:` removed, so `std::vec::Vec<u8>` reads as `Vec<u8>`.
+/// Returns the short name of `T`: the part of its full type name after the
+/// last `:`, so `std::vec::Vec<u8>` reads as `Vec<u8>`.
 ///
 /// # Examples
 ///
@@ -46,8 +74,10 @@ pub fn get_type_name<T>() -> String {
         .to_string()
 }
 
-/// Short name of the type of `value`: its full name with everything up to and
-/// including the last `:` removed.
+/// Returns the short name of the type of `value`: the part of its full type
+/// name after the last `:`.
+///
+/// Only the type of `value` is used; the value itself is not read.
 ///
 /// # Examples
 ///
@@ -66,9 +96,9 @@ pub fn get_value_type_name<T>(_: &T) -> String {
         .to_string()
 }
 
-/// Whether two references point to the same enum variant.
+/// Returns whether two values are the same enum variant.
 ///
-/// Compares [`std::mem::discriminant`], so payload values are ignored.
+/// It compares [`std::mem::discriminant`], so payload values are ignored.
 ///
 /// # Examples
 ///
@@ -78,13 +108,18 @@ pub fn get_value_type_name<T>(_: &T) -> String {
 /// assert!(enum_variant_eq(&Some(1), &Some(2)));
 /// assert!(!enum_variant_eq(&Some(1), &None::<i32>));
 /// ```
-pub fn enum_variant_eq<T>(a: &T, b: &T) -> bool {
-    std::mem::discriminant(a) == std::mem::discriminant(b)
+pub fn enum_variant_eq<T>(first: &T, second: &T) -> bool {
+    std::mem::discriminant(first) == std::mem::discriminant(second)
 }
 
-/// Name of the enum variant that `value` currently holds.
+/// Returns the name of the enum variant `value` holds, read from its `Debug`
+/// output.
 ///
-/// Uses the `Debug` representation, so `value` must implement `Debug`.
+/// Everything from the first `(` onward is dropped, which removes a tuple
+/// variant's payload. When that output has no `(`, the whole output comes
+/// back: that is the case for a struct, or for a struct-shaped variant.
+///
+/// `value` must implement `Debug`.
 ///
 /// # Examples
 ///
@@ -95,46 +130,25 @@ pub fn enum_variant_eq<T>(a: &T, b: &T) -> bool {
 /// assert_eq!(get_enum_variant_type_name(&None::<f32>), "None");
 /// ```
 pub fn get_enum_variant_type_name<T: core::fmt::Debug>(value: &T) -> String {
-    // The `Debug` representation starts with the variant name, optionally
-    // followed by a parenthesised payload that is discarded here.
-    let full_type_name = format!("{value:?}");
-    let name = full_type_name.split('(').next().unwrap_or(&full_type_name);
-    name.trim().to_string()
-}
-
-// =============================================================================
-// Types
-// =============================================================================
-
-/// Why an asset path was refused: it names nothing usable, or its format is
-/// not one the loader accepts. Reported by loaders that check a path before
-/// reading it (`pill_audio`'s `Sound::load`).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum AssetPathError {
-    /// The path does not exist or carries no file extension.
-    #[error("asset path is not usable: {path}")]
-    InvalidPath {
-        /// The offending path, for diagnostics.
-        path: String,
-    },
-    /// The file extension is not among the allowed formats.
-    #[error("asset format `{extension}` is not allowed (expected one of: {allowed})")]
-    InvalidFormat {
-        /// The file extension that was rejected.
-        extension: String,
-        /// Comma-separated list of allowed formats.
-        allowed: String,
-    },
+    // The `Debug` output starts with the variant name and then, for a tuple
+    // variant, a parenthesised payload that is dropped here.
+    let debug_representation = format!("{value:?}");
+    let name_before_payload = debug_representation
+        .split('(')
+        .next()
+        .unwrap_or(&debug_representation);
+    name_before_payload.trim().to_string()
 }
 
 // =============================================================================
 // Error-chain formatting
 // =============================================================================
 
-/// Format an error and its full source chain into a single message.
+/// Formats an error and its whole cause chain into one message.
 ///
-/// The first line is the top-level error; every [`std::error::Error::source`]
-/// is indented below it in order.
+/// The first line holds the top-level error, prefixed with
+/// `Pill project error: `. Each cause follows on its own line, indented and
+/// numbered from 0 in chain order.
 ///
 /// # Examples
 ///
@@ -152,25 +166,25 @@ pub fn get_project_error_message<E: std::error::Error>(result: Result<(), E>) ->
         // Walk the error's `source` chain, indenting each cause in order so
         // the report reads top-down from the outermost to the innermost error.
         let mut source = error.source();
-        let mut index = 0usize;
+        let mut cause_index = 0usize;
         while let Some(inner_source) = source {
-            message.push_str(&format!("  {index}: {inner_source}\n"));
-            index += 1;
+            message.push_str(&format!("  {cause_index}: {inner_source}\n"));
+            cause_index += 1;
             source = inner_source.source();
         }
         message
     })
 }
 
-/// Format an error and its full source chain on a single line.
+/// Formats an error and its whole cause chain on a single line.
 ///
-/// A console report built from `Display` shows only the outermost message, and
-/// the cause that names the actual problem - which import could not be
-/// resolved, which file was not found - sits under it in the chain. Causes are
-/// appended in order, separated by `: `.
+/// Printing an error with `Display` shows only the outermost message. The
+/// cause that names the actual problem - which import could not be resolved,
+/// or which file was not found - is only in the chain, not in that text. This
+/// function appends every cause in order, separated by `: `.
 ///
-/// Use [`get_project_error_message`] where a multi-line report is wanted: this
-/// one is shaped for one log line.
+/// Use [`get_project_error_message`] when a multi-line report is wanted. This
+/// one is shaped for a single log line.
 ///
 /// # Examples
 ///
@@ -196,10 +210,11 @@ pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 // Bitmask helpers
 // =============================================================================
 
-/// Build a bitmask of `T`'s width with one contiguous run of set bits.
+/// Builds a bitmask as wide as `T` with one contiguous run of set bits.
 ///
 /// Bits are numbered from the most significant bit (MSB, index 0) to the
-/// least significant. `mask_range` selects the run of bits to set.
+/// least significant. `mask_range` gives the run to set, and both ends count:
+/// `0..4` sets five bits, at indexes 0 to 4.
 ///
 /// # Examples
 ///
@@ -212,9 +227,9 @@ pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 ///
 /// # Panics
 ///
-/// Panics when `mask_range.end` reaches or exceeds the bit width of `T`, or
-/// when `mask_range.start` is greater than `mask_range.end` (a reversed range
-/// has no run to set, and its length would underflow).
+/// Panics when `mask_range.end` is at or past the bit width of `T`, or when
+/// `mask_range.start` is greater than `mask_range.end`. A reversed range has
+/// no run to set, and its length would underflow.
 pub fn create_bitmask_from_range<T>(mask_range: &core::ops::Range<T>) -> T
 where
     T: Copy
@@ -229,34 +244,34 @@ where
 {
     // Step 1: Compute the bit width of `T` and reject a range whose end
     // reaches or exceeds it.
-    let mask_size = T::from(std::mem::size_of::<T>() as u8 * 8);
-    if mask_range.end >= mask_size {
+    let bit_width = T::from(std::mem::size_of::<T>() as u8 * 8);
+    if mask_range.end >= bit_width {
         panic!("Provided mask range exceeds mask size");
     }
 
-    // Step 2: Reject a reversed range. Its length would underflow, and the
-    // shift that length feeds is masked to the type's width, so the caller
-    // would get a run of bits unrelated to the range it asked for.
+    // Step 2: Reject a reversed range. Its length would underflow, so it has
+    // no run of bits to set.
     if mask_range.start > mask_range.end {
         panic!("Provided mask range is reversed");
     }
 
-    // Step 3: Derive the run length and the shift aligning it to the MSB.
+    // Step 3: Work out the length of the run and the shift that places it at
+    // the MSB end.
     let range_length: T = mask_range.end - mask_range.start + T::from(1);
-    let mask_shift = mask_size - mask_range.end - T::from(1);
+    let mask_shift = bit_width - mask_range.end - T::from(1);
 
     // Step 4: Build the mask, handling a full-width run separately because
     // shifting by the full bit width would overflow.
-    match range_length == mask_size {
+    match range_length == bit_width {
         true => !(T::from(0)) << mask_shift,
         false => !(!T::from(0) << range_length) << mask_shift,
     }
 }
 
-/// Build a `u16` bitmask with a single set bit at `index`.
+/// Builds a `u16` bitmask with one bit set, at `index`.
 ///
 /// Bits are numbered from the most significant bit (index 0) to the least
-/// significant (index 15). Indexes outside `0..=15` produce a zero mask.
+/// significant (index 15). An index outside `0..=15` gives a zero mask.
 ///
 /// # Examples
 ///
@@ -283,7 +298,8 @@ pub fn create_bitmask_with_one(index: u16) -> u16 {
     mask
 }
 
-/// Indexes (from the MSB) of every set bit in a `u16` bitmask.
+/// Returns the index of every set bit in a `u16` bitmask, counted from the
+/// most significant bit (index 0).
 ///
 /// # Examples
 ///
@@ -298,15 +314,15 @@ pub fn create_bitmask_with_one(index: u16) -> u16 {
 pub fn get_indices_of_set_elements(bitmask: u16) -> Vec<usize> {
     // Walk the mask from the most significant bit (index 0) to the least
     // significant (index 15), recording the position of every set bit.
-    let mut test_mask: u16 = 0b1000_0000_0000_0000;
-    let mut indices = Vec::<usize>::new();
+    let mut single_bit_mask: u16 = 0b1000_0000_0000_0000;
+    let mut set_bit_indices = Vec::<usize>::new();
     for i in 0..=15 {
-        if bitmask & test_mask > 0 {
-            indices.push(i);
+        if bitmask & single_bit_mask > 0 {
+            set_bit_indices.push(i);
         }
-        test_mask >>= 1;
+        single_bit_mask >>= 1;
     }
-    indices
+    set_bit_indices
 }
 
 // =============================================================================
@@ -318,7 +334,8 @@ mod tests {
     // Current crate
     use super::*;
 
-    /// The documented example: the first four bits of a `u16` are set.
+    /// The documented example: `0..4` sets the five most significant bits of
+    /// a `u16`.
     #[test]
     fn a_range_sets_its_run_of_bits() {
         assert_eq!(
@@ -327,9 +344,8 @@ mod tests {
         );
     }
 
-    /// A reversed range is a caller error, not a request for a mask: the run
-    /// length would underflow, and the shift it feeds would then be masked to
-    /// something unrelated to the range.
+    /// A reversed range is a caller error, not a request for a mask: its
+    /// length would underflow, so there is no run of bits to set.
     #[test]
     #[should_panic(expected = "Provided mask range is reversed")]
     fn a_reversed_range_is_rejected() {

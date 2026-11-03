@@ -1,67 +1,85 @@
-//! A small generational arena for values addressed by stable handles.
+//! A generational slot arena: numbered slots that hand out stable handles.
 //!
 //! # Responsibilities
 //!
 //! - Hand out `Copy` handles that name one slot each, so a caller can pass
 //!   them around while the map keeps owning the values.
-//! - Validate every access against the version a handle was issued at, so a
-//!   handle to a removed value fails instead of aliasing whatever refills its
-//!   slot.
+//! - Check every access against the version a handle was issued with, so a
+//!   handle to a removed value fails instead of reaching whatever value refills
+//!   its slot.
 //! - Provide [`define_slot_key!`] so a crate can stamp out its own handle types
-//!   over the shared machinery rather than reimplementing the validation.
+//!   over the shared machinery instead of reimplementing the check.
 //!
 //! # Design
 //!
-//! Slots carry the current version and handles carry the version they were
-//! issued at; comparing the two is what turns a stale handle into a miss.
-//! [`SlotMap`] stays generic over the key, so one implementation serves every
+//! Each slot stores the version it is at (its generation), and each handle
+//! carries the version its slot had when the handle was made. A lookup compares
+//! the two versions and reads a mismatch as "no value". That comparison is what
+//! turns an old handle into a miss once its slot is freed and reused.
+//!
+//! [`SlotMap`] is generic over the key type, so one implementation serves every
 //! kind of resource a crate wants to address this way.
 //!
-//! This is deliberately not the engine's asset storage: an asset is registered
-//! by type, addressed by a guid and has to outlive a reload, while this is a
-//! flat arena of built objects with no identity beyond its slot.
+//! This is deliberately not the engine's asset storage. An asset is registered
+//! by type, addressed by a guid and has to outlive a module reload. This map
+//! holds built objects in a flat list, and a value has no identity beyond the
+//! slot it sits in.
 
 // Standard library
 use std::{marker::PhantomData, num::NonZeroU32};
 
-/// Index and version that together identify one incarnation of a slot.
+// =============================================================================
+// KeyData
+// =============================================================================
+
+/// The slot index and version a handle was issued with.
 ///
-/// A handle carries the `KeyData` it was issued with, and the slot stores its
-/// own version; a lookup only succeeds while the two match. Reusing a slot
-/// bumps its version, so a handle from before the reuse stops validating
-/// rather than naming its successor.
+/// A handle carries its `KeyData`, and the slot stores its own version. A
+/// lookup succeeds only while the two versions match. Freeing a slot increases
+/// its version, so a handle made before the free stops matching. It then reads
+/// as "no value" instead of naming the value that refills the slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct KeyData {
-    /// Position of the slot in the map's backing vector.
+    /// Position of the slot in the map's internal vector of slots.
     pub index: u32,
-    /// Version the slot must still carry for the handle to validate.
+    /// The version the slot must still have for the handle to work.
     pub version: NonZeroU32,
 }
 
+// =============================================================================
+// SlotKey
+// =============================================================================
+
 /// A typed handle for one entry of a [`SlotMap`].
 ///
-/// Implementations are thin wrappers over a [`KeyData`], so handles stay `Copy`
-/// and never borrow the value; the wrapper type records which slot map the
-/// handle may be used with.
+/// Each implementation is a thin wrapper around a [`KeyData`], so a handle
+/// stays `Copy` and never borrows the value it names. The wrapper type is the
+/// only record of which map a handle belongs to: a map accepts just the key
+/// type it was declared with.
 pub trait SlotKey: Copy + Eq {
-    /// Builds a handle from a raw slot index and the version the slot must
-    /// still carry for the handle to validate.
+    /// Builds a handle from a slot index and the version the slot must still
+    /// have for the handle to work.
     ///
-    /// Called where a handle is reconstructed outside the map's own insert - a
-    /// packed key carries the index and version a later frame rebuilds one from
-    /// - and where a fresh map seeds a placeholder handle to overwrite.
+    /// Handles are also built outside the map. A storage starts with stand-in
+    /// handles and replaces them as its real values are inserted, and a test
+    /// needs handles for slots it never fills. The map's own `insert` calls
+    /// this too.
     fn new(index: u32, version: NonZeroU32) -> Self;
 
-    /// Returns the raw [`KeyData`] the map validates the handle against.
+    /// Returns the index and version the handle carries.
     fn data(self) -> KeyData;
 }
 
-/// Defines one typed handle over [`KeyData`], with its accessors and its
-/// [`SlotKey`] impl.
+// =============================================================================
+// define_slot_key
+// =============================================================================
+
+/// Defines a typed handle over [`KeyData`], with its constructor, its accessor
+/// and its [`SlotKey`] implementation.
 ///
-/// Every handle a crate needs is the same wrapper, differing only in name and
-/// in which slot map accepts it, so the type is stamped out rather than written
-/// per resource.
+/// Every handle type a crate needs is the same wrapper; only the name and the
+/// map that accepts it differ. The macro writes the wrapper out so each
+/// resource does not get a hand-written copy of it.
 ///
 /// # Examples
 ///
@@ -73,19 +91,19 @@ macro_rules! define_slot_key {
     ($name:ident) => {
         /// A typed handle for the slots of the map it was issued by.
         ///
-        /// Generated by `define_slot_key!`; the wrapper type keeps handles
-        /// from different maps apart.
+        /// Generated by `define_slot_key!`. The wrapper type is what tells one
+        /// kind of handle from another.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub struct $name($crate::slot_map::KeyData);
 
         impl $name {
-            /// Builds a handle from a raw slot index and the version the slot
-            /// must still carry for the handle to validate.
+            /// Builds a handle from a slot index and the version the slot
+            /// must still have for the handle to work.
             pub fn new(index: u32, version: ::core::num::NonZeroU32) -> Self {
                 Self($crate::slot_map::KeyData { index, version })
             }
 
-            /// Returns the raw key data the map validates the handle against.
+            /// Returns the index and version this handle carries.
             pub fn data(self) -> $crate::slot_map::KeyData {
                 self.0
             }
@@ -103,100 +121,110 @@ macro_rules! define_slot_key {
     };
 }
 
-/// One entry of a [`SlotMap`]: the version it currently carries, and the value
-/// living in it, if any.
+// =============================================================================
+// Slot
+// =============================================================================
+
+/// One entry of a [`SlotMap`]. It holds the slot's current version and the
+/// value in it, if any.
 struct Slot<V> {
     version: NonZeroU32,
     value: Option<V>,
 }
 
-/// Generational slot arena that hands out typed [`SlotKey`] handles.
+// =============================================================================
+// SlotMap
+// =============================================================================
+
+/// A vector of slots that hands out typed [`SlotKey`] handles.
 ///
-/// Removal bumps the slot's version, so replacing a value can never make an old
-/// handle read the new one; freed slots are reused before the slot vector
-/// grows.
+/// Removing a value increases its slot's version, so an old handle can never
+/// read whatever takes its place. Freed slots are reused, with the version the
+/// removal left on them, before the vector of slots grows.
 pub struct SlotMap<K, V> {
     slots: Vec<Slot<V>>,
-    free: Vec<u32>,
+    free_slot_indices: Vec<u32>,
     marker: PhantomData<fn() -> K>,
 }
 
 impl<K: SlotKey, V> SlotMap<K, V> {
-    /// Creates an empty map for key type `K`, with room for `capacity` values.
+    /// Creates an empty map for key type `K` and value type `V`, with room for
+    /// `capacity` values before the slot vector has to grow.
     ///
-    /// The key is named in the method rather than inferred because nothing in
-    /// the arguments constrains it.
+    /// The caller names both types, as in
+    /// `SlotMap::<K, V>::with_capacity_and_key(16)`, because the capacity
+    /// argument says nothing about either.
     pub fn with_capacity_and_key(capacity: usize) -> Self {
         Self {
             slots: Vec::with_capacity(capacity),
-            free: Vec::new(),
+            free_slot_indices: Vec::new(),
             marker: PhantomData,
         }
     }
 
     /// Inserts a value and returns the handle that names it.
     ///
-    /// A freed slot is reused before the vector grows, keeping the version its
-    /// removal left behind, so the returned handle never equals the one that
-    /// freed the slot.
+    /// A freed slot is reused before the slot vector grows. It keeps the
+    /// version its removal gave it, so the new handle never equals the handle
+    /// that freed the slot.
     pub fn insert(&mut self, value: V) -> K {
-        if let Some(index) = self.free.pop() {
-            let slot = &mut self.slots[index as usize];
+        if let Some(slot_index) = self.free_slot_indices.pop() {
+            let slot = &mut self.slots[slot_index as usize];
             slot.value = Some(value);
-            return K::new(index, slot.version);
+            return K::new(slot_index, slot.version);
         }
-        let index = self.slots.len() as u32;
+        let slot_index = self.slots.len() as u32;
         let version = NonZeroU32::new(1).unwrap();
         self.slots.push(Slot {
             version,
             value: Some(value),
         });
-        K::new(index, version)
+        K::new(slot_index, version)
     }
 
-    /// Looks up the value a handle names, or `None` if the handle is stale.
+    /// Returns the value a handle names, or `None` if the handle is stale.
     ///
-    /// The slot's version must match the handle's, so a slot emptied or reused
-    /// after the handle was issued reads as stale.
+    /// The slot's version must match the handle's, so a handle whose slot has
+    /// been emptied or reused reads as stale.
     pub fn get(&self, key: K) -> Option<&V> {
-        let data = key.data();
-        let slot = self.slots.get(data.index as usize)?;
-        (slot.version == data.version)
+        let key_data = key.data();
+        let slot = self.slots.get(key_data.index as usize)?;
+        (slot.version == key_data.version)
             .then_some(slot.value.as_ref())
             .flatten()
     }
 
-    /// Looks up the value a handle names for mutation.
+    /// Returns a mutable reference to the value a handle names.
     ///
-    /// Validation is the same as [`get`](Self::get): a stale handle yields
-    /// `None` instead of aliasing the value that inherited its slot.
+    /// The check is the same as in [`get`](Self::get): a stale handle yields
+    /// `None` instead of a reference to whatever value took over its slot.
     pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
-        let data = key.data();
-        let slot = self.slots.get_mut(data.index as usize)?;
-        (slot.version == data.version)
+        let key_data = key.data();
+        let slot = self.slots.get_mut(key_data.index as usize)?;
+        (slot.version == key_data.version)
             .then_some(slot.value.as_mut())
             .flatten()
     }
 
-    /// Take the value out of its slot, invalidating every handle to it.
+    /// Removes the value from its slot and invalidates every handle to it.
     ///
-    /// The slot is freed for reuse behind a bumped version, so a handle kept
-    /// from before the removal can never name whatever refills it. At the
-    /// version ceiling the slot is retired instead of wrapped, because a
-    /// version that wrapped would validate handles issued before the last few
-    /// removals - the same reasoning any generational handle relies on.
+    /// The slot is freed for reuse with a higher version, so a handle kept from
+    /// before the removal can never name whatever value refills the slot. When
+    /// the next version would reach its maximum, the slot is never reused
+    /// instead of wrapping around to a low number, because a wrapped version
+    /// would make handles from before the last few removals valid again.
     pub fn remove(&mut self, key: K) -> Option<V> {
-        let data = key.data();
-        let slot = self.slots.get_mut(data.index as usize)?;
-        if slot.version != data.version {
+        let key_data = key.data();
+        let slot = self.slots.get_mut(key_data.index as usize)?;
+        if slot.version != key_data.version {
             return None;
         }
-        let value = slot.value.take()?;
-        let next = slot.version.get().saturating_add(1);
-        slot.version = NonZeroU32::new(next).unwrap();
-        if next < u32::MAX {
-            self.free.push(data.index);
+        let removed_value = slot.value.take()?;
+        let next_version = slot.version.get().saturating_add(1);
+        slot.version = NonZeroU32::new(next_version).unwrap();
+        if next_version < u32::MAX {
+            self.free_slot_indices.push(key_data.index);
         }
-        Some(value)
+        Some(removed_value)
     }
 }

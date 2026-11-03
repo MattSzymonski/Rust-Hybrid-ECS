@@ -1,14 +1,15 @@
-//! `#[pill_mirror_impl]` must accept its method marker written either bare or
-//! as a fully qualified path.
+//! `#[pill_mirror_impl]` must accept `#[pill_mirror_method]` written either
+//! bare or as a fully qualified path.
 //!
 //! # Responsibilities
 //!
 //! - Declare one `#[derive(PillMirror)]` value type with the marker in both
 //!   spellings.
-//! - Pin that both methods reach this artifact's mirror-method registry. A
-//!   skipped method is invisible until the generated C# fails to compile
-//!   against the missing member, so both spellings are pinned.
+//! - Pin that both methods reach the mirror-method registry this test binary
+//!   builds. A skipped method is simply missing from the generated C# mirror,
+//!   so the loss only shows up when C# code that uses it fails to compile.
 
+// External crates
 use pill_engine::component_registry::mirror_method_descriptors;
 use pill_engine::{pill_mirror_impl, pill_mirror_method, PillMirror};
 

@@ -1,30 +1,34 @@
-//! Terminal styling for both targets.
+//! Terminal styling for `&str` on the native and web targets.
 //!
 //! # Responsibilities
 //!
-//! - Implement [`PillStyle`](crate::style::PillStyle) for `&str` on native
-//!   targets (colored and bold through the `colored` crate) and on `wasm32`
-//!   (plain text, names still quoted).
+//! - Implement [`PillStyle`](crate::style::PillStyle) for `&str`, colored and
+//!   bold through the `colored` crate on native targets.
+//! - Provide the same methods on `wasm32` as plain text, with a name still put
+//!   in quotation marks.
 //!
 //! # Design
 //!
-//! The two implementations are chosen at compile time, which is why they live
-//! here beside the other target splits rather than next to the trait: the
-//! platform layer is the one place a `cfg(target_arch)` gate exists, so a
-//! reader looking for per-target behaviour looks here and nowhere else.
+//! Only one of the two implementations is compiled, so they sit here beside
+//! the other modules that differ per target, not next to the trait. This layer
+//! holds the crate's only `cfg(target_arch)` gates, so a reader looking for
+//! per-target behaviour finds all of it here.
 
 // =============================================================================
 // PillStyle for &str (native, colored)
 // =============================================================================
 
-/// Applies ANSI styling through the `colored` crate on native targets.
+/// Applies ANSI styling on native targets through the `colored` crate.
 ///
-/// Each method colors the string for its semantic role; module objects,
-/// errors, warnings, and debug messages also gain bold weight.
+/// Each method colors the text for its role. Module objects, errors, warnings
+/// and debug messages also become bold.
+///
+/// The `colored` crate writes the escape codes only when it decides the output
+/// is a terminal, so text redirected to a file usually comes back plain.
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::style::PillStyle for &str {
-    /// Style a large module object (Engine, Renderer, Window, and so on):
-    /// changes the color and adds bold weight.
+    /// Colors a large module object (Engine, Renderer, Window, and so on) and
+    /// makes it bold.
     #[inline]
     fn module_object_style(self) -> String {
         use colored::Colorize;
@@ -37,16 +41,14 @@ impl crate::style::PillStyle for &str {
         .to_string()
     }
 
-    /// Style a general object (Scene, Component, System, Resource, and so on):
-    /// changes the color.
+    /// Colors a general object (Scene, Component, System, Resource, and so on).
     #[inline]
     fn general_object_style(self) -> String {
         use colored::Colorize;
         self.color(colored::Color::BrightCyan).to_string()
     }
 
-    /// Style a specific object (CameraComponent, Texture, Mesh, and so on):
-    /// changes the color.
+    /// Colors a specific object (CameraComponent, Texture, Mesh, and so on).
     #[inline]
     fn specific_object_style(self) -> String {
         use colored::Colorize;
@@ -58,7 +60,7 @@ impl crate::style::PillStyle for &str {
         .to_string()
     }
 
-    /// Style a name: changes the color and adds quotation marks.
+    /// Puts a name in quotation marks and colors the quoted text.
     #[inline]
     fn name_style(self) -> String {
         use colored::Colorize;
@@ -71,21 +73,21 @@ impl crate::style::PillStyle for &str {
             .to_string()
     }
 
-    /// Style an error message: changes the color and adds bold weight.
+    /// Colors an error message and makes it bold.
     #[inline]
     fn error_style(self) -> String {
         use colored::Colorize;
         self.color(colored::Color::Red).bold().to_string()
     }
 
-    /// Style a warning message: changes the color and adds bold weight.
+    /// Colors a warning message and makes it bold.
     #[inline]
     fn warn_style(self) -> String {
         use colored::Colorize;
         self.color(colored::Color::Yellow).bold().to_string()
     }
 
-    /// Style a debug message: changes the color and adds bold weight.
+    /// Colors a debug message and makes it bold.
     #[inline]
     fn debug_style(self) -> String {
         use colored::Colorize;
@@ -97,49 +99,50 @@ impl crate::style::PillStyle for &str {
 // PillStyle for &str (wasm32, plain)
 // =============================================================================
 
-/// No-op styling for targets without terminal capabilities.
+/// Plain-text styling for `wasm32`, which has no terminal.
 ///
-/// Returns the string unchanged so the styling vocabulary compiles on
-/// `wasm32`; names still gain quotation marks.
+/// Every method returns the text unchanged, so code that styles terminal
+/// output still compiles on the web. The one exception is a name, which still
+/// gains quotation marks.
 #[cfg(target_arch = "wasm32")]
 impl crate::style::PillStyle for &str {
-    /// Style a large module object: returned unchanged.
+    /// Returns a large module object unchanged.
     #[inline]
     fn module_object_style(self) -> String {
         self.to_string()
     }
 
-    /// Style a general object: returned unchanged.
+    /// Returns a general object unchanged.
     #[inline]
     fn general_object_style(self) -> String {
         self.to_string()
     }
 
-    /// Style a specific object: returned unchanged.
+    /// Returns a specific object unchanged.
     #[inline]
     fn specific_object_style(self) -> String {
         self.to_string()
     }
 
-    /// Style a name: adds quotation marks.
+    /// Puts a name in quotation marks.
     #[inline]
     fn name_style(self) -> String {
         format!("\"{}\"", self)
     }
 
-    /// Style an error message: returned unchanged.
+    /// Returns an error message unchanged.
     #[inline]
     fn error_style(self) -> String {
         self.to_string()
     }
 
-    /// Style a warning message: returned unchanged.
+    /// Returns a warning message unchanged.
     #[inline]
     fn warn_style(self) -> String {
         self.to_string()
     }
 
-    /// Style a debug message: returned unchanged.
+    /// Returns a debug message unchanged.
     #[inline]
     fn debug_style(self) -> String {
         self.to_string()

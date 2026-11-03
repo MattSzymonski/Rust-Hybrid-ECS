@@ -3,23 +3,27 @@
 //! # Responsibilities
 //!
 //! - Defines the [`Entity`] handle type used throughout the ECS.
-//! - Defines [`EntityId`], the stable identity an [`Entity`] carries for a
-//!   lifetime longer than the handle (a saved reference, a network message).
+//! - Defines [`EntityId`], the stable identity the world keeps for an
+//!   [`Entity`], for references that outlive the handle (a saved reference, a
+//!   network message).
 //! - Provides generation-counter logic to prevent dangling-handle bugs.
 //! - Keeps the handle compact (16 bytes) for cheap copy and storage.
 //!
 //! # Design
 //!
-//! Entities are not objects - they are 64-bit IDs paired with a 32-bit
-//! generation counter. When an entity is destroyed, its ID is recycled via
-//! a free list and the generation is incremented. Any old handle still
-//! holding the previous generation will fail validation, preventing
-//! use-after-free bugs without reference counting or garbage collection.
+//! Entities are not objects: they are 64-bit slot ids paired with a 32-bit
+//! generation counter. When an entity is destroyed, its id goes back on a
+//! free list, and the next handle for that slot carries the next generation.
+//! A slot that has reached the maximum generation is retired instead of
+//! reused. Any old handle still holds the previous generation, so it fails
+//! validation. That prevents use-after-free bugs without reference counting
+//! or garbage collection.
 //!
-//! A handle is therefore cheap but meaningless outside its run: the slot it
-//! names is reused. [`EntityId`] is the opposite trade - 128 random bits that
-//! are never reused, so data written for a later run can name one entity
-//! without depending on the order the world happened to spawn them in.
+//! A handle is therefore cheap but meaningless outside its run, because the
+//! slot it names is reused. [`EntityId`] is the opposite trade: it is random
+//! and not derived from a slot, so data written for a later run can name one
+//! entity without depending on the order the world happened to spawn them
+//! in.
 
 // Standard library
 use std::fmt;
@@ -28,10 +32,11 @@ use std::fmt;
 // Entity
 // =============================================================================
 
-/// Lightweight handle referencing a collection of components in the [`World`].
+/// A handle that names one entity in a [`World`].
 ///
-/// Entities are 16 bytes, [`Copy`], and cheap to pass by value. The
-/// generation counter disambiguates recycled IDs:
+/// The handle is 16 bytes, [`Copy`], and cheap to pass by value. Its
+/// generation counter tells a reused slot apart from the entity that used it
+/// before:
 ///
 /// ```
 /// # use pill_engine::*;
@@ -47,37 +52,26 @@ use std::fmt;
 ///
 /// let bullet = world.create_entity().with(Damage(10.0)).build().unwrap();
 ///
-/// // Old handle is safely invalidated:
+/// // The destroyed handle is reported as invalid:
 /// assert!(!world.is_entity_valid(enemy));
 /// ```
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Entity {
-    /// Unique numeric identifier for this entity slot.
+    /// The numeric id of this entity's slot.
     ///
-    /// IDs are recycled when entities are destroyed to prevent unbounded growth.
-    /// The same ID may be reused for different entities over time, distinguished
-    /// by the `generation` field.
+    /// Ids are reused when entities are destroyed, so the id space does not
+    /// grow without end. The same id can name different entities over time;
+    /// the `generation` field tells them apart.
     pub(crate) id: u64,
 
-    /// Generation counter to distinguish reused entity IDs.
+    /// The generation of the entity now in this slot.
     ///
-    /// Incremented each time an entity ID is recycled. This allows detecting
-    /// "stale" entity handles that reference a destroyed entity whose ID was
-    /// reused for a new entity. A handle is valid only if both id AND generation
-    /// match the current entity at that slot.
+    /// The world adds one each time the slot is reused. This is what lets a
+    /// stale handle - one whose entity was destroyed and whose slot went to a
+    /// new entity - be detected. A handle is valid only if both its id and its
+    /// generation match the entity now in that slot.
     pub(crate) generation: u32,
-}
-
-impl Default for Entity {
-    /// The [null handle](Self::NULL): a reference to nothing.
-    ///
-    /// Slot 0 is a real slot the world hands out, so a defaulted field must not
-    /// mean "entity 0" - a component whose reference field was never set would
-    /// otherwise point at whoever owns that slot.
-    fn default() -> Self {
-        Self::NULL
-    }
 }
 
 // =============================================================================
@@ -88,8 +82,8 @@ impl Entity {
     /// A handle that names no entity.
     ///
     /// What a reference field holds before it is set and after it is cleared.
-    /// Both halves are saturated, so no slot allocation can ever produce it:
-    /// slot ids count up from zero and generations count up from zero too.
+    /// Both halves are saturated, which no slot allocation can produce: slot
+    /// ids count up from zero and stay far below `u64::MAX`.
     pub const NULL: Self = Self {
         id: u64::MAX,
         generation: u32::MAX,
@@ -111,11 +105,12 @@ impl Entity {
         Self { id, generation }
     }
 
-    /// Rebuilds a handle from its parts, for callers that persist handles
-    /// across process restarts and check them against the world themselves
-    /// (the editor's state recovery): the world answers `false` from
-    /// [`World::is_entity_valid`] until a live entity carries both numbers
-    /// again.
+    /// Rebuilds a handle from its id and generation.
+    ///
+    /// Callers that stored the pair and check it against the world themselves
+    /// use this - the editor's state recovery and saved references, for
+    /// example. Until a live entity carries both numbers again,
+    /// [`World::is_entity_valid`] answers `false`.
     #[inline]
     pub const fn from_raw(id: u64, generation: u32) -> Self {
         Self { id, generation }
@@ -125,19 +120,40 @@ impl Entity {
     // Property accessors
     // -------------------------------------------------------------------------
 
-    /// Returns the numeric slot identifier for this entity.
+    /// Returns the numeric id of this entity's slot.
     ///
-    /// Not unique on its own - pair with [`generation`](Self::generation)
-    /// for a fully unique handle.
+    /// The id alone is not unique over time, because the slot is reused. Pair
+    /// it with [`generation`](Self::generation) to name one entity.
     #[inline]
     pub fn id(self) -> u64 {
         self.id
     }
 
-    /// Returns the generation counter that disambiguates recycled entity IDs.
+    /// Returns the generation this handle was issued with.
     #[inline]
     pub fn generation(self) -> u32 {
         self.generation
+    }
+}
+
+// =============================================================================
+// Entity - Trait Implementations
+// =============================================================================
+
+impl Default for Entity {
+    /// The [null handle](Self::NULL): a reference to nothing.
+    ///
+    /// Slot 0 is a real slot the world hands out, so a defaulted field must not
+    /// mean "entity 0" - a component whose reference field was never set would
+    /// otherwise point at whoever owns that slot.
+    fn default() -> Self {
+        Self::NULL
+    }
+}
+
+impl fmt::Display for Entity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}v{}", self.id, self.generation)
     }
 }
 
@@ -147,16 +163,18 @@ impl Entity {
 
 /// Stable 128-bit identity of one entity, for references that outlive a run.
 ///
-/// An [`Entity`] is a slot and a generation: cheap, and meaningless to a world
-/// that did not issue it. An `EntityId` is what data meant for a later run
-/// carries instead - a scene file, a spawn table, a saved selection - so a
-/// reference finds its entity again after the world is rebuilt and the slots
-/// are handed out in a different order.
+/// An [`Entity`] names a slot and carries a generation: it is cheap, and it
+/// means nothing to a world that did not issue it, because the slot is reused.
+/// An `EntityId` is what data meant for a later run stores instead - a scene
+/// file, a spawn table, a saved selection - so a reference finds its entity
+/// again after the world is rebuilt and the slots are handed out in a
+/// different order.
 ///
-/// The id is random, not derived from the slot: a slot-derived id would name
-/// whoever took that slot next, and a stale reference would then address the
-/// wrong entity instead of nothing. It is assigned when the entity is created,
-/// unless the creator supplies one, and the world indexes it both ways.
+/// The id is random, not derived from the slot. A slot-derived id would name
+/// whoever took that slot next, so a stale reference would address the wrong
+/// entity instead of nothing. The world assigns one when it creates the
+/// entity, unless the creator supplies one, and indexes the id in both
+/// directions.
 ///
 /// # Examples
 ///
@@ -171,41 +189,45 @@ impl Entity {
 pub struct EntityId(u128);
 
 impl EntityId {
-    /// Wrap an id a file or a spawn table already recorded.
+    /// Wraps an id a file or a spawn table already recorded.
     pub const fn new(value: u128) -> Self {
         Self(value)
     }
 
-    /// Derive an id from a name, reusing the shared-identity hash.
+    /// Derives an id from a name, with the same hash the engine uses for shared
+    /// component identities.
     ///
-    /// What the world falls back to when the operating system has no random
-    /// source: unique per name, and reproducible from the same name.
+    /// This is what the world falls back to when it cannot mint a random id -
+    /// after four id collisions, or when the platform has no random source.
+    /// The result is unique per name and can be derived again from that name.
     pub const fn from_name(name: &str) -> Self {
         Self(crate::component::shared_component_identity(name))
     }
 
-    /// The raw 128-bit value.
+    /// Returns the id as its raw 128-bit number.
     pub const fn value(self) -> u128 {
         self.0
     }
 
-    /// A new id from the operating system's random source.
+    /// Creates a new id from the operating system's random source.
     ///
     /// # Errors
     ///
     /// Returns the `getrandom` error when the platform has no usable random
-    /// source; the world then derives ids from a counter and logs the failure.
+    /// source. The world then falls back to counter-derived ids and logs the
+    /// failure.
     pub fn random() -> Result<Self, getrandom::Error> {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes)?;
         Ok(Self(u128::from_le_bytes(bytes)))
     }
 
-    /// Parse the 32-digit hexadecimal form [`Display`](std::fmt::Display)
-    /// writes, or `None` for any other text.
+    /// Parses a 32-digit hexadecimal id, in either letter case, or returns
+    /// `None` for any other text. This is the form
+    /// [`Display`](std::fmt::Display) writes.
     pub fn parse(text: &str) -> Option<Self> {
         // Exactly 32 hex digits: `from_str_radix` alone would also accept a
-        // sign and a shorter string.
+        // leading `+` and a shorter string.
         if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return None;
         }
@@ -235,16 +257,6 @@ impl<'de> serde::Deserialize<'de> for EntityId {
                 "`{text}` is not an entity id (expected 32 hexadecimal digits)"
             ))
         })
-    }
-}
-
-// =============================================================================
-// Entity - Trait Implementations
-// =============================================================================
-
-impl fmt::Display for Entity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}v{}", self.id, self.generation)
     }
 }
 
@@ -282,8 +294,8 @@ mod tests {
         assert_eq!(EntityId::parse(&"z".repeat(32)), None, "not hex");
     }
 
-    /// Random ids are not derived from anything about the entity, so two
-    /// worlds spawning the same entities do not produce the same ids.
+    /// Random ids carry nothing about the entity, so two calls do not return
+    /// the same id.
     #[test]
     fn random_ids_differ() {
         let first = EntityId::random().expect("the platform has a random source");

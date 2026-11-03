@@ -1,26 +1,27 @@
-//! A reference to an asset that survives being saved: [`AssetReference`].
+//! A saved reference to an asset: [`AssetReference`].
 //!
 //! # Responsibilities
 //!
-//! - Name an asset by its guid in data written to disk, serialized as the
-//!   guid's 32 hexadecimal digits (or `null` when unset).
-//! - Resolve that guid to the live [`Handle`] when the data is loaded, and to
-//!   [`Handle::INVALID`] when no asset has it, reporting each missing guid once.
+//! - Store an asset by its guid in data written to disk. A set guid is
+//!   written as `{"guid": "<32 hex digits>"}`; an unset one as `null`.
+//! - Turn that guid back into the live [`Handle`] when the data is loaded.
+//!   A guid that no loaded asset has becomes [`Handle::INVALID`], and it is
+//!   reported once.
 //!
 //! # Design
 //!
-//! A [`Handle`] is a slot index and a generation: exact and cheap at runtime,
-//! meaningless in the next run, where the same asset lands in whatever slot it
-//! gets. Hot-reload persistence depends on the handle's `(index, generation)`
-//! serde form within one run, so that form stays as it is. Data written for a
-//! later run - a scene, a material file - holds an `AssetReference` instead and
-//! resolves it once loaded.
+//! A [`Handle`] is a slot index and a generation. That is exact and cheap
+//! while the game runs, but it means nothing in the next run, where the same
+//! asset may sit in a different slot. Hot-reload persistence keeps a handle
+//! as its `(index, generation)` pair, so that in-run form has to stay as it
+//! is. Anything written for a later run - a scene, a material file - stores
+//! an `AssetReference` instead and turns it back into a handle once loaded.
 //!
-//! An unresolved reference is a missing asset, not a broken program: it
-//! resolves to [`Handle::INVALID`], which the renderer's caches answer with
-//! their default material, shader or texture - an instance whose mesh never
-//! uploaded is not drawn. It is logged once per guid rather than once per
-//! frame.
+//! An unresolved reference means a missing asset, not a broken program. It
+//! resolves to [`Handle::INVALID`], and the renderer's caches answer that
+//! with the default material, shader or texture; an instance whose mesh
+//! never uploaded is not drawn at all. Each guid is reported once, not once
+//! per frame.
 
 // Standard library
 use std::marker::PhantomData;
@@ -31,45 +32,55 @@ use trait_type_map::TraitAccessible;
 // Current crate
 use crate::asset::{Asset, AssetGuid, AssetManager, Handle};
 
-/// A saved reference to an asset of type `T`, by guid.
+// =============================================================================
+// Asset Reference
+// =============================================================================
+
+/// A saved reference to an asset of type `T`, stored as the asset's guid.
 ///
-/// Serializes as the guid in hex, or `null` when unset; see the module docs
-/// for when to use it rather than a [`Handle`].
+/// A set reference is written as `{"guid": "<32 hex digits>"}` and an unset
+/// one as `null`. The module docs say when to use this instead of a
+/// [`Handle`].
 pub struct AssetReference<T: Asset> {
     guid: Option<AssetGuid>,
-    _type: PhantomData<fn() -> T>,
+    /// Marks `T` without storing one; a reference holds only its guid.
+    _asset_type: PhantomData<fn() -> T>,
 }
 
 impl<T: Asset> AssetReference<T> {
-    /// A reference to the asset with `guid`.
+    /// Creates a reference to the asset with `guid`.
     pub const fn new(guid: AssetGuid) -> Self {
         Self {
             guid: Some(guid),
-            _type: PhantomData,
+            _asset_type: PhantomData,
         }
     }
 
-    /// A reference to no asset, which resolves to [`Handle::INVALID`] without
-    /// a report: an intentionally empty slot rather than a missing asset.
+    /// Creates a reference to no asset.
+    ///
+    /// It resolves to [`Handle::INVALID`] and reports nothing: an empty slot
+    /// is a choice, not a missing asset.
     pub const fn unset() -> Self {
         Self {
             guid: None,
-            _type: PhantomData,
+            _asset_type: PhantomData,
         }
     }
 
-    /// The referenced guid, or `None` when unset.
+    /// Returns the referenced guid, or `None` when unset.
     pub fn guid(&self) -> Option<AssetGuid> {
         self.guid
     }
 
-    /// Whether the reference names an asset.
+    /// Returns whether the reference names an asset.
     pub fn is_set(&self) -> bool {
         self.guid.is_some()
     }
 
-    /// A reference to the asset `handle` addresses, by its guid; `None` when
-    /// the handle is stale or its asset has no guid.
+    /// Creates a reference to the asset that `handle` points at, stored by
+    /// its guid.
+    ///
+    /// Returns `None` when the handle is stale or the asset has no guid.
     pub fn from_handle(assets: &AssetManager, handle: Handle<T>) -> Option<Self>
     where
         T: TraitAccessible<dyn Asset>,
@@ -77,8 +88,8 @@ impl<T: Asset> AssetReference<T> {
         assets.guid_of(handle).map(Self::new)
     }
 
-    /// The live handle of the referenced asset, or `None` when the reference is
-    /// unset or no asset has its guid. Reports nothing.
+    /// Returns the live handle of the referenced asset, or `None` when the
+    /// reference is unset or no asset has its guid. Reports nothing.
     pub fn try_resolve(&self, assets: &AssetManager) -> Option<Handle<T>>
     where
         T: TraitAccessible<dyn Asset>,
@@ -86,10 +97,12 @@ impl<T: Asset> AssetReference<T> {
         assets.handle_by_guid::<T>(self.guid?)
     }
 
-    /// The live handle of the referenced asset, or [`Handle::INVALID`].
+    /// Returns the live handle of the referenced asset, or
+    /// [`Handle::INVALID`].
     ///
-    /// A set reference that resolves to nothing is logged as a warning the
-    /// first time its guid is seen in this process; an unset one is not.
+    /// When a set reference resolves to nothing, its guid is logged as a
+    /// warning the first time it is seen in this process. An unset reference
+    /// is not reported.
     pub fn resolve(&self, assets: &AssetManager) -> Handle<T>
     where
         T: TraitAccessible<dyn Asset>,
@@ -109,8 +122,8 @@ impl<T: Asset> AssetReference<T> {
     }
 }
 
-// Written out by hand: a derive would require `T` to implement each trait,
-// and a reference stores no `T`.
+// These impls are written by hand: a derive would require `T` to implement
+// each trait too, even though a reference stores no `T`.
 
 impl<T: Asset> Clone for AssetReference<T> {
     fn clone(&self) -> Self {
@@ -144,9 +157,11 @@ impl<T: Asset> std::fmt::Debug for AssetReference<T> {
 }
 
 impl<T: Asset> serde::Serialize for AssetReference<T> {
-    /// The saved form of a reference: `{"guid": "<32 hex>"}`, or `null` when
-    /// unset. A reference holds no path, so the hint is left out; a writer that
-    /// has the asset manager adds it through
+    /// Writes the saved form: `{"guid": "<32 hex digits>"}`, or `null` when
+    /// unset.
+    ///
+    /// A reference holds no path, so no hint is written. A writer that has
+    /// the asset manager can add one through
     /// [`SavedAssetReference::with_path`](crate::SavedAssetReference::with_path).
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.guid {
@@ -159,18 +174,22 @@ impl<T: Asset> serde::Serialize for AssetReference<T> {
 }
 
 impl<'de, T: Asset> serde::Deserialize<'de> for AssetReference<T> {
-    /// Reads both spellings: the object form this build writes and the bare
-    /// 32-hex guid an older material or render pass file holds.
+    /// Reads both stored spellings: the object form this build writes and the
+    /// bare 32-hex guid that an older material or render pass file holds.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(Self {
             guid: Option::<crate::saved_references::SavedAssetReference>::deserialize(
                 deserializer,
             )?
             .map(|reference| reference.guid),
-            _type: PhantomData,
+            _asset_type: PhantomData,
         })
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

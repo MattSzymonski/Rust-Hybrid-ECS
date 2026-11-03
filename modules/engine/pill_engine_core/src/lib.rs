@@ -11,44 +11,55 @@
 //!
 //! # Design
 //!
-//! Nothing outside the engine names this crate. Projects, extensions and the
-//! macros use `pill_engine`, a facade that re-exports everything here under
-//! the same paths and adds the per-DLL `inventory` registries. This crate holds
-//! what is the same for every DLL, and never reads a registry: what it needs
-//! from one, the calling DLL passes in. It must never depend on `pill_engine`.
+//! Projects, extensions and the macros never name this crate directly. They
+//! use `pill_engine`, a facade that re-exports everything here under the same
+//! paths and adds the per-DLL `inventory` registries. This crate holds the
+//! code every DLL shares, and never reads a registry: when it needs something
+//! from one, the calling DLL passes it in. It must never depend on
+//! `pill_engine`.
 //!
 //! The module ABI is **Rust-to-Rust by design**: a loaded project or module
-//! receives an [`EngineApi`] carrying a pointer to the host's engine and calls
+//! receives an [`EngineApi`] with a pointer to the host's engine, and calls
 //! the typed API through it. There is no language-neutral plugin table; see
-//! [`api`] for what one would cost.
-// The derive macros expand to `::pill_engine::...` paths, so the crate itself
-// needs that name in scope to use its own derives - `Position` and `Color`
-// derive `PillLayout` here rather than carrying hand-written offsets. Only
+//! [`api`] for why one would need a second copy of the whole API.
+
+// The derive macros expand to `::pill_engine::...` paths, so this crate needs
+// the name `pill_engine` in scope to use its own derives. `TransformComponent`
+// derives `PillLayout` here rather than carrying hand-written offsets. Only
 // `PillLayout` can be used here: the other derives submit into registries,
 // which live in the facade.
 extern crate self as pill_engine;
-// ===== Constants =====
 
-/// Tracy profiled allocator that tracks allocations in Tracy's memory view.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Tracy profiled allocator that reports every allocation in Tracy's memory
+/// view.
 ///
-/// Only active with the opt-in `profiling-memory` feature. The sampling rate is
-/// controlled by [`crate::config::PROFILING_MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY`].
+/// Only active with the opt-in `profiling-memory` feature. The sampling rate
+/// comes from
+/// [`crate::config::PROFILING_MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY`].
 ///
-/// Not part of `profiling`: the allocator is generic, so it is instantiated in
-/// every DLL that links it and calls Tracy's C entry points directly.
-/// Those live inside `pill_core.dll`, which exports only Rust symbols, so any
-/// extension DLL fails to link with "undefined symbol ___tracy_emit_memory_*".
+/// It is declared here and not in the `profiling` module because it is
+/// generic: every DLL that links it creates its own copy, and that copy calls
+/// Tracy's C entry points directly. Those entry points exist only inside
+/// `pill_core.dll`, which exports Rust symbols alone, so a separate extension
+/// DLL fails to link with "undefined symbol ___tracy_emit_memory_*".
 #[cfg(feature = "profiling-memory")]
 #[global_allocator]
-static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
+static PROFILED_ALLOCATOR: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(
         std::alloc::System,
         crate::config::PROFILING_MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY,
     );
 
-// ===== Public Modules =====
+// =============================================================================
+// Public Modules
+// =============================================================================
 
-/// The module entry-point contract passed to hot-reloadable artifacts.
+/// The engine API table a loaded project or module receives at its entry
+/// point.
 pub mod api;
 
 /// Archetype-based component storage with structure-of-arrays layout.
@@ -71,55 +82,58 @@ pub mod asset_import_registry;
 /// Loading assets and scenes from game code by path.
 pub mod asset_loading;
 
-/// Metadata files beside an asset's source (`<asset_name>.meta`).
+/// Metadata files beside an asset's source (`<source_file>.meta`).
 pub mod asset_metadata;
 
-/// Saved references to assets, by guid, that resolve in a later run.
+/// Saved references to assets, by guid, that point at the asset in a later
+/// run.
 pub mod asset_reference;
 
 /// Assets stored as their own file in `res`, with no source file.
 pub mod asset_standalone;
 
-/// Where asset paths resolve: mounted packs and the filesystem.
+/// Where an asset's bytes come from: mounted packs and the filesystem.
 pub mod asset_store;
 
 /// Deferred command queue for structural ECS mutations.
 pub mod commands;
 
-/// Component trait, type identification, and change-detection primitives.
-pub mod component;
-
-/// Compile-time component registry driven by `#[derive(PillComponent)]`.
-pub mod component_registry;
-
 /// Components the engine defines because more than one consumer needs them.
 pub mod common_components;
+
+/// Component trait, type identification, and change-detection primitives.
+pub mod component;
 
 /// Generic type-erased component field access for editor-style tools.
 pub mod component_field;
 
-/// Centralised configuration constants and hardware detection.
+/// Compile-time field layouts of components and value types, emitted by the
+/// derive macros.
+pub mod component_registry;
+
+/// The engine's tunable constants and the parallel-execution settings.
 pub mod config;
 
-/// Immediate debug drawing - lines, shapes, labels and gizmo handles - any
-/// system can draw and every renderer draws.
+/// Immediate debug drawing: lines, shapes, labels and gizmo handles. Any
+/// system can draw them, and every renderer draws them.
 pub mod debug_draw;
 
-/// Periodic ECS state report, registered on demand and printed once per
-/// configured interval.
+/// A periodic report of ECS state, switched on with
+/// `Engine::set_ecs_diagnostics_interval` and printed at that interval.
 pub mod diagnostics;
 
 /// Engine-owned native dynamic buffer, re-exported from `pill_core`.
 ///
 /// The type lives beside the allocation service that owns its blocks, so a
-/// module can name it without depending on the whole ECS. Re-exported here
-/// because a component field is what it is for, so `pill_engine::DynamicBuffer`
-/// resolves from the place users expect.
+/// module can name it without depending on the whole ECS. It is re-exported
+/// here so `pill_engine::DynamicBuffer` is found where users look for it: a
+/// component field is its usual place.
 pub mod dynamic_buffer {
     pub use pill_core::dynamic_buffer::*;
 }
 
-/// System registration, frame execution, and parallel dispatch orchestration.
+/// System registration, frame execution, and the parallel dispatch of
+/// systems.
 pub mod engine;
 
 /// Lightweight entity handles with generation-based invalidation.
@@ -128,11 +142,19 @@ pub mod entity;
 /// Typed error system for the ECS engine.
 pub mod error;
 
-/// The C ABI mirrored Rust functions cross to reach C#: argument slots,
-/// result encodings and the error and string channels.
+/// Per-function hot patching: stable dispatch slots for registered systems.
+pub mod hot_patch;
+
+/// Keyboard, mouse and gamepad state maintained by the engine and read through
+/// `Res<Input>`.
+pub mod input;
+
+/// The C ABI a mirrored Rust function crosses to reach C#: argument slots,
+/// result encodings, and the channels that carry an error message or a
+/// returned string.
 pub mod mirror;
 
-/// Constants shared between the host and extensions.
+/// The extension ABI revision the host and every module compare at load time.
 pub mod module_abi;
 
 /// Component persistence and schema migration for hot-reload.
@@ -144,40 +166,31 @@ pub mod profiling;
 /// Query system for efficient iteration over entities with specific components.
 pub mod query;
 
-/// The components the crate's unit tests build worlds out of.
-#[cfg(test)]
-mod test_fixtures;
-
 /// Singleton resources stored in the [`World`], not attached to entities.
 pub mod resource;
 
-/// Dependency analysis and parallel batch scheduling for system execution.
-pub mod scheduler;
-
-/// Script components with deferred structural mutation safety.
-pub mod scripting;
-
-/// The saved form of asset and entity references: guid and stable id, with the
-/// resolution a later run needs.
+/// The saved form of asset and entity references: a guid and a stable id, plus
+/// what a later run needs to find the target again.
 pub mod saved_references;
 
 /// A scene: a world's entities, components and references as one standalone
 /// asset that loads back into a world.
 pub mod scene;
 
+/// Dependency analysis and parallel batch scheduling for system execution.
+pub mod scheduler;
+
+/// Script components: a component trait with an update step, and a context
+/// that defers structural changes until it is safe to apply them.
+pub mod scripting;
+
 /// The startup scene: the `.scene` a project's settings name, loaded before
-/// the project's own `init` seeds anything.
+/// the project's own `init` fills the world.
 pub mod startup_scene;
 
-/// Per-function hot patching: stable dispatch slots for registered systems.
-pub mod hot_patch;
-
-/// Advanced system parameter infrastructure with automatic parameter resolution.
+/// How a plain function's parameters are pulled from the world so the function
+/// can run as a system.
 pub mod system;
-
-/// Keyboard, mouse and gamepad state maintained by the engine and read through
-/// `Res<Input>`.
-pub mod input;
 
 /// Frame timing maintained by the engine and read through `Res<Time>`.
 pub mod time;
@@ -186,11 +199,23 @@ pub mod time;
 /// engine's own types.
 pub mod type_names;
 
-/// Central ECS state container - entities, archetypes, components, and resources.
+/// Central ECS state container - entities, archetypes, components, and
+/// resources.
 pub mod world;
-// ===== Public Re-exports =====
 
-// Core engine types re-exported for single-import usage.
+// =============================================================================
+// Test Fixtures
+// =============================================================================
+
+/// The components the crate's unit tests build worlds out of.
+#[cfg(test)]
+mod test_fixtures;
+
+// =============================================================================
+// Public Re-exports
+// =============================================================================
+
+// Core engine types, re-exported so one `use` reaches them.
 pub use api::EngineApi;
 pub use asset::{
     Asset, AssetBindingError, AssetBindingResult, AssetGuid, AssetLoadError, AssetLoadResult,
@@ -247,8 +272,8 @@ pub use serde::{Deserialize, Serialize};
 pub use tracing;
 
 // Registration macros, re-exported here so the facade's glob re-export carries
-// them. The `inventory::submit` they expand to is re-exported by the facade,
-// which owns the registries.
+// them to every project and module. The `inventory::submit` they expand to is
+// re-exported by the facade, which owns the registries.
 pub use pill_engine_macros::{
     pill_hot, pill_hot_fn, pill_hot_resolver, pill_mirror_fn, pill_mirror_impl, pill_mirror_method,
     pill_mirror_object, pill_mirror_resource, pill_module, pill_project, pill_value_type,
@@ -261,14 +286,14 @@ pub use world::{
     World,
 };
 
-// ----------------------------------------------------------------------------
-// Profiling macro re-exports
-//
-// The profiling implementation and all its `#[macro_export]` macros live in
-// `pill_core::profiling`. Re-exporting the macros at the crate root keeps the
-// crate's `crate::profile_*` call sites compiling and gives downstream users
-// one flat namespace.
-// ----------------------------------------------------------------------------
+// =============================================================================
+// Profiling Macro Re-exports
+// =============================================================================
+
+// The profiling code and its `#[macro_export]` macros are written in
+// `pill_core`'s `profiling` module. Re-exporting the macros here keeps this
+// crate's own `crate::profile_*` call sites compiling and gives downstream
+// users one flat namespace.
 pub use pill_core::{
     profile_error, profile_frame_mark, profile_init, profile_message, profile_non_continuous_frame,
     profile_plot, profile_plot_config, profile_scope, profile_scope_detail, profile_scope_fine,

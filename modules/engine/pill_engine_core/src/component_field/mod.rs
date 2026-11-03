@@ -3,62 +3,65 @@
 //! # Responsibilities
 //!
 //! - Own the field vocabulary an inspector speaks: [`FieldValue`], the
-//!   [`ComponentFieldError`] every refusal reports, and the tag helpers that
-//!   name a field's kind (`is_handle_tag`, `is_entity_tag`, `is_container_tag`).
-//! - Keep the public paths this module has always had: `FieldValue` and
-//!   `ComponentFieldError` are what the rest of the engine names, and
-//!   `MAX_EXPANDED_ELEMENTS` / `format_component_debug` are re-exported from the
-//!   files that own them.
+//!   [`ComponentFieldError`] returned by every refused edit, and the helpers
+//!   that name a field's kind (`is_handle_tag`, `is_entity_tag`,
+//!   `is_container_tag`).
+//! - Keep the module's public paths stable. [`FieldValue`] and
+//!   [`ComponentFieldError`] are the names the rest of the engine uses, and
+//!   [`MAX_EXPANDED_ELEMENTS`] and [`format_component_debug`] are re-exported
+//!   from the files that own them.
 //!
 //! # Design
 //!
-//! Components are stored in erased columns with no `dyn Any` downcast, so the
-//! field layout (`name`, `type_tag`, `offset`, `size`, `align`,
-//! `element_count`) that `#[derive(PillComponent)]` / `#[derive(PillMirror)]`
-//! register is the only generic way to reach an arbitrary component's value.
-//! This module is the safe wrapper over that data, split by concern:
+//! Components live in erased columns, and nothing downcasts through `dyn Any`.
+//! So the field layout that `#[derive(PillComponent)]` and
+//! `#[derive(PillMirror)]` register (`name`, `type_tag`, `offset`, `size`,
+//! `align`, `element_count`) is the only generic way to reach a component's
+//! value. This module is the safe wrapper over that layout, split by concern:
 //!
-//! - `mod.rs` (here) - the vocabulary, the errors and the tag helpers.
-//! - `row.rs` - resolving a component's field to a live row, and reading or
-//!   writing it. Every entry point resolves through **the entity's own
-//!   archetype**, the one place that names the generation which created the
-//!   data (a registry-wide name lookup can see several registrations under one
-//!   name); nothing hands a raw pointer to the caller.
-//! - `codec.rs` - turning a row's bytes into a [`FieldValue`] and back.
-//! - `expand.rs` - flattening a nested `struct:` field into leaf rows at
-//!   registration.
+//! - `mod.rs` (here): the vocabulary, the errors and the tag helpers.
+//! - `row.rs`: finds a component's field in a live row, then reads or writes
+//!   it. Every entry point that resolves a live row looks the component up
+//!   through **the entity's own archetype**. That archetype is the one place
+//!   that records which generation created the data; a lookup by name across
+//!   the whole registry can find several registrations under one name. No
+//!   pointer into the row is handed to the caller.
+//! - `codec.rs`: turns a row's bytes into a [`FieldValue`] and back.
+//! - `expand.rs`: flattens a nested `struct:` field into leaf rows while a
+//!   component registers.
 //!
-//! The [`FieldValue`] vocabulary covers the derive's closed `type_tag`
-//! vocabulary. `struct:` fields (and anything else the engine cannot
-//! interpret) are surfaced as [`FieldValue::Opaque`] on read and are never
-//! edited by value, so an inspector can show them instead of hiding them; a
-//! restore hands the captured bytes back exactly as they were read. A nested
-//! `struct:` field whose type has a known layout never gets that far: the
-//! world flattens it into dotted leaf rows at registration
-//! ([`World::register_component_with_layout`]), so the tag survives only when
-//! no layout was resolvable.
+//! [`FieldValue`] covers the closed `type_tag` vocabulary of the derive. A
+//! `struct:` field, or any other tag the engine cannot interpret, is read as
+//! [`FieldValue::Opaque`] and is never edited by value, so an inspector can
+//! show such a field instead of hiding it. A restore writes the captured
+//! bytes back exactly as they were read. A nested `struct:` field whose type
+//! has a known layout never appears as `Opaque`: the world flattens it into
+//! dotted leaf rows at registration
+//! ([`World::register_component_with_layout`]), so `Opaque` appears only when
+//! no layout could be found.
 //!
-//! A tag is the derive's name for a field's type, not a type itself:
-//! `f32`/`u64`/`bool` are scalars, `struct:Handle<Mesh>` an asset reference,
-//! `entity` an entity reference, `array:<tag>` a fixed array and
-//! `struct:<path>` anything the engine cannot interpret. Reading a tag is always
-//! a string comparison against this closed set, never a type lookup.
+//! A tag is the derive's name for a field's type, not a type itself. `f32`,
+//! `u64` and `bool` are scalars, `struct:Handle<Mesh>` is an asset reference,
+//! `entity` is an entity reference, `array:<tag>` is a fixed array, and
+//! `struct:<path>` is anything the engine cannot interpret. Reading a tag is
+//! always a string comparison against this closed set, never a type lookup.
 //!
 //! # Row byte convention
 //!
-//! A row's bytes are native-endian, including an asset handle's two `u32`s
-//! (index, then generation) and an entity reference's slot and generation. The
-//! C# mirror reads the same row from the same process, so no byte order has to
-//! cross a machine boundary; a field that ever does would need its own stated
-//! convention here.
+//! A row's bytes are native-endian. That includes an asset handle's two `u32`s
+//! (index first, then generation) and an entity reference's slot and
+//! generation. The C# mirror reads the same row in the same process, so no
+//! byte order crosses a machine boundary. A field that ever does would need its
+//! own convention stated here.
 
-// Module tree: the vocabulary, the errors and the tag helpers live here; the
-// row layer, the codec and the registration-time expansion are files beside
-// this one, each declared with the re-export that keeps its public path.
+// Submodules split by concern: the row layer, the codec and the layout
+// expansion done at registration. The two `pub use` lines keep the public
+// paths of the items those files own.
 mod codec;
 mod expand;
 mod row;
 
+// Current crate
 use codec::ScalarKind;
 
 pub use expand::MAX_EXPANDED_ELEMENTS;
@@ -66,17 +69,22 @@ pub use row::format_component_debug;
 
 /// One read or edited value in the engine's reflected vocabulary.
 ///
-/// Covers the derive's `type_tag` vocabulary: the scalar primitives the engine
-/// can describe, whole fixed-size arrays, heap-backed containers (`List` and
-/// `Text`, summarized rather than materialized), handle and entity references,
-/// and an `Opaque` escape hatch for fields the engine can locate but not
-/// interpret (`struct:` tags whose value type is not resolvable, and any tag
-/// outside the vocabulary). `Opaque` carries the raw bytes so the UI can show
-/// them; no edit can introduce one, but a captured payload whose tag and size
-/// match the field's own descriptor writes back verbatim, which is how a
-/// restore re-creates a destroyed row. `List` and `Text` are read-only through
-/// this path — writes go through the container field's generated accessors,
-/// which reach the live buffer instead of rebuilding the row.
+/// Covers the `type_tag` vocabulary of the derive:
+///
+/// - the scalar primitives the engine can describe;
+/// - whole fixed-size arrays;
+/// - heap-backed containers: `List` reports a sequence's element count
+///   instead of copying it, and `Text` decodes a string;
+/// - handle and entity references;
+/// - `Opaque`, for a field the engine can find but not interpret (a `struct:`
+///   tag whose type is not resolvable, or any tag outside the vocabulary).
+///
+/// `Opaque` carries the field's raw bytes so a UI can show them. The UI never
+/// builds one; it only hands back bytes it captured earlier. Those write back
+/// verbatim when their tag and size match the field's own descriptor, which is
+/// how a restore re-creates a destroyed row. `List` and `Text` are read-only
+/// through this path; writes go through the container field's generated
+/// accessors, which reach the live buffer instead of rebuilding the row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldValue {
     /// A 32-bit IEEE-754 floating point value.
@@ -107,10 +115,11 @@ pub enum FieldValue {
     Isize(isize),
     /// A whole fixed-size array field, one entry per element in layout order.
     Array(Vec<FieldValue>),
-    /// A heap-backed sequence field (`vec:<element_tag>`), summarized by its
-    /// element count rather than materialized: a component `Vec` may hold
-    /// millions of elements, and an inspector showing the length is what makes
-    /// it useful. Read-only here; use the field's accessors to edit elements.
+    /// A heap-backed sequence field (`vec:<element_tag>` or
+    /// `dynbuf:<element_tag>`), reported as its element count instead of being
+    /// copied: a component `Vec` may hold millions of elements, and the length
+    /// is what an inspector needs. Read-only here; use the field's accessors to
+    /// edit elements.
     List {
         /// Element type tag from the closed vocabulary (`f32`, `struct:path`).
         element_tag: &'static str,
@@ -120,13 +129,13 @@ pub enum FieldValue {
     /// A heap-backed UTF-8 string field (`string`), decoded for display.
     /// Read-only here; use the field's accessors to replace its contents.
     Text(String),
-    /// A reference to an asset: a `Handle<T>` field, as its slot index and
+    /// A reference to an asset: a `Handle<T>` field's slot index and
     /// generation, with the asset type the field was registered with.
     ///
-    /// Writable like a scalar; a write naming another asset type than the
-    /// field's is refused. `asset_type` is the type's registered name (the
-    /// one `.meta` files and the import registry use), `None` when the field
-    /// carries no record of it. A cleared reference is
+    /// Writable like a scalar, but a write that names another asset type than
+    /// the field's is refused. `asset_type` is the type's registered name, the
+    /// one `.meta` files and the import registry use; it is `None` when the
+    /// field carries no record of it. A cleared reference holds
     /// [`Handle::INVALID`](crate::Handle::INVALID)'s pair, `u32::MAX` twice.
     Asset {
         /// The registered name of the referenced asset's type.
@@ -136,13 +145,13 @@ pub enum FieldValue {
         /// The handle's generation.
         generation: u32,
     },
-    /// A reference to another entity: an `Entity` field, as the slot id and
-    /// generation the handle carries.
+    /// A reference to another entity: an `Entity` field's slot id and
+    /// generation.
     ///
     /// Writable like a scalar. The pair is the *handle*, so it resolves only
-    /// in the world that issued it; what a reference saved for a later run
-    /// carries is the entity's [`EntityId`](crate::EntityId), which the writer
-    /// looks up and the loader resolves back to a handle.
+    /// in the world that issued it. A reference saved for a later run stores
+    /// the entity's [`EntityId`](crate::EntityId) instead: the writer looks
+    /// the id up, and the loader turns it back into a handle.
     Entity {
         /// The referenced entity's slot id.
         id: u64,
@@ -150,7 +159,11 @@ pub enum FieldValue {
         /// slot's previous occupant.
         generation: u32,
     },
-    /// A field the engine can locate but not interpret. Never writable.
+    /// A field the engine can locate but not interpret.
+    ///
+    /// It is never edited by value. The only write it accepts is its own
+    /// captured bytes, when their tag and size still match the field's
+    /// descriptor.
     Opaque {
         /// The registered `type_tag` of the field (for example `struct:path`).
         type_tag: &'static str,
@@ -228,8 +241,8 @@ impl FieldValue {
 /// Why a generic field read or write was refused.
 ///
 /// Every failure is all-or-nothing: nothing is written when any validation
-/// fails, and the error names the offending entity/component/field so the
-/// editor can surface it in a console rather than guessing.
+/// fails. Each variant names the component or field it is about, so the editor
+/// can show it in a console instead of guessing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComponentFieldError {
     /// The entity handle is not alive.
@@ -255,7 +268,7 @@ pub enum ComponentFieldError {
         /// The component type name.
         component: String,
     },
-    /// The component has fields, but not the one named.
+    /// The component's field layout does not name that field.
     FieldNotFound {
         /// The component type name.
         component: String,
@@ -308,27 +321,8 @@ pub enum ComponentFieldError {
     },
 }
 
-impl std::fmt::Display for ComponentFieldError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.summary())
-    }
-}
-
-impl std::error::Error for ComponentFieldError {}
-
-/// Whether a field's type tag names a heap-backed container.
-///
-/// `vec:<tag>` and `dynbuf:<tag>` describe a `(pointer, length, capacity)`
-/// header and `string` the same bytes with UTF-8 meaning; all three are
-/// decoded by following a pointer the row is expected to own. A descriptor row
-/// is raw bytes with no Rust value in it, so a layout claiming one of these
-/// tags on such a row promises a header that is not there.
-pub(crate) fn is_container_tag(type_tag: &str) -> bool {
-    type_tag == "string" || type_tag.starts_with("vec:") || type_tag.starts_with("dynbuf:")
-}
-
 impl ComponentFieldError {
-    /// A short, stable diagnostic for console surfacing.
+    /// A short, stable message for the editor's console.
     pub(crate) fn summary(&self) -> String {
         match self {
             Self::EntityNotFound => "entity is not alive".to_string(),
@@ -371,15 +365,39 @@ impl ComponentFieldError {
     }
 }
 
+impl std::fmt::Display for ComponentFieldError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.summary())
+    }
+}
+
+impl std::error::Error for ComponentFieldError {}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Whether a field's type tag names a heap-backed container.
+///
+/// `vec:<tag>` and `dynbuf:<tag>` fields hold a `(pointer, length, capacity)`
+/// header, and `string` holds the same three words with UTF-8 text behind
+/// them. All three are read by following a pointer that the value in the row
+/// owns. A descriptor row is raw bytes with no Rust value in it, so a layout
+/// that claims one of these tags on such a row promises a header the bytes
+/// never held.
+pub(crate) fn is_container_tag(type_tag: &str) -> bool {
+    type_tag == "string" || type_tag.starts_with("vec:") || type_tag.starts_with("dynbuf:")
+}
+
 /// Whether a type tag is a `Handle<T>` field's (`struct:Handle<Mesh>`, or
 /// `struct:Handle` when the derive could not read the type argument).
-pub(crate) fn is_handle_tag(tag: &str) -> bool {
-    tag == "struct:Handle" || tag.starts_with("struct:Handle<")
+pub(crate) fn is_handle_tag(type_tag: &str) -> bool {
+    type_tag == "struct:Handle" || type_tag.starts_with("struct:Handle<")
 }
 
 /// Whether a type tag is an `Entity` field's.
-pub(crate) fn is_entity_tag(tag: &str) -> bool {
-    tag == "entity"
+pub(crate) fn is_entity_tag(type_tag: &str) -> bool {
+    type_tag == "entity"
 }
 
 // =============================================================================

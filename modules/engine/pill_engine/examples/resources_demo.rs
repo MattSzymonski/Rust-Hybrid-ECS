@@ -1,39 +1,43 @@
-//! Demo: Resources + Components + Systems Together.
+//! Demonstrates resources and component queries working together in one frame
+//! loop.
 //!
-//! Demonstrates using resources (`Res`/`ResMut`) alongside component queries
-//! in a single frame loop. The scheduler respects resource access patterns
-//! when building the dependency graph for parallel execution.
+//! Four systems run over three entities. Two of them write a resource and one
+//! reads two resources. The scheduler puts a system that writes data in a
+//! different batch from every system that reads or writes that data, so the
+//! batches can run in parallel.
 //!
 //! # Responsibilities
 //!
 //! - Defines two components, `Position` and `Velocity`, and two resources,
-//!   `ProjectTime` (delta time, elapsed) and `Score` (total points), for a
-//!   minimal project loop.
+//!   `ProjectTime` (the frame step and the running total) and `Score` (total
+//!   points), for a minimal project loop.
 //! - Provides four systems: `time_system` (writes `ProjectTime`),
 //!   `movement_system` (writes `Position`, reads `Velocity`),
 //!   `scoring_system` (reads `Position`, writes `Score`), and
 //!   `display_system` (reads `Position`, `ProjectTime`, and `Score`).
-//! - Registers components, resources, and systems with an `Engine`, prints the
-//!   execution graph, and runs a few frames under parallel execution.
+//! - Registers the components and systems with an `Engine`, inserts the two
+//!   resources into its world, prints the execution graph, and runs a few
+//!   frames with parallel execution on.
 //!
 //! # Design
 //!
-//! The scheduler analyses each system's access pattern *before* any frame and
-//! splits batches wherever access patterns conflict: writes to `ProjectTime`,
-//! `Position`, and `Score` force a batch split against readers of the same
-//! storage. This demo is the smallest end-to-end illustration of that
-//! resource-aware dependency graph.
+//! The scheduler compares the access patterns when the set of systems changes.
+//! A write to `ProjectTime`, `Position`, or `Score` conflicts with every other
+//! read or write of the same data. Two systems that conflict never share a
+//! batch, and each system joins the first batch that holds nothing it conflicts
+//! with.
 
-// External crates
+// Current crate
 use pill_engine::*;
 
-// ============================================================================
+// =============================================================================
 // Components
-// ============================================================================
+// =============================================================================
 
 /// Position of an entity in 2D space.
 ///
-/// Updated each frame by `movement_system` based on the entity's `Velocity`.
+/// Updated every frame by `movement_system`, which adds the entity's
+/// `Velocity` to it.
 #[derive(Debug, Clone)]
 struct Position {
     /// X coordinate.
@@ -43,29 +47,30 @@ struct Position {
 }
 impl Component for Position {}
 
-/// Velocity of an entity, applied to its `Position` every frame.
+/// Velocity of an entity, added to its `Position` every frame.
 #[derive(Debug, Clone)]
 struct Velocity {
-    /// Speed along the X axis.
-    vx: f32,
-    /// Speed along the Y axis.
-    vy: f32,
+    /// Velocity along the X axis, in world units per frame.
+    x: f32,
+    /// Velocity along the Y axis, in world units per frame.
+    y: f32,
 }
 impl Component for Velocity {}
 
-// ============================================================================
+// =============================================================================
 // Resources
-// ============================================================================
+// =============================================================================
 
-/// Frame timing shared across all systems.
+/// Frame timing for the demo loop.
 ///
-/// Written by `time_system` and read by `display_system` each frame.
+/// Written by `time_system` and read by `display_system` every frame.
 #[derive(Debug)]
 struct ProjectTime {
-    /// Seconds elapsed since the previous frame.
-    delta: f32,
+    /// Seconds added to `elapsed_seconds` on every frame. The demo inserts it
+    /// once and never changes it, so the time step stays the same.
+    delta_seconds: f32,
     /// Total seconds since the loop started.
-    elapsed: f32,
+    elapsed_seconds: f32,
 }
 impl Resource for ProjectTime {}
 
@@ -74,100 +79,120 @@ impl Resource for ProjectTime {}
 struct Score(u32);
 impl Resource for Score {}
 
-// ============================================================================
+// =============================================================================
 // Systems
-// ============================================================================
+// =============================================================================
 
-/// Update the global project time.
+/// Adds one frame step to the project time.
 ///
-/// - `ResMut<ProjectTime>` ⇒ writes the resource (scheduler prevents parallel
-///   writes to ProjectTime).
+/// The `ResMut<ProjectTime>` parameter counts as a write of the resource, so
+/// the scheduler keeps this system out of any batch that holds another system
+/// reading or writing `ProjectTime`. When the resource is missing, the system
+/// returns without doing anything.
 fn time_system(mut time: ResMut<ProjectTime>) {
-    let Some(mut t) = time.get_mut() else { return };
-    t.elapsed += t.delta;
+    let Some(mut project_time) = time.get_mut() else {
+        return;
+    };
+    project_time.elapsed_seconds += project_time.delta_seconds;
 }
 
-/// Apply velocity to position for every entity.
+/// Adds each entity's velocity to its position.
 ///
-/// - `Query<(&mut Position, &Velocity)>` ⇒ writes Position, reads Velocity.
+/// The query asks for `&mut Position` and `&Velocity`, so the scheduler
+/// records a write of `Position` and a read of `Velocity`.
 fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
-    for (mut pos, vel) in query.iter_mut() {
-        pos.x += vel.vx;
-        pos.y += vel.vy;
+    for (mut position, velocity) in query.iter_mut() {
+        position.x += velocity.x;
+        position.y += velocity.y;
     }
 }
 
-/// Award points based on an entity's distance from (0,0).
+/// Awards points for every entity, based on its distance from the origin.
 ///
-/// - `Query<&Position>`    ⇒ reads Position.
-/// - `ResMut<Score>`       ⇒ writes Score.
+/// The query reads `Position`, and the `ResMut<Score>` parameter writes the
+/// resource. Each distance is truncated to whole points and added to the
+/// score.
 fn scoring_system(mut query: Query<&Position>, mut score: ResMut<Score>) {
-    let Some(mut s) = score.get_mut() else { return };
+    let Some(mut total_score) = score.get_mut() else {
+        return;
+    };
 
-    for pos in query.iter_mut() {
-        let dist = (pos.x * pos.x + pos.y * pos.y).sqrt();
-        s.0 += dist as u32;
+    for position in query.iter_mut() {
+        let distance = (position.x * position.x + position.y * position.y).sqrt();
+        total_score.0 += distance as u32;
     }
 }
 
-/// Print current project stats.
+/// Logs the frame's statistics.
 ///
-/// - `Query<(Entity, &Position)>` ⇒ reads Position (and entity id).
-/// - `Res<ProjectTime>`           ⇒ reads ProjectTime.
-/// - `Res<Score>`                 ⇒ reads Score.
+/// The query reads `Position` together with each entity's id, and both
+/// resources are read as well.
+///
+/// # Panics
+///
+/// Panics when `ProjectTime` or `Score` is missing from the world, because
+/// both resource lookups unwrap.
 fn display_system(
     mut query: Query<(Entity, &Position)>,
     time: Res<ProjectTime>,
     score: Res<Score>,
 ) {
-    let t = time.get().unwrap();
-    let s = score.get().unwrap();
+    let project_time = time.get().unwrap();
+    let total_score = score.get().unwrap();
 
-    pill_core::info!("--- Frame stats @ {:.3}s ---", t.elapsed);
-    pill_core::info!("  score: {:>5}", s.0);
-    for (entity, pos) in query.iter_mut() {
-        pill_core::info!("  entity {:?} at ({:.1}, {:.1})", entity, pos.x, pos.y);
+    pill_core::info!("--- Frame stats @ {:.3}s ---", project_time.elapsed_seconds);
+    pill_core::info!("  score: {:>5}", total_score.0);
+    for (entity, position) in query.iter_mut() {
+        pill_core::info!(
+            "  entity {:?} at ({:.1}, {:.1})",
+            entity,
+            position.x,
+            position.y
+        );
     }
 }
 
-// ============================================================================
+// =============================================================================
 // Entry Point
-// ============================================================================
+// =============================================================================
 
-/// Entry point: builds the demo world, registers components, resources, and
-/// systems, then runs a few frames to show the scheduler's batch splitting.
+/// Builds the demo world, registers the components and systems, and runs a few
+/// frames to show the scheduler's batch splitting.
+///
+/// # Panics
+///
+/// Panics when an entity is built with a component type that was not
+/// registered, and when `display_system` finds `ProjectTime` or `Score`
+/// missing. Both resources are inserted before the first frame.
 fn main() {
-    // Route this program's output, and the engine's own reports, through
-    // the engine logger.
+    // Install the engine logger, so this demo's lines and the engine's own log
+    // lines are printed.
     let _ = pill_core::telemetry::TelemetryBuilder::new().init();
     pill_core::info!("=== Resources + Components Demo ===");
 
+    // Parallel execution is already the engine's default. The call only
+    // states it for the reader.
     let mut engine = Engine::new();
     engine.set_parallel_execution(true);
 
-    // Step 1: Register component and resource types with the world.
+    // Step 1: Register the component types, then insert the starting
+    // resources.
     engine.world_mut().register_component::<Position>();
     engine.world_mut().register_component::<Velocity>();
-
-    // Insert the initial resources.
     engine.world_mut().insert_resource(ProjectTime {
-        delta: 0.016,
-        elapsed: 0.0,
+        delta_seconds: 0.016,
+        elapsed_seconds: 0.0,
     });
     engine.world_mut().insert_resource(Score(0));
 
-    // Step 2: Register systems and print the scheduler's execution graph.
-    // The scheduler analyses each system's access pattern *before* any frame:
-    //   time_system      ⇒ writes ProjectTime
-    //   movement_system  ⇒ writes Position, reads Velocity
-    //   scoring_system   ⇒ reads Position, writes Score
-    //   display_system   ⇒ reads Position, reads ProjectTime, reads Score
+    // Step 2: Register the systems, then print the execution graph.
     //
-    // Conflicts found by the scheduler:
-    //   • time_system (w ProjectTime) ⇏ display_system (r ProjectTime)  → batch split
-    //   • movement_system (w Pos)  ⇏ scoring_system (r Pos)       → batch split
-    //   • movement_system (w Pos)  ⇏ display_system (r Pos)       → batch split
-    //   • scoring_system  (w Score) ⇏ display_system (r Score)     → batch split
+    // The access patterns decide the batches. `time_system` writes
+    // `ProjectTime`, `movement_system` writes `Position` and reads `Velocity`,
+    // `scoring_system` reads `Position` and writes `Score`, and
+    // `display_system` reads all three. Every write is also read by another
+    // system, so no batch holds both sides of a conflicting pair. The batches
+    // come out as [time, movement], [scoring], [display].
     engine.register_system("time", time_system);
     engine.register_system("movement", movement_system);
     engine.register_system("scoring", scoring_system);
@@ -175,8 +200,8 @@ fn main() {
 
     engine.print_execution_graph();
 
-    // Step 3: Spawn three entities with distinct initial positions and
-    // velocities.
+    // Step 3: Spawn three entities, each with its own starting position and
+    // velocity.
     for i in 0..3 {
         engine
             .world_mut()
@@ -186,14 +211,14 @@ fn main() {
                 y: 0.0,
             })
             .with(Velocity {
-                vx: 1.0,
-                vy: (i as f32) * 0.5,
+                x: 1.0,
+                y: (i as f32) * 0.5,
             })
             .build()
             .unwrap();
     }
 
-    // Step 4: Run a few frames, then report the final state.
+    // Step 4: Run three frames, then log that the demo finished.
     for _frame in 0..3 {
         engine.process_frame().unwrap();
     }

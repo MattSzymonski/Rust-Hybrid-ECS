@@ -3,17 +3,18 @@
 //!
 //! # Responsibilities
 //!
-//! - [`PillComponent`] / [`PillLayout`]: one component's `Component` impl plus
-//!   a descriptor submitted into this artifact's registry - persistable ones
-//!   also register for schema migration and feed the project schema
-//!   fingerprint - or the field layout alone for a type that registers itself
-//!   and must not auto-register (engine types, host-linked extensions).
+//! - [`PillComponent`]: the `Component` impl plus the descriptor a type submits
+//!   into this artifact's registry. A persistable component also registers for
+//!   schema migration and feeds the project schema fingerprint.
+//! - [`PillLayout`]: the compile-time field layout alone, for a type that
+//!   registers itself and must not auto-register in every artifact that links
+//!   it (engine types, host-linked extensions).
 //! - [`pill_value_type!`]: the layout of a foreign value type, with offsets
 //!   taken from the compiler.
 //! - [`pill_module`] / [`pill_project`]: the loadable-artifact exports
 //!   (`pill_module_init`, `pill_module_abi_version`, the descriptor copies, the
-//!   project's schema fingerprint) behind the panic guard and engine-pointer
-//!   reconstruction every artifact otherwise hand-writes.
+//!   project's schema fingerprint), behind the panic guard and engine-pointer
+//!   reconstruction every artifact would otherwise have to write itself.
 //! - The mirror attributes ([`pill_mirror_impl`], [`pill_mirror_fn`],
 //!   [`pill_mirror_object`], [`pill_mirror_resource`], [`PillMirror`]): Rust
 //!   functions and types callable from C# through one C-ABI trampoline shape.
@@ -21,15 +22,16 @@
 //! # Design
 //!
 //! Generated code names the engine through fully-qualified `::pill_engine::`
-//! paths, so no macro needs to know its consumer's crate. Components are
-//! collected with the `inventory` crate, which builds a registry per linked
-//! artifact: each hot-reload generation DLL holds exactly the components its
-//! own sources declared, so a stale generation's types cannot be re-registered.
-//! The mirror lowering lives in `mirror`.
+//! paths, so no macro needs to know which crate uses it. Components are
+//! collected with the `inventory` crate, which builds one registry per linked
+//! artifact: each hot-reload generation DLL holds exactly the components its own
+//! sources declared, so a stale generation cannot re-register its types. The
+//! mirror lowering lives in `mirror`.
 
 extern crate proc_macro;
 
-/// The mirror attributes' lowering of Rust signatures and types to the C ABI.
+/// Converts the mirror attributes' Rust signatures and types into the C ABI
+/// form.
 mod mirror;
 
 // External crates
@@ -43,40 +45,45 @@ use syn::{parse_macro_input, spanned::Spanned, DeriveInput, ItemFn};
 
 /// Turns a component type into its engine registration.
 ///
-/// Generates `impl Component for T` plus a descriptor submitted into this
-/// artifact's compile-time registry, and the field layout that the schema hash
-/// and the C# mirror codegen read.
+/// Generates `impl Component for T`, a descriptor submitted into this
+/// artifact's compile-time registry, and the field layout read by the schema
+/// hash and the C# mirror codegen.
 ///
-/// Type-level helpers (`#[pill(...)]`):
-/// - `persistable` - schema-migrated across reloads; requires
-///   `Serialize + DeserializeOwned + Default`, as
-///   [`World::register_persistable_component_with_layout`] does.
-/// - `shared`, `shared = "crate::Name"` - one identity across every binary that
-///   links the type, instead of one `TypeId` and column per binary with neither
-///   able to see the other's entities. The identity is `module_path!()::TypeName`
-///   unless pinned, and must be unique process-wide.
+/// Type-level helpers (`#[pill(...)]` on the type):
+/// - `persistable` - the component survives a reload through schema migration.
+///   The type must implement `Serialize + DeserializeOwned + Default`, the same
+///   bounds [`World::register_persistable_component_with_layout`] requires.
+/// - `shared`, `shared = "crate::Name"` - gives the type one identity in every
+///   binary that links it. Without it, each binary has its own `TypeId` and its
+///   own column, and neither binary sees the other's entities. The identity is
+///   `module_path!()::TypeName` unless pinned, and it must be unique across the
+///   whole process.
 ///
-/// Field decorators (`#[pill(...)]` on a field, Unity's vocabulary; several per
-/// field, comma-separated or one attribute each). Presentation only: storage,
-/// persistence, the schema fingerprint and the generated C# mirror are unchanged.
-/// - `hide_in_inspector` (not drawn, still stored); `header("Text")` and
-///   `space(10.0)` (a separator line with text, a vertical gap);
-/// - `tooltip("Text")`; `min(0.0)` (a drag value with that floor);
+/// Field decorators (`#[pill(...)]` on a field, Unity's vocabulary). A field
+/// may take several, comma-separated or as one attribute each. They change
+/// presentation only: storage, persistence, the schema fingerprint and the
+/// generated C# mirror stay the same.
+/// - `hide_in_inspector` (not drawn, still stored), `header("Text")` (a
+///   separator line with text) and `space(10.0)` (a vertical gap);
+/// - `tooltip("Text")` (hover text) and `min(0.0)` (a drag value with that
+///   floor);
 /// - `range(0.0, 100.0)` (a slider, in whole steps for an integer field);
 /// - `text_area`, `text_area(3, 10)`, `multiline(5)` (multi-line text boxes);
-/// - `color` (an array of three or four numbers, or a struct of `r`, `g`, `b`[,
-///   `a`] leaves, draws as one colour row with a picker); `vector` (consecutive
-///   scalar leaves sharing a dotted prefix draw as one X/Y/Z/W row).
+/// - `color` (an array of three or four numbers, or a struct whose `r`, `g`,
+///   `b`[, `a`] leaves are numbers; drawn as one colour row with a picker);
+///   `vector` (consecutive scalar leaves sharing a dotted prefix, drawn as one
+///   X/Y/Z/W row).
 ///
 /// Field types: a primitive, a fixed-size array or a `#[derive(PillMirror)]`
-/// struct mirrors as a typed C# field. `String`, `Vec<E>` and `Vec<String>` are
-/// Rust-owned containers mirrored as accessor members that call derive-generated
-/// C-ABI trampolines, so managed code reads and writes the live container in
-/// place (`Vec` resizes through `E: Default + Clone`; `Vec<String>` elements are
-/// individually allocated, so each gets its own accessor). `DynamicBuffer<E>`
-/// lives in engine-owned native memory, so the mirror reads its `(ptr, len, cap)`
-/// handle straight out of the row and only resizing calls native code; `E` must
-/// be `Copy`, because the buffer runs no element drop glue.
+/// struct becomes a typed C# field. `String`, `Vec<E>` and `Vec<String>` are
+/// Rust-owned containers, mirrored as accessor members that call
+/// derive-generated C-ABI trampolines, so managed code reads and writes the
+/// live container in place. A `Vec` resizes through `E: Default + Clone`. The
+/// elements of a `Vec<String>` are allocated individually, so each one gets its
+/// own accessor. `DynamicBuffer<E>` lives in engine-owned native memory: the
+/// mirror reads its `(ptr, len, cap)` handle straight out of the row and calls
+/// native code only to resize. `E` must be `Copy`, because the buffer runs no
+/// element drop glue.
 ///
 /// [`World::register_persistable_component_with_layout`]: ::pill_engine::World::register_persistable_component_with_layout
 #[proc_macro_derive(PillComponent, attributes(pill))]
@@ -84,7 +91,7 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let ident = &input.ident;
 
-    // Parse the `#[pill(...)]` helper attribute.
+    // Step 1: Parse the `#[pill(...)]` helper attribute.
     let mut persistable = false;
     let mut shared = false;
     let mut shared_name_override: Option<String> = None;
@@ -108,14 +115,14 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
                             ));
                         }
                         // A shared name is a process-wide identity: two types
-                        // holding it become one component, one column, and one
-                        // set of rows. When their layouts also happen to agree
-                        // nothing downstream can notice, so the guard has to be
-                        // here, before the collision is expressible. Requiring
-                        // a path separator makes an accidental `"Transform"`
-                        // a compile error while leaving a deliberate, qualified
-                        // name - the only way two artifacts legitimately share
-                        // one - untouched.
+                        // that hold it become one component, one column and one
+                        // set of rows. If their layouts also agree, nothing
+                        // downstream can tell them apart. So the check has to
+                        // happen here, before the collision exists. Requiring a
+                        // path separator turns an accidental `"Transform"` into
+                        // a compile error, and leaves a deliberate qualified
+                        // name - the only way two artifacts can legitimately
+                        // share one - untouched.
                         if !name.contains("::") {
                             return Err(syn::Error::new_spanned(
                                 &literal,
@@ -140,8 +147,8 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
         }
     }
 
-    // Generic components are not supported: the engine registers concrete
-    // types keyed by `TypeId`, so a generic would be meaningless.
+    // Step 2: Reject a generic component: the engine registers concrete types
+    // keyed by `TypeId`, so a generic type has no single identity to register.
     if !input.generics.params.is_empty() {
         return syn::Error::new_spanned(
             &input.generics,
@@ -151,21 +158,21 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
         .into();
     }
 
-    // Capture the compile-time field layout for the C# mirror codegen, plus
-    // the accessor trampolines that let managed code reach a `Vec` or `String`
-    // field's live buffer. An unsupported field type is a compile error here,
-    // before the host would have to guess at a mirror.
+    // Step 3: Capture the compile-time field layout for the C# mirror codegen,
+    // plus the accessor trampolines that let managed code reach a `Vec` or
+    // `String` field's live buffer. An unsupported field type is a compile
+    // error here, before the host would have to guess at a mirror.
     let (declared_layout, layout_reference, field_accessors) =
         match component_field_descriptors(&input, ident, LayoutSubject::Component) {
-            Ok(triple) => triple,
+            Ok(field_descriptor_emissions) => field_descriptor_emissions,
             Err(error) => return error.to_compile_error().into(),
         };
 
-    // Each `Handle<T>` field's asset type, recorded at registration so the
-    // field layer knows what the field references. Recorded by the
-    // generated function, in this artifact, from `T`'s own shared name.
+    // Step 4: Record each `Handle<T>` field's asset type, so the field layer
+    // knows what the field references. The generated function records it in
+    // this artifact, from `T`'s own shared name.
     let asset_field_records = match handle_field_records(&input, ident) {
-        Ok(records) => records,
+        Ok(asset_field_records) => asset_field_records,
         Err(error) => return error.to_compile_error().into(),
     };
 
@@ -184,8 +191,8 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
     };
 
     // A shared component reports a stable name that every binary linking it
-    // computes identically; an ordinary one reports nothing and keeps the
-    // default per-binary `TypeId` identity.
+    // computes identically. An ordinary component reports no name and keeps the
+    // default `TypeId` identity, which is per binary.
     let shared_name_impl = if shared {
         let shared_name = match &shared_name_override {
             Some(name) => quote! { #name },
@@ -197,10 +204,11 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
             }
 
             fn shared_identity() -> ::core::option::Option<u128> {
-                // A `const` item, not the trait's default: that would hash the
-                // name on every `ComponentId::of` call, which is measurable on
-                // the per-call random-access path. Bound here, it is folded at
-                // compile time.
+                // The identity is a `const` item rather than the trait's
+                // default method, because the default would hash the name on
+                // every `ComponentId::of` call, and that cost shows on the
+                // per-call random-access path. Computed here, the hash is folded
+                // at compile time.
                 const IDENTITY: u128 =
                     ::pill_engine::component::shared_component_identity(#shared_name);
                 ::core::option::Option::Some(IDENTITY)
@@ -215,9 +223,10 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
             #shared_name_impl
 
             fn declared_schema_hash() -> ::core::option::Option<u64> {
-                // The same descriptors registration hashes, so a type agrees
-                // with its own registration by construction. An empty layout
-                // declares nothing, matching `ComponentRegistration::of`.
+                // These are the same descriptors the registration hashes, so a
+                // type's declared hash always agrees with its registration. An
+                // empty layout declares nothing, which matches
+                // `ComponentRegistration::of`.
                 let fields: &[::pill_engine::component_registry::ComponentFieldDescriptor] =
                     #layout_reference;
                 (!fields.is_empty())
@@ -256,16 +265,16 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
 /// the layout code reports those shapes itself.
 fn handle_field_records(
     input: &DeriveInput,
-    ident: &syn::Ident,
+    type_ident: &syn::Ident,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let syn::Data::Struct(data) = &input.data else {
         return Ok(quote! {});
     };
-    let syn::Fields::Named(named) = &data.fields else {
+    let syn::Fields::Named(fields) = &data.fields else {
         return Ok(quote! {});
     };
-    let mut records = Vec::new();
-    for field in &named.named {
+    let mut asset_field_records = Vec::new();
+    for field in &fields.named {
         let Some(asset) = handle_type_argument(&field.ty) else {
             continue;
         };
@@ -274,21 +283,21 @@ fn handle_field_records(
             .as_ref()
             .expect("named field has an identifier")
             .to_string();
-        records.push(quote! {
+        asset_field_records.push(quote! {
             world.record_asset_field_type(
-                ::pill_engine::ComponentId::of::<#ident>(),
+                ::pill_engine::ComponentId::of::<#type_ident>(),
                 #field_name,
                 <#asset as ::pill_engine::asset::Asset>::shared_name()
                     .unwrap_or_else(::core::any::type_name::<#asset>),
             );
         });
     }
-    Ok(quote! { #(#records)* })
+    Ok(quote! { #(#asset_field_records)* })
 }
 
 /// The `T` of a `Handle<T>` type, written with any path prefix.
-fn handle_type_argument(ty: &syn::Type) -> Option<&syn::Type> {
-    let syn::Type::Path(path) = ty else {
+fn handle_type_argument(field_type: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(path) = field_type else {
         return None;
     };
     let segment = path.path.segments.last()?;
@@ -311,15 +320,18 @@ fn handle_type_argument(ty: &syn::Type) -> Option<&syn::Type> {
 /// Emits a type's compile-time field layout without the component
 /// registration machinery.
 ///
-/// Generates [`PillComponent`]'s descriptor list - `offset_of!`, `size_of` and
-/// `align_of` over the same tag vocabulary - as an inherent `FIELD_LAYOUT` const
-/// plus a [`ComponentLayout`] impl, for a type that registers itself
-/// explicitly: an engine type, a host-linked extension, anything that must not
-/// submit an inventory registration into every artifact that links it.
+/// Generates the same descriptor list as [`PillComponent`], built from
+/// `offset_of!`, `size_of` and `align_of` over the same tag vocabulary. The
+/// list appears as an inherent `FIELD_LAYOUT` const plus a [`ComponentLayout`]
+/// impl.
 ///
-/// Nested struct fields are tagged `struct:<path>`; the world flattens them into
-/// dotted leaf rows at registration, provided the nested type's own layout is
-/// registered first.
+/// Use it for a type that registers itself explicitly: an engine type, a
+/// host-linked extension, or anything else that must not submit an inventory
+/// registration into every artifact that links it.
+///
+/// A nested struct field is tagged `struct:<path>`. The world flattens those
+/// into dotted leaf rows at registration, provided the nested type's own layout
+/// is registered first.
 ///
 /// [`ComponentLayout`]: ::pill_engine::component_registry::ComponentLayout
 #[proc_macro_derive(PillLayout, attributes(pill))]
@@ -335,7 +347,7 @@ pub fn derive_pill_layout(input: TokenStream) -> TokenStream {
         .into();
     }
 
-    // A layout-only type emits no accessors: it has no registration that could
+    // A layout-only type emits no accessors. It has no registration that could
     // carry heap-field trampolines.
     match component_field_descriptors(&input, &input.ident, LayoutSubject::LayoutOnly) {
         Ok((declared_layout, _layout_reference, _accessors)) => declared_layout.into(),
@@ -346,17 +358,17 @@ pub fn derive_pill_layout(input: TokenStream) -> TokenStream {
 /// The inherent `FIELD_LAYOUT` const and `ComponentLayout` impl every
 /// layout-carrying derive emits, both naming the same descriptor slice.
 fn layout_emission(
-    ident: &syn::Ident,
+    type_ident: &syn::Ident,
     layout_reference: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     quote! {
-        impl #ident {
+        impl #type_ident {
             /// Compile-time field layout of this type, generated by the derive
             /// macro; pass it to `World::register_component_with_layout`.
             pub const FIELD_LAYOUT: &'static [::pill_engine::component_registry::ComponentFieldDescriptor] = #layout_reference;
         }
 
-        impl ::pill_engine::component_registry::ComponentLayout for #ident {
+        impl ::pill_engine::component_registry::ComponentLayout for #type_ident {
             const FIELDS: &'static [::pill_engine::component_registry::ComponentFieldDescriptor] = #layout_reference;
         }
     }
@@ -365,17 +377,16 @@ fn layout_emission(
 /// The layout emission for a type with no named fields (unit struct, tuple
 /// struct, enum, union), so the const and trait impl exist on every derived
 /// type.
-fn empty_field_layout(ident: &syn::Ident) -> proc_macro2::TokenStream {
-    layout_emission(ident, &quote! { &[] })
+fn empty_field_layout(type_ident: &syn::Ident) -> proc_macro2::TokenStream {
+    layout_emission(type_ident, &quote! { &[] })
 }
 
-/// Which derive is asking for field descriptors, and therefore what the
-/// emission may contain.
+/// Which derive is asking for field descriptors, and so what the emission may
+/// contain.
 ///
-/// The four variants are exactly the four callers: two `true`s at a call site
-/// cannot say whether the caller keeps the accessor stream, which is how the
-/// component derive and the layout derive came to share a spelling while
-/// behaving differently.
+/// The four variants are exactly the four callers, so every call site says what
+/// it wants. Two `bool` flags could not express whether the caller keeps the
+/// accessor stream.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LayoutSubject {
     /// `#[derive(PillComponent)]`: container fields allowed, heap-field
@@ -418,72 +429,77 @@ impl LayoutSubject {
 ///
 /// `self_type` is the path every offset is taken through: the derived type's
 /// own name for the derives, or the declared path when `pill_value_type!`
-/// describes a foreign type. `subject` names which derive is asking, which is
-/// what decides container fields, accessors and consts.
+/// describes a foreign type. `layout_subject` says which derive is asking, and
+/// that is what decides container fields, accessors and consts.
 ///
-/// Enums, unions, unit structs and tuple structs have no named fields to
-/// mirror and yield an empty layout.
+/// Enums, unions, unit structs and tuple structs have no named fields to mirror
+/// and produce an empty layout.
 fn component_field_descriptors(
     input: &DeriveInput,
     self_type: &dyn ToTokens,
-    subject: LayoutSubject,
+    layout_subject: LayoutSubject,
 ) -> syn::Result<(
     proc_macro2::TokenStream,
     proc_macro2::TokenStream,
     proc_macro2::TokenStream,
 )> {
-    let ident = &input.ident;
-    let named = match &input.data {
+    let type_ident = &input.ident;
+    // Step 1: Any type without named fields has nothing to mirror, so it gets
+    // an empty layout.
+    let named_fields = match &input.data {
         syn::Data::Struct(data) => match &data.fields {
-            syn::Fields::Named(named) => &named.named,
-            _ => return Ok((empty_field_layout(ident), quote! { &[] }, quote! {})),
+            syn::Fields::Named(fields) => &fields.named,
+            _ => return Ok((empty_field_layout(type_ident), quote! { &[] }, quote! {})),
         },
-        _ => return Ok((empty_field_layout(ident), quote! { &[] }, quote! {})),
+        _ => return Ok((empty_field_layout(type_ident), quote! { &[] }, quote! {})),
     };
-    if named.is_empty() {
-        return Ok((empty_field_layout(ident), quote! { &[] }, quote! {}));
+    if named_fields.is_empty() {
+        return Ok((empty_field_layout(type_ident), quote! { &[] }, quote! {}));
     }
 
     let type_name = quote! {
-        ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#ident))
+        ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#type_ident))
     };
 
-    let mut entries = Vec::with_capacity(named.len());
-    let mut accessors: Vec<proc_macro2::TokenStream> = Vec::new();
-    for field in named {
+    let mut field_descriptor_expressions = Vec::with_capacity(named_fields.len());
+    let mut accessor_emissions: Vec<proc_macro2::TokenStream> = Vec::new();
+    // Step 2: Build one descriptor per field, and one accessor set per
+    // container field.
+    for field in named_fields {
         let field_ident = field.ident.as_ref().expect("named field has an identifier");
-        let field_ty = &field.ty;
+        let field_type = &field.ty;
         let field_name = field_ident.to_string();
-        let tag = field_type_tag(field_ty, subject.allows_containers())?;
-        let type_tag = &tag.text;
+        let tag = field_type_tag(field_type, layout_subject.allows_containers())?;
+        let type_tag = &tag.tag_text;
         let decorators = parse_field_decorators(&field.attrs)?;
-        // Array lengths may be a literal or a `const` path; both resolve in a
-        // const context, so the count is computed here rather than parsed.
-        let element_count = match field_ty {
+        // An array length may be a literal or a `const` path. Both work in a
+        // const context, so the count is emitted as an expression instead of
+        // being parsed here.
+        let element_count = match field_type {
             syn::Type::Array(array) => {
                 let array_len = &array.len;
                 quote! { (#array_len as usize) }
             }
             _ => quote! { 0usize },
         };
-        entries.push(quote! {
+        field_descriptor_expressions.push(quote! {
             ::pill_engine::component_registry::ComponentFieldDescriptor {
                 name: #field_name,
                 type_tag: #type_tag,
                 offset: ::core::mem::offset_of!(#self_type, #field_ident),
-                size: ::core::mem::size_of::<#field_ty>(),
-                align: ::core::mem::align_of::<#field_ty>(),
+                size: ::core::mem::size_of::<#field_type>(),
+                align: ::core::mem::align_of::<#field_type>(),
                 element_count: #element_count,
                 decorators: #decorators,
             }
         });
-        // A container field additionally gets one accessor per supported
-        // operation, so a managed mirror iterates the live buffer instead of
-        // copying the row's 24-byte header somewhere else.
-        if subject.emits_accessors() {
-            if let Some(kind) = tag.accessor {
-                accessors.push(emit_heap_field_accessor(
-                    ident,
+        // A container field also gets one accessor per supported operation, so
+        // a managed mirror reads and writes the live buffer instead of copying
+        // the container's header somewhere else.
+        if layout_subject.emits_accessors() {
+            if let Some(kind) = tag.heap_field_kind {
+                accessor_emissions.push(emit_heap_field_accessor(
+                    type_ident,
                     field_ident,
                     &field_name,
                     &type_name,
@@ -493,38 +509,46 @@ fn component_field_descriptors(
         }
     }
 
-    let static_name = format_ident!("__PILL_FIELD_LAYOUT_{}", ident);
+    // Step 3: Put the descriptors behind one `static`, and add the layout
+    // consts when this subject may carry them.
+    let static_name = format_ident!("__PILL_FIELD_LAYOUT_{}", type_ident);
     // A foreign type can carry neither an inherent const nor the
     // `ComponentLayout` impl (both are orphan-rule violations), so its
     // declaration emits the descriptor list alone.
-    let layout_consts = if subject.emits_layout_consts() {
-        layout_emission(ident, &quote! { #static_name })
+    let layout_consts = if layout_subject.emits_layout_consts() {
+        layout_emission(type_ident, &quote! { #static_name })
     } else {
         quote! {}
     };
-    let declared = quote! {
-        /// Compile-time field layout of `#ident`, consumed by the C# mirror
+    let declared_layout = quote! {
+        /// Compile-time field layout of `#type_ident`, consumed by the C# mirror
         /// codegen. Do not reference; generated by `#[derive(...)]`.
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
-        static #static_name: &[::pill_engine::component_registry::ComponentFieldDescriptor] = &[ #(#entries),* ];
+        static #static_name: &[::pill_engine::component_registry::ComponentFieldDescriptor] =
+            &[ #(#field_descriptor_expressions),* ];
 
         #layout_consts
     };
-    Ok((declared, quote! { #static_name }, quote! { #(#accessors)* }))
+    Ok((
+        declared_layout,
+        quote! { #static_name },
+        quote! { #(#accessor_emissions)* },
+    ))
 }
 
 /// The argument list of a decorator written with parentheses, e.g.
 /// `range(0.0, 100.0)`.
 type DecoratorArguments = syn::punctuated::Punctuated<syn::Lit, syn::Token![,]>;
 
-/// Every field decorator a field may declare, with the usage a refusal shows.
+/// Every field decorator a field may declare, with the usage text a refusal
+/// shows.
 ///
-/// One list, read by both refusal messages, so the parser and the text it
-/// answers with cannot drift apart - a decorator added to the parser without
-/// naming it here fails the test below, and a listed one that the parser does
-/// not accept fails it too. A decorator with two forms (parenthesised or not)
-/// appears once per form.
+/// The parser and both refusal messages read this one list, so they cannot
+/// drift apart. A listed decorator the parser does not accept fails the test at
+/// the bottom of the file, and so does one the refusal text stops naming. A
+/// decorator with two forms (with or without parentheses) appears once per
+/// form.
 const FIELD_DECORATOR_USAGE: &[(&str, &str)] = &[
     ("hide_in_inspector", "hide_in_inspector"),
     ("color", "color"),
@@ -628,17 +652,17 @@ fn add_field_decorator(
             "min(0.0)"
         };
         let argument = single_argument(meta, key, usage)?;
-        let value = literal_as_f32(&argument, key)?;
-        if !value.is_finite() || (path.is_ident("space") && value < 0.0) {
+        let numeric_argument = literal_as_f32(&argument, key)?;
+        if !numeric_argument.is_finite() || (path.is_ident("space") && numeric_argument < 0.0) {
             return Err(syn::Error::new_spanned(
                 argument,
                 format!("`{key}` takes a finite, non-negative number"),
             ));
         }
         decorators.push(if path.is_ident("space") {
-            quote! { ::pill_engine::component_registry::FieldDecorator::Space(#value) }
+            quote! { ::pill_engine::component_registry::FieldDecorator::Space(#numeric_argument) }
         } else {
-            quote! { ::pill_engine::component_registry::FieldDecorator::Min(#value) }
+            quote! { ::pill_engine::component_registry::FieldDecorator::Min(#numeric_argument) }
         });
         return Ok(());
     }
@@ -691,15 +715,15 @@ fn add_field_decorator(
     }
     if path.is_ident("multiline") {
         let argument = single_argument(meta, "multiline", "multiline(5)")?;
-        let lines = literal_as_usize(&argument, "multiline")?;
-        if lines == 0 {
+        let line_count = literal_as_usize(&argument, "multiline")?;
+        if line_count == 0 {
             return Err(syn::Error::new_spanned(
                 argument,
                 "`multiline` needs at least one line, as in multiline(5)",
             ));
         }
         decorators.push(quote! {
-            ::pill_engine::component_registry::FieldDecorator::Multiline(#lines)
+            ::pill_engine::component_registry::FieldDecorator::Multiline(#line_count)
         });
         return Ok(());
     }
@@ -779,8 +803,8 @@ fn arguments_of_two<'a>(
 /// `f32` parameter (`space(10)` as well as `space(10.0)`).
 fn literal_as_f32(literal: &syn::Lit, key: &str) -> syn::Result<f32> {
     match literal {
-        syn::Lit::Float(value) => value.base10_parse::<f32>(),
-        syn::Lit::Int(value) => value.base10_parse::<f32>(),
+        syn::Lit::Float(float_literal) => float_literal.base10_parse::<f32>(),
+        syn::Lit::Int(integer_literal) => integer_literal.base10_parse::<f32>(),
         _ => Err(syn::Error::new_spanned(
             literal,
             format!("`{key}` takes a number"),
@@ -791,7 +815,7 @@ fn literal_as_f32(literal: &syn::Lit, key: &str) -> syn::Result<f32> {
 /// Read a line-count decorator argument, insisting it is a plain integer.
 fn literal_as_usize(literal: &syn::Lit, key: &str) -> syn::Result<usize> {
     match literal {
-        syn::Lit::Int(value) => value.base10_parse::<usize>(),
+        syn::Lit::Int(integer_literal) => integer_literal.base10_parse::<usize>(),
         _ => Err(syn::Error::new_spanned(
             literal,
             format!("`{key}` takes a whole line count"),
@@ -820,35 +844,34 @@ enum HeapFieldKind {
     String,
 }
 
-/// A field's wire tag, with the accessor set the tag implies.
+/// A field's wire tag, together with the accessor set the tag implies.
 ///
-/// The walk that builds the tag already decides whether the field is a
-/// container and what its element is; carrying the decision out with the text
-/// means no second function has to strip the prefixes back off - a drift there
-/// would have silently emitted a `vec:f32` row with no accessor trampolines.
+/// The code that builds the tag already decides whether the field is a
+/// container and what its element is. Carrying that decision out with the text
+/// means no second function has to strip the prefixes off again. A mistake
+/// there would emit a `vec:f32` row with no accessor trampolines.
 struct FieldTag {
     /// The tag the descriptor carries (`f32`, `vec:f32`, `struct:<path>`, ...).
-    text: String,
+    tag_text: String,
     /// The accessor set the tag implies, when the field owns heap memory.
-    accessor: Option<HeapFieldKind>,
+    heap_field_kind: Option<HeapFieldKind>,
 }
 
 impl FieldTag {
     /// A tag with no accessor trampolines behind it.
-    fn plain(text: String) -> Self {
+    fn plain(tag_text: String) -> Self {
         Self {
-            text,
-            accessor: None,
+            tag_text,
+            heap_field_kind: None,
         }
     }
 }
 
-/// One trampoline an accessor kind offers, with what the descriptor says
-/// about it.
+/// One trampoline an accessor kind offers, and what the descriptor says about
+/// it.
 ///
-/// The kind decides the list of these ([`emit_heap_field_accessor`]), so which
-/// operations a container has is one readable list rather than five
-/// accumulators whose emptiness meant "no such operation".
+/// [`emit_heap_field_accessor`] decides the list, so which operations a
+/// container has is visible in one place.
 struct AccessorEmission {
     /// The operation the descriptor names it by (`view`, `resize`, ...).
     operation: &'static str,
@@ -858,16 +881,16 @@ struct AccessorEmission {
     trampoline: proc_macro2::TokenStream,
 }
 
-/// Emit the resize trampoline every container kind shares.
+/// Emits the resize trampoline that every container kind shares.
 ///
 /// `Vec`, `DynamicBuffer` and `Vec<String>` all rewrite their length the same
-/// way - grow with `Default`, refuse a null row - and differ only in what the
-/// doc says the rewrite does to outstanding views, so the doc lines come in as
-/// the caller's token stream and the body is written once.
+/// way: they grow with `Default` and refuse a null row. They differ only in
+/// what the documentation says the rewrite does to outstanding views, so the
+/// doc lines arrive as the caller's token stream and the body is written once.
 ///
-/// `resize` needs `E: Default + Clone`. The derive only accepts a primitive or
-/// a `#[derive(PillMirror)]` struct as `E`, and both are, so the bound is
-/// satisfied by the field's element type rather than by the component's.
+/// Resizing a `Vec` needs `E: Default + Clone`. Those bounds land on the
+/// field's element type (a primitive, a `String` or a mirrored struct), not on
+/// the component.
 fn emit_resize_trampoline(
     type_ident: &syn::Ident,
     field_ident: &syn::Ident,
@@ -901,15 +924,15 @@ fn emit_resize_trampoline(
     }
 }
 
-/// Emit the accessor trampolines and the descriptor submission for one
+/// Emits the accessor trampolines and the descriptor submission for one
 /// heap-owning field.
 ///
-/// Each trampoline receives the address of the live component value (the row a
-/// managed query is iterating): the view answers `(data, length)` for every
-/// container, resize grows or shrinks a `Vec` or a `DynamicBuffer`, and set
-/// replaces a `String`'s contents from UTF-8 bytes. Nothing here serializes or
-/// copies a buffer; the managed side reads and writes elements through the
-/// pointer it is handed.
+/// Every trampoline receives the address of the live component value, which is
+/// the row a managed query is iterating. The view reports `(data, length)` for
+/// any container, resize grows or shrinks a container, and set replaces a
+/// `String`'s contents from UTF-8 bytes. Nothing here serializes or copies a
+/// buffer: the managed side reads and writes elements through the pointer it
+/// receives.
 fn emit_heap_field_accessor(
     type_ident: &syn::Ident,
     field_ident: &syn::Ident,
@@ -920,9 +943,10 @@ fn emit_heap_field_accessor(
     let view_symbol = format!("pill_accessor_{type_ident}_{field_ident}_view");
     let view_fn = syn::Ident::new(&view_symbol, field_ident.span());
 
-    // A `Vec<String>` has no contiguous element run to point at: each element
-    // is its own allocation, so its view reports the count and a null data
-    // pointer, and the elements travel through their own trampolines below.
+    // A `Vec<String>` has no contiguous run of elements to point at. Each
+    // element is its own allocation, so the view reports the count and a null
+    // data pointer, and the elements are reached through their own trampolines
+    // below.
     let view_data = match &kind {
         HeapFieldKind::VecString => quote! {
             *out_data = ::core::ptr::null();
@@ -1242,18 +1266,18 @@ fn emit_heap_field_accessor(
 
     // The descriptor spells "this kind has no such operation" as an empty
     // symbol, so each field is looked up in the list instead of accumulated.
-    let symbol = |operation: &str| {
+    let symbol_for_operation = |operation: &str| {
         emissions
             .iter()
             .find(|emission| emission.operation == operation)
             .map(|emission| emission.symbol.clone())
             .unwrap_or_default()
     };
-    let resize_symbol = symbol("resize");
-    let set_symbol = symbol("set");
-    let item_symbol = symbol("item");
-    let set_item_symbol = symbol("set_item");
-    let push_symbol = symbol("push");
+    let resize_symbol = symbol_for_operation("resize");
+    let set_symbol = symbol_for_operation("set");
+    let item_symbol = symbol_for_operation("item");
+    let set_item_symbol = symbol_for_operation("set_item");
+    let push_symbol = symbol_for_operation("push");
     let trampolines = emissions.iter().map(|emission| &emission.trampoline);
 
     quote! {
@@ -1277,13 +1301,14 @@ fn emit_heap_field_accessor(
     }
 }
 
-/// Flatten a path's segments into one string, joined by `separator`.
+/// Joins a path's segments into one string, with `separator` between them.
 ///
-/// The spelling is a wire format in three places: the `struct:` tag a
-/// component field's nested type carries, and the mirrored declaration's
-/// descriptor name and synthetic static, which the C# side matches against
-/// the artifact registries. One implementation keeps those spellings from
-/// drifting apart.
+/// The result is a wire format in two places. One is the `struct:` tag a
+/// component field's nested type carries. The other is the descriptor name of a
+/// mirrored declaration, which the C# side matches against the artifact
+/// registries. The same function also builds the name of the synthetic struct a
+/// mirrored declaration parses through, where only uniqueness matters. Sharing
+/// one implementation keeps those spellings from drifting apart.
 fn flattened_path(path: &syn::Path, separator: &str) -> String {
     path.segments
         .iter()
@@ -1292,75 +1317,81 @@ fn flattened_path(path: &syn::Path, separator: &str) -> String {
         .join(separator)
 }
 
-/// Map a Rust field type to the closed C#-mirror type-tag vocabulary.
+/// Maps a Rust field type to the closed C#-mirror type-tag vocabulary.
 ///
-/// Primitives and fixed-size arrays are expressible; any other path type is
-/// tagged as a nested struct by its fully-qualified name (the codegen resolves
-/// it against the artifact's `PillMirror` inventory, falling back to an opaque
-/// blob of the field's size when it is not declared). `String`, `Vec<E>` and
-/// `DynamicBuffer<E>` become the heap-owning container tags `string`,
-/// `vec:<element>` and `dynbuf:<element>` when the caller allows them
-/// (component rows, which managed code reaches through generated accessor
-/// members) and are rejected otherwise (mirrored value types, which cross the
-/// boundary as plain data). `char` is rejected outright because Rust's and
-/// C#'s widths disagree.
-fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<FieldTag> {
-    match ty {
+/// Primitives and fixed-size arrays have a tag of their own. Any other path
+/// type is tagged as a nested struct by its fully-qualified name. The codegen
+/// resolves that against the artifact's `PillMirror` inventory, and falls back
+/// to an opaque blob of the field's size when no declaration exists.
+///
+/// `String`, `Vec<E>` and `DynamicBuffer<E>` become the heap-owning container
+/// tags `string`, `vec:<element>` and `dynbuf:<element>` when the caller allows
+/// containers. Component rows allow them, because managed code reaches their
+/// buffers through generated accessor members. Mirrored value types do not,
+/// because they cross the boundary as plain data.
+///
+/// A `char` field is rejected: Rust's `char` is 4 bytes and C#'s is 2.
+fn field_type_tag(field_type: &syn::Type, containers_allowed: bool) -> syn::Result<FieldTag> {
+    match field_type {
         syn::Type::Path(path) if path.qself.is_none() => {
             let segment = path.path.segments.last();
-            let last = segment
+            let last_segment_name = segment
                 .map(|segment| segment.ident.to_string())
                 .unwrap_or_default();
-            match last.as_str() {
+            match last_segment_name.as_str() {
                 "f32" | "f64" | "i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i64"
-                | "u64" | "bool" | "usize" | "isize" => Ok(FieldTag::plain(last)),
+                | "u64" | "bool" | "usize" | "isize" => Ok(FieldTag::plain(last_segment_name)),
                 "char" => Err(syn::Error::new_spanned(
-                    ty,
+                    field_type,
                     "`char` fields cannot be mirrored: Rust `char` is 4 bytes while C# `char` is 2",
                 )),
                 "String" => {
-                    if allow_containers {
+                    if containers_allowed {
                         Ok(FieldTag {
-                            text: "string".to_string(),
-                            accessor: Some(HeapFieldKind::String),
+                            tag_text: "string".to_string(),
+                            heap_field_kind: Some(HeapFieldKind::String),
                         })
                     } else {
-                        Err(heap_owned_rejection(ty, "String"))
+                        Err(heap_owned_rejection(field_type, "String"))
                     }
                 }
                 "Vec" | "DynamicBuffer" => {
-                    if !allow_containers {
-                        return Err(heap_owned_rejection(ty, &last));
+                    if !containers_allowed {
+                        return Err(heap_owned_rejection(field_type, &last_segment_name));
                     }
                     // The element type decides the span C# iterates, so it
                     // must be inside the closed vocabulary too.
-                    let element = container_element_type(segment, &last)
-                        .map_err(|message| syn::Error::new_spanned(ty, message))?;
-                    let element_tag = field_type_tag(element, allow_containers)?.text;
+                    let element = container_element_type(segment, &last_segment_name)
+                        .map_err(|message| syn::Error::new_spanned(field_type, message))?;
+                    let element_tag = field_type_tag(element, containers_allowed)?.tag_text;
                     if is_primitive_tag(&element_tag) || element_tag.starts_with("struct:") {
-                        let prefix = if last == "Vec" { "vec" } else { "dynbuf" };
-                        let text = format!("{prefix}:{element_tag}");
-                        let accessor = if last == "Vec" {
+                        let prefix = if last_segment_name == "Vec" {
+                            "vec"
+                        } else {
+                            "dynbuf"
+                        };
+                        let tag_text = format!("{prefix}:{element_tag}");
+                        let heap_field_kind = if last_segment_name == "Vec" {
                             HeapFieldKind::Vec { element_tag }
                         } else {
                             HeapFieldKind::DynamicBuffer { element_tag }
                         };
                         Ok(FieldTag {
-                            text,
-                            accessor: Some(accessor),
+                            tag_text,
+                            heap_field_kind: Some(heap_field_kind),
                         })
                     } else if element_tag == "string" {
-                        if last == "Vec" {
-                            // Elements are individually allocated strings, so
-                            // there is no span over them; C# reaches each one
-                            // through its own accessor instead.
+                        if last_segment_name == "Vec" {
+                            // The elements are individually allocated strings,
+                            // so there is no span over them. C# reaches each
+                            // one through its own accessor instead.
                             Ok(FieldTag {
-                                text: "vec:string".to_string(),
-                                accessor: Some(HeapFieldKind::VecString),
+                                tag_text: "vec:string".to_string(),
+                                heap_field_kind: Some(HeapFieldKind::VecString),
                             })
                         } else {
                             Err(syn::Error::new_spanned(
-                                ty,
+                                field_type,
                                 "`DynamicBuffer<String>` fields are not supported; a \
                                  `DynamicBuffer` holds plain `Copy` elements - use a `Vec<String>` \
                                  for a text list",
@@ -1370,41 +1401,44 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<FieldTa
                         || element_tag.starts_with("dynbuf:")
                     {
                         Err(syn::Error::new_spanned(
-                            ty,
+                            field_type,
                             format!(
-                                "nested containers are not supported; a `{last}` field's element \
-                                 must be a primitive or a `#[derive(PillMirror)]` struct"
+                                "nested containers are not supported; a `{last_segment_name}` field's \
+                                 element must be a primitive or a `#[derive(PillMirror)]` struct"
                             ),
                         ))
                     } else if element_tag.starts_with("array:") {
                         Err(syn::Error::new_spanned(
-                            ty,
+                            field_type,
                             format!(
-                                "a `{last}` of fixed-size arrays is not supported; use a `{last}` \
-                                 of primitives"
+                                "a `{last_segment_name}` of fixed-size arrays is not supported; \
+                                 use a `{last_segment_name}` of primitives"
                             ),
                         ))
                     } else {
                         Err(syn::Error::new_spanned(
-                            ty,
-                            format!("`{last}<{element_tag}>` is not a supported container field"),
+                            field_type,
+                            format!(
+                                "`{last_segment_name}<{element_tag}>` is not a supported container field"
+                            ),
                         ))
                     }
                 }
                 // Heap-owning standard types that have no accessor machinery.
                 "Box" | "Arc" | "Rc" | "Option" | "Result" | "Cow" | "HashMap" | "HashSet"
                 | "BTreeMap" | "BTreeSet" | "VecDeque" | "LinkedList" => {
-                    Err(heap_owned_rejection(ty, &last))
+                    Err(heap_owned_rejection(field_type, &last_segment_name))
                 }
-                // A field holding another entity's handle. Tagged on its own
-                // rather than as a `struct:` so the field layer reads and
-                // writes it as a reference the editor can pick, instead of an
+                // A field holding another entity's handle. It gets its own tag
+                // instead of a `struct:` tag, so the field layer reads and
+                // writes it as a reference the editor can pick, not as an
                 // opaque pair of numbers.
                 "Entity" => Ok(FieldTag::plain("entity".to_string())),
                 // An asset handle keeps the asset it names, so the C# mirror
-                // can type the field as `Handle<Mesh>` rather than an opaque
-                // `Handle`. Still a `struct:` tag: every reader that folds or
-                // resolves struct tags treats it exactly as before.
+                // can type the field as `Handle<Mesh>` instead of an opaque
+                // `Handle`. The tag is still a `struct:` tag, so every reader
+                // that folds or resolves struct tags treats it like any other
+                // struct.
                 "Handle" => {
                     let asset = segment
                         .and_then(|segment| match &segment.arguments {
@@ -1426,10 +1460,9 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<FieldTa
                     })
                 }
                 _ => {
-                    // A nested struct (or an enum, which the codegen treats as
-                    // an un-resolvable struct and renders opaque). Tagged by
-                    // its fully-qualified path so `PillMirror` descriptors
-                    // resolve by name.
+                    // A nested struct, or an enum, which the codegen cannot
+                    // resolve and renders opaque. Tagged by its fully-qualified
+                    // path so a `PillMirror` descriptor resolves it by name.
                     let qualified = flattened_path(&path.path, "::");
                     Ok(FieldTag::plain(format!("struct:{qualified}")))
                 }
@@ -1439,15 +1472,18 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<FieldTa
             // The element count lives in `element_count` (computed from the
             // length expression at compile time), so the tag only carries the
             // element type.
-            let inner = field_type_tag(&array.elem, allow_containers)?.text;
-            if inner.starts_with("vec:") || inner.starts_with("dynbuf:") || inner == "string" {
+            let element_tag = field_type_tag(&array.elem, containers_allowed)?.tag_text;
+            if element_tag.starts_with("vec:")
+                || element_tag.starts_with("dynbuf:")
+                || element_tag == "string"
+            {
                 return Err(syn::Error::new_spanned(
-                    ty,
+                    field_type,
                     "arrays of heap-owning fields are not supported; use a `Vec` or \
                      `DynamicBuffer` field instead",
                 ));
             }
-            Ok(FieldTag::plain(format!("array:{inner}")))
+            Ok(FieldTag::plain(format!("array:{element_tag}")))
         }
         other => Err(syn::Error::new_spanned(
             other,
@@ -1458,15 +1494,15 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<FieldTa
 
 /// The rejection for a heap-owning type outside the container vocabulary.
 ///
-/// `String`, `Vec` and `DynamicBuffer` reach this only from
-/// `#[derive(PillMirror)]`, whose values are copied across the boundary and
-/// have no live row to reach a buffer through.
-fn heap_owned_rejection(ty: &syn::Type, name: &str) -> syn::Error {
+/// `String`, `Vec` and `DynamicBuffer` reach this only from a value type that
+/// is mirrored as plain data (`#[derive(PillMirror)]` or `pill_value_type!`).
+/// Such a type has no live row to reach a buffer through.
+fn heap_owned_rejection(field_type: &syn::Type, field_type_name: &str) -> syn::Error {
     syn::Error::new_spanned(
-        ty,
+        field_type,
         format!(
-            "field type `{name}` owns heap memory and cannot be mirrored to C#; use a blittable \
-             value type, a `String`, a `Vec`, or a `DynamicBuffer`"
+            "field type `{field_type_name}` owns heap memory and cannot be mirrored to C#; use a \
+             blittable value type, a `String`, a `Vec`, or a `DynamicBuffer`"
         ),
     )
 }
@@ -1474,19 +1510,19 @@ fn heap_owned_rejection(ty: &syn::Type, name: &str) -> syn::Error {
 /// Extract the element type of a `Vec<E>` or `DynamicBuffer<E>` field.
 fn container_element_type<'a>(
     segment: Option<&'a syn::PathSegment>,
-    container: &str,
+    container_type_name: &str,
 ) -> Result<&'a syn::Type, String> {
-    let missing = || {
+    let missing_element_message = || {
         format!(
-            "a `{container}` field must name its element type (`{container}<f32>`, not bare \
-             `{container}`)"
+            "a `{container_type_name}` field must name its element type \
+             (`{container_type_name}<f32>`, not bare `{container_type_name}`)"
         )
     };
     let Some(segment) = segment else {
-        return Err(missing());
+        return Err(missing_element_message());
     };
     let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-        return Err(missing());
+        return Err(missing_element_message());
     };
     arguments
         .args
@@ -1495,7 +1531,7 @@ fn container_element_type<'a>(
             syn::GenericArgument::Type(element) => Some(element),
             _ => None,
         })
-        .ok_or_else(missing)
+        .ok_or_else(missing_element_message)
 }
 
 /// Whether a tag names one of the scalar primitives.
@@ -1525,12 +1561,14 @@ fn is_primitive_tag(tag: &str) -> bool {
 /// Turns a plain (non-component) value type, or a fieldless enum, into a typed
 /// C# mirror.
 ///
-/// A named-field struct gets a [`PillValueTypeDescriptor`] submitted into this
-/// artifact's inventory, so the host's C# codegen resolves `struct:<path>` field
-/// tags to typed nested structs, plus the encodings that let mirrored functions
-/// take and return it by value. A fieldless enum with an integer `#[repr]`
-/// becomes a C# `enum` whose values mirrored functions pass as the discriminant.
-/// Generic types are rejected.
+/// A struct with named fields gets a [`PillValueTypeDescriptor`] submitted into
+/// this artifact's inventory, so the host's C# codegen can resolve
+/// `struct:<path>` field tags to typed nested structs. It also gets the
+/// encodings that let mirrored functions take and return the type by value.
+///
+/// A fieldless enum with an integer `#[repr]` becomes a C# `enum`, and
+/// mirrored functions pass its values as the discriminant. Generic types are
+/// rejected.
 ///
 /// [`PillValueTypeDescriptor`]: ::pill_engine::component_registry::PillValueTypeDescriptor
 #[proc_macro_derive(PillMirror, attributes(pill))]
@@ -1554,11 +1592,11 @@ pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
     }
 
     // Value types cross the boundary as plain data, so a heap-owning field has
-    // no meaning here: there is no live row for managed code to reach a buffer
+    // no meaning here. Nothing gives managed code a live row to reach a buffer
     // through, and the mirror is copied by value.
     let (declared_layout, layout_reference, _accessors) =
         match component_field_descriptors(&input, ident, LayoutSubject::MirroredValue) {
-            Ok(triple) => triple,
+            Ok(field_descriptor_emissions) => field_descriptor_emissions,
             Err(error) => return error.to_compile_error().into(),
         };
 
@@ -1593,20 +1631,20 @@ pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
 /// Declares the layout of a foreign value type for the managed mirror.
 ///
 /// `#[derive(PillMirror)]` reads the type definition, so a type this crate does
-/// not define (`glam::Vec3`, say) cannot carry it. This macro takes the same
-/// declaration a derive would read - the type path and its `field: type` list -
-/// and emits the same
+/// not define (say `glam::Vec3`) cannot carry the derive. This macro takes the
+/// declaration the derive would read: the type path and its `field: type` list.
+/// It emits the same
 /// [`PillValueTypeDescriptor`](::pill_engine::component_registry::PillValueTypeDescriptor)
-/// into the calling artifact's registry, so managed code gets typed members for
-/// the fields instead of an opaque byte blob.
+/// into the calling artifact's registry. Managed code then gets typed members
+/// for the fields instead of an opaque byte blob.
 ///
-/// Spell the path exactly as the component field is written: the field tag is
+/// Spell the path exactly as the component field is written. The field tag is
 /// the path as spelled at the field site (`Vector3f` for a `[Vector3f; 16]`
 /// field), and the host resolves descriptors by exact name. A generated
-/// assertion fails the build when the last declared field does not end the type,
-/// so a field added behind the declaration cannot go unseen. The declaration
-/// belongs to the artifact whose mirror needs it; another module's registry does
-/// not see it.
+/// assertion fails the build when the last declared field does not end the
+/// type, so a field added behind the declaration cannot go unseen. The
+/// declaration belongs to the artifact whose mirror needs it: another module's
+/// registry does not see it.
 #[proc_macro]
 pub fn pill_value_type(input: TokenStream) -> TokenStream {
     let declaration = parse_macro_input!(input as ValueTypeDeclaration);
@@ -1622,13 +1660,13 @@ pub fn pill_value_type(input: TokenStream) -> TokenStream {
 
     // The field walk runs over a synthetic struct, so tags and offsets come
     // from the same code path as the derives. Its name only has to keep the
-    // generated `static` unique - two declarations whose paths end in the
-    // same segment would collide under the raw name - so the full path is
-    // flattened into the identifier.
+    // generated `static` unique: two declarations whose paths end in the same
+    // segment would collide under the raw name, so the full path is flattened
+    // into the identifier.
     let flat_name = flattened_path(&declaration.type_path, "_");
     let synthetic_ident = syn::Ident::new(&flat_name, declaration.type_path.span());
-    let field_names = declaration.fields.iter().map(|field| &field.name);
-    let field_types = declaration.fields.iter().map(|field| &field.ty);
+    let field_names = declaration.fields.iter().map(|field| &field.field_name);
+    let field_types = declaration.fields.iter().map(|field| &field.field_type);
     let synthetic: DeriveInput = syn::parse_quote! {
         struct #synthetic_ident {
             #(#field_names: #field_types,)*
@@ -1643,7 +1681,7 @@ pub fn pill_value_type(input: TokenStream) -> TokenStream {
         &declaration.type_path,
         LayoutSubject::ForeignValue,
     ) {
-        Ok(triple) => triple,
+        Ok(field_descriptor_emissions) => field_descriptor_emissions,
         Err(error) => return error.to_compile_error().into(),
     };
 
@@ -1655,8 +1693,8 @@ pub fn pill_value_type(input: TokenStream) -> TokenStream {
         .fields
         .last()
         .expect("the empty declaration was rejected above");
-    let last_name = &last_field.name;
-    let last_type = &last_field.ty;
+    let last_field_name = &last_field.field_name;
+    let last_field_type = &last_field.field_type;
 
     let expanded = quote! {
         #declared_layout
@@ -1675,8 +1713,8 @@ pub fn pill_value_type(input: TokenStream) -> TokenStream {
         // foreign type gained a field behind the last declared one, managed
         // code would see fewer members than the bytes contain.
         const _: () = assert!(
-            ::core::mem::offset_of!(#type_path, #last_name)
-                + ::core::mem::size_of::<#last_type>()
+            ::core::mem::offset_of!(#type_path, #last_field_name)
+                + ::core::mem::size_of::<#last_field_type>()
                 == ::core::mem::size_of::<#type_path>(),
             "the declared fields must cover the foreign type exactly; declare any missing field"
         );
@@ -1688,17 +1726,20 @@ pub fn pill_value_type(input: TokenStream) -> TokenStream {
 /// One `field: type` entry of a [`pill_value_type!`] declaration.
 struct ValueTypeField {
     /// The field's name, as it appears on the foreign type.
-    name: syn::Ident,
+    field_name: syn::Ident,
     /// The field's type, used for its size, alignment and tag.
-    ty: syn::Type,
+    field_type: syn::Type,
 }
 
 impl syn::parse::Parse for ValueTypeField {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let name = input.parse()?;
+        let field_name = input.parse()?;
         input.parse::<syn::Token![:]>()?;
-        let ty = input.parse()?;
-        Ok(Self { name, ty })
+        let field_type = input.parse()?;
+        Ok(Self {
+            field_name,
+            field_type,
+        })
     }
 }
 
@@ -1729,17 +1770,18 @@ impl syn::parse::Parse for ValueTypeDeclaration {
 
 /// Mirrors selected functions of an inherent `impl` block to C#.
 ///
-/// Every function inside it marked with `#[pill_mirror_method]` becomes a member
-/// of the type's C# mirror: `&self` / `&mut self` methods become instance members
-/// reaching the live value through its address - a component row, a
-/// `#[derive(PillMirror)]` value, a `#[pill_mirror_object]`'s box, or, on a
-/// `#[pill_mirror_resource]`, extension methods on `Res<T>` / `ResMut<T>`; `self`
-/// methods consume an object (a builder's `with_*` and `build`); functions with no
-/// receiver become static members (`Shader::new`).
+/// Every function inside the block that carries `#[pill_mirror_method]` becomes
+/// a member of the type's C# mirror:
+/// - a `&self` or `&mut self` method becomes an instance member that reaches the
+///   live value through its address: a component row, a `#[derive(PillMirror)]`
+///   value, the box of a `#[pill_mirror_object]`, or, on a
+///   `#[pill_mirror_resource]`, an extension method on `Res<T>` / `ResMut<T>`;
+/// - a `self` method consumes an object (a builder's `with_*` and `build`);
+/// - a function with no receiver becomes a static member (`Shader::new`).
 ///
-/// The marker's path may be written fully qualified; only its last segment is
+/// The marker's path may be written fully qualified: only its last segment is
 /// matched. The `impl` block must live in the module that declares the type,
-/// because the qualified name the methods are filed under is derived there.
+/// because the qualified name the methods are filed under is built there.
 ///
 /// ```ignore
 /// #[pill_mirror_object(asset)]
@@ -1754,15 +1796,16 @@ impl syn::parse::Parse for ValueTypeDeclaration {
 /// }
 /// ```
 ///
-/// For every marked function the macro emits, next to the `impl` block, a C-ABI
-/// trampoline of the one shape `pill_engine::mirror` defines and a
-/// [`PillMethodDescriptor`] carrying its address and the tags of its arguments
-/// and result - everything the host's C# codegen reads. Arguments and results may
-/// be primitives, strings, slices and `Vec`s, `impl Into<String>` and
-/// `impl IntoIterator`, `Handle<T>`, `AssetLoader`, `Option<T>`, tuples and arrays
-/// of primitives, and mirrored types themselves by value or by reference. A
-/// `Result<T, E>` with `E: Display` fails the managed call with `E`'s message;
-/// anything else is a compile error naming the parameter.
+/// For every marked function the macro also emits, next to the `impl` block, a
+/// C-ABI trampoline of the one shape `pill_engine::mirror` defines, and a
+/// [`PillMethodDescriptor`] carrying the trampoline's address and the tags of
+/// its arguments and result. That is everything the host's C# codegen reads.
+///
+/// Arguments and results may be primitives, strings, slices and `Vec`s,
+/// `impl Into<String>` and `impl IntoIterator`, `Handle<T>`, `AssetLoader`,
+/// `Option<T>`, tuples, arrays of primitives, and mirrored types by value or by
+/// reference. A `Result<T, E>` with `E: Display` fails the managed call with
+/// `E`'s message; any other type is a compile error that names the parameter.
 ///
 /// [`PillMethodDescriptor`]: ::pill_engine::component_registry::PillMethodDescriptor
 #[proc_macro_attribute]
@@ -1787,19 +1830,19 @@ pub fn pill_mirror_method(_attribute: TokenStream, item: TokenStream) -> TokenSt
 // #[pill_mirror_fn]
 // =============================================================================
 
-/// Mirrors a free function to C#, as a static method on a static class named
-/// after the module declaring it.
+/// Mirrors a free function to C#, as a static method on a static class.
 ///
 /// The free-function counterpart of [`pill_mirror_impl`]:
 /// `pill_dummy_color::get_color_a` becomes
-/// `pill_dummy_color.PillDummyColor.GetColorA()` - the class is the last path
-/// segment PascalCased, in the namespace of the preceding segments. The argument
-/// and result vocabulary is [`pill_mirror_impl`]'s, so a free function may take a
-/// resource (`assets: &mut AssetManager` becomes a `ResMut<AssetManager>`
-/// parameter) as well as plain values.
+/// `pill_dummy_color.PillDummyColor.GetColorA()`. The class is the last path
+/// segment in PascalCase. Its namespace is the preceding segments joined with
+/// dots, or the whole module path when there is no preceding segment. The
+/// arguments and results follow [`pill_mirror_impl`]'s vocabulary: a free
+/// function may take a resource (`assets: &mut AssetManager` becomes a
+/// `ResMut<AssetManager>` parameter) as well as plain values.
 ///
-/// List it before [`pill_hot_fn`]: it then captures the original signature (the
-/// contract C# compiled against) while the body stays hot-patchable, so a patch
+/// List it before [`pill_hot_fn`]. It then records the original signature, the
+/// contract C# compiled against, while the body stays hot-patchable, so a patch
 /// replaces the code a managed call executes.
 ///
 /// ```ignore
@@ -1821,25 +1864,30 @@ pub fn pill_mirror_fn(_attribute: TokenStream, item: TokenStream) -> TokenStream
 // #[pill_mirror_object] / #[pill_mirror_resource]
 // =============================================================================
 
-/// Mirrors a Rust type C# holds by reference: a class wrapping a box the
+/// Mirrors a Rust type that C# holds by reference: a class wrapping a box the
 /// managed side owns.
 ///
-/// Use it for a type that is not plain data - a mesh, a builder, a slot
-/// description with a `String` in it. Functions that return the type hand C# a
-/// new object; functions that take it by value move it out of the C# object,
-/// which is unusable afterwards; `&self`/`&mut self` methods borrow it.
-/// Disposing the C# object (or letting the garbage collector finalize it) drops
+/// Use it for a type that is not plain data: a mesh, a builder, or a slot
+/// description with a `String` in it.
+/// - A function that returns the type hands C# a new object.
+/// - A function that takes it by value moves it out of the C# object, which is
+///   unusable afterwards.
+/// - A `&self` or `&mut self` method borrows it.
+///
+/// Disposing the C# object, or letting the garbage collector finalize it, drops
 /// the Rust value, so the type must be `Send`.
 ///
 /// Flags:
 /// - `asset` - the type is an `Asset`: C# can add it to the world's
 ///   `AssetManager`, remove it and look it up (`assets.AddNamed(name, mesh)`).
-/// - `import` - also an `ImportedAsset`: `assets.Import<Mesh>(path, ...)`.
-/// - `standalone` - also a `StandaloneAsset`: `assets.ImportStandalone<Material>(path)`.
+/// - `import` - the type is also an `ImportedAsset`:
+///   `assets.Import<Mesh>(path, ...)`.
+/// - `standalone` - the type is also a `StandaloneAsset`, and this flag sets
+///   `asset` too: `assets.ImportStandalone<Material>(path)`.
 #[proc_macro_attribute]
 pub fn pill_mirror_object(attribute: TokenStream, item: TokenStream) -> TokenStream {
-    let item = parse_macro_input!(item as syn::Item);
-    mirror::mirror_object(attribute.into(), item)
+    let annotated_item = parse_macro_input!(item as syn::Item);
+    mirror::mirror_object(attribute.into(), annotated_item)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -1848,15 +1896,18 @@ pub fn pill_mirror_object(attribute: TokenStream, item: TokenStream) -> TokenStr
 ///
 /// `#[pill_mirror_resource("my_crate::MyResource")]` implements `Resource`
 /// with that shared name and declares the type, so C# names it as a marker
-/// type: systems take `Res<T>` / `ResMut<T>` (the scheduler orders them
-/// against every Rust user of the resource), its `#[pill_mirror_impl]`
-/// methods become extension methods on those parameters, and mirrored
-/// functions can take it as `&T` / `&mut T`. The resource's bytes are never
-/// exposed to C#.
+/// type:
+/// - systems take `Res<T>` or `ResMut<T>`, and the scheduler orders them
+///   against every Rust user of the resource;
+/// - its `#[pill_mirror_impl]` methods become extension methods on those
+///   parameters;
+/// - mirrored functions can take it as `&T` or `&mut T`.
+///
+/// The resource's bytes are never exposed to C#.
 #[proc_macro_attribute]
 pub fn pill_mirror_resource(attribute: TokenStream, item: TokenStream) -> TokenStream {
-    let item = parse_macro_input!(item as syn::Item);
-    mirror::mirror_resource(attribute.into(), item)
+    let annotated_item = parse_macro_input!(item as syn::Item);
+    mirror::mirror_resource(attribute.into(), annotated_item)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -1866,11 +1917,12 @@ pub fn pill_mirror_resource(attribute: TokenStream, item: TokenStream) -> TokenS
 // =============================================================================
 
 /// Marks a system function as hot-patchable, so the host can replace its
-/// implementation without re-registering it.
+/// implementation without registering it again.
 ///
-/// The function itself is emitted unchanged; the macro only adds a descriptor
-/// carrying its fully-qualified path, its dispatch address and its signature
-/// identity, submitted into this artifact's compile-time registry.
+/// The function itself is emitted unchanged. The macro only adds a descriptor
+/// that carries the function's fully-qualified path, its dispatch address and
+/// its signature identity, and submits it into this artifact's compile-time
+/// registry.
 ///
 /// ```ignore
 /// #[pill_hot]
@@ -1881,26 +1933,26 @@ pub fn pill_mirror_resource(attribute: TokenStream, item: TokenStream) -> TokenS
 /// }
 /// ```
 ///
-/// The name the host patches by is `module_path!() + "::" + fn name`, matching
-/// how `PillComponent` derives its type name. The address and signature are
-/// resolved through the function value, not its syntax: a function-item type
+/// The host patches by `module_path!() + "::" + fn name`, the same shape
+/// `PillComponent` uses for its type name. The address and the signature come
+/// from the function value, not from its syntax: a function-item type
 /// satisfies exactly one arity of `SystemParamFunction`, so the parameter tuple
 /// is inferred instead of being rebuilt from tokens.
 ///
-/// `#[pill_hot(name = "project::movement_system")]` overrides the derived name. A
-/// generated patch library is its own crate, so `module_path!()` there would
-/// report the patch's name rather than the original's; the host passes the name
-/// it is patching so the two agree.
+/// `#[pill_hot(name = "project::movement_system")]` overrides the derived name.
+/// A generated patch library is its own crate, so `module_path!()` there would
+/// report the patch's name instead of the original's. The host therefore passes
+/// the name it is patching, so the two agree.
 #[proc_macro_attribute]
 pub fn pill_hot(attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
     let fn_ident = &item_fn.sig.ident;
 
-    // Parse the optional `name = "..."` override.
+    // Step 1: Parse the optional `name = "..."` override.
     let mut name_override: Option<String> = None;
     if !attribute.is_empty() {
-        let parsed = syn::parse::<syn::MetaNameValue>(attribute);
-        match parsed {
+        let name_override_parse = syn::parse::<syn::MetaNameValue>(attribute);
+        match name_override_parse {
             Ok(meta) if meta.path.is_ident("name") => match &meta.value {
                 syn::Expr::Lit(syn::ExprLit {
                     lit: syn::Lit::Str(literal),
@@ -1927,7 +1979,7 @@ pub fn pill_hot(attribute: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // Generic systems are not supported: the engine patches one concrete
+    // Step 2: Reject a generic system: the engine patches one concrete
     // monomorphization, so a generic function has no single address to swap.
     if !item_fn.sig.generics.params.is_empty() {
         return syn::Error::new_spanned(
@@ -1940,6 +1992,8 @@ pub fn pill_hot(attribute: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
+    // Step 3: Emit the function unchanged, next to a descriptor that names its
+    // dispatch address and signature identity.
     let descriptor_fn = format_ident!("__pill_hot_descriptor_{}", fn_ident);
     let qualified_name = match &name_override {
         Some(name) => quote! { #name },
@@ -1971,18 +2025,19 @@ pub fn pill_hot(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
     expanded.into()
 }
-/// Arguments `#[pill_hot_fn]` accepts when it is generating a patch body.
+/// Arguments `#[pill_hot_fn]` accepts when it generates a patch body.
 ///
 /// A patch for an inherent method cannot copy the method into a free function,
-/// because the body names `self`. It is instead placed in a LOCAL trait
-/// implemented for the receiver type: a trait method has the same call shape as
-/// the inherent one it replaces, so its address drops straight into the slot.
+/// because the body names `self`. The body is placed in a local trait
+/// implemented for the receiver type instead. A trait method has the same call
+/// shape as the inherent method it replaces, so its address can go straight
+/// into the slot.
 ///
-/// The host supplies both values; a developer never writes them.
+/// The host supplies both values. A developer never writes them.
 #[derive(Default)]
 struct PatchArguments {
     /// Registry name the generated descriptor is filed under.
-    name: Option<String>,
+    registry_name: Option<String>,
     /// Concrete receiver type the local trait is implemented for.
     self_type: Option<syn::Type>,
 }
@@ -1992,33 +2047,33 @@ struct PatchArguments {
 /// An empty list is the ordinary case: the attribute is being applied by a
 /// developer to their own function or method.
 fn parse_patch_arguments(attribute: TokenStream) -> Result<PatchArguments, syn::Error> {
-    let mut parsed = PatchArguments::default();
+    let mut patch_arguments = PatchArguments::default();
     if attribute.is_empty() {
-        return Ok(parsed);
+        return Ok(patch_arguments);
     }
     let attribute = proc_macro2::TokenStream::from(attribute);
     let parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("name") {
-            let value: syn::LitStr = meta.value()?.parse()?;
-            parsed.name = Some(value.value());
+            let name_literal: syn::LitStr = meta.value()?.parse()?;
+            patch_arguments.registry_name = Some(name_literal.value());
             return Ok(());
         }
         if meta.path.is_ident("self_type") {
-            parsed.self_type = Some(meta.value()?.parse()?);
+            patch_arguments.self_type = Some(meta.value()?.parse()?);
             return Ok(());
         }
         Err(meta.error("expected `name` or `self_type`"))
     });
     syn::parse::Parser::parse2(parser, attribute)?;
-    Ok(parsed)
+    Ok(patch_arguments)
 }
 
 /// Makes an ordinary function hot-patchable.
 ///
-/// Use this for a plain `pub fn`; use `#[pill_hot]` for an ECS system. The two
-/// differ because a system already has an indirection - the engine holds its boxed
-/// closure and can swap what it calls - while an ordinary function is called
-/// directly, so the indirection has to live inside the function itself.
+/// Use this for a plain `pub fn`, and `#[pill_hot]` for an ECS system. A system
+/// already has an indirection: the engine holds its boxed closure and can swap
+/// what it calls. An ordinary function is called directly, so the indirection
+/// has to live inside the function itself.
 ///
 /// ```ignore
 /// #[pill_hot_fn]
@@ -2027,11 +2082,11 @@ fn parse_patch_arguments(attribute: TokenStream) -> Result<PatchArguments, syn::
 /// }
 /// ```
 ///
-/// The real body is renamed and the public name becomes a dispatcher that reads
-/// a slot, so every caller - including ones in other crates that linked this one
-/// statically - goes through the redirect.
+/// The real body is renamed, and the public name becomes a dispatcher that
+/// reads a slot. Every caller then goes through the redirect, including callers
+/// in other crates that linked this one statically.
 ///
-/// An inherent method takes a different shape: its body cannot be renamed
+/// An inherent method takes a different shape. Its body cannot be renamed
 /// because it uses `self`, so it is emitted in place and the dispatcher sits in
 /// front of it. A method parameter must therefore be a plain binding, because
 /// that is the name the dispatcher forwards by.
@@ -2044,8 +2099,9 @@ fn parse_patch_arguments(attribute: TokenStream) -> Result<PatchArguments, syn::
 /// The host installs into every loaded artifact that declares the name.
 #[proc_macro_attribute]
 pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
-    let patch = match parse_patch_arguments(attribute) {
-        Ok(parsed) => parsed,
+    // Step 1: Read the arguments the host passes when it generates a patch.
+    let patch_arguments = match parse_patch_arguments(attribute) {
+        Ok(parsed_arguments) => parsed_arguments,
         Err(error) => return error.to_compile_error().into(),
     };
     let item_fn = parse_macro_input!(item as ItemFn);
@@ -2055,8 +2111,8 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
     let attributes = &item_fn.attrs;
     let body = &item_fn.block;
 
-    // A generic function has one instantiation per set of type arguments, so
-    // there is no single address a slot could hold.
+    // Step 2: Reject a generic function. It has one instantiation per set of
+    // type arguments, so there is no single address a slot could hold.
     if !signature.generics.params.is_empty() {
         return syn::Error::new_spanned(
             &signature.generics,
@@ -2077,11 +2133,12 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
     // hoisted body would have to name the receiver type.
     let receiver = signature.receiver().cloned();
 
-    // Build the argument list. A free function's body is hoisted under its
-    // original signature, so its dispatcher may rename every parameter and
-    // forward the renamed values. A method keeps its body inline and forwards
-    // through the names that body uses, so its declaration keeps each pattern
-    // exactly as written and the forwarded name is the one the pattern binds.
+    // Step 3: Build the parameter lists. A free function's body is hoisted
+    // under its original signature, so its dispatcher may rename every
+    // parameter and forward the renamed values. A method keeps its body inline
+    // and forwards through the names that body uses. Its declaration therefore
+    // keeps each pattern exactly as written, and the forwarded name is the one
+    // the pattern binds.
     let mut parameter_names = Vec::new();
     let mut parameter_declarations = Vec::new();
     let mut parameter_declaration_shapes = Vec::new();
@@ -2115,21 +2172,22 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
             parameter_declarations.push(quote! { #typed });
             parameter_declaration_shapes.push(quote! { #identifier: #argument_type });
         } else {
-            let name = format_ident!("argument_{index}");
-            parameter_names.push(quote! { #name });
-            parameter_declarations.push(quote! { #name: #argument_type });
+            let argument_name = format_ident!("argument_{index}");
+            parameter_names.push(quote! { #argument_name });
+            parameter_declarations.push(quote! { #argument_name: #argument_type });
         }
     }
 
     let return_type = &signature.output;
     let slot_ident = format_ident!("__PILL_HOT_SLOT_{}", fn_ident.to_string().to_uppercase());
 
-    // The name a host addresses this function by. The receiver type is
-    // deliberately absent: a method-level attribute cannot learn it, because
+    // Step 4: Build the name, the signature text and the call shapes that this
+    // function and a generated patch share. The receiver type is deliberately
+    // absent from the name: a method-level attribute cannot learn it, because
     // the descriptor is an item and items may not name `Self`. Two hot
     // functions sharing a name in one module therefore collide, which the
     // host source scanner detects and refuses with a clear message.
-    let qualified_name = match &patch.name {
+    let qualified_name = match &patch_arguments.registry_name {
         // A generated patch is filed under the name the host asks for, which is
         // the running function's own path behind a prefix that cannot collide
         // with the copy the linked rlib also contributes.
@@ -2167,7 +2225,7 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
         Some(_) => quote! { self #(, #parameter_names)* },
         None => quote! { #(#parameter_names),* },
     };
-    let declarations = match &receiver {
+    let implementation_declarations = match &receiver {
         Some(receiver) => quote! { #receiver #(, #parameter_declarations)* },
         None => quote! { #(#parameter_declarations),* },
     };
@@ -2182,18 +2240,18 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { #(#parameter_declarations),* },
     };
 
-    // A generated patch for an inherent method. The body names `self`, so it
-    // cannot be copied into a free function - but a LOCAL trait may be
-    // implemented for a foreign type, and a trait method has the same call
-    // shape as the inherent one it replaces: the receiver is simply its first
-    // argument. So the body is carried verbatim into a trait implementation for
-    // the concrete receiver type, and that method's address drops straight into
+    // Step 5: A generated patch for an inherent method. The body names `self`,
+    // so it cannot be copied into a free function. A local trait may be
+    // implemented for a foreign type, though, and a trait method has the same
+    // call shape as the inherent method it replaces: the receiver is simply its
+    // first argument. So the body goes verbatim into a trait implementation for
+    // the concrete receiver type. That method's address then goes straight into
     // the running artifact's slot.
     //
     // No dispatcher is generated: nothing ever calls a patch through a slot of
     // its own. The signature text comes from the same computation the running
     // artifact used, which is what keeps the two comparable.
-    if let Some(self_type) = &patch.self_type {
+    if let Some(self_type) = &patch_arguments.self_type {
         if receiver.is_none() {
             return syn::Error::new_spanned(
                 signature,
@@ -2212,7 +2270,7 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
             impl PillHotMethodPatch for #self_type {
                 #[inline(never)]
-                fn #fn_ident(#declarations) #return_type #body
+                fn #fn_ident(#implementation_declarations) #return_type #body
             }
 
             /// Address of the replacement, reported through the descriptor.
@@ -2290,7 +2348,7 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
         #implementation_item
 
         #(#attributes)*
-        #visibility fn #fn_ident(#declarations) #return_type {
+        #visibility fn #fn_ident(#implementation_declarations) #return_type {
             #[cfg(debug_assertions)]
             {
                 /// Redirect slot for this function, private to this artifact.
@@ -2330,11 +2388,11 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Emits the hot-patch resolver export on its own.
 ///
-/// `#[pill_project]` and `#[pill_module]` already include it; this exists for an
-/// artifact that carries hot functions but neither entry point - in particular
-/// the patch libraries the host generates.
+/// `#[pill_project]` and `#[pill_module]` already include it. This macro exists
+/// for an artifact that carries hot functions but has neither entry point, in
+/// particular the patch libraries the host generates.
 ///
-/// Takes an optional export name, defaulting to `pill_hot_resolve`:
+/// Takes an optional export name, which defaults to `pill_hot_resolve`:
 ///
 /// ```ignore
 /// pill_engine::pill_hot_resolver!();                    // pill_hot_resolve
@@ -2343,8 +2401,8 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// A generated patch **must** pass a different name. It links the project's
 /// rlib to reach that crate's types and helpers, and that rlib already exports
-/// `pill_hot_resolve`; two `#[no_mangle]` definitions of one symbol in a single
-/// artifact is a linker error.
+/// `pill_hot_resolve`. Two `#[no_mangle]` definitions of one symbol in a single
+/// artifact are a linker error.
 #[proc_macro]
 pub fn pill_hot_resolver(item: TokenStream) -> TokenStream {
     let export_name = if item.is_empty() {
@@ -2360,9 +2418,9 @@ pub fn pill_hot_resolver(item: TokenStream) -> TokenStream {
 
 /// The exported resolver every loadable artifact provides.
 ///
-/// One export rather than one per hot function, for the same reason the module
-/// ABI keeps its surface small: a Windows DLL cannot exceed 65535 exports, and
-/// a name-keyed lookup costs nothing at reload time.
+/// There is one export rather than one per hot function. The module ABI keeps
+/// its export list small for the same reason: a Windows DLL cannot exceed 65535
+/// exports. A lookup by name is cheap at reload time.
 fn hot_patch_resolver_export(
     export_name: &proc_macro2::Ident,
     gate: &proc_macro2::TokenStream,
@@ -2599,17 +2657,21 @@ fn hot_patch_resolver_export(
     }
 }
 
-/// Emit the `pill_module_init` entry point every loadable artifact exports.
+// =============================================================================
+// Loadable-artifact entry points
+// =============================================================================
+
+/// Emits the `pill_module_init` entry point every loadable artifact exports.
 ///
-/// One body for both attributes. A project and an extension are the same DLL
-/// contract: they export the same symbols, are loaded the same way, reload
-/// through the same transaction and retire into the same graveyard, so the entry
-/// point is written once here and each attribute supplies only the `#[cfg]` gate
-/// its artifact needs.
+/// One body serves both attributes. A project and an extension share one DLL
+/// contract. They export the same symbols, are loaded the same way, reload
+/// through the same transaction, and keep their retired images the same way.
+/// So the entry point is written once here, and the caller decides which
+/// `#[cfg]` gate, if any, wraps it.
 ///
 /// `gate` is empty in both emissions: a project is always built as its own
-/// artifact, and a module's entry points are emitted by the wrapper macro (where
-/// `init_fn` is the path `$crate::register`).
+/// artifact, and a module's entry points are emitted by the wrapper macro, where
+/// `init_fn` is the path `$crate::` plus the annotated function's name.
 fn module_init_export(
     gate: &proc_macro2::TokenStream,
     init_fn: &proc_macro2::TokenStream,
@@ -2623,7 +2685,7 @@ fn module_init_export(
 fn module_init_export_with(
     gate: &proc_macro2::TokenStream,
     init_fn: &proc_macro2::TokenStream,
-    run: &proc_macro2::TokenStream,
+    registration_runner: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     quote! {
         /// Registers this artifact against the host engine; returns zero on
@@ -2654,7 +2716,7 @@ fn module_init_export_with(
                 // value types installed for the whole entry point, so a
                 // `struct:`-tagged field expands into editable rows even when
                 // the artifact registers components itself.
-                ::pill_engine::component_registry::#run(engine, #init_fn)
+                ::pill_engine::component_registry::#registration_runner(engine, #init_fn)
             }));
             result.unwrap_or(u32::MAX)
         }
@@ -2688,19 +2750,20 @@ fn module_abi_version_export(gate: &proc_macro2::TokenStream) -> proc_macro2::To
 /// C-ABI exports. The annotated function must have the signature
 /// `fn(engine: &mut Engine) -> u32`.
 ///
-/// Before calling it the macro auto-registers every component declared with
-/// `#[derive(PillComponent)]` in this artifact. It also derives the module name
-/// from `CARGO_PKG_NAME` (null-terminated), reads the ABI version from
-/// `::pill_engine::module_abi::MODULE_ABI_VERSION` so module and host can never
-/// drift, and wraps the whole init in `catch_unwind`, so a panic becomes a
-/// non-zero status and the host rolls back instead of unwinding across the C ABI.
+/// Before calling it, the macro registers every component that
+/// `#[derive(PillComponent)]` declared in this artifact. It also derives the
+/// module name from `CARGO_PKG_NAME`, null-terminated, and reads the ABI
+/// version from `::pill_engine::module_abi::MODULE_ABI_VERSION`, so module and
+/// host cannot drift apart. The whole init runs inside `catch_unwind`, so a
+/// panic becomes a non-zero status and the host rolls back instead of unwinding
+/// across the C ABI.
 ///
 /// The `#[no_mangle]` exports come from `__pill_module_entry_points!`, the macro
-/// this attribute emits: the loadable artifact is the generated
-/// `host_module_<name>` wrapper crate, which compiles this one as a plain library
+/// this attribute emits. The loadable artifact is the generated
+/// `host_module_<name>` wrapper crate. It compiles this crate as a plain library
 /// and expands the macro, so a crate linked into several artifacts never defines
-/// a symbol more than once. The wrapped function itself is always compiled, since
-/// a statically linked build calls it directly.
+/// a symbol more than once. The wrapped function itself is always compiled,
+/// because a statically linked build calls it directly.
 #[proc_macro_attribute]
 pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
@@ -2888,15 +2951,16 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
 /// `project_schema_fingerprint`.
 ///
 /// The annotated function must have the signature
-/// `fn(engine: &mut Engine) -> u32`. The macro auto-registers every component
-/// declared with `#[derive(PillComponent)]` in this artifact before calling the
-/// wrapped function, and generates the schema fingerprint from the same registry,
-/// so adding a component cannot leave the fingerprint stale.
+/// `fn(engine: &mut Engine) -> u32`. Before calling it, the macro registers
+/// every component that `#[derive(PillComponent)]` declared in this artifact.
+/// It also generates the schema fingerprint from the same registry, so adding a
+/// component cannot leave the fingerprint stale.
 ///
-/// The entry points are [`pill_module`]'s, because a project and an extension are
-/// one DLL contract loaded and reloaded the same way. What is project-specific is
-/// the schema fingerprint and the ungated exports: a project is always built as
-/// its own artifact, so there is no second definition to collide with.
+/// The entry points are [`pill_module`]'s, because a project and an extension
+/// follow one DLL contract and are loaded and reloaded the same way. Two things
+/// are project-specific: the schema fingerprint, and the exports that carry no
+/// `#[cfg]` gate. A project is always built as its own artifact, so there is no
+/// second definition to collide with.
 #[proc_macro_attribute]
 pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
@@ -2938,6 +3002,10 @@ pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod decorator_vocabulary_tests {
     use super::*;
@@ -2945,9 +3013,9 @@ mod decorator_vocabulary_tests {
     /// Every decorator the vocabulary lists is one the parser accepts, and the
     /// refusal text names every listed one.
     ///
-    /// The vocabulary is the single source for both lists, so a decorator
-    /// cannot be accepted without being offered, and a listed one cannot be
-    /// refused.
+    /// Both checks read the one vocabulary list. So the test fails when the
+    /// parser stops accepting a listed decorator, and when the refusal text
+    /// stops naming one.
     #[test]
     fn the_refusal_text_lists_exactly_the_accepted_decorators() {
         for (key, usage) in FIELD_DECORATOR_USAGE {

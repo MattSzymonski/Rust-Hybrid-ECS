@@ -1,26 +1,30 @@
-//! The OS clipboard bridge.
+//! Writes the editor's payload to the OS clipboard and reads text back from it.
 //!
 //! # Responsibilities
 //!
-//! - [`write`]: put one payload text on the clipboard under the editor's
-//!   registered format and as plain text, so another editor instance (or a
-//!   text editor) can read it.
-//! - [`read`]: the text the clipboard carries, preferring the editor's
-//!   payload format and falling back to plain text.
+//! - [`write`]: put text on the clipboard twice, once in the editor's own
+//!   clipboard format and once as plain text, so another editor instance or a
+//!   text editor can read it.
+//! - [`read`]: return the text the clipboard carries, preferring the editor's
+//!   own format and falling back to plain text.
 //!
 //! # Design
 //!
-//! The Win32 half lives here because only this executable names the `windows`
-//! crate: a shared dylib must never carry its large `raw-dylib` import set.
-//! The shell queues a `ClipboardRequest` on its `EditorClipboard` resource and
-//! the runner carries it out here at the frame boundary, so no OS clipboard
-//! handle crosses the reload boundary. Both sides close the clipboard on every
-//! path, because an open clipboard blocks every other process.
+//! The Win32 code lives here because only this executable names the `windows`
+//! crate. A shared dylib must never carry that crate's large `raw-dylib` import
+//! set. The shell does not touch the OS clipboard. It queues a
+//! `ClipboardRequest` on its `EditorClipboard` resource, and the runner carries
+//! the request out here at the frame boundary. That way no OS clipboard handle
+//! crosses the reload boundary.
 //!
-//! A read is bounded by the block the clipboard reports (`GlobalSize`), never
-//! by the producer's terminator: any process can set the registered format,
-//! and a block with no NUL inside its own size is refused with a log line
-//! rather than walked past into this process's heap.
+//! The write path and the read path both close the clipboard on every path,
+//! because a clipboard left open blocks every other process.
+//!
+//! A read is bounded by the size the clipboard reports for the block
+//! (`GlobalSize`), never by the terminator the producer was supposed to write.
+//! Any process can set the registered format. A block with no NUL inside its own
+//! size is therefore refused and logged, instead of being read past its end into
+//! this process's heap.
 
 // External crates
 use pill_core::telemetry::telemetry_target;
@@ -39,66 +43,102 @@ use windows::Win32::System::Threading::GetCurrentProcessId;
 // Current crate
 use pill_editor_core::clipboard::FORMAT_NAME;
 
-/// `CF_UNICODETEXT`: the plain-text format the readable copy uses.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// `CF_UNICODETEXT`: the plain-text clipboard format that any application can
+/// read.
 const CF_UNICODETEXT: u32 = 13;
 
-/// The clipboard format id the editor's payloads are registered under.
+/// How many attempts a read makes to open a busy clipboard before it reports
+/// failure.
+const READ_ATTEMPTS: usize = 10;
+
+/// The pause between clipboard read attempts.
+const READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns the clipboard format id the editor registers its copied text under.
 ///
-/// Registering is idempotent per name, so every call returns the same id for
-/// the life of the process and nothing needs caching.
-fn payload_format() -> Option<u32> {
+/// Registering the name is idempotent, so every call returns the same id for
+/// the life of the process and nothing needs caching. `None` means Windows
+/// refused the name.
+fn payload_format_id() -> Option<u32> {
     let name: Vec<u16> = FORMAT_NAME
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
     // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives the call,
     // which is what `RegisterClipboardFormatW` requires. A zero return means
-    // the format could not be registered, reported as `None` by the caller.
+    // Windows refused the name, reported here as `None`.
     let id = unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) };
     (id != 0).then_some(id)
 }
 
-/// Put `text` on the clipboard, under the editor's format and as plain text.
+/// Puts `text` on the clipboard, in the editor's own format and as plain text.
 ///
-/// Returns an error naming the failed step; once the clipboard is open it is
-/// emptied before the first allocation, so a later failure leaves it empty
-/// rather than holding what it held before.
+/// Once the clipboard is open it is emptied before the first allocation, so a
+/// later failure leaves it empty rather than holding what it held before.
+///
+/// # Errors
+///
+/// Returns a message naming the step that failed: registering the editor's
+/// format, opening the clipboard, emptying it, allocating the clipboard block,
+/// or handing that block to the clipboard.
 pub fn write(text: &str) -> Result<(), String> {
-    let format = payload_format().ok_or_else(|| "the payload format was refused".to_string())?;
-    let owner = HWND::default();
-    // SAFETY: `owner` is a null handle, which asks the API to associate the
-    // clipboard with the calling process - the documented form for a window
-    // that does not own the data.
-    unsafe { OpenClipboard(owner) }.map_err(|error| format!("open clipboard: {error}"))?;
-    let outcome = write_open(text, format);
+    // Step 1: find the editor's own clipboard format and open the clipboard
+    // for this process.
+    let format = payload_format_id().ok_or_else(|| "the payload format was refused".to_string())?;
+    let owner_window = HWND::default();
+    // SAFETY: `owner_window` is a null handle, which the API documents as
+    // associating the clipboard with the calling process rather than a window.
+    unsafe { OpenClipboard(owner_window) }.map_err(|error| format!("open clipboard: {error}"))?;
+    // Step 2: write both copies while it is open, then close it whatever the
+    // write did.
+    let write_open_result = write_open(text, format);
     // SAFETY: the clipboard is open exactly once here, after the write path
     // above opened it; closing it is unconditional so a failure above cannot
     // leave it locked.
     let _ = unsafe { CloseClipboard() };
-    outcome
+    write_open_result
 }
 
 /// The write path with the clipboard already open.
+///
+/// # Errors
+///
+/// Returns a message naming the failed step: emptying the clipboard, or one of
+/// the two copies [`set_one`] makes.
 fn write_open(text: &str, format: u32) -> Result<(), String> {
     // SAFETY: the clipboard is open (the caller holds it), which is the
     // documented precondition for emptying it.
     unsafe { EmptyClipboard() }.map_err(|error| format!("empty clipboard: {error}"))?;
-    // The registered format first: a reader that understands it gets the
-    // structured payload, one that does not falls back to the plain text below.
+    // The registered format goes first, so a reader that understands it gets
+    // the editor's payload. A reader that does not falls back to the plain text
+    // written below.
     set_one(text, format)?;
     set_one(text, CF_UNICODETEXT)?;
     Ok(())
 }
 
-/// Put one UTF-16 copy of `text` on the clipboard under `format`.
+/// Puts one UTF-16 copy of `text` on the clipboard under `format`.
 ///
 /// The memory is allocated with `GMEM_MOVEABLE` and handed to the clipboard,
-/// which takes ownership on success; a failed `SetClipboardData` leaves the
-/// block ours, and it is freed with `GlobalFree`.
+/// which takes ownership on success. A failed `SetClipboardData` leaves the
+/// block with this function, which frees it with `GlobalFree`.
+///
+/// # Errors
+///
+/// Returns a message when the block cannot be allocated, when it cannot be
+/// locked, or when the clipboard refuses it.
 fn set_one(text: &str, format: u32) -> Result<(), String> {
-    let mut wide: Vec<u16> = text.encode_utf16().collect();
-    wide.push(0);
-    let bytes = wide.len() * std::mem::size_of::<u16>();
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units.push(0);
+    let bytes = units.len() * std::mem::size_of::<u16>();
     // SAFETY: `GMEM_MOVEABLE` with a byte count is the documented allocation
     // for clipboard data; a null return means the allocation failed.
     let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) }
@@ -113,8 +153,8 @@ fn set_one(text: &str, format: u32) -> Result<(), String> {
         return Err("clipboard allocation could not be locked".to_string());
     }
     // SAFETY: the destination is the locked allocation, `bytes` long, and the
-    // source is `wide`'s live buffer of exactly that size.
-    unsafe { std::ptr::copy_nonoverlapping(wide.as_ptr(), target.cast::<u16>(), wide.len()) };
+    // source is `units`, a live buffer of exactly that size.
+    unsafe { std::ptr::copy_nonoverlapping(units.as_ptr(), target.cast::<u16>(), units.len()) };
     // SAFETY: the lock was taken above on this handle and is released once.
     let _ = unsafe { GlobalUnlock(HGLOBAL(handle.0)) };
     // SAFETY: the clipboard is open (the caller holds it); on success it takes
@@ -130,54 +170,66 @@ fn set_one(text: &str, format: u32) -> Result<(), String> {
     }
 }
 
-/// The text the clipboard carries, preferring the editor's payload format.
+/// Returns the text the clipboard carries, preferring the editor's own format.
 ///
-/// `Ok(None)` means the clipboard held nothing usable; the runner reports it
-/// as an empty paste.
+/// `Ok(None)` means the clipboard held nothing usable; the runner then shows an
+/// empty-clipboard notice instead of pasting.
 ///
-/// The clipboard is a process-global lock, so `OpenClipboard` can fail simply
-/// because another application held it at that moment: the attempt is retried
-/// a few times before the failure is reported, and a clipboard that never
-/// frees is an error rather than an empty paste.
+/// The clipboard is a lock shared by every process, so `OpenClipboard` can
+/// fail simply because another application holds it at that moment. The
+/// attempt is retried up to `READ_ATTEMPTS` times, `READ_RETRY_DELAY` apart,
+/// and a clipboard that never frees is an error rather than an empty paste.
+///
+/// # Errors
+///
+/// Returns the message from the last failed attempt when the clipboard cannot
+/// be opened within the retries.
 pub fn read() -> Result<Option<String>, String> {
-    let owner = HWND::default();
-    let mut last = String::new();
+    // Step 1: try to open the clipboard, pausing a little between attempts.
+    let owner_window = HWND::default();
+    let mut last_error = String::new();
     for attempt in 0..READ_ATTEMPTS {
-        // SAFETY: `owner` is a null handle, the documented form for reading the
-        // clipboard from a process without a window that owns the data.
-        match unsafe { OpenClipboard(owner) } {
+        // SAFETY: `owner_window` is a null handle, the documented form for
+        // reading the clipboard from a process without a window that owns the
+        // data.
+        match unsafe { OpenClipboard(owner_window) } {
             Ok(()) => {
-                let outcome = read_open();
+                // Step 2: read while it is open, then close it on every path.
+                let read_open_result = read_open();
                 // SAFETY: the clipboard is open exactly once here and is closed
                 // unconditionally, so a read failure cannot leave it locked.
                 let _ = unsafe { CloseClipboard() };
-                return outcome;
+                return read_open_result;
             }
             Err(error) => {
-                last = format!("open clipboard: {error}");
+                last_error = format!("open clipboard: {error}");
                 if attempt + 1 < READ_ATTEMPTS {
                     std::thread::sleep(READ_RETRY_DELAY);
                 }
             }
         }
     }
-    Err(last)
+    Err(last_error)
 }
 
-/// How many times a busy clipboard is retried before the read reports failure.
-const READ_ATTEMPTS: usize = 10;
-
-/// The pause between clipboard read attempts.
-const READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
-
 /// The read path with the clipboard already open.
+///
+/// The formats are tried in order: the editor's own format first, then plain
+/// text. A format that is unavailable, a block that cannot be locked and a
+/// block with no terminator all move on to the next format. The result is the
+/// first text that could be read, or `None`.
+///
+/// # Errors
+///
+/// No branch returns an error: the signature carries the type [`read`] passes
+/// on, but every failure here ends in `Ok`.
 fn read_open() -> Result<Option<String>, String> {
-    let mut formats = Vec::new();
-    if let Some(format) = payload_format() {
-        formats.push(format);
+    let mut format_ids = Vec::new();
+    if let Some(format) = payload_format_id() {
+        format_ids.push(format);
     }
-    formats.push(CF_UNICODETEXT);
-    for format in formats {
+    format_ids.push(CF_UNICODETEXT);
+    for format in format_ids {
         // SAFETY: the clipboard is open (the caller holds it); the query only
         // reads the format list.
         if unsafe { IsClipboardFormatAvailable(format) }.is_err() {
@@ -195,28 +247,30 @@ fn read_open() -> Result<Option<String>, String> {
         // SAFETY: `handle` is the clipboard's data block for an available
         // format; it stays valid until the clipboard changes, and it is not
         // freed here - the clipboard owns it.
-        let pointer = unsafe { GlobalLock(HGLOBAL(handle.0)) }.cast::<u16>();
-        if pointer.is_null() {
+        let block_pointer = unsafe { GlobalLock(HGLOBAL(handle.0)) }.cast::<u16>();
+        if block_pointer.is_null() {
             continue;
         }
-        // The block's own size is the only bound the read can trust: the
-        // terminator is a convention of the producer, not a property of the
-        // block, so a foreign block with no NUL in it must not walk the read
-        // out of the allocation.
+        // Read only as far as the block's own size allows. The terminator is
+        // something the producer is supposed to write, not a property the block
+        // guarantees. Any process can set the registered format, so a block with
+        // no NUL inside its size must not be followed out of the allocation.
         // SAFETY: `handle` is the clipboard's data block; the query only reads
         // the allocation's size, and neither frees nor unlocks it.
         let bytes = unsafe { GlobalSize(HGLOBAL(handle.0)) };
-        let capacity = bytes / std::mem::size_of::<u16>();
-        let mut length = 0usize;
-        // SAFETY: `pointer` addresses the locked block of `capacity` UTF-16
-        // units, so every index below `capacity` is inside the allocation.
-        while length < capacity && unsafe { *pointer.add(length) } != 0 {
-            length += 1;
+        let unit_capacity = bytes / std::mem::size_of::<u16>();
+        let mut unit_count = 0usize;
+        // SAFETY: `block_pointer` addresses the locked block of `unit_capacity`
+        // UTF-16 units, so every index below `unit_capacity` is inside the
+        // allocation.
+        while unit_count < unit_capacity && unsafe { *block_pointer.add(unit_count) } != 0 {
+            unit_count += 1;
         }
-        let unterminated = length == capacity;
-        // SAFETY: `pointer` is the locked block and `length` counts the UTF-16
-        // units before its terminator, so the slice stays inside the block.
-        let slice = unsafe { std::slice::from_raw_parts(pointer, length) };
+        let unterminated = unit_count == unit_capacity;
+        // SAFETY: `block_pointer` is the locked block and `unit_count` counts
+        // the UTF-16 units before its terminator, so the slice stays inside the
+        // block.
+        let slice = unsafe { std::slice::from_raw_parts(block_pointer, unit_count) };
         let text = String::from_utf16_lossy(slice);
         // SAFETY: the lock was taken above on this handle and is released once.
         let _ = unsafe { GlobalUnlock(HGLOBAL(handle.0)) };
@@ -235,33 +289,41 @@ fn read_open() -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// The clipboard owner tag the logs name, so a suite can tell which process
-/// wrote what it read.
+/// Returns the id of this process, which the clipboard log lines carry.
+///
+/// The write and paste lines name it as `writer =` and `reader =`, so a test
+/// that runs more than one editor can tell which process did each step.
 pub fn process_id() -> u32 {
     // SAFETY: `GetCurrentProcessId` takes no arguments and cannot fail.
     unsafe { GetCurrentProcessId() }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The clipboard is one process-wide resource, so the tests below take
-    /// turns: an `OpenClipboard` on one thread is closed by a `CloseClipboard`
-    /// on another.
+    /// The clipboard is one resource for the whole process, so the tests below
+    /// take turns. A `CloseClipboard` on one thread ends an `OpenClipboard` that
+    /// another thread made.
     static CLIPBOARD_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Serialise one test's use of the clipboard for its whole body.
+    /// Waits until no other test is using the clipboard, and keeps it until the
+    /// returned guard drops.
     fn clipboard_turn() -> std::sync::MutexGuard<'static, ()> {
         CLIPBOARD_TURN
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Put `units` UTF-16 `A`s on the clipboard under the payload format with
-    /// no terminator - the block shape a foreign application can hand over.
+    /// Puts `units` UTF-16 `A`s on the clipboard under the editor's format,
+    /// with no terminator - the block shape a foreign application can hand
+    /// over.
     fn set_unterminated_block(units: usize) {
-        let format = payload_format().expect("the payload format registers");
+        let format = payload_format_id().expect("the payload format registers");
         // SAFETY: `HWND::default()` is the null owner, the documented form for
         // a process without a clipboard-owning window.
         unsafe { OpenClipboard(HWND::default()) }.expect("the clipboard opens");

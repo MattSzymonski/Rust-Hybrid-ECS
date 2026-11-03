@@ -2,11 +2,12 @@
 //! `Added<T>`, `With<T>`, `Without<T>`) on top of the parameterized
 //! `Query<Data, Filter>` API.
 //!
-//! Each frame five systems run. `movement_system` writes `Position` through
-//! `Mut<Position>` on even frames, which bumps the per-row `changed` tick
-//! whether or not the value moved; `react_to_movement_system` observes those
-//! rows through `Changed<Position>`, and `react_to_new_health_system` observes
-//! a `Health` added through deferred `Commands` on the following frame.
+//! Every frame runs five systems. On even frames `movement_system` writes
+//! `Position` through `Mut<Position>`, which sets the row's `changed` tick
+//! whether or not the value moved. `react_to_movement_system` reports those
+//! rows through `Changed<Position>`. `react_to_new_health_system` reports a
+//! `Health` that the driver queued through deferred `Commands`, one frame
+//! later.
 //!
 //! # Responsibilities
 //!
@@ -19,9 +20,9 @@
 //! # Design
 //!
 //! The engine runs sequentially (`set_parallel_execution(false)`) so the
-//! printed log is deterministic, and `driver_system` runs first: it advances
-//! the frame counter and queues the `Health` attachment, so `Added<Health>`
-//! picks it up on the following frame.
+//! printed log has a fixed order. The driver runs first: it advances the frame
+//! counter and queues the `Health` attachment, so `Added<Health>` sees it on
+//! the following frame.
 
 // External crates
 use pill_engine::{
@@ -32,10 +33,10 @@ use pill_engine::{
 // Position
 // ============================================================================
 
-/// 2D position component used by the demo's movement simulation.
+/// 2D position of an entity in the demo's movement simulation.
 ///
-/// `movement_system` mutates this component through `Mut<Position>`, which
-/// bumps the per-row change tick so `Changed<Position>` filters observe it.
+/// `movement_system` writes it through `Mut<Position>`, which marks the row as
+/// changed so the `Changed<Position>` filter can see it.
 #[derive(Debug, Clone)]
 struct Position {
     /// Horizontal coordinate in world units.
@@ -49,10 +50,10 @@ impl Component for Position {}
 // Velocity
 // ============================================================================
 
-/// 2D velocity component describing per-frame movement.
+/// 2D velocity, added to `Position` on every frame that moves.
 ///
-/// Every entity carrying it is matched by `movement_system`, which adds the
-/// velocity to `Position` on even frames.
+/// Every entity that carries it matches the `movement_system` query, which adds
+/// the velocity to `Position` on even frames.
 #[derive(Debug, Clone)]
 struct Velocity {
     /// Horizontal velocity applied on each moved frame.
@@ -66,10 +67,10 @@ impl Component for Velocity {}
 // Health
 // ============================================================================
 
-/// Hit-points component attached to the target entity on frame 3.
+/// Hit points, attached to the target entity on frame 3.
 ///
-/// Exists solely to exercise the `Added<Health>` and `Without<Health>`
-/// filters; the demo never reads the value back.
+/// It exists only to exercise the `Added<Health>` and `Without<Health>`
+/// filters, and the demo never reads the value back.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct Health(i32);
@@ -79,9 +80,9 @@ impl Component for Health {}
 // Player
 // ============================================================================
 
-/// Marker so we can scope iteration with `With<Player>` / `Without<Player>`.
+/// Marks an entity as a player for the `With<Player>` filter.
 ///
-/// A unit component; it carries no data, only its presence on an entity.
+/// A unit component: it carries no data, and only its presence matters.
 #[derive(Debug, Clone)]
 struct Player;
 impl Component for Player {}
@@ -90,7 +91,7 @@ impl Component for Player {}
 // FrameCounter
 // ============================================================================
 
-/// Tracks the current frame so the demo only mutates on selected frames.
+/// Counts frames, so the demo changes data only on the frames it chooses.
 #[derive(Debug)]
 struct FrameCounter(u32);
 impl Resource for FrameCounter {}
@@ -99,7 +100,7 @@ impl Resource for FrameCounter {}
 // TargetEntity
 // ============================================================================
 
-/// Stores the entity id we want to give Health to on frame 3.
+/// Stores the entity that gains a `Health` component on frame 3.
 #[derive(Debug)]
 struct TargetEntity(Entity);
 impl Resource for TargetEntity {}
@@ -108,59 +109,67 @@ impl Resource for TargetEntity {}
 // Systems
 // ============================================================================
 
-/// Writes Position only on even frames so reactive systems can see the
-/// difference between "changed" and "unchanged" frames.
+/// Writes `Position` only on even frames, so the reactive systems see both
+/// changed and unchanged frames.
 ///
-/// The loop writes through `Mut` unconditionally, so a zero `Velocity` still
-/// marks the row as changed - the filter reports "written", not "moved".
-fn movement_system(frame: ResMut<FrameCounter>, mut q: Query<(&mut Position, &Velocity)>) {
-    // Step 1: read the current frame and skip odd frames entirely so the
-    // reactive systems observe a genuine "unchanged" frame.
-    let frame_no = frame.get().map(|f| f.0).unwrap_or(0);
-    if !frame_no.is_multiple_of(2) {
-        return; // odd frames: skip mutation entirely
+/// The loop writes through `Mut` on every matching entity, so a zero
+/// `Velocity` still marks the row as changed. The filter reports a write, not
+/// a move.
+fn movement_system(
+    frame_counter: ResMut<FrameCounter>,
+    mut query: Query<(&mut Position, &Velocity)>,
+) {
+    // Step 1: read the frame number and skip odd frames, so the reactive
+    // systems also see a frame in which nothing changed.
+    let frame_number = frame_counter.get().map(|counter| counter.0).unwrap_or(0);
+    if !frame_number.is_multiple_of(2) {
+        return;
     }
 
-    // Step 2: integrate velocity into position for every matching entity.
-    for (mut pos, vel) in q.iter_mut() {
-        pos.x += vel.x;
-        pos.y += vel.y;
+    // Step 2: add the velocity to the position of every matching entity.
+    for (mut position, velocity) in query.iter_mut() {
+        position.x += velocity.x;
+        position.y += velocity.y;
     }
 }
 
-/// Reacts only to entities whose Position was written through since this
-/// system last ran. Combines a row-level filter (`Changed<Position>`) with an
-/// archetype-level filter (`With<Player>`) to scope the result.
-// The full query type is spelled out on purpose: combining a row filter with
-// an archetype filter is exactly what this example exists to show, and hiding
-// it behind a type alias would move the demonstration out of view.
+/// Logs the player entities whose `Position` changed since this system last
+/// ran.
+///
+/// It combines a row filter (`Changed<Position>`) with an archetype filter
+/// (`With<Player>`) to narrow the result.
+// The long query type stays spelled out: this example exists to show a row
+// filter and an archetype filter side by side, and a type alias would hide the
+// part being demonstrated.
 #[allow(clippy::type_complexity)]
-fn react_to_movement_system(mut q: Query<(Entity, &Position), (Changed<Position>, With<Player>)>) {
-    let mut count = 0;
-    for (entity, pos) in q.iter_mut() {
+fn react_to_movement_system(
+    mut query: Query<(Entity, &Position), (Changed<Position>, With<Player>)>,
+) {
+    let mut changed_entity_count = 0;
+    for (entity, position) in query.iter_mut() {
         pill_core::info!(
             "  [react_to_movement] player entity {} moved -> ({:.1}, {:.1})",
             entity.id(),
-            pos.x,
-            pos.y
+            position.x,
+            position.y
         );
-        count += 1;
+        changed_entity_count += 1;
     }
-    if count == 0 {
+    if changed_entity_count == 0 {
         pill_core::info!("  [react_to_movement] no player movement this frame");
     }
 }
 
-/// Reacts to entities that have a Position but explicitly NO Health, to
-/// demonstrate the `Without<T>` filter.
-fn report_unhealthy_system(mut q: Query<(Entity,), (With<Position>, Without<Health>)>) {
-    let ids: Vec<u64> = q.iter_mut().map(|(e,)| e.id()).collect();
-    pill_core::info!("  [report_unhealthy] entities w/o Health: {:?}", ids);
+/// Logs every entity that has a `Position` and no `Health`, which is what the
+/// `Without<T>` filter selects.
+fn report_unhealthy_system(mut query: Query<(Entity,), (With<Position>, Without<Health>)>) {
+    let entity_ids: Vec<u64> = query.iter_mut().map(|(entity,)| entity.id()).collect();
+    pill_core::info!("  [report_unhealthy] entities w/o Health: {:?}", entity_ids);
 }
 
-/// Detects newly attached Health components.
-fn react_to_new_health_system(mut q: Query<(Entity,), Added<Health>>) {
-    for (entity,) in q.iter_mut() {
+/// Logs every entity whose `Health` was added since this system last ran.
+fn react_to_new_health_system(mut query: Query<(Entity,), Added<Health>>) {
+    for (entity,) in query.iter_mut() {
         pill_core::info!(
             "  [react_to_new_health] entity {} just gained Health!",
             entity.id()
@@ -168,29 +177,31 @@ fn react_to_new_health_system(mut q: Query<(Entity,), Added<Health>>) {
     }
 }
 
-/// Drives the simulation: bumps the frame counter and on frame 3 attaches
-/// a Health component to the target entity (via deferred Commands so the
-/// Added<Health> filter picks it up the following frame).
-fn driver_system(
+/// Drives the simulation: it adds one to the frame counter, and on frame 3 it
+/// attaches a `Health` component to the target entity.
+///
+/// The attachment goes through deferred `Commands`, so the `Added<Health>`
+/// filter sees it on the following frame.
+fn simulation_driver_system(
     mut commands: Commands,
-    mut frame: ResMut<FrameCounter>,
-    target: ResMut<TargetEntity>,
+    mut frame_counter: ResMut<FrameCounter>,
+    target_entity: ResMut<TargetEntity>,
 ) {
-    // Step 1: advance the frame counter for this frame.
-    let mut f = frame.get_mut().unwrap();
-    f.0 += 1;
-    let frame_no = f.0;
+    // Step 1: advance the frame counter and read the new frame number.
+    let mut counter = frame_counter.get_mut().unwrap();
+    counter.0 += 1;
+    let frame_number = counter.0;
 
-    let target_entity = target.get().unwrap().0;
+    let health_recipient = target_entity.get().unwrap().0;
 
-    // Step 2: on frame 3, queue the Health attachment through deferred
-    // Commands so `Added<Health>` observes it on the next frame.
-    if frame_no == 3 {
+    // Step 2: on frame 3, queue the `Health` attachment through deferred
+    // `Commands` so `Added<Health>` sees it on the next frame.
+    if frame_number == 3 {
         pill_core::info!(
             "  [driver] queueing Health for entity {}",
-            target_entity.id()
+            health_recipient.id()
         );
-        commands.add_component_to_entity(target_entity, Health(100));
+        commands.add_component_to_entity(health_recipient, Health(100));
     }
 }
 
@@ -198,17 +209,23 @@ fn driver_system(
 // Main
 // ============================================================================
 
-/// Entry point that builds the engine, registers components and systems,
-/// and runs five frames of the change-detection demo.
+/// Builds the engine, registers the components and systems, and runs five
+/// frames of the change-detection demo.
+///
+/// # Panics
+///
+/// Panics if an entity fails to build, which would mean the demo's setup is
+/// wrong.
 fn main() {
-    // Route this program's output, and the engine's own reports, through
-    // the engine logger.
+    // Install the engine's logger, so this program's lines and the engine's
+    // own reports are printed.
     let _ = pill_core::telemetry::TelemetryBuilder::new().init();
     pill_core::info!("=== Change Detection Demo ===");
 
     // Step 1: create the engine.
     let mut engine = Engine::new();
-    // Run sequentially so the printed log is deterministic.
+    // Run the systems one at a time, so the log lines always come out in the
+    // same order.
     engine.set_parallel_execution(false);
 
     // Step 2: register every component the demo's queries reference.
@@ -220,7 +237,7 @@ fn main() {
 
     // Step 3: spawn the demo's three entities.
     // Two players (one moving, one stationary) and one non-player.
-    let player_a = world
+    let moving_player = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
         .with(Velocity { x: 1.0, y: 0.5 })
@@ -228,15 +245,15 @@ fn main() {
         .build()
         .unwrap();
 
-    let _player_b = world
+    let _stationary_player = world
         .create_entity()
         .with(Position { x: 10.0, y: 10.0 })
-        .with(Velocity { x: 0.0, y: 0.0 }) // zero velocity: still written through
+        .with(Velocity { x: 0.0, y: 0.0 }) // zero velocity: the row still changes
         .with(Player)
         .build()
         .unwrap();
 
-    let _npc = world
+    let _non_player = world
         .create_entity()
         .with(Position { x: -5.0, y: 0.0 })
         .with(Velocity { x: 0.0, y: 0.0 })
@@ -245,19 +262,20 @@ fn main() {
 
     // Step 4: seed the resources the systems read each frame.
     world.insert_resource(FrameCounter(0));
-    world.insert_resource(TargetEntity(player_a));
+    world.insert_resource(TargetEntity(moving_player));
 
     // Step 5: register the systems in execution order.
-    // Driver runs first to advance the frame counter and queue Commands.
-    engine.register_system("driver", driver_system);
+    // The driver runs first: it advances the frame counter and queues the
+    // `Health` command.
+    engine.register_system("driver", simulation_driver_system);
     engine.register_system("movement", movement_system);
     engine.register_system("react_to_movement", react_to_movement_system);
     engine.register_system("react_to_new_health", react_to_new_health_system);
     engine.register_system("report_unhealthy", report_unhealthy_system);
 
     // Step 6: run five frames and print each one's reactive output.
-    for frame in 1..=5 {
-        pill_core::info!("--- Frame {} ---", frame);
+    for frame_number in 1..=5 {
+        pill_core::info!("--- Frame {} ---", frame_number);
         engine.process_frame().unwrap();
     }
 }

@@ -1,26 +1,34 @@
-//! Change detection: the world's tick counter and the per-system baseline.
+//! Change detection: the world's tick counter and each system's baseline.
 //!
 //! # Responsibilities
 //!
-//! - Owns the monotonically increasing world tick every write is stamped with.
-//! - Answers what "since my last run" means for the system currently running,
-//!   which is what `Changed<T>` and `Added<T>` compare against.
+//! - Owns the world tick counter that every component write is stamped with.
+//! - Answers what "since my last run" means for the system that is running
+//!   now: the baseline that `Changed<T>` and `Added<T>` compare against.
 //!
 //! # Design
 //!
-//! A component's own ticks live in its column, beside the row they describe:
-//! `added` and `changed`, the latter set to the current world tick by a write
-//! through a mutable query. Nothing here tracks per-row metadata.
+//! A component instance carries two ticks of its own, `added` and `changed`.
+//! They are kept in a separate list beside the component's data, at the same
+//! index as the entity's row. A write through a mutable query sets `changed`
+//! to the tick of the current run. Nothing in this file keeps per-row
+//! bookkeeping.
 //!
-//! What is left is the pair of numbers a filter needs: the tick this run was
-//! stamped with, and the tick the calling system last ran at - the baseline
-//! `Changed<T>` and `Added<T>` compare against.
+//! A filter therefore needs only two numbers: the tick of the current run,
+//! and the tick at which the calling system last ran. The second one is the
+//! baseline that `Changed<T>` and `Added<T>` compare against.
 //!
-//! The baseline has two sources. Sequentially it is `World::system_last_run`,
-//! one shared field. In a parallel batch two systems running at once need
-//! different baselines and a single field would race, so the engine sets a
-//! thread-local override before each system runs; every thread then reads that
-//! for its own system without touching shared state.
+//! The baseline comes from one of two places. In sequential execution it is
+//! the `system_last_run` field on `World`, which is set before each system
+//! runs. Two systems running at the same time in a parallel batch need
+//! different baselines, and one shared field would race, so the engine
+//! installs the value in a thread-local before each system runs. Every
+//! thread then reads the value installed for its own system, and no two
+//! threads share a cell.
+//!
+//! The tick is a `u32` that wraps: after `u32::MAX` the next one is 0.
+//! Comparisons such as `Tick::is_newer_than` therefore measure the distance
+//! between two ticks instead of their order, so a wrap changes nothing.
 
 use super::*;
 
@@ -29,49 +37,53 @@ use super::*;
 // =============================================================================
 
 impl World {
-    /// Read the current world tick without modifying it.
+    /// Returns the current world tick and leaves the counter unchanged.
     #[inline]
     pub fn change_tick(&self) -> Tick {
         Tick::new(self.change_tick)
     }
 
-    /// Bump the world tick and return the new value.
+    /// Increases the world tick by one and returns the new value.
     ///
-    /// Called by the [`Engine`](crate::engine::Engine) once per frame and by
-    /// mutable queries when they begin iteration, so mutations performed during
-    /// the same frame can still be told apart by tick.
+    /// The [`Engine`](crate::engine::Engine) calls this once per frame, and a
+    /// mutable query calls it when its iteration begins, so mutations made at
+    /// different points of a frame can still be told apart by their tick. A
+    /// write applied between frames (a field edit, for example) calls it too,
+    /// so the value it stamps is newer than every system's baseline.
     ///
-    /// A parallel batch runs every one of its systems against the same world,
-    /// so bumping here would be an unsynchronized read-modify-write. The engine
-    /// therefore allocates one tick per batch member on the dispatch thread and
-    /// installs it as this thread's override; inside a system the reserved value
-    /// is returned however often it is asked for, and the shared counter is left
-    /// untouched.
+    /// Inside a parallel batch every system runs against the same world, so
+    /// increasing the shared counter from a worker would be an unsynchronized
+    /// read-modify-write. The engine therefore allocates one tick per batch
+    /// member on the dispatch thread and installs it for the thread that runs
+    /// that system. Inside a system the reserved tick is returned every time,
+    /// however often it is asked for, and the shared counter is left alone.
     #[inline]
     pub fn increment_change_tick(&mut self) -> Tick {
-        if let Some(reserved) = per_thread_this_run_tick() {
-            return reserved;
+        if let Some(reserved_this_run_tick) = per_thread_this_run_tick() {
+            return reserved_this_run_tick;
         }
         self.change_tick = self.change_tick.wrapping_add(1);
         Tick::new(self.change_tick)
     }
 
-    /// What tick was current when the calling system last ran?
+    /// Returns the tick at which the calling system last ran.
     ///
-    /// A per-thread override, when one is installed (parallel execution), wins
-    /// over the shared world field (sequential execution or ad-hoc queries).
+    /// When a parallel batch installed a value for this thread, that value
+    /// wins. Otherwise the answer comes from the shared field on the world,
+    /// which sequential systems and ad-hoc queries use.
     #[inline]
     pub fn system_last_run(&self) -> Tick {
-        if let Some(t) = per_thread_last_run_tick() {
-            return t;
+        if let Some(installed_last_run_tick) = per_thread_last_run_tick() {
+            return installed_last_run_tick;
         }
         Tick::new(self.system_last_run)
     }
 
-    /// Set the world-level baseline directly.
+    /// Sets the world-level baseline tick directly.
     ///
-    /// The engine manages this itself; the setter exists for tests and one-off
-    /// queries that compare against a tick they chose.
+    /// The engine sets the baseline itself before each system runs, so this
+    /// setter is meant for tests and for one-off queries that compare against
+    /// a tick they chose.
     #[inline]
     pub fn set_system_last_run(&mut self, tick: Tick) {
         self.system_last_run = tick.get();

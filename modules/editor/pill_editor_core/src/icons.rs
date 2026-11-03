@@ -1,11 +1,12 @@
-//! Phosphor's icons for the editor's chrome: the regular weight inline and
-//! duotone icons as two painted layers.
+//! Phosphor icons for the editor's chrome: single glyphs from the regular
+//! face and duotone icons drawn as a fill under the line art.
 //!
 //! # Responsibilities
 //!
-//! - [`append_font_definitions`]: the two vendored Phosphor families, appended
-//!   to the definitions [`crate::style::apply_theme`] has the UI kit install.
-//! - [`Icon`]: the icons the editor uses, as the fonts' codepoints.
+//! - [`append_font_definitions`]: the two vendored Phosphor families, added to
+//!   the font definitions that [`crate::style::apply_theme`] installs through
+//!   the UI kit.
+//! - [`Icon`]: the icons the editor uses, with their codepoints in the fonts.
 //! - [`rich`]: an icon and a label as one text run.
 //! - [`paint_duotone`] and [`IconButton`]: Phosphor's duotone form, a fill
 //!   under the line art, for the editor's buttons, menus and tool rows.
@@ -13,15 +14,16 @@
 //! # Design
 //!
 //! The vendored `Phosphor.ttf` (regular) and `Phosphor-Duotone.ttf` come from
-//! the `@phosphor-icons/web` package. In the duotone font each icon appears
-//! twice, its fill at the codepoint and its line art one further - the pairing
-//! the package's stylesheet overlays at a fifth of the opacity - and painting
-//! both from one origin at [`DUOTONE_FILL_ALPHA`] gives the look with no image
-//! atlas: the icons tint with the theme and need no texture of their own.
+//! the `@phosphor-icons/web` package. The duotone font holds each icon twice:
+//! the fill shape at the codepoint and the line art one codepoint further.
+//! The package's stylesheet overlays the pair at one fifth of the opacity;
+//! [`paint_duotone`] draws the fill at [`DUOTONE_FILL_ALPHA`] from the same
+//! origin as the line art and gets the same look with no image atlas. The
+//! icons take the theme's colour and need no texture of their own.
 //!
-//! Both families lead with their Phosphor face: the UI fonts claim this
-//! private-use range with glyphs of their own, so an icon listed behind them
-//! draws as a stray letter. [`rich`] carries the mixed-run rule.
+//! Both icon families list their Phosphor face first. The UI fonts also map
+//! this private-use range, so an icon listed behind them would draw as a
+//! stray letter. [`rich`] carries the rule for mixing an icon with letters.
 
 // Standard library
 use std::sync::Arc;
@@ -31,6 +33,10 @@ use egui::{
     Color32, FontData, FontDefinitions, FontFamily, FontId, Painter, Rect, Response, Sense,
     StrokeKind, TextStyle, Ui, Vec2, Widget,
 };
+
+// =============================================================================
+// Constants
+// =============================================================================
 
 /// The family of the regular-weight icons, falling back to the UI font.
 pub const FAMILY: &str = "phosphor";
@@ -48,7 +54,7 @@ const ICON_TEXT_RATIO: f32 = 1.15;
 const ICON_LABEL_GAP: f32 = 6.0;
 
 /// How much the hovered fill of a row floating over a scene brightens.
-const HOVER_BRIGHTEN: u8 = 14;
+const HOVER_BRIGHTEN_AMOUNT: u8 = 14;
 
 /// The regular-weight font, as the package shipped it.
 const REGULAR_FONT: &[u8] = include_bytes!("../assets/Phosphor.ttf");
@@ -56,46 +62,14 @@ const REGULAR_FONT: &[u8] = include_bytes!("../assets/Phosphor.ttf");
 /// The duotone font, as the package shipped it.
 const DUOTONE_FONT: &[u8] = include_bytes!("../assets/Phosphor-Duotone.ttf");
 
-/// The font definitions' keys for the two files.
+/// The key the regular face is registered under.
 pub const REGULAR_KEY: &str = "phosphor";
 /// The key the duotone face is registered under.
 pub const DUOTONE_KEY: &str = "phosphor.duotone";
 
-/// Append the Phosphor fonts to `fonts` as [`FAMILY`] and [`DUOTONE_FAMILY`],
-/// each leading with its icon face and falling back to the proportional
-/// family built so far so a label beside an icon still draws.
-///
-/// The icon face goes first because the UI fonts claim this private-use range
-/// with glyphs of their own, which would turn an icon into a letter. The
-/// regular face cannot lead a mixed run - it claims the lowercase range with
-/// blank glyphs - so [`rich`] takes its icon from the duotone face instead.
-pub fn append_font_definitions(fonts: &mut FontDefinitions) {
-    fonts.font_data.insert(
-        REGULAR_KEY.to_owned(),
-        Arc::new(FontData::from_static(REGULAR_FONT)),
-    );
-    fonts.font_data.insert(
-        DUOTONE_KEY.to_owned(),
-        Arc::new(FontData::from_static(DUOTONE_FONT)),
-    );
-    let fallbacks = fonts
-        .families
-        .get(&FontFamily::Proportional)
-        .cloned()
-        .unwrap_or_default();
-    let family = |icon_font: &str| {
-        let mut names = Vec::with_capacity(fallbacks.len() + 1);
-        names.push(icon_font.to_owned());
-        names.extend(fallbacks.iter().cloned());
-        names
-    };
-    fonts
-        .families
-        .insert(FontFamily::Name(FAMILY.into()), family(REGULAR_KEY));
-    fonts
-        .families
-        .insert(FontFamily::Name(DUOTONE_FAMILY.into()), family(DUOTONE_KEY));
-}
+// =============================================================================
+// Icon
+// =============================================================================
 
 /// One Phosphor icon, named the way the package names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -136,7 +110,7 @@ pub enum Icon {
     Trash,
     /// A pencil: rename.
     PencilSimple,
-    /// A file with a down arrow: write the asset's metadata.
+    /// A file with a down arrow: write metadata.
     FileArrowDown,
     /// The power symbol: a system's on/off switch.
     Power,
@@ -150,9 +124,9 @@ pub enum Icon {
     PlusCircle,
     /// A circled minus: remove a component.
     MinusCircle,
-    /// A circled tick: confirm a dialog.
+    /// A circled tick: confirm.
     CheckCircle,
-    /// A circled cross: cancel a dialog.
+    /// A circled cross: a problem or an error.
     XCircle,
     /// A floppy disk: save.
     FloppyDisk,
@@ -318,104 +292,63 @@ impl Icon {
     }
 }
 
-/// The glyph at `codepoint`, which the vendored fonts always carry.
-fn glyph(codepoint: u32) -> char {
-    char::from_u32(codepoint).expect("a Phosphor codepoint is a scalar value")
-}
+// =============================================================================
+// IconButton
+// =============================================================================
 
-/// `icon` and `label` as one text run: the icon's line art from the duotone
-/// face and the letters from the UI fonts behind it.
+/// A button carrying a duotone icon and a label, drawn across the editor's
+/// menus, tab headers and toolbars.
 ///
-/// The duotone face leads its family and claims no ASCII codepoint, so a
-/// label's letters reach the UI font; its line art at `codepoint + 1` is the
-/// regular face's outline. The regular face cannot carry a mixed run: it
-/// claims the lowercase range with blank glyphs.
-pub fn rich(icon: Icon, label: &str) -> egui::RichText {
-    let (_, line) = icon.duotone();
-    egui::RichText::new(format!("{line}  {label}")).family(FontFamily::Name(DUOTONE_FAMILY.into()))
-}
-
-/// `color` at `factor` of its opacity.
-pub fn with_alpha(color: Color32, factor: f32) -> Color32 {
-    Color32::from_rgba_unmultiplied(
-        color.r(),
-        color.g(),
-        color.b(),
-        (color.a() as f32 * factor.clamp(0.0, 1.0)) as u8,
-    )
-}
-
-/// Paint `icon`'s duotone form centred in `rect`, tinted `color`: the fill
-/// shape at [`DUOTONE_FILL_ALPHA`] with the line art over it.
-pub fn paint_duotone(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
-    let size = rect.width().min(rect.height());
-    if size <= 0.0 {
-        return;
-    }
-    let font = FontId::new(size, FontFamily::Name(DUOTONE_FAMILY.into()));
-    let (fill, line) = icon.duotone();
-    // The line art's layout box anchors both layers: the two glyphs share a
-    // baseline, so drawing them from one origin keeps the fill exactly under
-    // the line whatever their ink extents are.
-    let line_galley = painter.layout_no_wrap(line.to_string(), font.clone(), color);
-    let origin = rect.center() - line_galley.size() * 0.5;
-    let faded = with_alpha(color, DUOTONE_FILL_ALPHA);
-    let fill_galley = painter.layout_no_wrap(fill.to_string(), font, faded);
-    painter.galley(origin, fill_galley, faded);
-    painter.galley(origin, line_galley, color);
-}
-
-/// A button carrying a duotone icon and a label: the one button the egui
-/// editor's toolbars, menus and floating tool rows draw.
-///
-/// It wears the theme's button visuals - the hover and press feedback, the
-/// selected fill a current choice takes - and lays the icon out before the
+/// It uses the theme's button visuals: the hover and press feedback, and the
+/// selected fill that marks the current choice. The icon sits before the
 /// label. A row whose rectangle a panel has already fixed takes exactly that
 /// rectangle through [`IconButton::fixed_size`].
 pub struct IconButton<'a> {
     icon: Icon,
     label: &'a str,
     active: bool,
-    fill: Option<Color32>,
-    size: Option<Vec2>,
+    fill_override: Option<Color32>,
+    fixed_size: Option<Vec2>,
 }
 
 impl<'a> IconButton<'a> {
-    /// A button for `icon` and `label`; an empty label leaves the icon
-    /// alone.
+    /// Creates a button for `icon` and `label`. An empty `label` shows the
+    /// icon on its own.
     pub fn new(icon: Icon, label: &'a str) -> Self {
         Self {
             icon,
             label,
             active: false,
-            fill: None,
-            size: None,
+            fill_override: None,
+            fixed_size: None,
         }
     }
 
-    /// Draw the button as the current choice (a checked menu item, a tool
-    /// that is on).
+    /// Marks the button as the current choice: a checked menu item or a tool
+    /// that is on.
     pub fn active(mut self, active: bool) -> Self {
         self.active = active;
         self
     }
 
-    /// Use `fill` instead of the theme's button fill: a panel floating over
-    /// the scene keeps its own palette.
+    /// Uses `fill` instead of the theme's button fill, so a panel floating
+    /// over the scene can keep its own palette.
     pub fn fill(mut self, fill: Color32) -> Self {
-        self.fill = Some(fill);
+        self.fill_override = Some(fill);
         self
     }
 
-    /// Take exactly `size` rather than growing to the icon and label.
-    pub fn fixed_size(mut self, size: Vec2) -> Self {
-        self.size = Some(size);
+    /// Gives the button exactly `fixed_size` instead of the size its icon and
+    /// label need.
+    pub fn fixed_size(mut self, fixed_size: Vec2) -> Self {
+        self.fixed_size = Some(fixed_size);
         self
     }
 }
 
 impl Widget for IconButton<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
+        // Step 1: Read the button text font, the padding and the text colour.
         let style = ui.style();
         let font = style
             .text_styles
@@ -433,27 +366,36 @@ impl Widget for IconButton<'_> {
         } else {
             ICON_LABEL_GAP
         };
-        let content = Vec2::new(
+        // Step 2: Measure the icon and label and work out the button's size.
+        let content_size = Vec2::new(
             icon_size + gap + label_galley.size().x,
             label_galley.size().y.max(icon_size),
         );
-        let size = self.size.unwrap_or(content + padding * 2.0);
-        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        let button_size = self.fixed_size.unwrap_or(content_size + padding * 2.0);
+        // Step 3: Allocate the rectangle and draw the button when it is visible.
+        let (rect, response) = ui.allocate_exact_size(button_size, Sense::click());
         if ui.is_rect_visible(rect) {
             let visuals = ui.style().interact_selectable(&response, self.active);
-            let fill = self.fill.map_or(visuals.weak_bg_fill, |fill| {
-                if response.hovered() {
-                    brighten(fill, HOVER_BRIGHTEN)
-                } else {
-                    fill
-                }
-            });
-            let corner = ui.style().visuals.widgets.inactive.corner_radius;
-            ui.painter()
-                .rect(rect, corner, fill, visuals.bg_stroke, StrokeKind::Inside);
+            let button_fill = self
+                .fill_override
+                .map_or(visuals.weak_bg_fill, |override_fill| {
+                    if response.hovered() {
+                        brighten(override_fill, HOVER_BRIGHTEN_AMOUNT)
+                    } else {
+                        override_fill
+                    }
+                });
+            let corner_radius = ui.style().visuals.widgets.inactive.corner_radius;
+            ui.painter().rect(
+                rect,
+                corner_radius,
+                button_fill,
+                visuals.bg_stroke,
+                StrokeKind::Inside,
+            );
             let icon_rect = Rect::from_center_size(
                 egui::pos2(
-                    rect.center().x - content.x * 0.5 + icon_size * 0.5,
+                    rect.center().x - content_size.x * 0.5 + icon_size * 0.5,
                     rect.center().y,
                 ),
                 Vec2::splat(icon_size),
@@ -474,19 +416,123 @@ impl Widget for IconButton<'_> {
     }
 }
 
-/// `color` lifted `amount` towards white on every channel.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Appends the Phosphor fonts to `fonts` as the [`FAMILY`] and
+/// [`DUOTONE_FAMILY`] families.
+///
+/// Each family lists its icon face first and then every font of the
+/// proportional family already built, so a label beside an icon still draws.
+/// The icon face goes first because the UI fonts also map the icon range, so
+/// a UI font listed first would draw an icon as a letter. The regular face
+/// cannot lead a mixed run because it maps the lowercase letters with blank
+/// glyphs, so [`rich`] takes its icon from the duotone face instead.
+pub fn append_font_definitions(fonts: &mut FontDefinitions) {
+    // Step 1: Register both font files under their keys.
+    fonts.font_data.insert(
+        REGULAR_KEY.to_owned(),
+        Arc::new(FontData::from_static(REGULAR_FONT)),
+    );
+    fonts.font_data.insert(
+        DUOTONE_KEY.to_owned(),
+        Arc::new(FontData::from_static(DUOTONE_FONT)),
+    );
+    // Step 2: Build each icon family from its face and the proportional
+    // fallbacks.
+    let fallback_font_names = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let family_names = |icon_font_key: &str| {
+        let mut font_names = Vec::with_capacity(fallback_font_names.len() + 1);
+        font_names.push(icon_font_key.to_owned());
+        font_names.extend(fallback_font_names.iter().cloned());
+        font_names
+    };
+    fonts
+        .families
+        .insert(FontFamily::Name(FAMILY.into()), family_names(REGULAR_KEY));
+    fonts.families.insert(
+        FontFamily::Name(DUOTONE_FAMILY.into()),
+        family_names(DUOTONE_KEY),
+    );
+}
+
+/// The character at `codepoint`.
+///
+/// # Panics
+///
+/// Panics if `codepoint` is not a Unicode scalar value. Every Phosphor
+/// codepoint is one, so the calls in this file cannot panic.
+fn glyph(codepoint: u32) -> char {
+    char::from_u32(codepoint).expect("a Phosphor codepoint is a scalar value")
+}
+
+/// Combines `icon` and `label` into one text run. The icon's line art comes
+/// from the duotone face and the letters from the UI fonts behind it.
+///
+/// The duotone face leads its family and maps no ASCII letter, so a label's
+/// letters reach the UI font. Its line art at `codepoint + 1` has the same
+/// outline as the regular face. The regular face cannot carry a mixed run
+/// because it maps the lowercase letters with blank glyphs.
+pub fn rich(icon: Icon, label: &str) -> egui::RichText {
+    let (_, line) = icon.duotone();
+    egui::RichText::new(format!("{line}  {label}")).family(FontFamily::Name(DUOTONE_FAMILY.into()))
+}
+
+/// Returns `color` with its alpha channel scaled by `opacity_factor`.
+///
+/// The factor is clamped between 0 and 1.
+pub fn with_alpha(color: Color32, opacity_factor: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        color.r(),
+        color.g(),
+        color.b(),
+        (color.a() as f32 * opacity_factor.clamp(0.0, 1.0)) as u8,
+    )
+}
+
+/// Paints `icon`'s duotone form centred in `rect`, tinted `color`. The fill
+/// shape is drawn at [`DUOTONE_FILL_ALPHA`] with the line art over it.
+pub fn paint_duotone(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
+    let icon_size = rect.width().min(rect.height());
+    if icon_size <= 0.0 {
+        return;
+    }
+    let font = FontId::new(icon_size, FontFamily::Name(DUOTONE_FAMILY.into()));
+    let (fill, line) = icon.duotone();
+    // Lay out the line art first and use its box for both layers. The two
+    // glyphs share a baseline, so one origin keeps the fill directly under
+    // the line, whatever shape each glyph has.
+    let line_galley = painter.layout_no_wrap(line.to_string(), font.clone(), color);
+    let origin = rect.center() - line_galley.size() * 0.5;
+    let faded = with_alpha(color, DUOTONE_FILL_ALPHA);
+    let fill_galley = painter.layout_no_wrap(fill.to_string(), font, faded);
+    painter.galley(origin, fill_galley, faded);
+    painter.galley(origin, line_galley, color);
+}
+
+/// Returns `color` with every RGB channel raised by `amount`, stopping at
+/// 255. The alpha channel is unchanged.
 fn brighten(color: Color32, amount: u8) -> Color32 {
     let lift = |channel: u8| channel.saturating_add(amount);
     Color32::from_rgba_unmultiplied(lift(color.r()), lift(color.g()), lift(color.b()), color.a())
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every icon's codepoint is in both vendored fonts' character maps, and
-    /// the duotone font also maps the line art one codepoint further: a typo
-    /// or a package change fails here instead of drawing a blank.
+    /// Checks that both vendored fonts map every icon's codepoint and that the
+    /// duotone font also maps the line art one codepoint further. A typo or a
+    /// package change then fails here instead of drawing a blank glyph.
     #[test]
     fn every_icon_is_in_the_vendored_fonts() {
         let regular = codepoints(REGULAR_FONT);
@@ -513,8 +559,8 @@ mod tests {
         }
     }
 
-    /// The inline form puts the icon's glyph first and keeps the label
-    /// after it, whatever the icon.
+    /// Checks that the inline form starts with the icon's line art and ends
+    /// with the label.
     #[test]
     fn a_rich_label_starts_with_its_icon() {
         let grid = rich(Icon::GridFour, "Grid");
@@ -527,10 +573,10 @@ mod tests {
         assert_ne!(grid.text(), magnet.text());
     }
 
-    /// An icon's codepoint is answered by its Phosphor face, not by the UI font
-    /// the family falls back to. Inter carries alternates across this range, so
-    /// the UI font really does claim it - the two layouts differ, which is what
-    /// the icon family must not give it to.
+    /// Checks that an icon's codepoint is answered by its Phosphor face, not
+    /// by the UI font that the family lists as a fallback. Inter maps many
+    /// private-use codepoints, so the two layouts differ and a stray UI glyph
+    /// would be visible.
     #[test]
     fn an_icon_is_drawn_by_its_phosphor_face() {
         let mut definitions = pill_ui_kit::style::font_definitions(
@@ -545,17 +591,21 @@ mod tests {
             egui::epaint::text::Fonts::new(egui::epaint::text::TextOptions::default(), definitions);
 
         for icon in [Icon::Cube, Icon::Image, Icon::File, Icon::FolderOpen] {
-            let glyph = icon.glyph().to_string();
-            let phosphor = ink(&mut fonts, &glyph, FontFamily::Name("test.phosphor".into()));
-            let icons = ink(&mut fonts, &glyph, FontFamily::Name(FAMILY.into()));
-            let ui = ink(&mut fonts, &glyph, FontFamily::Proportional);
-            assert_eq!(icons, phosphor, "{} came from the UI font", icon.name());
+            let glyph_text = icon.glyph().to_string();
+            let phosphor = ink(
+                &mut fonts,
+                &glyph_text,
+                FontFamily::Name("test.phosphor".into()),
+            );
+            let icon_ink = ink(&mut fonts, &glyph_text, FontFamily::Name(FAMILY.into()));
+            let ui = ink(&mut fonts, &glyph_text, FontFamily::Proportional);
+            assert_eq!(icon_ink, phosphor, "{} came from the UI font", icon.name());
             assert_ne!(ui, phosphor, "the UI font does not claim {}", icon.name());
         }
     }
 
-    /// The ink rectangle `text` gets in `family`: layout only measures the
-    /// glyph, so the colour comes from the palette like every other one.
+    /// Returns the rectangle `text` covers in `family`. Layout measures only
+    /// the glyph, so the colour can come from the editor palette.
     fn ink(fonts: &mut egui::epaint::text::Fonts, text: &str, family: FontFamily) -> Rect {
         let color = crate::style::palette().text;
         fonts
@@ -564,10 +614,10 @@ mod tests {
             .rect
     }
 
-    /// Both icon families lead with their Phosphor face. The UI fonts a family
-    /// falls back to claim the private-use codepoints with glyphs of their own
-    /// (Inter carries alternates across the range), so an icon listed behind
-    /// them draws as a stray letter.
+    /// Checks that both icon families list their Phosphor face first. The UI
+    /// fonts they fall back to map the same private-use codepoints (Inter
+    /// carries alternates there), so an icon listed behind them would draw as
+    /// a stray letter.
     #[test]
     fn the_icon_families_lead_with_their_phosphor_face() {
         let mut fonts = FontDefinitions::default();
@@ -578,16 +628,21 @@ mod tests {
             .insert(0, "ui".to_owned());
         append_font_definitions(&mut fonts);
         for (family, key) in [(FAMILY, REGULAR_KEY), (DUOTONE_FAMILY, DUOTONE_KEY)] {
-            let names = &fonts.families[&FontFamily::Name(family.into())];
-            assert_eq!(names.first().map(String::as_str), Some(key), "{family}");
+            let font_names = &fonts.families[&FontFamily::Name(family.into())];
+            assert_eq!(
+                font_names.first().map(String::as_str),
+                Some(key),
+                "{family}"
+            );
             assert!(
-                names.iter().any(|name| name == "ui"),
+                font_names.iter().any(|name| name == "ui"),
                 "{family} lost its UI fallback"
             );
         }
     }
 
-    /// The fade scales the colour's opacity and leaves a solid colour alone.
+    /// Checks that the fade scales the colour's alpha and leaves a fully
+    /// opaque colour unchanged.
     #[test]
     fn the_fill_fades_the_colour() {
         let solid = with_alpha(Color32::from_rgb(200, 100, 50), 1.0);
@@ -601,56 +656,68 @@ mod tests {
         assert_ne!(faded, solid);
     }
 
-    /// Every codepoint a font maps, read from its `cmap` table: the format 4
-    /// and format 12 subtables a TrueType font carries.
+    /// Returns every codepoint a font maps, read from its `cmap` table. Only
+    /// the format 4 and format 12 subtables a TrueType font carries are read.
     fn codepoints(font: &[u8]) -> std::collections::HashSet<u32> {
-        let mut found = std::collections::HashSet::new();
+        let mut found_codepoints = std::collections::HashSet::new();
         let table_count = read_u16(font, 4) as usize;
-        for index in 0..table_count {
-            let entry = 12 + index * 16;
-            if &font[entry..entry + 4] != b"cmap" {
+        for table_index in 0..table_count {
+            let table_record_offset = 12 + table_index * 16;
+            if &font[table_record_offset..table_record_offset + 4] != b"cmap" {
                 continue;
             }
-            let cmap = read_u32(font, entry + 8) as usize;
-            for subtable in 0..read_u16(font, cmap + 2) as usize {
-                let record = cmap + 4 + subtable * 8;
-                let offset = cmap + read_u32(font, record + 4) as usize;
+            let cmap_offset = read_u32(font, table_record_offset + 8) as usize;
+            for subtable_index in 0..read_u16(font, cmap_offset + 2) as usize {
+                let record_offset = cmap_offset + 4 + subtable_index * 8;
+                let offset = cmap_offset + read_u32(font, record_offset + 4) as usize;
                 match read_u16(font, offset) {
-                    4 => read_format_4(font, offset, &mut found),
-                    12 => read_format_12(font, offset, &mut found),
+                    4 => read_format_4(font, offset, &mut found_codepoints),
+                    12 => read_format_12(font, offset, &mut found_codepoints),
                     _ => {}
                 }
             }
         }
-        found
+        found_codepoints
     }
 
-    /// The `cmap` format 4 segments: a run of codepoints per segment.
-    fn read_format_4(font: &[u8], offset: usize, found: &mut std::collections::HashSet<u32>) {
-        let segments = read_u16(font, offset + 6) as usize / 2;
-        let ends = offset + 14;
-        let starts = ends + segments * 2 + 2;
-        for segment in 0..segments {
-            let end = read_u16(font, ends + segment * 2);
-            let start = read_u16(font, starts + segment * 2);
-            found.extend((start..=end).map(u32::from));
+    /// Adds the codepoints of the `cmap` format 4 segments: one run of
+    /// codepoints per segment.
+    fn read_format_4(
+        font: &[u8],
+        offset: usize,
+        found_codepoints: &mut std::collections::HashSet<u32>,
+    ) {
+        let segment_count = read_u16(font, offset + 6) as usize / 2;
+        let ends_offset = offset + 14;
+        let starts_offset = ends_offset + segment_count * 2 + 2;
+        for segment_index in 0..segment_count {
+            let end = read_u16(font, ends_offset + segment_index * 2);
+            let start = read_u16(font, starts_offset + segment_index * 2);
+            found_codepoints.extend((start..=end).map(u32::from));
         }
     }
 
-    /// The `cmap` format 12 groups: a run of codepoints per group.
-    fn read_format_12(font: &[u8], offset: usize, found: &mut std::collections::HashSet<u32>) {
-        for group in 0..read_u32(font, offset + 12) as usize {
-            let entry = offset + 16 + group * 12;
-            let start = read_u32(font, entry);
-            let end = read_u32(font, entry + 4);
-            found.extend(start..=end);
+    /// Adds the codepoints of the `cmap` format 12 groups: one run of
+    /// codepoints per group.
+    fn read_format_12(
+        font: &[u8],
+        offset: usize,
+        found_codepoints: &mut std::collections::HashSet<u32>,
+    ) {
+        for group_index in 0..read_u32(font, offset + 12) as usize {
+            let group_offset = offset + 16 + group_index * 12;
+            let start = read_u32(font, group_offset);
+            let end = read_u32(font, group_offset + 4);
+            found_codepoints.extend(start..=end);
         }
     }
 
+    /// Reads the big-endian `u16` at `offset` in `font`.
     fn read_u16(font: &[u8], offset: usize) -> u16 {
         u16::from_be_bytes([font[offset], font[offset + 1]])
     }
 
+    /// Reads the big-endian `u32` at `offset` in `font`.
     fn read_u32(font: &[u8], offset: usize) -> u32 {
         u32::from_be_bytes([
             font[offset],

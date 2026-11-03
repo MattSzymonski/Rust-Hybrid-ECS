@@ -2,60 +2,71 @@
 //!
 //! # Responsibilities
 //!
-//! - [`OrbitCamera`]: one scene view's view state - the pivot it orbits, its
-//!   yaw, pitch and distance - and the eye and basis derived from them.
+//! - [`OrbitCamera`]: one scene view's view state. It holds the pivot the
+//!   camera orbits, its yaw, pitch and distance, and derives the eye position,
+//!   the forward, right and up directions and the rotation from them.
 //! - The four gestures a camera answers - [`OrbitCamera::orbit`],
-//!   [`OrbitCamera::pan`], [`OrbitCamera::dolly`] and [`OrbitCamera::zoom`]:
-//!   orbit stops the pitch short of the poles, and dolly and zoom keep the
-//!   distance inside its range.
+//!   [`OrbitCamera::pan`], [`OrbitCamera::dolly`] and [`OrbitCamera::zoom`].
+//!   Orbit stops the pitch just short of the poles, and dolly and zoom keep
+//!   the distance inside its range.
 //! - [`navigation_binding`]: which gesture a mouse button and the keyboard
-//!   modifiers name under a keymap preset - Blender's by default.
+//!   modifiers mean under a keymap preset. The default preset is Blender's.
 //!
 //! # Design
 //!
-//! Plain arrays and scalars: the executable owns the pointer and the
-//! surface, and a camera's numbers are testable with no window. The presets
-//! are a table rather than code inside the event handler, so a preset is one
-//! row here and the preferences file only has to name it. A viewport's camera
-//! lives beside its window (the scene views navigate independently), and only
-//! the *active* viewport's camera receives a gesture.
+//! The camera is plain arrays and scalars. The executable owns the pointer and
+//! the surface, so a camera's numbers are testable with no window. The chords
+//! live in this module instead of inside the event handlers, and the
+//! preferences file only names the preset it wants. A viewport's camera lives
+//! beside its window, so the scene views navigate independently, and only the
+//! *active* viewport's camera receives a gesture.
 
 // Current crate
 use crate::commands::KeymapPreset;
 
-/// The closest the eye may come to its pivot, in world units: any nearer and
-/// the near plane would clip the pivot itself.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The closest the eye may come to its pivot, in world units. The scene
+/// camera's near clip plane is 0.1 away, so this limit keeps the point being
+/// orbited in front of it.
 pub const MIN_DISTANCE: f32 = 0.25;
 
 /// The farthest the eye may go from its pivot, in world units.
 pub const MAX_DISTANCE: f32 = 2_000.0;
 
-/// The pitch stops just short of the poles: at exactly +-90 degrees the
-/// camera's right vector has no horizontal component left, and the yaw would
-/// spin under the pointer.
+/// The pitch stops just short of the poles. At exactly +-90 degrees the
+/// camera looks straight down or up, the look direction has no horizontal
+/// part left, and turning the yaw would only roll the view around the look
+/// axis instead of turning it.
 pub const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 - 0.02;
 
 /// How far one pixel of an orbit drag turns the view, in radians.
 pub const ORBIT_RADIANS_PER_PIXEL: f32 = 0.008;
 
-/// How fast one pixel of a dolly drag changes the distance: the distance
-/// scales by `2^(pixels * this)`, so a dolly feels the same at any distance.
+/// How fast a dolly drag changes the distance. Every pixel scales the distance
+/// by the same ratio, so a dolly feels the same at any distance.
 pub const DOLLY_EXPONENT_PER_PIXEL: f32 = 0.006;
 
 /// How much one wheel line moves the eye, as a distance ratio.
 pub const ZOOM_RATIO_PER_LINE: f32 = 1.15;
 
-/// The pitch the default camera looks down from, in radians.
+/// The downward pitch a new camera starts with, in radians.
 const DEFAULT_PITCH: f32 = 0.30;
 
-/// The distance the default camera keeps from its pivot, in world units.
+/// The distance a new camera keeps from its pivot, in world units.
 const DEFAULT_DISTANCE: f32 = 16.0;
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// One scene viewport's orbit camera.
 ///
-/// The camera never enters the world: the scene surface is bound to it as a
-/// view camera, so project systems can neither see nor move it. Each scene
-/// view keeps its own, which is what makes navigation "the active
+/// The camera is not a world entity. The executable publishes it to the scene
+/// surface as a view camera, so project systems can neither see nor move it.
+/// Each scene view keeps its own, which is what makes navigation "the active
 /// viewport's" rather than the editor's.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OrbitCamera {
@@ -69,17 +80,6 @@ pub struct OrbitCamera {
     pub distance: f32,
 }
 
-impl Default for OrbitCamera {
-    fn default() -> Self {
-        Self {
-            pivot: [0.0, 0.0, 0.0],
-            yaw: 0.0,
-            pitch: DEFAULT_PITCH,
-            distance: DEFAULT_DISTANCE,
-        }
-    }
-}
-
 impl OrbitCamera {
     /// The direction the camera looks along.
     pub fn forward(&self) -> [f32; 3] {
@@ -88,8 +88,8 @@ impl OrbitCamera {
         [-cos_pitch * sin_yaw, -sin_pitch, -cos_pitch * cos_yaw]
     }
 
-    /// The camera's right direction, horizontal by construction: the gizmo's
-    /// screen-space rays are built from it.
+    /// The camera's right direction. It is always horizontal, and the gizmo
+    /// builds its screen-space rays from it.
     pub fn right(&self) -> [f32; 3] {
         let forward = self.forward();
         let horizontal = (forward[0] * forward[0] + forward[2] * forward[2]).sqrt();
@@ -99,8 +99,8 @@ impl OrbitCamera {
         [-forward[2] / horizontal, 0.0, forward[0] / horizontal]
     }
 
-    /// The camera's up direction: the plane's vertical, perpendicular to the
-    /// look and right directions.
+    /// The camera's up direction. It is perpendicular to the look and right
+    /// directions, so it tilts with the pitch.
     pub fn up(&self) -> [f32; 3] {
         [
             self.right()[1] * self.forward()[2] - self.right()[2] * self.forward()[1],
@@ -109,8 +109,8 @@ impl OrbitCamera {
         ]
     }
 
-    /// Where the camera sits: the pivot, backed off along the look
-    /// direction.
+    /// The world position of the eye: the pivot moved back along the look
+    /// direction by `distance`.
     pub fn eye(&self) -> [f32; 3] {
         let forward = self.forward();
         [
@@ -120,8 +120,8 @@ impl OrbitCamera {
         ]
     }
 
-    /// The camera's orientation as a quaternion built from yaw and pitch, in
-    /// the transform's `[x, y, z, w]` layout.
+    /// The camera's orientation as an `[x, y, z, w]` quaternion built from
+    /// yaw and pitch, ready for a transform's rotation field.
     pub fn rotation(&self) -> [f32; 4] {
         let half_yaw = self.yaw * 0.5;
         let half_pitch = self.pitch * 0.5;
@@ -130,17 +130,18 @@ impl OrbitCamera {
         quaternion_product(yaw_quaternion, pitch_quaternion)
     }
 
-    /// Orbit around the pivot by a drag's pixel delta: dragging right turns
-    /// the view right, dragging down lifts it over the pivot.
+    /// Turns the camera around the pivot by a drag's pixel delta. Dragging
+    /// right turns the view right, and dragging down raises the eye so it
+    /// looks more steeply down at the pivot.
     pub fn orbit(&mut self, delta_x: f32, delta_y: f32) {
         self.yaw -= delta_x * ORBIT_RADIANS_PER_PIXEL;
         self.pitch = (self.pitch + delta_y * ORBIT_RADIANS_PER_PIXEL).clamp(-MAX_PITCH, MAX_PITCH);
     }
 
-    /// Pan the pivot with the view: the world follows the drag, so the pivot
-    /// moves the other way. `world_per_pixel` is the height of one pixel at
-    /// the pivot's depth, which the caller derives from the distance and the
-    /// field of view.
+    /// Moves the pivot so the world follows the drag, which means the pivot
+    /// moves the opposite way. `world_per_pixel` is the world height of one
+    /// screen pixel at the pivot's depth; the caller computes it from the
+    /// distance and the field of view.
     pub fn pan(&mut self, delta_x: f32, delta_y: f32, world_per_pixel: f32) {
         let right = self.right();
         let up = self.up();
@@ -149,19 +150,30 @@ impl OrbitCamera {
         }
     }
 
-    /// Dolly the eye along the view by a drag's pixel delta: dragging up
-    /// moves closer, dragging down farther, at a rate that feels the same at
-    /// any distance.
+    /// Moves the eye along the view by a drag's pixel delta. Dragging up moves
+    /// closer and dragging down moves farther, at a rate that feels the same
+    /// at every distance.
     pub fn dolly(&mut self, delta_y: f32) {
         let factor = 2.0f32.powf(delta_y * DOLLY_EXPONENT_PER_PIXEL);
         self.distance = (self.distance * factor).clamp(MIN_DISTANCE, MAX_DISTANCE);
     }
 
-    /// Zoom by a wheel's line count: a positive count (wheel up) moves the
-    /// eye closer, a negative one farther.
+    /// Zooms by a wheel's line count. A positive count (wheel up) moves the
+    /// eye closer and a negative one moves it farther.
     pub fn zoom(&mut self, lines: f32) {
         let factor = ZOOM_RATIO_PER_LINE.powf(-lines);
         self.distance = (self.distance * factor).clamp(MIN_DISTANCE, MAX_DISTANCE);
+    }
+}
+
+impl Default for OrbitCamera {
+    fn default() -> Self {
+        Self {
+            pivot: [0.0, 0.0, 0.0],
+            yaw: 0.0,
+            pitch: DEFAULT_PITCH,
+            distance: DEFAULT_DISTANCE,
+        }
     }
 }
 
@@ -176,8 +188,9 @@ pub enum CameraButton {
     Right,
 }
 
-/// The keyboard modifiers held during a press, as plain data: the event
-/// handlers carry winit's modifiers, the preset table wants flags.
+/// The keyboard modifiers held during a press, as plain booleans. The event
+/// handler converts winit's modifier state into this, because the navigation
+/// rules compare booleans.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Modifiers {
     /// Shift held.
@@ -199,12 +212,17 @@ pub enum CameraNavigation {
     Dolly,
 }
 
-/// The gesture a press means under `preset`, or `None` when it is no
-/// navigation chord (the press belongs to selection or the gizmo).
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// The gesture a press means under `preset`, or `None` when no camera gesture
+/// claims the press.
 ///
-/// Blender and Godot orbit with the middle button and pan and dolly with
-/// shift and control held; Unity and Unreal orbit with Alt and the left
-/// button. Any other preset falls back to Blender's table.
+/// Blender and Godot orbit with a plain middle-button drag, pan with
+/// Shift+middle and dolly with Ctrl+middle. Unity and Unreal orbit with Alt
+/// and the left button, pan with Alt and the middle button, and dolly with Alt
+/// and the right button.
 pub fn navigation_binding(
     preset: KeymapPreset,
     button: CameraButton,
@@ -221,8 +239,8 @@ pub fn navigation_binding(
     }
 }
 
-/// Blender's middle-button navigation, which Godot shares: the plain drag
-/// orbits, shift pans, control dollies.
+/// The middle-button navigation Blender and Godot share: a plain drag orbits,
+/// Shift+drag pans and Ctrl+drag dollies.
 fn middle_button_table(button: CameraButton, modifiers: Modifiers) -> Option<CameraNavigation> {
     if button != CameraButton::Middle || modifiers.alt {
         return None;
@@ -236,7 +254,8 @@ fn middle_button_table(button: CameraButton, modifiers: Modifiers) -> Option<Cam
     }
 }
 
-/// The Hamilton product of two `[x, y, z, w]` quaternions.
+/// The Hamilton product of two `[x, y, z, w]` quaternions: applying the
+/// result turns a vector by `right` first and then by `left`.
 fn quaternion_product(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
     let [left_x, left_y, left_z, left_w] = left;
     let [right_x, right_y, right_z, right_w] = right;
@@ -247,6 +266,10 @@ fn quaternion_product(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
         left_w * right_w - left_x * right_x - left_y * right_y - left_z * right_z,
     ]
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -265,8 +288,8 @@ mod tests {
             camera.eye()[1] - camera.pivot[1],
             DEFAULT_PITCH.sin() * camera.distance
         ));
-        // The eye sits one distance from the pivot, on the far side of the
-        // forward direction.
+        // The eye sits exactly `distance` away from the pivot, in the
+        // direction opposite to `forward`.
         let offset = [
             camera.eye()[0] - camera.pivot[0],
             camera.eye()[1] - camera.pivot[1],
@@ -282,15 +305,16 @@ mod tests {
         let before = camera.forward();
         camera.orbit(40.0, 0.0);
         assert!(!close(camera.forward()[0], before[0]), "yaw moved the view");
-        // The direction a horizontal drag turns the view is part of the
-        // contract: a drag to the right turns the view to the right, which
-        // swings the forward vector toward +X from a camera looking down -Z.
+        // A horizontal drag turns the view, and its direction is part of the
+        // contract: a drag to the right turns the view to the right. From a
+        // camera looking down -Z, that swings the forward vector toward +X.
         assert!(camera.yaw < 0.0, "a rightward drag turned the view left");
         assert!(
             camera.forward()[0] > 0.0,
             "the view turned toward -X on a rightward drag"
         );
-        // A drag far past the pole clamps instead of flipping.
+        // A drag far past the pole clamps the pitch instead of flipping it
+        // over.
         camera.orbit(0.0, 100_000.0);
         assert!(close(camera.pitch, MAX_PITCH));
         camera.orbit(0.0, -1_000_000.0);
@@ -367,9 +391,8 @@ mod tests {
             ),
             Some(CameraNavigation::Dolly)
         );
-        // Alt means "left-button navigation" in the presets that use it, so a
-        // middle-button drag with Alt held navigates nothing - the guard is a
-        // condition on `modifiers`, not a rebinding of them.
+        // Unity and Unreal navigate on Alt chords, so Blender's table treats a
+        // middle-button drag with Alt held as no gesture at all.
         assert_eq!(
             navigation_binding(
                 KeymapPreset::Blender,
@@ -381,12 +404,13 @@ mod tests {
             ),
             None
         );
-        // The left button is selection's, whatever the modifiers.
+        // In Blender's table the left button belongs to selection, whatever
+        // the modifiers.
         assert_eq!(
             navigation_binding(KeymapPreset::Blender, CameraButton::Left, modifiers),
             None
         );
-        // Godot shares Blender's middle-button table.
+        // Godot uses the same middle-button table as Blender.
         assert_eq!(
             navigation_binding(KeymapPreset::Godot, CameraButton::Middle, modifiers),
             Some(CameraNavigation::Orbit)

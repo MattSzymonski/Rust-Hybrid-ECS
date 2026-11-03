@@ -7,15 +7,16 @@
 //! - Enumerates the world for a tool rather than for a system: the entities
 //!   that exist, the component names attached to each, and which types are
 //!   registered at all.
-//! - Renders the archetype graph and estimates the world's memory, for the
-//!   diagnostics report.
+//! - Prints the archetype list, builds a Graphviz DOT description of the
+//!   archetype graph, and estimates the world's memory for telemetry.
 //!
 //! # Design
 //!
-//! Everything here is read-mostly and addressed by name rather than by type:
-//! the callers are the editor and the managed side, neither of which has the
-//! Rust type in hand. Names are what survive a reload, so a name is the only
-//! identity a tool can hold across one.
+//! Most of these methods only read the world, and they identify components and
+//! resources by name or id rather than by type, because the callers are tools
+//! (the editor, the managed side) that never hold the Rust type. A name is
+//! also the one identity that survives a reload: a tool keeps names between
+//! generations and resolves the ids again in each new one.
 
 use super::*;
 
@@ -24,11 +25,11 @@ use super::*;
 // =============================================================================
 
 impl World {
-    /// Return the field layout a component was registered with, as the editor
-    /// reads it: nested `struct:` fields flattened into dotted leaf rows.
+    /// Returns the field layout the editor reads: nested `struct:` fields
+    /// flattened into one dotted row per leaf (`position.x`).
     ///
-    /// `None` for components registered without field metadata, which is how
-    /// the editor decides a component is not field-editable.
+    /// `None` when the component was registered without field metadata. The
+    /// editor treats that as a component it cannot edit field by field.
     pub fn component_field_layout(
         &self,
         component_id: ComponentId,
@@ -38,12 +39,13 @@ impl World {
             .map(ComponentFieldLayout::fields)
     }
 
-    /// The same layout as declared, with no nested field flattened.
+    /// Returns the same layout as declared, with no nested field flattened.
     ///
     /// This is the form a generated mirror has to describe: the editor's view
     /// names leaf rows (`position.x`, `points[0].y`) that no struct declares.
-    /// `None` for components registered without field metadata, which is how
-    /// the C# codegen decides between a typed mirror and the ABI blob.
+    /// The C# codegen reads this to emit a typed mirror, and falls back to the
+    /// opaque ABI blob when a component was registered without field metadata
+    /// (`None` here).
     pub fn component_declared_field_layout(
         &self,
         component_id: ComponentId,
@@ -53,11 +55,13 @@ impl World {
             .map(ComponentFieldLayout::declared)
     }
 
-    /// The declared field layout of a foreign resource, if one was recorded.
+    /// Returns the field layout of a foreign resource.
     ///
-    /// The resource twin of [`Self::component_field_layout`]. `None` means the
-    /// resource was registered without a layout, which is the ordinary state
-    /// for a Rust resource: its fields are a Rust type's, not a manifest's.
+    /// This is the resource twin of [`Self::component_field_layout`]. A
+    /// resource's layout is never flattened, so its declared and editor views
+    /// are the same list. `None` means no layout was recorded, the ordinary
+    /// state for a Rust resource: its fields belong to a Rust type, not to a
+    /// manifest.
     #[must_use]
     pub fn resource_field_layout(
         &self,
@@ -68,22 +72,24 @@ impl World {
             .map(ComponentFieldLayout::fields)
     }
 
-    /// Record the declared field layout of a foreign resource.
+    /// Records the declared field layout of a foreign resource.
     ///
     /// Overwrites any previous layout for the same id, as
     /// [`Self::register_component_descriptor_with_layout`] does. **A relayout
-    /// clears it**, so it has to be called again after one: serving the
+    /// clears it**, so it has to be called again after one. Serving the
     /// previous generation's offsets over migrated bytes would be worse than
-    /// serving nothing, and a caller that forgets loses inspectability rather
-    /// than correctness.
+    /// serving nothing, so a caller that forgets loses inspectability, not
+    /// correctness.
     ///
     /// # Errors
     ///
     /// Returns [`ComponentFieldError::UnsupportedField`](crate::component_field::ComponentFieldError::UnsupportedField)
-    /// for a descriptor that reaches past the resource's registered size or
-    /// names a container tag: the bound keeps a reader inside the value, and
-    /// the tag check keeps it from following a `(pointer, length)` pair the
-    /// bytes never held.
+    /// when a field's offset and size overflow, when a field ends past the
+    /// registered size of the resource, or when a field carries a container
+    /// tag. The size check keeps a reader inside the value, and the tag check
+    /// keeps it from following a `(pointer, length)` pair that the bytes never
+    /// held. A resource with no registered factory has no size, so the check
+    /// has nothing to compare against.
     pub fn register_resource_field_layout(
         &mut self,
         resource_id: ResourceId,
@@ -94,7 +100,7 @@ impl World {
             .get(&resource_id)
             .map(|ops| ops.size);
         for field in &fields {
-            let Some(end) = field.offset.checked_add(field.size) else {
+            let Some(field_end) = field.offset.checked_add(field.size) else {
                 return Err(
                     crate::component_field::ComponentFieldError::UnsupportedField {
                         field: field.name.to_string(),
@@ -102,7 +108,7 @@ impl World {
                     },
                 );
             };
-            if resource_size.is_some_and(|size| end > size) {
+            if resource_size.is_some_and(|size| field_end > size) {
                 return Err(
                     crate::component_field::ComponentFieldError::UnsupportedField {
                         field: field.name.to_string(),
@@ -122,19 +128,20 @@ impl World {
         Ok(())
     }
 
-    /// Every live entity with its component type names, sorted by entity id.
+    /// Returns every live entity with the type names of its components, sorted
+    /// by the entity's slot id.
     ///
-    /// Read-only and tick-neutral: nothing is mutated and no change tick is
-    /// touched, so the editor can call this every refresh without disturbing
-    /// the simulation. Component names are resolved per archetype once and
-    /// shared across the entities of that archetype.
+    /// Read-only: nothing is mutated and no change tick is touched, so the
+    /// editor can call it on every refresh without disturbing the simulation.
+    /// Component names are resolved once per archetype and copied to each of
+    /// that archetype's entities.
     pub fn entity_rows(&self) -> Vec<EntityRow> {
-        // Step 1: Resolve each archetype's component names once; the string
-        // work is per archetype rather than per entity.
-        let mut archetype_names: HashMap<ArchetypeId, Vec<String>> =
+        // Step 1: Name each archetype's components once, so the string work is
+        // per archetype instead of per entity.
+        let mut component_names_by_archetype: HashMap<ArchetypeId, Vec<String>> =
             HashMap::with_capacity(self.archetypes.len());
         for (archetype_id, archetype) in &self.archetypes {
-            let names: Vec<String> = archetype
+            let component_names: Vec<String> = archetype
                 .component_types
                 .iter()
                 .filter_map(|component_id| {
@@ -143,31 +150,33 @@ impl World {
                         .map(str::to_string)
                 })
                 .collect();
-            archetype_names.insert(*archetype_id, names);
+            component_names_by_archetype.insert(*archetype_id, component_names);
         }
 
-        // Step 2: Assemble one row per live entity, cloning the shared names.
+        // Step 2: Build one row per live entity, copying its archetype's names.
         let mut rows: Vec<EntityRow> = self
             .entity_locations
             .iter()
             .map(|(entity, location)| EntityRow {
                 entity: *entity,
-                components: archetype_names
+                components: component_names_by_archetype
                     .get(&location.archetype_id)
                     .cloned()
                     .unwrap_or_default(),
             })
             .collect();
 
-        // Step 3: Deterministic ordering for the editor list.
+        // Step 3: Sort by slot id so the editor's list keeps the same order.
         rows.sort_by_key(|row| row.entity.id());
         rows
     }
 
-    /// Component type names attached to one entity, or `None` when it is dead.
+    /// Returns the component type names of one entity, or `None` when the
+    /// entity is not alive.
     ///
-    /// Names come from the entity's own archetype, never from a registry scan,
-    /// so the result is authoritative for the generation that created the data.
+    /// The names come from the components the entity's own archetype stores,
+    /// not from a scan of the registry, so a type that another generation
+    /// registered, but this entity does not have, never appears.
     pub fn entity_component_names(&self, entity: Entity) -> Option<Vec<String>> {
         let location = self.entity_locations.get(&entity)?;
         let archetype = self.archetypes.get(&location.archetype_id)?;
@@ -184,11 +193,17 @@ impl World {
         )
     }
 
-    /// Every registered component type: name plus current [`ComponentId`].
+    /// Returns every component the registry still holds: type name plus its
+    /// [`ComponentId`], sorted by name.
     ///
-    /// Names are the stable cross-reload key; ids are per-generation and must
-    /// not be cached across a reload. Used by the editor's add-component
-    /// picker, not by the per-frame snapshot.
+    /// The name is the key that survives a reload. A native component's id is
+    /// its Rust `TypeId`, which belongs to the build that declared the type
+    /// and is not stable across a reload, so an id must not be kept. The
+    /// registry may hold one entry per generation of a name.
+    ///
+    /// Used by the editor's component list (the add-component picker and the
+    /// snapshot's component tier) and by the C# bridge, to name the component a
+    /// binding points at.
     pub fn registered_components(&self) -> Vec<(String, ComponentId)> {
         let mut components: Vec<(String, ComponentId)> = self
             .component_registry
@@ -199,21 +214,24 @@ impl World {
         components
     }
 
-    /// Whether a component type is registered as persistable (schema-migrated
-    /// across reloads). Used by the editor to mark such components.
+    /// Returns whether a component type was registered as persistable.
+    ///
+    /// A persistable type registers the functions that save and restore its
+    /// rows, and a hash of its field schema, which is how a reload knows which
+    /// columns to migrate when the type's layout changed. The editor records
+    /// this per component in its snapshot.
     pub fn component_is_persistable(&self, component_id: ComponentId) -> bool {
         self.persist_inserters.contains_key(&component_id)
     }
 
-    /// The component id an entity's archetype actually stores for a registered
-    /// type name.
+    /// Returns the component id an entity's archetype stores for a registered
+    /// type name, or `None` when the entity does not have that component.
     ///
     /// Unlike [`Self::resolve_component_id_by_name_any`], which searches every
     /// generation the registry still remembers, this looks only at the columns
-    /// the entity really has. That makes it correct across reloads even when a
-    /// bit index was recycled, and it guarantees the returned id has a live
-    /// column, a live tick vector, and a field layout belonging to the
-    /// generation that created the data.
+    /// the entity really has. The answer therefore stays correct across
+    /// reloads, even when a bit index was reused, and it always names a column
+    /// of this entity's own archetype rather than one from another generation.
     pub fn resolve_entity_component_id(
         &self,
         entity: Entity,
@@ -228,10 +246,12 @@ impl World {
             .find(|component_id| self.component_registry.get_name(component_id) == Some(type_name))
     }
 
-    /// Return the byte size and alignment of a registered component's layout.
+    /// Returns the byte size and alignment of a registered component's
+    /// storage.
     ///
-    /// Works for both native (Rust) and descriptor (foreign-language) components.
-    /// Used by the C# backend to validate that a managed mirror struct has the
+    /// Works for native (Rust) and descriptor (foreign-language) components
+    /// alike, and returns `None` when no component is registered under the id.
+    /// The C# backend uses it to check that a managed mirror struct has the
     /// same ABI layout as the component an extension registered.
     pub fn component_layout(&self, component_id: ComponentId) -> Option<(usize, usize)> {
         match self.storage_factories.get(&component_id) {
@@ -241,11 +261,11 @@ impl World {
         }
     }
 
-    /// Log information about all archetypes in the world, as one multi-line
-    /// entry.
+    /// Logs one block describing every archetype in the world.
     ///
-    /// This displays the component types and entity count for each archetype,
-    /// useful for debugging and understanding the current state of the ECS.
+    /// Each line is one archetype with its id, its entity count and its
+    /// component type names, followed by a line with the world's total entity
+    /// count. Useful when debugging the ECS.
     pub fn print_archetypes(&self) {
         let mut lines: Vec<String> = self
             .archetypes
@@ -263,42 +283,48 @@ impl World {
         );
     }
 
-    /// Estimate the total memory footprint of the world in bytes.
+    /// Estimates the world's total memory use in bytes.
     ///
-    /// Sums all archetype storage, entity location map, resources,
-    /// and internal data structures.
+    /// Adds up the archetype storage (component columns, entities and change
+    /// ticks), the entity location map, the two stable-id maps, the resources,
+    /// the free-id list, the storage factories and the script updaters. The
+    /// per-entry numbers are fixed allowances rather than exact sizes, so the
+    /// result is an estimate.
     pub fn memory_estimate(&self) -> usize {
-        let mut total = 0usize;
+        let mut total_bytes = 0usize;
 
-        // Archetype storage (component columns + entities + ticks)
+        // Archetype storage: component columns, entities and change ticks.
         for archetype in self.archetypes.values() {
-            total += archetype.memory_estimate();
+            total_bytes += archetype.memory_estimate();
         }
 
-        // Entity location map, at a fixed per-entry allowance for the key, the
-        // value and the table overhead.
-        total += self.entity_locations.len() * 48;
+        // Entity location map, charged at a flat 48 bytes per entry for the
+        // key, the value and the table overhead.
+        total_bytes += self.entity_locations.len() * 48;
 
-        // Stable-id indexes: a handle-keyed map and its reverse, two entries
-        // per live entity at 16-byte keys and values plus table overhead.
-        total += self.entity_ids.len() * 48;
-        total += self.entity_handles.len() * 48;
+        // The two stable-id maps, handle to id and id back to handle. Between
+        // them they hold two entries per live entity, with 16-byte keys and
+        // values, each charged at 48 bytes.
+        total_bytes += self.entity_ids.len() * 48;
+        total_bytes += self.entity_handles.len() * 48;
 
-        // Resources: approximate based on type count
-        total += self.resources.len() * 128;
+        // Resources, at a flat allowance per type.
+        total_bytes += self.resources.len() * 128;
 
-        // Free entity IDs
-        total += self.free_entity_ids.capacity() * 12;
+        // The recycled-id free list, at its reserved capacity.
+        total_bytes += self.free_entity_ids.capacity() * 12;
 
-        // Storage factories and script data
-        total += self.storage_factories.len() * 128;
-        total += self.script_updaters.len() * 32;
+        // Storage factories and script updaters.
+        total_bytes += self.storage_factories.len() * 128;
+        total_bytes += self.script_updaters.len() * 32;
 
-        total
+        total_bytes
     }
 
-    /// Generate a Graphviz DOT representation of the world: one node per
-    /// archetype, labelled with its component names and entity count.
+    /// Builds a Graphviz DOT description of the world: one node per archetype,
+    /// labelled with its component names and entity count.
+    ///
+    /// A component whose id has no registered name appears as `?`.
     ///
     /// ```dot
     /// digraph World {
@@ -315,9 +341,9 @@ impl World {
             let component_names: Vec<String> = archetype
                 .component_types
                 .iter()
-                .map(|id| {
+                .map(|component_id| {
                     self.component_registry
-                        .get_name(id)
+                        .get_name(component_id)
                         .unwrap_or("?")
                         .to_string()
                 })

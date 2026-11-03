@@ -1,8 +1,5 @@
-//! The asset family's applier.
-//!
-//! The asset-file commands: import, remove, create, delete, restore, move,
-//! rename and settings - the family that touches the filesystem and the asset
-//! store, with its own rollback rules.
+//! Applies the asset-file command family: every editor command that reads or
+//! writes a file under the asset directory.
 //!
 //! # Responsibilities
 //!
@@ -15,15 +12,38 @@
 //!
 //! One `match` over the family's own variants, called from
 //! [`EditorCommand::apply_one`](super::EditorCommand). Every arm ends in a
-//! [`CommandOutcome`]: the inverse the history records, or `plain()` for a
-//! command that cannot be undone.
+//! [`CommandOutcome`]: the inverse the history records, or `plain()` when the
+//! command changed nothing and so has nothing to undo.
 
+// External crates
 use pill_engine::Engine;
 
+// Current crate
 use super::CommandOutcome;
 use super::*;
 
-/// Apply one asset command.
+/// Applies one asset command.
+///
+/// # Errors
+///
+/// A message naming the command and the reason when:
+///
+/// - a path is outside the asset directory, or names a module's resource,
+///   which the editor may only read;
+/// - a file cannot be read, written, copied, moved or removed, or the file a
+///   command would write already exists;
+/// - the engine has no asset directory, no registered asset type, no
+///   `AssetManager`, or no random source for a new guid;
+/// - a written asset does not load, or the file the new settings go into is
+///   not a JSON object.
+///
+/// A rollback that cannot finish adds the files it left on disk to the
+/// message.
+///
+/// # Panics
+///
+/// Panics when `command` belongs to another family; `EditorCommand::apply_one`
+/// routes only asset commands here.
 pub(super) fn apply(
     engine: &mut Engine,
     command: &EditorCommand,
@@ -33,8 +53,8 @@ pub(super) fn apply(
             sources,
             destination,
         } => {
-            // Validate every source before copying anything, so one bad
-            // path in a multi-file drop changes nothing.
+            // Check every source before copying anything, so one bad path in
+            // a multi-file drop changes nothing.
             for source in sources {
                 if !std::path::Path::new(source).is_file() {
                     return Err(format!("{command:?}: `{source}` is not a file"));
@@ -42,43 +62,42 @@ pub(super) fn apply(
             }
             std::fs::create_dir_all(destination)
                 .map_err(|error| format!("{command:?}: {error}"))?;
-            let mut created: Vec<String> = Vec::new();
+            let mut created_paths: Vec<String> = Vec::new();
             for source in sources {
                 let file_name = std::path::Path::new(source)
                     .file_name()
                     .ok_or_else(|| format!("{command:?}: `{source}` has no file name"))?;
-                let target = std::path::Path::new(destination).join(file_name);
-                // A source that already is the destination file - a drop
-                // of something the project already has - is nothing to
-                // copy; copying a file onto itself would at best fail and
-                // at worst truncate it.
+                let target_path = std::path::Path::new(destination).join(file_name);
+                // A source that is already the destination file (a drop of a
+                // file the project has) is skipped: copying a file onto
+                // itself would fail, and may truncate it.
                 let source_path = std::path::Path::new(source);
-                let same = match (source_path.canonicalize(), target.canonicalize()) {
+                let is_same_file = match (source_path.canonicalize(), target_path.canonicalize()) {
                     (Ok(source), Ok(target)) => source == target,
-                    _ => source_path == target,
+                    _ => source_path == target_path,
                 };
-                if same {
+                if is_same_file {
                     continue;
                 }
-                if let Err(error) = std::fs::copy(source, &target) {
-                    // The command's own copies go back; a removal that fails
-                    // names the file it left, so the failure is the whole
-                    // story rather than half of it.
-                    let left_behind = roll_back_files(&created);
+                if let Err(error) = std::fs::copy(source, &target_path) {
+                    // Take back the copies this command already made. A copy
+                    // that cannot be removed is named in the error, so the
+                    // failure says what is still on disk.
+                    let unremoved_paths = roll_back_files(&created_paths);
                     return Err(with_rollback_paths(
                         format!("{command:?}: {error}"),
-                        &left_behind,
+                        &unremoved_paths,
                     ));
                 }
-                created.push(target.to_string_lossy().into_owned());
+                created_paths.push(target_path.to_string_lossy().into_owned());
             }
-            if created.is_empty() {
+            if created_paths.is_empty() {
                 // Every source was already in place: nothing changed, and
                 // nothing is recorded.
                 return Ok(CommandOutcome::plain());
             }
             Ok(CommandOutcome::inverse(EditorCommand::RemoveFiles {
-                paths: created,
+                paths: created_paths,
                 sources: sources.clone(),
                 destination: destination.clone(),
             }))
@@ -115,9 +134,9 @@ pub(super) fn apply(
                 .get_resource::<pill_engine::ImportRegistry>()
                 .cloned()
                 .ok_or_else(|| format!("{command:?}: no asset types are registered"))?;
-            // The store is taken before the file is written: an engine
-            // without one must refuse the create, not leave a file no
-            // asset manager will ever hold.
+            // Take the asset store before the file is written: an engine
+            // without one must refuse the create rather than leave a file
+            // that no asset manager will ever hold.
             let assets = engine
                 .world_mut()
                 .get_resource_mut::<pill_engine::AssetManager>()
@@ -139,9 +158,9 @@ pub(super) fn apply(
             };
             let directory = root.join(&relative_folder);
             if !directory.is_dir() {
-                // A project whose asset directory does not exist yet gets
-                // its root made on demand; a named folder must exist, the
-                // same refusal the host's browser states.
+                // The asset root is created when the project has none yet.
+                // A folder below it must already exist; the development
+                // host's asset browser refuses the same create.
                 if relative_folder.as_os_str().is_empty() {
                     std::fs::create_dir_all(&directory)
                         .map_err(|error| format!("{command:?}: {error}"))?;
@@ -166,9 +185,9 @@ pub(super) fn apply(
                     asset_slash(&relative)
                 ));
             }
-            // What the replace overwrites, so a write that fails to load
-            // can be taken back byte for byte.
-            let previous = if existing {
+            // The bytes the replace overwrites, kept so a write that fails
+            // to load can be taken back byte for byte.
+            let previous_bytes = if existing {
                 Some(std::fs::read(&destination).map_err(|error| {
                     format!(
                         "{command:?}: cannot read `{}`: {error}",
@@ -178,12 +197,15 @@ pub(super) fn apply(
             } else {
                 None
             };
-            // The store's identity comes first: a path bound to a guid is
-            // what every reference names, so a file whose own header
-            // disagrees with it cannot take its place.
+            // The asset store's guid for this path wins. A reference to an
+            // asset is written as its guid, so the guid the store already
+            // holds is the one to keep; only a path the store does not know
+            // falls back to the guid in the file being replaced.
             let loaded_guid = registry.guid_by_path(assets, &relative);
             let kept_guid = match overwrite {
-                Some(true) => loaded_guid.or_else(|| previous.as_deref().and_then(document_guid)),
+                Some(true) => {
+                    loaded_guid.or_else(|| previous_bytes.as_deref().and_then(document_guid))
+                }
                 _ => None,
             };
             let document = registry
@@ -195,20 +217,21 @@ pub(super) fn apply(
                     format!("{command:?}: no random source for a guid: {error}")
                 })?,
             };
-            // A stale asset under this path would refuse the import, and
-            // the file is the truth now: a fresh guid unloads it, a kept
-            // one reloads it from the file written below.
+            // Drop an asset the store still holds under this path, unless
+            // this write keeps its guid: an import refuses a path that is
+            // loaded under a different guid than the file carries, and the
+            // file written below carries the guid chosen here.
             let reloads_loaded = loaded_guid == Some(guid);
             if loaded_guid.is_some() && !reloads_loaded {
                 registry.remove_loaded(assets, &relative);
             }
-            let file = serde_json::json!({
+            let file_document = serde_json::json!({
                 "format_version": pill_engine::asset_metadata::METADATA_FORMAT_VERSION,
                 "asset_type": type_name,
                 "guid": guid.to_string(),
                 "asset": document,
             });
-            let mut bytes = serde_json::to_vec_pretty(&file)
+            let mut bytes = serde_json::to_vec_pretty(&file_document)
                 .map_err(|error| format!("{command:?}: {error}"))?;
             bytes.push(b'\n');
             let sidecar = pill_engine::asset_metadata::metadata_path_for(&relative);
@@ -222,10 +245,11 @@ pub(super) fn apply(
                 pill_engine::asset_store::write_new(&destination, &bytes)
                     .map_err(|error| format!("{command:?}: {error}"))?;
             }
-            // An asset that was loaded keeps its handle, so the file is
-            // read again through the value - an import would answer with
-            // the handle it already has and decode nothing.
-            let loaded = if reloads_loaded {
+            // A kept guid means the store already holds this asset, and an
+            // import would hand back that handle without decoding the new
+            // file. A reimport reads the file again and replaces the value in
+            // place, so the handle stays valid.
+            let load_outcome = if reloads_loaded {
                 registry
                     .reimport(assets, &relative)
                     .map(|_| ())
@@ -240,26 +264,29 @@ pub(super) fn apply(
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             };
-            if let Err(error) = loaded {
-                // The file is only an asset once it loads, so a refusal
-                // takes the write back rather than leaving a file the
-                // project cannot read: a replaced file gets its previous
-                // bytes again, a new one goes.
-                let mut left_behind = Vec::new();
-                match previous {
-                    Some(previous) => {
-                        let restored =
-                            pill_engine::asset_store::write_replacing(&destination, &previous);
+            if let Err(error) = load_outcome {
+                // A file is only an asset once it loads. If it does not load,
+                // take the write back rather than leave a file the project
+                // cannot read: a replaced file gets its previous bytes again,
+                // a new file is removed, and so is the sidecar this import
+                // created.
+                let mut unremoved_paths = Vec::new();
+                match previous_bytes {
+                    Some(previous_bytes) => {
+                        let restored = pill_engine::asset_store::write_replacing(
+                            &destination,
+                            &previous_bytes,
+                        );
                         if restored.is_err() {
-                            left_behind.push(destination.display().to_string());
+                            unremoved_paths.push(destination.display().to_string());
                         }
                     }
                     None => {
-                        let destination = destination.display().to_string();
-                        left_behind.extend(roll_back_files(&[destination]));
+                        let destination_text = destination.display().to_string();
+                        unremoved_paths.extend(roll_back_files(&[destination_text]));
                         if let Some(meta) = sidecar.filter(|_| !sidecar_existed) {
-                            let meta = root.join(meta).display().to_string();
-                            left_behind.extend(roll_back_files(&[meta]));
+                            let meta_text = root.join(meta).display().to_string();
+                            unremoved_paths.extend(roll_back_files(&[meta_text]));
                         }
                     }
                 }
@@ -268,7 +295,7 @@ pub(super) fn apply(
                         "{command:?}: `{}` did not load: {error}",
                         asset_slash(&relative)
                     ),
-                    &left_behind,
+                    &unremoved_paths,
                 ));
             }
             Ok(CommandOutcome::inverse(EditorCommand::DeleteAssetFile {
@@ -281,8 +308,8 @@ pub(super) fn apply(
             let relative = pill_engine::asset_metadata::checked_relative(path)
                 .map_err(|message| format!("{command:?}: {message}"))?;
             refuse_module_resource(command, &relative)?;
-            let file = root.join(&relative);
-            let bytes = std::fs::read(&file)
+            let asset_file = root.join(&relative);
+            let bytes = std::fs::read(&asset_file)
                 .map_err(|error| format!("{command:?}: cannot read `{path}`: {error}"))?;
             let meta_relative = pill_engine::asset_metadata::metadata_path_for(&relative);
             let meta = match &meta_relative {
@@ -293,16 +320,17 @@ pub(super) fn apply(
                 },
                 None => None,
             };
-            std::fs::remove_file(&file)
+            std::fs::remove_file(&asset_file)
                 .map_err(|error| format!("{command:?}: cannot delete `{path}`: {error}"))?;
-            if let Some(meta) = meta_relative {
-                match std::fs::remove_file(root.join(&meta)) {
+            if let Some(meta_relative) = meta_relative {
+                match std::fs::remove_file(root.join(&meta_relative)) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
-                        // The asset file is already gone; put it back, so a
-                        // delete that cannot finish leaves nothing behind.
-                        return Err(match write_asset_bytes(&file, &bytes) {
+                        // The asset file is already deleted. Put it back, so
+                        // a delete that fails on the sidecar leaves the asset
+                        // as it was.
+                        return Err(match write_asset_bytes(&asset_file, &bytes) {
                             Ok(()) => format!(
                                 "{command:?}: cannot delete `{path}`'s sidecar, so nothing was deleted: {error}"
                             ),
@@ -313,9 +341,10 @@ pub(super) fn apply(
                     }
                 }
             }
-            // The file is gone, so the asset it held must go with it: a
-            // re-created path would otherwise collide with the loaded
-            // value on the guid the create writes.
+            // The file is gone, so drop the asset the store still holds for
+            // this path. A file that appears here again carries its own guid,
+            // and an import refuses a path that is loaded under a different
+            // guid than the file.
             if let Some(registry) = engine
                 .world()
                 .get_resource::<pill_engine::ImportRegistry>()
@@ -347,12 +376,13 @@ pub(super) fn apply(
                 match meta {
                     Some(meta) => write_asset_bytes(&meta_path, meta)
                         .map_err(|message| format!("{command:?}: {message}"))?,
-                    // A file that had no sidecar restores without one;
-                    // anything sitting there now is an orphan, and a
-                    // removal that fails says which one.
+                    // The deleted asset had no sidecar, so the restore writes
+                    // none. A sidecar sitting there now belongs to nothing,
+                    // and is removed; one that cannot be removed is named in
+                    // the warning.
                     None => {
-                        let meta = meta_path.display().to_string();
-                        warn_left_behind(&roll_back_files(&[meta]));
+                        let meta_text = meta_path.display().to_string();
+                        warn_left_behind(&roll_back_files(&[meta_text]));
                     }
                 }
             }
@@ -398,11 +428,11 @@ pub(super) fn apply(
             };
             let meta_path = root.join(&meta_relative);
             if meta_path.is_file() {
-                // A sidecar that carries a guid is not missing: nothing
-                // changes, nothing is recorded. One left empty or
-                // unreadable by an interrupted write counts as missing
-                // and is replaced; the undo removes the replacement.
-                let usable = std::fs::read_to_string(&meta_path)
+                // A sidecar that already holds a guid is not missing: nothing
+                // changes and nothing is recorded. A sidecar left empty or
+                // unreadable by an interrupted write counts as missing and is
+                // replaced; the undo removes the replacement.
+                let carries_guid = std::fs::read_to_string(&meta_path)
                     .ok()
                     .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
                     .and_then(|document| {
@@ -412,7 +442,7 @@ pub(super) fn apply(
                             .map(str::to_owned)
                     })
                     .is_some();
-                if usable {
+                if carries_guid {
                     return Ok(CommandOutcome::plain());
                 }
                 std::fs::remove_file(&meta_path)
@@ -454,24 +484,24 @@ pub(super) fn apply(
                 .type_for_extension(&extension)
                 .ok_or_else(|| format!("{command:?}: no asset type imports `.{extension}` files"))?
                 .to_owned();
-            let normalized = registry
+            let normalized_settings = registry
                 .normalize_settings_json(&type_name, settings.clone())
                 .map_err(|error| format!("{command:?}: {error}"))?;
-            let previous = registry
+            let previous_settings = registry
                 .settings_json(&relative)
                 .map_err(|error| format!("{command:?}: {error}"))?;
-            let standalone = registry.is_standalone_extension(&extension);
-            let body_field = if standalone { "asset" } else { "settings" };
-            let file = if standalone {
+            let is_standalone = registry.is_standalone_extension(&extension);
+            let body_field = if is_standalone { "asset" } else { "settings" };
+            let settings_file = if is_standalone {
                 root.join(&relative)
             } else {
                 let meta_relative = pill_engine::asset_metadata::metadata_path_for(&relative)
                     .ok_or_else(|| format!("{command:?}: `{path}` cannot have a sidecar"))?;
-                let file = root.join(&meta_relative);
-                if !file.is_file() {
-                    // The import writes the sidecar with the type's
-                    // defaults and a guid, which the write below then
-                    // replaces.
+                let settings_file = root.join(&meta_relative);
+                if !settings_file.is_file() {
+                    // The import writes the sidecar with the type's default
+                    // settings and a guid. The write below then rewrites that
+                    // document with the new settings and the same guid.
                     let assets = engine
                         .world_mut()
                         .get_resource_mut::<pill_engine::AssetManager>()
@@ -484,29 +514,35 @@ pub(super) fn apply(
                         )
                         .map_err(|error| format!("{command:?}: {error}"))?;
                 }
-                file
+                settings_file
             };
-            let text = std::fs::read_to_string(&file).map_err(|error| {
-                format!("{command:?}: cannot read `{}`: {error}", file.display())
+            let text = std::fs::read_to_string(&settings_file).map_err(|error| {
+                format!(
+                    "{command:?}: cannot read `{}`: {error}",
+                    settings_file.display()
+                )
             })?;
             let mut document: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
                 format!(
                     "{command:?}: `{}` is not valid JSON: {error}",
-                    file.display()
+                    settings_file.display()
                 )
             })?;
-            let object = document
-                .as_object_mut()
-                .ok_or_else(|| format!("{command:?}: `{}` is not a JSON object", file.display()))?;
-            object.insert(body_field.to_owned(), normalized);
+            let document_object = document.as_object_mut().ok_or_else(|| {
+                format!(
+                    "{command:?}: `{}` is not a JSON object",
+                    settings_file.display()
+                )
+            })?;
+            document_object.insert(body_field.to_owned(), normalized_settings);
             let mut bytes = serde_json::to_vec_pretty(&document)
                 .map_err(|error| format!("{command:?}: {error}"))?;
             bytes.push(b'\n');
-            write_asset_bytes(&file, &bytes)
+            write_asset_bytes(&settings_file, &bytes)
                 .map_err(|message| format!("{command:?}: {message}"))?;
             Ok(CommandOutcome::inverse(EditorCommand::SetAssetSettings {
                 path: path.clone(),
-                settings: previous,
+                settings: previous_settings,
             }))
         }
 

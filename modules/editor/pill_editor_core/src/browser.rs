@@ -1,5 +1,5 @@
-//! The Assets tab's project browser: the folder the grid lists, the tree's
-//! open folders, and the listing math both panes share.
+//! The Assets tab's project browser: the folder the grid lists, the folders
+//! the tree has open, and the listing helpers the panes use.
 //!
 //! # Responsibilities
 //!
@@ -8,22 +8,22 @@
 //!   draws.
 //! - The panel's roots ([`ROOTS`], [`is_root`], [`root_of`]): the project's
 //!   own tree, and every extension's read-only resources beside it.
-//! - The listing math both panes read: [`children`], [`child_folders`],
+//! - The listing helpers the panes use: [`children`], [`child_folders`],
 //!   [`breadcrumb`], [`parent_folder`], [`file_name`] and [`tile_columns`].
-//! - [`drop_folder_relative`]: where a dropped file lands, validated so a
-//!   folder outside the asset directory is refused rather than joined.
+//! - [`drop_folder_relative`]: where a dropped file goes, checked so a
+//!   folder outside the asset directory is refused instead of joined.
 //!
 //! # Design
 //!
-//! The snapshot's asset listing is one flat, project-relative list of files
-//! and folders ([`AssetListing`]), so both panes derive what they show from
-//! that list: the tree walks its folder rows, the grid keeps the open
-//! folder's direct children, and the breadcrumb cuts the open folder's path.
-//! The panel's roots are the exception that shapes the rest: a row whose key
-//! *is* a root is never listed as somebody's child, so the extensions' rows
-//! reach the tree only through their own root row. Nothing here touches egui
-//! or the disk, which is what lets the tree, the grid, the breadcrumb and the
-//! scripted channel agree on one state.
+//! The snapshot lists every file and folder in one flat list of
+//! [`AssetListing`] rows. Each row names the root it came from and its path
+//! inside that root, so both panes build what they show from the same list:
+//! the tree walks the folder rows, the grid keeps the open folder's direct
+//! children, and the breadcrumb cuts the open folder's path into segments.
+//! A row whose key is a root is never listed as another row's child, so the
+//! extensions' rows reach the tree only through their own root row. Nothing
+//! here touches egui or the disk, which lets the tree, the grid, the
+//! breadcrumb and the scripted channel agree on one state.
 
 // Standard library
 use std::collections::BTreeSet;
@@ -36,28 +36,16 @@ use pill_core::telemetry::telemetry_target;
 // Current crate
 use crate::editor_state::{AssetListing, EXTENSIONS_ROOT};
 
-/// The label the project's root row and the breadcrumb start with.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The label of the project's root row. Inside the project's tree it is also
+/// the breadcrumb's first segment.
 pub const ROOT_LABEL: &str = "Assets";
 
-/// One root of the Assets panel: the key it opens and the label its row
-/// carries.
-///
-/// A root is the panel's own level, not a folder inside another root's tree:
-/// the tree draws both of them at the left edge, and a row whose key *is* a
-/// root is never listed as somebody's child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AssetRoot {
-    /// The key the root's row opens; empty for the project's own tree.
-    pub key: &'static str,
-    /// The label the root's row and the breadcrumb's first segment carry.
-    pub label: &'static str,
-    /// Whether everything below the root is an extension's read-only
-    /// resource: listed and inspected, never written into.
-    pub read_only: bool,
-}
-
-/// The panel's roots, in the order its tree draws them: the project's own
-/// assets first, every extension's resources beside them.
+/// The panel's roots, in the order the tree draws them: the project's own
+/// assets first, then every extension's read-only resources.
 pub const ROOTS: [AssetRoot; 2] = [
     AssetRoot {
         key: "",
@@ -71,53 +59,58 @@ pub const ROOTS: [AssetRoot; 2] = [
     },
 ];
 
-/// Whether `key` is one of the panel's roots.
-pub fn is_root(key: &str) -> bool {
-    ROOTS.iter().any(|root| root.key == key)
-}
-
-/// The root `folder` belongs to: the extensions' for everything under
-/// [`EXTENSIONS_ROOT`], the project's tree for anything else.
-pub fn root_of(folder: &str) -> AssetRoot {
-    ROOTS
-        .iter()
-        .copied()
-        .rfind(|root| {
-            !root.key.is_empty()
-                && (folder == root.key || folder.starts_with(&format!("{}/", root.key)))
-        })
-        .unwrap_or(ROOTS[0])
-}
-
 /// The tile size the grid starts at, in points.
 pub const DEFAULT_TILE_SIZE: f32 = 72.0;
 
 /// The tile sizes the grid's slider spans, in points.
 pub const TILE_SIZE_RANGE: RangeInclusive<f32> = 40.0..=120.0;
 
-/// The Assets tab's project browser: the two panes' shared state.
+// =============================================================================
+// Types
+// =============================================================================
+
+/// One root of the Assets panel: the key that opening its row sets, and the
+/// label the row shows.
 ///
-/// Session-scoped, like the toolbox: a restart starts the browser at the
-/// project's asset root. The state lives in the shared `dylib` with the rest
-/// of the session, so a shell reload keeps the folder the user was looking
-/// at.
+/// A root sits at the panel's own level. It is not a folder inside another
+/// root's tree: the tree draws both roots at the left edge, and a row whose
+/// key is a root is never listed as another row's child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssetRoot {
+    /// The key the root's row opens in the grid. Empty for the project's own
+    /// tree.
+    pub key: &'static str,
+    /// The label the root's row and the breadcrumb's first segment show.
+    pub label: &'static str,
+    /// Whether everything below the root is an extension's resource that may
+    /// be listed and inspected but never written into.
+    pub read_only: bool,
+}
+
+/// The Assets tab's project browser: the state both panes share.
+///
+/// It lives for one session, like the viewport toolbox: a restart starts the
+/// browser at the project's asset root. The state sits in the shared `dylib`
+/// with the rest of the session, so a shell reload keeps the folder the user
+/// was looking at.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectBrowser {
-    /// The folder the grid lists, relative to the asset root; empty for the
+    /// The folder the grid lists, as a path from the asset root: empty for the
     /// root itself.
     pub folder: String,
-    /// The folders whose tree rows show their children.
+    /// The folders whose tree rows are open, so their children are shown.
     pub expanded: BTreeSet<String>,
     /// The tile size the grid draws, in points.
     pub tile_size: f32,
-    /// Each tile's last logged rectangle, keyed by its path: logged once per
-    /// placement, so a suite can drag a tile without reading pixels.
+    /// Each tile's last logged rectangle, keyed by the tile's path. A
+    /// rectangle is logged once per placement, so a test suite can drag a
+    /// tile without reading pixels.
     pub tile_rects: Vec<(String, [f32; 4])>,
-    /// Each folder tree row's last logged rectangle, keyed by the folder: what
-    /// a suite right-clicks without reading pixels.
+    /// Each folder tree row's last logged rectangle, keyed by the folder. A
+    /// test suite right-clicks a row through it without reading pixels.
     pub tree_rects: Vec<(String, [f32; 4])>,
-    /// The grid pane's last logged rectangle: the area whose right-click opens
-    /// the container menu.
+    /// The grid pane's last logged rectangle. A right-click on the empty space
+    /// inside it opens the open folder's menu.
     pub pane_rect: Option<[f32; 4]>,
 }
 
@@ -135,11 +128,11 @@ impl Default for ProjectBrowser {
 }
 
 impl ProjectBrowser {
-    /// Open `folder` in the grid, logging the token the suite watches.
-    /// Returns whether the open folder changed.
+    /// Opens `folder` in the grid and returns whether the open folder changed.
     ///
-    /// The folder's ancestors open in the tree with it, so the tree always
-    /// shows where the grid is looking.
+    /// The call logs the `[editor] browser folder` line the suites watch. The
+    /// folder's ancestors open in the tree too, so the tree always shows where
+    /// the grid is looking.
     pub fn open(&mut self, folder: &str) -> bool {
         let folder = folder.trim_matches('/').to_string();
         self.expand_ancestors(&folder);
@@ -155,7 +148,8 @@ impl ProjectBrowser {
         true
     }
 
-    /// Open or close a folder's tree row. Returns whether it moved.
+    /// Opens a closed folder's tree row, or closes an open one, and returns
+    /// whether the folder is now open.
     pub fn toggle_expanded(&mut self, folder: &str) -> bool {
         if self.expanded.contains(folder) {
             self.expanded.remove(folder);
@@ -166,13 +160,13 @@ impl ProjectBrowser {
         }
     }
 
-    /// Whether the tree shows `folder` open.
+    /// Returns whether the tree shows `folder` open.
     pub fn is_expanded(&self, folder: &str) -> bool {
         self.expanded.contains(folder)
     }
 
-    /// Open every ancestor of `path` in the tree, so a folder the grid shows
-    /// or a file the selection names has a visible row.
+    /// Opens every ancestor of `path` in the tree, so the tree shows the
+    /// folder that holds it.
     pub fn expand_ancestors(&mut self, path: &str) {
         let mut ancestor = parent_folder(path);
         while !ancestor.is_empty() {
@@ -181,15 +175,15 @@ impl ProjectBrowser {
         }
     }
 
-    /// Fall back to the nearest folder the listing still holds when the open
-    /// folder vanished (deleted, renamed, or the project reloaded onto
-    /// another tree). Returns whether the open folder changed.
+    /// Moves the open folder to the nearest one the listing still holds, when
+    /// the open folder has vanished: it was deleted or renamed, or the project
+    /// reloaded onto another tree. Returns whether the open folder changed.
     pub fn settle(&mut self, assets: &[AssetListing]) -> bool {
+        // Step 1: check that the open folder still exists. A root always
+        // does: the panel draws its row itself, so no listing row can vanish.
         if self.folder.is_empty() {
             return false;
         }
-        // A root has no row of its own - the panel draws it - so it can never
-        // vanish the way a folder can.
         let exists = is_root(&self.folder)
             || assets
                 .iter()
@@ -197,28 +191,53 @@ impl ProjectBrowser {
         if exists {
             return false;
         }
-        let mut fallback = parent_folder(&self.folder).to_string();
-        while !fallback.is_empty() {
-            if is_root(&fallback)
+        // Step 2: climb to the nearest ancestor the listing still holds.
+        let mut fallback_folder = parent_folder(&self.folder).to_string();
+        while !fallback_folder.is_empty() {
+            if is_root(&fallback_folder)
                 || assets
                     .iter()
-                    .any(|row| is_folder(row) && row.key() == fallback)
+                    .any(|row| is_folder(row) && row.key() == fallback_folder)
             {
-                return self.open(&fallback);
+                return self.open(&fallback_folder);
             }
-            fallback = parent_folder(&fallback).to_string();
+            fallback_folder = parent_folder(&fallback_folder).to_string();
         }
+        // Step 3: nothing above it survived, so open the asset root.
         self.open("")
     }
 }
 
-/// Whether a row is a folder: the one kind the tree and the grid treat
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns whether `key` is one of the panel's roots.
+pub fn is_root(key: &str) -> bool {
+    ROOTS.iter().any(|root| root.key == key)
+}
+
+/// Returns the root `folder` belongs to: the extensions root for everything
+/// under [`EXTENSIONS_ROOT`], the project's tree for anything else.
+pub fn root_of(folder: &str) -> AssetRoot {
+    ROOTS
+        .iter()
+        .copied()
+        .rfind(|root| {
+            !root.key.is_empty()
+                && (folder == root.key || folder.starts_with(&format!("{}/", root.key)))
+        })
+        .unwrap_or(ROOTS[0])
+}
+
+/// Returns whether a row is a folder: the one kind the tree and the grid treat
 /// differently.
 pub fn is_folder(row: &AssetListing) -> bool {
     row.kind.is_folder()
 }
 
-/// The folder a path lives in: its parent, or empty for the asset root.
+/// Returns the folder a path lives in: its parent, or empty for the asset
+/// root.
 pub fn parent_folder(path: &str) -> &str {
     match path.rsplit_once('/') {
         Some((parent, _)) => parent,
@@ -226,22 +245,22 @@ pub fn parent_folder(path: &str) -> &str {
     }
 }
 
-/// A path's own name: its last `/`-separated segment.
+/// Returns a path's own name: its last `/`-separated segment.
 pub fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Whether `path` is a direct child of `folder` (the empty folder is the
-/// asset root).
+/// Returns whether `path` is a direct child of `folder`. The empty folder is
+/// the asset root.
 pub fn is_direct_child(path: &str, folder: &str) -> bool {
     parent_folder(path) == folder
 }
 
-/// The direct children of `folder`, folders first and each group in
-/// case-insensitive name order - the order both panes list them in.
+/// Returns the direct children of `folder`: folders first, then files, each
+/// group in case-insensitive name order. Both panes list rows in this order.
 ///
-/// A root's row is never a child: the panel draws its roots at its own level,
-/// so the project's tree holds the project's content alone.
+/// A root's row is never a child, because the panel draws its roots at its own
+/// level. That keeps the project's tree to the project's own content.
 pub fn children<'a>(assets: &'a [AssetListing], folder: &str) -> Vec<&'a AssetListing> {
     let mut rows: Vec<&AssetListing> = assets
         .iter()
@@ -254,7 +273,7 @@ pub fn children<'a>(assets: &'a [AssetListing], folder: &str) -> Vec<&'a AssetLi
     rows
 }
 
-/// The direct child folders of `folder`, in the same order [`children`]
+/// Returns the direct child folders of `folder`, in the order [`children`]
 /// lists them.
 pub fn child_folders<'a>(assets: &'a [AssetListing], folder: &str) -> Vec<&'a AssetListing> {
     let mut rows: Vec<&AssetListing> = assets
@@ -268,15 +287,16 @@ pub fn child_folders<'a>(assets: &'a [AssetListing], folder: &str) -> Vec<&'a As
     rows
 }
 
-/// The breadcrumb of `folder`: the root it belongs to first, then one
-/// `(path, label)` per segment, each path cumulative - so a click can open
-/// any ancestor.
+/// Builds the breadcrumb of `folder`: the root it belongs to, then one
+/// `(path, label)` pair per segment. Each path holds the segments up to it, so
+/// a click on a label can open that ancestor.
 pub fn breadcrumb(folder: &str) -> Vec<(String, String)> {
     let root = root_of(folder);
     let mut segments = vec![(root.key.to_string(), root.label.to_string())];
     let mut cumulative = root.key.to_string();
-    // The root's own segment is already in place; the rest starts after it.
-    let rest = if root.key.is_empty() {
+    // The root's segment is already in place, so only the part after it is
+    // split.
+    let path_below_root = if root.key.is_empty() {
         folder
     } else {
         folder
@@ -284,7 +304,10 @@ pub fn breadcrumb(folder: &str) -> Vec<(String, String)> {
             .unwrap_or(folder)
             .trim_start_matches('/')
     };
-    for segment in rest.split('/').filter(|segment| !segment.is_empty()) {
+    for segment in path_below_root
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
         if !cumulative.is_empty() {
             cumulative.push('/');
         }
@@ -294,46 +317,52 @@ pub fn breadcrumb(folder: &str) -> Vec<(String, String)> {
     segments
 }
 
-/// How many tiles fit across `available_width` points when each cell takes
-/// `cell_width` - at least one, so a narrow pane still draws its rows.
+/// Returns how many tiles fit across `available_width` points when each cell
+/// takes `cell_width` points. The count is never zero, so a narrow pane still
+/// draws its rows.
 pub fn tile_columns(available_width: f32, cell_width: f32) -> usize {
-    // A zero, negative, NaN or infinite cell has no honest column count.
+    // A zero, negative or non-finite cell width gives no sensible column
+    // count.
     if !cell_width.is_finite() || cell_width <= 0.0 {
         return 1;
     }
     ((available_width / cell_width).floor() as usize).max(1)
 }
 
-/// The folder a drop lands in, relative to the asset root, from the browser's
-/// `res/…` folder label.
+/// Returns the folder a drop lands in, relative to the asset root, from the
+/// browser's folder label.
 ///
-/// `res` itself is the asset root - an empty relative path - and everything
-/// under it goes through the same validator every other asset command uses, so
-/// a folder the scripted channel climbed out of (`res/../..`) is refused
-/// instead of joined onto the root: the copy would land outside the project.
+/// `res` itself is the asset root, so it becomes an empty relative path. Every
+/// other folder goes through the same validator every asset command uses. A
+/// folder that climbed out of the root (`res/../..`) is therefore refused
+/// instead of joined onto it, so the copy cannot land outside the project.
 ///
 /// # Errors
 ///
 /// The validator's message when the folder is not a path inside the asset
 /// directory.
 pub fn drop_folder_relative(folder: &str) -> Result<PathBuf, String> {
-    let sub_folder = match folder {
+    let relative_folder = match folder {
         "res" => "",
         other => other.strip_prefix("res/").unwrap_or(other),
     };
-    if sub_folder.is_empty() {
+    if relative_folder.is_empty() {
         return Ok(PathBuf::new());
     }
-    pill_engine::asset_metadata::checked_relative(sub_folder)
+    pill_engine::asset_metadata::checked_relative(relative_folder)
 }
 
-/// Folders before files, then case-insensitive by name.
+/// Sorts rows with folders first, then by name without regard to case.
 ///
-/// The name comes from the row's key, not from its own path: a module root's
-/// row carries an empty path, so its name only exists in the key.
+/// The name is read from the row's key, not from its path: a module root's row
+/// carries an empty path, so the key is the only place its name exists.
 fn sort_rows(rows: &mut [&AssetListing]) {
     rows.sort_by_cached_key(|row| (!is_folder(row), file_name(&row.key()).to_lowercase()));
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -382,16 +411,16 @@ mod tests {
     }
 
     /// An extension's module and one folder inside it, as the host lists them.
-    fn with_a_module() -> Vec<AssetListing> {
+    fn listing_with_a_module() -> Vec<AssetListing> {
         let mut assets = listing();
         assets.push(module_row("pill_master_renderer_data", ""));
         assets.push(module_row("pill_master_renderer_data", "defaults"));
         assets
     }
 
-    /// The folder sentinel is a type now, so only the label `folder` makes a
-    /// row a folder: a type path that ends in `Folder`, or a near miss of the
-    /// label, is a file the tree lists and the toolbar may write.
+    /// Only the exact label `folder` makes a row a folder. A type path that
+    /// ends in `Folder`, or a near miss of the label, is a file: the tree lists
+    /// it, and the toolbar may write to it.
     #[test]
     fn only_the_folder_label_makes_a_folder() {
         assert!(is_folder(&row("models", "folder")));
@@ -401,11 +430,11 @@ mod tests {
         assert!(!is_folder(&row("models/odd.folder", "file")));
     }
 
-    /// The panel has two roots, and an extension's resources hang under theirs
-    /// rather than inside the project's tree.
+    /// The panel has two roots, and an extension's resources sit under their
+    /// own root rather than inside the project's tree.
     #[test]
     fn the_extensions_root_sits_beside_the_project_tree() {
-        let assets = with_a_module();
+        let assets = listing_with_a_module();
 
         let top: Vec<String> = children(&assets, "").iter().map(|row| row.key()).collect();
         assert_eq!(top, vec!["models", "shaders", "textures", "config.ini"]);
@@ -426,14 +455,14 @@ mod tests {
             vec!["extensions/pill_master_renderer_data/defaults".to_string()]
         );
 
-        // A browser sitting in a module's tree settles onto the folder it lists.
+        // A browser opened inside a module's tree keeps the folder it lists.
         let mut browser = ProjectBrowser::default();
         assert!(browser.open("extensions/pill_master_renderer_data/defaults"));
         assert!(!browser.settle(&assets));
     }
 
-    /// A root has no row of its own, so it never settles away - and a folder
-    /// whose module unloaded lands back on the root it hung under.
+    /// A root has no row of its own, so it never falls back. A folder whose
+    /// module unloaded moves to the root that held it.
     #[test]
     fn the_extensions_root_outlives_the_rows_below_it() {
         let mut browser = ProjectBrowser::default();
@@ -544,12 +573,12 @@ mod tests {
         ];
         assert!(browser.settle(&assets));
         assert_eq!(browser.folder, "models");
-        // A tree without the folder at all lands on the root.
+        // A tree that lacks the folder entirely falls back to the asset root.
         let mut browser = ProjectBrowser::default();
         browser.open("gone/deeper");
         assert!(browser.settle(&assets));
         assert_eq!(browser.folder, "");
-        // The root never settles away.
+        // A root never falls back.
         assert!(!browser.settle(&assets));
     }
 

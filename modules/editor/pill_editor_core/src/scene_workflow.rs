@@ -1,20 +1,23 @@
-//! The editor's open scene: which `.scene` the world came from, whether it is
-//! dirty, and the file operations behind New, Open, Save and Save As.
+//! The editor's open scene: which `.scene` the world came from, whether it
+//! changed since the last save, and the file operations behind New, Open, Save
+//! and Save As.
 //!
 //! # Responsibilities
 //!
 //! - [`SceneSession`]: the open scene's path and guid, and the unsaved marker
-//!   every recorded edit raises. A world resource, so a shell or executable
-//!   reload keeps it.
-//! - [`new_scene`], [`open_scene`], [`write_scene`]: the three file operations,
-//!   over the engine's [`save_scene`]/[`load_scene`].
+//!   every undoable command sets. A world resource, so reloading the editor
+//!   shell keeps the open document.
+//! - [`new_scene`], [`open_scene`], [`write_scene`]: the scene commands behind
+//!   New, Open and Save. Open and Save go through the engine's
+//!   [`import_scene_document`], [`load_scene`] and [`save_scene`].
 //!
 //! # Design
 //!
 //! The engine owns serialization; this module owns the document's *identity* -
-//! the path it was read from and the guid written into it - because that is
-//! what Save needs and what the title shows. Opening replaces the world, so the
-//! command history and selection go with it: their steps name entities the
+//! the path it was read from and the guid written into it. Save needs that
+//! identity, and the scene title is built from it. Opening or starting a new
+//! scene replaces the world, so the command history and the selection go with
+//! it. The history's steps and the selection both name entities that the
 //! previous document owned.
 
 // Standard library
@@ -29,7 +32,11 @@ use pill_engine::{
 // Current crate
 use crate::editor_state::{EditorCommand, EditorSelection};
 
-/// The `.scene` the editor's world currently is.
+// =============================================================================
+// Types
+// =============================================================================
+
+/// Which `.scene` file the editor's world came from: its path and its guid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenScene {
     /// The scene's path below the asset directory, `/`-separated.
@@ -39,20 +46,23 @@ pub struct OpenScene {
     pub guid: AssetGuid,
 }
 
-/// The editor's document state: what is open, and whether it has unsaved
-/// edits.
+/// The editor's document state: the scene file that is open and the unsaved
+/// marker.
 #[derive(Default)]
 pub struct SceneSession {
-    /// The open scene, or `None` for a world that was never saved.
+    /// The scene file the world came from, or `None` when no file backs it
+    /// (a new scene).
     pub open: Option<OpenScene>,
-    /// Whether a recorded edit happened since the last save or open.
+    /// Whether an undoable command has run since the scene was last saved or
+    /// opened.
     pub dirty: bool,
 }
 
 impl Resource for SceneSession {}
 
 impl SceneSession {
-    /// Re-claim the resource across a reload, keeping the live document state.
+    /// Register the resource, and keep the value already in the world, so a
+    /// reload does not reset the open scene.
     pub fn ensure(world: &mut World) {
         world.register_resource::<SceneSession>();
         if world.get_resource::<SceneSession>().is_none() {
@@ -60,11 +70,11 @@ impl SceneSession {
         }
     }
 
-    /// What the title bar shows: the scene's file name, or `untitled`, with a
-    /// trailing `*` while there are unsaved edits.
+    /// The open scene's display name: the scene's file name, or `untitled`,
+    /// with ` *` appended while the scene is marked dirty.
     #[must_use]
     pub fn title(&self) -> String {
-        let name = match &self.open {
+        let display_name = match &self.open {
             Some(open) => open
                 .path
                 .rsplit('/')
@@ -74,54 +84,65 @@ impl SceneSession {
             None => "untitled".to_string(),
         };
         if self.dirty {
-            format!("{name} *")
+            format!("{display_name} *")
         } else {
-            name
+            display_name
         }
     }
 }
 
-/// Note that an edit touched the open document.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Mark the document as changed since it was last saved or opened.
 ///
-/// Called once per recorded step that applied; the document commands reset
-/// the marker themselves.
+/// Called after each undoable command that applied, including selection and
+/// asset-file commands. The scene commands clear the marker themselves when
+/// they start, open or save a scene.
 pub fn mark_dirty(world: &mut World) {
     if let Some(session) = world.get_resource_mut::<SceneSession>() {
         session.dirty = true;
     }
 }
 
-/// Start an empty scene: every entity goes, and no file is open.
+/// Start an empty scene: every entity is removed, no file is open, and the
+/// selection and history are cleared.
 ///
 /// Returns how many entities were removed.
 pub fn new_scene(engine: &mut Engine) -> usize {
-    let removed = clear_world(engine.world_mut());
+    let removed_entity_count = clear_world(engine.world_mut());
     let world = engine.world_mut();
     if let Some(session) = world.get_resource_mut::<SceneSession>() {
         session.open = None;
         session.dirty = false;
     }
     reset_document_state(world);
-    removed
+    removed_entity_count
 }
 
 /// Open the scene at `path`, replacing the world's entities.
 ///
 /// The path is below the asset directory; the file's own guid is kept, so
-/// saving writes it back unchanged.
+/// saving writes it back unchanged. The world is left as it was when the file
+/// cannot be imported or carries no guid.
 ///
 /// # Errors
 ///
-/// Returns why the file could not be imported, when it carries no guid, or
-/// when no asset types are registered to instantiate it.
+/// Returns an error when the file cannot be imported: it is not a scene file,
+/// no asset types are registered, or it fails to load. It also fails when the
+/// file carries no guid.
 pub fn open_scene(engine: &mut Engine, path: &str) -> Result<SceneLoad, String> {
+    // Step 1: Read the document and its guid, before the world is touched.
     let (document, guid) = import_scene_document(engine, path)?;
     // A standalone scene carries its guid in the file's own header; the editor
     // needs it to save the file back under the same identity.
     let guid = guid.ok_or_else(|| format!("the scene file `{path}` carries no guid"))?;
+    // Step 2: Replace the world.
     let database = scene_database(engine);
     clear_world(engine.world_mut());
-    let report = load_scene(engine, &database, &document);
+    let scene_load = load_scene(engine, &database, &document);
+    // Step 3: Record the scene as the open document.
     let world = engine.world_mut();
     if let Some(session) = world.get_resource_mut::<SceneSession>() {
         session.open = Some(OpenScene {
@@ -135,25 +156,35 @@ pub fn open_scene(engine: &mut Engine, path: &str) -> Result<SceneLoad, String> 
         target: pill_core::telemetry::telemetry_target::ENGINE,
         path,
         guid = %guid,
-        entities = report.entities,
-        components = report.components,
-        unknown_components = report.unknown_components.len(),
-        unresolved_references = report.unresolved_references,
+        entities = scene_load.entities,
+        components = scene_load.components,
+        unknown_components = scene_load.unknown_components.len(),
+        unresolved_references = scene_load.unresolved_references,
         "[editor] scene opened"
     );
-    Ok(report)
+    Ok(scene_load)
 }
 
 /// Write the world to the open scene, or to `path` for a save-as.
 ///
-/// Saving to the open scene keeps its guid; a save-as writes a fresh one unless
-/// the target file already exists, in which case its guid is kept so anything
-/// referencing it still resolves.
+/// Saving to the open scene keeps its guid; a save-as writes a fresh one
+/// unless the target file already exists, in which case its guid is kept so
+/// anything referencing it still resolves.
+///
+/// The file is read back after writing, so the loaded scene asset matches what
+/// is on disk, and a file the engine cannot read is reported here instead of at
+/// the next open.
 ///
 /// # Errors
 ///
-/// Returns why the scene could not be rendered, written or loaded back.
+/// Returns an error when no asset types are registered, when no scene is open
+/// and `path` is `None`, when no asset directory is mounted, or when the engine
+/// has no [`AssetManager`].
+///
+/// It also fails when the document cannot be rendered or written, or when the
+/// written file does not read back with the guid that was assigned.
 pub fn write_scene(engine: &mut Engine, path: Option<&str>) -> Result<OpenScene, String> {
+    // Step 1: Find the open scene and the file to write.
     let registry = engine
         .world()
         .get_resource::<ImportRegistry>()
@@ -171,40 +202,44 @@ pub fn write_scene(engine: &mut Engine, path: Option<&str>) -> Result<OpenScene,
         .ok_or("no asset directory is mounted".to_owned())?;
     let file = root.join(&target);
 
-    let (document, report) = {
+    // Step 2: Build the document and report what the file cannot hold.
+    let (document, save_report) = {
         let world = engine.world();
         let assets = world
             .get_resource::<AssetManager>()
             .ok_or_else(|| "the engine has no AssetManager".to_string())?;
         save_scene(world, assets, &registry, None)
     };
-    // A field the writer cannot express - a handle to an asset that has no
-    // guid, because game code created it instead of a file - is a loss the
-    // author has to see. The save goes ahead: refusing would make every
-    // project that builds its meshes in code unable to save a scene at all.
-    if !report.skipped_fields.is_empty() {
+    // Some fields cannot be written to the file: a text or list field, a float
+    // that is NaN or infinite, and a handle to an asset with no guid (game code
+    // created it instead of loading a file). Each one is a loss the author has
+    // to see, so it is logged. The save still goes ahead: refusing would stop a
+    // project that builds its meshes in code from saving a scene.
+    if !save_report.skipped_fields.is_empty() {
         pill_core::warn!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
-            count = report.skipped_fields.len(),
-            fields = report.skipped_fields.join(", ").as_str(),
+            count = save_report.skipped_fields.len(),
+            fields = save_report.skipped_fields.join(", ").as_str(),
             "[editor] scene fields not written"
         );
     }
-    // A component the field layer cannot reach is not in the file at all, so
-    // reopening the scene brings the entity back without it. Same bargain: the
-    // save goes ahead, and the author is told what stayed behind.
-    if !report.skipped_components.is_empty() {
+    // A component the field layer cannot reach is left out of the file, so
+    // reopening the scene brings the entity back without it. Here too the save
+    // goes ahead, and the author is told which components were dropped.
+    if !save_report.skipped_components.is_empty() {
         pill_core::warn!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
-            count = report.skipped_components.len(),
-            components = report.skipped_components.join(", ").as_str(),
+            count = save_report.skipped_components.len(),
+            components = save_report.skipped_components.join(", ").as_str(),
             "[editor] scene components not written"
         );
     }
+
+    // Step 3: Choose the guid and write the file.
     let guid = match (open.as_ref(), path) {
         // Save to the open scene: keep its guid.
         (Some(open), None) => open.guid,
-        // Save As on top of an existing scene: keep the guid in that file.
+        // Save As onto an existing scene file: keep the guid that file holds.
         _ if file.is_file() => match existing_guid(engine, &target) {
             Some(guid) => guid,
             None => fresh_guid()?,
@@ -215,9 +250,9 @@ pub fn write_scene(engine: &mut Engine, path: Option<&str>) -> Result<OpenScene,
         .map_err(|error| format!("the scene cannot be rendered: {error}"))?;
     crate::editor_files::write_bytes(&file, &bytes).map_err(|error| error.message())?;
 
-    // Re-read the file: the world and the loaded asset then agree, and a file
-    // the engine cannot read back is caught here rather than at the next open.
-    let reopened = {
+    // Step 4: Read the file back and record it as the open scene. A file the
+    // engine cannot read fails here rather than at the next open.
+    let reimported_scene = {
         let assets = engine
             .world_mut()
             .get_resource_mut::<AssetManager>()
@@ -226,32 +261,33 @@ pub fn write_scene(engine: &mut Engine, path: Option<&str>) -> Result<OpenScene,
             .reimport_standalone::<Scene>(Path::new(&target))
             .map_err(|error| format!("`{target}` was written but did not load back: {error}"))?
     };
-    if reopened.guid != Some(guid) {
+    if reimported_scene.guid != Some(guid) {
         return Err(format!(
             "`{target}` was written with guid {guid} but reads back as {}",
-            reopened
+            reimported_scene
                 .guid
                 .map_or_else(|| "none".to_owned(), |guid| guid.to_string())
         ));
     }
-    let open = OpenScene { path: target, guid };
+    let saved_scene = OpenScene { path: target, guid };
     let world = engine.world_mut();
     if let Some(session) = world.get_resource_mut::<SceneSession>() {
-        session.open = Some(open.clone());
+        session.open = Some(saved_scene.clone());
         session.dirty = false;
     }
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
-        path = open.path.as_str(),
-        guid = %open.guid,
+        path = saved_scene.path.as_str(),
+        guid = %saved_scene.guid,
         entities = document.entities.len(),
-        components = report.components,
+        components = save_report.components,
         "[editor] scene saved"
     );
-    Ok(open)
+    Ok(saved_scene)
 }
 
-/// The guid the scene at `path` already carries, when it can be read.
+/// The guid the scene file at `path` already carries, or `None` when it cannot
+/// be read.
 fn existing_guid(engine: &mut Engine, path: &str) -> Option<AssetGuid> {
     let assets = engine.world_mut().get_resource_mut::<AssetManager>()?;
     assets
@@ -261,11 +297,16 @@ fn existing_guid(engine: &mut Engine, path: &str) -> Option<AssetGuid> {
 }
 
 /// A fresh guid for a scene file that does not exist yet.
+///
+/// # Errors
+///
+/// Returns an error when the platform random source cannot produce one.
 fn fresh_guid() -> Result<AssetGuid, String> {
     AssetGuid::random().map_err(|error| format!("no random source for a scene guid: {error}"))
 }
 
-/// Destroy every entity, returning how many there were.
+/// Destroy every entity and return how many there were. A destroy that fails
+/// is ignored.
 fn clear_world(world: &mut World) -> usize {
     let entities: Vec<_> = world
         .entity_rows()
@@ -278,8 +319,8 @@ fn clear_world(world: &mut World) -> usize {
     entities.len()
 }
 
-/// Forget the selection and the recorded history: both name entities the
-/// document that just replaced this one owned.
+/// Forget the selection and the recorded history. Both name entities that
+/// belonged to the document this scene replaced.
 fn reset_document_state(world: &mut World) {
     if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
         *selection = EditorSelection::default();
@@ -289,8 +330,8 @@ fn reset_document_state(world: &mut World) {
     }
 }
 
-/// The commands that change which document is open; they are not undoable
-/// edits and never mark the document dirty.
+/// Whether `command` changes which scene document is open. The scene commands
+/// are not undoable edits and never mark the document dirty.
 #[must_use]
 pub fn is_document_command(command: &EditorCommand) -> bool {
     matches!(
@@ -302,10 +343,13 @@ pub fn is_document_command(command: &EditorCommand) -> bool {
     )
 }
 
-/// The file name `name` gets, with the scene extension when it lacks one.
+/// Add the `.scene` extension to `requested_name` when it has none.
+///
+/// Surrounding spaces are trimmed, and the extension is matched in any letter
+/// case, so `My Scene.SCENE` is left alone.
 #[must_use]
-pub fn scene_file_name(name: &str) -> String {
-    let trimmed = name.trim();
+pub fn scene_file_name(requested_name: &str) -> String {
+    let trimmed = requested_name.trim();
     if trimmed.to_ascii_lowercase().ends_with(".scene") {
         trimmed.to_string()
     } else {
@@ -313,11 +357,11 @@ pub fn scene_file_name(name: &str) -> String {
     }
 }
 
-/// The path a Save As defaults to: the scene that is open, or `scenes/untitled.scene`
-/// for a world that was never saved.
+/// The path a Save As defaults to: the open scene's path, or
+/// `scenes/untitled.scene` when no scene file is open.
 #[must_use]
-pub fn default_save_path(session: &SceneSession) -> String {
-    match &session.open {
+pub fn default_save_path(scene_session: &SceneSession) -> String {
+    match &scene_session.open {
         Some(open) => open.path.clone(),
         None => PathBuf::from("scenes")
             .join(scene_file_name("untitled"))

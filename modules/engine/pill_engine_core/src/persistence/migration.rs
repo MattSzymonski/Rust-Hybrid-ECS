@@ -2,21 +2,24 @@
 //!
 //! # Responsibilities
 //!
-//! - Drives the selective pass: for every changed type name, reads the old
-//!   value through the retiring generation's serializer and writes it back
-//!   through the arriving generation's deserializer and inserter.
-//! - Chooses the strategy per type: an in-place column swap when the id is
-//!   unchanged, a full archetype remap when the reload moved the id.
-//! - Reports what it migrated and what it had to skip, so the host can log the
-//!   difference between the two.
+//! - Runs the selective pass: for each changed type name, it reads the old
+//!   value with the retiring generation's serializer and writes it back with
+//!   the arriving generation's deserializer and inserter.
+//! - Picks one of two strategies for each type: an in-place column swap when
+//!   the component id is unchanged, or a full archetype move when the reload
+//!   changed the id.
+//! - Reports what it migrated and what it skipped, so the host can log both.
 //!
 //! # Design
 //!
 //! Everything here must run while the retiring generation's image is still
-//! mapped: the serializer came from that artifact and is the only code that
-//! can read the old bytes correctly. Entities the incoming generation spawned
-//! during `init` are exempted from the old glue and round-tripped through the
-//! current serializer instead.
+//! mapped: the serializer came from that image and is the only code that can
+//! read the old bytes correctly.
+//!
+//! In the in-place path, entities the incoming generation spawned during
+//! `init` already hold values in the current layout, so those rows are read
+//! with the current serializer while every older row goes through the
+//! retiring one.
 
 use super::*;
 
@@ -25,31 +28,32 @@ use super::*;
 // =============================================================================
 
 impl World {
-    /// Migrate only changed persistable components.
+    /// Migrates only the persistable component types a reload changed.
     ///
-    /// For each changed type name, this uses the old serializer (captured before
-    /// reload) and the new deserializer/inserter (registered by the new init)
-    /// to rewrite only the affected component columns.
+    /// For each changed type name it reads the old value with the serializer
+    /// captured before the reload, then writes it back through the
+    /// deserializer and inserter the new `init` registered. Only the affected
+    /// component columns are rewritten.
     ///
-    /// `pre_swap_entities` is the set of entities that existed before the
-    /// incoming generation's `init` ran (see [`Self::capture_live_entities`]).
-    /// Entities outside the set were spawned by the new generation: they
-    /// already carry the current schema, so where a column rebuild touches
-    /// them they are round-tripped through the current serializer rather than
-    /// the retiring generation's. Pass `None` when the arriving generation
-    /// spawned nothing during `init`, so every entity predates the migration.
+    /// `pre_swap_entities` holds the entities that existed before the incoming
+    /// generation's `init` ran (see [`Self::capture_live_entities`]). Entities
+    /// outside that set were spawned by the new generation and already hold
+    /// current-layout values, so a column rebuild reads their rows with the
+    /// current serializer instead of the retiring one. Pass `None` when the
+    /// arriving generation spawned no entity during `init`, so every entity
+    /// predates the migration.
     pub fn migrate_changed_persistable_components(
         &mut self,
         previous_metadata_by_name: &HashMap<String, PersistTypeMetadata>,
         changed_type_names: &HashSet<String>,
         pre_swap_entities: Option<&HashSet<Entity>>,
     ) -> SelectiveMigrationReport {
-        let mut report = SelectiveMigrationReport::default();
+        let mut migration_report = SelectiveMigrationReport::default();
 
-        // Sort references into the names rather than cloning every string into
-        // a heap `Vec<String>`: the ordering exists only for a deterministic
-        // report, and the names are unique, so `sort_unstable` is fine. The
-        // sort is skipped entirely when nothing will render the report.
+        // Collect borrowed `&str` names instead of cloning every string into a
+        // `Vec<String>`: the sort only makes the report's order stable for the
+        // caller's logs, and the names are unique, so `sort_unstable` is fine.
+        // The sort runs only when the hot-reload info log is enabled.
         let mut sorted_changed_type_names: Vec<&str> =
             changed_type_names.iter().map(String::as_str).collect();
         if tracing::enabled!(
@@ -74,7 +78,7 @@ impl World {
                     type_name,
                     reason,
                 );
-                report.skipped_types.push(SkippedType {
+                migration_report.skipped_types.push(SkippedType {
                     type_name: (*type_name).to_string(),
                     reason,
                 });
@@ -103,8 +107,8 @@ impl World {
                         "[persistence]   '{}' -> OK ({} entities)",
                         type_name, migrated_entity_count_for_type,
                     );
-                    report.migrated_type_count += 1;
-                    report.migrated_entity_count += migrated_entity_count_for_type;
+                    migration_report.migrated_type_count += 1;
+                    migration_report.migrated_entity_count += migrated_entity_count_for_type;
                 }
                 Err(error) => {
                     let reason = error.to_string();
@@ -112,7 +116,7 @@ impl World {
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                         "[persistence]   '{type_name}' -> SKIP ({reason})",
                     );
-                    report.skipped_types.push(SkippedType {
+                    migration_report.skipped_types.push(SkippedType {
                         type_name: (*type_name).to_string(),
                         reason,
                     });
@@ -123,36 +127,39 @@ impl World {
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "[persistence] Selective migration finished: {} type(s) migrated, {} entities touched, {} type(s) skipped.",
-            report.migrated_type_count,
-            report.migrated_entity_count,
-            report.skipped_types.len(),
+            migration_report.migrated_type_count,
+            migration_report.migrated_entity_count,
+            migration_report.skipped_types.len(),
         );
 
-        report
+        migration_report
     }
 
-    /// Migrate one persistable component type from its previous registration
+    /// Migrates one persistable component type from its previous registration
     /// to the current one.
     ///
-    /// Chooses between an in-place column swap (when the [`ComponentId`] is
-    /// unchanged) and a full archetype remap (when the component id changed
-    /// after a reload).
+    /// Picks an in-place column swap when the [`ComponentId`] is unchanged, or
+    /// a full archetype move when a reload gave the type a new id.
     ///
     /// # Errors
     ///
     /// Returns [`PersistenceError::ComponentTypeUnregistered`] when the type
-    /// name is no longer registered, [`PersistenceError::DeserializerMissing`]
-    /// when no deserializer is registered for the type name, and
+    /// name no longer resolves to a registered component,
+    /// [`PersistenceError::ComponentTypeAmbiguous`] when the name matches more
+    /// than one component, [`PersistenceError::DeserializerMissing`] when no
+    /// deserializer is registered for the type name,
     /// [`PersistenceError::InserterMissing`] when no inserter is registered
-    /// for the resolved component id.  Errors from the underlying in-place or
-    /// cross-archetype migration propagate unchanged.
+    /// for the resolved component id, and [`PersistenceError::SerializerMissing`]
+    /// when the id is unchanged but no serializer is registered for it. Errors
+    /// from the in-place or cross-archetype migration below propagate as they
+    /// are.
     pub(super) fn migrate_single_component_type(
         &mut self,
         type_name: &str,
         previous_metadata: &PersistTypeMetadata,
         pre_swap_entities: Option<&HashSet<Entity>>,
     ) -> Result<usize, PersistenceError> {
-        let new_component_id = match self.resolve_component_id_by_name(type_name) {
+        let current_component_id = match self.resolve_component_id_by_name(type_name) {
             Ok(Some(component_id)) => component_id,
             Ok(None) => {
                 return Err(PersistenceError::ComponentTypeUnregistered {
@@ -172,29 +179,30 @@ impl World {
             }
         };
 
-        let Some(&deserialize_component) = self.persist_deserializers.get(type_name) else {
+        let Some(&deserialize_current_component) = self.persist_deserializers.get(type_name) else {
             return Err(PersistenceError::DeserializerMissing {
                 type_name: type_name.to_string(),
             });
         };
 
-        let Some(&insert_component) = self.persist_inserters.get(&new_component_id) else {
+        let Some(&insert_current_component) = self.persist_inserters.get(&current_component_id)
+        else {
             return Err(PersistenceError::InserterMissing {
                 type_name: type_name.to_string(),
             });
         };
 
-        if previous_metadata.component_id == new_component_id {
+        if previous_metadata.component_id == current_component_id {
             debug!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "[persistence]     strategy: in-place column swap for '{}'",
                 type_name,
             );
-            // The current serializer reads spawns' values with the layout the
-            // new generation wrote them in; without it the rebuild would have
-            // to misread them through the retiring generation's layout.
+            // Rows spawned by the new generation hold current-layout values,
+            // so the rebuild needs the current serializer to read them; the
+            // retiring one would read those bytes as the old shape.
             let Some(&serialize_current_component) =
-                self.persist_serializers.get(&new_component_id)
+                self.persist_serializers.get(&current_component_id)
             else {
                 return Err(PersistenceError::SerializerMissing {
                     type_name: type_name.to_string(),
@@ -204,8 +212,8 @@ impl World {
                 previous_metadata.component_id,
                 previous_metadata.serializer,
                 serialize_current_component,
-                deserialize_component,
-                insert_component,
+                deserialize_current_component,
+                insert_current_component,
                 pre_swap_entities,
             )
         } else {
@@ -216,47 +224,55 @@ impl World {
             );
             self.migrate_component_across_archetypes(
                 previous_metadata.component_id,
-                new_component_id,
+                current_component_id,
                 previous_metadata.serializer,
-                deserialize_component,
-                insert_component,
+                deserialize_current_component,
+                insert_current_component,
             )
         }
     }
 
-    /// Rewrite one component column in place inside every archetype that
-    /// contains the old component id.
+    /// Rewrites one component column in place in every archetype that holds the
+    /// old component id.
     ///
-    /// Serializes each old value, deserializes it with the new schema
-    /// (falling back to `{}` when the snapshot bytes no longer parse),
-    /// removes the old storage column, recreates it through the registered
+    /// For each such archetype it serializes the old values, decodes them with
+    /// the new schema (an empty `{}` is tried when the bytes no longer parse),
+    /// removes the old storage column, builds a new one from the registered
     /// storage factory, and inserts the migrated values.
     ///
-    /// `serialize_current_component` is what reads the rows the incoming
-    /// generation spawned during `init`: they already hold current-layout
-    /// values, and the retiring serializer would reinterpret their bytes under
-    /// the old shape.
+    /// `serialize_current_component` reads the rows the incoming generation
+    /// spawned during `init`. Those rows already hold current-layout values,
+    /// and the retiring serializer would read their bytes as the old shape.
     ///
     /// # Errors
     ///
-    /// Returns [`PersistenceError::DeserializationFailed`] when a value cannot
-    /// be decoded with either the snapshot bytes or `{}`,
-    /// [`PersistenceError::StorageRemovalFailed`] when the old storage column
-    /// cannot be removed, [`PersistenceError::StorageFactoryMissing`] when no
-    /// storage factory is registered, and
-    /// [`PersistenceError::NativeStorageExpected`] when the registered
-    /// factory is not a native storage factory.
+    /// Returns [`PersistenceError::SerializationFailed`] when the serializer of
+    /// the generation that wrote a value refuses it, and
+    /// [`PersistenceError::DeserializationFailed`] when a value cannot be
+    /// decoded from either its own bytes or `{}`.
+    ///
+    /// Also returns [`PersistenceError::StorageRemovalFailed`] when the old
+    /// storage column cannot be removed,
+    /// [`PersistenceError::StorageFactoryMissing`] when no storage factory is
+    /// registered, and [`PersistenceError::NativeStorageExpected`] when the
+    /// component id is not native storage or its registered factory is not a
+    /// native factory.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the registered native layout cannot describe an allocation.
+    /// The layout comes from a Rust type at registration time, so this can only
+    /// happen if the registration itself is broken.
     pub(super) fn migrate_component_column_in_place(
         &mut self,
         component_id: ComponentId,
-        serialize_old_component: SerializeComponentFn,
+        serialize_retiring_component: SerializeComponentFn,
         serialize_current_component: SerializeComponentFn,
-        deserialize_new_component: DeserializeComponentFn,
-        insert_new_component: InsertComponentFn,
+        deserialize_current_component: DeserializeComponentFn,
+        insert_current_component: InsertComponentFn,
         pre_swap_entities: Option<&HashSet<Entity>>,
     ) -> Result<usize, PersistenceError> {
-        // Step 1: Collect the archetypes whose columns contain the old
-        // component id.
+        // Step 1: Find every archetype that stores the old component id.
         let archetype_ids: Vec<_> = self
             .archetypes
             .iter()
@@ -267,10 +283,10 @@ impl World {
         let mut migrated_entity_count: usize = 0;
 
         for archetype_id in archetype_ids {
-            // Step 2: Serialize every value before the storage column is
-            // removed. Entities spawn-swapped in by the new generation (they
-            // are not in the pre-swap set) already hold current-layout values
-            // and go through the current serializer.
+            // Step 2: Serialize every value before the column is removed.
+            // Entities the new generation spawned are missing from the pre-swap
+            // set, so their rows already hold current-layout values and go
+            // through the current serializer.
             let serialized_components: Vec<Vec<u8>> = {
                 let Some(archetype) = self.archetypes.get(&archetype_id) else {
                     continue;
@@ -281,12 +297,13 @@ impl World {
                     let spawned_this_generation = pre_swap_entities.is_some_and(|entities| {
                         !entities.contains(&archetype.entities[entity_index])
                     });
-                    // A refused serialization is reported before the column is
-                    // touched, so the archetype still holds every row.
+                    // If a serializer refuses a value, the error is returned
+                    // before the column is touched, so the archetype still
+                    // holds every row.
                     let Some(bytes) = (if spawned_this_generation {
                         serialize_current_component(&archetype.component_storages, entity_index)
                     } else {
-                        serialize_old_component(&archetype.component_storages, entity_index)
+                        serialize_retiring_component(&archetype.component_storages, entity_index)
                     }) else {
                         return Err(PersistenceError::SerializationFailed { component_id });
                     };
@@ -295,21 +312,21 @@ impl World {
                 serialized
             };
 
-            // Step 3: Decode each value with the new schema, falling back to
-            // an empty `{}` object when the snapshot bytes no longer parse.
+            // Step 3: Decode each value with the new schema. When the bytes no
+            // longer parse, an empty `{}` object is tried instead.
             let mut migrated_components: Vec<Box<dyn Component>> =
                 Vec::with_capacity(serialized_components.len());
 
             for bytes in &serialized_components {
-                let component = deserialize_new_component(bytes)
-                    .or_else(|| deserialize_new_component(b"{}"))
+                let component = deserialize_current_component(bytes)
+                    .or_else(|| deserialize_current_component(b"{}"))
                     .ok_or(PersistenceError::DeserializationFailed { component_id })?;
                 migrated_components.push(component);
             }
 
-            // Step 4: Swap the storage column: remove the old one, recreate it
-            // through the registered storage factory, and insert the migrated
-            // values.
+            // Step 4: Replace the storage column. Remove the old one, build a
+            // new one from the registered storage factory, and insert the
+            // migrated values.
             let Some(archetype) = self.archetypes.get_mut(&archetype_id) else {
                 continue;
             };
@@ -317,11 +334,11 @@ impl World {
             if !component_id.is_native_storage() {
                 return Err(PersistenceError::NativeStorageExpected { component_id });
             }
-            // Drop the old column through the glue that wrote it. The re-home
-            // pass already stamped the arriving generation's table onto every
-            // column, and old-layout values must not be released by code that
-            // never allocated them; `register_component_inner` captured the
-            // retiring table when the incoming registration replaced it.
+            // Drop the old column through the code that wrote it. The re-home
+            // pass already pointed every column at the arriving generation's
+            // function table, and old-layout values must not be released by
+            // code that never allocated them. `register_component_inner` saved
+            // the retiring table when the incoming registration replaced it.
             if let Some(retiring_ops) = self.retired_native_storage_ops.get(&component_id) {
                 if let Some(column) = archetype.component_storages.get_mut(component_id) {
                     column.refresh_ops(*retiring_ops);
@@ -331,22 +348,23 @@ impl World {
                 return Err(PersistenceError::StorageRemovalFailed { component_id });
             }
 
-            let Some(factory) = self.storage_factories.get(&component_id) else {
+            let Some(storage_factory) = self.storage_factories.get(&component_id) else {
                 return Err(PersistenceError::StorageFactoryMissing { component_id });
             };
-            let crate::archetype::StorageFactory::Native(info) = factory else {
+            let crate::archetype::StorageFactory::Native(native_column_info) = storage_factory
+            else {
                 return Err(PersistenceError::NativeStorageExpected { component_id });
             };
-            // Build the replacement column as a concrete erased column (no
-            // trait-object vtable) so it stays valid across module unloads.
+            // Build the replacement column from the native layout rather than a
+            // trait object, so it stays valid across module unloads.
             archetype.component_storages.insert(
                 component_id,
-                crate::archetype::ComponentColumn::from_native_info(*info, 0)
+                crate::archetype::ComponentColumn::from_native_info(*native_column_info, 0)
                     .expect("a registered native layout is valid by construction"),
             );
 
             for component in migrated_components {
-                insert_new_component(&mut archetype.component_storages, component);
+                insert_current_component(&mut archetype.component_storages, component);
             }
 
             migrated_entity_count += serialized_components.len();
@@ -355,42 +373,48 @@ impl World {
         Ok(migrated_entity_count)
     }
 
-    /// Move every entity from archetypes containing the old component id into
-    /// archetypes containing the new component id.
+    /// Moves every entity from the archetypes that hold the old component id
+    /// into archetypes that hold the new one.
     ///
-    /// Serializes each old component value, deserializes it with the new
-    /// schema (falling back to `{}`), moves the unchanged components across
-    /// bitwise, and re-inserts the migrated value. Used when a reload changes
-    /// the [`ComponentId`] assigned to a type name.
+    /// For each entity it serializes the old component value and decodes it
+    /// with the new schema (an empty `{}` is tried when the bytes no longer
+    /// parse), moves the unchanged components across byte for byte, and inserts
+    /// the migrated value. A reload uses this path when it gives a type a new
+    /// [`ComponentId`].
     ///
     /// # Errors
     ///
-    /// Returns [`PersistenceError::DeserializationFailed`] when a migrated
-    /// value cannot be decoded with either the stored bytes or `{}`,
+    /// Returns [`PersistenceError::SerializationFailed`] when the retiring
+    /// generation's serializer refuses a value; the source archetype is put
+    /// back before that error is returned.
+    ///
+    /// Returns [`PersistenceError::DeserializationFailed`] when a migrated value
+    /// cannot be decoded from either its stored bytes or `{}`,
     /// [`PersistenceError::DestinationArchetypeMissing`] when the destination
     /// archetype cannot be created, and [`PersistenceError::ColumnMoveFailed`]
     /// when an unchanged column cannot hand its row to the destination.
     pub(super) fn migrate_component_across_archetypes(
         &mut self,
-        old_component_id: ComponentId,
-        new_component_id: ComponentId,
-        serialize_old_component: SerializeComponentFn,
-        deserialize_new_component: DeserializeComponentFn,
-        insert_new_component: InsertComponentFn,
+        retiring_component_id: ComponentId,
+        current_component_id: ComponentId,
+        serialize_retiring_component: SerializeComponentFn,
+        deserialize_current_component: DeserializeComponentFn,
+        insert_current_component: InsertComponentFn,
     ) -> Result<usize, PersistenceError> {
-        // Step 1: Locate every archetype that contains the old component id.
+        // Step 1: Find every archetype that holds the old component id.
         let source_archetype_ids: Vec<_> = self
             .archetypes
             .iter()
-            .filter(|(_, archetype)| archetype.component_types.contains(&old_component_id))
+            .filter(|(_, archetype)| archetype.component_types.contains(&retiring_component_id))
             .map(|(archetype_id, _)| *archetype_id)
             .collect();
 
         let mut migrated_entity_count: usize = 0;
 
         for source_archetype_id in source_archetype_ids {
-            // Step 2: Remove the source archetype and compute its destination
-            // component set with the old id replaced by the new one.
+            // Step 2: Remove the source archetype and work out which ids its
+            // destination holds: the same set with the old id replaced by the
+            // new one.
             let Some(mut source_archetype) = self.archetypes.remove(&source_archetype_id) else {
                 continue;
             };
@@ -399,8 +423,8 @@ impl World {
                 .component_types
                 .iter()
                 .map(|component_id| {
-                    if *component_id == old_component_id {
-                        new_component_id
+                    if *component_id == retiring_component_id {
+                        current_component_id
                     } else {
                         *component_id
                     }
@@ -413,19 +437,19 @@ impl World {
             let destination_archetype_id = self.get_or_create_archetype(destination_component_ids);
 
             // Step 3: Serialize the old component values and decode them with
-            // the new schema, falling back to `{}`. A refused serialization
-            // puts the source archetype back before reporting, so a skipped
-            // type leaves the world exactly as it was found.
+            // the new schema, trying `{}` when the bytes no longer parse. A
+            // refused serialization puts the source archetype back before the
+            // error is returned, so a skipped type leaves the world as it was.
             let mut serialized_components: Vec<Vec<u8>> =
                 Vec::with_capacity(source_archetype.entities.len());
             for entity_index in 0..source_archetype.entities.len() {
                 let Some(bytes) =
-                    serialize_old_component(&source_archetype.component_storages, entity_index)
+                    serialize_retiring_component(&source_archetype.component_storages, entity_index)
                 else {
                     self.archetypes
                         .insert(source_archetype_id, source_archetype);
                     return Err(PersistenceError::SerializationFailed {
-                        component_id: old_component_id,
+                        component_id: retiring_component_id,
                     });
                 };
                 serialized_components.push(bytes);
@@ -435,21 +459,22 @@ impl World {
                 Vec::with_capacity(serialized_components.len());
 
             for bytes in &serialized_components {
-                let component = deserialize_new_component(bytes)
-                    .or_else(|| deserialize_new_component(b"{}"))
+                let component = deserialize_current_component(bytes)
+                    .or_else(|| deserialize_current_component(b"{}"))
                     .ok_or(PersistenceError::DeserializationFailed {
-                        component_id: old_component_id,
+                        component_id: retiring_component_id,
                     })?;
                 migrated_components.push(component);
             }
 
-            // Step 4: Move each entity into the destination archetype,
-            // handing over the unchanged components and inserting the migrated
-            // one, then re-record its location and per-component ticks.
+            // Step 4: Move each entity into the destination archetype, hand
+            // over its unchanged components, insert the migrated one, then
+            // record the entity's new location and its components' ticks.
             //
-            // Back to front: a column hands over its last row, which
-            // `take_row_from` removes without reordering, so the rows still
-            // waiting keep the indices their serialized values were read at.
+            // The rows are taken back to front. `take_row_from` removes a row
+            // by moving the column's last row into that slot, and going back to
+            // front keeps the taken row last, so no other row moves and the
+            // waiting rows keep the index their value was read at.
             let Some(destination_archetype) = self.archetypes.get_mut(&destination_archetype_id)
             else {
                 return Err(PersistenceError::DestinationArchetypeMissing);
@@ -464,9 +489,9 @@ impl World {
 
                 for source_component_id in &source_archetype.component_types {
                     // The old column keeps its rows: they hold the retiring
-                    // generation's values, which were read out above and are
-                    // released when the source archetype drops.
-                    if *source_component_id == old_component_id {
+                    // generation's values, which were read above, and they are
+                    // released when the source archetype is dropped.
+                    if *source_component_id == retiring_component_id {
                         continue;
                     }
 
@@ -484,9 +509,9 @@ impl World {
                             component_id: *source_component_id,
                         });
                     };
-                    // A bitwise hand-over rather than a clone: the row's bytes
-                    // and the ownership they carry move together, and the
-                    // source releases the row without running drop glue.
+                    // The row moves instead of being copied: its bytes and
+                    // whatever they own travel together, and the source column
+                    // releases the row without running its destructor.
                     destination_column
                         .take_row_from(source_column, entity_index)
                         .map_err(|_| PersistenceError::ColumnMoveFailed {
@@ -494,22 +519,22 @@ impl World {
                         })?;
                 }
 
-                insert_new_component(&mut destination_archetype.component_storages, component);
+                insert_current_component(&mut destination_archetype.component_storages, component);
 
-                // A carried column brought its ticks across with its row. The
-                // rewritten component did not: its value was decoded from the
-                // old column, so its ticks are copied from there by hand, which
-                // is what keeps a migrated component from looking freshly added
-                // to every `Changed<T>` system.
+                // An unchanged column moved its row's ticks along with the row.
+                // The migrated component did not, because its value was decoded
+                // from the old column, so its ticks are copied across from that
+                // column now. That keeps a migrated component from looking
+                // freshly added to every `Changed<T>` system.
                 let rewritten_ticks = source_archetype
                     .component_storages
-                    .get(old_component_id)
+                    .get(retiring_component_id)
                     .and_then(|column| column.row_ticks(entity_index))
                     .copied()
                     .unwrap_or(crate::component::ComponentTicks::new(current_tick));
                 if let Some(column) = destination_archetype
                     .component_storages
-                    .get_mut(new_component_id)
+                    .get_mut(current_component_id)
                 {
                     column.set_row_ticks(destination_index, rewritten_ticks);
                 }
@@ -526,8 +551,8 @@ impl World {
             migrated_entity_count += source_archetype.entities.len();
         }
 
-        // Step 5: Bump the archetype generation so cached query plans observe
-        // the new archetype layout.
+        // Step 5: Add one to the archetype generation, so cached query plans
+        // notice the new archetype layout.
         self.archetype_generation = self.archetype_generation.wrapping_add(1);
         Ok(migrated_entity_count)
     }

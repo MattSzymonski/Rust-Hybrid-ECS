@@ -1,4 +1,4 @@
-//! Row access, the field reads and the field writes.
+//! Finds, reads and writes single fields of a component row.
 //!
 //! # Responsibilities
 //!
@@ -8,15 +8,20 @@
 //!   and write one back, stamping the row's `changed` tick so `Changed<T>`
 //!   observes the edit next frame.
 //! - Report every refusal as a [`ComponentFieldError`](super::ComponentFieldError)
-//!   naming the component and the field, without handing a raw pointer out.
+//!   that names the component, and the field when it is known, without handing
+//!   a raw pointer out.
 //!
 //! # Design
 //!
-//! Every entry point resolves through the entity's own archetype, the one place
-//! that names the generation which created the data; a registry-wide name
-//! lookup can see several registrations under one name. Values are validated
-//! against the registered layout before anything is written, and a refused
-//! write leaves the row untouched.
+//! Every entry point that targets a live entity resolves the component through
+//! that entity's own archetype. That archetype is the one place that names the
+//! generation which created the data, while a lookup by name across the whole
+//! registry can see several registrations under one name.
+//! [`World::build_component_image`] has no entity yet, so it is the one entry
+//! point that resolves through the registry.
+//!
+//! Values are validated against the registered layout before anything is
+//! written, and a refused write leaves the row untouched.
 
 // Current crate
 use super::codec::{decode_field, encode_field_write, encode_scalar, is_scalar_tag, scalar_size};
@@ -27,24 +32,16 @@ use crate::component_registry::ComponentFieldDescriptor;
 use crate::entity::Entity;
 use crate::world::World;
 
-/// Format a copied component row for native debugger helpers.
-///
-/// This accepts a byte slice rather than a component type, so it works for
-/// Rust, renderer, and managed descriptor columns alike when paired with the
-/// registered field layout.
-pub fn format_component_debug(fields: &[ComponentFieldDescriptor], bytes: &[u8]) -> String {
-    fields
-        .iter()
-        .map(|field| format!("{}={:?}", field.name, decode_field(bytes, field)))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+// =============================================================================
+// ResolvedField
+// =============================================================================
 
-/// One field's location: the entity's row, its component and the descriptor.
+/// The archetype, row, component id and field descriptor of one field.
 ///
-/// What every single-field entry point needs before it can read or write, so
-/// the resolution rule and its error payloads live in
-/// [`World::resolve_field`] rather than in each entry point.
+/// Together these four values say where a field lives. Every single-field
+/// entry point needs them before it can read or write and gets them from
+/// [`World::resolve_field`], so the rule and its error payloads live in one
+/// place instead of in each entry point.
 struct ResolvedField {
     /// The archetype holding the entity.
     archetype_id: ArchetypeId,
@@ -56,31 +53,67 @@ struct ResolvedField {
     descriptor: ComponentFieldDescriptor,
 }
 
+// =============================================================================
+// RowWriteTarget
+// =============================================================================
+
+/// The row one field write targets, and the names its refusals report.
+pub(super) struct RowWriteTarget<'a> {
+    /// Archetype holding the row.
+    pub(super) archetype_id: ArchetypeId,
+    /// Row within that archetype.
+    pub(super) row: usize,
+    /// Component whose column holds the field.
+    pub(super) component_id: ComponentId,
+    /// Component name the error paths report.
+    pub(super) component_name: &'a str,
+    /// Field name the error paths report.
+    pub(super) field_name: &'a str,
+}
+
+// =============================================================================
+// FieldWrite
+// =============================================================================
+
+/// A validated byte payload and where in the component row it belongs.
+pub(super) struct FieldWrite {
+    /// Byte offset of the payload within the component row.
+    pub(super) row_offset: usize,
+    /// The payload bytes (a scalar, one array element, or a whole array).
+    pub(super) bytes: Vec<u8>,
+}
+
+// =============================================================================
+// World - Row Lookup
+// =============================================================================
+
 impl World {
-    /// The archetype id and row of a live entity, for component access.
+    /// Returns the archetype and row that hold a live entity, or `None` when
+    /// the entity is not alive.
     pub(super) fn entity_row_location(&self, entity: Entity) -> Option<(ArchetypeId, usize)> {
         let location = self.entity_locations.get(&entity)?;
         Some((location.archetype_id, location.index_in_archetype))
     }
 
-    /// The registered field layout of a component, refusing an empty one.
+    /// The registered field layout of a component.
     ///
-    /// Borrowed rather than copied: the field entry points read one or every
-    /// descriptor out of it, and the inspector calls them once per row per
-    /// frame.
-    fn field_layout(
+    /// A component with no registered layout, or an empty one, is refused. The
+    /// layout is borrowed rather than copied. The field entry points read one
+    /// descriptor from it or every descriptor, and the inspector asks for it
+    /// once per component row per frame.
+    fn required_component_field_layout(
         &self,
         component_id: ComponentId,
-        component: &str,
+        component_name: &str,
     ) -> Result<&[ComponentFieldDescriptor], ComponentFieldError> {
         let layout = self.component_field_layout(component_id).ok_or(
             ComponentFieldError::ComponentHasNoFieldLayout {
-                component: component.to_string(),
+                component: component_name.to_string(),
             },
         )?;
         if layout.is_empty() {
             return Err(ComponentFieldError::ComponentHasNoFieldLayout {
-                component: component.to_string(),
+                component: component_name.to_string(),
             });
         }
         Ok(layout)
@@ -88,30 +121,30 @@ impl World {
 
     /// Locate one field of one component on one entity.
     ///
-    /// The one place entity, component, layout and field are resolved, so a
-    /// new entry point cannot invent its own error path: every miss reports the
+    /// This is the one place a single field is resolved, so a new single-field
+    /// entry point cannot invent its own error path: every miss reports the
     /// same variant with the same payload.
     fn resolve_field(
         &self,
         entity: Entity,
-        component: &str,
-        field: &str,
+        component_name: &str,
+        field_name: &str,
     ) -> Result<ResolvedField, ComponentFieldError> {
         let (archetype_id, row) = self
             .entity_row_location(entity)
             .ok_or(ComponentFieldError::EntityNotFound)?;
-        let component_id = self.resolve_entity_component_id(entity, component).ok_or(
+        let component_id = self.resolve_entity_component_id(entity, component_name).ok_or(
             ComponentFieldError::ComponentNotFound {
-                component: component.to_string(),
+                component: component_name.to_string(),
             },
         )?;
         let descriptor = self
-            .field_layout(component_id, component)?
+            .required_component_field_layout(component_id, component_name)?
             .iter()
-            .find(|descriptor| descriptor.name == field)
+            .find(|descriptor| descriptor.name == field_name)
             .ok_or(ComponentFieldError::FieldNotFound {
-                component: component.to_string(),
-                field: field.to_string(),
+                component: component_name.to_string(),
+                field: field_name.to_string(),
             })?;
         Ok(ResolvedField {
             archetype_id,
@@ -121,7 +154,7 @@ impl World {
         })
     }
 
-    /// One component column of one archetype, for a row that exists.
+    /// One component column of one archetype, checked to hold the given row.
     ///
     /// `component_name` only feeds the error path: the caller resolved the
     /// component through the entity, so a missing column or a row past its end
@@ -150,7 +183,7 @@ impl World {
         Ok(column)
     }
 
-    /// [`Self::row_column`]'s mutable twin, for the write lanes.
+    /// [`Self::row_column`]'s mutable twin, for the write paths.
     fn row_column_mut(
         &mut self,
         archetype_id: ArchetypeId,
@@ -210,13 +243,29 @@ impl World {
     }
 }
 
+// =============================================================================
+// World - Reads and Asset Types
+// =============================================================================
+
 impl World {
-    /// Read one field of one component on one entity.
+    /// The value of one field of one component on one entity.
     ///
     /// The component is resolved through the entity's own archetype (see
     /// [`Self::resolve_entity_component_id`]), so the returned value always
-    /// describes data the entity really holds. Reads never mutate and never
-    /// stamp a change tick.
+    /// describes data the entity really holds. A read never mutates and never
+    /// stamps a change tick.
+    ///
+    /// # Errors
+    ///
+    /// [`ComponentFieldError::EntityNotFound`] when the entity is not alive,
+    /// [`ComponentFieldError::ComponentNotFound`] when it does not carry that
+    /// component, [`ComponentFieldError::ComponentHasNoFieldLayout`] when the
+    /// component has no field layout or an empty one, and
+    /// [`ComponentFieldError::FieldNotFound`] when the layout does not name
+    /// that field. After those checks pass, a missing archetype reports
+    /// [`ComponentFieldError::EntityNotFound`] again and a missing column or
+    /// row reports [`ComponentFieldError::ComponentStorageMissing`]; both mean
+    /// that the storage no longer matches the world's own bookkeeping.
     pub fn read_component_field(
         &self,
         entity: Entity,
@@ -242,17 +291,29 @@ impl World {
         ))
     }
 
-    /// Read every field of one component in layout order, for the inspector.
+    /// Every field of one component, in layout order.
     ///
-    /// Cheaper than N [`Self::read_component_field`] calls: the row is located
-    /// and copied once.
+    /// Cheaper than calling [`Self::read_component_field`] once per field: the
+    /// row is located and copied once. The inspector reads a whole component
+    /// this way, and so does a scene save.
+    ///
+    /// # Errors
+    ///
+    /// [`ComponentFieldError::EntityNotFound`] when the entity is not alive,
+    /// [`ComponentFieldError::ComponentNotFound`] when it does not carry that
+    /// component, and [`ComponentFieldError::ComponentHasNoFieldLayout`] when
+    /// the component has no field layout or an empty one. After those checks
+    /// pass, a missing archetype reports [`ComponentFieldError::EntityNotFound`]
+    /// again and a missing column or row reports
+    /// [`ComponentFieldError::ComponentStorageMissing`].
     pub fn read_component_fields(
         &self,
         entity: Entity,
         component_name: &str,
     ) -> Result<Vec<FieldValue>, ComponentFieldError> {
-        // The entity and component half of `resolve_field`; this one reads every
-        // descriptor, so it keeps the borrowed layout instead of one clone.
+        // The entity and component half of `resolve_field`. This path reads
+        // every descriptor, so it borrows the layout instead of cloning the
+        // one descriptor it needs.
         let (archetype_id, row) = self
             .entity_row_location(entity)
             .ok_or(ComponentFieldError::EntityNotFound)?;
@@ -262,12 +323,12 @@ impl World {
                 component: component_name.to_string(),
             })?;
 
-        // Copy the layout and the whole row once.
-        let layout = self.field_layout(component_id, component_name)?;
+        // Borrow the layout and copy the whole row once.
+        let layout = self.required_component_field_layout(component_id, component_name)?;
         let row_bytes =
             self.copy_component_row_bytes(archetype_id, row, component_id, component_name)?;
 
-        // Decode every field from the one row image.
+        // Decode every field from that one copy of the row.
         Ok(layout
             .iter()
             .map(|descriptor| {
@@ -280,8 +341,9 @@ impl World {
             .collect())
     }
 
-    /// `value` with the asset type a handle field was registered with, when
-    /// it is one; any other value unchanged.
+    /// Adds the field's recorded asset type to an asset value that carries
+    /// none, and returns every other value unchanged. A field with no recorded
+    /// type leaves the value as it was.
     fn with_asset_type(
         &self,
         component_id: ComponentId,
@@ -308,9 +370,12 @@ impl World {
     /// type registered as `asset_type`.
     ///
     /// Called by `#[derive(PillComponent)]`'s generated registration for each
-    /// `Handle<T>` field, with `T`'s shared name, and by a foreign-language
-    /// backend for its components. The name is copied: the caller's string
-    /// may live in a module that a reload unmaps.
+    /// `Handle<T>` field, with the asset's shared name (or its Rust type name
+    /// when it has no shared name), and by a foreign-language backend for its
+    /// components.
+    ///
+    /// The name is copied: the caller's string may live in a module that a
+    /// reload unmaps.
     pub fn record_asset_field_type(
         &mut self,
         component: ComponentId,
@@ -323,12 +388,12 @@ impl World {
             .insert(field.to_owned(), asset_type.to_owned());
     }
 
-    /// Refuse an asset value whose type is not the one `field` was recorded
-    /// with; a value or a field without a recorded type passes.
+    /// Refuses an asset value whose type differs from the one recorded for the
+    /// field. A value with no type, or a field with no recorded type, passes.
     fn check_asset_type(
         &self,
-        component: ComponentId,
-        field: &str,
+        component_id: ComponentId,
+        field_name: &str,
         value: &FieldValue,
     ) -> Result<(), ComponentFieldError> {
         let FieldValue::Asset {
@@ -338,9 +403,9 @@ impl World {
         else {
             return Ok(());
         };
-        match self.asset_field_type(component, field) {
+        match self.asset_field_type(component_id, field_name) {
             Some(expected) if expected != found => Err(ComponentFieldError::AssetTypeMismatch {
-                field: field.to_owned(),
+                field: field_name.to_owned(),
                 expected: expected.to_owned(),
                 found: found.clone(),
             }),
@@ -358,37 +423,34 @@ impl World {
     }
 }
 
-/// The row one field write targets, and the names its refusals report.
-pub(super) struct RowWriteTarget<'a> {
-    /// Archetype holding the row.
-    pub(super) archetype_id: ArchetypeId,
-    /// Row within that archetype.
-    pub(super) row: usize,
-    /// Component whose column holds the field.
-    pub(super) component_id: ComponentId,
-    /// Component name the error paths report.
-    pub(super) component_name: &'a str,
-    /// Field name the error paths report.
-    pub(super) field_name: &'a str,
-}
-
-/// A validated byte payload and where in the component row it belongs.
-pub(super) struct FieldWrite {
-    /// Byte offset of the payload within the component row.
-    pub(super) row_offset: usize,
-    /// The payload bytes (a scalar, one array element, or a whole array).
-    pub(super) bytes: Vec<u8>,
-}
+// =============================================================================
+// World - Writes
+// =============================================================================
 
 impl World {
-    /// Write one field of a live component.
+    /// Writes one field of a live component.
     ///
-    /// Resolves the component through the entity's own archetype, validates the
-    /// value against the registered field layout, writes it through the column,
-    /// and stamps that row's `ComponentTicks::changed` so `Changed<T>` systems
-    /// observe the edit on their next run. [`Self::get_component_mut`] hands out
-    /// the same column slot without that stamp. Nothing is written when any
-    /// validation fails.
+    /// The component is resolved through the entity's own archetype, and the
+    /// value is checked against the registered field layout before anything is
+    /// written. The write goes through the component's column and stamps that
+    /// row's `ComponentTicks::changed`, so `Changed<T>` systems observe the
+    /// edit on their next run; [`Self::get_component_mut`] hands out the same
+    /// column slot without that stamp. Nothing is written when any validation
+    /// fails.
+    ///
+    /// # Errors
+    ///
+    /// Fails before writing anything when the field cannot be resolved, with
+    /// the variants [`Self::read_component_field`] reports, or when the value
+    /// is refused: [`ComponentFieldError::AssetTypeMismatch`] for an asset
+    /// value of another type, [`ComponentFieldError::UnsupportedField`] for a
+    /// heap-backed field, a tag outside the editable vocabulary or a fixed
+    /// array of non-scalars, [`ComponentFieldError::TypeMismatch`] when the
+    /// value does not match the field's tag, and
+    /// [`ComponentFieldError::ArrayLengthMismatch`] when a whole array has the
+    /// wrong element count. A payload that would extend past the row reports
+    /// [`ComponentFieldError::UnsupportedField`], and a column or row that has
+    /// gone missing reports [`ComponentFieldError::ComponentStorageMissing`].
     pub fn write_component_field(
         &mut self,
         entity: Entity,
@@ -396,8 +458,8 @@ impl World {
         field_name: &str,
         value: FieldValue,
     ) -> Result<(), ComponentFieldError> {
-        // Resolve, then validate and encode the payload BEFORE touching any
-        // column, so a refused edit leaves the world untouched.
+        // Step 1: resolve the field, then validate and encode the payload
+        // before touching a column, so a refused edit leaves the row as it was.
         let ResolvedField {
             archetype_id,
             row,
@@ -407,14 +469,15 @@ impl World {
         self.check_asset_type(component_id, field_name, &value)?;
         let write = encode_field_write(&descriptor, field_name, &value)?;
 
-        // Write the payload and stamp the row's changed tick, each in its own
-        // archetype borrow so column and tick lookups never overlap.
+        // Step 2: write the payload, then stamp the row's changed tick. Each
+        // runs under its own archetype borrow, so the column and tick lookups
+        // never overlap.
         //
-        // The world tick is bumped first so the stamped `changed` value is
-        // strictly newer than every system's `last_run` baseline. Edits are
-        // applied between frames, when the tick is otherwise frozen; without
-        // the bump a `Changed<T>` filter would compare the new value against
-        // an equal baseline and never observe the edit.
+        // The world tick is increased first, so the stamped `changed` value is
+        // strictly newer than every system's `last_run` baseline. An edit
+        // applied between frames would otherwise stamp the tick the last frame
+        // left behind, and a `Changed<T>` filter would compare the new value
+        // against an equal baseline and never see the edit.
         let current_tick = self.increment_change_tick();
         self.apply_row_write(
             RowWriteTarget {
@@ -436,35 +499,55 @@ impl World {
         )
     }
 
-    /// Build a zero-initialised component image for a registered type name,
-    /// then write the supplied field values over it.
+    /// Builds a zero-initialised component image for a registered type name,
+    /// then writes the supplied field values over it.
     ///
-    /// Used by the editor to create entities or add components from field
-    /// values without knowing the concrete Rust type. Creation has no entity
-    /// yet, so the component is resolved through the registry (this is the one
-    /// editor path where the registry-wide name resolver is correct).
-    /// Zero-initialisation is only valid for components with a non-empty
-    /// registered field layout, which this enforces.
+    /// Used where the entity does not exist yet: the editor creating an entity
+    /// or adding a component from field values without knowing the concrete
+    /// Rust type, and a scene load attaching a component the document lists.
+    /// With no entity to look through, the component is resolved through the
+    /// registry, which is the correct resolver for this path.
+    ///
+    /// Zero-initialisation is only valid for a component with a non-empty
+    /// registered field layout, and a missing or empty layout is refused:
+    /// without a layout the image cannot be described field by field.
+    ///
+    /// # Errors
+    ///
+    /// [`ComponentFieldError::ComponentNotFound`] when no component is
+    /// registered under that name, or when two registrations claim it;
+    /// [`ComponentFieldError::ComponentHasNoFieldLayout`] when it has no field
+    /// layout, an empty one, or no registered size; and
+    /// [`ComponentFieldError::FieldNotFound`] when a supplied field name is
+    /// not in the layout. A value is refused the way a field write refuses it:
+    /// [`ComponentFieldError::AssetTypeMismatch`],
+    /// [`ComponentFieldError::TypeMismatch`],
+    /// [`ComponentFieldError::ArrayLengthMismatch`] or
+    /// [`ComponentFieldError::UnsupportedField`], the last also for a value
+    /// that would extend past the image.
     pub fn build_component_image(
         &self,
         component_name: &str,
         fields: &[(String, FieldValue)],
     ) -> Result<Vec<u8>, ComponentFieldError> {
-        // An ambiguous name means two registrations claim it, so there is no
-        // one component to build an image for; it reads the same as "not
-        // found" to the editor, which is the safe outcome either way.
+        // Step 1: resolve the component through the registry. An ambiguous
+        // name means two registrations claim it, so there is no single
+        // component to build an image for. It is treated as "not found", which
+        // is the safe answer for both the editor and a scene load.
         let component_id = self
             .resolve_component_id_by_name_any(component_name)
             .unwrap_or(None)
             .ok_or(ComponentFieldError::ComponentNotFound {
                 component: component_name.to_string(),
             })?;
-        let layout = self.field_layout(component_id, component_name)?;
+        let layout = self.required_component_field_layout(component_id, component_name)?;
         let (size, _) = self.component_layout(component_id).ok_or(
             ComponentFieldError::ComponentHasNoFieldLayout {
                 component: component_name.to_string(),
             },
         )?;
+        // Step 2: allocate the zero-initialised image and write each supplied
+        // value into it.
         let mut image = vec![0u8; size];
         for (field_name, value) in fields {
             let descriptor = layout
@@ -487,7 +570,19 @@ impl World {
         Ok(image)
     }
 
-    /// Write one element of a fixed-size array field.
+    /// Writes one element of a fixed-size array field.
+    ///
+    /// # Errors
+    ///
+    /// Fails before writing anything when the field cannot be resolved, with
+    /// the variants [`Self::read_component_field`] reports, when the field is
+    /// not a fixed array of scalars ([`ComponentFieldError::TypeMismatch`] for
+    /// another tag, [`ComponentFieldError::UnsupportedField`] for non-scalar
+    /// elements or an unknown element size), when `index` is past the array
+    /// ([`ComponentFieldError::ArrayIndexOutOfRange`]), or when the value does
+    /// not encode into one element ([`ComponentFieldError::TypeMismatch`]). A
+    /// column or row that has gone missing reports
+    /// [`ComponentFieldError::ComponentStorageMissing`].
     pub fn write_component_array_element(
         &mut self,
         entity: Entity,
@@ -503,7 +598,8 @@ impl World {
             descriptor,
         } = self.resolve_field(entity, component_name, field_name)?;
 
-        // The field must be a fixed array of scalar primitives.
+        // Step 1: the field must be a fixed array of scalar primitives, and
+        // the value must encode into one element.
         let Some(inner_tag) = descriptor.type_tag.strip_prefix("array:") else {
             return Err(ComponentFieldError::TypeMismatch {
                 field: field_name.to_string(),
@@ -537,9 +633,9 @@ impl World {
             });
         }
 
-        // Write the element and stamp the row's changed tick. The tick is
-        // bumped first for the same reason the whole-field write bumps it: a
-        // between-frame edit must be visible to `Changed<T>` filters.
+        // Step 2: write the element and stamp the row's changed tick. The tick
+        // is increased first for the same reason the whole-field write does
+        // it: a between-frame edit must be visible to `Changed<T>` filters.
         let row_offset = descriptor.offset + index * element_size;
         let current_tick = self.increment_change_tick();
         self.apply_row_write(
@@ -562,7 +658,7 @@ impl World {
         )
     }
 
-    /// Overwrite `bytes.len()` bytes at `row_offset` of one component row.
+    /// Writes `bytes.len()` bytes at `row_offset` of one component row.
     ///
     /// `target.component_name` only feeds the error paths: the caller resolved
     /// the component through the entity, so a missing column or row here is a
@@ -604,7 +700,7 @@ impl World {
                 else {
                     return Err(past_the_row());
                 };
-                // SAFETY: the destination row is initialized (`row < len`) and
+                // SAFETY: the destination row is initialised (`row < len`) and
                 // the payload fits within it (checked above); the column is not
                 // reallocated while this borrow is held.
                 unsafe {
@@ -625,8 +721,8 @@ impl World {
                     })?
                     .to_vec();
                 let element_size = row_bytes.len();
-                // The same checked arithmetic as the native branch: the row
-                // slice below would otherwise be ranged with a wrapped sum.
+                // The same checked arithmetic as the native branch, so a
+                // wrapped sum cannot select the wrong part of the row slice.
                 let Some(end) = row_offset
                     .checked_add(bytes.len())
                     .filter(|end| *end <= element_size)
@@ -647,7 +743,8 @@ impl World {
         }
     }
 
-    /// Stamp one row's `changed` tick so `Changed<T>` systems react.
+    /// Stamps one row's `changed` tick so `Changed<T>` systems react to the
+    /// write.
     fn stamp_row_changed(
         &mut self,
         archetype_id: ArchetypeId,
@@ -665,4 +762,21 @@ impl World {
         row_ticks.set_changed(tick);
         Ok(())
     }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Formats a copied component row for native debugger helpers.
+///
+/// It takes the row's bytes and the registered field layout instead of a
+/// component type, so it works for Rust, renderer and managed descriptor
+/// columns alike.
+pub fn format_component_debug(fields: &[ComponentFieldDescriptor], bytes: &[u8]) -> String {
+    fields
+        .iter()
+        .map(|field| format!("{}={:?}", field.name, decode_field(bytes, field)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

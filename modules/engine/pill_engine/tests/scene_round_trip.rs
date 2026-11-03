@@ -1,19 +1,20 @@
-//! A game's world saves to a `.scene` file and loads back into an empty one.
+//! A game's world saves to a `.scene` file and loads back into an empty world.
 //!
 //! # Responsibilities
 //!
 //! - Prove the whole scene path through the API a project uses: the derive's
-//!   field layouts, [`save_scene`], the `.scene` file, and [`load_scene`],
-//!   with an entity reference and a `Handle<Scene>` reference surviving the
-//!   trip.
+//!   field layouts, [`save_scene`], the `.scene` file and [`load_scene`]. An
+//!   entity reference and a `Handle<Scene>` reference both survive the trip.
+//! - Check that the import registry maps the `.scene` extension, so a scan of
+//!   a project finds scene files without being given a list of types.
 //!
 //! # Design
 //!
-//! The components come from `#[derive(PillComponent)]` and are registered
-//! through the artifact-wide loop, exactly as a module's are, so the layout the
-//! scene reads and writes is the generated one rather than a hand-written copy.
-//! The referenced asset is itself a scene file, which is what makes a scene
-//! nameable by other data.
+//! The component comes from `#[derive(PillComponent)]` and is registered by
+//! [`register_all_components`], the same loop a module's registration uses, so
+//! the scene reads and writes the generated field layout rather than a
+//! hand-written copy. The asset the rider references is itself a scene file,
+//! so the file proves that one scene can name another.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -26,21 +27,69 @@ use pill_engine::{
     Entity, EntityId, Handle, ImportRegistry, PillComponent, Scene, SceneDocument, StandaloneAsset,
 };
 
-/// A rider: the entity it rides, the prop scene it carries, and a scalar, which
-/// is one field of each kind a scene has to carry.
+// =============================================================================
+// Test Types
+// =============================================================================
+
+/// A rider, the component the test saves: it names the entity it rides, the
+/// prop scene that goes with it, and its weight.
+///
+/// The three fields are one of each kind a scene has to save: an entity
+/// reference, an asset reference and a plain number.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PillComponent)]
 pub struct Rider {
-    /// The entity this rider sits on.
+    /// The entity this rider rides.
     mount: Entity,
-    /// The prop scene drawn with the rider.
+    /// The prop scene that travels with the rider.
     prop: Handle<Scene>,
-    /// How much the rider weighs, in the physics.
+    /// The rider's weight, saved as a plain number.
     weight: f32,
 }
 
-/// A mounted project world: both engines of the test register the same
-/// components and asset types, as two runs of one project would.
+/// A temporary directory that stands in for the project's asset folder.
+///
+/// Creating it mounts it as the asset directory; dropping it deletes it, so a
+/// run leaves no files behind.
+struct ScratchDirectory {
+    root_path: PathBuf,
+}
+
+impl ScratchDirectory {
+    /// Creates an empty directory named after `test_name` and mounts it as the
+    /// project's asset directory.
+    fn new(test_name: &str) -> Self {
+        let root_path =
+            std::env::temp_dir().join(format!("pill-scene-{test_name}-{}", std::process::id()));
+        // Start empty, in case a run with the same process id left files here.
+        let _ = std::fs::remove_dir_all(&root_path);
+        std::fs::create_dir_all(&root_path).expect("the scratch directory is created");
+        mount_directory(&root_path);
+        Self { root_path }
+    }
+
+    /// Writes `bytes` to `relative_path` below the directory, creating the
+    /// folders on the way.
+    fn write(&self, relative_path: &str, bytes: &[u8]) {
+        let path = self.root_path.join(relative_path);
+        std::fs::create_dir_all(path.parent().expect("a file below a directory"))
+            .expect("the directory is created");
+        std::fs::write(path, bytes).expect("the file is written");
+    }
+}
+
+impl Drop for ScratchDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root_path);
+    }
+}
+
+// =============================================================================
+// Test Helpers
+// =============================================================================
+
+/// Builds an engine that registers the components and asset types of this
+/// project, so every engine the test creates has the same world shape.
 fn engine_with_project() -> Engine {
     let mut engine = Engine::new();
     register_all_components(engine.world_mut()).expect("registration succeeds");
@@ -48,49 +97,26 @@ fn engine_with_project() -> Engine {
     engine
 }
 
-/// The project's asset directory, removed when the test ends.
-struct Scratch {
-    root: PathBuf,
-}
+// =============================================================================
+// Tests
+// =============================================================================
 
-impl Scratch {
-    fn new(label: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("pill-scene-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("the scratch directory is created");
-        mount_directory(&root);
-        Self { root }
-    }
-
-    fn write(&self, relative: &str, bytes: &[u8]) {
-        let path = self.root.join(relative);
-        std::fs::create_dir_all(path.parent().expect("a file below a directory"))
-            .expect("the directory is created");
-        std::fs::write(path, bytes).expect("the file is written");
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
-/// A scene's entities, components and references all come back from the file,
-/// including the scene reference and the entity reference it carried.
+/// Saves a world that holds a rider, then loads the file into a fresh engine
+/// and checks that every value came back, both references included.
 #[test]
 fn a_project_scene_saves_and_loads_back_with_its_references() {
-    let scratch = Scratch::new("round-trip");
+    let scratch_directory = ScratchDirectory::new("round-trip");
     let mount_id = EntityId::from_name("mount");
     let hero_id = EntityId::from_name("hero");
 
-    // The prop scene the rider references: an empty document is a valid scene.
+    // The prop scene the rider references. An empty document is a valid
+    // scene, so the file only needs a fresh guid.
     let prop_guid = AssetGuid::random().expect("a fresh guid");
     let prop = render_standalone::<Scene>(prop_guid, &SceneDocument::default())
         .expect("an empty scene renders");
-    scratch.write("props/scenery.scene", &prop);
+    scratch_directory.write("props/scenery.scene", &prop);
 
-    // Step 1: the world that saves.
+    // Step 1: build the world that holds the rider, and save it to a file.
     let scene_guid = {
         let mut engine = engine_with_project();
         let prop = {
@@ -140,34 +166,34 @@ fn a_project_scene_saves_and_loads_back_with_its_references() {
 
         let scene_guid = AssetGuid::random().expect("a fresh guid");
         let bytes = render_standalone::<Scene>(scene_guid, &document).expect("the scene renders");
-        scratch.write("scenes/main.scene", &bytes);
+        scratch_directory.write("scenes/main.scene", &bytes);
         scene_guid
     };
 
-    // Step 2: an empty engine of the same project reads the file back.
+    // Step 2: a fresh engine of the same project reads the file back.
     let mut engine = engine_with_project();
     let database = {
         let registry = engine
             .world()
             .get_resource::<ImportRegistry>()
             .expect("an engine owns an import registry");
-        AssetDatabase::from_directory(&scratch.root, registry)
+        AssetDatabase::from_directory(&scratch_directory.root_path, registry)
     };
     let scene = {
         let assets = engine
             .world_mut()
             .get_resource_mut::<AssetManager>()
             .expect("an engine owns an asset manager");
-        let imported = assets
+        let imported_scene = assets
             .import_standalone::<Scene>(Path::new("scenes/main.scene"))
             .expect("the scene file loads");
         assert_eq!(
-            imported.guid,
+            imported_scene.guid,
             Some(scene_guid),
             "the file keeps the guid it was saved with"
         );
         assets
-            .get(imported.handle)
+            .get(imported_scene.handle)
             .expect("the scene asset is live")
             .clone()
     };
@@ -186,7 +212,7 @@ fn a_project_scene_saves_and_loads_back_with_its_references() {
     );
     assert_eq!(report.unresolved_references, 0);
 
-    // Step 3: the values the file carried, read back through the components.
+    // Step 3: read the saved values back through the components.
     let world = engine.world_mut();
     let hero = world.entity_by_id(hero_id).expect("the hero came back");
     let rider = *world
@@ -209,8 +235,9 @@ fn a_project_scene_saves_and_loads_back_with_its_references() {
     );
 }
 
-/// The `.scene` extension is registered with the import registry, so a scan of
-/// the project's asset directory finds scene files without a type list.
+/// The import registry maps the `.scene` extension to the scene type, so a
+/// scan of a project's asset directory finds scene files without being given a
+/// list of types to look for.
 #[test]
 fn the_scene_extension_is_registered() {
     let engine = engine_with_project();

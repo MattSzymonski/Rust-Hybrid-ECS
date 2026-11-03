@@ -1,32 +1,35 @@
-//! Every asset of a project by guid and by path, loaded or not:
-//! [`AssetDatabase`].
+//! An index of every asset a project holds, by guid and by path, whether or
+//! not it is loaded: [`AssetDatabase`].
 //!
 //! # Responsibilities
 //!
-//! - Index each asset in a project's `res` by guid and by path, with the type
-//!   its header names and whether it is standalone ([`AssetRecord`]), from a
-//!   directory ([`AssetDatabase::from_directory`]) or a shipping pack
+//! - Index each asset in a project's `res` directory by guid and by path, and
+//!   record the type its header names and whether it is standalone
+//!   ([`AssetRecord`]). The index is built from a directory
+//!   ([`AssetDatabase::from_directory`]) or from a shipping pack
 //!   ([`AssetDatabase::from_pack`]).
-//! - Follow edits on disk one path at a time ([`AssetDatabase::refresh`]): a
-//!   new file, a deleted one, and a file moved with its `.meta`.
-//! - Report a guid two files claim instead of indexing it twice
+//! - Follow edits on disk one path at a time
+//!   ([`AssetDatabase::refresh`]): a new file, a deleted one, and a file
+//!   moved together with its `.meta`.
+//! - Report a guid that two files claim, instead of indexing the asset twice
 //!   ([`AssetDatabase::conflicts`]).
 //!
 //! # Design
 //!
-//! The [`AssetManager`](crate::AssetManager) knows the assets that are loaded;
-//! this knows the ones that exist. A reference names an asset by guid (see
-//! [`AssetReference`](crate::AssetReference)), and resolving one that is not
-//! loaded yet needs the step from that guid to a path, which the import registry
-//! takes ([`ImportRegistry::load_by_guid`]).
+//! The [`AssetManager`](crate::AssetManager) knows which assets are loaded;
+//! this index knows which ones exist. A reference names an asset by guid (see
+//! [`AssetReference`](crate::AssetReference)), so resolving an asset that is
+//! not loaded yet needs a step from its guid to its path. The import registry
+//! takes that step ([`ImportRegistry::load_by_guid`]).
 //!
-//! The identity rules are the importer's (`asset_metadata.rs`): one path is one
-//! asset, its guid is the one its `.meta` (or, for a standalone file, its own
-//! header) holds, and a guid a second path claims is refused rather than moved.
-//! Only the header is read - `format_version`, `asset_type`, `guid` - never the
-//! settings or the body, so indexing a large project costs one small JSON read
-//! per asset. A source with no `.meta` has no guid yet and is not indexed; the
-//! write that gives it one is a change [`AssetDatabase::refresh`] picks up.
+//! The identity rules are the importer's (`asset_metadata.rs`): one path is
+//! one asset, and the guid is the one its `.meta` holds (or, for a standalone
+//! file, the one in its own header). A guid that a second path claims is
+//! refused, not moved. The index takes only the identity out of a header -
+//! `format_version`, `asset_type` and `guid` - and never decodes an asset's
+//! settings, so indexing a large project costs one small JSON read per asset.
+//! A source with no `.meta` has no guid yet and is not indexed; the write that
+//! gives it one is a change [`AssetDatabase::refresh`] picks up.
 //!
 //! [`ImportRegistry::load_by_guid`]: crate::ImportRegistry::load_by_guid
 
@@ -50,7 +53,7 @@ use crate::resource::Resource;
 pub struct AssetRecord {
     /// The asset's stable identity.
     pub guid: AssetGuid,
-    /// Its path relative to `res`, `/`-separated: the name it loads under.
+    /// The path the asset loads under, relative to `res` and separated by `/`.
     pub path: String,
     /// The asset type its header names (`pill_master_renderer::assets::Mesh`).
     pub asset_type: String,
@@ -59,17 +62,18 @@ pub struct AssetRecord {
     pub standalone: bool,
 }
 
-/// A guid two files claim: the first path keeps it, the second is not indexed.
+/// Two paths that claim one guid. The first path keeps it; the second is not
+/// indexed.
 ///
-/// The same refusal the importer makes for a source copied together with its
-/// `.meta`: the second file needs a guid of its own.
+/// The importer refuses the same thing when a source is copied together with
+/// its `.meta`: the copied file needs a guid of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuidConflict {
-    /// The contested guid.
+    /// The guid both paths claim.
     pub guid: AssetGuid,
-    /// The path that holds it.
+    /// The path that keeps the guid.
     pub kept: String,
-    /// The path that also claims it and was left out.
+    /// The path that also claims it and is not indexed.
     pub refused: String,
 }
 
@@ -77,17 +81,20 @@ pub struct GuidConflict {
 // AssetDatabase
 // =============================================================================
 
-/// The assets of a project by guid and by path; see the module docs.
+/// Every asset of a project, indexed by guid and by path; see the module docs.
 ///
-/// A world resource, inserted by the host when it mounts the project's assets,
-/// and read by whatever resolves a reference or lists the assets of a type.
+/// The host inserts it as a world resource when it mounts the project's
+/// assets. Whatever resolves a reference or lists the assets of a type reads
+/// it from there.
 #[derive(Debug, Default, Clone)]
 pub struct AssetDatabase {
-    /// Every indexed asset, by path, kept sorted so listings are stable.
+    /// Every indexed asset, keyed by path and kept sorted so listings are
+    /// stable.
     records: BTreeMap<String, AssetRecord>,
-    /// The path holding each guid.
-    by_guid: HashMap<AssetGuid, String>,
-    /// Guids a second path claimed, as found by the last build or refresh.
+    /// The path that holds each indexed guid.
+    paths_by_guid: HashMap<AssetGuid, String>,
+    /// Guids that a second path claimed, as found by the build and by each
+    /// refresh.
     conflicts: Vec<GuidConflict>,
 }
 
@@ -99,39 +106,43 @@ impl AssetDatabase {
         Self::default()
     }
 
-    /// Index every asset under `root`, a project's `res` directory.
+    /// Indexes every asset under `root`, which is a project's `res` directory.
     ///
-    /// `registry` says which extensions are standalone (their file holds the
-    /// header); every other file is indexed through its `.meta`, when it has
-    /// one. Files are visited in path order, so when two claim one guid the
-    /// first path keeps it on every machine.
+    /// `registry` says which file extensions belong to standalone types, where
+    /// the file itself holds the header. Every other file is indexed through
+    /// its `.meta`, when it has one. Files are visited in path order, so when
+    /// two paths claim one guid, the first path keeps it on every machine.
     pub fn from_directory(root: &Path, registry: &ImportRegistry) -> Self {
         let mut database = Self::new();
-        for relative in files_under(root) {
-            database.index_from_disk(root, &relative, registry);
+        for relative_path in files_under(root) {
+            database.index_from_disk(root, &relative_path, registry);
         }
         database
     }
 
-    /// Index every asset a shipping pack carries, from the `.meta` entries and
-    /// standalone files it holds beside the sources.
+    /// Indexes every asset that a shipping pack carries, from the `.meta`
+    /// entries and the standalone files it holds beside the sources.
     ///
-    /// Needs no registry, because a shipping build indexes its pack before any
-    /// module has registered a type: an entry with a `.meta` beside it is a
-    /// sourced asset, and one without is standalone when the entry itself is
-    /// an asset header. A binary source fails that check at its first byte.
+    /// This needs no registry, because a shipping build indexes its pack before
+    /// any module has registered a type. An entry with a `.meta` beside it is a
+    /// sourced asset. An entry without one is a standalone asset when the entry
+    /// itself is an asset header, so a binary source is skipped.
     pub fn from_pack(pack: &AssetPack) -> Self {
         let mut database = Self::new();
+        // Step 1: Collect every entry that is not a `.meta` file or a
+        // dot-file, in path order.
         let mut paths: Vec<&str> = pack
             .paths()
             .filter(|path| !is_metadata_path(path) && !is_hidden_path(path))
             .collect();
         paths.sort_unstable();
+        // Step 2: Read each entry's identity from its `.meta` when it has one,
+        // and from the entry itself when it does not.
         for path in paths {
-            let sidecar = pack
+            let sidecar_identity = pack
                 .get(&format!("{path}.{METADATA_EXTENSION}"))
                 .and_then(read_identity);
-            let (identity, standalone) = match sidecar {
+            let (identity, standalone) = match sidecar_identity {
                 Some(identity) => (Some(identity), false),
                 None => (pack.get(path).and_then(read_identity), true),
             };
@@ -147,27 +158,34 @@ impl AssetDatabase {
         database
     }
 
-    /// Re-read one path under `root` after it changed on disk.
+    /// Re-reads one path under `root` after the file changed on disk.
     ///
-    /// `relative` is the source's path relative to `root` (a change to a
-    /// `.meta` is reported as its source's path). A file that is gone, or no
-    /// longer has a header, leaves the index. A file whose guid another path
-    /// holds takes it over when that other path no longer exists - a file
-    /// moved with its `.meta` - and is refused as a conflict when it does.
-    pub fn refresh(&mut self, root: &Path, relative: &str, registry: &ImportRegistry) {
-        let path = slash_path(relative);
+    /// `relative_path` is the source's path relative to `root`. A change to a
+    /// `.meta` file is reported under its source's path. A file that is gone,
+    /// or that no longer has a header, leaves the index.
+    ///
+    /// A file whose guid another path holds takes the guid over when that other
+    /// path no longer exists, which is what a file moved with its `.meta`
+    /// looks like. While the other path still exists, the file is refused as a
+    /// conflict.
+    pub fn refresh(&mut self, root: &Path, relative_path: &str, registry: &ImportRegistry) {
+        // Step 1: Drop what this path used to contribute.
+        let path = to_slash_path(relative_path);
         self.remove_path(&path);
         self.conflicts.retain(|conflict| conflict.refused != path);
         if !root.join(&path).is_file() {
             return;
         }
+        // Step 2: Read the path again, and follow the guid to its new path
+        // when the old one is gone.
         let Some(record) = read_record(root, &path, registry) else {
             return;
         };
-        // The guid's current owner is gone from disk: this is where it moved.
-        if let Some(owner) = self.by_guid.get(&record.guid).cloned() {
-            if !root.join(&owner).is_file() {
-                self.remove_path(&owner);
+        // The path that held this guid is gone from disk, so this record is
+        // the asset at its new path.
+        if let Some(owner_path) = self.paths_by_guid.get(&record.guid).cloned() {
+            if !root.join(&owner_path).is_file() {
+                self.remove_path(&owner_path);
             }
         }
         self.insert(record);
@@ -175,12 +193,12 @@ impl AssetDatabase {
 
     /// The asset with `guid`, if one is indexed.
     pub fn by_guid(&self, guid: AssetGuid) -> Option<&AssetRecord> {
-        self.records.get(self.by_guid.get(&guid)?)
+        self.records.get(self.paths_by_guid.get(&guid)?)
     }
 
     /// The asset at `path` (relative to `res`, either separator), if indexed.
     pub fn by_path(&self, path: &str) -> Option<&AssetRecord> {
-        self.records.get(&slash_path(path))
+        self.records.get(&to_slash_path(path))
     }
 
     /// Every indexed asset, in path order.
@@ -188,7 +206,7 @@ impl AssetDatabase {
         self.records.values()
     }
 
-    /// Every indexed asset of the type `asset_type`, in path order: what a
+    /// Every indexed asset of type `asset_type`, in path order. This is what a
     /// reference picker lists.
     pub fn records_of_type<'a>(
         &'a self,
@@ -199,7 +217,8 @@ impl AssetDatabase {
             .filter(move |record| record.asset_type == asset_type)
     }
 
-    /// The guids a second path claimed, as found by the last build or refresh.
+    /// The guids that a second path claimed, as found by the build and by each
+    /// refresh.
     pub fn conflicts(&self) -> &[GuidConflict] {
         &self.conflicts
     }
@@ -214,38 +233,41 @@ impl AssetDatabase {
         self.records.is_empty()
     }
 
-    /// Index `relative` from the files under `root`, if it carries a header.
-    fn index_from_disk(&mut self, root: &Path, relative: &str, registry: &ImportRegistry) {
-        if let Some(record) = read_record(root, relative, registry) {
+    /// Reads `relative_path` from disk under `root` and indexes it, when it
+    /// carries a header.
+    fn index_from_disk(&mut self, root: &Path, relative_path: &str, registry: &ImportRegistry) {
+        if let Some(record) = read_record(root, relative_path, registry) {
             self.insert(record);
         }
     }
 
-    /// Add `record`, refusing it as a conflict when another path holds its guid.
+    /// Adds `record`. When another path already holds its guid, records a
+    /// conflict instead and does not index the asset.
     fn insert(&mut self, record: AssetRecord) {
-        if let Some(owner) = self.by_guid.get(&record.guid) {
-            if owner != &record.path {
+        if let Some(owner_path) = self.paths_by_guid.get(&record.guid) {
+            if owner_path != &record.path {
                 self.conflicts.push(GuidConflict {
                     guid: record.guid,
-                    kept: owner.clone(),
+                    kept: owner_path.clone(),
                     refused: record.path,
                 });
                 return;
             }
         }
-        self.by_guid.insert(record.guid, record.path.clone());
+        self.paths_by_guid.insert(record.guid, record.path.clone());
         self.records.insert(record.path.clone(), record);
     }
 
-    /// Drop the record at `path`, if any, and its guid entry.
+    /// Drops the record at `path`, when there is one, and the guid entry that
+    /// points at it.
     fn remove_path(&mut self, path: &str) {
         if let Some(record) = self.records.remove(path) {
             if self
-                .by_guid
+                .paths_by_guid
                 .get(&record.guid)
-                .is_some_and(|owner| owner == path)
+                .is_some_and(|owner_path| owner_path == path)
             {
-                self.by_guid.remove(&record.guid);
+                self.paths_by_guid.remove(&record.guid);
             }
         }
     }
@@ -255,38 +277,46 @@ impl AssetDatabase {
 // Free Functions
 // =============================================================================
 
-/// The record for `relative` under `root`: its header read from the file
-/// itself when standalone, from its `.meta` otherwise; `None` without one.
-fn read_record(root: &Path, relative: &str, registry: &ImportRegistry) -> Option<AssetRecord> {
-    let standalone = is_standalone(relative, registry);
+/// Builds the record for `relative_path` under `root`, or returns `None` when
+/// it has no readable header.
+///
+/// The header is read from the file itself when its type is standalone, and
+/// from its `.meta` otherwise.
+fn read_record(
+    root: &Path,
+    relative_path: &str,
+    registry: &ImportRegistry,
+) -> Option<AssetRecord> {
+    let standalone = is_standalone(relative_path, registry);
     let header_path = if standalone {
-        root.join(relative)
+        root.join(relative_path)
     } else {
-        root.join(format!("{relative}.{METADATA_EXTENSION}"))
+        root.join(format!("{relative_path}.{METADATA_EXTENSION}"))
     };
     let bytes = std::fs::read(header_path).ok()?;
     let (asset_type, guid) = read_identity(&bytes)?;
     Some(AssetRecord {
         guid,
-        path: slash_path(relative),
+        path: to_slash_path(relative_path),
         asset_type,
         standalone,
     })
 }
 
-/// The `asset_type` and `guid` of a header, when it is one this engine reads.
+/// Returns the `asset_type` and the `guid` of a header that this engine can
+/// read, or `None` when it cannot.
 ///
-/// The header contract itself lives in
+/// The header rules live in
 /// [`asset_metadata::read_header`](crate::asset_metadata::read_header), so the
-/// index and the importer cannot disagree about which versions are readable or
-/// what a guid looks like. The index only wants the identity, not the body, and
-/// has nothing to report a refusal to.
+/// index and the importer agree on which format versions are readable and what
+/// a guid looks like. The index needs only the identity, not the body, and has
+/// no one to report a refusal to, so a refused header becomes `None`.
 fn read_identity(bytes: &[u8]) -> Option<(String, AssetGuid)> {
     let (header, _) = crate::asset_metadata::read_header(bytes).ok()?;
     Some((header.asset_type, header.guid))
 }
 
-/// Whether `path`'s extension is a standalone type's.
+/// Whether the extension of `path` belongs to a standalone type.
 fn is_standalone(path: &str, registry: &ImportRegistry) -> bool {
     Path::new(path)
         .extension()
@@ -301,28 +331,29 @@ fn is_metadata_path(path: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(METADATA_EXTENSION))
 }
 
-/// Whether any component of `path` is a dot-file or a dot-directory.
+/// Whether any part of `path` is a dot-file or a dot-directory.
 ///
-/// `write_beside` writes a metadata update as `.<file>.meta.<pid>-<seq>.tmp`
-/// beside its source, and a crash leaves one behind. Such a file holds the
-/// asset's own header, so indexing it would take the guid from the asset it
-/// was written for; `files_under` skips dot-files on disk, and a pack must
-/// skip them too.
+/// `write_beside` writes a metadata update next to its source as
+/// `.<file>.meta.<pid>-<seq>.tmp`, and a crash can leave one of those files
+/// behind. It holds the asset's own header, so indexing it would take the guid
+/// away from the asset it was written for. `files_under` skips dot-files on
+/// disk, and a pack has to skip them too.
 fn is_hidden_path(path: &str) -> bool {
     path.split('/').any(|component| component.starts_with('.'))
 }
 
-/// `path` with `/` separators, the form the index keys on.
-fn slash_path(path: &str) -> String {
+/// Returns `path` with `/` separators, the form the index uses as a key.
+fn to_slash_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
-/// Every file under `root` as a `/`-separated relative path, sorted; `.meta`
-/// files and dot-files left out. An unreadable directory contributes nothing.
+/// Every file under `root` as a `/`-separated relative path, sorted, with
+/// `.meta` files and dot-files left out. A directory that cannot be read
+/// contributes nothing.
 fn files_under(root: &Path) -> Vec<String> {
     let mut files = Vec::new();
-    let mut pending = vec![String::new()];
-    while let Some(directory) = pending.pop() {
+    let mut pending_directories = vec![String::new()];
+    while let Some(directory) = pending_directories.pop() {
         let Ok(entries) = std::fs::read_dir(root.join(&directory)) else {
             continue;
         };
@@ -331,14 +362,16 @@ fn files_under(root: &Path) -> Vec<String> {
             if name.starts_with('.') {
                 continue;
             }
-            let relative = if directory.is_empty() {
+            let relative_path = if directory.is_empty() {
                 name
             } else {
                 format!("{directory}/{name}")
             };
             match entry.file_type() {
-                Ok(kind) if kind.is_dir() => pending.push(relative),
-                Ok(kind) if kind.is_file() && !is_metadata_path(&relative) => files.push(relative),
+                Ok(kind) if kind.is_dir() => pending_directories.push(relative_path),
+                Ok(kind) if kind.is_file() && !is_metadata_path(&relative_path) => {
+                    files.push(relative_path)
+                }
                 _ => {}
             }
         }
@@ -363,7 +396,7 @@ mod tests {
     use std::path::PathBuf;
     use trait_type_map::impl_trait_accessible;
 
-    /// An imported test asset: a `.note` file's text.
+    /// An imported test asset: the text of a `.note` file.
     #[derive(Debug)]
     struct Note(String);
     impl Asset for Note {}
@@ -386,7 +419,7 @@ mod tests {
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     struct NoteSettings {}
 
-    /// A standalone test asset: a `.card` file is the asset.
+    /// A standalone test asset: the `.card` file is the asset itself.
     #[derive(Debug)]
     struct Card;
     impl Asset for Card {}
@@ -416,12 +449,12 @@ mod tests {
     const NOTE_GUID: &str = "000000000000000000000000000000a1";
     const CARD_GUID: &str = "000000000000000000000000000000c1";
 
-    /// A scratch `res` directory, mounted while the test holds the lock, and a
-    /// world with both test types registered.
+    /// A scratch `res` directory and a world with both test types registered.
+    /// The directory stays mounted while the test holds the lock.
     struct Scratch {
         root: PathBuf,
         world: World,
-        _mounted: std::sync::MutexGuard<'static, ()>,
+        _mount_guard: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Scratch {
@@ -440,21 +473,22 @@ mod tests {
             Self {
                 root,
                 world,
-                _mounted: mounted,
+                _mount_guard: mounted,
             }
         }
 
-        fn write(&self, relative: &str, text: &str) {
-            let path = self.root.join(relative);
+        fn write(&self, relative_path: &str, text: &str) {
+            let path = self.root.join(relative_path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
 
-        /// A note at `relative` with a `.meta` holding `guid`.
-        fn note(&self, relative: &str, guid: &str) {
-            self.write(relative, "hello");
+        /// Writes a note at `relative_path` together with a `.meta` that holds
+        /// `guid`.
+        fn note(&self, relative_path: &str, guid: &str) {
+            self.write(relative_path, "hello");
             self.write(
-                &format!("{relative}.meta"),
+                &format!("{relative_path}.meta"),
                 &header("pill_engine::asset_database::tests::Note", guid, "settings"),
             );
         }
@@ -470,8 +504,8 @@ mod tests {
         }
     }
 
-    /// A header document naming `asset_type` and `guid`, with an empty body
-    /// under `body_field`.
+    /// Builds a header document naming `asset_type` and `guid`, with an empty
+    /// body under `body_field`.
     fn header(asset_type: &str, guid: &str, body_field: &str) -> String {
         format!(
             r#"{{"format_version": 1, "asset_type": "{asset_type}", "guid": "{guid}", "{body_field}": {{}}}}"#
@@ -550,8 +584,8 @@ mod tests {
         database.refresh(&scratch.root, "a.note", &registry);
         assert_eq!(database.by_guid(guid(NOTE_GUID)).unwrap().path, "a.note");
 
-        // Moved with its `.meta`: the new path arrives first, as the watcher
-        // reports it, and takes the guid over because the old one is gone.
+        // Moved with its `.meta`: the watcher reports the new path first. It
+        // takes the guid over because the old path is gone.
         std::fs::create_dir_all(scratch.root.join("moved")).unwrap();
         std::fs::rename(
             scratch.root.join("a.note"),
@@ -734,9 +768,9 @@ mod tests {
         assert_eq!((card.path.as_str(), card.standalone), ("b.card", true));
     }
 
-    /// A metadata document left behind by a crashed `write_beside` is a
-    /// dot-file, and a dot-file is not an asset: it must not be indexed, and
-    /// must not take the guid its own asset holds.
+    /// A metadata document that a crashed `write_beside` left behind is a
+    /// dot-file, and a dot-file is not an asset. It must not be indexed and
+    /// must not take the guid that its own asset holds.
     #[test]
     fn a_packed_metadata_temp_file_does_not_steal_the_guid() {
         let meta = header(
@@ -762,8 +796,9 @@ mod tests {
         );
     }
 
-    /// The bytes of a version-1 pack holding `files`, as the pack writer lays
-    /// them out (see `asset_store.rs`'s format notes).
+    /// Builds the bytes of a version-1 pack that holds `files`, laid out the
+    /// way the pack writer does (see the pack format section of
+    /// `asset_store.rs`).
     fn pack(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut index_length = 0usize;
         for (path, _) in files {

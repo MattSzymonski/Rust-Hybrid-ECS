@@ -1,24 +1,30 @@
-//! Transform gizmos: handle geometry, drag math and snapping.
+//! Transform gizmos: handle geometry, drag math, picking and snapping.
 //!
 //! # Responsibilities
 //!
 //! - Name the tool's modes ([`GizmoMode`]: translate, rotate, scale) and
 //!   spaces ([`GizmoSpace`]: world, local), and the settings a toolbar edits
 //!   ([`GizmoSettings`]).
-//! - Build the handle geometry a renderer draws and picks, one handle id per
-//!   axis of the active mode ([`build_geometry`]).
-//! - The drag math: project a cursor ray onto the dragged axis or rotation
+//! - Build the handle geometry a renderer draws, one handle id per axis of the
+//!   active mode ([`build_geometry`]).
+//! - Answer which handle a cursor ray is over ([`hit_test`]) and build the
+//!   guides a drag draws ([`axis_guide`], [`dotted_segments`]).
+//! - Do the drag math: project a cursor ray onto the dragged axis or rotation
 //!   plane, and snap the result to the configured step.
+//! - Carry the editable-field table ([`RESOURCE_FIELDS`]) that the Inspector's
+//!   rows and `SetResourceField` both use.
 //!
 //! # Design
 //!
-//! Pure functions over plain arrays. The geometry and the math live here and
-//! the editor executable owns the camera and the world, so a drag is testable
-//! without a renderer or a window. Handle ids are stable numbers
-//! (`1..=3` translate, `11..=13` rotate, `21..=23` scale), so a pick's
-//! `Handle(id)` names both the mode it belongs to and its axis
-//! ([`handle_axis`]), and the renderer never needs to know what a handle
-//! means.
+//! Everything here is a pure function over plain arrays, so a drag can be
+//! tested without a renderer or a window. The editor executable owns the
+//! camera and the world; this module only does the arithmetic.
+//!
+//! Handle ids are stable numbers: `1..=3` for translate axes, `4..=6` for
+//! translation planes, `11..=13` for rotate rings and `21..=23` for scale
+//! axes. A pick's `Handle(id)` decodes through [`handle_kind`] into the mode
+//! and the axis it belongs to (or the axis pair a plane spans), so the
+//! renderer never needs to know what a handle means.
 
 // External crates
 use pill_engine::FieldValue;
@@ -28,13 +34,13 @@ use serde::{Deserialize, Serialize};
 // State
 // =============================================================================
 
-/// The gizmo tool's live state: the settings the editor draws and drags with.
+/// The gizmo tool's state: the settings the editor draws and drags with.
 ///
-/// A world resource rather than shell state, because the executable owns the
-/// drag - it holds the camera and the pick answers - and the preferences
-/// write, while the shell queues the commands. Both sides meet here, so a
-/// shell reload keeps the tool as it is, and the draw, the pick and the drag
-/// can never disagree about which handles are on screen.
+/// This is a world resource, not shell state. The executable owns the drag
+/// (it holds the camera and receives the pick answers) and writes the
+/// preferences file; the shell only queues the commands. Both sides meet here,
+/// so a shell reload keeps the tool as it is, and the draw, the pick and the
+/// drag always agree about which handles are on screen.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GizmoState {
     /// What the tool edits, in which space, and how it snaps.
@@ -51,12 +57,15 @@ impl pill_engine::Resource for GizmoState {
 // Resource fields
 // =============================================================================
 
-/// The name [`GizmoState`] answers to in `SetResourceField` - the same string
-/// the resource registers under, so a command written by hand finds it.
+/// The name [`GizmoState`] registers under, which a `SetResourceField`
+/// command must also carry. Keeping them the same lets a command written by
+/// hand find the resource.
 pub const RESOURCE_NAME: &str = "pill_editor_core::gizmo::GizmoState";
 
-/// One editable field of the gizmo settings: the name a command addresses it
-/// by, the label the Inspector's row shows, and how to read and write it.
+/// One editable field of the gizmo settings.
+///
+/// It carries the name a command addresses the field by, the label the
+/// Inspector's row shows, and the functions that read and write it.
 #[derive(Clone, Copy, Debug)]
 pub struct ResourceField {
     /// The field's name in a `SetResourceField` command.
@@ -65,49 +74,49 @@ pub struct ResourceField {
     pub label: &'static str,
     /// Read the field out of the settings.
     pub read: fn(&GizmoSettings) -> FieldValue,
-    /// Write the field, answering its previous value for the command's
-    /// inverse.
+    /// Write the field and return its previous value, which the command's
+    /// inverse restores.
     pub write: fn(&mut GizmoSettings, &FieldValue) -> Result<FieldValue, String>,
 }
 
-/// Every editable field, in row order.
+/// Every editable field, in the order the Inspector lists them.
 ///
-/// One table serves the write path ([`set_resource_field`]), the read path
-/// ([`resource_field_value`]) and the Inspector's rows
-/// ([`crate::resources::EDITABLE_RESOURCES`] derives its entries from here), so
-/// a field cannot be offered by the tab and refused by the write, nor be
-/// readable and not writable.
+/// One table serves three readers: the write path ([`set_resource_field`]),
+/// the read path ([`resource_field_value`]) and the Inspector's rows, through
+/// [`crate::resources::EDITABLE_RESOURCES`]. A field therefore cannot be
+/// offered by the tab and refused by the write, or be readable and not
+/// writable.
 ///
-/// An enum field travels as its `U32` discriminant, in declaration order, and a
-/// step as `F32`.
+/// An enum field travels as its `U32` discriminant, in declaration order. A
+/// step travels as an `F32`.
 pub const RESOURCE_FIELDS: &[ResourceField] = &[
     ResourceField {
         name: "settings.mode",
         label: "Mode",
-        read: |settings| FieldValue::U32(mode_index(settings.mode)),
-        write: |settings, value| {
+        read: |settings| FieldValue::U32(mode_discriminant(settings.mode)),
+        write: |settings, field_value| {
             let previous = settings.mode;
-            settings.mode = mode_from_index(field_u32("settings.mode", value)?)?;
-            Ok(FieldValue::U32(mode_index(previous)))
+            settings.mode = mode_from_discriminant(field_u32("settings.mode", field_value)?)?;
+            Ok(FieldValue::U32(mode_discriminant(previous)))
         },
     },
     ResourceField {
         name: "settings.space",
         label: "Space",
-        read: |settings| FieldValue::U32(space_index(settings.space)),
-        write: |settings, value| {
+        read: |settings| FieldValue::U32(space_discriminant(settings.space)),
+        write: |settings, field_value| {
             let previous = settings.space;
-            settings.space = space_from_index(field_u32("settings.space", value)?)?;
-            Ok(FieldValue::U32(space_index(previous)))
+            settings.space = space_from_discriminant(field_u32("settings.space", field_value)?)?;
+            Ok(FieldValue::U32(space_discriminant(previous)))
         },
     },
     ResourceField {
         name: "settings.snap",
         label: "Snapping",
         read: |settings| FieldValue::Bool(settings.snap),
-        write: |settings, value| {
+        write: |settings, field_value| {
             let previous = settings.snap;
-            settings.snap = match value {
+            settings.snap = match field_value {
                 FieldValue::Bool(value) => *value,
                 other => return Err(format!("`settings.snap` expects a Bool, got {other:?}")),
             };
@@ -118,11 +127,11 @@ pub const RESOURCE_FIELDS: &[ResourceField] = &[
         name: "settings.translate_step",
         label: "Move step",
         read: |settings| FieldValue::F32(settings.translate_step),
-        write: |settings, value| {
+        write: |settings, field_value| {
             swap_f32(
                 &mut settings.translate_step,
                 "settings.translate_step",
-                value,
+                field_value,
             )
         },
     },
@@ -130,11 +139,11 @@ pub const RESOURCE_FIELDS: &[ResourceField] = &[
         name: "settings.rotate_step_degrees",
         label: "Rotate step",
         read: |settings| FieldValue::F32(settings.rotate_step_degrees),
-        write: |settings, value| {
+        write: |settings, field_value| {
             swap_f32(
                 &mut settings.rotate_step_degrees,
                 "settings.rotate_step_degrees",
-                value,
+                field_value,
             )
         },
     },
@@ -142,87 +151,104 @@ pub const RESOURCE_FIELDS: &[ResourceField] = &[
         name: "settings.scale_step",
         label: "Scale step",
         read: |settings| FieldValue::F32(settings.scale_step),
-        write: |settings, value| swap_f32(&mut settings.scale_step, "settings.scale_step", value),
+        write: |settings, field_value| {
+            swap_f32(&mut settings.scale_step, "settings.scale_step", field_value)
+        },
     },
 ];
 
-/// The table's row for `field`, when it has one.
-pub fn resource_field(field: &str) -> Option<&'static ResourceField> {
-    RESOURCE_FIELDS.iter().find(|row| row.name == field)
+/// The table's row for `field_name`, when it has one.
+pub fn resource_field(field_name: &str) -> Option<&'static ResourceField> {
+    RESOURCE_FIELDS.iter().find(|row| row.name == field_name)
 }
 
-/// Set one field of the gizmo settings from a field value, and return the
-/// previous value for the command's inverse.
+/// Sets one field of the gizmo settings from a field value and returns the
+/// previous value, for the command's inverse.
 ///
 /// The engine cannot read or write a Rust resource's fields generically, so
-/// [`RESOURCE_FIELDS`] names the writable ones; this is a lookup plus the row's
-/// own write.
+/// [`RESOURCE_FIELDS`] lists the ones that may be written. This function is a
+/// lookup in that table, then the row's own write.
+///
+/// # Errors
+///
+/// Returns the message to show the user when `resource_name` is not
+/// [`RESOURCE_NAME`], when `field_name` is not in [`RESOURCE_FIELDS`], or when
+/// `field_value` has a kind the field cannot hold.
 pub fn set_resource_field(
     settings: &mut GizmoSettings,
-    resource: &str,
-    field: &str,
-    value: &FieldValue,
+    resource_name: &str,
+    field_name: &str,
+    field_value: &FieldValue,
 ) -> Result<FieldValue, String> {
-    check_resource(resource)?;
-    let row = resource_field(field).ok_or_else(|| {
-        let names: Vec<&str> = RESOURCE_FIELDS.iter().map(|row| row.name).collect();
+    check_resource(resource_name)?;
+    let row = resource_field(field_name).ok_or_else(|| {
+        let field_names: Vec<&str> = RESOURCE_FIELDS.iter().map(|row| row.name).collect();
         format!(
-            "`{field}` is not an editable field of `{RESOURCE_NAME}` ({})",
-            names.join(", ")
+            "`{field_name}` is not an editable field of `{RESOURCE_NAME}` ({})",
+            field_names.join(", ")
         )
     })?;
-    (row.write)(settings, value)
+    (row.write)(settings, field_value)
 }
 
-/// Read one editable field of the gizmo settings: the reading half of the table
-/// [`set_resource_field`] writes through.
+/// Reads one editable field of the gizmo settings: the reading half of the
+/// table [`set_resource_field`] writes through.
+///
+/// # Errors
+///
+/// Returns the message to show the user when `resource_name` is not
+/// [`RESOURCE_NAME`] or when `field_name` is not in [`RESOURCE_FIELDS`].
 pub fn resource_field_value(
     settings: &GizmoSettings,
-    resource: &str,
-    field: &str,
+    resource_name: &str,
+    field_name: &str,
 ) -> Result<FieldValue, String> {
-    check_resource(resource)?;
-    let row = resource_field(field)
-        .ok_or_else(|| format!("`{field}` is not a readable field of `{RESOURCE_NAME}`"))?;
+    check_resource(resource_name)?;
+    let row = resource_field(field_name)
+        .ok_or_else(|| format!("`{field_name}` is not a readable field of `{RESOURCE_NAME}`"))?;
     Ok((row.read)(settings))
 }
 
 /// Refuse any resource but the gizmo state, naming it in the message.
-fn check_resource(resource: &str) -> Result<(), String> {
-    if resource == RESOURCE_NAME {
+fn check_resource(resource_name: &str) -> Result<(), String> {
+    if resource_name == RESOURCE_NAME {
         Ok(())
     } else {
         Err(format!(
-            "`{resource}` is not an editable resource (`{RESOURCE_NAME}` is)"
+            "`{resource_name}` is not an editable resource (`{RESOURCE_NAME}` is)"
         ))
     }
 }
 
 /// A `U32` field value, accepting the wider unsigned forms too.
-fn field_u32(field: &str, value: &FieldValue) -> Result<u32, String> {
-    match value {
+fn field_u32(field_name: &str, field_value: &FieldValue) -> Result<u32, String> {
+    match field_value {
         FieldValue::U32(value) => Ok(*value),
         FieldValue::U64(value) => {
-            u32::try_from(*value).map_err(|_| format!("`{field}` does not fit a u32"))
+            u32::try_from(*value).map_err(|_| format!("`{field_name}` does not fit a u32"))
         }
-        other => Err(format!("`{field}` expects a U32, got {other:?}")),
+        other => Err(format!("`{field_name}` expects a U32, got {other:?}")),
     }
 }
 
 /// Swap one `f32` field and hand back its previous value.
-fn swap_f32(slot: &mut f32, field: &str, value: &FieldValue) -> Result<FieldValue, String> {
-    let next = match value {
+fn swap_f32(
+    field_slot: &mut f32,
+    field_name: &str,
+    field_value: &FieldValue,
+) -> Result<FieldValue, String> {
+    let next = match field_value {
         FieldValue::F32(value) => *value,
         FieldValue::F64(value) => *value as f32,
-        other => return Err(format!("`{field}` expects an F32, got {other:?}")),
+        other => return Err(format!("`{field_name}` expects an F32, got {other:?}")),
     };
-    let previous = *slot;
-    *slot = next;
+    let previous = *field_slot;
+    *field_slot = next;
     Ok(FieldValue::F32(previous))
 }
 
 /// The `U32` discriminant of a mode, in declaration order.
-fn mode_index(mode: GizmoMode) -> u32 {
+fn mode_discriminant(mode: GizmoMode) -> u32 {
     match mode {
         GizmoMode::Translate => 0,
         GizmoMode::Rotate => 1,
@@ -231,8 +257,8 @@ fn mode_index(mode: GizmoMode) -> u32 {
 }
 
 /// The mode a discriminant names.
-fn mode_from_index(index: u32) -> Result<GizmoMode, String> {
-    match index {
+fn mode_from_discriminant(discriminant: u32) -> Result<GizmoMode, String> {
+    match discriminant {
         0 => Ok(GizmoMode::Translate),
         1 => Ok(GizmoMode::Rotate),
         2 => Ok(GizmoMode::Scale),
@@ -241,7 +267,7 @@ fn mode_from_index(index: u32) -> Result<GizmoMode, String> {
 }
 
 /// The `U32` discriminant of a space, in declaration order.
-fn space_index(space: GizmoSpace) -> u32 {
+fn space_discriminant(space: GizmoSpace) -> u32 {
     match space {
         GizmoSpace::World => 0,
         GizmoSpace::Local => 1,
@@ -249,8 +275,8 @@ fn space_index(space: GizmoSpace) -> u32 {
 }
 
 /// The space a discriminant names.
-fn space_from_index(index: u32) -> Result<GizmoSpace, String> {
-    match index {
+fn space_from_discriminant(discriminant: u32) -> Result<GizmoSpace, String> {
+    match discriminant {
         0 => Ok(GizmoSpace::World),
         1 => Ok(GizmoSpace::Local),
         _ => Err("`settings.space` is 0 (world) or 1 (local)".to_owned()),
@@ -283,10 +309,10 @@ pub enum GizmoSpace {
     Local,
 }
 
-/// The tool's state: what it edits, in which space, and how it snaps.
+/// The tool's settings: what it edits, in which space, and how it snaps.
 ///
-/// The preferences file holds it, snapping steps included, so a step is
-/// editable by hand and the panel and the file never disagree.
+/// The preferences file stores them, snapping steps included, so a step can be
+/// edited by hand and the panel and the file always show the same values.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GizmoSettings {
     /// The active mode.
@@ -358,11 +384,11 @@ impl GizmoSettings {
 // =============================================================================
 
 /// The handle one axis of a mode is pickable by.
-pub const fn axis_handle(mode: GizmoMode, axis: usize) -> u32 {
+pub const fn axis_handle(mode: GizmoMode, axis_index: usize) -> u32 {
     match mode {
-        GizmoMode::Translate => 1 + axis as u32,
-        GizmoMode::Rotate => 11 + axis as u32,
-        GizmoMode::Scale => 21 + axis as u32,
+        GizmoMode::Translate => 1 + axis_index as u32,
+        GizmoMode::Rotate => 11 + axis_index as u32,
+        GizmoMode::Scale => 21 + axis_index as u32,
     }
 }
 
@@ -371,14 +397,14 @@ pub const PLANE_PAIRS: [(usize, usize); 3] = [(0, 1), (0, 2), (1, 2)];
 
 /// The handle one translation plane is pickable by: the square between its
 /// two axes. Planes only exist on the translation tool.
-pub const fn plane_handle(first: usize, second: usize) -> u32 {
-    let index = match (first, second) {
+pub const fn plane_handle(first_axis: usize, second_axis: usize) -> u32 {
+    let plane_index = match (first_axis, second_axis) {
         (0, 1) => 0,
         (0, 2) => 1,
         (1, 2) => 2,
         _ => 0,
     };
-    4 + index as u32
+    4 + plane_index as u32
 }
 
 /// What a handle id addresses.
@@ -418,7 +444,7 @@ impl HandleKind {
     }
 }
 
-/// What a handle id addresses; `None` for a foreign id.
+/// What a handle id addresses; `None` for an id this module never issues.
 ///
 /// Ids are stable numbers: `1..=3` translate axes, `4..=6` translation
 /// planes, `11..=13` rotate rings, `21..=23` scale axes.
@@ -429,8 +455,11 @@ pub fn handle_kind(handle: u32) -> Option<HandleKind> {
             axis: (handle - 1) as usize,
         }),
         4..=6 => {
-            let (first, second) = PLANE_PAIRS[(handle - 4) as usize];
-            Some(HandleKind::Plane { first, second })
+            let (first_axis, second_axis) = PLANE_PAIRS[(handle - 4) as usize];
+            Some(HandleKind::Plane {
+                first: first_axis,
+                second: second_axis,
+            })
         }
         11..=13 => Some(HandleKind::Axis {
             mode: GizmoMode::Rotate,
@@ -444,11 +473,15 @@ pub fn handle_kind(handle: u32) -> Option<HandleKind> {
     }
 }
 
-/// Which mode and axis a handle belongs to; `None` for a foreign id or a
-/// plane handle.
+/// Which mode and axis a handle belongs to; `None` for an id this module never
+/// issues, or for a plane handle.
 pub fn handle_axis(handle: u32) -> Option<(GizmoMode, usize)> {
     handle_kind(handle).and_then(HandleKind::axis)
 }
+
+// =============================================================================
+// Appearance
+// =============================================================================
 
 /// The world axes, in handle order.
 pub const AXES: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -460,28 +493,32 @@ pub const AXIS_COLORS: [[f32; 4]; 3] = [
     [0.30, 0.50, 0.95, 1.0],
 ];
 
-/// How much a hovered handle brightens.
+/// The factor a hovered handle's colour is multiplied by.
 pub const HOVER_BRIGHTEN: f32 = 1.35;
-/// The active handle's multiplier against its base colour.
+/// The factor the active handle's colour is multiplied by.
 pub const ACTIVE_DIM: f32 = 0.70;
 
-/// The plane squares' alpha: translucent, so the axis arrows behind them
-/// still read.
+/// The plane squares' alpha: translucent, so the axis arrows behind them stay
+/// visible.
 pub const PLANE_ALPHA: f32 = 0.55;
 
 /// Where a plane square's centre sits along both of its axes, as a fraction
-/// of the gizmo's length, and its half-size.
+/// of the gizmo's length.
 pub const PLANE_OFFSET: f32 = 0.32;
+/// Half of a plane square's side, as a fraction of the gizmo's length.
 pub const PLANE_HALF: f32 = 0.09;
 
-/// The largest factor a scale handle may grow to during a drag, and the
-/// smallest it may shrink to: past these the handle would leave the view or
-/// vanish into the origin.
+/// The largest factor a scale handle may grow to during a drag. Past it the
+/// handle would reach out of the view.
 pub const SCALE_HANDLE_MAX_RATIO: f32 = 3.0;
+/// The smallest factor a scale handle may shrink to during a drag. Below it
+/// the handle would vanish into the origin.
 pub const SCALE_HANDLE_MIN_RATIO: f32 = 0.2;
 
-/// Which handle the pointer is over and which one a drag holds, so the
-/// geometry can be built in the state the user is looking at.
+/// The handle the pointer is over and the handle a drag holds.
+///
+/// The geometry is built in this state, so a hover or a drag shows on the
+/// handles the frame draws.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HandleStates {
     /// The handle under the pointer, if one is.
@@ -514,34 +551,34 @@ pub enum HandleState {
     Active,
 }
 
-/// `base` adjusted for the state `handle` is in.
-pub fn styled_color(base: [f32; 4], handle: u32, states: HandleStates) -> [f32; 4] {
+/// `base_color` adjusted for the state `handle` is in.
+pub fn styled_color(base_color: [f32; 4], handle: u32, states: HandleStates) -> [f32; 4] {
     match states.of(handle) {
-        HandleState::Idle => base,
+        HandleState::Idle => base_color,
         HandleState::Hovered => [
-            (base[0] * HOVER_BRIGHTEN).min(1.0),
-            (base[1] * HOVER_BRIGHTEN).min(1.0),
-            (base[2] * HOVER_BRIGHTEN).min(1.0),
-            base[3],
+            (base_color[0] * HOVER_BRIGHTEN).min(1.0),
+            (base_color[1] * HOVER_BRIGHTEN).min(1.0),
+            (base_color[2] * HOVER_BRIGHTEN).min(1.0),
+            base_color[3],
         ],
         HandleState::Active => [
-            base[0] * ACTIVE_DIM,
-            base[1] * ACTIVE_DIM,
-            base[2] * ACTIVE_DIM,
-            base[3],
+            base_color[0] * ACTIVE_DIM,
+            base_color[1] * ACTIVE_DIM,
+            base_color[2] * ACTIVE_DIM,
+            base_color[3],
         ],
     }
 }
 
 /// The colour a plane square draws in: its two axes' colours averaged, at
 /// [`PLANE_ALPHA`].
-pub fn plane_color(first: usize, second: usize) -> [f32; 4] {
-    let left = AXIS_COLORS[first];
-    let right = AXIS_COLORS[second];
+pub fn plane_color(first_axis: usize, second_axis: usize) -> [f32; 4] {
+    let first_color = AXIS_COLORS[first_axis];
+    let second_color = AXIS_COLORS[second_axis];
     [
-        (left[0] + right[0]) * 0.5,
-        (left[1] + right[1]) * 0.5,
-        (left[2] + right[2]) * 0.5,
+        (first_color[0] + second_color[0]) * 0.5,
+        (first_color[1] + second_color[1]) * 0.5,
+        (first_color[2] + second_color[2]) * 0.5,
         PLANE_ALPHA,
     ]
 }
@@ -556,7 +593,10 @@ pub type GizmoLine = ([f32; 3], [f32; 3], [f32; 4], u32);
 /// One gizmo triangle: its three points, its colour, and its handle id.
 pub type GizmoTriangle = ([[f32; 3]; 3], [f32; 4], u32);
 
-/// The handle geometry one gizmo draws: contract primitives, handle ids set.
+/// The handle geometry one gizmo draws.
+///
+/// The executable adds every line and triangle to the engine's `DebugDraw`,
+/// and each one carries the id of the handle it belongs to.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GizmoGeometry {
     /// Handle lines.
@@ -565,12 +605,14 @@ pub struct GizmoGeometry {
     pub triangles: Vec<GizmoTriangle>,
 }
 
-/// Build the handles of `mode`, `length` long, centred on `origin`, in the
-/// idle state: the plain form of [`build_geometry_styled`].
+/// Builds the handles of `mode` around `origin`, one per basis vector, each
+/// `length` long, with no hover or drag.
 ///
-/// `basis` is the frame the axes draw in - the world axes, or the entity's
-/// rotation applied to them when the gizmo is in local space - so the caller
-/// decides the space once and the geometry needs no quaternions.
+/// This is the plain form of [`build_geometry_styled`].
+///
+/// `basis` is the frame the axes draw in: the world axes, or those axes with
+/// the entity's rotation applied for local space. The caller picks the space,
+/// so the geometry itself needs no quaternions.
 pub fn build_geometry(
     mode: GizmoMode,
     origin: [f32; 3],
@@ -580,13 +622,15 @@ pub fn build_geometry(
     build_geometry_styled(mode, origin, basis, [length; 3], HandleStates::default())
 }
 
-/// Build the handles of `mode` centred on `origin`, each axis `lengths[axis]`
-/// long, coloured for the hover and drag states.
+/// Builds the handles of `mode` around `origin`, one per basis vector, each as
+/// long as `lengths` gives for its axis.
 ///
-/// The per-axis lengths are the scale gizmo's dynamic handles: a scale drag
-/// passes the factor it is writing, so the dragged axis grows and shrinks
-/// with the object's scale while the drag runs. The translation tool also
-/// builds its three plane squares here, between each pair of axes.
+/// `states` decides which handle is drawn hovered or active.
+///
+/// A scale drag passes the ratio it is writing as the dragged axis's length,
+/// so that handle grows and shrinks with the object's scale. The translation
+/// tool also builds its three plane squares here, one between each pair of
+/// axes.
 pub fn build_geometry_styled(
     mode: GizmoMode,
     origin: [f32; 3],
@@ -595,16 +639,18 @@ pub fn build_geometry_styled(
     states: HandleStates,
 ) -> GizmoGeometry {
     let mut geometry = GizmoGeometry::default();
-    for (index, axis) in basis.iter().enumerate() {
-        let handle = axis_handle(mode, index);
-        let color = styled_color(AXIS_COLORS[index], handle, states);
-        let length = lengths[index].max(1e-4);
+    // Step 1: one handle per basis vector - a line, a ring or a cube head,
+    // depending on the mode.
+    for (axis_index, axis) in basis.iter().enumerate() {
+        let handle = axis_handle(mode, axis_index);
+        let color = styled_color(AXIS_COLORS[axis_index], handle, states);
+        let length = lengths[axis_index].max(1e-4);
         let tip = add(origin, scale(*axis, length));
         match mode {
             GizmoMode::Translate => {
                 geometry.lines.push((origin, tip, color, handle));
-                // The arrow head: a ring of triangles around the tip, opened
-                // towards the tip's side.
+                // The arrow head: a square base part-way along the axis,
+                // with one triangle from each of its edges to the tip.
                 head_triangles(&mut geometry.triangles, origin, *axis, tip, color, handle);
             }
             GizmoMode::Scale => {
@@ -619,13 +665,15 @@ pub fn build_geometry_styled(
                 );
             }
             GizmoMode::Rotate => {
-                // A full ring per axis, its segments all carrying the ring's
-                // handle so any part of it is grabbable.
+                // A full ring around the axis, cut into segments. Every
+                // segment carries the ring's handle, so any part of the ring
+                // can be grabbed.
                 let (u, v) = plane_axes(*axis);
-                let segments = 48;
+                let ring_segment_count = 48;
                 let mut previous = ring_point(origin, u, v, length, 0.0);
-                for step in 1..=segments {
-                    let angle = step as f32 / segments as f32 * std::f32::consts::TAU;
+                for segment_index in 1..=ring_segment_count {
+                    let angle =
+                        segment_index as f32 / ring_segment_count as f32 * std::f32::consts::TAU;
                     let point = ring_point(origin, u, v, length, angle);
                     geometry.lines.push((previous, point, color, handle));
                     previous = point;
@@ -633,16 +681,17 @@ pub fn build_geometry_styled(
             }
         }
     }
+    // Step 2: the three plane squares, which only the translation tool has.
     if mode == GizmoMode::Translate {
-        for (first, second) in PLANE_PAIRS {
-            let handle = plane_handle(first, second);
-            let color = styled_color(plane_color(first, second), handle, states);
-            let length = (lengths[first] + lengths[second]) * 0.5;
+        for (first_axis, second_axis) in PLANE_PAIRS {
+            let handle = plane_handle(first_axis, second_axis);
+            let color = styled_color(plane_color(first_axis, second_axis), handle, states);
+            let length = (lengths[first_axis] + lengths[second_axis]) * 0.5;
             plane_square(
                 &mut geometry.triangles,
                 origin,
-                basis[first],
-                basis[second],
+                basis[first_axis],
+                basis[second_axis],
                 length,
                 color,
                 handle,
@@ -652,26 +701,34 @@ pub fn build_geometry_styled(
     geometry
 }
 
-/// Two triangles forming one translation plane's square, centred
-/// [`PLANE_OFFSET`] of `length` along both of the plane's axes.
+/// Builds one translation plane's square as two triangles.
+///
+/// The square is centred [`PLANE_OFFSET`] times `length` along both of the
+/// plane's axes, and its half-size is [`PLANE_HALF`] times `length`.
 fn plane_square(
     triangles: &mut Vec<GizmoTriangle>,
     origin: [f32; 3],
-    first: [f32; 3],
-    second: [f32; 3],
+    first_axis_direction: [f32; 3],
+    second_axis_direction: [f32; 3],
     length: f32,
     color: [f32; 4],
     handle: u32,
 ) {
-    let offset = length * PLANE_OFFSET;
-    let half = length * PLANE_HALF;
-    let center = add(origin, add(scale(first, offset), scale(second, offset)));
+    let center_offset = length * PLANE_OFFSET;
+    let half_size = length * PLANE_HALF;
+    let center = add(
+        origin,
+        add(
+            scale(first_axis_direction, center_offset),
+            scale(second_axis_direction, center_offset),
+        ),
+    );
     let corner = |along_first: f32, along_second: f32| {
         add(
             center,
             add(
-                scale(first, along_first * half),
-                scale(second, along_second * half),
+                scale(first_axis_direction, along_first * half_size),
+                scale(second_axis_direction, along_second * half_size),
             ),
         )
     };
@@ -691,8 +748,11 @@ fn ring_point(origin: [f32; 3], u: [f32; 3], v: [f32; 3], radius: f32, angle: f3
     add(origin, add(scale(u, radius * cos), scale(v, radius * sin)))
 }
 
-/// Four triangles forming a square head around the tip, flattened along the
-/// axis so the head reads as an arrow from any side.
+/// Builds an arrow head at `tip`: a square base 80% of the way along `axis`,
+/// with one triangle from each of its edges to the tip.
+///
+/// The head is small next to the axis length, so it reads as an arrow from any
+/// side.
 fn head_triangles(
     triangles: &mut Vec<GizmoTriangle>,
     origin: [f32; 3],
@@ -702,17 +762,30 @@ fn head_triangles(
     handle: u32,
 ) {
     let (u, v) = plane_axes(axis);
-    let back = add(origin, scale(sub(tip, origin), 0.8));
-    let half = distance(origin, tip) * 0.06;
+    let square_center = add(origin, scale(sub(tip, origin), 0.8));
+    let half_size = distance(origin, tip) * 0.06;
     let corners = [
-        add(add(back, scale(u, half)), scale(v, half)),
-        add(add(back, scale(u, -half)), scale(v, half)),
-        add(add(back, scale(u, -half)), scale(v, -half)),
-        add(add(back, scale(u, half)), scale(v, -half)),
+        add(add(square_center, scale(u, half_size)), scale(v, half_size)),
+        add(
+            add(square_center, scale(u, -half_size)),
+            scale(v, half_size),
+        ),
+        add(
+            add(square_center, scale(u, -half_size)),
+            scale(v, -half_size),
+        ),
+        add(
+            add(square_center, scale(u, half_size)),
+            scale(v, -half_size),
+        ),
     ];
-    for index in 0..4 {
-        let next = (index + 1) % 4;
-        triangles.push(([corners[index], corners[next], tip], color, handle));
+    for corner_index in 0..4 {
+        let next_index = (corner_index + 1) % 4;
+        triangles.push((
+            [corners[corner_index], corners[next_index], tip],
+            color,
+            handle,
+        ));
     }
 }
 
@@ -721,7 +794,7 @@ fn cube_triangles(
     triangles: &mut Vec<GizmoTriangle>,
     center: [f32; 3],
     axis: [f32; 3],
-    half: f32,
+    half_size: f32,
     color: [f32; 4],
     handle: u32,
 ) {
@@ -730,8 +803,8 @@ fn cube_triangles(
         add(
             center,
             add(
-                add(scale(u, along_u * half), scale(v, along_v * half)),
-                scale(axis, along_axis * half),
+                add(scale(u, along_u * half_size), scale(v, along_v * half_size)),
+                scale(axis, along_axis * half_size),
             ),
         )
     };
@@ -746,7 +819,7 @@ fn cube_triangles(
         corner(-1.0, 1.0, 1.0),
     ];
     // Six faces, two triangles each.
-    for (a, b, c, d) in [
+    for (first_corner, second_corner, third_corner, fourth_corner) in [
         (0, 1, 2, 3),
         (4, 5, 6, 7),
         (0, 1, 5, 4),
@@ -754,8 +827,24 @@ fn cube_triangles(
         (2, 3, 7, 6),
         (3, 0, 4, 7),
     ] {
-        triangles.push(([corners[a], corners[b], corners[c]], color, handle));
-        triangles.push(([corners[a], corners[c], corners[d]], color, handle));
+        triangles.push((
+            [
+                corners[first_corner],
+                corners[second_corner],
+                corners[third_corner],
+            ],
+            color,
+            handle,
+        ));
+        triangles.push((
+            [
+                corners[first_corner],
+                corners[third_corner],
+                corners[fourth_corner],
+            ],
+            color,
+            handle,
+        ));
     }
 }
 
@@ -763,13 +852,13 @@ fn cube_triangles(
 // Drag math
 // =============================================================================
 
-/// How far along `axis` the point closest to the cursor ray sits, relative to
-/// `origin`, or `None` when the ray is parallel to the axis.
+/// Returns how far along `axis` the point closest to the cursor ray lies,
+/// measured from `origin`. `None` when the ray runs parallel to the axis.
 ///
-/// This is the closest-approach parameter of two lines: the axis through
-/// `origin`, and the cursor ray. A translation drag applies the difference
-/// between the value recorded when the drag began and the value now, so the
-/// entity follows the cursor without jumping to it.
+/// This is where two lines come closest: the axis through `origin` and the
+/// cursor ray. A translation drag applies the difference between the value
+/// recorded at the press and the value now, so the entity follows the cursor
+/// without jumping to it.
 pub fn closest_axis_point(
     origin: [f32; 3],
     axis: [f32; 3],
@@ -777,18 +866,23 @@ pub fn closest_axis_point(
     ray_direction: [f32; 3],
 ) -> Option<f32> {
     let axis = normalize(axis)?;
-    let direction = normalize(ray_direction)?;
-    let w0 = sub(origin, ray_origin);
-    let a = dot(axis, axis);
-    let b = dot(axis, direction);
-    let c = dot(direction, direction);
-    let d = dot(axis, w0);
-    let e = dot(direction, w0);
-    let denominator = a * c - b * b;
+    let ray_direction = normalize(ray_direction)?;
+    let origin_offset = sub(origin, ray_origin);
+    let axis_length_squared = dot(axis, axis);
+    let axis_dot_ray_direction = dot(axis, ray_direction);
+    let ray_direction_length_squared = dot(ray_direction, ray_direction);
+    let axis_dot_origin_offset = dot(axis, origin_offset);
+    let ray_direction_dot_origin_offset = dot(ray_direction, origin_offset);
+    let denominator = axis_length_squared * ray_direction_length_squared
+        - axis_dot_ray_direction * axis_dot_ray_direction;
     if denominator.abs() < 1e-6 {
         return None;
     }
-    Some((b * e - c * d) / denominator)
+    Some(
+        (axis_dot_ray_direction * ray_direction_dot_origin_offset
+            - ray_direction_length_squared * axis_dot_origin_offset)
+            / denominator,
+    )
 }
 
 /// Where the cursor ray meets the plane through `origin` whose normal is
@@ -805,25 +899,29 @@ pub fn ray_plane_point(
     if denominator.abs() < 1e-6 {
         return None;
     }
-    let t = dot(normal, sub(origin, ray_origin)) / denominator;
-    if t < 0.0 {
+    let ray_distance = dot(normal, sub(origin, ray_origin)) / denominator;
+    if ray_distance < 0.0 {
         return None;
     }
-    Some(add(ray_origin, scale(ray_direction, t)))
+    Some(add(ray_origin, scale(ray_direction, ray_distance)))
 }
 
-/// The angle of `point` around `axis`, in the ring's own basis, in radians.
+/// Returns the angle of `point` around `axis`, in radians, measured in the
+/// basis of the axis's rotation ring.
 ///
-/// The drag records this at the press and reads it again on every move; the
-/// difference is the rotation, so no jump at the first frame.
+/// A rotation drag records this angle at the press and reads it again on every
+/// move. The difference is the rotation, so the entity does not jump on the
+/// first frame.
 pub fn plane_angle(origin: [f32; 3], axis: [f32; 3], point: [f32; 3]) -> f32 {
     let (u, v) = plane_axes(axis);
     let relative = sub(point, origin);
     dot(relative, v).atan2(dot(relative, u))
 }
 
-/// Wrap an angle difference into `(-PI, PI]`, so a drag past the seam keeps
-/// turning the short way.
+/// Wraps an angle difference into `(-PI, PI]`.
+///
+/// Without the wrap, a drag past the seam - where the angle jumps from `PI` to
+/// `-PI` - would turn the entity the long way round.
 pub fn wrap_angle(angle: f32) -> f32 {
     let mut wrapped = angle % std::f32::consts::TAU;
     if wrapped > std::f32::consts::PI {
@@ -843,89 +941,99 @@ pub fn snap_value(value: f32, step: f32) -> f32 {
     (value / step).round() * step
 }
 
-/// The `[x, y, z, w]` quaternion of `radians` around `axis`.
+/// Returns the `[x, y, z, w]` quaternion that turns by `radians` around
+/// `axis`.
 ///
-/// A zero-length axis is the identity: a drag with no axis cannot happen,
-/// but a caller must not get a NaN rotation from one.
+/// A zero-length axis gives the identity quaternion. A drag with no axis
+/// cannot happen, but a caller must never get a NaN rotation from one.
 pub fn axis_angle_quaternion(axis: [f32; 3], radians: f32) -> [f32; 4] {
     let Some(axis) = normalize(axis) else {
         return [0.0, 0.0, 0.0, 1.0];
     };
-    let half = radians * 0.5;
-    let (sin, cos) = half.sin_cos();
+    let half_angle = radians * 0.5;
+    let (sin, cos) = half_angle.sin_cos();
     [axis[0] * sin, axis[1] * sin, axis[2] * sin, cos]
 }
 
 /// Rotate `vector` by the `[x, y, z, w]` quaternion.
 pub fn rotate_vector(quaternion: [f32; 4], vector: [f32; 3]) -> [f32; 3] {
     let [x, y, z, w] = quaternion;
-    let length = (x * x + y * y + z * z + w * w).sqrt();
-    if length <= f32::EPSILON {
+    let quaternion_length = (x * x + y * y + z * z + w * w).sqrt();
+    if quaternion_length <= f32::EPSILON {
         return vector;
     }
-    let (x, y, z, w) = (x / length, y / length, z / length, w / length);
+    let (x, y, z, w) = (
+        x / quaternion_length,
+        y / quaternion_length,
+        z / quaternion_length,
+        w / quaternion_length,
+    );
     // v' = v + 2 * cross(q.xyz, cross(q.xyz, v) + w * v)
     let axis = [x, y, z];
-    let first = cross(axis, vector);
-    let second = cross(axis, add(first, scale(vector, w)));
-    add(vector, scale(second, 2.0))
+    let axis_cross_vector = cross(axis, vector);
+    let axis_cross_corrected = cross(axis, add(axis_cross_vector, scale(vector, w)));
+    add(vector, scale(axis_cross_corrected, 2.0))
 }
 
 // =============================================================================
-// Plane drags, dynamic scale handles and the drag guides
+// Plane drags, scale handles and guides
 // =============================================================================
 
-/// `point`'s coordinates along the plane's two axes, relative to `origin`.
+/// Returns `point`'s coordinates along a plane's two axes, measured from
+/// `origin`.
 ///
-/// A plane drag records both at the press and reads them again on every
-/// move, so the object follows the cursor without jumping to it - the same
-/// rule [`closest_axis_point`] follows for one axis. The axes are the
+/// A plane drag records both at the press and reads them again on every move,
+/// so the object follows the cursor without jumping to it.
+/// [`closest_axis_point`] does the same for a single axis. The two axes are the
 /// gizmo's basis vectors, so world and local space both work.
 pub fn plane_coordinates(
     origin: [f32; 3],
-    first: [f32; 3],
-    second: [f32; 3],
+    first_axis_direction: [f32; 3],
+    second_axis_direction: [f32; 3],
     point: [f32; 3],
 ) -> (f32, f32) {
     let relative = sub(point, origin);
-    (dot(relative, first), dot(relative, second))
+    (
+        dot(relative, first_axis_direction),
+        dot(relative, second_axis_direction),
+    )
 }
 
-/// The per-axis handle lengths a scale drag draws: the dragged axis follows
-/// the object's scale factor against the drag's original scale, the others
-/// keep `reference`.
+/// Returns the handle length for each axis during a scale drag.
 ///
-/// The ratio is clamped to the handle range and guarded against a zero
-/// original scale, so a degenerate object still draws a usable handle, and a
-/// non-finite ratio (a zero scale written by a command mid-drag) falls back
-/// to the reference length rather than a NaN geometry.
+/// The dragged axis follows the object's scale against its scale at the press.
+/// The other axes keep `reference_length`.
+///
+/// The ratio is clamped to the handle's range. A zero scale at the press, or a
+/// zero scale written by a command in the middle of a drag, gives a ratio that
+/// is not usable; it falls back to `reference_length`, so a degenerate object
+/// still draws a usable handle instead of NaN geometry.
 pub fn scale_handle_lengths(
-    reference: f32,
-    original: [f32; 3],
-    current: [f32; 3],
-    axis: usize,
+    reference_length: f32,
+    original_scale: [f32; 3],
+    current_scale: [f32; 3],
+    axis_index: usize,
 ) -> [f32; 3] {
-    let mut lengths = [reference; 3];
-    if axis >= 3 {
+    let mut lengths = [reference_length; 3];
+    if axis_index >= 3 {
         return lengths;
     }
-    let ratio = if original[axis].abs() > 1e-4 {
-        current[axis] / original[axis]
+    let scale_ratio = if original_scale[axis_index].abs() > 1e-4 {
+        current_scale[axis_index] / original_scale[axis_index]
     } else {
         1.0
     };
-    let ratio = if ratio.is_finite() {
-        ratio.clamp(SCALE_HANDLE_MIN_RATIO, SCALE_HANDLE_MAX_RATIO)
+    let clamped_ratio = if scale_ratio.is_finite() {
+        scale_ratio.clamp(SCALE_HANDLE_MIN_RATIO, SCALE_HANDLE_MAX_RATIO)
     } else {
         1.0
     };
-    lengths[axis] = reference * ratio;
+    lengths[axis_index] = reference_length * clamped_ratio;
     lengths
 }
 
-/// The two ends of the axis constraint guide through `origin`, `span` long
-/// on both sides: the line a single-axis drag draws along the axis it
-/// constrains.
+/// Returns the two ends of the guide line a single-axis drag draws: `span`
+/// long on both sides of `origin`, along `axis`.
 pub fn axis_guide(origin: [f32; 3], axis: [f32; 3], span: f32) -> ([f32; 3], [f32; 3]) {
     let axis = normalize(axis).unwrap_or(AXES[0]);
     (
@@ -934,34 +1042,39 @@ pub fn axis_guide(origin: [f32; 3], axis: [f32; 3], span: f32) -> ([f32; 3], [f3
     )
 }
 
-/// The dashes of a dotted line from `start` to `end`: `dash`-long segments
-/// separated by the same gap, ending exactly at `end`.
+/// Builds the dashes of a dotted line from `start` to `end`.
 ///
-/// The dash length is a world distance the caller derives from the camera
-/// distance, so the dots keep a steady look on screen. A very long line is
-/// cut to [`DOTTED_SEGMENTS_MAX`] dashes rather than building thousands of
-/// them.
-pub fn dotted_segments(start: [f32; 3], end: [f32; 3], dash: f32) -> Vec<([f32; 3], [f32; 3])> {
-    let total = distance(start, end);
-    if total <= 1e-5 || dash <= 1e-5 {
+/// Each dash is `dash_length` long, the gaps between them are the same size,
+/// and the line always ends exactly at `end`.
+///
+/// The caller derives the dash length from the camera distance, so the dots
+/// look the same on screen at any zoom. A very long line is cut to
+/// [`DOTTED_SEGMENTS_MAX`] dashes instead of building thousands of them.
+pub fn dotted_segments(
+    start: [f32; 3],
+    end: [f32; 3],
+    dash_length: f32,
+) -> Vec<([f32; 3], [f32; 3])> {
+    let line_length = distance(start, end);
+    if line_length <= 1e-5 || dash_length <= 1e-5 {
         return Vec::new();
     }
-    let step = dash * 2.0;
-    let count = ((total / step).ceil() as usize).clamp(1, DOTTED_SEGMENTS_MAX);
-    let direction = scale(sub(end, start), 1.0 / total);
-    let mut segments = Vec::with_capacity(count);
-    for index in 0..count {
-        let from = total * index as f32 / count as f32;
+    let dash_period = dash_length * 2.0;
+    let dash_count = ((line_length / dash_period).ceil() as usize).clamp(1, DOTTED_SEGMENTS_MAX);
+    let direction = scale(sub(end, start), 1.0 / line_length);
+    let mut segments = Vec::with_capacity(dash_count);
+    for index in 0..dash_count {
+        let dash_start = line_length * index as f32 / dash_count as f32;
         // The last dash reaches the end exactly, so the line always shows
         // where the pivot is now, whatever the dash count rounds to.
-        let to = if index + 1 == count {
-            total
+        let dash_end = if index + 1 == dash_count {
+            line_length
         } else {
-            (from + dash).min(total)
+            (dash_start + dash_length).min(line_length)
         };
         segments.push((
-            add(start, scale(direction, from)),
-            add(start, scale(direction, to)),
+            add(start, scale(direction, dash_start)),
+            add(start, scale(direction, dash_end)),
         ));
     }
     segments
@@ -970,115 +1083,140 @@ pub fn dotted_segments(start: [f32; 3], end: [f32; 3], dash: f32) -> Vec<([f32; 
 /// The most dashes [`dotted_segments`] builds for one line.
 pub const DOTTED_SEGMENTS_MAX: usize = 96;
 
-/// The handle a cursor ray hovers: the nearest handle whose line the ray
-/// passes within `radius` world units of, or whose triangle it enters.
+// =============================================================================
+// Picking
+// =============================================================================
+
+/// Returns the handle under a cursor ray: the nearest one whose line passes
+/// within `radius` world units of the ray, or whose triangle the ray enters.
+/// `None` when the ray touches no handle.
 ///
-/// The test runs against the geometry the frame draws - the exact numbers
-/// the renderer turns into pixels - so the highlight cannot disagree with
-/// what is on screen.
+/// The test runs on the geometry the frame draws, the same numbers the
+/// renderer turns into pixels, so the highlight cannot disagree with what is
+/// on screen.
 pub fn hit_test(
     geometry: &GizmoGeometry,
     ray_origin: [f32; 3],
     ray_direction: [f32; 3],
     radius: f32,
 ) -> Option<u32> {
-    let mut best: Option<(f32, u32)> = None;
-    let mut consider = |along: f32, handle: u32| {
-        let better = match best {
+    let mut nearest_hit: Option<(f32, u32)> = None;
+    let mut consider = |distance_along_ray: f32, handle: u32| {
+        let better = match nearest_hit {
             None => true,
-            Some((current, _)) => along < current,
+            Some((current_distance, _)) => distance_along_ray < current_distance,
         };
         if better {
-            best = Some((along, handle));
+            nearest_hit = Some((distance_along_ray, handle));
         }
     };
+    // Step 1: the handle lines, within the pick radius of the ray.
     for (start, end, _, handle) in &geometry.lines {
-        if let Some((along, distance)) =
+        if let Some((distance_along_ray, distance_from_ray)) =
             ray_segment_distance(ray_origin, ray_direction, *start, *end)
         {
-            if distance <= radius {
-                consider(along, *handle);
+            if distance_from_ray <= radius {
+                consider(distance_along_ray, *handle);
             }
         }
     }
+    // Step 2: the handle triangles, which the ray has to enter.
     for (corners, _, handle) in &geometry.triangles {
-        if let Some(along) = ray_triangle_intersection(ray_origin, ray_direction, *corners) {
-            consider(along, *handle);
+        if let Some(distance_along_ray) =
+            ray_triangle_intersection(ray_origin, ray_direction, *corners)
+        {
+            consider(distance_along_ray, *handle);
         }
     }
-    best.map(|(_, handle)| handle)
+    nearest_hit.map(|(_, handle)| handle)
 }
 
-/// How far along the ray and how far from it the closest approach to the
-/// segment `start..end` is; an approach behind the ray's origin clamps to the
-/// origin. `None` for a zero-length ray direction, or for a zero-length
-/// segment behind the origin.
+/// Returns how far along the ray, and how far away from it, the ray comes
+/// closest to the segment `start..end`.
+///
+/// A closest point behind the ray's origin is clamped to the origin. `None`
+/// for a zero-length ray direction, or for a zero-length segment that lies
+/// behind the origin.
 fn ray_segment_distance(
     ray_origin: [f32; 3],
     ray_direction: [f32; 3],
     start: [f32; 3],
     end: [f32; 3],
 ) -> Option<(f32, f32)> {
-    let direction = normalize(ray_direction)?;
+    let ray_direction = normalize(ray_direction)?;
     let segment = sub(end, start);
     let segment_length = dot(segment, segment).sqrt();
     if segment_length <= 1e-6 {
-        let along = dot(sub(start, ray_origin), direction);
-        if along < 0.0 {
+        let distance_along_ray = dot(sub(start, ray_origin), ray_direction);
+        if distance_along_ray < 0.0 {
             return None;
         }
-        let point = add(ray_origin, scale(direction, along));
-        return Some((along, distance(point, start)));
+        let point = add(ray_origin, scale(ray_direction, distance_along_ray));
+        return Some((distance_along_ray, distance(point, start)));
     }
-    let segment = scale(segment, 1.0 / segment_length);
-    let offset = sub(ray_origin, start);
-    let a = dot(direction, direction);
-    let b = dot(direction, segment);
-    let c = dot(segment, segment);
-    let d = dot(direction, offset);
-    let e = dot(segment, offset);
-    let denominator = a * c - b * b;
-    let (along, position) = if denominator.abs() < 1e-6 {
+    let segment_direction = scale(segment, 1.0 / segment_length);
+    let ray_origin_offset = sub(ray_origin, start);
+    let ray_direction_length_squared = dot(ray_direction, ray_direction);
+    let ray_direction_dot_segment_direction = dot(ray_direction, segment_direction);
+    let segment_direction_length_squared = dot(segment_direction, segment_direction);
+    let ray_direction_dot_origin_offset = dot(ray_direction, ray_origin_offset);
+    let segment_direction_dot_origin_offset = dot(segment_direction, ray_origin_offset);
+    let denominator = ray_direction_length_squared * segment_direction_length_squared
+        - ray_direction_dot_segment_direction * ray_direction_dot_segment_direction;
+    let (distance_along_ray, segment_position) = if denominator.abs() < 1e-6 {
         // Parallel: measure from the ray's own origin.
-        (0.0f32, (e / c).clamp(0.0, segment_length))
+        (
+            0.0f32,
+            (segment_direction_dot_origin_offset / segment_direction_length_squared)
+                .clamp(0.0, segment_length),
+        )
     } else {
-        let along = (b * e - c * d) / denominator;
-        let position = (a * e - b * d) / denominator;
-        (along.max(0.0), position.clamp(0.0, segment_length))
+        let distance_along_ray = (ray_direction_dot_segment_direction
+            * segment_direction_dot_origin_offset
+            - segment_direction_length_squared * ray_direction_dot_origin_offset)
+            / denominator;
+        let segment_position = (ray_direction_length_squared * segment_direction_dot_origin_offset
+            - ray_direction_dot_segment_direction * ray_direction_dot_origin_offset)
+            / denominator;
+        (
+            distance_along_ray.max(0.0),
+            segment_position.clamp(0.0, segment_length),
+        )
     };
-    let ray_point = add(ray_origin, scale(direction, along));
-    let segment_point = add(start, scale(segment, position));
-    Some((along, distance(ray_point, segment_point)))
+    let ray_point = add(ray_origin, scale(ray_direction, distance_along_ray));
+    let segment_point = add(start, scale(segment_direction, segment_position));
+    Some((distance_along_ray, distance(ray_point, segment_point)))
 }
 
-/// How far along the ray a triangle is hit, by Möller-Trumbore; `None` for a
-/// miss or a triangle behind the ray's origin.
+/// Returns how far along the ray it hits the triangle `corners`, using the
+/// Möller-Trumbore test. `None` for a miss, or for a triangle behind the ray's
+/// origin.
 pub fn ray_triangle_intersection(
     ray_origin: [f32; 3],
     ray_direction: [f32; 3],
     corners: [[f32; 3]; 3],
 ) -> Option<f32> {
-    let direction = normalize(ray_direction)?;
+    let ray_direction = normalize(ray_direction)?;
     let edge_one = sub(corners[1], corners[0]);
     let edge_two = sub(corners[2], corners[0]);
-    let pvec = cross(direction, edge_two);
+    let pvec = cross(ray_direction, edge_two);
     let determinant = dot(edge_one, pvec);
     if determinant.abs() < 1e-7 {
         return None;
     }
-    let inverse = 1.0 / determinant;
+    let inverse_determinant = 1.0 / determinant;
     let tvec = sub(ray_origin, corners[0]);
-    let u = dot(tvec, pvec) * inverse;
+    let u = dot(tvec, pvec) * inverse_determinant;
     if !(0.0..=1.0).contains(&u) {
         return None;
     }
     let qvec = cross(tvec, edge_one);
-    let v = dot(direction, qvec) * inverse;
+    let v = dot(ray_direction, qvec) * inverse_determinant;
     if v < 0.0 || u + v > 1.0 {
         return None;
     }
-    let along = dot(edge_two, qvec) * inverse;
-    (along > 1e-4).then_some(along)
+    let distance_along_ray = dot(edge_two, qvec) * inverse_determinant;
+    (distance_along_ray > 1e-4).then_some(distance_along_ray)
 }
 
 // =============================================================================
@@ -1088,12 +1226,12 @@ pub fn ray_triangle_intersection(
 /// Two unit vectors spanning the plane whose normal is `normal`.
 pub fn plane_axes(normal: [f32; 3]) -> ([f32; 3], [f32; 3]) {
     let normal = normalize(normal).unwrap_or([0.0, 1.0, 0.0]);
-    let helper = if normal[0].abs() < 0.9 {
+    let helper_axis = if normal[0].abs() < 0.9 {
         [1.0, 0.0, 0.0]
     } else {
         [0.0, 1.0, 0.0]
     };
-    let u = normalize(cross(helper, normal)).unwrap_or([1.0, 0.0, 0.0]);
+    let u = normalize(cross(helper_axis, normal)).unwrap_or([1.0, 0.0, 0.0]);
     let v = cross(normal, u);
     (u, v)
 }
@@ -1142,25 +1280,35 @@ pub fn distance(left: [f32; 3], right: [f32; 3]) -> f32 {
     dot(delta, delta).sqrt()
 }
 
-/// The element writes a released drag records, as `(index, value)` in array
-/// order; `None` when the drag ended where it started, because a click that
-/// moved nothing is not an undo step.
+// =============================================================================
+// Released drags
+// =============================================================================
+
+/// Returns the edits a released drag records, as `(index, value)` pairs in
+/// array order.
 ///
-/// `original` is the field's value at the press and `released` the value the
-/// drag wrote, so the answer covers a field of any length a transform's arrays
-/// use (`translation`/`scale` 3, `rotation` 4).
-pub fn release_edits(original: &[f32], released: &[f32]) -> Option<Vec<(usize, f32)>> {
-    if original == released {
+/// `pressed_values` is the field's value at the press and `released_values` is
+/// the value the drag wrote. `None` when the two are equal, because a click
+/// that moved nothing is not an undo step.
+///
+/// Any length works, so the transform's arrays are covered too: `translation`
+/// and `scale` hold 3 values and `rotation` holds 4.
+pub fn release_edits(pressed_values: &[f32], released_values: &[f32]) -> Option<Vec<(usize, f32)>> {
+    if pressed_values == released_values {
         return None;
     }
     Some(
-        released
+        released_values
             .iter()
             .enumerate()
             .map(|(index, value)| (index, *value))
             .collect(),
     )
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1173,14 +1321,18 @@ mod tests {
         let geometry = build_geometry(GizmoMode::Translate, origin, AXES, 2.0);
         assert_eq!(geometry.lines.len(), 3);
         assert!(!geometry.triangles.is_empty());
-        for (index, (start, end, _, handle)) in geometry.lines.iter().enumerate() {
+        for (axis_index, (start, end, _, handle)) in geometry.lines.iter().enumerate() {
             assert_eq!(*start, origin);
-            assert_eq!(*handle, axis_handle(GizmoMode::Translate, index));
-            assert!((distance(*end, add(origin, scale(AXES[index], 2.0)))).abs() < 1e-5);
+            assert_eq!(*handle, axis_handle(GizmoMode::Translate, axis_index));
+            assert!((distance(*end, add(origin, scale(AXES[axis_index], 2.0)))).abs() < 1e-5);
         }
         let rings = build_geometry(GizmoMode::Rotate, origin, AXES, 1.0);
         assert_eq!(
-            rings.lines.iter().filter(|(_, _, _, h)| *h == 11).count(),
+            rings
+                .lines
+                .iter()
+                .filter(|(_, _, _, handle_id)| *handle_id == 11)
+                .count(),
             48,
             "the X ring's segments all carry its handle"
         );
@@ -1211,14 +1363,17 @@ mod tests {
     #[test]
     fn the_axis_follows_the_cursor_ray() {
         // Straight down through x = 3: the closest point on X is 3.
-        let t = closest_axis_point(
+        let distance_along_axis = closest_axis_point(
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
             [3.0, 10.0, 0.0],
             [0.0, -1.0, 0.0],
         )
         .expect("not parallel");
-        assert!((t - 3.0).abs() < 1e-4, "t = {t}");
+        assert!(
+            (distance_along_axis - 3.0).abs() < 1e-4,
+            "t = {distance_along_axis}"
+        );
         // A ray parallel to the axis has no closest point.
         assert!(closest_axis_point(
             [0.0, 0.0, 0.0],
@@ -1232,16 +1387,16 @@ mod tests {
     /// The rotation plane answers with the angle around the ring's axis.
     #[test]
     fn the_ring_angle_reads_the_plane() {
-        // The Y ring's basis starts at +Z (`plane_axes`), so the +Z point is
-        // angle zero and +X a quarter turn later; the sign of that quarter
-        // turn is the basis's business, its magnitude is not.
+        // `plane_axes` gives the Y ring a basis that starts at +Z, so the +Z
+        // point is angle zero and +X is a quarter turn later. The basis decides
+        // the sign of that quarter turn; only its size is checked here.
         let axis = [0.0, 1.0, 0.0];
-        let along_start = plane_angle([0.0, 0.0, 0.0], axis, [0.0, 0.0, 1.0]);
-        assert!(along_start.abs() < 1e-4, "start = {along_start}");
-        let quarter = plane_angle([0.0, 0.0, 0.0], axis, [1.0, 0.0, 0.0]);
+        let start_angle = plane_angle([0.0, 0.0, 0.0], axis, [0.0, 0.0, 1.0]);
+        assert!(start_angle.abs() < 1e-4, "start = {start_angle}");
+        let quarter_angle = plane_angle([0.0, 0.0, 0.0], axis, [1.0, 0.0, 0.0]);
         assert!(
-            (quarter.abs() - std::f32::consts::FRAC_PI_2).abs() < 1e-4,
-            "quarter = {quarter}"
+            (quarter_angle.abs() - std::f32::consts::FRAC_PI_2).abs() < 1e-4,
+            "quarter = {quarter_angle}"
         );
         // Crossing the seam keeps turning the short way.
         assert!((wrap_angle(350.0_f32.to_radians()) + 10.0_f32.to_radians()).abs() < 1e-4);
@@ -1275,15 +1430,15 @@ mod tests {
             [0.0, 1.0, 0.0]
         );
         // A quarter turn around Y, built from the angle: X goes to -Z.
-        let quarter = axis_angle_quaternion([0.0, 1.0, 0.0], std::f32::consts::FRAC_PI_2);
-        let turned = rotate_vector(quarter, [1.0, 0.0, 0.0]);
+        let quarter_turn = axis_angle_quaternion([0.0, 1.0, 0.0], std::f32::consts::FRAC_PI_2);
+        let turned_vector = rotate_vector(quarter_turn, [1.0, 0.0, 0.0]);
         assert!(
-            turned[2] + 1.0 < 1e-4 && turned[2] + 1.0 > -1e-4,
-            "turned = {turned:?}"
+            turned_vector[2] + 1.0 < 1e-4 && turned_vector[2] + 1.0 > -1e-4,
+            "turned = {turned_vector:?}"
         );
         // A zero axis is the identity, not a NaN.
-        let fallback = axis_angle_quaternion([0.0; 3], 1.0);
-        assert_eq!(fallback, [0.0, 0.0, 0.0, 1.0]);
+        let identity_quaternion = axis_angle_quaternion([0.0; 3], 1.0);
+        assert_eq!(identity_quaternion, [0.0, 0.0, 0.0, 1.0]);
     }
 
     /// The translation tool carries one square per axis pair, and its handle
@@ -1296,29 +1451,30 @@ mod tests {
         // Three axes plus three planes, two triangles per plane.
         let plane_handles: Vec<u32> = (4..=6).collect();
         for handle in plane_handles {
-            let count = geometry
+            let triangle_count = geometry
                 .triangles
                 .iter()
                 .filter(|(_, _, id)| *id == handle)
                 .count();
-            assert_eq!(count, 2, "plane {handle} is one square");
+            assert_eq!(triangle_count, 2, "plane {handle} is one square");
         }
         // The XY square sits at the offset along +X and +Y.
-        let expected = length * PLANE_OFFSET;
-        let xy = geometry
+        let expected_offset = length * PLANE_OFFSET;
+        let xy_triangle = geometry
             .triangles
             .iter()
             .find(|(_, _, id)| *id == plane_handle(0, 1))
             .expect("the XY square exists");
         // The first triangle's corners 0 and 2 are the square's diagonal.
         let center = [
-            (xy.0[0][0] + xy.0[2][0]) * 0.5,
-            (xy.0[0][1] + xy.0[2][1]) * 0.5,
-            (xy.0[0][2] + xy.0[2][2]) * 0.5,
+            (xy_triangle.0[0][0] + xy_triangle.0[2][0]) * 0.5,
+            (xy_triangle.0[0][1] + xy_triangle.0[2][1]) * 0.5,
+            (xy_triangle.0[0][2] + xy_triangle.0[2][2]) * 0.5,
         ];
         assert!(center[0] > 0.0 && center[1] > 0.0, "center {center:?}");
         assert!(
-            (center[0] - expected).abs() < 1e-4 && (center[1] - expected).abs() < 1e-4,
+            (center[0] - expected_offset).abs() < 1e-4
+                && (center[1] - expected_offset).abs() < 1e-4,
             "center {center:?}"
         );
         assert!(center[2].abs() < 1e-5, "the XY square stays at z = 0");
@@ -1337,56 +1493,65 @@ mod tests {
         );
     }
 
-    /// Hover brightens a handle, an active drag dims it under that.
+    /// A hovered handle brightens, and a handle being dragged dims below its
+    /// normal colour.
     #[test]
     fn handle_states_brighten_then_dim() {
-        let base = AXIS_COLORS[0];
+        let base_color = AXIS_COLORS[0];
         let states = HandleStates {
             hovered: Some(1),
             active: None,
         };
-        let hovered = styled_color(base, 1, states);
-        assert!(hovered[0] > base[0] || hovered[1] > base[1] || hovered[2] > base[2]);
-        let active = HandleStates {
+        let hovered_color = styled_color(base_color, 1, states);
+        assert!(
+            hovered_color[0] > base_color[0]
+                || hovered_color[1] > base_color[1]
+                || hovered_color[2] > base_color[2]
+        );
+        let active_states = HandleStates {
             hovered: Some(1),
             active: Some(1),
         };
-        let dragging = styled_color(base, 1, active);
+        let dragging_color = styled_color(base_color, 1, active_states);
         assert!(
-            dragging[0] < base[0],
-            "the active handle dims: {dragging:?}"
+            dragging_color[0] < base_color[0],
+            "the active handle dims: {dragging_color:?}"
         );
         assert!(
-            dragging[0] < hovered[0],
-            "active is dimmer than hovered: {dragging:?} vs {hovered:?}"
+            dragging_color[0] < hovered_color[0],
+            "active is dimmer than hovered: {dragging_color:?} vs {hovered_color:?}"
         );
         // Other handles keep their normal look.
-        assert_eq!(styled_color(base, 2, states), base);
+        assert_eq!(styled_color(base_color, 2, states), base_color);
         // A plane handle's colour is its axes' average, translucent.
-        let plane = plane_color(0, 2);
-        assert!(plane[3] < 1.0, "plane squares are translucent");
-        assert!((plane[0] - (AXIS_COLORS[0][0] + AXIS_COLORS[2][0]) * 0.5).abs() < 1e-5);
+        let plane_square_color = plane_color(0, 2);
+        assert!(plane_square_color[3] < 1.0, "plane squares are translucent");
+        assert!(
+            (plane_square_color[0] - (AXIS_COLORS[0][0] + AXIS_COLORS[2][0]) * 0.5).abs() < 1e-5
+        );
     }
 
     /// A scale handle follows the scale factor, clamped at both ends.
     #[test]
     fn scale_handles_follow_the_scale_factor() {
-        let reference = 2.0;
-        let original = [1.0, 1.0, 1.0];
-        let grown = scale_handle_lengths(reference, original, [2.0, 1.0, 1.0], 0);
+        let reference_length = 2.0;
+        let original_scale = [1.0, 1.0, 1.0];
+        let grown = scale_handle_lengths(reference_length, original_scale, [2.0, 1.0, 1.0], 0);
         assert!((grown[0] - 4.0).abs() < 1e-5, "grown {grown:?}");
-        assert!((grown[1] - reference).abs() < 1e-5, "others stay");
-        let shrunk = scale_handle_lengths(reference, original, [0.5, 1.0, 1.0], 0);
+        assert!((grown[1] - reference_length).abs() < 1e-5, "others stay");
+        let shrunk = scale_handle_lengths(reference_length, original_scale, [0.5, 1.0, 1.0], 0);
         assert!((shrunk[0] - 1.0).abs() < 1e-5, "shrunk {shrunk:?}");
         // The clamps hold against extreme and degenerate scales.
-        let huge = scale_handle_lengths(reference, original, [1000.0, 1.0, 1.0], 0);
-        assert!((huge[0] - reference * SCALE_HANDLE_MAX_RATIO).abs() < 1e-5);
-        let tiny = scale_handle_lengths(reference, original, [0.0001, 1.0, 1.0], 0);
-        assert!((tiny[0] - reference * SCALE_HANDLE_MIN_RATIO).abs() < 1e-5);
-        let zero_original = scale_handle_lengths(reference, [0.0, 1.0, 1.0], [1.0, 1.0, 1.0], 0);
-        assert!((zero_original[0] - reference).abs() < 1e-5);
-        let not_finite = scale_handle_lengths(reference, original, [f32::NAN, 1.0, 1.0], 0);
-        assert!((not_finite[0] - reference).abs() < 1e-5);
+        let huge = scale_handle_lengths(reference_length, original_scale, [1000.0, 1.0, 1.0], 0);
+        assert!((huge[0] - reference_length * SCALE_HANDLE_MAX_RATIO).abs() < 1e-5);
+        let tiny = scale_handle_lengths(reference_length, original_scale, [0.0001, 1.0, 1.0], 0);
+        assert!((tiny[0] - reference_length * SCALE_HANDLE_MIN_RATIO).abs() < 1e-5);
+        let zero_original =
+            scale_handle_lengths(reference_length, [0.0, 1.0, 1.0], [1.0, 1.0, 1.0], 0);
+        assert!((zero_original[0] - reference_length).abs() < 1e-5);
+        let not_finite =
+            scale_handle_lengths(reference_length, original_scale, [f32::NAN, 1.0, 1.0], 0);
+        assert!((not_finite[0] - reference_length).abs() < 1e-5);
     }
 
     /// The guides: a symmetric axis line and evenly spaced dashes.
@@ -1403,15 +1568,15 @@ mod tests {
             assert!((distance(*from, *to) - 1.0).abs() < 1e-4, "dash length");
         }
         // The last dash reaches the end, so it may run up to twice as long.
-        let last = dashes.last().expect("a dash");
-        let last_length = distance(last.0, last.1);
+        let last_dash = dashes.last().expect("a dash");
+        let last_length = distance(last_dash.0, last_dash.1);
         assert!(
             (1.0..=2.0 + 1e-4).contains(&last_length),
             "last dash {last_length}"
         );
         // A very long line is capped rather than building thousands of dashes.
-        let capped = dotted_segments([0.0, 0.0, 0.0], [10_000.0, 0.0, 0.0], 0.01);
-        assert_eq!(capped.len(), DOTTED_SEGMENTS_MAX);
+        let capped_dashes = dotted_segments([0.0, 0.0, 0.0], [10_000.0, 0.0, 0.0], 0.01);
+        assert_eq!(capped_dashes.len(), DOTTED_SEGMENTS_MAX);
         assert!(dotted_segments([0.0; 3], [0.0; 3], 1.0).is_empty());
     }
 
@@ -1425,98 +1590,117 @@ mod tests {
         let hit = hit_test(&geometry, [1.0, 5.0, 0.0], [0.0, -1.0, 0.0], 0.05);
         assert_eq!(hit, Some(axis_handle(GizmoMode::Translate, 0)));
         // Straight down through the XY square, away from any line.
-        let offset = 2.0 * PLANE_OFFSET;
-        let plane = hit_test(&geometry, [offset, offset, 5.0], [0.0, 0.0, -1.0], 0.02);
-        assert_eq!(plane, Some(plane_handle(0, 1)), "the XY square answers");
+        let plane_offset = 2.0 * PLANE_OFFSET;
+        let plane_hit = hit_test(
+            &geometry,
+            [plane_offset, plane_offset, 5.0],
+            [0.0, 0.0, -1.0],
+            0.02,
+        );
+        assert_eq!(plane_hit, Some(plane_handle(0, 1)), "the XY square answers");
         // A ray into empty space finds nothing.
-        let miss = hit_test(&geometry, [10.0, 10.0, 10.0], [0.0, 1.0, 0.0], 0.05);
-        assert_eq!(miss, None);
+        let missed_hit = hit_test(&geometry, [10.0, 10.0, 10.0], [0.0, 1.0, 0.0], 0.05);
+        assert_eq!(missed_hit, None);
     }
 
-    /// A released drag records one step, and only when it moved: the press's
-    /// value on its own is not an undo entry.
+    /// A released drag records one step, and only when it moved.
+    ///
+    /// The press's value on its own is not an undo entry.
     #[test]
     fn a_release_records_one_step_only_when_it_moved() {
-        let press = [1.0, 2.0, 3.0];
-        assert_eq!(release_edits(&press, &press), None);
-        let released = [1.0, 2.0, 4.5];
+        let pressed_values = [1.0, 2.0, 3.0];
+        assert_eq!(release_edits(&pressed_values, &pressed_values), None);
+        let released_values = [1.0, 2.0, 4.5];
         assert_eq!(
-            release_edits(&press, &released),
+            release_edits(&pressed_values, &released_values),
             Some(vec![(0, 1.0), (1, 2.0), (2, 4.5)]),
             "every element of the field is written, in array order"
         );
         // A rotation is four wide; the same rule covers it.
-        let released = [0.0, 0.0, 0.0, 1.0];
+        let released_rotation = [0.0, 0.0, 0.0, 1.0];
         assert_eq!(
-            release_edits(&[0.0; 4], &released).map(|edits| edits.len()),
+            release_edits(&[0.0; 4], &released_rotation).map(|edits| edits.len()),
             Some(4)
         );
     }
 
-    /// Every row of the field table reads, writes and round-trips, a value it
-    /// cannot hold leaves it alone, and the Inspector's list is exactly the
-    /// table - the three lists the audit found drifting.
+    /// Every row of the field table reads, writes and round-trips.
+    ///
+    /// A value of the wrong kind is refused and leaves the field alone, and the
+    /// Inspector's entry uses the same table in the same order.
     #[test]
     fn every_resource_field_reads_writes_and_round_trips() {
-        let entry = crate::resources::EDITABLE_RESOURCES
+        let resource_entry = crate::resources::EDITABLE_RESOURCES
             .iter()
             .find(|entry| entry.name == RESOURCE_NAME)
             .expect("the gizmo settings are an editable resource");
-        let listed: Vec<&str> = entry.fields.iter().map(|field| field.name).collect();
-        let table: Vec<&str> = RESOURCE_FIELDS.iter().map(|field| field.name).collect();
+        let inspector_field_names: Vec<&str> =
+            resource_entry.fields.iter().map(|row| row.name).collect();
+        let table_field_names: Vec<&str> = RESOURCE_FIELDS.iter().map(|row| row.name).collect();
         assert_eq!(
-            listed, table,
+            inspector_field_names, table_field_names,
             "the Inspector offers the table's fields in order"
         );
 
-        for field in RESOURCE_FIELDS {
+        for field_row in RESOURCE_FIELDS {
             let mut settings = GizmoSettings::default();
-            let before = (field.read)(&settings);
+            let before = (field_row.read)(&settings);
             // A value the kind accepts and that differs from the current one.
-            let changed = match &before {
+            let changed_value = match &before {
                 FieldValue::Bool(value) => FieldValue::Bool(!*value),
                 FieldValue::F32(value) => FieldValue::F32(value + 1.0),
                 FieldValue::U32(value) => FieldValue::U32(u32::from(*value == 0)),
-                other => panic!("{} reads an unexpected kind {other:?}", field.name),
+                other => panic!("{} reads an unexpected kind {other:?}", field_row.name),
             };
-            let previous = set_resource_field(&mut settings, RESOURCE_NAME, field.name, &changed)
-                .unwrap_or_else(|error| panic!("{} refused its own kind: {error}", field.name));
+            let previous =
+                set_resource_field(&mut settings, RESOURCE_NAME, field_row.name, &changed_value)
+                    .unwrap_or_else(|error| {
+                        panic!("{} refused its own kind: {error}", field_row.name)
+                    });
             assert_eq!(
                 previous, before,
                 "{} answers the value it replaced, for the inverse",
-                field.name
+                field_row.name
             );
-            assert_eq!((field.read)(&settings), changed, "{}", field.name);
             assert_eq!(
-                resource_field_value(&settings, RESOURCE_NAME, field.name),
-                Ok(changed.clone()),
+                (field_row.read)(&settings),
+                changed_value,
+                "{}",
+                field_row.name
+            );
+            assert_eq!(
+                resource_field_value(&settings, RESOURCE_NAME, field_row.name),
+                Ok(changed_value.clone()),
                 "{} reads back what the write took",
-                field.name
+                field_row.name
             );
-            set_resource_field(&mut settings, RESOURCE_NAME, field.name, &before)
-                .unwrap_or_else(|error| panic!("{} could not be put back: {error}", field.name));
+            set_resource_field(&mut settings, RESOURCE_NAME, field_row.name, &before)
+                .unwrap_or_else(|error| {
+                    panic!("{} could not be put back: {error}", field_row.name)
+                });
             assert_eq!(
-                (field.read)(&settings),
+                (field_row.read)(&settings),
                 before,
                 "{} round-trips",
-                field.name
+                field_row.name
             );
 
             // A kind the field cannot hold is refused, and changes nothing.
-            let refused = match &before {
+            let refused_value = match &before {
                 FieldValue::Bool(_) => FieldValue::U32(1),
                 _ => FieldValue::Bool(true),
             };
             assert!(
-                set_resource_field(&mut settings, RESOURCE_NAME, field.name, &refused).is_err(),
-                "{} accepted {refused:?}",
-                field.name
+                set_resource_field(&mut settings, RESOURCE_NAME, field_row.name, &refused_value)
+                    .is_err(),
+                "{} accepted {refused_value:?}",
+                field_row.name
             );
             assert_eq!(
-                (field.read)(&settings),
+                (field_row.read)(&settings),
                 before,
                 "{} changed on a refused write",
-                field.name
+                field_row.name
             );
         }
     }

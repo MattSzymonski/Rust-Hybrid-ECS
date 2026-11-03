@@ -2,20 +2,24 @@
 //!
 //! # Responsibilities
 //!
-//! - Define [`RenderViewport`], the pixel bounds the renderer restricts drawing
-//!   to when a frontend asks for a sub-region of the surface.
+//! - Define [`RenderViewport`]: the pixel area inside a surface that the
+//!   renderer draws into when a frontend asks for only part of it.
 //!
 //! # Design
 //!
-//! Not a component and not an asset: a plain value the renderer holds, so it
-//! carries no ECS derives and is registered with nothing. It sits under
-//! `components/` with the contract's other scene-facing types.
+//! It is neither a component nor an asset. It is a plain value that the
+//! renderer stores, so it has no ECS derives and nothing registers it. It sits
+//! in `components/` beside the camera, the contract's other scene type.
 
-/// A rectangle of the target a frame draws into.
+// =============================================================================
+// RenderViewport
+// =============================================================================
+
+/// A rectangle of the target that a frame draws into, in pixels.
 ///
-/// The renderer holds one as its optional split-screen viewport, and falls
-/// back to drawing the full target when none is set or the one it has clamps
-/// away to nothing.
+/// The renderer may hold one for a surface and draw only inside it. When it
+/// holds none, or the one it holds has no area left inside the target, it
+/// draws the whole target instead.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RenderViewport {
     /// Left edge of the rectangle within the target, in pixels.
@@ -31,8 +35,9 @@ pub struct RenderViewport {
 impl RenderViewport {
     /// Creates a viewport from explicit pixel bounds.
     ///
-    /// The bounds are taken as given; use [`RenderViewport::clamped_to`] to
-    /// fit the rectangle to a target that may be smaller.
+    /// Nothing is checked here: the values are stored unchanged. To fit the
+    /// rectangle to a target that may be smaller, use
+    /// [`RenderViewport::clamped_to`].
     pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
         Self {
             x,
@@ -42,24 +47,25 @@ impl RenderViewport {
         }
     }
 
-    /// The whole target, from the origin, sized `width` by `height`.
+    /// Returns a viewport that covers the whole target.
     ///
-    /// This is what the renderer substitutes when no viewport is set or an
-    /// explicit one leaves nothing on screen.
-    pub const fn full(width: u32, height: u32) -> Self {
-        Self::new(0, 0, width, height)
+    /// It starts at the origin and measures `target_width` by
+    /// `target_height`. The renderer substitutes it when no viewport is set,
+    /// or when an explicit one would draw nothing.
+    pub const fn full(target_width: u32, target_height: u32) -> Self {
+        Self::new(0, 0, target_width, target_height)
     }
 
     /// Clips the rectangle to a target of the given pixel size.
     ///
-    /// Returns `None` when nothing of the rectangle survives, meaning an
-    /// origin at or past the target edge or a visible width or height of zero;
-    /// the renderer treats that as "draw the full target".
-    pub fn clamped_to(self, width: u32, height: u32) -> Option<Self> {
-        let x = self.x.min(width);
-        let y = self.y.min(height);
-        let width = self.width.min(width - x);
-        let height = self.height.min(height - y);
+    /// Returns `None` when nothing of the rectangle stays inside the target:
+    /// the origin is at or past the target's edge, or the visible width or
+    /// height is zero. The renderer treats `None` as "draw the full target".
+    pub fn clamped_to(self, target_width: u32, target_height: u32) -> Option<Self> {
+        let x = self.x.min(target_width);
+        let y = self.y.min(target_height);
+        let width = self.width.min(target_width - x);
+        let height = self.height.min(target_height - y);
         (width > 0 && height > 0).then_some(Self::new(x, y, width, height))
     }
 }

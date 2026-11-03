@@ -1,25 +1,28 @@
-//! The Entities tab's shared actions: the recorded create and delete the
-//! row menu and the scripted channel both queue.
+//! The Entities tab's shared actions, used by the menus, the palette, the
+//! Cut command and the scripted channel. They are the recorded steps that
+//! create one empty entity and delete the selected one.
 //!
 //! # Responsibilities
 //!
 //! - [`entity_create`]: one empty entity, under the `new entity` label.
-//! - [`entity_delete`]: the destroy with the selection clear as ONE recorded
+//! - [`entity_delete`]: the selection clear and the destroy as one recorded
 //!   step, under the `delete entity` label, so undo restores the entity and
 //!   the selection that pointed at it.
 //!
 //! # Design
 //!
-//! The commands ride the shared
-//! [`PendingEditorCommands`](crate::commands::PendingEditorCommands) queue
-//! and apply at the frame boundary like every other editor edit. The
-//! restore of a deleted entity lands under a fresh handle; the executable's
-//! drain follows the remap, so callers never hold a stale one.
+//! The callers queue these commands in the shared
+//! [`PendingEditorCommands`](crate::commands::PendingEditorCommands)
+//! resource, and they apply at the frame boundary like every other editor
+//! edit. A restore gives the entity a new handle. From then on,
+//! [`EditorCommand::apply_recorded`] rewrites the rest of the batch, and
+//! the inverses already collected, to that handle.
 
 // Current crate
 use crate::editor_state::EditorCommand;
 
-/// The recorded create: one empty entity, ready for components.
+/// Returns the recorded create: one empty entity, with the history label
+/// `new entity`.
 pub fn entity_create() -> (EditorCommand, String) {
     (
         EditorCommand::CreateEntity {
@@ -29,14 +32,14 @@ pub fn entity_create() -> (EditorCommand, String) {
     )
 }
 
-/// The recorded delete: the selection clear and the destroy in one step.
+/// Returns the recorded delete: clearing the selection and destroying the
+/// entity, as one history step under the `delete entity` label.
 ///
-/// `asset` is the selection's asset half, carried so the clear keeps it -
-/// the user is deleting an entity, not dropping the file they had selected.
-/// The clear comes FIRST: an undo walks the step backwards, so the destroy's
-/// restore runs first, assigns the entity its fresh handle, and the batch's
-/// own selection command follows it to that handle (see
-/// [`EditorCommand::apply_recorded`]).
+/// `asset` is the selected asset's path. The clear keeps it, so deleting an
+/// entity does not drop the selected file as well. The clear comes first on
+/// purpose: undo runs a step's commands backwards, so the restore runs
+/// first, gives the entity a new handle, and the selection command after it
+/// is moved to that handle (see [`EditorCommand::apply_recorded`]).
 pub fn entity_delete(
     entity: pill_engine::Entity,
     asset: Option<String>,
@@ -58,7 +61,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_create_is_one_empty_entity_under_the_native_label() {
+    fn the_create_is_one_empty_entity_under_the_new_entity_label() {
         let (command, label) = entity_create();
         assert_eq!(
             command,

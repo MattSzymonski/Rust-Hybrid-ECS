@@ -2,38 +2,39 @@
 //!
 //! # Responsibilities
 //!
-//! - Defines [`TransformComponent`], an entity's placement in the scene, which
-//!   rendering, physics, audio and gameplay all read.
-//! - Publishes its editor field layout and the one call that registers it
-//!   ([`register_transform_component`]), so a world that uses it exposes its
-//!   fields to the inspector.
+//! - Defines [`TransformComponent`], an entity's placement in the scene.
+//!   Rendering, physics, audio and gameplay code all read it.
+//! - Declares its editor field layout and the one call that registers it
+//!   ([`register_transform_component`]), so a world that uses it shows the
+//!   transform's fields in the inspector.
 //!
 //! # Design
 //!
-//! The transform is universal rather than renderer-specific: where a thing is
-//! belongs to the scene, not to a GPU. Renderer-specific mesh, camera and
-//! material contracts live in the rendering extension, and a renderer that
-//! wants a component of its own - a pixel position for a sprite, say - defines
-//! it beside the code that draws it.
+//! The transform belongs to the scene rather than to a renderer: where a thing
+//! is has nothing to do with a GPU. Renderer-specific mesh, camera and material
+//! contracts live in the rendering crates, and a renderer that wants a
+//! component of its own - a pixel position for a sprite, say - defines it
+//! beside the code that draws it.
 //!
-//! The byte layout is a shared ABI. Another language binds this row by the
-//! name it registers under and the `repr(C)` size it verifies, because a
-//! `TypeId` is computed per compilation unit. [`TransformComponent`] declares a
-//! shared name, so every binary that registers it resolves to one column. It is
-//! declared by hand rather than with `#[derive(PillComponent)]`, whose inventory
-//! entry would make every artifact linking the engine register the component -
-//! and fold it into its persistable-schema fingerprint - whether it used it or
-//! not.
+//! The struct's bytes are a shared ABI. Another language binds the same row
+//! through the name the component registers under and the `repr(C)` size it
+//! checks. A `TypeId` would not work for this, because it is computed per
+//! compilation unit; [`TransformComponent`] declares a shared name instead, so
+//! every binary that registers it resolves to the same column. The component is
+//! declared by hand rather than with `#[derive(PillComponent)]`, whose
+//! inventory entry would make every artifact that links the engine register the
+//! component - and add it to that artifact's persistable-schema fingerprint -
+//! whether the artifact used it or not.
 
 // External crates
+// The derive macro for the field layout: the layout half of `PillComponent`,
+// without the inventory entry that registers the type in every artifact.
+use pill_engine_macros::PillLayout;
 use serde::{Deserialize, Serialize};
 
 // Current crate
 use crate::component::Component;
 use crate::world::World;
-
-// Derive macro for the field layout (the layout half of `PillComponent`).
-use pill_engine_macros::PillLayout;
 
 // =============================================================================
 // Components
@@ -41,25 +42,25 @@ use pill_engine_macros::PillLayout;
 
 /// The shared name [`TransformComponent`] registers under.
 ///
-/// Pinned, not derived from the module path: a derived name would register a
-/// different component and orphan every column a live world holds for this
-/// one.
+/// The name is pinned here and not derived from the module path. A derived
+/// name would register a different component, and a live world's stored column
+/// for this one would no longer be found.
 pub const TRANSFORM_SHARED_NAME: &str = "pill_master_renderer::component::TransformComponent";
 
 /// Placement of an entity in the scene: position, orientation and scale.
 ///
 /// Renderers read it for every drawable and for the camera they render
-/// through; any other system may read or write it too. It is shared and
-/// persistable, so one write is visible to the managed side and survives a
-/// project reload.
+/// through, and any other system may read or write it. It is shared and
+/// persistable, so a write is visible to the managed side and the value
+/// survives a project reload.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillLayout)]
 pub struct TransformComponent {
     /// Position of the entity's origin, in world units.
     pub translation: [f32; 3],
-    /// Orientation as a unit quaternion `[x, y, z, w]`; identity is
-    /// `[0, 0, 0, 1]`. A non-finite or zero-length value is read as identity
-    /// instead of being used as-is.
+    /// Orientation as a unit quaternion `[x, y, z, w]`. The identity is
+    /// `[0, 0, 0, 1]`. A non-finite or near-zero value is read as the identity
+    /// instead of being used as it is.
     pub rotation: [f32; 4],
     /// Per-axis scale applied to the mesh when it is drawn.
     pub scale: [f32; 3],
@@ -78,7 +79,8 @@ impl Component for TransformComponent {
     }
 
     fn declared_schema_hash() -> Option<u64> {
-        // What the derive would emit: the hash of the layout registration uses.
+        // The same hash the derive would emit, computed over the field layout
+        // that registration uses.
         Some(crate::component::component_schema_hash(
             TransformComponent::FIELD_LAYOUT,
         ))
@@ -95,18 +97,19 @@ impl Default for TransformComponent {
     }
 }
 
-/// Squared length below which a rotation quaternion is read as identity.
+/// Squared length at or below which a rotation quaternion is read as the
+/// identity orientation.
 ///
-/// Normalizing a near-zero quaternion would amplify rounding noise rather
-/// than an angle, so anything at or under this is not a usable orientation.
+/// Normalizing a quaternion this close to zero would amplify rounding noise
+/// rather than an angle, so such a value is not a usable orientation.
 pub const ROTATION_IDENTITY_EPSILON: f32 = 1.0e-8;
 
-/// Read a [`TransformComponent::rotation`] value as a normalize-or-identity
-/// quaternion array.
+/// Reads a [`TransformComponent::rotation`] value and returns it as a unit
+/// quaternion, or as the identity when it is not usable.
 ///
-/// The one implementation of the rule the field's documentation states, so
-/// systems, projects and the renderer share it and its tolerance rather than
-/// each spelling their own.
+/// This is the only implementation of the rule the field's documentation
+/// states, so systems, projects and the renderer share it and its tolerance
+/// instead of each writing its own.
 pub fn rotation_or_identity(rotation: [f32; 4]) -> [f32; 4] {
     let length_squared: f32 = rotation.iter().map(|value| value * value).sum();
     if rotation.iter().all(|value| value.is_finite()) && length_squared > ROTATION_IDENTITY_EPSILON
@@ -122,14 +125,15 @@ pub fn rotation_or_identity(rotation: [f32; 4]) -> [f32; 4] {
 // Registration
 // =============================================================================
 
-/// Register [`TransformComponent`] with its editor layout.
+/// Registers [`TransformComponent`] together with its editor field layout.
 ///
-/// The transform is registered as persistable, so its values are migrated
-/// across reloads. Idempotent, so a hot reload re-running `init` is safe, and
-/// the type arrives in the inspector field-editable rather than as an opaque
-/// blob: the layout comes from `#[derive(PillLayout)]`.
+/// The component is registered as persistable, so its values are migrated
+/// across reloads. Registering it again is safe and is what a hot reload does
+/// when it re-runs `init`. The layout comes from `#[derive(PillLayout)]`, which
+/// is what lets the inspector edit the fields instead of showing one opaque
+/// blob.
 ///
-/// A renderer calls this from its registration entry point before adding
+/// A renderer calls this from its registration entry point, before adding
 /// whatever it draws with.
 pub fn register_transform_component(world: &mut World) {
     world.register_persistable_component_with_layout::<TransformComponent>(

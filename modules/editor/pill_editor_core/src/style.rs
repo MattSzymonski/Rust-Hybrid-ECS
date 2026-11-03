@@ -6,9 +6,9 @@
 //! - [`default_theme`]: the editor's look as theme tokens, built in code.
 //! - [`ThemeLayer`] and [`UserThemeSelection`]: where a theme layer comes
 //!   from - the code default, the user's file, the project's - and the merge
-//!   that folds them in order.
-//! - [`apply_theme`] and [`apply`]: the one install entry point, and the
-//!   re-install a pop-out window or the no-shell fallback needs.
+//!   that applies them in order.
+//! - [`apply_theme`] and [`apply`]: the one entry point that installs a theme,
+//!   and the re-install a pop-out window or the no-shell fallback needs.
 //! - [`palette`] and the role accessors ([`text`], [`panel`], [`accent`], ...):
 //!   the colours the shell needs beyond egui's own visuals.
 //! - [`dock_style`]: the `egui_dock` styling (flat tabs merged with their
@@ -17,11 +17,12 @@
 //! # Design
 //!
 //! Styling is egui `Style`/`Visuals` data, never CSS: the shell asks for a role
-//! and holds no colour value of its own. [`apply_theme`] is the only writer of
-//! the recorded palette, and the record lives in this crate - a shared dylib
-//! that never reloads - so a shell reload leaves it untouched and the reloaded
-//! shell reads the same roles. It holds `Color32` copies only: nothing a module
-//! image owns outlives its image.
+//! and holds no colour value of its own. Once the record is seeded,
+//! [`apply_theme`] is the only code that writes it. The record lives in this
+//! crate - a shared dylib that never reloads - so a shell reload leaves it
+//! untouched, and the reloaded shell reads the same roles. Everything the
+//! record holds is an owned copy - tokens, layer paths, font bytes - so nothing
+//! a module image owns outlives it.
 
 // Standard library
 use std::sync::{Arc, OnceLock, RwLock};
@@ -35,23 +36,29 @@ use pill_ui_theme::{
 // Current crate
 use crate::kit;
 
-/// The UI font: Inter, vendored under `assets/` with its OFL text.
-const BODY_FONT: &[u8] = include_bytes!("../assets/Inter-Variable.ttf");
-/// The code font: JetBrains Mono, vendored under `assets/` with its OFL text.
-const MONOSPACE_FONT: &[u8] = include_bytes!("../assets/JetBrainsMono-Variable.ttf");
-/// The keys the two families are registered under.
-const BODY_KEY: &str = "editor.body";
-const MONOSPACE_KEY: &str = "editor.monospace";
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The UI font's bytes: Inter, vendored under `assets/` with its OFL text.
+const BODY_FONT_BYTES: &[u8] = include_bytes!("../assets/Inter-Variable.ttf");
+/// The code font's bytes: JetBrains Mono, vendored under `assets/` with its
+/// OFL text.
+const MONOSPACE_FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono-Variable.ttf");
+/// The names the two fonts are registered under in egui.
+const BODY_FONT_KEY: &str = "editor.body";
+const MONOSPACE_FONT_KEY: &str = "editor.monospace";
 
 // =============================================================================
 // The recorded palette
 // =============================================================================
 
-/// The editor's colour roles as egui colours, recorded from the last installed
+/// The editor's colour roles as egui colours, copied from the last installed
 /// theme.
 ///
-/// The shell reads these through the role accessors below; it never names the
-/// theme's `Rgba` values, so a restyle moves every call site at once.
+/// The shell reads them through the role accessors below and never names the
+/// theme's own `Rgba` values, so changing the theme gives every call site a new
+/// colour at once.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
     /// The window frame and tab-strip background.
@@ -72,9 +79,10 @@ pub struct Palette {
     pub text_strong: Color32,
     /// Muted text: inactive tab titles, secondary labels.
     pub text_muted: Color32,
-    /// The accent: links and highlights.
+    /// The accent: the active tab's underline and other highlighted marks.
     pub accent: Color32,
-    /// A brighter accent for hovered accents.
+    /// A brighter accent: the link colour and the face of an accented control
+    /// while it is hovered or held.
     pub accent_hot: Color32,
     /// Success and running states.
     pub success: Color32,
@@ -107,62 +115,63 @@ impl Palette {
     fn from_theme(theme: &Theme) -> Self {
         let palette = &theme.palette;
         Self {
-            frame: color(palette.frame),
-            panel: color(palette.panel),
-            panel_raised: color(palette.panel_raised),
-            control: color(palette.control),
-            well: color(palette.well),
-            line: color(palette.line),
-            text: color(palette.text),
-            text_strong: color(palette.text_strong),
-            text_muted: color(palette.text_muted),
-            accent: color(palette.accent),
-            accent_hot: color(palette.accent_hot),
-            success: color(palette.success),
-            warning: color(palette.warning),
-            danger: color(palette.danger),
-            selection: color(palette.selection),
-            selection_bar: color(palette.selection_bar),
-            overlay: color(palette.overlay),
-            overlay_border: color(palette.overlay_border),
-            shadow: color(theme.shape.window_shadow.color),
-            log_info: color(palette.log_info),
-            log_debug: color(palette.log_debug),
-            log_warn: color(palette.log_warn),
-            log_error: color(palette.log_error),
+            frame: to_egui_color(palette.frame),
+            panel: to_egui_color(palette.panel),
+            panel_raised: to_egui_color(palette.panel_raised),
+            control: to_egui_color(palette.control),
+            well: to_egui_color(palette.well),
+            line: to_egui_color(palette.line),
+            text: to_egui_color(palette.text),
+            text_strong: to_egui_color(palette.text_strong),
+            text_muted: to_egui_color(palette.text_muted),
+            accent: to_egui_color(palette.accent),
+            accent_hot: to_egui_color(palette.accent_hot),
+            success: to_egui_color(palette.success),
+            warning: to_egui_color(palette.warning),
+            danger: to_egui_color(palette.danger),
+            selection: to_egui_color(palette.selection),
+            selection_bar: to_egui_color(palette.selection_bar),
+            overlay: to_egui_color(palette.overlay),
+            overlay_border: to_egui_color(palette.overlay_border),
+            shadow: to_egui_color(theme.shape.window_shadow.color),
+            log_info: to_egui_color(palette.log_info),
+            log_debug: to_egui_color(palette.log_debug),
+            log_warn: to_egui_color(palette.log_warn),
+            log_error: to_egui_color(palette.log_error),
         }
     }
 }
 
 /// The theme the editor last resolved, with the palette it records.
-struct Resolved {
+struct ResolvedTheme {
     /// The tokens every context paints with.
     theme: Theme,
-    /// [`Resolved::theme`] as egui colours.
+    /// [`ResolvedTheme::theme`] as egui colours.
     palette: Palette,
-    /// The layers [`Resolved::theme`] was merged from, in apply order.
+    /// The layers [`ResolvedTheme::theme`] was merged from, in apply order.
     layers: Vec<ThemeLayerInfo>,
     /// The font bytes the layers resolved.
     fonts: kit::style::ThemeFonts,
-    /// The executable's layer generation; moving it means a new theme to
-    /// install.
+    /// The executable's layer generation. When it changes, there is a new
+    /// theme to install.
     generation: u64,
-    /// How many context installs have run; the log line's `contexts`.
+    /// How many context installs have run. The log line's `contexts` field
+    /// carries it.
     contexts: u64,
     /// Whether a theme has ever been installed, so the first one logs.
     installed: bool,
 }
 
 /// The one record every accessor reads.
-static RESOLVED: OnceLock<RwLock<Resolved>> = OnceLock::new();
+static RESOLVED_THEME: OnceLock<RwLock<ResolvedTheme>> = OnceLock::new();
 
 /// The record, seeded with the code default so a read before the first install
 /// still answers.
-fn resolved() -> &'static RwLock<Resolved> {
-    RESOLVED.get_or_init(|| {
+fn resolved_theme() -> &'static RwLock<ResolvedTheme> {
+    RESOLVED_THEME.get_or_init(|| {
         let theme = default_theme();
         let palette = Palette::from_theme(&theme);
-        RwLock::new(Resolved {
+        RwLock::new(ResolvedTheme {
             theme,
             palette,
             layers: vec![ThemeLayerInfo::code()],
@@ -174,9 +183,10 @@ fn resolved() -> &'static RwLock<Resolved> {
     })
 }
 
-/// Read the record, ignoring a panic another thread took while writing it.
-fn read_resolved<T>(read: impl FnOnce(&Resolved) -> T) -> T {
-    let record = resolved()
+/// Reads the record and recovers the data even if another thread panicked
+/// while holding the write lock.
+fn read_resolved_theme<T>(read: impl FnOnce(&ResolvedTheme) -> T) -> T {
+    let record = resolved_theme()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     read(&record)
@@ -184,24 +194,24 @@ fn read_resolved<T>(read: impl FnOnce(&Resolved) -> T) -> T {
 
 /// The palette the last installed theme recorded.
 pub fn palette() -> Palette {
-    read_resolved(|resolved| resolved.palette)
+    read_resolved_theme(|resolved| resolved.palette)
 }
 
 /// The theme the editor last installed.
 pub fn current_theme() -> Theme {
-    read_resolved(|resolved| resolved.theme.clone())
+    read_resolved_theme(|resolved| resolved.theme.clone())
 }
 
-/// The generation of the theme the editor last installed: what a shell reads
-/// to decide whether the executable's next resolution is a theme it already
-/// paints.
+/// The generation of the theme the editor last installed. A shell compares it
+/// with the generation it already installed, so it knows when the executable
+/// has resolved a new theme.
 pub fn generation() -> u64 {
-    read_resolved(|resolved| resolved.generation)
+    read_resolved_theme(|resolved| resolved.generation)
 }
 
 /// The layers the installed theme was merged from.
 pub fn current_layers() -> Vec<ThemeLayerInfo> {
-    read_resolved(|resolved| resolved.layers.clone())
+    read_resolved_theme(|resolved| resolved.layers.clone())
 }
 
 /// The window frame and tab-strip background.
@@ -249,12 +259,13 @@ pub fn text_muted() -> Color32 {
     palette().text_muted
 }
 
-/// The accent: links and highlights.
+/// The accent colour: the active tab's underline and other highlights.
 pub fn accent() -> Color32 {
     palette().accent
 }
 
-/// A brighter accent for hovered accents.
+/// A brighter accent, used for links and for the face of an accented control
+/// while it is hovered or held.
 pub fn accent_hot() -> Color32 {
     palette().accent_hot
 }
@@ -294,9 +305,9 @@ pub fn overlay_border() -> Color32 {
     palette().overlay_border
 }
 
-/// The ink a drop shadow is cast in: the theme's window-shadow colour, so a
-/// mark floating over the scene shadows itself in the same ink as every
-/// other floating surface.
+/// The colour a drop shadow is drawn in: the theme's window-shadow colour. A
+/// mark floating over the scene then casts the same shadow as every other
+/// floating surface.
 pub fn shadow() -> Color32 {
     palette().shadow
 }
@@ -321,21 +332,22 @@ pub fn log_error() -> Color32 {
     palette().log_error
 }
 
-/// Paint the selected-row wash and its left accent bar over `rect`.
+/// Paints the selected row's tinted background and its left accent bar over
+/// `rect`.
 ///
-/// The Hierarchy, Entities and Assets rows call this - or [`selected_row_bar`]
-/// when the widget already fills the row with the `selection` role - so one
-/// selected row looks the same in every panel: the wash is the `selection`
-/// colour and the bar the `selection_bar` one, three points wide as the
-/// reference draws it.
+/// The background is the `selection` colour and the bar the `selection_bar`
+/// one, three points wide. A widget that already fills its row with the
+/// `selection` colour calls [`selected_row_bar`] instead.
 pub fn selected_row(ui: &egui::Ui, rect: egui::Rect) {
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::ZERO, palette().selection);
     selected_row_bar(ui, rect);
 }
 
-/// Paint only the selected row's left accent bar, for a widget that already
-/// fills its row with the `selection` colour.
+/// Paints only the selected row's left accent bar.
+///
+/// Use it for a widget that already fills its row with the `selection` colour,
+/// as the Entities list does.
 pub fn selected_row_bar(ui: &egui::Ui, rect: egui::Rect) {
     let bar = egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, rect.height()));
     ui.painter()
@@ -348,9 +360,9 @@ pub fn selected_row_bar(ui: &egui::Ui, rect: egui::Rect) {
 
 /// The editor's look as a complete theme: one flat, compact dark style.
 ///
-/// The values follow the editor's reference look: near-black panels, a crimson
-/// accent on links, the active tab and the selected row's bar, and compact
-/// controls drawn in Inter and JetBrains Mono.
+/// The palette is near-black panels with a crimson accent for the active tab
+/// and the selected row's bar. Controls are compact and draw their text in
+/// Inter and JetBrains Mono.
 pub fn default_theme() -> Theme {
     let mut theme = Theme::fallback();
     theme.name = "editor".to_owned();
@@ -364,14 +376,14 @@ pub fn default_theme() -> Theme {
     theme.palette.text = Rgba::rgb(201, 201, 208);
     theme.palette.text_strong = Rgba::rgb(240, 240, 244);
     theme.palette.text_muted = Rgba::rgb(138, 138, 147);
-    // The crimson accent: links, the active tab's underline, the selected
-    // row's bar.
+    // The crimson accent: the active tab's underline and the selected row's
+    // bar.
     theme.palette.accent = Rgba::rgb(200, 53, 63);
     theme.palette.accent_hot = Rgba::rgb(224, 69, 80);
     theme.palette.success = Rgba::rgb(111, 191, 115);
     theme.palette.warning = Rgba::rgb(224, 176, 64);
     theme.palette.danger = Rgba::rgb(229, 72, 77);
-    // The selected row: a dark crimson wash under the accent bar.
+    // The selected row: a dark crimson tint under the accent bar.
     theme.palette.selection = Rgba::rgb(58, 28, 32);
     theme.palette.selection_bar = Rgba::rgb(200, 53, 63);
     theme.palette.overlay = Rgba::with_alpha(26, 26, 30, 236);
@@ -391,34 +403,34 @@ pub fn default_theme() -> Theme {
     theme.shape.tab_underline_width = 2.0;
     theme.shape.selected_row_bar_width = 3.0;
 
-    // The five widget states: fills carry the state, the stroke stays subtle,
-    // the corners stay tight.
+    // The five widget states: the fill shows the state, the outline stays
+    // subtle and the corners stay tight.
     theme.widgets = WidgetStates {
-        noninteractive: widget(
+        noninteractive: widget_style(
             Rgba::rgb(26, 26, 29),
             Rgba::rgb(26, 26, 29),
             Some((1.0, Rgba::rgb(46, 46, 52))),
             Rgba::rgb(201, 201, 208),
         ),
-        inactive: widget(
+        inactive: widget_style(
             Rgba::rgb(38, 38, 43),
             Rgba::rgb(38, 38, 43),
             None,
             Rgba::rgb(201, 201, 208),
         ),
-        hovered: widget(
+        hovered: widget_style(
             Rgba::rgb(46, 46, 52),
             Rgba::rgb(46, 46, 52),
             Some((1.0, Rgba::rgb(70, 70, 78))),
             Rgba::rgb(240, 240, 244),
         ),
-        active: widget(
+        active: widget_style(
             Rgba::rgb(54, 54, 61),
             Rgba::rgb(54, 54, 61),
             Some((1.0, Rgba::rgb(90, 90, 99))),
             Rgba::rgb(240, 240, 244),
         ),
-        open: widget(
+        open: widget_style(
             Rgba::rgb(46, 46, 52),
             Rgba::rgb(46, 46, 52),
             Some((1.0, Rgba::rgb(70, 70, 78))),
@@ -474,8 +486,9 @@ pub fn default_theme() -> Theme {
 /// Where one layer of the editor's theme came from.
 ///
 /// The executable merges the layers in this order and the shell installs the
-/// result; a launch stamps the generation so a shell that was reloaded knows
-/// whether it still paints the theme the executable resolved.
+/// result. The generation number goes up whenever the merged theme changes,
+/// so a shell that was reloaded can tell whether it still paints the theme the
+/// executable resolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ThemeLayer {
     /// The editor's own default, built in code.
@@ -503,7 +516,8 @@ impl std::fmt::Display for ThemeLayer {
     }
 }
 
-/// One layer of a resolved theme: its provenance and, for a file, its path.
+/// One layer of a resolved theme: where it came from and, for a file, which
+/// path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThemeLayerInfo {
     /// Which layer this is.
@@ -559,32 +573,40 @@ pub enum UserThemeSelection {
     /// The preference is absent or blank: no user layer.
     #[default]
     None,
-    /// A bare theme name, as preferences written before theme files spell it
-    /// (`dark`, `light`): kept, but adds no layer.
+    /// A bare theme name such as `dark` or `light`, left over from a preference
+    /// that named a theme instead of a file. The executable warns about it and
+    /// adds no layer.
     Legacy(String),
     /// A theme file, absolute or relative to the editor's state directory.
     File(std::path::PathBuf),
 }
 
 impl UserThemeSelection {
-    /// Read the preference's value.
+    /// Reads the value of the `theme` preference.
     ///
-    /// A value ending in `.json` or `.theme` is a file; anything else is a
-    /// bare theme name, which adds no layer. A relative path resolves against
-    /// `state_directory`, where the preferences file itself lives.
-    pub fn from_preference(value: Option<&str>, state_directory: &std::path::Path) -> Self {
-        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+    /// A value ending in `.json` or `.theme` names a file. Anything else is a
+    /// bare theme name, which adds no layer. A relative path is joined to
+    /// `state_directory`, the folder that holds the preferences file. A
+    /// missing or blank value selects [`UserThemeSelection::None`].
+    pub fn from_preference(
+        preference_text: Option<&str>,
+        state_directory: &std::path::Path,
+    ) -> Self {
+        let Some(preference_text) = preference_text
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
             return Self::None;
         };
-        if value.ends_with(".json") || value.ends_with(".theme") {
-            let path = std::path::Path::new(value);
+        if preference_text.ends_with(".json") || preference_text.ends_with(".theme") {
+            let path = std::path::Path::new(preference_text);
             return Self::File(if path.is_absolute() {
                 path.to_path_buf()
             } else {
                 state_directory.join(path)
             });
         }
-        Self::Legacy(value.to_string())
+        Self::Legacy(preference_text.to_string())
     }
 }
 
@@ -593,18 +615,19 @@ impl UserThemeSelection {
 pub struct ThemeMerge {
     /// The merged theme.
     pub theme: Theme,
-    /// The layers that fed [`ThemeMerge::theme`], in apply order; the code
-    /// default is always first.
+    /// The layers that were merged, in apply order; the code default is always
+    /// first.
     pub layers: Vec<ThemeLayerInfo>,
     /// The layers a refused override dropped, with the reason.
     pub refused: Vec<(ThemeLayer, String)>,
 }
 
-/// Merge `user` and then `project` over `code`, refusing individually.
+/// Merges `user` and then `project` over `code` and refuses a bad layer on its
+/// own.
 ///
-/// A layer the merge refuses is skipped and named in
-/// [`ThemeMerge::refused`], so one bad item never costs the other layer's
-/// values; the layers that did apply are what [`ThemeMerge::layers`] lists.
+/// A refused layer is skipped and named in [`ThemeMerge::refused`], so one
+/// broken item never costs the other layer's values.
+/// [`ThemeMerge::layers`] lists only the layers that were applied.
 pub fn merge_layers(
     code: &Theme,
     user: Option<(&ThemeLayerInfo, &pill_ui_theme::ThemeOverrides)>,
@@ -628,28 +651,29 @@ pub fn merge_layers(
 }
 
 /// One widget state's look: fills, an optional outline and a text colour.
-fn widget(
+fn widget_style(
     bg_fill: Rgba,
     weak_bg_fill: Rgba,
     outline: Option<(f32, Rgba)>,
-    fg_fill: Rgba,
+    fg_color: Rgba,
 ) -> WidgetStyle {
     WidgetStyle {
         bg_fill,
         weak_bg_fill,
         bg_stroke: match outline {
-            Some((width, color)) => TokenStroke::new(width, color),
+            Some((width, outline_color)) => TokenStroke::new(width, outline_color),
             None => TokenStroke::new(0.0, Rgba::with_alpha(0, 0, 0, 0)),
         },
-        fg_stroke: TokenStroke::new(1.0, fg_fill),
+        fg_stroke: TokenStroke::new(1.0, fg_color),
         corner_radius: 3,
         expansion: 0.0,
     }
 }
 
-/// An egui colour from a theme colour (straight sRGB alpha).
-fn color(value: Rgba) -> Color32 {
-    let [red, green, blue, alpha] = value.0;
+/// Converts a theme colour to an egui colour, keeping its straight (not
+/// premultiplied) alpha.
+fn to_egui_color(theme_color: Rgba) -> Color32 {
+    let [red, green, blue, alpha] = theme_color.0;
     Color32::from_rgba_unmultiplied(red, green, blue, alpha)
 }
 
@@ -657,14 +681,14 @@ fn color(value: Rgba) -> Color32 {
 // Applying the theme
 // =============================================================================
 
-/// Install `theme` on `context` and record it as the editor's look.
+/// Installs `theme` on `context` and records it as the editor's look.
 ///
-/// The executable resolves the layers and the shell installs the merged theme
-/// with the layers and the generation it came from; a context created later - a
-/// pop-out window, the no-shell fallback - calls [`apply`] to install whatever
-/// is recorded. The install goes through the UI kit with `append_fonts` as
-/// its callback, so a theme layer's font leads each UI family, the editor's own
-/// fonts follow it, and each icon family leads with its Phosphor face.
+/// The executable merges the layers and the shell installs the result, passing
+/// the layers and the generation the theme came from. A context created later
+/// - a pop-out window, the no-shell fallback - calls [`apply`] to install the
+/// recorded theme. The install goes through the UI kit with `append_fonts` as
+/// its callback: a font a theme layer names leads each UI family, the editor's
+/// own fonts follow it, and each icon family leads with its Phosphor face.
 pub fn apply_theme(
     context: &Context,
     theme: &Theme,
@@ -672,8 +696,10 @@ pub fn apply_theme(
     generation: u64,
     fonts: &kit::style::ThemeFonts,
 ) {
+    // Step 1: store the theme in the record when it changed, and count this
+    // install.
     let (contexts, first) = {
-        let mut record = resolved()
+        let mut record = resolved_theme()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let changed = record.theme != *theme
@@ -692,8 +718,8 @@ pub fn apply_theme(
         record.installed = true;
         (record.contexts, first)
     };
-    // One line per resolved theme, not per context: a pop-out that registers
-    // the same theme joins the count without logging again.
+    // Step 2: log once per resolved theme, not once per context, so a pop-out
+    // that registers the same theme joins the count without logging again.
     if first {
         let user = layers
             .iter()
@@ -715,8 +741,9 @@ pub fn apply_theme(
             "[editor] theme applied"
         );
     }
-    // The signature is fresh per context: fonts belong to the context, so a
-    // pop-out always gets them even when the main one already had them.
+    // Step 3: install `theme` and its fonts on this context. The signature is
+    // new for each context. Fonts belong to the context, so a pop-out gets
+    // them even when the main context already had them.
     let mut signature = kit::style::FontSignature::default();
     let fonts_installed = kit::style::install(context, theme, fonts, append_fonts, &mut signature);
     if fonts_installed {
@@ -728,27 +755,27 @@ pub fn apply_theme(
     }
 }
 
-/// Append the editor's own families to `fonts`: Inter for the UI, JetBrains
+/// Appends the editor's own families to `fonts`: Inter for the UI, JetBrains
 /// Mono for code and numbers, then the icon families. Phosphor joins no UI
-/// family, because its regular font claims the lowercase Latin range with
-/// empty glyphs.
+/// family, because its regular font also maps the lowercase Latin letters,
+/// with empty glyphs.
 pub(crate) fn append_fonts(fonts: &mut egui::FontDefinitions) {
     fonts.font_data.insert(
-        BODY_KEY.to_owned(),
-        Arc::new(egui::FontData::from_static(BODY_FONT)),
+        BODY_FONT_KEY.to_owned(),
+        Arc::new(egui::FontData::from_static(BODY_FONT_BYTES)),
     );
     fonts.font_data.insert(
-        MONOSPACE_KEY.to_owned(),
-        Arc::new(egui::FontData::from_static(MONOSPACE_FONT)),
+        MONOSPACE_FONT_KEY.to_owned(),
+        Arc::new(egui::FontData::from_static(MONOSPACE_FONT_BYTES)),
     );
     for (family, key) in [
-        (egui::FontFamily::Proportional, BODY_KEY),
-        (egui::FontFamily::Monospace, MONOSPACE_KEY),
+        (egui::FontFamily::Proportional, BODY_FONT_KEY),
+        (egui::FontFamily::Monospace, MONOSPACE_FONT_KEY),
     ] {
         let names = fonts.families.entry(family).or_default();
-        // A theme layer's font is what the layer asked for; Inter and
+        // A theme layer's font is what the layer asked for. Inter and
         // JetBrains Mono are the fallback the editor ships, so they go behind
-        // it and ahead of egui's defaults.
+        // it and ahead of egui's default fonts.
         let index = names
             .iter()
             .take_while(|name| kit::style::is_theme_font(name))
@@ -758,12 +785,12 @@ pub(crate) fn append_fonts(fonts: &mut egui::FontDefinitions) {
     crate::icons::append_font_definitions(fonts);
 }
 
-/// Install the theme the editor last resolved on `context`.
+/// Installs the theme the editor last resolved on `context`.
 ///
 /// A pop-out window and the no-shell fallback call this, so every context
 /// paints with the same tokens as the main one.
 pub fn apply(context: &Context) {
-    let (theme, layers, generation, fonts) = read_resolved(|resolved| {
+    let (theme, layers, generation, fonts) = read_resolved_theme(|resolved| {
         (
             resolved.theme.clone(),
             resolved.layers.clone(),
@@ -778,35 +805,35 @@ pub fn apply(context: &Context) {
 // The dock's style
 // =============================================================================
 
-/// The `egui_dock` styling for the shell's `DockArea`, derived from
-/// `egui_style` and overridden to the editor's look: flat tabs that merge
-/// with their active bodies, a dark tab strip, and thin separators between
-/// panels. Colours come from `palette`; only an inactive tab's fill is
+/// The `egui_dock` styling for the shell's `DockArea`.
+///
+/// It starts from `egui_style` and changes it to the editor's look: flat tabs
+/// that join their active bodies, a dark tab strip and thin separators between
+/// panels. The colours come from `palette`; only an inactive tab's fill is
 /// transparent.
 pub fn dock_style(egui_style: &egui::Style, palette: &Palette) -> egui_dock::Style {
     let mut style = egui_dock::Style::from_egui(egui_style);
     style.main_surface_border_stroke = Stroke::NONE;
     style.dock_area_padding = None;
-    // The tab strip: a darker band; the active tab takes the body's fill and
-    // carries the accent underline, so it reads as one surface with its
-    // panel. The strip's own line under the tabs is the neutral separator:
-    // the accent underline is the selected tab's alone and the shell paints
-    // it, because the dock uses one line colour for every tab.
+    // The tab strip is a darker band. The active tab takes the body's fill and
+    // carries the accent underline, so it reads as one surface with its panel.
+    // The line under the tabs is the neutral separator. The accent underline
+    // belongs to the selected tab only, and the shell paints it, because the
+    // dock uses one line colour for every tab.
     style.tab_bar.bg_fill = palette.frame;
     style.tab_bar.height = 26.0;
     style.tab_bar.corner_radius = CornerRadius::ZERO;
     style.tab_bar.hline_color = palette.line;
     style.tab_bar.inner_margin = egui::Margin::symmetric(6, 3);
-    style.tab.active = tab_faces(palette.panel, palette.text_strong);
-    style.tab.focused = tab_faces(palette.panel, palette.text_strong);
-    style.tab.active_with_kb_focus = tab_faces(palette.panel, palette.text_strong);
-    style.tab.inactive = tab_faces(Color32::TRANSPARENT, palette.text_muted);
-    style.tab.inactive_with_kb_focus = tab_faces(Color32::TRANSPARENT, palette.text_muted);
-    style.tab.hovered = tab_faces(palette.panel_raised, palette.text);
-    style.tab.focused_with_kb_focus = tab_faces(palette.panel_raised, palette.text);
-    // The active tab merges with its body: the shell paints the accent
-    // underline there itself, so the dock must not run the neutral line
-    // under it.
+    style.tab.active = tab_face(palette.panel, palette.text_strong);
+    style.tab.focused = tab_face(palette.panel, palette.text_strong);
+    style.tab.active_with_kb_focus = tab_face(palette.panel, palette.text_strong);
+    style.tab.inactive = tab_face(Color32::TRANSPARENT, palette.text_muted);
+    style.tab.inactive_with_kb_focus = tab_face(Color32::TRANSPARENT, palette.text_muted);
+    style.tab.hovered = tab_face(palette.panel_raised, palette.text);
+    style.tab.focused_with_kb_focus = tab_face(palette.panel_raised, palette.text);
+    // The active tab joins its body. The shell paints the accent underline
+    // there itself, so the dock must not draw the neutral line under it.
     style.tab.hline_below_active_tab_name = false;
     style.tab.spacing = 0.0;
     style.tab.tab_body.bg_fill = palette.panel;
@@ -814,9 +841,9 @@ pub fn dock_style(egui_style: &egui::Style, palette: &Palette) -> egui_dock::Sty
     style.tab.tab_body.corner_radius = CornerRadius::ZERO;
     style.tab.tab_body.stroke = Stroke::NONE;
     // Panel boundaries: one thin line, with a grab band several times its
-    // width so the splitter is easy to catch, brightened while
-    // interacted with - the line stepped towards the text colours rather than
-    // a second pair of literals.
+    // width so the splitter is easy to catch. The line brightens while the
+    // pointer is over it or it is dragged. It moves towards the text colours
+    // instead of using a second pair of literal values.
     style.separator.width = 1.0;
     style.separator.extra_interact_width = 8.0;
     style.separator.color_idle = palette.line;
@@ -824,7 +851,7 @@ pub fn dock_style(egui_style: &egui::Style, palette: &Palette) -> egui_dock::Sty
     style.separator.color_dragged = palette.line.lerp_to_gamma(palette.text, 0.47);
     // The drag-and-drop preview uses the selection tint.
     style.overlay.selection_color = palette.selection;
-    // Icon-ish buttons: muted, brightening on hover.
+    // The tab-strip and window buttons: muted, brighter on hover.
     let buttons = &mut style.buttons;
     buttons.add_tab_align = egui_dock::TabAddAlign::Left;
     for (color, active) in [
@@ -857,7 +884,7 @@ pub fn dock_style(egui_style: &egui::Style, palette: &Palette) -> egui_dock::Sty
 
 /// One `egui_dock` tab face: square corners and no outline, so the fill
 /// alone separates the states.
-fn tab_faces(bg_fill: Color32, text_color: Color32) -> egui_dock::TabInteractionStyle {
+fn tab_face(bg_fill: Color32, text_color: Color32) -> egui_dock::TabInteractionStyle {
     egui_dock::TabInteractionStyle {
         bg_fill,
         text_color,
@@ -866,23 +893,27 @@ fn tab_faces(bg_fill: Color32, text_color: Color32) -> egui_dock::TabInteraction
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The record is process-wide, so the tests that install into it take
-    /// turns: a parallel test's install would otherwise move the state the
-    /// one below is asserting on.
-    static RECORD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The record is shared by the whole process, so the tests that install
+    /// into it take turns. Otherwise a parallel test's install would change the
+    /// state that another test is checking.
+    static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn record() -> std::sync::MutexGuard<'static, ()> {
-        RECORD
+    fn record_guard() -> std::sync::MutexGuard<'static, ()> {
+        RECORD_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// A fresh context with the code default installed.
-    fn themed() -> Context {
+    fn themed_context() -> Context {
         let context = Context::default();
         apply_theme(
             &context,
@@ -896,27 +927,39 @@ mod tests {
 
     #[test]
     fn the_installed_style_carries_the_theme_tokens() {
-        let _record = record();
-        let context = themed();
+        let _record_guard = record_guard();
+        let context = themed_context();
         let theme = default_theme();
         let style = context.style_of(egui::Theme::Dark);
         let visuals = &style.visuals;
-        assert_eq!(visuals.panel_fill, color(theme.palette.panel));
-        assert_eq!(visuals.window_fill, color(theme.palette.panel));
+        assert_eq!(visuals.panel_fill, to_egui_color(theme.palette.panel));
+        assert_eq!(visuals.window_fill, to_egui_color(theme.palette.panel));
         assert_eq!(visuals.window_stroke.width, 1.0);
-        assert_eq!(visuals.window_stroke.color, color(theme.palette.line));
+        assert_eq!(
+            visuals.window_stroke.color,
+            to_egui_color(theme.palette.line)
+        );
         assert_eq!(
             visuals.window_corner_radius,
             CornerRadius::same(theme.shape.window_corner_radius)
         );
-        assert_eq!(visuals.extreme_bg_color, color(theme.palette.well));
-        assert_eq!(visuals.faint_bg_color, color(theme.palette.panel_raised));
-        assert_eq!(visuals.selection.bg_fill, color(theme.palette.selection));
+        assert_eq!(visuals.extreme_bg_color, to_egui_color(theme.palette.well));
+        assert_eq!(
+            visuals.faint_bg_color,
+            to_egui_color(theme.palette.panel_raised)
+        );
+        assert_eq!(
+            visuals.selection.bg_fill,
+            to_egui_color(theme.palette.selection)
+        );
         assert_eq!(
             visuals.selection.stroke.color,
-            color(theme.shape.selection_stroke.color)
+            to_egui_color(theme.shape.selection_stroke.color)
         );
-        assert_eq!(visuals.hyperlink_color, color(theme.palette.accent_hot));
+        assert_eq!(
+            visuals.hyperlink_color,
+            to_egui_color(theme.palette.accent_hot)
+        );
         assert!(visuals.slider_trailing_fill);
         assert_eq!(
             visuals.window_shadow.offset,
@@ -927,22 +970,22 @@ mod tests {
 
     #[test]
     fn the_installed_style_carries_the_widget_states() {
-        let _record = record();
-        let context = themed();
+        let _record_guard = record_guard();
+        let context = themed_context();
         let theme = default_theme();
         let style = context.style_of(egui::Theme::Dark);
         let widgets = &style.visuals.widgets;
         assert_eq!(
             widgets.noninteractive.bg_fill,
-            color(theme.widgets.noninteractive.bg_fill)
+            to_egui_color(theme.widgets.noninteractive.bg_fill)
         );
         assert_eq!(
             widgets.noninteractive.fg_stroke.color,
-            color(theme.widgets.noninteractive.fg_stroke.color)
+            to_egui_color(theme.widgets.noninteractive.fg_stroke.color)
         );
         assert_eq!(
             widgets.inactive.bg_fill,
-            color(theme.widgets.inactive.bg_fill)
+            to_egui_color(theme.widgets.inactive.bg_fill)
         );
         assert_eq!(
             widgets.inactive.bg_stroke.width,
@@ -950,18 +993,24 @@ mod tests {
         );
         assert_eq!(
             widgets.hovered.bg_fill,
-            color(theme.widgets.hovered.bg_fill)
+            to_egui_color(theme.widgets.hovered.bg_fill)
         );
         assert_eq!(
             widgets.hovered.bg_stroke.color,
-            color(theme.widgets.hovered.bg_stroke.color)
+            to_egui_color(theme.widgets.hovered.bg_stroke.color)
         );
-        assert_eq!(widgets.active.bg_fill, color(theme.widgets.active.bg_fill));
+        assert_eq!(
+            widgets.active.bg_fill,
+            to_egui_color(theme.widgets.active.bg_fill)
+        );
         assert_eq!(
             widgets.active.bg_stroke.color,
-            color(theme.widgets.active.bg_stroke.color)
+            to_egui_color(theme.widgets.active.bg_stroke.color)
         );
-        assert_eq!(widgets.open.bg_fill, color(theme.widgets.open.bg_fill));
+        assert_eq!(
+            widgets.open.bg_fill,
+            to_egui_color(theme.widgets.open.bg_fill)
+        );
         for state in [
             &widgets.noninteractive,
             &widgets.inactive,
@@ -978,8 +1027,8 @@ mod tests {
 
     #[test]
     fn the_installed_style_carries_the_metrics_and_text() {
-        let _record = record();
-        let context = themed();
+        let _record_guard = record_guard();
+        let context = themed_context();
         let theme = default_theme();
         let style = context.style_of(egui::Theme::Dark);
         assert_eq!(
@@ -1017,10 +1066,10 @@ mod tests {
         assert_eq!(context.theme(), egui::Theme::Dark);
     }
 
-    /// The default theme's signature values: a crimson accent on near-black
-    /// chrome, with tight corners.
+    /// The default theme's representative values: a crimson accent on
+    /// near-black panels and tight corners.
     #[test]
-    fn the_default_theme_samples_the_reference() {
+    fn the_default_theme_has_the_representative_values() {
         let theme = default_theme();
         assert_eq!(theme.palette.accent, Rgba::rgb(200, 53, 63));
         assert_eq!(theme.palette.selection_bar, theme.palette.accent);
@@ -1030,7 +1079,7 @@ mod tests {
 
     #[test]
     fn the_recorded_palette_is_the_installed_theme() {
-        let _record = record();
+        let _record_guard = record_guard();
         let context = Context::default();
         let theme = default_theme();
         apply_theme(
@@ -1041,17 +1090,17 @@ mod tests {
             &kit::style::ThemeFonts::default(),
         );
         let palette = palette();
-        assert_eq!(palette.panel, color(theme.palette.panel));
-        assert_eq!(text(), color(theme.palette.text));
-        assert_eq!(text_muted(), color(theme.palette.text_muted));
-        assert_eq!(accent(), color(theme.palette.accent));
-        assert_eq!(overlay(), color(theme.palette.overlay));
-        assert_eq!(shadow(), color(theme.shape.window_shadow.color));
-        assert_eq!(log_warn(), color(theme.palette.log_warn));
+        assert_eq!(palette.panel, to_egui_color(theme.palette.panel));
+        assert_eq!(text(), to_egui_color(theme.palette.text));
+        assert_eq!(text_muted(), to_egui_color(theme.palette.text_muted));
+        assert_eq!(accent(), to_egui_color(theme.palette.accent));
+        assert_eq!(overlay(), to_egui_color(theme.palette.overlay));
+        assert_eq!(shadow(), to_egui_color(theme.shape.window_shadow.color));
+        assert_eq!(log_warn(), to_egui_color(theme.palette.log_warn));
     }
 
-    /// The preference's value: a file (absolute or beside the state files), a
-    /// bare theme name, or nothing.
+    /// The preference's value: a file path (absolute or relative to the state
+    /// directory), a bare theme name, or nothing.
     #[test]
     fn the_user_layer_reads_a_preference_value() {
         let directory = std::path::Path::new("C:/state");
@@ -1081,9 +1130,9 @@ mod tests {
         );
     }
 
-    /// The layers fold in order - user first, project last - so the project's
-    /// value wins where both name the same item and the user's survives where
-    /// only it spoke.
+    /// The layers are applied in order, user first and project last. The
+    /// project's value wins where both name the same item, and the user's value
+    /// stays where only the user named it.
     #[test]
     fn the_layers_merge_user_then_project() {
         let code = default_theme();
@@ -1118,9 +1167,8 @@ mod tests {
         assert_eq!(layers_text(&merged.layers), "code,user,project");
     }
 
-    /// A layer whose document the merge refuses is named and skipped: the
-    /// other layer still applies, and the code default it fell back to is
-    /// still there.
+    /// A layer the merge refuses is named and skipped. The other layer still
+    /// applies, and the code default it fell back to is still there.
     #[test]
     fn a_refused_layer_is_skipped_and_named() {
         let code = default_theme();
@@ -1148,11 +1196,12 @@ mod tests {
         assert_eq!(merged.layers.len(), 2);
     }
 
-    /// The record follows the layer set: a new generation with the same tokens
-    /// is still a theme to install, and `apply` re-installs what is recorded.
+    /// The record follows the layer set. A new generation with the same tokens
+    /// still counts as a theme to install, and `apply` re-installs the recorded
+    /// theme.
     #[test]
     fn the_record_follows_the_layer_set() {
-        let _record = record();
+        let _record_guard = record_guard();
         let context = Context::default();
         let theme = default_theme();
         let layers = vec![ThemeLayerInfo::code(), ThemeLayerInfo::user("theme.json")];
@@ -1163,13 +1212,14 @@ mod tests {
             7,
             &kit::style::ThemeFonts::default(),
         );
-        let recorded = read_resolved(|resolved| (resolved.generation, resolved.layers.clone()));
+        let recorded =
+            read_resolved_theme(|resolved| (resolved.generation, resolved.layers.clone()));
         assert_eq!(recorded.0, 7);
         assert_eq!(recorded.1, layers);
         // A second context installs the same record without moving it.
         let popout = Context::default();
         apply(&popout);
-        let after = read_resolved(|resolved| resolved.generation);
+        let after = read_resolved_theme(|resolved| resolved.generation);
         assert_eq!(after, 7);
     }
 
@@ -1199,13 +1249,13 @@ mod tests {
         let proportional = &definitions.families[&egui::FontFamily::Proportional];
         assert_eq!(
             proportional.first().map(String::as_str),
-            Some(BODY_KEY),
+            Some(BODY_FONT_KEY),
             "Inter leads the proportional family"
         );
         let monospace = &definitions.families[&egui::FontFamily::Monospace];
         assert_eq!(
             monospace.first().map(String::as_str),
-            Some(MONOSPACE_KEY),
+            Some(MONOSPACE_FONT_KEY),
             "JetBrains Mono leads the monospace family"
         );
         let duotone =
@@ -1216,15 +1266,15 @@ mod tests {
             "Phosphor's duotone face leads its own family"
         );
         assert!(
-            duotone.iter().any(|name| name == BODY_KEY),
+            duotone.iter().any(|name| name == BODY_FONT_KEY),
             "Inter follows it as the label's fallback"
         );
     }
 
-    /// A theme layer's font leads the UI families, the editor's own fonts
+    /// A theme layer's font leads in each UI family, the editor's own fonts
     /// follow it as the fallback, and an icon family leads with its Phosphor
-    /// face - the UI fonts claim the icons' private-use codepoints with glyphs
-    /// of their own, so an icon listed behind them would draw as a letter.
+    /// face. The UI fonts also map the icons' private-use codepoints, so an
+    /// icon listed behind them would draw as a letter.
     #[test]
     fn a_theme_font_leads_the_editors_own_families() {
         let fonts = kit::style::ThemeFonts {
@@ -1242,7 +1292,7 @@ mod tests {
         );
         assert_eq!(
             proportional.get(1).map(String::as_str),
-            Some(BODY_KEY),
+            Some(BODY_FONT_KEY),
             "Inter is the fallback behind it"
         );
         let monospace = &definitions.families[&egui::FontFamily::Monospace];
@@ -1250,7 +1300,10 @@ mod tests {
             monospace.first().map(String::as_str),
             Some(kit::style::THEME_MONOSPACE_KEY)
         );
-        assert_eq!(monospace.get(1).map(String::as_str), Some(MONOSPACE_KEY));
+        assert_eq!(
+            monospace.get(1).map(String::as_str),
+            Some(MONOSPACE_FONT_KEY)
+        );
         let icons = &definitions.families[&egui::FontFamily::Name(crate::icons::FAMILY.into())];
         assert_eq!(
             icons.first().map(String::as_str),

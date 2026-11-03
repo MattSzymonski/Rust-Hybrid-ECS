@@ -1,26 +1,27 @@
-//! Assets with no source file: the file in `res` is the asset itself.
+//! Assets stored as their own file in `res`, with no source file behind them.
 //!
 //! # Responsibilities
 //!
-//! - Define what such an asset type provides ([`StandaloneAsset`]): its
-//!   serialized document, the one file extension it is stored under, and how
-//!   to build the asset from a document.
+//! - Define what a standalone type provides ([`StandaloneAsset`]): the
+//!   document written to its file, the one file extension it uses, and how to
+//!   build the asset from that document.
 //! - Load, reload in place and follow a move of a standalone file
-//!   ([`AssetManager::import_standalone`] and its siblings), with the same
-//!   identity rules as a sourced asset: named by its path, keyed by its guid.
-//! - Write a new standalone file ([`render_standalone`]), and read or check
-//!   its document as JSON for code that does not know its type.
+//!   ([`AssetManager::import_standalone`] and its siblings). The identity
+//!   rules match a sourced asset's: the asset is named by its path and keyed
+//!   by the guid in its file.
+//! - Write a new standalone file ([`render_standalone`]), and read or
+//!   normalize its document as JSON for code that does not know its type.
 //!
-//! A new standalone file's name is validated by
-//! [`crate::asset_metadata::standalone_file_name`], which lives with the import
-//! pipeline so every editor's create dialog shares one rule.
+//! A new standalone file's name is checked by
+//! [`crate::asset_metadata::standalone_file_name`], so every editor's create
+//! dialog applies the same rule.
 //!
 //! # Design
 //!
-//! A material or a render pass has no image or model behind it: it is data.
-//! Its file therefore carries the same header a `.meta` file does - format
-//! version, asset type, guid - with the asset itself under `asset` where a
-//! metadata file has `settings`:
+//! A material or a render pass is not built from an image or a model; it is
+//! data. Its file therefore starts with the same header a `.meta` file has -
+//! format version, asset type, guid - and holds the asset under `asset`,
+//! where a metadata file holds `settings`:
 //!
 //! ```json
 //! {
@@ -31,16 +32,17 @@
 //! }
 //! ```
 //!
-//! The guid lives in the file's own header, so a standalone file has no
-//! `.meta`, and `.meta` stays a sidecar only. Its type is found by its
-//! extension (`helmet.material`), exactly like a sourced asset's, so the scan,
-//! the watcher and the move-following treat it with no special case.
+//! The guid lives in the file's own header, so a standalone file needs no
+//! `.meta`; a `.meta` file remains the sidecar of a sourced asset. The type
+//! comes from the file's extension (`helmet.material`), as it does for a
+//! sourced asset, so the scan, the watcher and the move-following find its
+//! type the same way.
 //!
 //! A document refers to other assets by
-//! [`AssetReference`](crate::asset_reference::AssetReference), resolved when
-//! the asset is built. A reference to an asset that is not loaded yet resolves
-//! to the invalid handle, which is why a scan imports standalone files after
-//! every sourced one.
+//! [`AssetReference`](crate::asset_reference::AssetReference), which is
+//! resolved when the asset is built. A reference to an asset that is not
+//! loaded yet becomes the invalid handle, so a scan imports standalone files
+//! after every sourced one.
 
 // Standard library
 use std::path::Path;
@@ -58,8 +60,16 @@ use crate::asset_metadata::{
 };
 use crate::asset_store::{self, pack_key};
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// The header field holding a standalone file's asset.
 pub const STANDALONE_BODY_FIELD: &str = "asset";
+
+// =============================================================================
+// StandaloneAsset
+// =============================================================================
 
 /// An asset stored as its own JSON file in `res`, with no source file.
 ///
@@ -67,9 +77,9 @@ pub const STANDALONE_BODY_FIELD: &str = "asset";
 /// [`World::register_standalone_asset`](crate::World::register_standalone_asset)
 /// so it can be loaded by extension.
 pub trait StandaloneAsset: Asset + TraitAccessible<dyn Asset> + Sized {
-    /// The asset as written in its file. Its `Default` is what a newly
-    /// created file holds, so it must build a valid asset on its own. Mark it
-    /// `#[serde(default)]` so a file written before a field existed still
+    /// The asset's shape as written to its file. A newly created file holds
+    /// `Default`, so the default must build a valid asset on its own. Mark the
+    /// type `#[serde(default)]` so a file written before a field existed still
     /// reads, and use `BTreeMap`, never `HashMap`, for maps (see
     /// `ImportedAsset::ImportSettings`).
     type Document: Serialize + DeserializeOwned + Default;
@@ -99,62 +109,19 @@ pub trait StandaloneAsset: Asset + TraitAccessible<dyn Asset> + Sized {
     ) -> AssetLoadResult<Self>;
 }
 
-/// The bytes of a standalone file for `T` holding `guid` and `document`.
-///
-/// # Errors
-///
-/// Returns [`AssetLoadError::Metadata`] when the document cannot be written as
-/// JSON.
-pub fn render_standalone<T: StandaloneAsset>(
-    guid: AssetGuid,
-    document: &T::Document,
-) -> AssetLoadResult<Vec<u8>> {
-    let value = serde_json::json!({
-        "format_version": METADATA_FORMAT_VERSION,
-        "asset_type": T::metadata_type_name(),
-        "guid": guid,
-        STANDALONE_BODY_FIELD: document,
-    });
-    let mut bytes =
-        serde_json::to_vec_pretty(&value).map_err(|error| AssetLoadError::Metadata {
-            path: T::metadata_type_name().into(),
-            detail: format!("the document cannot be written as JSON: {error}"),
-        })?;
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-
-/// Read the standalone file at the normalized `name` as `T`'s: its guid and
-/// document.
-fn read_standalone<T: StandaloneAsset>(name: &str) -> AssetLoadResult<(AssetGuid, T::Document)> {
-    let path = Path::new(name);
-    let bytes = asset_store::read(path)?;
-    let (guid, body) = parse_header(path, &bytes, T::metadata_type_name(), STANDALONE_BODY_FIELD)?;
-    let document = match body {
-        None => T::Document::default(),
-        Some(body) => serde_json::from_value(body).map_err(|error| AssetLoadError::Metadata {
-            path: path.to_owned(),
-            detail: format!("`{STANDALONE_BODY_FIELD}` does not fit this asset type: {error}"),
-        })?,
-    };
-    Ok((guid, document))
-}
-
-/// `path` normalized into an asset name, or the refusal `import` gives.
-fn asset_name_of(path: &Path) -> Result<String, AssetLoadError> {
-    pack_key(path).ok_or_else(|| AssetLoadError::PathNotFound {
-        path: path.to_owned(),
-    })
-}
+// =============================================================================
+// AssetManager
+// =============================================================================
 
 impl AssetManager {
-    /// Load the standalone file at `path` as a `T`.
+    /// Loads the standalone file at `path` as a `T`.
     ///
-    /// Named by its normalized path and keyed by the guid in its header, under
-    /// the same rules as [`Self::import`]: a path already loaded under that guid
-    /// returns its handle with `already_loaded` set and decodes nothing; a guid
-    /// another live `T` has is refused. Nothing is ever written: the file is the
-    /// asset, and its header always supplies the guid.
+    /// The asset is named by its normalized path and keyed by the guid in the
+    /// file's header. The identity rules match [`Self::import`]'s: a path that
+    /// is already loaded under that guid returns its handle with
+    /// `already_loaded` set and builds nothing, and a guid another live `T`
+    /// holds is refused. Nothing is written: the file is the asset, and its
+    /// header always supplies the guid.
     ///
     /// # Errors
     ///
@@ -164,9 +131,12 @@ impl AssetManager {
         &mut self,
         path: &Path,
     ) -> Result<ImportOutcome<T>, AssetImportError> {
+        // Step 1: Name the file and read the guid and document it holds.
         let asset_name = asset_name_of(path)?;
         let (guid, document) = read_standalone::<T>(&asset_name)?;
 
+        // Step 2: A path loaded under this guid is the same asset. A path bound
+        // to another guid, or a guid another asset holds, is refused.
         if let Some(handle) = self.handle_by_name::<T>(&asset_name) {
             let loaded = self.guid_of(handle);
             if loaded == Some(guid) {
@@ -191,6 +161,7 @@ impl AssetManager {
             });
         }
 
+        // Step 3: Build the asset and add it under the file's guid.
         let asset = T::from_document(&asset_name, document, self)?;
         let handle = self
             .add_named_with_guid(asset_name, guid, asset)
@@ -203,19 +174,22 @@ impl AssetManager {
         })
     }
 
-    /// Read the standalone file at `path` again and replace the loaded value
-    /// in its slot, keeping its handle, name and guid; a path that is not
-    /// loaded is imported instead.
+    /// Reads the standalone file at `path` again and replaces the value in the
+    /// loaded asset's slot, keeping its handle, name and guid. A path that is
+    /// not loaded is imported instead.
     ///
     /// # Errors
     ///
-    /// As [`Self::import_standalone`]; a header whose guid changed under the
-    /// loaded asset is [`AssetImportError::PathBoundToOtherGuid`]. On every
-    /// error the loaded value stays as it was.
+    /// As [`Self::import_standalone`]. A file whose header now holds a
+    /// different guid than the loaded asset is
+    /// [`AssetImportError::PathBoundToOtherGuid`]. On every error the loaded
+    /// value stays as it was.
     pub fn reimport_standalone<T: StandaloneAsset>(
         &mut self,
         path: &Path,
     ) -> Result<ReimportOutcome<T>, AssetImportError> {
+        // Step 1: Name the file. A path that is not loaded has nothing to
+        // replace, so import it instead.
         let asset_name = asset_name_of(path)?;
         let Some(handle) = self.handle_by_name::<T>(&asset_name) else {
             let imported = self.import_standalone::<T>(path)?;
@@ -226,6 +200,8 @@ impl AssetManager {
                 replaced: false,
             });
         };
+
+        // Step 2: Read the file again and refuse a header whose guid changed.
         let (guid, document) = read_standalone::<T>(&asset_name)?;
         let loaded = self.guid_of(handle);
         if loaded != Some(guid) {
@@ -235,7 +211,9 @@ impl AssetManager {
                 metadata: guid,
             });
         }
-        // Built fully before the slot is touched, so a failure leaves it as is.
+
+        // Step 3: Build the replacement first, so a failure leaves the loaded
+        // value as it is.
         let asset = T::from_document(&asset_name, document, self)?;
         *self
             .get_mut(handle)
@@ -248,15 +226,15 @@ impl AssetManager {
         })
     }
 
-    /// When the standalone file at `path` is a loaded `T` moved here, rename
-    /// that asset to `path` and return its old name; the counterpart of
-    /// [`Self::follow_move`], recognizing the move by the guid in the file's
-    /// own header.
+    /// Renames a loaded `T` to `path` when the standalone file there is that
+    /// asset moved here, and returns the asset's old name. This is the
+    /// standalone counterpart of [`Self::follow_move`]; it recognizes the move
+    /// by the guid in the file's own header.
     ///
     /// # Errors
     ///
-    /// When the path does not normalize, or the file exists but is not a
-    /// readable `T` file.
+    /// When the path does not normalize, or the file exists but does not read
+    /// as a `T` file.
     pub fn follow_standalone_move<T: StandaloneAsset>(
         &mut self,
         path: &Path,
@@ -274,11 +252,66 @@ impl AssetManager {
     }
 }
 
-/// The document in the standalone file at `path`, as JSON.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns the bytes of a standalone file for `T`, holding `guid` and
+/// `document`.
 ///
 /// # Errors
 ///
-/// When the file cannot be read or is not a `T`'s.
+/// Returns [`AssetLoadError::Metadata`] when the document cannot be written as
+/// JSON.
+pub fn render_standalone<T: StandaloneAsset>(
+    guid: AssetGuid,
+    document: &T::Document,
+) -> AssetLoadResult<Vec<u8>> {
+    let document_json = serde_json::json!({
+        "format_version": METADATA_FORMAT_VERSION,
+        "asset_type": T::metadata_type_name(),
+        "guid": guid,
+        STANDALONE_BODY_FIELD: document,
+    });
+    let mut bytes =
+        serde_json::to_vec_pretty(&document_json).map_err(|error| AssetLoadError::Metadata {
+            path: T::metadata_type_name().into(),
+            detail: format!("the document cannot be written as JSON: {error}"),
+        })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Returns the guid and document of the standalone file at the normalized
+/// asset name `name`.
+fn read_standalone<T: StandaloneAsset>(name: &str) -> AssetLoadResult<(AssetGuid, T::Document)> {
+    let path = Path::new(name);
+    let bytes = asset_store::read(path)?;
+    let (guid, body) = parse_header(path, &bytes, T::metadata_type_name(), STANDALONE_BODY_FIELD)?;
+    let document = match body {
+        None => T::Document::default(),
+        Some(body) => serde_json::from_value(body).map_err(|error| AssetLoadError::Metadata {
+            path: path.to_owned(),
+            detail: format!("`{STANDALONE_BODY_FIELD}` does not fit this asset type: {error}"),
+        })?,
+    };
+    Ok((guid, document))
+}
+
+/// Returns `path` as an asset name, or the error an import reports for a path
+/// that does not normalize.
+fn asset_name_of(path: &Path) -> Result<String, AssetLoadError> {
+    pack_key(path).ok_or_else(|| AssetLoadError::PathNotFound {
+        path: path.to_owned(),
+    })
+}
+
+/// Returns the document of the standalone file at `path`, as JSON.
+///
+/// # Errors
+///
+/// When the path does not normalize, the file cannot be read, or it is not a
+/// `T`'s file.
 pub fn standalone_document_json<T: StandaloneAsset>(
     path: &Path,
 ) -> AssetLoadResult<serde_json::Value> {
@@ -287,25 +320,26 @@ pub fn standalone_document_json<T: StandaloneAsset>(
     document_to_json::<T>(path, &document)
 }
 
-/// `value` read as `T`'s document and written back: missing fields defaulted,
-/// unknown ones dropped.
+/// Reads `document_json` as `T`'s document and returns it as JSON, with
+/// missing fields set to their defaults and unknown ones dropped.
 ///
 /// # Errors
 ///
 /// [`AssetLoadError::Metadata`] when the value does not fit the document.
 pub fn normalize_standalone_document<T: StandaloneAsset>(
-    value: serde_json::Value,
+    document_json: serde_json::Value,
 ) -> AssetLoadResult<serde_json::Value> {
     let label = Path::new(T::metadata_type_name());
     let document: T::Document =
-        serde_json::from_value(value).map_err(|error| AssetLoadError::Metadata {
+        serde_json::from_value(document_json).map_err(|error| AssetLoadError::Metadata {
             path: label.to_owned(),
             detail: format!("the document does not fit this asset type: {error}"),
         })?;
     document_to_json::<T>(label, &document)
 }
 
-/// The document a new `T` file holds, as JSON: `T::Document::default()`.
+/// Returns the document a newly created `T` file holds, as JSON, which is
+/// `T::Document::default()`.
 ///
 /// # Errors
 ///
@@ -314,7 +348,11 @@ pub fn default_standalone_document<T: StandaloneAsset>() -> AssetLoadResult<serd
     document_to_json::<T>(Path::new(T::metadata_type_name()), &T::Document::default())
 }
 
-/// `document` as JSON, with `path` naming the failure.
+/// Returns `document` as JSON, with `path` naming the asset in the error.
+///
+/// # Errors
+///
+/// [`AssetLoadError::Metadata`] when the document cannot be written as JSON.
 fn document_to_json<T: StandaloneAsset>(
     path: &Path,
     document: &T::Document,
@@ -324,6 +362,10 @@ fn document_to_json<T: StandaloneAsset>(
         detail: format!("the document cannot be written as JSON: {error}"),
     })
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -335,13 +377,13 @@ mod tests {
     use std::path::PathBuf;
     use trait_type_map::impl_trait_accessible;
 
-    /// A sourceless picture the tests refer to by guid.
+    /// A picture asset with no file behind it, which the tests name by guid.
     #[derive(Debug, PartialEq)]
     struct Picture;
     impl Asset for Picture {}
     impl_trait_accessible!(dyn Asset; Picture);
 
-    /// The standalone test asset: a tint and a picture reference.
+    /// The test's standalone asset: a tint and a reference to the picture.
     #[derive(Debug)]
     struct Swatch {
         name: String,
@@ -351,6 +393,7 @@ mod tests {
     impl Asset for Swatch {}
     impl_trait_accessible!(dyn Asset; Swatch);
 
+    /// The swatch's saved form: its tint and its picture reference.
     #[derive(Serialize, Deserialize)]
     #[serde(default)]
     struct SwatchDocument {
@@ -394,16 +437,20 @@ mod tests {
         }
     }
 
+    /// The guid the swatch file in each test is written with.
     const GUID: &str = "0000000000000000000000000000005a";
+    /// The guid of the picture asset the swatch points at.
     const PICTURE_GUID: &str = "000000000000000000000000000000b1";
 
-    /// A scratch `res` directory mounted under the mounted-directory lock.
+    /// A scratch `res` directory for one test, mounted under the process-wide
+    /// directory lock while it lives.
     struct ScratchRes {
         root: PathBuf,
         _mounted: std::sync::MutexGuard<'static, ()>,
     }
 
     impl ScratchRes {
+        /// Creates an empty directory and mounts it as the asset root.
         fn new(label: &str) -> Self {
             let mounted = mounted_directory_test_lock();
             let root = std::env::temp_dir()
@@ -417,8 +464,10 @@ mod tests {
             }
         }
 
-        fn write_swatch(&self, relative: &str, guid: &str, body: &str) {
-            let path = self.root.join(relative);
+        /// Writes a swatch file at `relative_path` with `guid` and the JSON
+        /// `body` under the asset header.
+        fn write_swatch(&self, relative_path: &str, guid: &str, body: &str) {
+            let path = self.root.join(relative_path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(
                 path,
@@ -437,7 +486,8 @@ mod tests {
         }
     }
 
-    fn with_picture(assets: &mut AssetManager) -> Handle<Picture> {
+    /// Adds the shared picture asset and returns its handle.
+    fn add_picture(assets: &mut AssetManager) -> Handle<Picture> {
         assets
             .add_named_with_guid("picture", AssetGuid::parse(PICTURE_GUID).unwrap(), Picture)
             .unwrap()
@@ -452,7 +502,7 @@ mod tests {
             &format!(r#"{{"tint": 9, "picture": "{PICTURE_GUID}"}}"#),
         );
         let mut assets = AssetManager::new();
-        let picture = with_picture(&mut assets);
+        let picture = add_picture(&mut assets);
 
         let outcome = assets
             .import_standalone::<Swatch>(Path::new("swatches/a.swatch"))
@@ -553,11 +603,11 @@ mod tests {
 
         std::fs::create_dir_all(res.root.join("moved")).unwrap();
         std::fs::rename(res.root.join("a.swatch"), res.root.join("moved/a.swatch")).unwrap();
-        let old = assets
+        let old_name = assets
             .follow_standalone_move::<Swatch>(Path::new("moved/a.swatch"))
             .unwrap();
 
-        assert_eq!(old.as_deref(), Some("a.swatch"));
+        assert_eq!(old_name.as_deref(), Some("a.swatch"));
         assert_eq!(
             assets.handle_by_name::<Swatch>("moved/a.swatch"),
             Some(first.handle)

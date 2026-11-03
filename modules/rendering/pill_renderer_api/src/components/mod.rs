@@ -1,9 +1,10 @@
-//! The scene components that are part of the renderer contract.
+//! The scene types that are part of the renderer contract.
 //!
 //! # Responsibilities
 //!
-//! - Declare [`CameraComponent`], which [`crate::frame::RenderFrame`] embeds,
-//!   and [`RenderViewport`], the rectangle a frontend points a renderer at.
+//! - Declare [`CameraComponent`], the camera [`crate::frame::RenderFrame`]
+//!   carries for each surface, and [`RenderViewport`], the rectangle a frontend
+//!   points a renderer at.
 //! - Register the contract's components through
 //!   [`register_contract_components`], field layout included.
 //!
@@ -14,22 +15,23 @@
 //! instance - live in that renderer's data crate, which registers these first
 //! and its own after.
 //!
-//! **The camera pins its shared name.** The `PillComponent` derive otherwise
-//! builds it from `module_path!()`, so a derived name would register a
-//! *different* component and orphan every column a live world holds for this
-//! one.
+//! **The camera sets its shared name explicitly.** The `PillComponent` derive
+//! would otherwise build the name from `module_path!()`. A name built that way
+//! registers a *different* component, and the world would no longer find the
+//! columns it already holds for this one.
 
 mod camera;
 mod viewport;
 
-pub use camera::CameraComponent;
-pub use viewport::RenderViewport;
-
 // External crates
 use pill_engine::World;
 
-/// Registers the contract's components with the world, field layouts included:
-/// the engine's transform and the camera.
+// Current crate
+pub use camera::CameraComponent;
+pub use viewport::RenderViewport;
+
+/// Registers the contract's components - the engine's transform and the
+/// camera - with the world, and records each component's field layout.
 ///
 /// A renderer's data crate calls this before registering its own components.
 pub fn register_contract_components(world: &mut World) {
@@ -43,21 +45,21 @@ mod tests {
     use pill_engine::common_components::TransformComponent;
     use pill_engine::{Component, ComponentId};
 
-    /// The contract's components arrive field-described, under their pinned
-    /// shared names.
+    /// Registering the contract's components records their field layouts, and
+    /// the camera reports its declared shared name.
     #[test]
     fn the_contract_components_register_with_their_layouts() {
         let mut world = World::new();
         register_contract_components(&mut world);
 
-        let fields = |component| {
+        let field_count = |component_id| {
             world
-                .component_field_layout(component)
+                .component_field_layout(component_id)
                 .map(<[_]>::len)
                 .unwrap_or(0)
         };
-        assert_eq!(fields(ComponentId::of::<TransformComponent>()), 3);
-        assert_eq!(fields(ComponentId::of::<CameraComponent>()), 5);
+        assert_eq!(field_count(ComponentId::of::<TransformComponent>()), 3);
+        assert_eq!(field_count(ComponentId::of::<CameraComponent>()), 5);
         assert_eq!(
             CameraComponent::shared_name(),
             Some("pill_master_renderer::component::CameraComponent")

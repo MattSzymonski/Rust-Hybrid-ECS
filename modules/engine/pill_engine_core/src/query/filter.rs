@@ -1,4 +1,5 @@
-//! [`QueryFilter`] trait and built-in filter types for entity-level predicates.
+//! The [`QueryFilter`] trait and the filter types the engine provides for
+//! deciding which entities a query yields.
 //!
 //! # Responsibilities
 //!
@@ -10,11 +11,12 @@
 //! # Design
 //!
 //! Filters produce `(include, exclude)` component-id pairs that the query
-//! turns into masks; an archetype matches a pair when it holds every include
-//! and none of the excludes. `With<T>` adds T to the include set;
-//! `Without<T>` adds T to the exclude set. `Changed<T>` and `Added<T>` compare
-//! per-entity tick values against the calling system's last-run baseline. `Or`
-//! produces multiple pairs - an archetype matches if any pair passes.
+//! turns into masks. An archetype matches a pair when it holds every include
+//! and none of the excludes. `With<T>` adds `T` to the include set, and
+//! `Without<T>` adds `T` to the exclude set. `Changed<T>` and `Added<T>`
+//! compare the ticks stored for each row against the baseline the calling
+//! system recorded on its last run. `Or` produces several pairs, and an
+//! archetype matches it when any one of them passes.
 
 // Current crate
 use crate::archetype::Archetype;
@@ -27,18 +29,19 @@ use super::ptr::SendPtr;
 // =============================================================================
 
 /// Trait for predicates that decide which entities a query yields beyond
-/// the basic component-set match implied by the [`QueryTarget`].
+/// the component-set match the [`QueryTarget`] already implies.
 ///
 /// A filter answers at two levels:
 ///
 /// 1. Archetype level: [`archetype_filter_pairs`] returns `(include, exclude)`
-///    component-id pairs, and an archetype matches when it satisfies any
-///    pair. The default builds one pair from [`included_component_ids`] /
-///    [`excluded_component_ids`]; [`Or`] overrides it to produce one pair per
-///    inner filter.
-/// 2. Row level: [`init_state`] caches per-archetype data (a pointer into the
-///    column's ticks) and [`matches`] is consulted for every candidate row.
-///    This drives [`Changed`] and [`Added`].
+///    component-id pairs, and an archetype passes when it satisfies any one
+///    pair (a filter that returns no pair at all restricts nothing). The
+///    default builds one pair from [`included_component_ids`] and
+///    [`excluded_component_ids`]; [`Or`] overrides it to return the pairs of
+///    every inner filter.
+/// 2. Row level: [`init_state`] builds one state per archetype (for the tick
+///    filters, a pointer to the column's ticks) and [`matches`] runs for every
+///    candidate row. This is how [`Changed`] and [`Added`] work.
 ///
 /// The trivial filter `()` matches every row.
 ///
@@ -53,65 +56,75 @@ pub trait QueryFilter {
     type State: Send + Sync;
 
     /// True when this filter accepts every row unconditionally (e.g. `()`).
-    /// Queries use this to skip filter evaluation in the inner loop.
-    /// Default: `false` - most filters do actual work.
+    /// Queries read it to skip filter evaluation in the inner loop and to
+    /// take their fast paths in `first`, `is_empty` and `entity_count`. It
+    /// stays `false` by default because most filters do real work.
     const ACCEPTS_ALL: bool = false;
 
     /// Components whose storage this filter inspects.
     ///
-    /// Two consumers read this list: the default `archetype_filter_pairs`
-    /// turns it into one must-contain / must-not-contain pair, and the
-    /// scheduler's access report unions it (which is what `Or` overrides for).
-    /// The query's archetype mask is built from `archetype_filter_pairs`, not
-    /// from this method.
+    /// Two consumers read this list. The default `archetype_filter_pairs`
+    /// turns it into the must-contain half of one pair, and a query's access
+    /// report declares every listed component as read, so the scheduler never
+    /// runs a writer of that component beside this system ([`Or`] overrides
+    /// this method to return the union of its branches). The query's
+    /// archetype mask is built from `archetype_filter_pairs`, not from this
+    /// method.
     fn included_component_ids() -> Vec<ComponentId> {
         Vec::new()
     }
 
-    /// Components that filtered archetypes must NOT contain.
-    /// Archetypes containing any of these are excluded outright.
+    /// Components that a matching archetype must not contain. An archetype
+    /// that holds any of them is excluded.
     fn excluded_component_ids() -> Vec<ComponentId> {
         Vec::new()
     }
 
-    /// Returns a list of `(include_ids, exclude_ids)` pairs for archetype
-    /// scoping. An archetype matches the filter if it matches any of
-    /// the pairs - i.e. OR semantics across pairs.
+    /// Returns `(include_ids, exclude_ids)` pairs that scope which archetypes
+    /// this filter accepts.
     ///
-    /// Each pair means: the archetype must contain ALL `include_ids` AND
-    /// NONE of the `exclude_ids`.
+    /// One pair means: the archetype must contain all of `include_ids` and
+    /// none of `exclude_ids`. An archetype passes the filter when it passes
+    /// any one of the pairs, so the pairs combine with OR.
     ///
-    /// The default implementation returns a single pair from
-    /// [`included_component_ids`] and [`excluded_component_ids`], and no pair
-    /// at all when both are empty (which the query reads as "no archetype
-    /// restriction"). [`Or`] overrides this to return one pair per inner
-    /// filter, giving correct logical-OR semantics at the archetype level.
+    /// The default implementation returns one pair built from
+    /// [`included_component_ids`] and [`excluded_component_ids`]. It returns
+    /// no pair at all when both lists are empty, which the query reads as "no
+    /// archetype restriction". [`Or`] overrides this method to return the
+    /// pairs of every inner filter, so a branch that accepts every archetype
+    /// makes the whole `Or` accept every archetype.
     ///
     /// [`included_component_ids`]: QueryFilter::included_component_ids
     /// [`excluded_component_ids`]: QueryFilter::excluded_component_ids
     /// [`Or`]: Or
     fn archetype_filter_pairs() -> Vec<(Vec<ComponentId>, Vec<ComponentId>)> {
         // Collect this filter's include and exclude component sets.
-        let included = Self::included_component_ids();
-        let excluded = Self::excluded_component_ids();
-        // A filter with no restrictions matches every archetype and so
-        // contributes no pairs; otherwise it contributes exactly one pair.
-        if included.is_empty() && excluded.is_empty() {
+        let included_component_ids = Self::included_component_ids();
+        let excluded_component_ids = Self::excluded_component_ids();
+        // A filter with no restrictions lets every archetype through, so it
+        // contributes no pair. Any other filter contributes exactly one.
+        if included_component_ids.is_empty() && excluded_component_ids.is_empty() {
             Vec::new()
         } else {
-            vec![(included, excluded)]
+            vec![(included_component_ids, excluded_component_ids)]
         }
     }
 
-    /// Initialize per-archetype state for row-level filtering.
+    /// Builds the state this filter needs to test the rows of one archetype.
     ///
-    /// Takes the archetype by shared reference because that is all a filter
-    /// needs: every implementation only reads a column's ticks. The shared
-    /// borrow is also what lets a tuple or [`Or`] initialize its members in a
-    /// single expression.
+    /// The archetype arrives as a shared reference because that is all a
+    /// filter needs: it only reads a column's ticks. The shared borrow also
+    /// lets a tuple or [`Or`] build the state of every member in one
+    /// expression.
+    ///
+    /// `last_run` and `this_run` bound the ticks a row must fall between to
+    /// count as changed or added.
     fn init_state(archetype: &Archetype, last_run: Tick, this_run: Tick) -> Self::State;
 
-    /// Decide whether the row at `index` in this archetype passes the filter.
+    /// Returns `true` when the row at `index` passes this filter.
+    ///
+    /// `state` is the state [`init_state`] built for the archetype the row
+    /// belongs to.
     fn matches(state: &Self::State, index: usize) -> bool;
 }
 
@@ -136,11 +149,11 @@ impl QueryFilter for () {
 // With
 // =============================================================================
 
-/// Archetype filter: only yield rows whose archetype contains `T`.
+/// Archetype filter that yields only the rows whose archetype contains `T`.
 ///
-/// Useful when the query does not need to access `T`'s data (so it does not
-/// appear in the [`QueryTarget`](super::QueryTarget)) but should still
-/// scope the iteration.
+/// Use it when the query does not need `T`'s data - so `T` does not appear in
+/// the [`QueryTarget`](super::QueryTarget) - but iteration should still be
+/// limited to the entities that have it.
 pub struct With<T: Component>(std::marker::PhantomData<T>);
 
 impl<T: Component> QueryFilter for With<T> {
@@ -157,11 +170,13 @@ impl<T: Component> QueryFilter for With<T> {
         true
     }
 }
+
 // =============================================================================
 // Without
 // =============================================================================
 
-/// Archetype filter: only yield rows whose archetype does NOT contain `T`.
+/// Archetype filter that yields only the rows whose archetype does not
+/// contain `T`.
 pub struct Without<T: Component>(std::marker::PhantomData<T>);
 
 impl<T: Component> QueryFilter for Without<T> {
@@ -183,73 +198,82 @@ impl<T: Component> QueryFilter for Without<T> {
 // TickFilterState
 // =============================================================================
 
-/// Per-row state shared by `Changed<T>` and `Added<T>`: a `Send` pointer to
-/// the filtered component's ticks plus the comparison window.
+/// Per-archetype state that `Changed<T>` and `Added<T>` use to test one row
+/// at a time: a thread-safe pointer to the filtered component's ticks plus
+/// the two ticks that bound the search.
 ///
-/// When the component is not present in the archetype (possible when
-/// `Changed<T>` appears inside an [`Or`] whose other branch matched),
-/// `ticks` is `None` and all rows are rejected.
+/// The component can be missing from the archetype when one of those filters
+/// sits inside an [`Or`] whose other branch matched. The state then holds no
+/// pointer, and every row is rejected.
 pub struct TickFilterState {
-    /// Raw pointer to the first of the column's ticks for the filtered
-    /// component; `None` when the component is absent from the archetype.
-    ticks: Option<SendPtr<ComponentTicks>>,
+    /// Raw pointer to the first tick of the filtered component's column;
+    /// `None` when the component is absent from the archetype.
+    ticks_pointer: Option<SendPtr<ComponentTicks>>,
     /// How many ticks that pointer addresses, for the debug bounds check.
     tick_count: usize,
-    /// Tick recorded when the owning system last ran.
+    /// Tick of the owning system's previous run.
     last_run: Tick,
-    /// Tick recorded for the current run of the owning system.
+    /// Tick of the owning system's current run.
     this_run: Tick,
 }
 
 impl TickFilterState {
     /// Builds state pointing at the ticks of a column that is present in the
     /// archetype being iterated.
-    fn new(ticks: &[ComponentTicks], last_run: Tick, this_run: Tick) -> Self {
+    fn new(column_ticks: &[ComponentTicks], last_run: Tick, this_run: Tick) -> Self {
         Self {
-            ticks: Some(SendPtr::new(ticks.as_ptr())),
-            tick_count: ticks.len(),
+            ticks_pointer: Some(SendPtr::new(column_ticks.as_ptr())),
+            tick_count: column_ticks.len(),
             last_run,
             this_run,
         }
     }
 
-    /// State for when the component is absent from the archetype -
-    /// [`matches`](TickFilterState::matches) always returns `false`.
+    /// State for an archetype that does not hold the component; every row is
+    /// then rejected.
     fn missing() -> Self {
         Self {
-            ticks: None,
+            ticks_pointer: None,
             tick_count: 0,
             last_run: Tick(0),
             this_run: Tick(0),
         }
     }
 
-    /// Returns `true` if the component exists in this archetype.
+    /// Returns `true` when the archetype this state was built for holds the
+    /// component.
     #[inline]
     fn is_present(&self) -> bool {
-        self.ticks.is_some()
+        self.ticks_pointer.is_some()
     }
 
     /// # Safety
-    /// Caller must ensure `is_present()` returned `true` before calling.
+    ///
+    /// The caller must have seen [`is_present`](Self::is_present) return
+    /// `true`.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when the component is missing, or when `index`
+    /// is past the last tick of the column.
     #[inline]
     unsafe fn ticks_at(&self, index: usize) -> &ComponentTicks {
         debug_assert!(self.is_present(), "ticks_at called on missing component");
-        // SAFETY: the caller's `# Safety` contract plus the `debug_assert!`
-        // above guarantee the `Option` is `Some`, so `unwrap_unchecked` cannot
-        // panic. The pointer was created in `new` from a `&[ComponentTicks]`
-        // owned by a column of the archetype, and the state lives for exactly
-        // one query iteration, during which the archetype is neither mutated
-        // nor deallocated. A column holds one tick per component row, so
-        // `index` - a row index into that archetype - is in bounds.
-        let ticks = unsafe { self.ticks.as_ref().unwrap_unchecked().as_ptr() };
+        // SAFETY: the caller's `# Safety` contract makes the `Option` `Some`
+        // before this runs. `new` built the pointer from a `&[ComponentTicks]`
+        // that belongs to a column of the archetype, and the query holds the
+        // world borrowed for as long as the state exists, so that tick slice
+        // is neither mutated nor freed. A column stores one tick per row of
+        // its archetype, so `index`, a row index there, is in bounds.
+        let ticks = unsafe { self.ticks_pointer.as_ref().unwrap_unchecked().as_ptr() };
         debug_assert!(
             index < self.tick_count,
             "row {index} is out of bounds for {} component ticks",
             self.tick_count
         );
-        // SAFETY: `index` is a row index into the archetype this state was
-        // built from, and a column has exactly one tick per row.
+        // SAFETY: `index` is a row index in the archetype this state was
+        // built from, and the column holds exactly one tick per row, so the
+        // address is a live `ComponentTicks`.
         unsafe { &*ticks.add(index) }
     }
 }
@@ -258,10 +282,10 @@ impl TickFilterState {
 // Changed
 // =============================================================================
 
-/// Row filter: yields only entities whose `T` was mutated (or added) since
-/// the system that owns this query last ran.
+/// Row filter that yields only the entities whose `T` changed (or was added)
+/// since the system that owns this query last ran.
 ///
-/// Implemented in terms of [`ComponentTicks::is_changed`].
+/// It is built on [`ComponentTicks::is_changed`].
 pub struct Changed<T: Component>(std::marker::PhantomData<T>);
 
 impl<T: Component> QueryFilter for Changed<T> {
@@ -274,16 +298,17 @@ impl<T: Component> QueryFilter for Changed<T> {
     fn init_state(archetype: &Archetype, last_run: Tick, this_run: Tick) -> Self::State {
         match archetype.component_storages.get(ComponentId::of::<T>()) {
             Some(column) => TickFilterState::new(column.ticks(), last_run, this_run),
-            // Component not in this archetype - possible when Changed<T>
-            // appears inside an Or whose other branch matched the archetype.
+            // The component is not in this archetype. That happens when
+            // `Changed<T>` sits inside an `Or` whose other branch matched the
+            // archetype.
             None => TickFilterState::missing(),
         }
     }
 
     #[inline]
     fn matches(state: &Self::State, index: usize) -> bool {
-        // A row can never match when the component is absent from the
-        // archetype (possible inside an `Or` whose other branch matched).
+        // When the archetype lacks the component, no row can match. This
+        // happens inside an `Or` whose other branch matched the archetype.
         if !state.is_present() {
             return false;
         }
@@ -302,8 +327,8 @@ impl<T: Component> QueryFilter for Changed<T> {
 // Added
 // =============================================================================
 
-/// Row filter: yields only entities whose `T` was added since the system
-/// that owns this query last ran.
+/// Row filter that yields only the entities whose `T` was added since the
+/// system that owns this query last ran.
 pub struct Added<T: Component>(std::marker::PhantomData<T>);
 
 impl<T: Component> QueryFilter for Added<T> {
@@ -322,8 +347,8 @@ impl<T: Component> QueryFilter for Added<T> {
 
     #[inline]
     fn matches(state: &Self::State, index: usize) -> bool {
-        // A row can never match when the component is absent from the
-        // archetype (possible inside an `Or` whose other branch matched).
+        // An archetype that does not hold the component yields no row at all.
+        // This happens inside an `Or` whose other branch matched.
         if !state.is_present() {
             return false;
         }
@@ -348,23 +373,26 @@ macro_rules! impl_query_filter_tuple {
             type State = ($($T::State,)*);
 
             fn included_component_ids() -> Vec<ComponentId> {
-                let mut ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
-                $(ids.extend($T::included_component_ids());)*
-                ids
+                let mut component_ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
+                $(component_ids.extend($T::included_component_ids());)*
+                component_ids
             }
 
             fn excluded_component_ids() -> Vec<ComponentId> {
-                let mut ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
-                $(ids.extend($T::excluded_component_ids());)*
-                ids
+                let mut component_ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
+                $(component_ids.extend($T::excluded_component_ids());)*
+                component_ids
             }
 
-            /// AND semantics: the cross-product of inner filter pairs.
-            /// For `(Or<(With<A>, With<B>)>, Without<C>)` this yields
-            /// `[({A},{C}), ({B},{C})]` - (has A AND lacks C) OR (has B AND lacks C).
+            /// Combines the inner filters with AND: the result holds every
+            /// combination of one pair taken from each inner filter.
+            ///
+            /// For `(Or<(With<A>, With<B>)>, Without<C>)` this gives
+            /// `[({A},{C}), ({B},{C})]`, that is (has A and lacks C) or
+            /// (has B and lacks C).
             fn archetype_filter_pairs() -> Vec<(Vec<ComponentId>, Vec<ComponentId>)> {
-                let all_pairs = [$($T::archetype_filter_pairs()),*];
-                and_filter_pairs(&all_pairs)
+                let pairs_per_filter = [$($T::archetype_filter_pairs()),*];
+                and_filter_pairs(&pairs_per_filter)
             }
 
             #[allow(non_snake_case)]
@@ -391,12 +419,12 @@ impl_query_filter_tuple!(A, B, C, D);
 // Or
 // =============================================================================
 
-/// Disjunction over a tuple of filters: a row matches if at least one
+/// A logical OR over a tuple of filters: a row matches when at least one
 /// inner filter matches it.
 ///
-/// `Or` implements logical OR at both levels - across archetype pairs (via
-/// [`archetype_filter_pairs`]) and across rows (via [`matches`]) - so an
-/// archetype or row matching any branch is included.
+/// `Or` applies that OR at both levels. An archetype is kept when it matches
+/// the pairs of any branch (see [`archetype_filter_pairs`]), and a row is
+/// yielded when any branch accepts it (see [`matches`]).
 ///
 /// [`archetype_filter_pairs`]: QueryFilter::archetype_filter_pairs
 /// [`matches`]: QueryFilter::matches
@@ -407,40 +435,41 @@ macro_rules! impl_query_filter_or {
         impl<$($T: QueryFilter),*> QueryFilter for Or<($($T,)*)> {
             type State = ($($T::State,)*);
 
-            // The union is the scheduler's access report: every branch's
-            // storage is read while `matches` runs. Archetype scoping does not
-            // use it - `archetype_filter_pairs` accepts an archetype that
-            // matches any one branch.
+            // This union feeds the query's access report: `matches` may read
+            // the storage of any branch, so the scheduler has to treat all of
+            // them as read. Archetype scoping ignores the list -
+            // `archetype_filter_pairs` keeps an archetype that matches any one
+            // branch.
             fn included_component_ids() -> Vec<ComponentId> {
-                let mut ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
-                $(ids.extend($T::included_component_ids());)*
-                ids
+                let mut component_ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
+                $(component_ids.extend($T::included_component_ids());)*
+                component_ids
             }
 
             fn excluded_component_ids() -> Vec<ComponentId> {
-                let mut ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
-                $(ids.extend($T::excluded_component_ids());)*
-                ids
+                let mut component_ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
+                $(component_ids.extend($T::excluded_component_ids());)*
+                component_ids
             }
 
-            /// Returns the union of all inner filter pairs: an archetype
-            /// matches the `Or` if it matches ANY inner filter.
+            /// Returns the pairs of every inner filter: an archetype matches
+            /// the `Or` when it matches any branch.
             ///
-            /// If any inner filter returns zero pairs (meaning "no archetype
-            /// restrictions - matches everything"), the whole `Or` also
-            /// returns zero pairs. OR with "always true" is "always true".
+            /// A filter that returns no pairs accepts every archetype. If any
+            /// branch is like that, the `Or` returns no pairs either, so it
+            /// accepts every archetype too.
             fn archetype_filter_pairs() -> Vec<(Vec<ComponentId>, Vec<ComponentId>)> {
-                let mut pairs = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_FILTER_PAIRS_CAPACITY);
+                let mut filter_pairs = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_FILTER_PAIRS_CAPACITY);
                 $(
-                    let inner = $T::archetype_filter_pairs();
-                    if inner.is_empty() {
-                        // One branch has no restrictions - the whole Or
-                        // matches every archetype.
+                    let inner_filter_pairs = $T::archetype_filter_pairs();
+                    if inner_filter_pairs.is_empty() {
+                        // This branch restricts nothing, so the whole `Or`
+                        // restricts nothing either.
                         return Vec::new();
                     }
-                    pairs.extend(inner);
+                    filter_pairs.extend(inner_filter_pairs);
                 )*
-                pairs
+                filter_pairs
             }
 
             #[allow(non_snake_case)]
@@ -466,40 +495,40 @@ impl_query_filter_or!(A, B, C, D);
 // Free Functions
 // =============================================================================
 
-/// Compute the cross-product of filter pairs for AND semantics.
+/// Combines the filter pairs of several filters with AND.
 ///
-/// Given a list of filter-pair lists (one per conjunct), returns all
-/// combinations where each conjunct contributes one of its pairs.
-/// For `(FilterA, FilterB)` this is the Cartesian product of A's pairs
-/// and B's pairs, with includes/excludes merged within each combination.
+/// Each inner slice holds the pairs of one filter. The result holds every
+/// combination of one pair per filter, with the include and exclude lists
+/// merged. For two filters that is the Cartesian product of their pairs.
 ///
-/// If any conjunct has zero pairs (meaning "no archetype restrictions"),
-/// it is skipped (does not restrict the result).
+/// A filter with no pairs restricts nothing, so it is skipped and adds no
+/// combination of its own.
 fn and_filter_pairs(
-    all_pairs: &[Vec<(Vec<ComponentId>, Vec<ComponentId>)>],
+    pairs_per_filter: &[Vec<(Vec<ComponentId>, Vec<ComponentId>)>],
 ) -> Vec<(Vec<ComponentId>, Vec<ComponentId>)> {
-    // Step 1: seed the accumulator with a single unrestricted pair so the
-    // fold below starts from a neutral value.
-    let mut accumulator: Vec<(Vec<ComponentId>, Vec<ComponentId>)> = vec![(Vec::new(), Vec::new())];
+    // Step 1: start from one pair that restricts nothing, so the loop below
+    // has a neutral starting value.
+    let mut cross_product_pairs: Vec<(Vec<ComponentId>, Vec<ComponentId>)> =
+        vec![(Vec::new(), Vec::new())];
 
-    // Step 2: fold every conjunct's pairs into the accumulator, merging the
-    // include and exclude sets of each combination.
-    for inner_pairs in all_pairs {
-        if inner_pairs.is_empty() {
-            // No archetype restrictions from this conjunct - skip.
+    // Step 2: for each filter, pair every combination built so far with each
+    // of its pairs, merging the include and exclude lists.
+    for filter_pairs in pairs_per_filter {
+        if filter_pairs.is_empty() {
+            // This filter restricts nothing, so it adds no combination.
             continue;
         }
-        let mut next = Vec::with_capacity(accumulator.len() * inner_pairs.len());
-        for (included, excluded) in &accumulator {
-            for (inner_included, inner_excluded) in inner_pairs {
-                let mut merged_included = included.clone();
-                let mut merged_excluded = excluded.clone();
-                merged_included.extend_from_slice(inner_included);
-                merged_excluded.extend_from_slice(inner_excluded);
-                next.push((merged_included, merged_excluded));
+        let mut merged_pairs = Vec::with_capacity(cross_product_pairs.len() * filter_pairs.len());
+        for (included_component_ids, excluded_component_ids) in &cross_product_pairs {
+            for (filter_included_component_ids, filter_excluded_component_ids) in filter_pairs {
+                let mut merged_included_component_ids = included_component_ids.clone();
+                let mut merged_excluded_component_ids = excluded_component_ids.clone();
+                merged_included_component_ids.extend_from_slice(filter_included_component_ids);
+                merged_excluded_component_ids.extend_from_slice(filter_excluded_component_ids);
+                merged_pairs.push((merged_included_component_ids, merged_excluded_component_ids));
             }
         }
-        accumulator = next;
+        cross_product_pairs = merged_pairs;
     }
-    accumulator
+    cross_product_pairs
 }

@@ -6,35 +6,39 @@
 //!   each through [`run_scripted`](EditorWindow::run_scripted).
 //! - Answer a command with a log line a suite can wait for, or refuse it
 //!   through the one rejection token a suite treats as failure.
-//! - Inject the input a suite cannot produce otherwise: keys, clicks, drags
-//!   and the snapshots the dumps read.
+//! - Inject the input a suite cannot produce otherwise: keys, clicks and
+//!   drags.
 //!
 //! # Design
 //!
-//! Development only. The grammar itself is `pill_editor_core::scripted`, which
-//! the browser editor shares; this module is the native executable's dispatch
-//! and its dumps. Every verb here exists to observe something a real press
-//! could not reach.
+//! Development only. The verb grammar is `pill_editor_core::scripted`, which
+//! the browser editor shares too. This module adds the native executable's
+//! dispatch and its dumps: every verb runs the code a real press runs, and
+//! every dump shows state that no press can reach.
 //!
-//! Refusals come in two kinds. A line whose own target is wrong - a handle no
-//! entity answers to, a field that is not editable, a value the field's kind
-//! cannot read, a drag asked to start while another is in flight - is refused
-//! through the one rejection token, so a suite's typo fails the way a
-//! malformed verb does instead of waiting out a timeout. A line that is right
-//! but has arrived before the shell module attached keeps its own warning:
-//! the same line works a moment later, so it was never a refused line.
+//! A line is refused when its own target is wrong: a handle no entity answers
+//! to, a field that is not editable, a value the field's kind cannot read, or
+//! a drag asked to start while another is still running. Every refusal prints
+//! the one rejection token, so a suite's typo fails like a malformed verb
+//! instead of waiting out a timeout. A correct line that arrives before the
+//! shell module attaches is not refused: it warns or does nothing, and the
+//! same line works a moment later.
 
 // Current crate
 use super::*;
 
+// =============================================================================
+// Scripted Refusals
+// =============================================================================
+
 /// Refuses one scripted line, naming it and why it cannot run.
 ///
-/// Every refusal - an unknown verb, an unknown target, a missing or malformed
-/// argument, a handle that resolves to nothing - prints this one token, so a
-/// suite can tell a rejected line from a slow answer without pinning twenty
-/// messages, and `EditorSession` raises on it the moment it lands instead of
+/// Every refusal prints the same token: an unknown verb, an unknown target, a
+/// missing or malformed argument, or a handle that resolves to nothing. A
+/// suite can then tell a rejected line from a slow answer without matching
+/// every message, and `EditorSession` raises on the token at once instead of
 /// timing out.
-fn reject_scripted(command: &str, reason: &str) {
+fn reject_scripted_command(command: &str, reason: &str) {
     warn!(
         target: telemetry_target::ENGINE,
         command,
@@ -43,23 +47,28 @@ fn reject_scripted(command: &str, reason: &str) {
     );
 }
 
-/// Refuses a fallible scripted step's failure on the one rejection token.
+/// Refuses a failed scripted step through [`reject_scripted_command`].
 ///
-/// The handlers that answer `Result<(), String>` fail for reasons about the
-/// line itself - a handle that resolves to nothing, a field that is not
-/// editable, a value the field's kind cannot read. Both this and
-/// [`reject_scripted`] take no window, because a refusal is about the line: an
-/// arm can hand the handler's own result straight here without borrowing the
-/// window a second time.
-fn refuse_on(line: &str, outcome: Result<(), String>) {
+/// A handler that answers `Result<(), String>` fails for a reason about the
+/// line itself: a handle that resolves to nothing, a field that is not
+/// editable, or a value the field's kind cannot read. Neither this function
+/// nor [`reject_scripted_command`] takes the window, so an arm of
+/// [`EditorWindow::run_scripted`] can pass a handler's result here without
+/// borrowing the window a second time.
+fn reject_on_failure(line: &str, outcome: Result<(), String>) {
     if let Err(reason) = outcome {
-        reject_scripted(line, &reason);
+        reject_scripted_command(line, &reason);
     }
 }
 
+// =============================================================================
+// EditorWindow
+// =============================================================================
+
 impl EditorWindow {
-    /// Advance a scripted drag one frame: the press first, then the move,
-    /// then the release. The completion token marks the pointer free.
+    /// Advances a scripted drag by one frame: first the press, then the move,
+    /// then the release. The line it logs on the release tells a suite that
+    /// the drag is over and the pointer is free again.
     pub(super) fn advance_scripted_drag(&mut self) {
         let Some(drag) = self.scripted_drag.as_ref() else {
             return;
@@ -104,8 +113,8 @@ impl EditorWindow {
         }
     }
 
-    /// Log the asset browser's rows: the count first, then one line per
-    /// row with its kind and flags - the suite's window into the listing.
+    /// Logs the asset browser's rows: the count first, then one line per row
+    /// with its kind and flags. A suite reads the listing from these lines.
     pub(super) fn dump_assets(&mut self) {
         info!(
             target: telemetry_target::ENGINE,
@@ -113,8 +122,8 @@ impl EditorWindow {
             "[test] assets"
         );
         for row in &self.asset_entries {
-            // The root and the flag go last: the suites' patterns read the
-            // other fields first, in this order.
+            // The suites' patterns read the other fields first, in this order,
+            // so the root and the read-only flag come last.
             info!(
                 target: telemetry_target::ENGINE,
                 path = row.key().as_str(),
@@ -128,8 +137,8 @@ impl EditorWindow {
         }
     }
 
-    /// Log the Assets tab's open folder and the rows its grid lists there -
-    /// the suite's window into the tree and grid navigation, which needs no
+    /// Logs the Assets tab's open folder and the rows its grid lists there.
+    /// A suite can check tree and grid navigation from these lines, with no
     /// pixel clicks.
     pub(super) fn dump_browser(&mut self) {
         let folder = {
@@ -139,14 +148,14 @@ impl EditorWindow {
                 None => String::new(),
             }
         };
-        let entries = pill_editor_core::browser::children(&self.asset_entries, &folder);
+        let browser_rows = pill_editor_core::browser::children(&self.asset_entries, &folder);
         info!(
             target: telemetry_target::ENGINE,
             folder = folder.as_str(),
-            count = entries.len(),
+            count = browser_rows.len(),
             "[test] browser"
         );
-        for row in entries {
+        for row in browser_rows {
             info!(
                 target: telemetry_target::ENGINE,
                 path = row.path.as_str(),
@@ -156,11 +165,11 @@ impl EditorWindow {
         }
     }
 
-    /// Log the redraw counters, for the suites.
+    /// Logs the redraw counters, for the suites.
     ///
-    /// Two dumps separated by an idle stretch tell the posture apart: with the
-    /// loop waiting, the frame count grows by the idle poll's pace, not by the
-    /// display's.
+    /// Two dumps separated by an idle stretch show which redraw mode the loop
+    /// is in. When the loop waits instead of presenting every frame, the frame
+    /// count grows at the idle poll's pace, not at the display's.
     pub(super) fn dump_cadence(&mut self) {
         let paused = self.host.host().engine().systems_paused();
         info!(
@@ -180,22 +189,23 @@ impl EditorWindow {
         );
     }
 
-    /// Log the Console tab's filters and the rows they leave, for the suites.
+    /// Logs the Console tab's filters, the counts they leave and the first
+    /// visible row, for the suites.
     pub(super) fn dump_console(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
-        let Some(state) = world.get_resource::<ConsoleState>() else {
+        let Some(console_state) = world.get_resource::<ConsoleState>() else {
             return;
         };
-        let view = state.view();
-        // The per-channel counts are what proves a project's own line reached
-        // the history: the game channel only fills when something outside the
+        let view = console_state.view();
+        // The per-channel counts prove that a project's own line reached the
+        // history. The game channel only fills when something outside the
         // engine logs.
-        let engine = state
+        let engine = console_state
             .lines
             .iter()
             .filter(|line| line.channel == ConsoleChannel::Engine)
             .count();
-        let game = state.lines.len() - engine;
+        let game = console_state.lines.len() - engine;
         let first = view
             .lines
             .first()
@@ -215,11 +225,11 @@ impl EditorWindow {
         );
     }
 
-    /// Log the store's own assets - the ones no file backs, which every picker
-    /// offers beside the listing's rows: the suite's window into what a picker
-    /// can reach beyond the project's `res`.
+    /// Logs the store's own assets: the ones no file backs. Every picker
+    /// offers them beside the listing's rows, so a suite can check what a
+    /// picker reaches beyond the project's `res`.
     pub(super) fn dump_engine_assets(&mut self) {
-        let rows = {
+        let engine_assets = {
             let world = self.host.host_mut().engine_mut().world_mut();
             world
                 .get_resource::<EditorSnapshot>()
@@ -228,10 +238,10 @@ impl EditorWindow {
         };
         info!(
             target: telemetry_target::ENGINE,
-            count = rows.len(),
+            count = engine_assets.len(),
             "[test] engine assets"
         );
-        for row in &rows {
+        for row in &engine_assets {
             info!(
                 target: telemetry_target::ENGINE,
                 kind = row.kind.as_str(),
@@ -242,7 +252,7 @@ impl EditorWindow {
         }
     }
 
-    /// Log the entity list and each row's component names, for the suites: a
+    /// Logs the entity list and each row's component names, for the suites. A
     /// collection test finds its subject this way.
     pub(super) fn dump_entities(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
@@ -265,14 +275,15 @@ impl EditorWindow {
         }
     }
 
-    /// Log one component field's value: the suite's window into the world
-    /// (the scripted `dump field <entity> <component> <field>`); the
-    /// component name may be abbreviated to its `::Name` suffix.
+    /// Logs one component field's value, for the scripted
+    /// `dump field <entity> <component> <field>`. The entity is a display
+    /// handle, and the component name may be abbreviated to its `::Name`
+    /// suffix.
     pub(super) fn dump_field(&mut self, entity_text: &str, component: &str, field: &str) {
         let world = self.host.host_mut().engine_mut().world_mut();
-        let resolved = resolve_display_entity(world, entity_text)
+        let resolved_target = resolve_display_entity(world, entity_text)
             .and_then(|entity| resolve_component_name(world, component).map(|name| (entity, name)));
-        let Some((entity, component)) = resolved else {
+        let Some((entity, component)) = resolved_target else {
             warn!(
                 target: telemetry_target::ENGINE,
                 entity = entity_text,
@@ -298,16 +309,17 @@ impl EditorWindow {
         }
     }
 
-    /// Log the scene grid's state: the switch, the spacing and
-    /// the surfaces the renderer draws it on - the same resolution the
+    /// Logs the scene grid's state: whether it is on, its cell size, and the
+    /// surfaces the renderer draws it on. This is the same resolution the
     /// renderer makes from the same bindings.
     pub(super) fn dump_grid(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
         let cameras = world.get_resource::<SurfaceCameras>();
         let grid = cameras.map(|cameras| cameras.grid).unwrap_or_default();
-        // The surfaces the renderer draws it on are the frame's editor views -
-        // the view-bound set - and it draws them only while the switch is on.
-        let surfaces = match cameras {
+        // The renderer draws the grid on the frame's view-bound editor views,
+        // and only while the switch is on. With the switch off, the log line
+        // carries no surfaces.
+        let surface_ids_text = match cameras {
             Some(cameras) if grid.enabled => editor_view_surfaces(cameras)
                 .iter()
                 .map(|surface| surface.0.to_string())
@@ -319,18 +331,18 @@ impl EditorWindow {
             target: telemetry_target::ENGINE,
             enabled = grid.enabled,
             cell = grid.cell_size,
-            surfaces = %surfaces,
+            surfaces = %surface_ids_text,
             "[test] scene grid"
         );
     }
 
-    /// Log the module panels, for the suites.
+    /// Logs the module panels, for the suites.
     pub(super) fn dump_panels(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(registry) = world.get_resource::<PanelRegistry>() else {
             return;
         };
-        let budget = world
+        let panel_budget = world
             .get_resource::<EguiShellState>()
             .map(|state| state.panel_budget.clone())
             .unwrap_or_default();
@@ -345,7 +357,7 @@ impl EditorWindow {
             "[test] panels"
         );
         for (slot, entry) in registry.entries().iter().enumerate() {
-            let timing = budget.get(slot as u16);
+            let timing = panel_budget.get(slot as u16);
             info!(
                 target: telemetry_target::ENGINE,
                 slot,
@@ -355,17 +367,17 @@ impl EditorWindow {
                 epoch = entry.epoch,
                 micros = timing.map(|timing| timing.micros).unwrap_or(0.0),
                 passes = timing.map(|timing| timing.passes).unwrap_or(0),
-                slow = budget.is_slow(slot as u16),
+                slow = panel_budget.is_slow(slot as u16),
                 title = registry.tab_title(slot as u16).as_str(),
                 "[test] panel"
             );
         }
     }
 
-    /// Log the preferences file's rows as the Preferences tab's view holds
-    /// them, then the project key and its remembered entry - the tab's
-    /// exact data, so a suite can assert a save or a tool choice without
-    /// reading the tab's pixels.
+    /// Logs the preferences file's rows as the Preferences tab's view holds
+    /// them, then the project key and whether the file remembers it. This is
+    /// the tab's exact data, so a suite can check a save or a tool choice
+    /// without reading the tab's pixels.
     pub(super) fn dump_preferences(&mut self) {
         let view = PreferencesView::from_document(
             &self.preferences_document,
@@ -394,7 +406,7 @@ impl EditorWindow {
         );
     }
 
-    /// Log the Problems rows, for the suites.
+    /// Log the Problems count and the first ten rows, for the suites.
     pub(super) fn dump_problems(&mut self) {
         info!(
             target: telemetry_target::ENGINE,
@@ -414,7 +426,7 @@ impl EditorWindow {
         }
     }
 
-    /// Log the editable resources and their values, for the suites.
+    /// Logs the editable resources and their values, for the suites.
     pub(super) fn dump_resources(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
         let resources = world
@@ -447,9 +459,9 @@ impl EditorWindow {
         }
     }
 
-    /// Log every scene view's placed rectangle, in the main window's
-    /// physical pixels, for the suite's scripted clicks, and the game
-    /// window's own rectangle when it exists.
+    /// Logs the placed rectangle of every scene view, in the main window's
+    /// physical pixels, for the suite's scripted clicks. The game view's
+    /// rectangle follows when the game window exists.
     pub(super) fn dump_scenes(&mut self) {
         for view in 0..self.views.len() {
             let Some(scene) = &self.views[view] else {
@@ -482,7 +494,8 @@ impl EditorWindow {
         }
     }
 
-    /// Log the selected entities, primary last (`dump selection`).
+    /// Logs the selected entities, primary last, and the selected asset
+    /// (`dump selection`).
     pub(super) fn dump_selection(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
         let (entities, asset) = world
@@ -509,27 +522,27 @@ impl EditorWindow {
         }
     }
 
-    /// Log the live standalone types the create dialog offers; the suite
-    /// reads the first one to drive a create.
+    /// Logs the live standalone types the create dialog offers. A suite reads
+    /// the first one to drive a create.
     pub(super) fn dump_standalone_types(&mut self) {
-        for info_type in &self.standalone_types {
+        for standalone_type in &self.standalone_types {
             info!(
                 target: telemetry_target::ENGINE,
-                type_name = info_type.type_name.as_str(),
-                display = info_type.display_name.as_str(),
-                extension = info_type.extension.as_str(),
+                type_name = standalone_type.type_name.as_str(),
+                display = standalone_type.display_name.as_str(),
+                extension = standalone_type.extension.as_str(),
                 "[test] standalone type"
             );
         }
     }
 
-    /// Log the Statistics tab's numbers, for the suites.
+    /// Logs the Statistics tab's numbers, for the suites.
     pub(super) fn dump_stats(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
-        let Some(state) = world.get_resource::<EguiShellState>() else {
+        let Some(shell_state) = world.get_resource::<EguiShellState>() else {
             return;
         };
-        let stats = &state.stats;
+        let stats = &shell_state.stats;
         info!(
             target: telemetry_target::ENGINE,
             fps = stats.frames_per_second,
@@ -549,9 +562,10 @@ impl EditorWindow {
         }
     }
 
-    /// Log every registered system with the state the Systems tab draws,
-    /// then the engine's pause flag - the tab's exact data, so a suite can
-    /// assert a toggle or a pause without reading the tab's pixels.
+    /// Logs every registered system with the state the Systems tab draws, and
+    /// puts the engine's pause flag on the count line. This is the tab's exact
+    /// data, so a suite can check a toggle or a pause without reading the
+    /// tab's pixels.
     pub(super) fn dump_systems(&mut self) {
         let (systems, paused) = {
             let world = self.host.host_mut().engine_mut().world_mut();
@@ -580,25 +594,27 @@ impl EditorWindow {
         }
     }
 
-    /// Log the dock's surfaces and tabs, for the suite's assertions.
+    /// Logs the dock's layout for the suite's assertions: the surface count,
+    /// one line per leaf and one line per popped-out tab.
     pub(super) fn dump_tabs(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
-        let Some(state) = world.get_resource::<EguiShellState>() else {
+        let Some(shell_state) = world.get_resource::<EguiShellState>() else {
             warn!(
                 target: telemetry_target::ENGINE,
                 "[editor] dump needs the shell module's state"
             );
             return;
         };
-        let surfaces = state.dock.state().surfaces_count();
+        let surfaces = shell_state.dock.state().surfaces_count();
         info!(
             target: telemetry_target::ENGINE,
             surfaces,
             "[editor] egui dock dump"
         );
         // One line per leaf, so a suite can tell a restored layout from the
-        // default: which tabs a group holds and which of them is in front.
-        let leaves: Vec<(usize, usize, String, String)> = state
+        // default. A leaf line names the tabs its group holds and which one is
+        // in front.
+        let leaves: Vec<(usize, usize, String, String)> = shell_state
             .dock
             .state()
             .iter_all_nodes()
@@ -629,9 +645,14 @@ impl EditorWindow {
                 "[editor] egui dock leaf"
             );
         }
-        // Popped-out tabs are not in the tree, so they get their own lines:
-        // a suite reads which tabs left the dock and which came back.
-        let popouts: Vec<String> = state.dock.popouts().iter().map(|tab| tab.name()).collect();
+        // Popped-out tabs are not in the tree, so they get their own lines.
+        // A suite reads which tabs left the dock and which came back.
+        let popouts: Vec<String> = shell_state
+            .dock
+            .popouts()
+            .iter()
+            .map(|tab| tab.name())
+            .collect();
         for tab in popouts {
             info!(
                 target: telemetry_target::ENGINE,
@@ -640,27 +661,29 @@ impl EditorWindow {
             );
         }
     }
-    /// Log the theme the editor paints with, the layers it was merged from and
-    /// the generation that produced it (`dump theme`).
+
+    /// Logs the theme the editor paints with: the layers it was merged from,
+    /// the generation that produced it, and the accent, panel and corner
+    /// values it resolved (`dump theme`).
     ///
-    /// This is the executable's own resolution - what the shell installs - so
-    /// a suite can assert a layer change without reading the tab's pixels.
+    /// These are the values the executable hands the shell, so a suite can
+    /// check a layer change without reading the tab's pixels.
     pub(super) fn dump_theme(&mut self) {
-        let user = self
+        let user_layer_path = self
             .theme_layers
             .iter()
-            .find(|info| info.layer == ThemeLayer::User)
+            .find(|layer_info| layer_info.layer == ThemeLayer::User)
             .map_or("none", ThemeLayerInfo::path_text);
-        let project = self
+        let project_layer_path = self
             .theme_layers
             .iter()
-            .find(|info| info.layer == ThemeLayer::Project)
+            .find(|layer_info| layer_info.layer == ThemeLayer::Project)
             .map_or("none", ThemeLayerInfo::path_text);
         info!(
             target: telemetry_target::ENGINE,
             layers = %layers_text(&self.theme_layers),
-            user = %user,
-            project = %project,
+            user = %user_layer_path,
+            project = %project_layer_path,
             generation = self.theme_generation,
             accent = %self.theme.palette.accent.hex(),
             panel = %self.theme.palette.panel.hex(),
@@ -669,16 +692,16 @@ impl EditorWindow {
         );
     }
 
-    /// Log the active viewport, the interaction state, the hovered handle
-    /// and every view's camera: the suite's window into navigation and the
-    /// viewport routing, with no pixel clicks.
+    /// Logs the active viewport, the interaction state, the hovered handle and
+    /// every view's camera. These are the inputs to navigation and viewport
+    /// routing, and a suite can read them with no pixel clicks.
     pub(super) fn dump_viewport(&mut self) {
-        let hovered = self
+        let hovered_handle_text = self
             .hovered_handle
             .map(|handle| handle.to_string())
             .unwrap_or_else(|| "-".to_string());
-        // The shell's own frame counter, so a suite that waits for "a frame
-        // ran since N" asks for one dump instead of waiting for the rows
+        // The shell's own frame counter. A suite that waits for "a frame ran
+        // since N" asks for one dump instead of waiting for the rows
         // heartbeat, which prints once every 210 frames.
         let frame = self
             .host
@@ -691,7 +714,7 @@ impl EditorWindow {
             target: telemetry_target::ENGINE,
             active = self.active_view,
             interaction = self.interaction_name(),
-            hovered = hovered.as_str(),
+            hovered = hovered_handle_text.as_str(),
             keymap = %self.keymap,
             frame,
             "[test] viewport"
@@ -713,7 +736,7 @@ impl EditorWindow {
         }
     }
 
-    /// Log the panel windows on screen, for the suites.
+    /// Logs the panel windows on screen, for the suites.
     pub(super) fn dump_windows(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
         let windows = world
@@ -737,13 +760,16 @@ impl EditorWindow {
         }
     }
 
-    /// Inject a full left click at a point of the window's client area, in
-    /// its physical pixels, through the same engine input seam a real click
-    /// enters: the shell's egui pass hit-tests and routes it, so an overlay
-    /// widget takes it while a point with no widget still reaches the
-    /// scene. Press and release arrive in one input frame, which the engine
-    /// reports as both edges; the egui bridge forwards them in order.
+    /// Injects a full left click at a point of the window's client area, in
+    /// its physical pixels.
+    ///
+    /// The click enters through the same input path as a real one: the shell's
+    /// egui pass hit-tests it and routes it, so an overlay widget takes it,
+    /// while a point with no widget reaches the scene. Press and release
+    /// arrive in one input frame, which the engine reports as both edges, and
+    /// the egui bridge forwards them in order.
     pub(super) fn inject_click(&mut self, x: f32, y: f32) {
+        // Step 1: Queue the press and the release, as one input frame.
         let position = pill_core::math::Vector2f::new(x, y);
         self.queue_input(InputEvent::CursorMoved { position });
         self.queue_input(InputEvent::MouseButton {
@@ -760,16 +786,17 @@ impl EditorWindow {
             y,
             "[editor] click injected"
         );
-        // A click inside a visible scene viewport activates it and asks what
-        // is under it, through the same press the window events route: the
-        // pick's answer moves the shared selection, and the outline follows.
-        // A point over the overlay's chips is the UI's, not the scene's.
+        // Step 2: A click inside a visible scene viewport activates that view
+        // and asks what is under the point, through the same press a window
+        // event sends. The pick's answer moves the shared selection, and the
+        // outline follows it. A point over an overlay region - a chip, the
+        // floating toolbox or an open menu - belongs to the UI, not the scene.
         if let Some(view) = self.scene_view_at(x, y) {
-            let scale = self.scale_factor;
+            let scale_factor = self.scale_factor;
             let over_ui = self
                 .overlay_regions
                 .iter()
-                .any(|region| region.contains(x / scale, y / scale));
+                .any(|region| region.contains(x / scale_factor, y / scale_factor));
             if !over_ui {
                 let (origin_x, origin_y) = self.view_origin(view);
                 info!(
@@ -779,8 +806,8 @@ impl EditorWindow {
                     y,
                     "[editor] scene view click"
                 );
-                // A scripted click is a press and a release in one command:
-                // the pick answers later with the button already up, so a
+                // A scripted click is a press and a release in one command.
+                // The pick answers later, with the button already up, so a
                 // handle under the point does not start a drag.
                 self.activate_view(view);
                 self.press_scene(view, x - origin_x, y - origin_y);
@@ -789,22 +816,25 @@ impl EditorWindow {
         }
     }
 
-    /// Inject a keyboard chord through the same engine input seam a real key
-    /// enters: the modifiers, the press, the typed text and the release, in
-    /// the order a window reports them.
+    /// Injects a keyboard chord through the same input path a real key enters:
+    /// the modifiers, the press, the typed text and the release, in the order
+    /// a window reports them.
     ///
-    /// The editor's own tool shortcuts read winit events rather than the
-    /// engine's input stream, so the chord also runs the handler a real press
-    /// runs - without that, `key w` would reach the shell but never switch
-    /// the tool.
+    /// The editor's own tool shortcuts read winit events, not the engine's
+    /// input stream, so the chord also runs the handler a real press runs.
+    /// Without that, `key w` would reach the shell but never switch the tool.
     pub(super) fn inject_key(&mut self, chord: &KeyChord) {
-        let held = EngineModifiers {
+        // Step 1: Queue the modifiers, the press, the typed text and the
+        // release, in the order a window reports them.
+        let held_modifiers = EngineModifiers {
             shift: chord.shift,
             control: chord.control,
             alt: chord.alt,
             super_key: chord.super_key,
         };
-        self.queue_input(InputEvent::ModifiersChanged { modifiers: held });
+        self.queue_input(InputEvent::ModifiersChanged {
+            modifiers: held_modifiers,
+        });
         self.queue_input(InputEvent::Key {
             key: chord.key,
             state: ButtonState::Pressed,
@@ -818,8 +848,8 @@ impl EditorWindow {
             key: chord.key,
             state: ButtonState::Released,
         });
-        // The chord releases its modifiers as it ends: a later injection must
-        // not inherit a held Control from this one.
+        // The chord releases its modifiers as it ends, so a later injection
+        // does not inherit a held Control from this one.
         self.queue_input(InputEvent::ModifiersChanged {
             modifiers: EngineModifiers {
                 shift: false,
@@ -833,8 +863,9 @@ impl EditorWindow {
             chord = chord.label().as_str(),
             "[editor] key injected"
         );
-        // A scripted chord runs what a real press runs: the same
-        // registry-resolved command, with the modifiers the chord named.
+        // Step 2: Run the command the chord stands for. A real press runs the
+        // same one: the command the keybinding registry resolves, with the
+        // modifiers the chord named.
         self.run_bound_command(
             chord.key,
             EngineModifiers {
@@ -846,11 +877,11 @@ impl EditorWindow {
         );
     }
 
-    /// Inject a full right click at a point of the window's client area,
-    /// through the same engine input seam a real click enters: the shell's
-    /// egui pass hit-tests and routes it, so a context menu opens over
-    /// whatever is under the pointer. No scene pick: a right click is the
-    /// UI's, never the scene's.
+    /// Injects a full right click at a point of the window's client area,
+    /// through the same input path a real click enters.
+    ///
+    /// The shell's egui pass hit-tests and routes it, so a context menu opens
+    /// over whatever is under the pointer. It never reaches the scene.
     pub(super) fn inject_rclick(&mut self, x: f32, y: f32) {
         let position = pill_core::math::Vector2f::new(x, y);
         self.queue_input(InputEvent::CursorMoved { position });
@@ -870,8 +901,8 @@ impl EditorWindow {
         );
     }
 
-    /// The viewport interaction state's name: one owner at a time, so the
-    /// dump and the logs say who has the pointer.
+    /// Returns the viewport interaction state's name. Only one owner holds the
+    /// pointer at a time, so the dump and the logs say who has it.
     pub(super) fn interaction_name(&self) -> &'static str {
         if self.camera_drag.is_some() {
             return "navigating";
@@ -884,42 +915,43 @@ impl EditorWindow {
         }
     }
 
-    /// Run the scripted commands appended since the last frame.
+    /// Runs the scripted commands appended since the last frame.
     ///
-    /// The grammar lives in [`pill_editor_core::scripted`]: this parses each
-    /// line and dispatches it, and a line that cannot be parsed takes the one
-    /// refusal path, so a suite sees it at once instead of waiting out a
-    /// timeout.
+    /// The grammar lives in [`pill_editor_core::scripted`]. This parses each
+    /// line and dispatches it, and a line that does not parse is refused at
+    /// once, so a suite sees the failure instead of waiting out a timeout.
     ///
-    /// What a line queues is applied before the next line runs: one append
-    /// reaches the loop as one batch, so without this an append that edits and
-    /// then reads would answer the value the edit replaced.
+    /// The commands a line queued are applied before the next line runs. An
+    /// append reaches the loop as one batch, so without that order an append
+    /// that edits and then reads would answer the value the edit replaced.
     pub(super) fn poll_test_channel(&mut self) {
+        // Step 1: Read the batch the channel appended.
         let lines = match &mut self.test_channel {
             Some(channel) => channel.poll(),
             None => return,
         };
+        // Step 2: Parse and run each line, then apply what it queued.
         for line in lines {
-            // A scripted line arrives between frames; the loop must not stay
+            // A scripted line arrives between frames. The loop must not stay
             // asleep over it.
             self.demand.scripted = true;
             match ScriptedCommand::parse(&line) {
                 Ok(command) => self.run_scripted(&line, command),
-                Err(error) => reject_scripted(&line, &error.reason),
+                Err(error) => reject_scripted_command(&line, &error.reason),
             }
             self.apply_pending_commands();
         }
     }
 
-    /// Queue one scripted event: to the engine, and to the shell's list too.
+    /// Queues one scripted event for the engine and for the shell's own list.
     ///
-    /// A scripted click or key stands in for a user's, so the UI must see it
-    /// the way a real event arrives - through the shell's own list - while
-    /// the game still receives what a user's would.
+    /// A scripted click or key stands in for a user's, so the UI has to see it
+    /// the way a real event arrives, through the shell's list. The game still
+    /// receives what a user's event would.
     pub(super) fn queue_input(&mut self, event: InputEvent) {
         if let InputEvent::CursorMoved { position } = event {
-            // The scripted pointer is the shell's pointer too: the seed the
-            // next frame carries has to match what the shell just saw.
+            // The scripted pointer is the shell's pointer too, so the seed the
+            // next frame carries must match what the shell just saw.
             self.shell_cursor = Some(position);
         }
         self.host
@@ -929,10 +961,10 @@ impl EditorWindow {
         self.shell_events.push(event);
     }
 
-    /// Run one parsed scripted command.
+    /// Runs one parsed scripted command.
     ///
-    /// No grammar is left here: an arm names its side effect, so the verbs,
-    /// their arguments and their refusal sentences have exactly one home.
+    /// No grammar is left here: each arm names its side effect, so the verbs
+    /// and their arguments have one home, the core parser.
     pub(super) fn run_scripted(&mut self, line: &str, command: ScriptedCommand) {
         match command {
             ScriptedCommand::Quit => {
@@ -953,7 +985,7 @@ impl EditorWindow {
                 component,
                 field,
                 value,
-            } => refuse_on(line, self.scripted_panel_field(&component, &field, &value)),
+            } => reject_on_failure(line, self.scripted_panel_field(&component, &field, &value)),
             ScriptedCommand::Reveal(path) => {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
@@ -970,8 +1002,9 @@ impl EditorWindow {
                 key,
                 candidate,
             } => {
-                // The choice a picker row makes: the candidate's own guid,
-                // written through the same settings edit the row queues.
+                // This makes the choice a picker row makes: it writes the
+                // candidate's own guid through the same settings edit the row
+                // queues.
                 let guid = self
                     .asset_entries
                     .iter()
@@ -988,27 +1021,28 @@ impl EditorWindow {
                         );
                         self.pick_reference(&asset, &key, &guid);
                     }
-                    None => {
-                        reject_scripted(line, "pick reference needs a candidate carrying a guid")
-                    }
+                    None => reject_scripted_command(
+                        line,
+                        "pick reference needs a candidate carrying a guid",
+                    ),
                 }
             }
             ScriptedCommand::Click { x, y } => self.inject_click(x, y),
             ScriptedCommand::RightClick { x, y } => self.inject_rclick(x, y),
             ScriptedCommand::Drag { from, to } => {
-                refuse_on(line, self.start_scripted_drag(from, to))
+                reject_on_failure(line, self.start_scripted_drag(from, to))
             }
             ScriptedCommand::GizmoDrag { target, delta } => {
                 match self.scripted_gizmo_handle(&target) {
                     Some(handle) => self.start_synthetic_gizmo_drag(handle, Some(delta)),
-                    None => reject_scripted(line, "gizmo drag needs a known axis or plane"),
+                    None => reject_scripted_command(line, "gizmo drag needs a known axis or plane"),
                 }
             }
             ScriptedCommand::GizmoPress { target } => match self.scripted_gizmo_handle(&target) {
                 Some(handle) => self.start_synthetic_gizmo_drag(handle, None),
-                None => reject_scripted(line, "gizmo press needs a known axis or plane"),
+                None => reject_scripted_command(line, "gizmo press needs a known axis or plane"),
             },
-            ScriptedCommand::GizmoRelease => refuse_on(line, self.scripted_gizmo_release()),
+            ScriptedCommand::GizmoRelease => reject_on_failure(line, self.scripted_gizmo_release()),
             ScriptedCommand::GizmoTool(mode) => self.set_gizmo_tool(mode),
             ScriptedCommand::Key(chord) => self.inject_key(&chord),
             ScriptedCommand::Dump(dump) => match dump {
@@ -1044,30 +1078,30 @@ impl EditorWindow {
             }
             ScriptedCommand::CameraZoom(lines) => self.zoom_camera(self.active_view, lines),
             ScriptedCommand::Hover { view, x, y } => {
-                refuse_on(line, self.scripted_hover(view, x, y))
+                reject_on_failure(line, self.scripted_hover(view, x, y))
             }
             ScriptedCommand::HoverUi { x, y } => self.scripted_hover_ui(x, y),
             ScriptedCommand::Drop(path) => self.drop_files(vec![std::path::PathBuf::from(path)]),
             ScriptedCommand::HoverFile(path) => self.preview_drop(std::path::Path::new(&path)),
             ScriptedCommand::DragOut(path) => self.start_drag_out(&path),
             ScriptedCommand::SelectAsset(path) => self.scripted_select_asset(&path),
-            ScriptedCommand::SelectEntity(handle) => {
-                refuse_on(line, self.scripted_select_entity(&handle))
+            ScriptedCommand::SelectEntity(entity_text) => {
+                reject_on_failure(line, self.scripted_select_entity(&entity_text))
             }
-            ScriptedCommand::SelectAdd(handle) => refuse_on(
+            ScriptedCommand::SelectAdd(entity_text) => reject_on_failure(
                 line,
-                self.scripted_select_extend(&handle, SelectionClick::Add),
+                self.scripted_select_extend(&entity_text, SelectionClick::Add),
             ),
-            ScriptedCommand::SelectRange(handle) => refuse_on(
+            ScriptedCommand::SelectRange(entity_text) => reject_on_failure(
                 line,
-                self.scripted_select_extend(&handle, SelectionClick::Range),
+                self.scripted_select_extend(&entity_text, SelectionClick::Range),
             ),
             ScriptedCommand::SelectResource(name) => self.scripted_select_resource(&name),
             ScriptedCommand::EditResource {
                 resource,
                 field,
                 value,
-            } => refuse_on(line, self.scripted_edit_resource(&resource, &field, &value)),
+            } => reject_on_failure(line, self.scripted_edit_resource(&resource, &field, &value)),
             ScriptedCommand::Toolbar(action) => self.scripted_toolbar(action),
             ScriptedCommand::SceneNew => self.scripted_scene(EditorCommand::SceneNew),
             ScriptedCommand::SceneOpen(path) => {
@@ -1084,13 +1118,13 @@ impl EditorWindow {
                 entity,
                 component,
                 field,
-            } => refuse_on(line, self.scripted_pick_entity(&entity, &component, &field)),
+            } => reject_on_failure(line, self.scripted_pick_entity(&entity, &component, &field)),
             ScriptedCommand::EditSet {
                 entity,
                 component,
                 field,
                 value,
-            } => refuse_on(
+            } => reject_on_failure(
                 line,
                 self.scripted_edit_set(&entity, &component, &field, &value),
             ),
@@ -1100,7 +1134,7 @@ impl EditorWindow {
                 field,
                 index,
                 value,
-            } => refuse_on(
+            } => reject_on_failure(
                 line,
                 self.scripted_edit_array(&entity, &component, &field, index, &value),
             ),
@@ -1108,12 +1142,12 @@ impl EditorWindow {
                 component,
                 field,
                 value,
-            } => refuse_on(
+            } => reject_on_failure(
                 line,
                 self.scripted_edit_selection(&component, &field, &value),
             ),
             ScriptedCommand::EditAssetSettings { path, key, value } => {
-                refuse_on(line, self.scripted_asset_settings(&path, &key, &value))
+                reject_on_failure(line, self.scripted_asset_settings(&path, &key, &value))
             }
             ScriptedCommand::EditSystem { index, enabled } => {
                 self.scripted_edit_system(index, enabled)
@@ -1125,16 +1159,18 @@ impl EditorWindow {
                 entity,
                 component,
                 add,
-            } => refuse_on(line, self.scripted_component_edit(&entity, &component, add)),
+            } => reject_on_failure(line, self.scripted_component_edit(&entity, &component, add)),
             ScriptedCommand::Undo => self.scripted_undo(),
             ScriptedCommand::Redo => self.scripted_redo(),
             ScriptedCommand::Copy => self.scripted_clipboard(ClipboardAction::Copy),
             ScriptedCommand::Cut => self.scripted_clipboard(ClipboardAction::Cut),
             ScriptedCommand::Paste => self.scripted_clipboard(ClipboardAction::Paste),
             ScriptedCommand::PauseToggle => self.scripted_pause_toggle(),
-            ScriptedCommand::NewSceneView => refuse_on(line, self.scripted_new_scene_view()),
+            ScriptedCommand::NewSceneView => {
+                reject_on_failure(line, self.scripted_new_scene_view())
+            }
             ScriptedCommand::Popout { tab, redock } => {
-                refuse_on(line, self.scripted_popout(tab, redock))
+                reject_on_failure(line, self.scripted_popout(tab, redock))
             }
             ScriptedCommand::Step => self.scripted_step(),
             ScriptedCommand::EntityCreate => self.scripted_entity_create(),
@@ -1145,19 +1181,19 @@ impl EditorWindow {
             }
             ScriptedCommand::SpaceToggle => {
                 let space = self.gizmo_settings().space;
-                let next = match space {
+                let next_space = match space {
                     GizmoSpace::World => GizmoSpace::Local,
                     GizmoSpace::Local => GizmoSpace::World,
                 };
-                self.scripted_gizmo_tool(None, Some(next), None)
+                self.scripted_gizmo_tool(None, Some(next_space), None)
             }
         }
     }
 
-    /// One `edit asset` command, queued as the recorded edit the Assets tab's
+    /// Queues one `edit asset` command as the recorded edit the Assets tab's
     /// actions also queue.
     pub(super) fn scripted_asset_edit(&mut self, edit: AssetEdit) {
-        let (command_value, label) = match edit {
+        let (edit_command, label) = match edit {
             AssetEdit::Create {
                 type_name,
                 folder,
@@ -1189,13 +1225,20 @@ impl EditorWindow {
         };
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-            pending.push_recorded(vec![command_value], label, None);
+            pending.push_recorded(vec![edit_command], label, None);
         }
     }
 
-    /// One scripted asset-settings edit (`edit asset-settings <path> <key>
-    /// <value>`): the same recorded `SetAssetSettings` batch the Inspector's
-    /// settings rows queue, parsed against the leaf's current JSON kind.
+    /// Runs one scripted asset-settings edit (`edit asset-settings <path>
+    /// <key> <value>`): the same recorded `SetAssetSettings` batch the
+    /// Inspector's settings rows queue. The text is parsed against the leaf's
+    /// current JSON kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the key path is malformed, when no asset at
+    /// `path` has a settings document, or when the text is not a value of the
+    /// leaf's kind or the path cannot be reached in the document.
     pub(super) fn scripted_asset_settings(
         &mut self,
         path: &str,
@@ -1206,33 +1249,34 @@ impl EditorWindow {
         let Some(document) = self.read_asset_settings(path) else {
             return Err(format!("no asset at '{path}' has a settings document"));
         };
-        // A leaf the document does not hold yet reads as text: that is the
-        // unbound-slot case, and the picker's value is a guid string.
+        // A leaf the document does not hold yet is read as text. That happens
+        // for a slot with no reference yet, whose picker value is a guid
+        // string.
         let kind = inspector::settings_field(&document, &key_path)
             .cloned()
             .unwrap_or_else(|| serde_json::Value::String(String::new()));
-        let value = inspector::parse_settings_value(value_text, &kind)?;
-        let mut patched = document;
+        let parsed_value = inspector::parse_settings_value(value_text, &kind)?;
+        let mut patched_document = document;
         // The same inserting rule the Inspector's settings rows use.
-        inspector::patch_settings_inserting(&mut patched, &key_path, value)?;
-        self.queue_settings_value(path, key, patched);
+        inspector::patch_settings_inserting(&mut patched_document, &key_path, parsed_value)?;
+        self.queue_settings_value(path, key, patched_document);
         Ok(())
     }
 
-    /// Open a folder in the Assets tab's browser (`root` opens the asset
-    /// root), through the shell's session state - the scripted channel's
-    /// stand-in for clicking the folder tree.
+    /// Opens a folder in the Assets tab's browser (`root` opens the asset
+    /// root), through the shell's session state. It stands in for a click in
+    /// the folder tree.
     pub(super) fn scripted_browser(&mut self, folder: &str) {
         let folder = if folder == "root" { "" } else { folder };
         let world = self.host.host_mut().engine_mut().world_mut();
-        let Some(state) = world.get_resource_mut::<EguiShellState>() else {
+        let Some(shell_state) = world.get_resource_mut::<EguiShellState>() else {
             warn!(
                 target: telemetry_target::ENGINE,
                 "[editor] browser navigation needs the shell module's state"
             );
             return;
         };
-        if !state.browser.open(folder) {
+        if !shell_state.browser.open(folder) {
             info!(
                 target: telemetry_target::ENGINE,
                 folder,
@@ -1241,7 +1285,7 @@ impl EditorWindow {
         }
     }
 
-    /// Apply a scripted camera gesture to the active viewport, through the
+    /// Applies a scripted camera gesture to the active viewport, through the
     /// same math a drag uses.
     pub(super) fn scripted_camera(
         &mut self,
@@ -1259,9 +1303,9 @@ impl EditorWindow {
         );
     }
 
-    /// One scripted clipboard command (`command editor.copy/cut/paste`): the
-    /// same request the Edit menu's rows queue, so the test channel drives the
-    /// menu's own path.
+    /// Runs one scripted clipboard command (`command editor.copy/cut/paste`).
+    /// It queues the same request the Edit menu's rows queue, so the test
+    /// channel drives the menu's own path.
     pub(super) fn scripted_clipboard(&mut self, action: ClipboardAction) {
         let world = self.host.host_mut().engine_mut().world_mut();
         let selection = world
@@ -1276,8 +1320,8 @@ impl EditorWindow {
             Some(clipboard) => clipboard::queue_request(clipboard, action, &selection, &snapshot),
             None => None,
         };
-        // The cut's delete is queued from its own borrow: the two resources
-        // cannot be held mutably at once.
+        // The cut's delete is queued in its own borrow, because the two
+        // resources cannot be held mutably at once.
         if action == ClipboardAction::Cut {
             if let (Some((commands, label)), Some(pending)) = (
                 clipboard::cut_commands(&selection),
@@ -1298,9 +1342,14 @@ impl EditorWindow {
         );
     }
 
-    /// Run `edit add <entity> <component>` / `edit remove <entity>
-    /// <component>` from the scripted channel: the same recorded component
-    /// attach or detach the Inspector's menu items queue.
+    /// Runs `edit add <entity> <component>` or `edit remove <entity>
+    /// <component>` from the scripted channel. It queues the same recorded
+    /// component attach or detach the Inspector's menu items queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the display handle names no entity or the
+    /// component name resolves to no component.
     pub(super) fn scripted_component_edit(
         &mut self,
         entity_text: &str,
@@ -1331,10 +1380,10 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// Run `console filter <level>`: the lowest level the Console tab shows,
-    /// which the next frame applies to the history.
+    /// Runs `console filter <level>`, which sets the lowest level the Console
+    /// tab shows. The next frame applies it to the history.
     pub(super) fn scripted_console_filter(&mut self, level: &str) {
-        let Some(value) = pill_editor_core::console::level_from_name(level) else {
+        let Some(minimum_level) = pill_editor_core::console::level_from_name(level) else {
             warn!(
                 target: telemetry_target::ENGINE,
                 level,
@@ -1344,7 +1393,7 @@ impl EditorWindow {
         };
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(state) = world.get_resource_mut::<EguiShellState>() {
-            state.console_filters.minimum_level = value;
+            state.console_filters.minimum_level = minimum_level;
         }
         info!(
             target: telemetry_target::ENGINE,
@@ -1353,7 +1402,8 @@ impl EditorWindow {
         );
     }
 
-    /// Run `console search <text>`: the Console tab's substring filter.
+    /// Runs `console search <text>`, which sets the Console tab's substring
+    /// filter.
     pub(super) fn scripted_console_search(&mut self, text: String) {
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(state) = world.get_resource_mut::<EguiShellState>() {
@@ -1366,15 +1416,15 @@ impl EditorWindow {
         );
     }
 
-    /// Set the open dialog's name field - what typing into the window's
-    /// text field does.
-    pub(super) fn scripted_dialog_set_name(&mut self, name: &str) {
+    /// Sets the open dialog's name field, as typing into the window's text
+    /// field does.
+    pub(super) fn scripted_dialog_set_name(&mut self, dialog_name: &str) {
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(state) = world.get_resource_mut::<EguiShellState>() {
             match state.asset_dialog.as_mut() {
                 Some(AssetDialog::Create { name: field, .. })
                 | Some(AssetDialog::Rename { name: field, .. }) => {
-                    *field = name.to_string();
+                    *field = dialog_name.to_string();
                 }
                 None => warn!(
                     target: telemetry_target::ENGINE,
@@ -1384,11 +1434,14 @@ impl EditorWindow {
         }
     }
 
-    /// Run the open dialog's submit button: the dialog is taken out of the
-    /// session, submitted, and put back, because the submit needs the
-    /// pending queue - a second mutable resource the world cannot lend
-    /// alongside the session.
+    /// Runs the open dialog's submit button.
+    ///
+    /// The dialog is taken out of the session, submitted, and put back,
+    /// because the submit also needs the pending command queue. The world
+    /// cannot lend two mutable resources at once.
     pub(super) fn scripted_dialog_submit(&mut self) {
+        // Step 1: Take the dialog out of the shell state, so the session is
+        // free while the submit runs.
         let mut dialog = {
             let world = self.host.host_mut().engine_mut().world_mut();
             world
@@ -1402,6 +1455,7 @@ impl EditorWindow {
             );
             return;
         }
+        // Step 2: Submit it against the pending command queue.
         {
             let world = self.host.host_mut().engine_mut().world_mut();
             if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
@@ -1416,15 +1470,23 @@ impl EditorWindow {
                 }
             }
         }
+        // Step 3: Store the dialog back as the submit left it. An accepted
+        // submit leaves none, so the window closes.
         let world = self.host.host_mut().engine_mut().world_mut();
-        if let Some(state) = world.get_resource_mut::<EguiShellState>() {
-            state.asset_dialog = dialog;
+        if let Some(shell_state) = world.get_resource_mut::<EguiShellState>() {
+            shell_state.asset_dialog = dialog;
         }
     }
 
-    /// One scripted array-element edit (`edit array <entity> <component>
-    /// <field> <index> <value>`): the same recorded `SetArrayElement` batch
-    /// an inspector element widget queues.
+    /// Runs one scripted array-element edit (`edit array <entity> <component>
+    /// <field> <index> <value>`). It queues the same recorded
+    /// `SetArrayElement` batch an inspector element widget queues.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the target does not resolve - no entity, no
+    /// component or no such field - when the index is outside the array, or
+    /// when the text does not parse against the element's kind.
     pub(super) fn scripted_edit_array(
         &mut self,
         entity_text: &str,
@@ -1433,10 +1495,10 @@ impl EditorWindow {
         index: usize,
         value_text: &str,
     ) -> Result<(), String> {
-        let (entity, component, current) =
+        let (entity, component, current_value) =
             self.resolve_edit_target(entity_text, component_text, field)?;
         let recorded =
-            inspector::element_write(entity, &component, field, &current, index, value_text)?;
+            inspector::element_write(entity, &component, field, &current_value, index, value_text)?;
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
             pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
@@ -1444,9 +1506,9 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// One scripted preferences row (`edit preference <key> <value...>`):
-    /// the same `SetPreferences` batch the tab's Save button queues, with
-    /// the one row. The value is everything after the key, so a text value
+    /// Runs one scripted preferences row (`edit preference <key> <value...>`):
+    /// the same `SetPreferences` batch the tab's Save button queues, holding
+    /// just that row. The value is everything after the key, so a text value
     /// keeps its spaces.
     pub(super) fn scripted_edit_preference(&mut self, key: &str, value: &str) {
         let world = self.host.host_mut().engine_mut().world_mut();
@@ -1463,7 +1525,13 @@ impl EditorWindow {
         );
     }
 
-    /// `edit resource <field> <value>`: one recorded `SetResourceField`.
+    /// Runs `edit resource <resource> <field> <value>`, which queues one
+    /// recorded `SetResourceField`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the resource has no such editable field, or when
+    /// the text does not parse against the field's current kind.
     pub(super) fn scripted_edit_resource(
         &mut self,
         resource: &str,
@@ -1471,13 +1539,13 @@ impl EditorWindow {
         value_text: &str,
     ) -> Result<(), String> {
         let world = self.host.host_mut().engine_mut().world_mut();
-        let current = world.get_resource::<GizmoState>().and_then(|state| {
+        let current_value = world.get_resource::<GizmoState>().and_then(|state| {
             pill_editor_core::gizmo::resource_field_value(&state.settings, resource, field).ok()
         });
-        let Some(current) = current else {
+        let Some(current_value) = current_value else {
             return Err(format!("'{resource}' has no editable field '{field}'"));
         };
-        let value = inspector::parse_field_value(value_text, &current)?;
+        let parsed_value = inspector::parse_field_value(value_text, &current_value)?;
         let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() else {
             return Ok(());
         };
@@ -1485,7 +1553,7 @@ impl EditorWindow {
             vec![EditorCommand::SetResourceField {
                 resource: resource.to_string(),
                 field: field.to_string(),
-                value,
+                value: parsed_value,
             }],
             format!("set {resource}.{field}"),
             Some(format!("resource.{resource}.{field}")),
@@ -1500,40 +1568,51 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// One scripted whole-field edit over the whole selection (`edit selection
-    /// <component> <field> <value>`): the recorded batch an Inspector row
-    /// queues when several entities are selected.
+    /// Runs one scripted whole-field edit over the whole selection
+    /// (`edit selection <component> <field> <value>`): the recorded batch an
+    /// Inspector row queues when several entities are selected.
     ///
-    /// The value parses against the primary's field, and the write reaches
-    /// every selected entity whose detail carries the component, so an
-    /// `EditorCommand::SetField` step is recorded once for the set and undoes
-    /// in one step.
+    /// The value is parsed against the primary entity's field. The write
+    /// reaches every selected entity whose detail carries the component, so
+    /// one recorded step covers the whole set and undoes in one step.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when nothing is selected, when the target does not
+    /// resolve against the primary entity, or when the text does not name a
+    /// value for the field.
     pub(super) fn scripted_edit_selection(
         &mut self,
         component_text: &str,
         field: &str,
         value_text: &str,
     ) -> Result<(), String> {
-        let (primary, details) = {
+        let (primary_entity, selected_details) = {
             let world = self.host.host_mut().engine_mut().world_mut();
-            let Some(primary) = world
+            let Some(primary_entity) = world
                 .get_resource::<EditorSelection>()
                 .and_then(|selection| selection.primary())
             else {
                 return Err("edit selection needs a selected entity".to_string());
             };
-            let details = world
+            let selected_details = world
                 .get_resource::<EditorSnapshot>()
                 .map(|snapshot| snapshot.selected_details.clone())
                 .unwrap_or_default();
-            (primary, details)
+            (primary_entity, selected_details)
         };
-        let (entity, component, current) =
-            self.resolve_edit_target(&primary.to_string(), component_text, field)?;
-        let targets = inspector::selection_targets(&details, entity, &component);
-        let recorded =
-            inspector::selection_write(&targets, entity, &component, field, &current, value_text)?;
-        let written = recorded.commands.len();
+        let (entity, component, current_value) =
+            self.resolve_edit_target(&primary_entity.to_string(), component_text, field)?;
+        let targets = inspector::selection_targets(&selected_details, entity, &component);
+        let recorded = inspector::selection_write(
+            &targets,
+            entity,
+            &component,
+            field,
+            &current_value,
+            value_text,
+        )?;
+        let written_command_count = recorded.commands.len();
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
             pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
@@ -1542,15 +1621,21 @@ impl EditorWindow {
             target: telemetry_target::ENGINE,
             component = component.as_str(),
             field,
-            entities = written,
+            entities = written_command_count,
             "[editor] selection field edit queued"
         );
         Ok(())
     }
 
-    /// One scripted whole-field edit (`edit set <entity> <component>
-    /// <field> <value>`): the same recorded `SetField` batch an inspector
-    /// widget queues, parsed against the field's current kind.
+    /// Runs one scripted whole-field edit (`edit set <entity> <component>
+    /// <field> <value>`): the same recorded field edit an inspector widget
+    /// queues, which is a `SetField` or its asset or entity reference variant.
+    /// The text is parsed against the field's current kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the target does not resolve, or when the text
+    /// does not name a value for the field.
     pub(super) fn scripted_edit_set(
         &mut self,
         entity_text: &str,
@@ -1558,9 +1643,10 @@ impl EditorWindow {
         field: &str,
         value_text: &str,
     ) -> Result<(), String> {
-        let (entity, component, current) =
+        let (entity, component, current_value) =
             self.resolve_edit_target(entity_text, component_text, field)?;
-        let recorded = inspector::field_write(entity, &component, field, &current, value_text)?;
+        let recorded =
+            inspector::field_write(entity, &component, field, &current_value, value_text)?;
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
             pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
@@ -1568,8 +1654,8 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// Run `edit system <index> on|off` from the scripted channel: the same
-    /// recorded, undoable toggle the Systems tab's state buttons queue.
+    /// Runs `edit system <index> on|off` from the scripted channel: the same
+    /// recorded, undoable toggle the Systems tab's on/off buttons queue.
     pub(super) fn scripted_edit_system(&mut self, index: usize, enabled: bool) {
         let (edit, label) = systems::system_toggle(index, enabled);
         let world = self.host.host_mut().engine_mut().world_mut();
@@ -1584,8 +1670,9 @@ impl EditorWindow {
         );
     }
 
-    /// `editor.entity_create` from the scripted channel: the recorded
-    /// one-empty-entity edit the Entities menu's New Entity queues.
+    /// Runs `editor.entity_create` from the scripted channel: the recorded
+    /// edit that creates one empty entity, as the Entities menu's New Entity
+    /// does.
     pub(super) fn scripted_entity_create(&mut self) {
         let (command, label) = entities::entity_create();
         let world = self.host.host_mut().engine_mut().world_mut();
@@ -1598,9 +1685,9 @@ impl EditorWindow {
         );
     }
 
-    /// `editor.entity_delete`: the selected entity's recorded delete (the
-    /// destroy and the selection clear as one step), or a note when the
-    /// selection holds no entity.
+    /// Runs `editor.entity_delete`: the selected entity's recorded delete, with
+    /// the destroy and the selection clear as one step. When the selection
+    /// holds no entity, it logs a note and does nothing.
     pub(super) fn scripted_entity_delete(&mut self) {
         let (entity, asset) = {
             let world = self.host.host_mut().engine_mut().world_mut();
@@ -1628,31 +1715,36 @@ impl EditorWindow {
         );
     }
 
-    /// Resolve a scripted handle name to its id: `x`/`y`/`z` name the
-    /// active tool's axes, `xy`/`xz`/`yz` the translation planes.
-    pub(super) fn scripted_gizmo_handle(&mut self, name: &str) -> Option<u32> {
-        let settings = self.gizmo_settings();
-        if let Some(axis) = parse_gizmo_axis(name) {
-            return Some(gizmo::axis_handle(settings.mode, axis));
+    /// Resolves a scripted handle name to its handle id. `x`/`y`/`z` name the
+    /// active tool's axes, and `xy`/`xz`/`yz` name the translation planes,
+    /// which only the translate tool offers.
+    pub(super) fn scripted_gizmo_handle(&mut self, handle_name: &str) -> Option<u32> {
+        let gizmo_settings = self.gizmo_settings();
+        if let Some(axis) = parse_gizmo_axis(handle_name) {
+            return Some(gizmo::axis_handle(gizmo_settings.mode, axis));
         }
-        let (first, second) = match name {
+        let (first_axis, second_axis) = match handle_name {
             "xy" => (0, 1),
             "xz" => (0, 2),
             "yz" => (1, 2),
             _ => return None,
         };
-        if settings.mode != GizmoMode::Translate {
+        if gizmo_settings.mode != GizmoMode::Translate {
             warn!(
                 target: telemetry_target::ENGINE,
-                mode = gizmo_mode_name(settings.mode),
+                mode = gizmo_mode_name(gizmo_settings.mode),
                 "[editor] plane handles belong to the translate tool"
             );
             return None;
         }
-        Some(gizmo::plane_handle(first, second))
+        Some(gizmo::plane_handle(first_axis, second_axis))
     }
 
-    /// Finish the drag a `gizmo press` started, like a mouse release.
+    /// Finishes the drag a `gizmo press` started, like a mouse release.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no gizmo drag is in flight.
     pub(super) fn scripted_gizmo_release(&mut self) -> Result<(), String> {
         if self.gizmo_drag.is_none() {
             return Err("gizmo release needs a drag in flight".to_string());
@@ -1662,9 +1754,10 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// `editor.tool_*` from the scripted channel: queue the same
-    /// `SetGizmoTool` edit the toolbox rows and the viewport menu queue
-    /// (applied, never recorded - a tool choice is a control, not an edit).
+    /// Runs `editor.tool_*` from the scripted channel: it queues the same
+    /// `SetGizmoTool` edit the toolbox rows and the viewport menu queue. The
+    /// edit is applied but never recorded, because a tool choice is a control,
+    /// not an edit.
     pub(super) fn scripted_gizmo_tool(
         &mut self,
         mode: Option<GizmoMode>,
@@ -1677,8 +1770,12 @@ impl EditorWindow {
         }
     }
 
-    /// Move one view's pointer and update the hovered handle - the scripted
-    /// channel's stand-in for a real pointer move.
+    /// Moves one view's pointer and updates the hovered handle, standing in for
+    /// a real pointer move.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `view` is not a scene view index.
     pub(super) fn scripted_hover(&mut self, view: usize, x: f32, y: f32) -> Result<(), String> {
         if view >= self.views.len() {
             return Err(format!("there is no scene view {view}"));
@@ -1695,12 +1792,12 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// Move the shell's own pointer, as a real move arrives.
+    /// Moves the shell's own pointer, as a real move arrives.
     ///
-    /// egui learns a pointer position only from an event, so a suite that
-    /// wants a tooltip or a resize cursor moves the pointer here. The carried
-    /// cursor keeps the position on later frames, exactly like a real move
-    /// that stopped moving.
+    /// egui learns a pointer position only from an event, so a suite that wants
+    /// a tooltip or a resize cursor moves the pointer here. The stored cursor
+    /// keeps the position on later frames, just like a real move that has
+    /// stopped moving.
     pub(super) fn scripted_hover_ui(&mut self, x: f32, y: f32) {
         let position = pill_core::math::Vector2f::new(x, y);
         self.shell_cursor = Some(position);
@@ -1714,11 +1811,16 @@ impl EditorWindow {
         );
     }
 
-    /// Dock one more scene view, the Window menu's own request: the tab goes
-    /// in exactly where the menu would put it, and the executable's activation
-    /// path brings it to the front.
+    /// Docks one more scene view, as the Window menu asks: the tab goes where
+    /// the menu would put it, and the executable's activation path brings it to
+    /// the front.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when every scene view is already open. A shell that
+    /// has not attached yet only warns, and the same line works once it has.
     pub(super) fn scripted_new_scene_view(&mut self) -> Result<(), String> {
-        let next = {
+        let scene_view_choice = {
             let world = self.host.host_mut().engine_mut().world_mut();
             world.get_resource::<EguiShellState>().map(|state| {
                 (
@@ -1727,16 +1829,16 @@ impl EditorWindow {
                 )
             })
         };
-        // The shell not being attached yet is a moment, not a refused line:
-        // the same command works once it is.
-        let Some((tab, fits)) = next else {
+        // A shell that is not attached yet is a passing moment, not a refused
+        // line, because the same command works once it is.
+        let Some((tab, has_room)) = scene_view_choice else {
             warn!(
                 target: telemetry_target::ENGINE,
                 "[editor] scene view needs the shell module's state"
             );
             return Ok(());
         };
-        if !fits {
+        if !has_room {
             return Err(format!(
                 "the editor shows at most {} scene views",
                 pill_editor_core::boundary::SCENE_VIEWS_MAX
@@ -1752,33 +1854,33 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// Run `palette <query>` / `palette run` / `palette close` from the
+    /// Runs `palette <query>`, `palette run` or `palette close` from the
     /// scripted channel.
     ///
-    /// This touches the palette's model state only; the shell's pass draws the
+    /// This touches only the palette's model state. The shell's pass draws the
     /// popup and runs the selected row, so a scripted run and a click take the
     /// same action path.
     pub(super) fn scripted_palette(&mut self, request: PaletteRequest) {
         let world = self.host.host_mut().engine_mut().world_mut();
-        let Some(state) = world.get_resource_mut::<EguiShellState>() else {
+        let Some(shell_state) = world.get_resource_mut::<EguiShellState>() else {
             return;
         };
         match request {
             PaletteRequest::Query(query) => {
-                state.palette.open = true;
-                state.palette.query = query;
-                state.palette.selected = 0;
-                state.palette.logged_query = None;
+                shell_state.palette.open = true;
+                shell_state.palette.query = query;
+                shell_state.palette.selected = 0;
+                shell_state.palette.logged_query = None;
                 info!(
                     target: telemetry_target::ENGINE,
-                    query = state.palette.query.as_str(),
+                    query = shell_state.palette.query.as_str(),
                     "[editor] palette opened"
                 );
             }
-            PaletteRequest::Run => state.palette.run_requested = true,
+            PaletteRequest::Run => shell_state.palette.run_requested = true,
             PaletteRequest::Close => {
-                state.palette.open = false;
-                state.palette.run_requested = false;
+                shell_state.palette.open = false;
+                shell_state.palette.run_requested = false;
                 info!(
                     target: telemetry_target::ENGINE,
                     "[editor] palette dismissed"
@@ -1787,14 +1889,18 @@ impl EditorWindow {
         }
     }
 
-    /// Queue the component-field write a module panel's own row would queue
+    /// Queues the component-field write a module panel's own row would queue
     /// (`panel field <component> <field> <value>`).
     ///
-    /// The row is a drag value the test channel cannot press, so the write is
-    /// injected where the row puts it: the shared `PanelCommands` queue, applied
-    /// by [`Self::apply_panel_commands`] at the next frame boundary. What a test
-    /// drives is therefore the panel contract itself - the queue, the recorded
-    /// field edit and its undo step - not a second write path.
+    /// The row is a drag value the test channel cannot press, so the write goes
+    /// where the row puts it: into the shared `PanelCommands` queue.
+    /// [`Self::apply_panel_commands`] applies that queue at the next frame
+    /// boundary. A test therefore drives the panel contract itself - the queue,
+    /// the recorded field edit and its undo step - and not a second write path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the selection holds no primary entity.
     pub(super) fn scripted_panel_field(
         &mut self,
         component: &str,
@@ -1831,11 +1937,12 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// `panel restore <source>`: bind that module's panels again.
+    /// Runs `panel restore <source>`, which binds that module's panels again.
     ///
-    /// The requests the executable kept are registered against a fresh marker,
-    /// which is what a reload's re-registration does.
+    /// The requests the executable kept are registered against a fresh liveness
+    /// marker, which is what a reload's re-registration does.
     pub(super) fn scripted_panel_restore(&mut self, source: &str) {
+        // Step 1: Report a source that is still bound and stop.
         if self.panel_markers.contains_key(source) {
             info!(
                 target: telemetry_target::ENGINE,
@@ -1845,8 +1952,9 @@ impl EditorWindow {
             );
             return;
         }
-        let marker = ModuleLiveness::new();
-        let kept: Vec<PanelRequest> = self
+        // Step 2: Register the kept requests against a fresh liveness marker.
+        let liveness_marker = ModuleLiveness::new();
+        let kept_requests: Vec<PanelRequest> = self
             .panel_requests
             .iter()
             .copied()
@@ -1855,19 +1963,21 @@ impl EditorWindow {
         let world = self.host.host_mut().engine_mut().world_mut();
         let mut restored = 0;
         if let Some(registry) = world.get_resource_mut::<PanelRegistry>() {
-            for request in &kept {
+            for request in &kept_requests {
                 registry.register(
                     request.id,
                     request.title,
                     request.source,
                     request.draw,
-                    &marker,
+                    &liveness_marker,
                 );
                 restored += 1;
             }
         }
+        // Step 3: Remember the marker and report the count.
         if restored > 0 {
-            self.panel_markers.insert(source.to_string(), marker);
+            self.panel_markers
+                .insert(source.to_string(), liveness_marker);
         }
         info!(
             target: telemetry_target::ENGINE,
@@ -1877,11 +1987,12 @@ impl EditorWindow {
         );
     }
 
-    /// `panel unload <source>`: drop one module's liveness marker.
+    /// Runs `panel unload <source>`, which drops one module's liveness marker.
     ///
-    /// This is the state a module's unload leaves the registry in - the marker
-    /// is what the unload would drop - so the tab reads "module not loaded"
-    /// and the panel's draw function is no longer handed out.
+    /// This leaves the registry in the state a module unload leaves it in,
+    /// because the marker is what an unload drops. The tab then reads
+    /// "module not loaded", and the panel's draw function is no longer handed
+    /// out.
     pub(super) fn scripted_panel_unload(&mut self, source: &str) {
         let dropped = self.panel_markers.remove(source).is_some();
         info!(
@@ -1892,20 +2003,21 @@ impl EditorWindow {
         );
     }
 
-    /// `panel window <slot> <id>`: ask a panel to open one of its windows.
+    /// Runs `panel window <slot> <id>`, which asks a panel to open one of its
+    /// windows.
     ///
     /// The panel decides what the id means, so this drives the same code its
     /// button does.
     pub(super) fn scripted_panel_window(&mut self, slot: u16, id: &str) {
         let world = self.host.host_mut().engine_mut().world_mut();
-        let Some(state) = world.get_resource_mut::<EguiShellState>() else {
+        let Some(shell_state) = world.get_resource_mut::<EguiShellState>() else {
             warn!(
                 target: telemetry_target::ENGINE,
                 "[editor] panel window request needs the shell module's state"
             );
             return;
         };
-        state.pending_panel_window = Some((slot, id.to_string()));
+        shell_state.pending_panel_window = Some((slot, id.to_string()));
         info!(
             target: telemetry_target::ENGINE,
             slot,
@@ -1914,9 +2026,9 @@ impl EditorWindow {
         );
     }
 
-    /// Run `editor.pause_toggle` from the scripted channel: queue the flip
-    /// of the engine's pause flag - applied, never recorded, the same walk
-    /// the Systems tab's Pause/Resume button takes.
+    /// Runs `editor.pause_toggle` from the scripted channel: it queues the flip
+    /// of the engine's pause flag, applied but never recorded. That is the same
+    /// walk the Systems tab's Pause/Resume button takes.
     pub(super) fn scripted_pause_toggle(&mut self) {
         let paused = self.host.host_mut().engine_mut().systems_paused();
         let world = self.host.host_mut().engine_mut().world_mut();
@@ -1930,18 +2042,23 @@ impl EditorWindow {
         );
     }
 
-    /// Arm an entity reference row (`pick entity <entity> <component>
+    /// Arms an entity reference row (`pick entity <entity> <component>
     /// <field>`): the same `ArmEntityPick` the row's target button queues, so
     /// the next scene press names the field's reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the target does not resolve, or when the field
+    /// does not hold an entity reference.
     pub(super) fn scripted_pick_entity(
         &mut self,
         entity_text: &str,
         component_text: &str,
         field: &str,
     ) -> Result<(), String> {
-        let (entity, component, current) =
+        let (entity, component, current_value) =
             self.resolve_edit_target(entity_text, component_text, field)?;
-        if !matches!(current, FieldValue::Entity { .. }) {
+        if !matches!(current_value, FieldValue::Entity { .. }) {
             return Err(format!("'{field}' does not hold an entity reference"));
         }
         let command = EditorCommand::ArmEntityPick {
@@ -1956,15 +2073,21 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// `popout <tab>` / `popout <tab> redock`: the same dock
-    /// move the tab menu makes, driven from the scripted channel.
+    /// Runs `popout <tab>` or `popout <tab> redock`: the same dock move the tab
+    /// menu makes, driven from the scripted channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for the game view, which is the primary surface's
+    /// window, and when the tab is already docked or already out.
     pub(super) fn scripted_popout(&mut self, tab: EditorTab, redock: bool) -> Result<(), String> {
         if tab == EditorTab::Game {
             return Err("the game view is the primary surface's window".to_string());
         }
         let world = self.host.host_mut().engine_mut().world_mut();
-        // The shell not being attached yet is a moment, not a refused line.
-        let Some(state) = world.get_resource_mut::<EguiShellState>() else {
+        // A shell that is not attached yet is a passing moment, not a refused
+        // line.
+        let Some(shell_state) = world.get_resource_mut::<EguiShellState>() else {
             warn!(
                 target: telemetry_target::ENGINE,
                 "[editor] popout needs the shell module's state"
@@ -1972,9 +2095,9 @@ impl EditorWindow {
             return Ok(());
         };
         let moved = if redock {
-            state.dock.redock(tab)
+            shell_state.dock.redock(tab)
         } else {
-            state.dock.pop_out(tab)
+            shell_state.dock.pop_out(tab)
         };
         if moved {
             info!(
@@ -1993,12 +2116,12 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// Run `problem open <index>`: the same action a click on the row takes.
+    /// Runs `problem open <index>`, the same action a click on the row takes.
     ///
-    /// The row opens at once rather than at the next frame boundary: a suite
-    /// that sends this line waits for the editor it launches, and one frame of
-    /// delay would make the assertion race the spawn. The body is the one the
-    /// frame drain calls, so the two paths differ only in when they run.
+    /// The row opens at once, not at the next frame boundary. A suite that sends
+    /// this line waits for the editor it launched, and one frame of delay would
+    /// make the assertion race the launch. The body is the one the frame drain
+    /// calls, so the two paths differ only in when they run.
     pub(super) fn scripted_problem_open(&mut self, index: usize) {
         info!(
             target: telemetry_target::ENGINE,
@@ -2008,17 +2131,18 @@ impl EditorWindow {
         self.open_problem(index);
     }
 
-    /// Run `editor.redo` from the scripted channel: the same walk, queueing
-    /// the next step's forward batch.
+    /// Runs `editor.redo` from the scripted channel: the same walk, which
+    /// queues the next step's forward batch.
     pub(super) fn scripted_redo(&mut self) {
         drain::step_history(self.host.host_mut().engine_mut(), HistoryDirection::Redo);
     }
 
-    /// `scene new|open|save` from the scripted channel: the same command the
-    /// File menu queues, applied at the next frame boundary.
+    /// Runs `scene new`, `scene open` or `scene save` from the scripted channel:
+    /// the same command the File menu queues, applied at the next frame
+    /// boundary.
     ///
-    /// Document commands are not recorded - they replace the world rather than
-    /// edit it - so the batch is queued unrecorded.
+    /// Document commands are not recorded, because they replace the world
+    /// instead of editing it, so the batch is queued unrecorded.
     pub(super) fn scripted_scene(&mut self, command: EditorCommand) {
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
@@ -2026,8 +2150,8 @@ impl EditorWindow {
         }
     }
 
-    /// The scripted asset selection: the same shared resource an Assets row
-    /// click writes, logged so a suite can watch either path.
+    /// Sets the scripted asset selection: the same shared resource an Assets row
+    /// click writes. The line is logged so a suite can watch either path.
     pub(super) fn scripted_select_asset(&mut self, path: &str) {
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
@@ -2040,42 +2164,50 @@ impl EditorWindow {
         );
     }
 
-    /// The scripted entity selection: the same recorded step the Entities
+    /// Sets the scripted entity selection: the same recorded step the Entities
     /// tab's row click queues, resolved against the live entity table.
     ///
-    /// A screen-space click cannot re-select an entity a gizmo drag moved;
-    /// the handle a pick logged still resolves here.
-    pub(super) fn scripted_select_entity(&mut self, handle: &str) -> Result<(), String> {
-        // A plain click is the reset shape of the same rule, so the two scripted
+    /// A screen-space click cannot re-select an entity that a gizmo drag moved,
+    /// but the handle a pick logged still resolves here.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the display handle names no entity.
+    pub(super) fn scripted_select_entity(&mut self, entity_text: &str) -> Result<(), String> {
+        // A plain click is the reset form of the same rule, so the two scripted
         // verbs and the pointer path share one path.
-        self.scripted_select_extend(handle, SelectionClick::Reset)
+        self.scripted_select_extend(entity_text, SelectionClick::Reset)
     }
 
-    /// The scripted selection extension (`select add` / `select range`): the
-    /// set a Ctrl- or Shift-click on the Entities list produces, recorded as
-    /// the same single `SetSelection` step the row click queues.
+    /// Extends the scripted selection (`select add` / `select range`): the set a
+    /// Ctrl- or Shift-click on the Entities list produces, recorded as the same
+    /// single `SetSelection` step the row click queues.
     ///
     /// The click rule itself lives in the core's `EditorSelection::clicked`, so
     /// the pointer path and this channel cannot disagree about what a click
-    /// means; what the modifiers do is the shell's `click_from_modifiers`.
+    /// means. What the modifiers do is the shell's `click_from_modifiers`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the display handle names no entity.
     pub(super) fn scripted_select_extend(
         &mut self,
-        handle: &str,
+        entity_text: &str,
         click: SelectionClick,
     ) -> Result<(), String> {
         let world = self.host.host_mut().engine_mut().world_mut();
-        let Some(entity) = resolve_display_entity(world, handle) else {
-            return Err(format!("no entity named '{handle}'"));
+        let Some(entity) = resolve_display_entity(world, entity_text) else {
+            return Err(format!("no entity named '{entity_text}'"));
         };
         // The Entities list's row order, which a range click reads.
-        let rows: Vec<Entity> = world
+        let entity_rows: Vec<Entity> = world
             .get_resource::<EditorSnapshot>()
             .map(|snapshot| snapshot.entities.iter().map(|row| row.entity).collect())
             .unwrap_or_default();
         let Some(selection) = world.get_resource::<EditorSelection>() else {
             return Ok(());
         };
-        let entities = selection.clicked(click, entity, &rows);
+        let entities = selection.clicked(click, entity, &entity_rows);
         let asset = selection.asset.clone();
         let count = entities.len();
         let label = match click {
@@ -2098,28 +2230,29 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// `select resource <name>`: the recorded selection a resource row makes.
-    pub(super) fn scripted_select_resource(&mut self, name: &str) {
+    /// Runs `select resource <name>`: the recorded selection a resource row
+    /// makes.
+    pub(super) fn scripted_select_resource(&mut self, resource_name: &str) {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() else {
             return;
         };
         pending.push_recorded(
             vec![EditorCommand::SelectResource {
-                resource: Some(name.to_string()),
+                resource: Some(resource_name.to_string()),
             }],
-            format!("select resource {name}"),
+            format!("select resource {resource_name}"),
             None,
         );
         info!(
             target: telemetry_target::ENGINE,
-            resource = name,
+            resource = resource_name,
             "[editor] resource selection queued"
         );
     }
 
-    /// Run `editor.step` from the scripted channel: queue one single step -
-    /// applied, never recorded, the same walk the Step button takes.
+    /// Runs `editor.step` from the scripted channel: it queues one single step,
+    /// applied but never recorded. That is the same walk the Step button takes.
     pub(super) fn scripted_step(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
@@ -2128,67 +2261,77 @@ impl EditorWindow {
         info!(target: telemetry_target::ENGINE, "[editor] step queued");
     }
 
-    /// One Assets toolbar button, driven by the scripted channel: the same
-    /// core helpers the buttons call, enablement rules included.
+    /// Runs one Assets toolbar button from the scripted channel, through the
+    /// same core helpers the buttons call, enablement rules included.
     pub(super) fn scripted_toolbar(&mut self, action: ToolbarAction) {
-        // The rows, the types and the selection the helpers read, cloned
-        // out first: the world's mutable resources are borrowed below.
-        let (rows, types, selected) = {
+        // Step 1: Clone out the rows, the types and the selection the helpers
+        // read, because the world's mutable resources are borrowed below.
+        let (asset_rows, standalone_types, selected_asset_path) = {
             let world = self.host.host_mut().engine_mut().world_mut();
-            let (rows, types) = match world.get_resource::<EditorSnapshot>() {
+            let (asset_rows, standalone_types) = match world.get_resource::<EditorSnapshot>() {
                 Some(snapshot) => (snapshot.assets.clone(), snapshot.standalone_types.clone()),
                 None => (Vec::new(), Vec::new()),
             };
-            let selected = world
+            let selected_asset_path = world
                 .get_resource::<EditorSelection>()
                 .and_then(|selection| selection.asset.clone());
-            (rows, types, selected)
+            (asset_rows, standalone_types, selected_asset_path)
         };
-        // A view of the selection for the shared asset helpers: only the asset
-        // half is theirs, and the entity set is empty because nothing here
-        // acts on entities.
+        // Step 2: Build a selection view for the shared asset helpers. Only the
+        // asset half belongs to them, and the entity set is empty because
+        // nothing here acts on entities.
         let mut selection = EditorSelection::default();
-        selection.asset = selected;
+        selection.asset = selected_asset_path;
+        // Step 3: Run the chosen button through its shared helper.
         match action {
             ToolbarAction::Create => {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 if let Some(state) = world.get_resource_mut::<EguiShellState>() {
-                    assets::open_create(&mut state.asset_dialog, &selection, &rows, &types);
+                    assets::open_create(
+                        &mut state.asset_dialog,
+                        &selection,
+                        &asset_rows,
+                        &standalone_types,
+                    );
                 }
             }
             ToolbarAction::Rename => {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 if let Some(state) = world.get_resource_mut::<EguiShellState>() {
-                    assets::open_rename(&mut state.asset_dialog, &selection, &rows);
+                    assets::open_rename(&mut state.asset_dialog, &selection, &asset_rows);
                 }
             }
             ToolbarAction::Delete => {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-                    assets::delete_selection(pending, &selection, &rows);
+                    assets::delete_selection(pending, &selection, &asset_rows);
                 }
             }
             ToolbarAction::Meta => {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-                    assets::write_meta_selection(pending, &selection, &rows);
+                    assets::write_meta_selection(pending, &selection, &asset_rows);
                 }
             }
         }
     }
 
-    /// Run `editor.undo` from the scripted channel: the shared core walk pops
-    /// the newest step and queues its inverse - applied, never recorded, the
-    /// same walk the browser editor and the native editor take.
+    /// Runs `editor.undo` from the scripted channel. The shared core walk pops
+    /// the newest step and queues its inverse, applied but never recorded, which
+    /// is the same walk the browser editor and the native editor take.
     pub(super) fn scripted_undo(&mut self) {
         drain::step_history(self.host.host_mut().engine_mut(), HistoryDirection::Undo);
     }
 
-    /// Queue a scripted left-button drag: the press, the move
-    /// and the release arrive one per frame through
-    /// [`Self::advance_scripted_drag`], the shape egui's drag detection
-    /// needs. The same engine input seam a real drag enters, so a panel's
-    /// drag handle reacts exactly as it does for a user.
+    /// Queues a scripted left-button drag. The press, the move and the release
+    /// arrive one per frame through [`Self::advance_scripted_drag`], which is
+    /// the shape egui's drag detection needs. The events enter through the same
+    /// input path a real drag enters, so a panel's drag handle reacts exactly as
+    /// it does for a user.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a scripted drag is already in flight.
     pub(super) fn start_scripted_drag(
         &mut self,
         from: (f32, f32),

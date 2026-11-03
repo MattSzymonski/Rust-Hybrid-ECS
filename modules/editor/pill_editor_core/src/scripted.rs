@@ -9,22 +9,24 @@
 //!
 //! # Design
 //!
-//! The vocabulary is the suites' API: `test_editor_egui.py` writes these
+//! The vocabulary is the suites' API. `test_editor_egui.py` writes these
 //! lines, so a verb name or an argument order cannot change without the suite
-//! noticing. Both editors parse with this module and dispatch what their
-//! posture can run; a verb a posture cannot run is refused through the same
+//! noticing. Both editors parse with this module and run only what their
+//! posture can. A verb a posture cannot run is refused with the same
 //! `[editor] scripted command rejected` line the Python side raises on. The
-//! module names only model types, so the browser build can link it.
+//! module names model types only, so the browser build can link it.
 //!
-//! Arguments are whitespace-separated words, except a trailing free-text
-//! value (`edit set`, a path, a name), which takes the rest of the line so it
-//! keeps its spaces; surrounding double quotes are removed and a backslash
-//! escapes the character after it. A path that is *not* the last argument
+//! Arguments are whitespace-separated words. A trailing free-text value
+//! (`edit set`, a path, a name) takes the rest of the line and keeps its
+//! spaces. One surrounding pair of double quotes is removed, and a backslash
+//! escapes the character after it. A path that is not the last argument
 //! (`edit asset move <from> <to>`, `edit asset create <type> <folder> <name>`)
-//! keeps its spaces by being quoted, which is what the cursor's `path` reader
-//! reads; a bare path in one of those positions stops at the first space. `key
-//! <chord>` takes `ctrl`, `shift`, `alt` or `super` joined with `+`, then a
-//! letter, a digit, `f1`..`f24` or a named editing key from [`key_code_name`].
+//! keeps its spaces only when it is quoted, because the cursor's `path`
+//! reader stops a bare path at the first space.
+//!
+//! `key <chord>` joins `ctrl`, `shift`, `alt` or `super` (`control`, `win`
+//! and `cmd` work too) with `+`, then names a letter, a digit, `f1`..`f24` or
+//! a named editing key from [`key_code_name`].
 
 // External crates
 use pill_engine::KeyCode;
@@ -46,7 +48,8 @@ use crate::layout::EditorTab;
 pub enum ScriptedCommand {
     /// `quit` - leave the editor through its own quit path.
     Quit,
-    /// `palette ...` - what the suite asks of the command palette.
+    /// `palette [<query>]`, `palette run`, `palette close` - open the command
+    /// palette, run its selected row, or close it.
     Palette(PaletteRequest),
     /// `console filter <level>` - the lowest level the Console tab shows.
     ConsoleFilter(String),
@@ -56,11 +59,12 @@ pub enum ScriptedCommand {
     ProblemOpen(usize),
     /// `safe_mode retry` - press the safe-mode panel's Retry button.
     SafeModeRetry,
-    /// `panel unload <source>` - drop one module's liveness marker, the state
-    /// its unload leaves: its panels read "module not loaded".
+    /// `panel unload <source>` - drop one module's liveness marker (the value
+    /// that says the module is loaded), so its panels read "module not
+    /// loaded" as they do after an unload.
     PanelUnload(String),
-    /// `panel restore <source>` - bind that module's panels again, the state a
-    /// reload leaves.
+    /// `panel restore <source>` - bind that module's panels to a fresh
+    /// liveness marker, as a reload's re-registration does.
     PanelRestore(String),
     /// `panel window <slot> <id>` - ask the panel in that slot to open the
     /// window it calls `id`, as clicking its own button would.
@@ -88,12 +92,12 @@ pub enum ScriptedCommand {
         /// The point's y in physical pixels.
         y: f32,
     },
-    /// `drag <x1> <y1> <x2> <y2>` - a left-button drag: press, move and
-    /// release arrive one per frame.
+    /// `drag <x1> <y1> <x2> <y2>` - a left-button drag. The press, the move
+    /// and the release each arrive in their own frame.
     Drag {
-        /// Where the press lands.
+        /// The point the press starts at.
         from: (f32, f32),
-        /// Where the release lands.
+        /// The point the release happens at.
         to: (f32, f32),
     },
     /// `gizmo drag <axis|plane> <dx> <dy>` - press a handle and drag it.
@@ -138,9 +142,9 @@ pub enum ScriptedCommand {
     },
     /// `hover ui <x> <y>` - move the shell's own pointer, as a real move would.
     ///
-    /// The UI's hover state is egui's, and egui learns a position from an
-    /// event: this is how a suite makes a tooltip or a cursor appear without
-    /// a mouse.
+    /// The hover state belongs to egui, and egui learns a position only from
+    /// an event. This line is how a suite makes a tooltip or a cursor appear
+    /// without a mouse.
     HoverUi {
         /// The pointer's x in physical pixels.
         x: f32,
@@ -297,12 +301,12 @@ pub enum ScriptedCommand {
         /// The candidate's path, as the Assets panel lists it.
         candidate: String,
     },
-    /// `popout <tab>` - move a tab into its own OS window;
-    /// `popout <tab> redock` puts it back in the dock.
+    /// `popout <tab>` - move a tab into its own OS window. Add `redock` to put
+    /// the tab back in the dock instead.
     Popout {
         /// The tab to move.
         tab: EditorTab,
-        /// Whether to put it back instead.
+        /// Whether to put the tab back in the dock instead of floating it.
         redock: bool,
     },
     /// `command editor.pause_toggle` - flip the engine's pause flag.
@@ -335,8 +339,9 @@ pub enum ScriptedCommand {
 
 /// What a `palette` line asks of the command palette.
 ///
-/// The suite drives the palette's model rather than its pixels: the popup's
-/// own keys (arrows, Enter, Escape) take the same state changes a person's do.
+/// The command changes the palette's state, not its pixels. The popup's own
+/// keys (arrows, Enter, Escape) make the same changes that a person's presses
+/// make.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteRequest {
     /// Open the palette with this query in the field.
@@ -354,14 +359,15 @@ pub enum Dump {
     Tabs,
     /// `dump scenes` - the scene view rectangles and the game view's.
     Scenes,
-    /// `dump viewport` - the viewport's rectangles and chips.
+    /// `dump viewport` - the active view, the interaction state, the hovered
+    /// handle and every view's camera.
     Viewport,
     /// `dump grid` - the scene grid's switch and the surfaces it draws on.
     Grid,
     /// `dump assets` - the asset listing's rows.
     Assets,
-    /// `dump engine-assets` - the store's own assets no file backs, which a
-    /// picker offers beside the listing's rows.
+    /// `dump engine-assets` - the assets the store holds that no file backs,
+    /// which a picker offers beside the listing's rows.
     EngineAssets,
     /// `dump browser` - the project browser's open folder and open rows.
     Browser,
@@ -371,8 +377,9 @@ pub enum Dump {
     Systems,
     /// `dump preferences` - the preferences document and the live halves.
     Preferences,
-    /// `dump theme` - the theme the editor paints with, its layers and the
-    /// generation that produced it.
+    /// `dump theme` - the theme the editor paints with, the layers it was
+    /// merged from, and the generation number that moves when they resolve
+    /// again.
     Theme,
     /// `dump console` - the Console tab's filters and the rows they leave.
     Console,
@@ -386,8 +393,8 @@ pub enum Dump {
     Panels,
     /// `dump windows` - the panel windows on screen.
     Windows,
-    /// `dump entities` - the entity list with each row's component names:
-    /// what a collection test needs to find its subject.
+    /// `dump entities` - the entity list with each row's component names,
+    /// which is what a collection test needs to find its subject.
     Entities,
     /// `dump selection` - the selected entities, primary last.
     Selection,
@@ -438,7 +445,7 @@ pub enum AssetEdit {
     Move {
         /// The file's current project-relative path.
         from: String,
-        /// Where it moves to.
+        /// The project-relative path the file moves to.
         to: String,
     },
     /// `edit asset meta <path>` - write one file's `.meta` sidecar.
@@ -464,7 +471,7 @@ pub struct KeyChord {
 }
 
 impl KeyChord {
-    /// The chord's canonical text, as the log line and a suite read it:
+    /// The chord written out, as the log line and a suite read it:
     /// `ctrl+shift+z`, `w`.
     pub fn label(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
@@ -486,12 +493,12 @@ impl KeyChord {
 
     /// The character the chord types into a text field, when it types one.
     ///
-    /// A letter, a digit or the space bar types its character - Shift types
-    /// the capital of a letter, exactly as the key would - while a chord that
-    /// holds Control, Alt or Super is a command, and the named keys (Enter,
-    /// Tab, Delete, the arrows) act rather than type. A shifted digit types
-    /// nothing: the number row's symbols are not in the key-name table, and
-    /// typing the unshifted digit would be the wrong character.
+    /// A letter, a digit or the space bar types its character. Shift types
+    /// the capital of a letter, as the real key would. A chord that holds
+    /// Control, Alt or Super is a command and types nothing, and the named
+    /// keys (Enter, Tab, Delete, the arrows) act instead of typing. A shifted
+    /// digit also types nothing: the number row's symbols are not in the
+    /// key-name table, and the unshifted digit would be the wrong character.
     pub fn typed_character(&self) -> Option<char> {
         if self.control || self.alt || self.super_key {
             return None;
@@ -514,12 +521,13 @@ impl KeyChord {
 /// Why a scripted line could not be parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError {
-    /// The sentence the runner logs beside the line: what the verb needs.
+    /// The sentence the runner logs beside the line, which says what the verb
+    /// needs.
     pub reason: String,
 }
 
 impl ParseError {
-    /// An error with that sentence.
+    /// One error carrying `reason`.
     fn new(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
@@ -534,9 +542,14 @@ impl ParseError {
 impl ScriptedCommand {
     /// Parse one line of the scripted command file.
     ///
-    /// Unknown verbs, unknown targets and missing or malformed arguments are
-    /// errors; the caller logs the line and the reason, so a suite sees a
+    /// The caller logs the line and the returned reason, so a suite sees a
     /// refusal instead of waiting out its timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ParseError`] when the line is empty, when the verb or one
+    /// of its targets is unknown, and when an argument the verb needs is
+    /// missing or malformed. Its reason says what the verb expects.
     pub fn parse(line: &str) -> Result<ScriptedCommand, ParseError> {
         let mut cursor = Cursor::new(line);
         let Some(verb) = cursor.word() else {
@@ -558,7 +571,7 @@ impl ScriptedCommand {
                 Ok(ScriptedCommand::ActivateTab(tab))
             }
             // `popout <tab>` moves a tab into its own OS window, and
-            // `popout <tab> redock` brings it back.
+            // `popout <tab> redock` moves it back into the dock.
             "popout" => {
                 let tab = tab(&mut cursor, "popout needs a tab name")?;
                 let redock = match cursor.word() {
@@ -585,15 +598,15 @@ impl ScriptedCommand {
                 cursor.finish(verb)?;
                 Ok(ScriptedCommand::RightClick { x, y })
             }
-            // `drag x1 y1 x2 y2` is a pointer gesture; `drag out <path>` hands
-            // one file to the OS drag, which ends at once when no mouse
-            // button is held - safe to drive from the file.
+            // `drag x1 y1 x2 y2` is a pointer gesture. `drag out <path>` hands
+            // one file to the OS drag. No mouse button is held there, so the
+            // drag ends at once and is safe to drive from the file.
             "drag" => {
-                let drag_out = {
+                let is_drag_out = {
                     let rest = cursor.rest();
                     rest == "out" || rest.starts_with("out ")
                 };
-                if drag_out {
+                if is_drag_out {
                     cursor.word();
                     let path = cursor.text("drag out needs a path")?;
                     Ok(ScriptedCommand::DragOut(path))
@@ -605,10 +618,8 @@ impl ScriptedCommand {
                 }
             }
             "gizmo" => gizmo(&mut cursor),
-            // `palette <query>` opens the palette with the query typed in;
-            // `palette run` and `palette close` drive the open palette.
             // `console filter <level>` and `console search <text>` set the
-            // Console tab's filters; the executable applies them next frame.
+            // Console tab's filters. The executable applies them next frame.
             "console" => match cursor.word() {
                 Some("filter") => {
                     let level = cursor
@@ -626,7 +637,7 @@ impl ScriptedCommand {
                 )),
             },
             // `problem open <index>` opens a Problems row the way a click
-            // does; the executable spawns the configured editor.
+            // does, which makes the executable spawn the configured editor.
             // `safe_mode retry` presses the safe-mode panel's Retry button,
             // which the executable draws only while no shell is loaded.
             "safe_mode" => match cursor.word() {
@@ -645,8 +656,8 @@ impl ScriptedCommand {
                 _ => Err(ParseError::new("problem needs `open <index>`")),
             },
             // `reveal <path>` is the row menu's show-in-file-manager action,
-            // driven from the channel: the executable resolves the key and
-            // opens the file manager.
+            // driven from the channel. The executable looks the file up and
+            // opens the file manager on it.
             "reveal" => {
                 let path = cursor.text("reveal needs a path")?;
                 Ok(ScriptedCommand::Reveal(path))
@@ -677,8 +688,8 @@ impl ScriptedCommand {
                         id: id.to_string(),
                     })
                 }
-                // The write a panel's own row queues, driven from the test
-                // channel instead of the pointer.
+                // The write one of a panel's own rows queues, driven from the
+                // test channel instead of from the pointer.
                 Some("field") => {
                     let reason = "panel field needs a component, a field and a value";
                     let component = cursor.word().ok_or_else(|| ParseError::new(reason))?;
@@ -694,6 +705,8 @@ impl ScriptedCommand {
                     "panel needs `unload <module>`, `restore <module>`, `window <slot> <id>` or `field <component> <field> <value>`",
                 )),
             },
+            // `palette <query>` opens the palette with the query typed in,
+            // and `palette run` and `palette close` drive the open palette.
             "palette" => {
                 let first = cursor.word();
                 let tail = cursor.rest();
@@ -716,8 +729,8 @@ impl ScriptedCommand {
                 cursor.finish(verb)?;
                 Ok(ScriptedCommand::Key(chord))
             }
-            // The OS drop, driven from the file: winit's own events cannot be
-            // synthesised from here, and this calls the handler they call.
+            // The OS drop, driven from the file. winit's own events cannot be
+            // synthesised from here, so this calls the handler they call.
             "drop" => {
                 let path = cursor.text("drop needs a path")?;
                 Ok(ScriptedCommand::Drop(path))
@@ -727,15 +740,15 @@ impl ScriptedCommand {
                     let path = cursor.text("hover file needs a path")?;
                     Ok(ScriptedCommand::HoverFile(path))
                 }
-                // The shell's own pointer: the UI's hover state, which the
-                // scene hover below never touches.
+                // The shell's own pointer, which sets the UI's hover state.
+                // The scene hover below never touches that state.
                 Some("ui") => {
                     let x = number(&mut cursor, "hover ui needs an x")?;
                     let y = number(&mut cursor, "hover ui needs a y")?;
                     cursor.finish(verb)?;
                     Ok(ScriptedCommand::HoverUi { x, y })
                 }
-                // The view index was the word just read, so the numbers that
+                // The word just read was the view index, so the numbers that
                 // follow it are the pointer position.
                 other => {
                     let view = match other {
@@ -814,13 +827,18 @@ impl ScriptedCommand {
 }
 
 /// `scene new|open <path>|save [<path>]`.
+///
+/// # Errors
+///
+/// Returns an error when the action is missing or unknown, and when `open`
+/// names no path.
 fn scene_action(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
     let command = match cursor.word() {
         Some("new") => ScriptedCommand::SceneNew,
         Some("open") => {
-            // The rest of the line, so a path with spaces in it parses - the
-            // header promises as much, and `save` next door already reads it
-            // that way.
+            // Take the rest of the line, so a path with spaces in it parses.
+            // The header promises as much, and `save` below reads a path the
+            // same way.
             let path = cursor.text("scene open needs a .scene path")?;
             ScriptedCommand::SceneOpen(path)
         }
@@ -845,6 +863,12 @@ fn scene_action(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> 
 }
 
 /// `gizmo drag|press|release|<tool>`.
+///
+/// # Errors
+///
+/// Returns an error when the action or the target is missing, and when the
+/// target is not a tool, an axis or a plane. A drag also fails when its two
+/// deltas are missing or not numbers.
 fn gizmo(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
     match cursor.word() {
         Some("drag") => {
@@ -885,6 +909,11 @@ fn gizmo(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
 }
 
 /// `camera orbit|pan <dx> <dy>`, `camera dolly <dy>`, `camera zoom <lines>`.
+///
+/// # Errors
+///
+/// Returns an error when the gesture is missing or unknown, and when the
+/// numbers it reads are missing or not numbers.
 fn camera(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
     let action = cursor
         .word()
@@ -920,6 +949,11 @@ fn camera(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
 }
 
 /// `dump <target>` and `dump field <entity> <component> <field>`.
+///
+/// # Errors
+///
+/// Returns an error when the target is missing or unknown, and one naming
+/// the missing arguments when a `field` line is short of them.
 fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
     let target = cursor
         .word()
@@ -965,6 +999,11 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
 }
 
 /// `dialog set name <text>` and `dialog submit`.
+///
+/// # Errors
+///
+/// Returns an error when the action is neither `set name` nor `submit`, and
+/// when the name text is missing.
 fn dialog(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
     match cursor.word() {
         Some("set") => match cursor.word() {
@@ -984,6 +1023,11 @@ fn dialog(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
 
 /// `pick entity <entity> <component> <field>`: arm an entity reference row, so
 /// the next scene click names its reference.
+///
+/// # Errors
+///
+/// Returns an error when the target is neither `entity` nor `reference`, and
+/// when one of the three arguments that follow is missing.
 fn pick(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
     match cursor.word() {
         Some("entity") => {
@@ -998,7 +1042,7 @@ fn pick(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
                 field: field.to_string(),
             })
         }
-        // `pick reference <asset> <key> <candidate>`: the choice a picker row
+        // `pick reference <asset> <key> <candidate>` - the choice a picker row
         // makes, by candidate path instead of by click.
         Some("reference") => {
             let reason = "pick reference needs an asset, a key and a candidate";
@@ -1016,6 +1060,11 @@ fn pick(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
 }
 
 /// `edit <target>` and its sub-grammars.
+///
+/// # Errors
+///
+/// Returns an error when the target is missing or unknown, when one of its
+/// arguments is missing, and when an index is not a number.
 fn edit(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
     match cursor.word() {
         Some("asset") => {
@@ -1130,6 +1179,12 @@ fn edit(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
 }
 
 /// `edit asset create|delete|move|meta`.
+///
+/// # Errors
+///
+/// Returns an error when the action is missing or unknown, when its type,
+/// folder, name or destination is missing, and when a quoted path is never
+/// closed.
 fn asset_edit(cursor: &mut Cursor<'_>) -> Result<AssetEdit, ParseError> {
     let reason = "edit asset needs create, delete, move or meta with its arguments";
     let action = cursor
@@ -1165,6 +1220,11 @@ fn asset_edit(cursor: &mut Cursor<'_>) -> Result<AssetEdit, ParseError> {
 }
 
 /// `command <id>` - the recorded editor actions the suites drive.
+///
+/// # Errors
+///
+/// Returns an error when the id is missing, or names an action this editor
+/// does not run; the reason quotes the id.
 fn command(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
     let id = cursor
         .word()
@@ -1197,6 +1257,11 @@ fn command(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
 }
 
 /// `toolbar <action>`.
+///
+/// # Errors
+///
+/// Returns an error when the word is missing or is not one of the four
+/// toolbar buttons.
 fn toolbar_action(cursor: &mut Cursor<'_>) -> Result<ToolbarAction, ParseError> {
     let reason = "toolbar needs create, rename, delete or meta";
     match cursor.word().ok_or_else(|| ParseError::new(reason))? {
@@ -1209,9 +1274,20 @@ fn toolbar_action(cursor: &mut Cursor<'_>) -> Result<ToolbarAction, ParseError> 
 }
 
 /// `key <chord>`, the modifiers joined to the key with `+`.
+///
+/// # Errors
+///
+/// Returns an error when the chord is missing, when a part before the key is
+/// not a modifier, and when the last part is not a key name. A chord that
+/// ends in `+` is malformed rather than unknown, and gets the general reason.
 fn chord(cursor: &mut Cursor<'_>) -> Result<KeyChord, ParseError> {
     let reason = "key needs a chord, like ctrl+z or w";
+    // Step 1: read the chord word.
     let text = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+
+    // Step 2: start a chord with no modifiers held, then read the
+    // `+`-separated parts. Every part except the last is a modifier, and the
+    // last one names the key.
     let mut chord = KeyChord {
         key: KeyCode::Escape,
         control: false,
@@ -1222,10 +1298,10 @@ fn chord(cursor: &mut Cursor<'_>) -> Result<KeyChord, ParseError> {
     let mut parts = text.split('+').peekable();
     let mut key = None;
     while let Some(part) = parts.next() {
-        let last = parts.peek().is_none();
-        if last {
-            // A trailing `+` leaves no key name: that is the chord form being
-            // wrong, not an unknown key, so it reads as the generic reason.
+        let is_last = parts.peek().is_none();
+        if is_last {
+            // A trailing `+` leaves no key part. That is a malformed chord
+            // rather than an unknown key name, so it gets the general reason.
             if part.is_empty() {
                 return Err(ParseError::new(reason));
             }
@@ -1249,6 +1325,8 @@ fn chord(cursor: &mut Cursor<'_>) -> Result<KeyChord, ParseError> {
             }
         }
     }
+
+    // Step 3: a chord always names a key.
     chord.key = key.ok_or_else(|| ParseError::new(reason))?;
     Ok(chord)
 }
@@ -1308,7 +1386,7 @@ fn key_code(name: &str) -> Option<KeyCode> {
     }
 }
 
-/// The canonical name of a key, for [`KeyChord::label`].
+/// The name a key prints as, for [`KeyChord::label`].
 fn key_code_name(key: KeyCode) -> &'static str {
     match key {
         KeyCode::KeyA => "a",
@@ -1446,7 +1524,8 @@ fn digit_key(character: char) -> Option<KeyCode> {
 // Cursor
 // =============================================================================
 
-/// The words of one line and what is left of it after each is taken.
+/// A position in one line, holding the text left after the words taken so
+/// far.
 struct Cursor<'a> {
     rest: &'a str,
 }
@@ -1478,6 +1557,10 @@ impl<'a> Cursor<'a> {
 
     /// Everything left, trimmed, with one surrounding `"..."` pair removed
     /// and its escapes resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns `reason` when the line has nothing left on it.
     fn text(&mut self, reason: &str) -> Result<String, ParseError> {
         let rest = self.rest.trim();
         if rest.is_empty() {
@@ -1491,7 +1574,12 @@ impl<'a> Cursor<'a> {
     ///
     /// A path is not always the last argument, so it cannot take the rest of
     /// the line the way [`Cursor::text`] does. The quoted form is how one in
-    /// the middle keeps a space; the bare form stops at the first one.
+    /// the middle keeps a space, and the bare form stops at the first one.
+    ///
+    /// # Errors
+    ///
+    /// Returns `reason` when no path is left, and its own sentence when a
+    /// quoted path is never closed.
     fn path(&mut self, reason: &str) -> Result<String, ParseError> {
         let rest = self.rest.trim();
         if let Some(body) = rest.strip_prefix('"') {
@@ -1500,9 +1588,9 @@ impl<'a> Cursor<'a> {
                 match character {
                     '\\' if !escaped => escaped = true,
                     '"' if !escaped => {
-                        let length = index + 2;
-                        self.take(length);
-                        return Ok(unquote(&rest[..length]));
+                        let quoted_length = index + 2;
+                        self.take(quoted_length);
+                        return Ok(unquote(&rest[..quoted_length]));
                     }
                     _ => escaped = false,
                 }
@@ -1527,6 +1615,11 @@ impl<'a> Cursor<'a> {
     }
 
     /// Refuses whatever is left after a verb took its arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming `verb` and the leftover text when the line has
+    /// words the verb did not take.
     fn finish(&self, verb: &str) -> Result<(), ParseError> {
         let rest = self.rest.trim();
         if rest.is_empty() {
@@ -1538,30 +1631,35 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// One surrounding pair of double quotes removed, and `\"` / `\\` resolved.
+/// One surrounding pair of double quotes removed, with a backslash escaping
+/// the character after it.
 fn unquote(text: &str) -> String {
-    let Some(inner) = text
+    let Some(text_between_quotes) = text
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
     else {
         return text.to_string();
     };
-    let mut value = String::with_capacity(inner.len());
-    let mut characters = inner.chars();
+    let mut unquoted_text = String::with_capacity(text_between_quotes.len());
+    let mut characters = text_between_quotes.chars();
     while let Some(character) = characters.next() {
         if character != '\\' {
-            value.push(character);
+            unquoted_text.push(character);
             continue;
         }
         match characters.next() {
-            Some(escaped) => value.push(escaped),
-            None => value.push('\\'),
+            Some(escaped) => unquoted_text.push(escaped),
+            None => unquoted_text.push('\\'),
         }
     }
-    value
+    unquoted_text
 }
 
 /// The next word as a tab name.
+///
+/// # Errors
+///
+/// Returns `reason` when the next word is missing or is not a tab name.
 fn tab(cursor: &mut Cursor<'_>, reason: &str) -> Result<EditorTab, ParseError> {
     cursor
         .word()
@@ -1570,6 +1668,11 @@ fn tab(cursor: &mut Cursor<'_>, reason: &str) -> Result<EditorTab, ParseError> {
 }
 
 /// The next word as a number.
+///
+/// # Errors
+///
+/// Returns `reason` when the next word is missing or does not parse as the
+/// requested number type.
 fn number<T: std::str::FromStr>(cursor: &mut Cursor<'_>, reason: &str) -> Result<T, ParseError> {
     cursor
         .word()
@@ -1578,15 +1681,22 @@ fn number<T: std::str::FromStr>(cursor: &mut Cursor<'_>, reason: &str) -> Result
 }
 
 /// The next two words as a point or a delta.
+///
+/// # Errors
+///
+/// Returns `reason` when either of the two words is missing or is not a
+/// number.
 fn point(cursor: &mut Cursor<'_>, reason: &str) -> Result<(f32, f32), ParseError> {
     let x = number(cursor, reason)?;
     let y = number(cursor, reason)?;
     Ok((x, y))
 }
 
-/// The tab a scripted name selects: [`EditorTab::from_wire`], the one parser
-/// every side of the editor shares, so a name this channel accepts is a name
-/// the dock and the popout map accept too.
+/// The tab a scripted name selects.
+///
+/// It reads the name with [`EditorTab::from_wire`], the parser every side of
+/// the editor shares. A name this channel accepts is therefore a name the
+/// dock and the popout map accept.
 fn tab_by_name(name: &str) -> Option<EditorTab> {
     EditorTab::from_wire(name)
 }
@@ -1625,10 +1735,10 @@ mod tests {
         reason: &'static str,
     }
 
-    /// The chord `w` with no modifiers.
-    fn key(key: KeyCode) -> KeyChord {
+    /// A chord for the key it is given, with no modifiers held.
+    fn unmodified_chord(key_code: KeyCode) -> KeyChord {
         KeyChord {
-            key,
+            key: key_code,
             control: false,
             shift: false,
             alt: false,
@@ -1761,13 +1871,13 @@ mod tests {
             },
             Accept {
                 line: "key w",
-                command: ScriptedCommand::Key(key(KeyCode::KeyW)),
+                command: ScriptedCommand::Key(unmodified_chord(KeyCode::KeyW)),
             },
             Accept {
                 line: "key ctrl+z",
                 command: ScriptedCommand::Key(KeyChord {
                     control: true,
-                    ..key(KeyCode::KeyZ)
+                    ..unmodified_chord(KeyCode::KeyZ)
                 }),
             },
             Accept {
@@ -1775,23 +1885,23 @@ mod tests {
                 command: ScriptedCommand::Key(KeyChord {
                     control: true,
                     shift: true,
-                    ..key(KeyCode::KeyS)
+                    ..unmodified_chord(KeyCode::KeyS)
                 }),
             },
             Accept {
                 line: "key alt+enter",
                 command: ScriptedCommand::Key(KeyChord {
                     alt: true,
-                    ..key(KeyCode::Enter)
+                    ..unmodified_chord(KeyCode::Enter)
                 }),
             },
             Accept {
                 line: "key f2",
-                command: ScriptedCommand::Key(key(KeyCode::F2)),
+                command: ScriptedCommand::Key(unmodified_chord(KeyCode::F2)),
             },
             Accept {
                 line: "key delete",
-                command: ScriptedCommand::Key(key(KeyCode::Delete)),
+                command: ScriptedCommand::Key(unmodified_chord(KeyCode::Delete)),
             },
             Accept {
                 line: "dump tabs",
@@ -1962,9 +2072,9 @@ mod tests {
                 command: ScriptedCommand::HoverUi { x: 640.0, y: 312.0 },
             },
             Accept {
-                // Reserved for the shell's reference rows: armed here, named by
-                // the next scene press. No suite drives it, so the table is the
-                // only thing that pins the arm.
+                // Reserved for the shell's reference rows: the line arms the
+                // row, and the next scene press names it. No suite drives it,
+                // so this table is the only place the arm runs.
                 line: "pick entity 3v1 ShowcaseComponent note",
                 command: ScriptedCommand::PickEntity {
                     entity: "3v1".to_string(),
@@ -1989,9 +2099,9 @@ mod tests {
                 command: ScriptedCommand::SelectAdd("3v2".to_string()),
             },
             Accept {
-                // Reserved for the shell's Entities list: the native runner
+                // Reserved for the shell's Entities list. The native runner
                 // answers it, the browser editor refuses it by name, and no
-                // suite drives it - the table is the only thing that pins it.
+                // suite drives it, so this table is the only place it runs.
                 line: "select range 3v4",
                 command: ScriptedCommand::SelectRange("3v4".to_string()),
             },
@@ -2053,8 +2163,8 @@ mod tests {
                 }),
             },
             Accept {
-                // A path in a non-trailing position keeps its spaces by being
-                // quoted; the destination is the trailing free text.
+                // A path in a position other than the last keeps its spaces
+                // by being quoted. The destination is the trailing free text.
                 line: "edit asset move \"res/my file.mat\" res/other.mat",
                 command: ScriptedCommand::EditAsset(AssetEdit::Move {
                     from: "res/my file.mat".to_string(),
@@ -2218,8 +2328,9 @@ mod tests {
 
     #[test]
     fn quoted_and_padded_values_keep_their_text() {
-        // One surrounding pair of quotes is removed, escapes resolved, and the
-        // value's own spaces survive - the reason the text form exists.
+        // One surrounding pair of quotes is removed, escapes are resolved,
+        // and the value's own spaces survive. That is why the text form
+        // exists.
         assert_eq!(
             ScriptedCommand::parse("edit set 3v1 C f \"  padded  \""),
             Ok(ScriptedCommand::EditSet {
@@ -2339,8 +2450,8 @@ mod tests {
 
     #[test]
     fn the_keys_the_suites_press_are_named() {
-        // The chord table is the API a suite reads: a rename here breaks a
-        // scripted line, so the mapping is pinned.
+        // The chord table is the API a suite reads. Renaming an entry here
+        // breaks a scripted line, so the mapping is fixed.
         assert_eq!(key_code("a"), Some(KeyCode::KeyA));
         assert_eq!(key_code("Z"), Some(KeyCode::KeyZ));
         assert_eq!(key_code("7"), Some(KeyCode::Digit7));
@@ -2355,11 +2466,11 @@ mod tests {
         };
         assert_eq!(chord.label(), "ctrl+alt+k");
         // A plain letter types its character; a command chord does not.
-        assert_eq!(key(KeyCode::KeyW).typed_character(), Some('w'));
+        assert_eq!(unmodified_chord(KeyCode::KeyW).typed_character(), Some('w'));
         assert_eq!(
             KeyChord {
                 control: true,
-                ..key(KeyCode::KeyW)
+                ..unmodified_chord(KeyCode::KeyW)
             }
             .typed_character(),
             None

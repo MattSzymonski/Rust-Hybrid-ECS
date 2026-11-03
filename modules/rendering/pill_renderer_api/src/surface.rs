@@ -1,5 +1,5 @@
-//! Several surfaces per renderer: their identities, how each presents, and
-//! which camera draws into each.
+//! The surfaces one renderer draws into: their identities, how each one
+//! presents, and which camera draws into it.
 //!
 //! # Responsibilities
 //!
@@ -14,17 +14,17 @@
 //! # Design
 //!
 //! Everything here is plain data, so a frontend, the host and any renderer
-//! agree on it without sharing a graphics type. A camera binding may name a
-//! camera entity, or carry the camera itself: the editor's own camera is the
-//! second kind, which is what keeps it out of the world.
+//! agree on it without sharing a graphics type. A camera binding either names
+//! a camera entity or carries the camera itself. The editor's own camera is
+//! the second kind, which keeps it out of the world.
 //!
-//! Presentation pacing belongs to the frontend, because only it knows the
-//! window system: presenting into a Wayland subsurface before the compositor
-//! asks blocks under Mesa's FIFO mode. The frontend therefore tells the
-//! renderer, per surface and per frame, whether that surface may present now
-//! ([`crate::PillRenderer::set_surface_ready`]), and the renderer skips a
-//! surface that may not - one blocked surface never stalls another or the
-//! event loop.
+//! The frontend decides when each surface presents, because only it knows the
+//! window system. Presenting into a Wayland subsurface before the compositor
+//! asks for a frame blocks under Mesa's FIFO mode. So the frontend tells the
+//! renderer, for each surface and each frame, whether that surface may present
+//! now ([`crate::PillRenderer::set_surface_ready`]), and the renderer skips a
+//! surface that may not. One blocked surface never stalls another surface or
+//! the event loop.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -45,12 +45,10 @@ impl SurfaceId {
     pub const PRIMARY: Self = Self(0);
 }
 
-/// How a surface would like to present, from which the renderer picks the
-/// closest mode the surface supports.
+/// How a surface would like to present.
 ///
-/// Vsync is the default because it is the one mode every surface must offer;
-/// the others are honoured only where the surface lists them, and fall back to
-/// vsync otherwise.
+/// The renderer uses the requested mode when the surface supports it, and
+/// vsync otherwise. Vsync is the default because every surface supports it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PresentPreference {
     /// Wait for the display (`Fifo`).
@@ -73,11 +71,11 @@ pub struct SurfaceOptions {
 /// Which camera draws into a surface.
 #[derive(Debug, Clone, Copy)]
 pub enum CameraBinding {
-    /// A camera entity in the world; the surface shows nothing while that
+    /// A camera entity in the world. The surface shows nothing while that
     /// entity has no enabled camera.
     Entity(Entity),
-    /// A camera given as plain data, which is never an entity: the editor's
-    /// own camera, for one.
+    /// A camera given as plain data instead of an entity. The editor's own
+    /// camera is one of these.
     View {
         /// The projection.
         camera: CameraComponent,
@@ -88,21 +86,22 @@ pub enum CameraBinding {
 
 /// The camera bindings of every surface, by surface id.
 ///
-/// A world resource the frontend writes. A surface without an entry is drawn
-/// through the frame's chosen camera when it is the primary one, and not at
-/// all otherwise. An entry for [`SurfaceId::PRIMARY`] overrides the choice the
-/// frame would make among the world's cameras.
+/// The frontend writes this into the world as a resource. A surface with no
+/// entry draws through the frame's chosen camera when it is the primary one,
+/// and draws nothing otherwise. An entry for [`SurfaceId::PRIMARY`] replaces
+/// the choice the frame would make among the world's cameras.
 #[derive(Debug, Clone, Default)]
 pub struct SurfaceCameras {
     /// Binding per surface.
     pub bindings: BTreeMap<SurfaceId, CameraBinding>,
-    /// The scene grid the view-bound surfaces draw; off until a frontend
-    /// turns it on.
+    /// The scene grid the view-bound surfaces draw. It is off until a
+    /// frontend turns it on.
     pub grid: crate::SceneGrid,
 }
 
 impl SurfaceCameras {
-    /// Bind `binding` to `surface`, or remove the surface's binding with `None`.
+    /// Binds `binding` to `surface`, or removes the surface's binding with
+    /// `None`.
     pub fn set(&mut self, surface: SurfaceId, binding: Option<CameraBinding>) {
         match binding {
             Some(binding) => {
@@ -121,8 +120,10 @@ impl Resource for SurfaceCameras {
     }
 }
 
-/// The camera one surface draws through this frame, resolved from its
-/// binding.
+/// The camera one surface draws through this frame.
+///
+/// The frame resolves it from the surface's binding or, for the primary
+/// surface without one, from the world's cameras.
 #[derive(Debug, Clone, Copy)]
 pub struct SurfaceView {
     /// The projection.
@@ -131,11 +132,11 @@ pub struct SurfaceView {
     pub transform: TransformComponent,
 }
 
-/// Resolves one binding against the world's cameras: `cameras` yields each
-/// camera entity with its camera and transform.
+/// Finds the camera a binding names among the world's cameras.
 ///
-/// A [`CameraBinding::View`] resolves to itself; an entity binding resolves to
-/// that entity's camera when the entity is among `cameras` and its camera is
+/// `cameras` yields each camera entity with its camera and transform. A
+/// [`CameraBinding::View`] resolves to itself. An entity binding resolves to
+/// that entity's camera when the entity is in `cameras` and the camera is
 /// enabled, and to `None` otherwise.
 pub fn resolve_camera_binding(
     binding: &CameraBinding,
@@ -180,22 +181,22 @@ mod tests {
         let wanted = world.reserve_entity();
         let other = world.reserve_entity();
         let missing = world.reserve_entity();
-        let enabled = CameraComponent::default();
-        let disabled = CameraComponent {
+        let enabled_camera = CameraComponent::default();
+        let disabled_camera = CameraComponent {
             enabled: false,
             ..Default::default()
         };
         let cameras = || {
             [
-                (other, enabled, TransformComponent::default()),
-                (wanted, enabled, TransformComponent::default()),
+                (other, enabled_camera, TransformComponent::default()),
+                (wanted, enabled_camera, TransformComponent::default()),
             ]
         };
         assert!(resolve_camera_binding(&CameraBinding::Entity(wanted), cameras()).is_some());
         assert!(resolve_camera_binding(&CameraBinding::Entity(missing), cameras()).is_none());
         assert!(resolve_camera_binding(
             &CameraBinding::Entity(wanted),
-            [(wanted, disabled, TransformComponent::default())]
+            [(wanted, disabled_camera, TransformComponent::default())]
         )
         .is_none());
     }

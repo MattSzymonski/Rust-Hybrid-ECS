@@ -2,15 +2,15 @@
 //!
 //! # Responsibilities
 //!
-//! - Provides [`Res<T>`] for immutable singleton resource access from system functions.
-//! - Provides [`ResMut<T>`] for mutable resource access with change-detection tracking.
+//! - Provides [`Res<T>`] to read the world's one value of type `T` from a system.
+//! - Provides [`ResMut<T>`] to read and write that value, with change tracking.
 //!
 //! # Design
 //!
-//! These types implement [`SystemParam`](crate::system::SystemParam) so they
-//! can appear as system function parameters. The scheduler tracks resource
-//! reads and writes for conflict detection, ensuring no two systems obtain
-//! `&mut` to the same resource simultaneously.
+//! These types implement [`SystemParam`](crate::system::SystemParam), so a
+//! system can take them as parameters. The scheduler records which resources
+//! each system reads and writes, so two systems that would conflict on one
+//! resource never run at the same time.
 
 // Current crate
 use crate::query::change_detection::Mut;
@@ -23,9 +23,9 @@ use crate::world::World;
 
 /// Immutable resource access for systems.
 ///
-/// Use `Res<T>` as a system parameter to read a resource without mutation.
-/// The scheduler tracks this as a read and allows multiple systems to
-/// read the same resource in parallel.
+/// Use `Res<T>` as a system parameter to read a resource without changing it.
+/// The scheduler counts this as a read, so several systems can read the same
+/// resource at the same time.
 ///
 /// # Examples
 /// ```no_run
@@ -41,8 +41,8 @@ use crate::world::World;
 pub struct Res<'w, T: Resource> {
     /// The world the resource is fetched from.
     world: &'w World,
-    /// Marks `T` as the resource type targeted by this wrapper.
-    _phantom: std::marker::PhantomData<T>,
+    /// Ties the wrapper to the resource type `T`; the value stays in the world.
+    _resource_type: std::marker::PhantomData<T>,
 }
 
 impl<'w, T: Resource> Res<'w, T> {
@@ -54,7 +54,7 @@ impl<'w, T: Resource> Res<'w, T> {
     pub fn new(world: &'w World) -> Self {
         Self {
             world,
-            _phantom: std::marker::PhantomData,
+            _resource_type: std::marker::PhantomData,
         }
     }
 
@@ -70,15 +70,15 @@ impl<'w, T: Resource> Res<'w, T> {
 // ResMut
 // =============================================================================
 
-/// Mutable resource access for systems - with change-detection tracking.
+/// Mutable resource access for systems, with change tracking.
 ///
-/// Use `ResMut<T>` as a system parameter to read and write a resource.
-/// The scheduler tracks this as a write and prevents other systems from
-/// accessing the same resource in parallel.
+/// Use `ResMut<T>` as a system parameter to read and write a resource. The
+/// scheduler counts this as a write, so no other system that touches the same
+/// resource runs at the same time.
 ///
-/// `get_mut()` returns a [`Mut<'_, T>`] that automatically bumps the
-/// resource's `changed` tick when mutated through `DerefMut`. This lets
-/// other systems (or future frames) detect that the resource was modified.
+/// `get_mut()` returns a [`Mut<'_, T>`]. A write through it sets the
+/// resource's `changed` tick to the current world tick, which is how other
+/// systems see that the value changed.
 ///
 /// # Examples
 /// ```no_run
@@ -87,15 +87,15 @@ impl<'w, T: Resource> Res<'w, T> {
 /// # impl Resource for ProjectTime {}
 /// fn my_system(mut time: ResMut<ProjectTime>) {
 ///     if let Some(mut time) = time.get_mut() {
-///         time.elapsed += time.delta; // bumps changed tick
+///         time.elapsed += time.delta; // this write marks the resource as changed
 ///     }
 /// }
 /// ```
 pub struct ResMut<'w, T: Resource> {
     /// The world the resource is fetched from.
     world: &'w mut World,
-    /// Marks `T` as the resource type targeted by this wrapper.
-    _phantom: std::marker::PhantomData<T>,
+    /// Ties the wrapper to the resource type `T`; the value stays in the world.
+    _resource_type: std::marker::PhantomData<T>,
 }
 
 impl<'w, T: Resource> ResMut<'w, T> {
@@ -104,15 +104,20 @@ impl<'w, T: Resource> ResMut<'w, T> {
     /// The system runner builds this through
     /// [`SystemParam::fetch`](crate::system::SystemParam::fetch); calling it
     /// directly is not the intended path.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if another `ResMut` for the same resource is
+    /// still alive, because one resource may only be borrowed mutably once.
     pub fn new(world: &'w mut World) -> Self {
-        // Take the debug write lock here rather than in `get_mut`, so acquire
-        // and release share one granularity: this guard's lifetime, which is
-        // the system's. See `World::debug_acquire_resource_lock`.
+        // Take the debug write lock here and release it on drop, not around
+        // each `get_mut` call, so the lock covers the wrapper's whole life,
+        // which is one system call. See `World::debug_acquire_resource_lock`.
         #[cfg(debug_assertions)]
         world.debug_acquire_resource_lock(crate::resource::ResourceId::of::<T>());
         Self {
             world,
-            _phantom: std::marker::PhantomData,
+            _resource_type: std::marker::PhantomData,
         }
     }
 
@@ -125,9 +130,9 @@ impl<'w, T: Resource> ResMut<'w, T> {
 
     /// Returns mutable, change-tracking access to the resource.
     ///
-    /// Returns a [`Mut<'_, T>`] that wraps both the value and its
-    /// change-detection ticks. Mutating through `DerefMut` automatically
-    /// bumps `ticks.changed` to the current world tick.
+    /// The returned [`Mut<'_, T>`] holds both the value and its
+    /// change-detection ticks. Writing through it (`DerefMut`) sets
+    /// `ticks.changed` to the current world tick.
     ///
     /// Returns `None` if the resource has not been inserted into the World.
     pub fn get_mut(&mut self) -> Option<Mut<'_, T>> {
@@ -135,12 +140,11 @@ impl<'w, T: Resource> ResMut<'w, T> {
     }
 }
 
-/// Dropping a `ResMut` releases its debug write lock, which is what scopes the
-/// lock to one system.
+/// Releases the debug write lock when a `ResMut` is dropped, which is what
+/// keeps the lock limited to one system.
 ///
-/// A `ResMut` is built when a system's parameters are fetched and dropped when
-/// that system returns, so the lock it holds spans exactly the window in which
-/// concurrent access would be a bug.
+/// A system's parameters are fetched just before it runs and dropped when it
+/// returns, so the lock is held exactly while a second holder would be a bug.
 #[cfg(debug_assertions)]
 impl<T: Resource> Drop for ResMut<'_, T> {
     fn drop(&mut self) {
@@ -176,10 +180,11 @@ mod tests {
         }
     }
 
-    /// Two systems writing one resource is an ordinary pattern: the scheduler
-    /// detects the conflict and runs them in separate batches. The debug write
-    /// lock must scope to a system, not to the whole frame, or the second one
-    /// panics on an assertion about concurrency that is not happening.
+    /// Two systems writing one resource is an ordinary pattern. The scheduler
+    /// sees the conflict and runs them in separate batches, one after the
+    /// other. The debug write lock must cover one system, not the whole frame,
+    /// or the second system would panic on a concurrency check that is not
+    /// actually failing.
     #[test]
     fn two_systems_may_write_one_resource_in_the_same_frame() {
         let mut engine = Engine::new();
@@ -196,8 +201,8 @@ mod tests {
         );
     }
 
-    /// The same system taking the resource repeatedly across frames is fine
-    /// too: the lock is released when its `ResMut` drops, every frame.
+    /// The same system taking the resource every frame is fine too. Each frame
+    /// builds a new `ResMut`, and the lock is released when it drops.
     #[test]
     fn a_writer_may_run_every_frame() {
         let mut engine = Engine::new();
@@ -211,17 +216,17 @@ mod tests {
     }
 
     /// One system taking the resource mutably more than once, in sequence, is
-    /// ordinary code. The lock is per guard, not per `get_mut()` call, so this
-    /// must not look like overlapping access.
+    /// ordinary code. The lock is held per wrapper, not per `get_mut()` call,
+    /// so this must not look like overlapping access.
     #[test]
     fn one_system_may_take_the_resource_twice() {
         fn writes_twice(mut counter: ResMut<Counter>) {
             {
-                let mut first = counter.get_mut().expect("resource is present");
-                first.count += 1;
+                let mut first_write = counter.get_mut().expect("resource is present");
+                first_write.count += 1;
             }
-            let mut second = counter.get_mut().expect("resource is present");
-            second.count += 1;
+            let mut second_write = counter.get_mut().expect("resource is present");
+            second_write.count += 1;
         }
 
         let mut engine = Engine::new();
@@ -232,8 +237,8 @@ mod tests {
         assert_eq!(engine.world().get_resource::<Counter>().unwrap().count, 2);
     }
 
-    /// Releasing on drop must not blunt the check: two `ResMut` guards alive at
-    /// once over one resource is what it exists to catch, and still panics.
+    /// Releasing on drop must not weaken the check: two `ResMut` wrappers alive
+    /// at once over one resource is exactly what it catches, and still panics.
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "already mutably borrowed")]
@@ -241,26 +246,29 @@ mod tests {
         let mut world = crate::World::new();
         world.insert_resource(Counter::default());
 
-        let first = ResMut::<Counter>::new(&mut world);
-        let world_ptr: *mut crate::World = first.world;
-        // SAFETY: the alias is deliberate and is the point of the test - a
-        // second guard built while the first is alive is exactly the overlap
-        // the debug lock reports. The pointer comes from a live borrow, and
-        // this thread is the only one touching the world, so the aliasing
-        // `&mut` is never used to read or write through both handles.
-        let _second = ResMut::<Counter>::new(unsafe { &mut *world_ptr });
+        let live_write_guard = ResMut::<Counter>::new(&mut world);
+        let world_pointer: *mut crate::World = live_write_guard.world;
+        // SAFETY: the alias is deliberate and is exactly what the test is
+        // about: a second `ResMut` built while the first is alive. The pointer
+        // comes from a live borrow, and only this thread touches the world.
+        // Neither wrapper is used to read or write, so the two `&mut World`
+        // never access memory at the same time.
+        let _second = ResMut::<Counter>::new(unsafe { &mut *world_pointer });
     }
 
-    /// A resource released by one guard can be taken again by the next, which
-    /// is what lets two systems write it in one frame.
+    /// A lock released by one wrapper can be taken again by the next, which is
+    /// what lets two systems write one resource in the same frame.
     #[test]
     fn a_released_lock_can_be_retaken() {
         let mut world = crate::World::new();
         world.insert_resource(Counter::default());
 
         for _ in 0..3 {
-            let mut guard = ResMut::<Counter>::new(&mut world);
-            guard.get_mut().expect("resource is present").count += 1;
+            let mut resource_write_guard = ResMut::<Counter>::new(&mut world);
+            resource_write_guard
+                .get_mut()
+                .expect("resource is present")
+                .count += 1;
         }
         assert_eq!(world.get_resource::<Counter>().unwrap().count, 3);
     }

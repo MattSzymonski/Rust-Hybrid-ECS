@@ -1,42 +1,35 @@
 //! Integration tests for engine-owned native dynamic buffers.
 //!
-//! Pins the address-stability contract end to end: the derive's tag, the
-//! generated trampolines, the archetype-move behavior (the handle is copied,
-//! the block is not), migration through serde, the unchanged-schema fast path,
-//! and balanced ownership of the engine's native memory.
+//! Pins the address-stability contract at three points: the tag the derive
+//! registers for a buffer field, the trampolines it generates, and what happens
+//! to an engine-owned block when its entity moves to another archetype (the
+//! handle is copied, the block is not). It also covers migration through serde,
+//! the unchanged-schema pass, and balanced ownership of the engine's native
+//! memory.
 //!
 //! # Responsibilities
 //!
 //! - Exercise the derive's `dynbuf:` tag and the `DynamicBuffer` API.
-//! - Pin the address-stability contract across archetype moves and reloads.
+//! - Pin the address-stability contract across an archetype move and the
+//!   unchanged-schema migration pass.
 //! - Pin balanced ownership of the shared native allocation service.
 
+// Standard library
 use std::collections::HashSet;
 use std::sync::Mutex;
 
+// External crates
 use pill_core::native_buffer;
 use pill_engine::component_registry::{register_all_components, ComponentFieldDescriptor};
 use pill_engine::{ComponentId, DynamicBuffer, PillComponent, World};
 
-/// A persistable component holding an engine-owned buffer plus an inline
-/// scalar, so a structural change exercises both.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PillComponent)]
-#[pill(persistable)]
-struct Trail {
-    points: DynamicBuffer<f32>,
-    weight: u32,
-}
+// =============================================================================
+// Constants
+// =============================================================================
 
-/// A second component that forces an archetype move.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PillComponent)]
-#[pill(persistable)]
-struct Marker {
-    value: u32,
-}
-
-/// The derive's own layout for [`Trail`], spelled out so the migration test
-/// can move the schema hash by changing one tag.
-static DERIVE_LAYOUT: &[ComponentFieldDescriptor] = &[
+/// The layout the derive registers for [`Trail`], written out by hand so a test
+/// can register the same Rust type with a different one.
+static TRAIL_DERIVE_LAYOUT: &[ComponentFieldDescriptor] = &[
     ComponentFieldDescriptor {
         name: "points",
         type_tag: "dynbuf:f32",
@@ -57,9 +50,10 @@ static DERIVE_LAYOUT: &[ComponentFieldDescriptor] = &[
     },
 ];
 
-/// A deliberately altered layout for the same Rust type, standing in for a
+/// The same Rust type with a moved declared shape: `points` claims `f64`
+/// elements instead of `f32`, which changes the schema hash. It stands in for a
 /// build whose declared shape moved.
-static ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
+static TRAIL_F64_ELEMENT_LAYOUT: &[ComponentFieldDescriptor] = &[
     ComponentFieldDescriptor {
         name: "points",
         type_tag: "dynbuf:f64",
@@ -80,41 +74,78 @@ static ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
     },
 ];
 
-/// Serializes the tests that assert on the process-wide block accounting.
-static ACCOUNTING_GUARD: Mutex<()> = Mutex::new(());
+/// Held by every test that checks the process-wide block counters, so those
+/// tests never run at the same time.
+static ACCOUNTING_LOCK: Mutex<()> = Mutex::new(());
 
-fn accounted() -> std::sync::MutexGuard<'static, ()> {
-    ACCOUNTING_GUARD
+// =============================================================================
+// Fixture Components
+// =============================================================================
+
+/// A persistable component with an engine-owned buffer field and a plain `u32`
+/// field, so one structural change carries both kinds of field.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PillComponent)]
+#[pill(persistable)]
+struct Trail {
+    points: DynamicBuffer<f32>,
+    weight: u32,
+}
+
+/// A second component that forces an archetype move.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PillComponent)]
+#[pill(persistable)]
+struct Marker {
+    value: u32,
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Takes the lock every test that checks the process-wide block counters must
+/// hold.
+///
+/// A poisoned lock means another test panicked while holding it. That panic is
+/// already reported, so the lock is taken anyway instead of failing every later
+/// test as well.
+fn lock_accounting() -> std::sync::MutexGuard<'static, ()> {
+    ACCOUNTING_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The derive registers an engine-owned buffer with its `dynbuf:` tag, which
-/// is what the C# codegen and the schema hash both read.
+// =============================================================================
+// Tests
+// =============================================================================
+
+/// The derive registers an engine-owned buffer field with its `dynbuf:` tag,
+/// and both the C# codegen and the schema hash read that tag.
 #[test]
 fn derive_registers_the_dynbuf_tag() {
-    let _guard = accounted();
+    let _accounting_lock = lock_accounting();
     let mut world = World::new();
     register_all_components(&mut world).expect("registration succeeds");
 
-    let layout = world
+    let field_layout = world
         .component_field_layout(ComponentId::of::<Trail>())
         .expect("the derive registers a field layout");
-    let tag = |name: &str| {
-        layout
+    let field_type_tag = |field_name: &str| {
+        field_layout
             .iter()
-            .find(|field| field.name == name)
+            .find(|field| field.name == field_name)
             .map(|field| field.type_tag)
     };
-    assert_eq!(tag("points"), Some("dynbuf:f32"));
-    assert_eq!(tag("weight"), Some("u32"));
+    assert_eq!(field_type_tag("points"), Some("dynbuf:f32"));
+    assert_eq!(field_type_tag("weight"), Some("u32"));
 }
 
-/// The generated trampolines reach the live handle: a view answers the real
-/// block and a resize rewrites it in place.
+/// The generated trampolines work on the live component: the view reports the
+/// block's elements and its length, and a resize writes the new elements
+/// through the handle in the component row. Growing past the capacity gives the
+/// buffer a new block.
 #[test]
 fn accessor_trampolines_resize_the_engine_owned_buffer() {
-    let _guard = accounted();
+    let _accounting_lock = lock_accounting();
     let mut trail = Trail {
         points: DynamicBuffer::from_slice(&[1.0, 2.0]),
         weight: 3,
@@ -124,29 +155,31 @@ fn accessor_trampolines_resize_the_engine_owned_buffer() {
     let row = std::ptr::addr_of_mut!(trail).cast::<u8>();
 
     // SAFETY: `row` addresses the live `Trail` above for the whole test, and
-    // every out pointer is a valid local the trampoline may write.
+    // every out pointer is a valid local the trampoline may write. The slices
+    // built from `view_data` and `view_length` read elements the view reported
+    // from that live block, so they stay inside it.
     unsafe {
-        let mut data: *const u8 = std::ptr::null();
-        let mut length = 0usize;
+        let mut view_data: *const u8 = std::ptr::null();
+        let mut view_length = 0usize;
         assert_eq!(
-            pill_accessor_Trail_points_view(row as *const u8, &mut data, &mut length),
+            pill_accessor_Trail_points_view(row as *const u8, &mut view_data, &mut view_length),
             0
         );
-        assert_eq!(length, 2);
+        assert_eq!(view_length, 2);
         assert_eq!(
-            std::slice::from_raw_parts(data as *const f32, length),
+            std::slice::from_raw_parts(view_data as *const f32, view_length),
             &[1.0, 2.0]
         );
 
         // Growing fills the new elements with the element type's default.
         assert_eq!(pill_accessor_Trail_points_resize(row, 4), 0);
         assert_eq!(
-            pill_accessor_Trail_points_view(row as *const u8, &mut data, &mut length),
+            pill_accessor_Trail_points_view(row as *const u8, &mut view_data, &mut view_length),
             0
         );
-        assert_eq!(length, 4);
+        assert_eq!(view_length, 4);
         assert_eq!(
-            std::slice::from_raw_parts(data as *const f32, length),
+            std::slice::from_raw_parts(view_data as *const f32, view_length),
             &[1.0, 2.0, 0.0, 0.0]
         );
     }
@@ -154,12 +187,12 @@ fn accessor_trampolines_resize_the_engine_owned_buffer() {
     assert_eq!(trail.points.as_slice(), &[1.0, 2.0, 0.0, 0.0]);
 }
 
-/// A structural change copies the handle and never the block: the address an
-/// element view was taken from stays valid across an archetype move, which is
-/// the property generated C# spans rely on.
+/// A structural change copies the handle and never the block, so the address an
+/// element view was taken from stays valid across an archetype move. Generated
+/// C# spans depend on that property.
 #[test]
 fn archetype_move_copies_the_handle_not_the_block() {
-    let _guard = accounted();
+    let _accounting_lock = lock_accounting();
     let mut world = World::new();
     register_all_components(&mut world).expect("registration succeeds");
     let entity = world
@@ -171,30 +204,30 @@ fn archetype_move_copies_the_handle_not_the_block() {
         .build()
         .expect("entity is created");
 
-    let before = world
+    let trail_before_move = world
         .get_component::<Trail>(entity)
         .expect("trail is present");
-    let address = before.points.as_ptr();
-    let bytes = native_buffer::live_bytes();
+    let block_address = trail_before_move.points.as_ptr();
+    let baseline_live_byte_count = native_buffer::live_bytes();
 
-    // Adding a component moves the entity into a new archetype, which hands
-    // every surviving component's row to the destination column bitwise.
+    // Adding a component moves the entity into a new archetype, which copies
+    // each surviving component's row into the destination column as raw bytes.
     world
         .add_component::<Marker>(entity, Marker { value: 5 })
         .expect("component is added");
 
-    let after = world
+    let trail_after_move = world
         .get_component::<Trail>(entity)
         .expect("trail survived the move");
     assert_eq!(
-        after.points.as_ptr(),
-        address,
+        trail_after_move.points.as_ptr(),
+        block_address,
         "the block must not move when the entity does"
     );
-    assert_eq!(after.points.as_slice(), &[7.0, 8.0, 9.0]);
+    assert_eq!(trail_after_move.points.as_slice(), &[7.0, 8.0, 9.0]);
     assert_eq!(
         native_buffer::live_bytes(),
-        bytes,
+        baseline_live_byte_count,
         "a handle copy must not allocate or leak a block"
     );
 
@@ -206,13 +239,13 @@ fn archetype_move_copies_the_handle_not_the_block() {
     );
 }
 
-/// A changed schema migrates the buffer's contents through serde; an unchanged
-/// one leaves the block - and its address - exactly where it was.
+/// A changed schema migrates the buffer's contents through serde, and the
+/// unchanged-schema pass leaves the block, and its address, where it was.
 #[test]
 fn buffer_contents_survive_migration_and_the_fast_path() {
-    let _guard = accounted();
+    let _accounting_lock = lock_accounting();
     let mut world = World::new();
-    world.register_persistable_component_with_layout::<Trail>(DERIVE_LAYOUT);
+    world.register_persistable_component_with_layout::<Trail>(TRAIL_DERIVE_LAYOUT);
     let entity = world
         .create_entity()
         .with(Trail {
@@ -229,31 +262,39 @@ fn buffer_contents_survive_migration_and_the_fast_path() {
         .find(|name| name.ends_with("Trail"))
         .expect("the component is persistable");
 
-    // Simulate a reload whose declared shape moved: capture the retiring
-    // generation's metadata, register the new shape, then migrate.
-    let previous = world.capture_persist_type_metadata();
-    world.register_persistable_component_with_layout::<Trail>(ALTERED_LAYOUT);
-    let changed: HashSet<String> = HashSet::from([type_name]);
-    let report = world.migrate_changed_persistable_components(&previous, &changed, None);
-    assert_eq!(report.migrated_type_count, 1);
-    assert_eq!(report.migrated_entity_count, 1);
+    // Simulate a reload whose declared shape moved: capture the metadata of the
+    // shape being replaced, register the new shape, then migrate the values.
+    let previous_metadata_by_name = world.capture_persist_type_metadata();
+    world.register_persistable_component_with_layout::<Trail>(TRAIL_F64_ELEMENT_LAYOUT);
+    let changed_type_names: HashSet<String> = HashSet::from([type_name]);
+    let migration_report = world.migrate_changed_persistable_components(
+        &previous_metadata_by_name,
+        &changed_type_names,
+        None,
+    );
+    assert_eq!(migration_report.migrated_type_count, 1);
+    assert_eq!(migration_report.migrated_entity_count, 1);
 
     let trail = world
         .get_component::<Trail>(entity)
         .expect("data survived the migration");
     assert_eq!(trail.points.as_slice(), &[3.5, 4.5]);
     assert_eq!(trail.weight, 9);
-    let address = trail.points.as_ptr();
+    let block_address = trail.points.as_ptr();
 
-    // The unchanged-schema fast path visits no value at all: the same block
-    // stays in place, which is what keeps outstanding views valid.
-    let previous = world.capture_persist_type_metadata();
-    let report = world.migrate_changed_persistable_components(&previous, &HashSet::new(), None);
-    assert_eq!(report.migrated_type_count, 0);
+    // The unchanged-schema pass has no changed type names, so it visits no
+    // value at all: the block stays where it is and `block_address` still holds.
+    let previous_metadata_by_name = world.capture_persist_type_metadata();
+    let migration_report = world.migrate_changed_persistable_components(
+        &previous_metadata_by_name,
+        &HashSet::new(),
+        None,
+    );
+    assert_eq!(migration_report.migrated_type_count, 0);
     let trail = world
         .get_component::<Trail>(entity)
         .expect("data survived the fast path");
-    assert_eq!(trail.points.as_ptr(), address);
+    assert_eq!(trail.points.as_ptr(), block_address);
     assert_eq!(trail.points.as_slice(), &[3.5, 4.5]);
 
     drop(world);

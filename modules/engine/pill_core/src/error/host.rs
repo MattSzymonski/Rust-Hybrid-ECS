@@ -1,19 +1,20 @@
-//! Every subsystem error and the composition root over them.
+//! The error type of every host subsystem, and the root that combines them.
 //!
 //! # Responsibilities
 //!
-//! - Declare the subsystem error each area returns: configuration, build,
-//!   library loading, module loading, the file watcher, and the managed side.
-//! - Compose them into [`HostError`] through transparent `#[from]` wrappers, so
-//!   `?` works across a subsystem boundary and the leaf error plus its source
-//!   chain survive.
+//! - Declare the error each subsystem returns: configuration, build, library
+//!   loading, extension loading, the file watcher, and the C# backend.
+//! - Combine them into [`HostError`] with transparent `#[from]` wrappers, so
+//!   `?` works across a subsystem boundary and the original error plus its
+//!   source chain survive.
 //!
 //! # Design
 //!
-//! Each variant carries one `#[message(...)]` definition; the `#[engine_error]`
-//! macro generates the plain `Display`, a stable `namespace::variant` code and
-//! the [`EngineMessage`] implementation that renders the same definition with
-//! semantic roles. Nothing here names a presentation medium.
+//! Every subsystem variant carries one `#[message(...)]` definition. The
+//! `#[engine_error]` macro turns that definition into the plain `Display`
+//! text, a stable `namespace::variant` code, and the [`EngineMessage`]
+//! implementation that renders the same definition with semantic roles. No
+//! variant names a colour, a glyph or any other way of showing a message.
 
 use super::*;
 
@@ -21,10 +22,11 @@ use super::*;
 // Subsystem Errors
 // =============================================================================
 
-/// Configuration-validation failures for project-module setups.
+/// Setup and configuration failures for a project and its modules.
 ///
-/// Raised before any build work begins, so a misconfigured module fails fast
-/// with a precise diagnostic instead of a confusing runtime error.
+/// Every one of them except the asset-pack failure is raised before any build
+/// work starts, so a bad setup stops the host at once with a precise message
+/// instead of a confusing error much later.
 #[engine_error(namespace = host::config)]
 pub enum ConfigError {
     /// The configured module name is empty.
@@ -61,12 +63,12 @@ pub enum ConfigError {
 
     /// The directory the engine workspace lives in could not be determined.
     ///
-    /// Every stored path is relative to that directory, and it is derived from
-    /// this crate's own build location rather than from the process's working
-    /// directory: the two agree only when the host happens to be started from
-    /// the workspace root, and a launcher that sets a working directory of its
-    /// own would otherwise resolve `extensions/` to a directory that does not
-    /// exist.
+    /// The host finds it from the build location of its own crate, which is
+    /// fixed at compile time, and resolves every stored relative path against
+    /// it. The process's working directory is not used: the two agree only
+    /// when the host is started from the workspace root, and a launcher that
+    /// sets a working directory of its own would resolve `extensions/` to a
+    /// directory that does not exist.
     #[message("engine workspace root could not be determined from the host build")]
     EngineWorkspaceRootUndetermined,
 
@@ -125,12 +127,13 @@ pub enum ConfigError {
         source: std::io::Error,
     },
 
-    /// A `path` dependency in the project manifest does not resolve to an
-    /// existing directory once rewritten for the generated workspace member.
+    /// A `path` dependency in the project manifest does not point at a path
+    /// that exists, once the host has rewritten it for the generated workspace
+    /// member.
     ///
-    /// Reported instead of writing the member, because a member Cargo cannot
-    /// load breaks every build in the workspace - including the one that would
-    /// replace it.
+    /// Reported instead of writing the member: Cargo refuses the whole
+    /// workspace when one member cannot load, which stops every build,
+    /// including the one that would replace that member.
     #[message(
         "project manifest ",
         name_style(manifest_path),
@@ -183,8 +186,8 @@ pub enum ConfigError {
     )]
     InvalidBuildBinaryName { path: String },
 
-    /// The settings file's `logging:` section names a level or a target that
-    /// does not read.
+    /// The settings file's `logging:` section names a level, a timestamp
+    /// format or a target the engine does not recognize.
     #[message(
         "project settings file ",
         name_style(path),
@@ -243,7 +246,7 @@ pub enum ConfigError {
     )]
     ExtensionDirectoryMissing { name: String },
 
-    /// The asset pack a shipping build embeds could not be read.
+    /// The asset pack a shipped build mounts is not a valid pack.
     #[message(
         "the embedded asset pack of ",
         name_style(project),
@@ -255,8 +258,10 @@ pub enum ConfigError {
 
 /// Project-module build execution failures.
 ///
-/// Covers spawn, wait, timeout, cancellation, and missing-artifact failures
-/// of the external command that builds a project module.
+/// One variant for each step of running the external command that builds a
+/// project module: starting it, waiting for it, its exit status, its deadline
+/// and its cancellation. Two more cover the artifact it should have written:
+/// one that never appeared, and one that was staged and then changed on disk.
 #[engine_error(namespace = host::build)]
 pub enum BuildError {
     /// The build command list is empty.
@@ -338,12 +343,14 @@ pub enum BuildError {
 
 /// Native project-library loading and initialization failures.
 ///
-/// Covers the temporary-directory staging, the copy into place, dynamic
-/// loading, and the `pill_module_init` entry-point contract.
+/// One variant for each step: preparing the per-process temporary directory,
+/// copying the artifact there, mapping it, resolving its imports, and calling
+/// its `pill_module_init` entry point.
 ///
-/// The loader's own error is a boxed source: `pill_core` is the shared dylib
-/// every posture links, so it may not name `libloading`. The cause is
-/// still reported through `Error::source()` and the message chain.
+/// The loader's own error arrives as a boxed source. `pill_core` is the shared
+/// dylib that every posture links, so it may not name `libloading`. The real
+/// cause still reaches the reader through `Error::source()` and the error
+/// chain.
 #[engine_error(namespace = host::library)]
 pub enum LibraryError {
     /// The per-process temporary directory could not be created.
@@ -382,18 +389,18 @@ pub enum LibraryError {
     /// The artifact was linked against a different engine dylib than the host
     /// has mapped, so the loader cannot resolve its imports.
     ///
-    /// Cargo folds a dependency's resolved features into the dependent's
-    /// `-C metadata`, and that hash is part of every symbol name `pill_core`
-    /// exports. Two builds that resolve different graphs therefore produce two
-    /// `pill_core.dll` files whose symbols do not match, and the artifact built
-    /// against one cannot load against the other. Windows reports that as
-    /// `LoadLibrary` error 127, "The specified procedure could not be found",
-    /// which names neither the dylib nor the feature that moved.
+    /// Cargo puts the features a dependency resolved into the `-C metadata` of
+    /// the crate that uses it, and that hash is part of every symbol name
+    /// `pill_core` exports. Two builds that resolved different feature sets
+    /// therefore produce two `pill_core.dll` files with different symbols, and
+    /// an artifact built against one cannot load against the other. Windows
+    /// reports that as `LoadLibrary` error 127, "The specified procedure could
+    /// not be found", which names neither the dylib nor the feature.
     ///
-    /// Staging the matching dylib beside the artifact does not help: the loader
-    /// resolves a DLL that is already mapped by its module name, whatever
-    /// directory the new one sits in, and the host mapped `pill_core.dll`
-    /// before it built anything.
+    /// Copying the matching dylib beside the artifact does not help. The loader
+    /// uses the copy already mapped in the process, whatever directory a new
+    /// one sits in, and the host maps `pill_core.dll` before it builds
+    /// anything.
     #[message(
         "native library for ",
         name_style(subject),
@@ -420,9 +427,9 @@ pub enum LibraryError {
     ///
     /// Windows reports a missing named import as `LoadLibrary` error 127,
     /// "The specified procedure could not be found", naming neither the DLL
-    /// nor the symbol. The module's own import tables against the candidate
-    /// copy's export table say exactly which symbol is missing and where it
-    /// was looked for.
+    /// nor the symbol. Comparing the module's import table with the export
+    /// table of each candidate copy says which symbol is missing and which
+    /// copy was looked at.
     #[message(
         "native library for ",
         name_style(subject),
@@ -442,9 +449,9 @@ pub enum LibraryError {
 
     /// The library does not export a required entry point.
     ///
-    /// Names the subject as well as the symbol: a project and an extension
-    /// export the same entry points, so the symbol alone does not say which
-    /// artifact is missing it.
+    /// The error names the artifact as well as the symbol. A project and an
+    /// extension export the same entry points, so the symbol alone would not
+    /// say which artifact is missing one.
     #[message(
         "native library for ",
         name_style(subject),
@@ -466,7 +473,7 @@ pub enum LibraryError {
 /// Extension loading and compatibility failures.
 ///
 /// Distinct from [`LibraryError`], which covers the mechanics of mapping a
-/// library: these report a broken contract between the host and a module.
+/// library. These report a broken contract between the host and a module.
 #[engine_error(namespace = host::module)]
 pub enum ModuleError {
     /// The module was built against a different module ABI revision.
@@ -503,11 +510,13 @@ pub enum ModuleError {
     )]
     InitializationFailed { module: String, status: u32 },
 
-    /// A module whose failures clear only its systems registered data.
+    /// A module registered components or resources, although a failed load of
+    /// it clears only its systems.
     ///
-    /// Clearing only systems on a failed load is sound because such a module
-    /// owns no data: its components and resources are registered by someone
-    /// else. One that registers its own is refused rather than trusted.
+    /// When a failed load keeps the world and removes just the module's
+    /// systems, that is sound only if the module owns no data: the components
+    /// and resources it uses were registered by someone else. A module that
+    /// registers its own is refused instead of trusted.
     #[message(
         "extension ",
         name_style(module),
@@ -529,12 +538,12 @@ pub enum ModuleError {
 
 /// Source-watching startup failures.
 ///
-/// Distinct from build failures: the watcher must start before any build can
-/// be triggered by a source change.
+/// Distinct from build failures: the watcher has to run before a source change
+/// can trigger a build.
 ///
-/// The watcher's own error is a boxed source: `pill_core` is the shared dylib
-/// every posture links, so it may not name `notify`. The cause is
-/// still reported through `Error::source()` and the message chain.
+/// The watcher's own error arrives as a boxed source. `pill_core` is the shared
+/// dylib that every posture links, so it may not name `notify`. The real cause
+/// still reaches the reader through `Error::source()` and the error chain.
 #[engine_error(namespace = host::watcher)]
 pub enum WatcherError {
     /// The configured watch directory does not exist.
@@ -559,12 +568,14 @@ pub enum WatcherError {
 
 /// Managed (C#) backend startup and registration failures.
 ///
-/// Covers hostfxr discovery and loading, runtime delegates, the component
-/// manifest exchange, and reflected managed startup.
+/// One variant for each step: finding and loading hostfxr, resolving the
+/// runtime delegates, exchanging the component manifest, generating the host's
+/// C# mirror, and starting the managed systems.
 ///
-/// The loader's own error is a boxed source: `pill_core` is the shared dylib
-/// every posture links, so it may not name `libloading`. The cause is
-/// still reported through `Error::source()` and the message chain.
+/// The loader's own error arrives as a boxed source. `pill_core` is the shared
+/// dylib that every posture links, so it may not name `libloading`. The real
+/// cause still reaches the reader through `Error::source()` and the error
+/// chain.
 #[engine_error(namespace = host::csharp)]
 pub enum CSharpError {
     /// No hostfxr installation was found in any configured dotnet root.
@@ -660,11 +671,13 @@ pub enum CSharpError {
     )]
     ManifestLengthOutOfRange { length: u32, limit: u32 },
 
-    /// A managed-reported system or access count exceeds what the host reflects.
+    /// A managed-reported system or access count exceeds what the host
+    /// reflects.
     ///
-    /// The counts size host allocations before any item is read, so they are
-    /// checked against fixed caps; without them a buggy assembly could ask for
-    /// an allocation that aborts the process instead of failing startup.
+    /// The count decides how much memory the host reserves before it reads any
+    /// item, so it is checked against a fixed limit first. Without that check a
+    /// buggy assembly could ask for an allocation that aborts the process
+    /// instead of failing startup.
     #[message(
         "managed-reported count ",
         value(count),
@@ -679,10 +692,11 @@ pub enum CSharpError {
 
     /// The managed loader reported a reload status the host does not know.
     ///
-    /// The poll answers `0` (nothing happened), `1` (swapped) or `2`
-    /// (rejected). Anything else is an ABI drift or a loader-level failure, and
-    /// filing it as "nothing happened" would leave the previous assembly
-    /// running with no indication anywhere.
+    /// The poll answers `0` (nothing happened), `1` (swapped), `2` (rejected)
+    /// or `3` (a rebuilt assembly is waiting for its manifest to be applied).
+    /// Anything else means the ABI drifted or the loader failed. Treating it
+    /// as "nothing happened" would keep the previous assembly running without
+    /// saying so anywhere.
     #[message("the managed loader reported unknown reload status ", value(status))]
     UnknownPollStatus { status: u8 },
 
@@ -720,8 +734,8 @@ pub enum CSharpError {
         " declares no [EcsSystem] methods"
     )]
     NoSystems {
-        /// Assembly that was inspected, so the report names the artifact that
-        /// failed rather than a fixed example project.
+        /// The assembly the host inspected, so the message names the artifact
+        /// that failed instead of a fixed example project.
         subject: String,
     },
 
@@ -744,9 +758,9 @@ pub enum CSharpError {
 
     /// A reflected access references a resource the host never registered.
     ///
-    /// Almost always a resource struct that a system declares through
-    /// `Res<T>`/`ResMut<T>` without carrying `[EcsResource]`, so the manifest
-    /// never told the host it existed.
+    /// In almost every case the resource struct is missing `[EcsResource]`, so
+    /// the manifest never told the host about it, even though a system asks
+    /// for it through `Res<T>` or `ResMut<T>`.
     #[message("C# system references unregistered resource key ", value(key))]
     UnregisteredResource { key: String },
 
@@ -756,7 +770,7 @@ pub enum CSharpError {
 }
 
 impl From<String> for CSharpError {
-    /// Route free-form manifest validation messages into the typed
+    /// Turns a free-form manifest validation message into the typed
     /// `ManifestInvalid` variant.
     fn from(message: String) -> Self {
         Self::ManifestInvalid { message }
@@ -764,7 +778,7 @@ impl From<String> for CSharpError {
 }
 
 impl From<serde_json::Error> for CSharpError {
-    /// Preserve the real JSON parse error instead of converting it to text.
+    /// Keeps the real JSON parse error, instead of turning it into text.
     fn from(source: serde_json::Error) -> Self {
         Self::ManifestParseFailed { source }
     }
@@ -776,8 +790,8 @@ impl From<serde_json::Error> for CSharpError {
 
 /// Transparent composition of every host subsystem error.
 ///
-/// Subsystem functions return their narrowest meaningful error; [`HostError`]
-/// exists only as the composition boundary where `?` crosses subsystems.
+/// A subsystem function returns its own narrow error. [`HostError`] exists
+/// only at the boundary where `?` moves from one subsystem to another.
 #[engine_error(namespace = host)]
 pub enum HostError {
     /// Configuration validation failed.

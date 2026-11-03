@@ -1,19 +1,25 @@
-//! The Inspector's editing helpers: field edits, their labels and the asset
-//! settings documents as editable rows.
+//! The Inspector's editing helpers: the rows a component section draws, the
+//! edits those rows queue, and the asset settings documents as editable rows.
 //!
 //! # Responsibilities
 //!
-//! - The `SetField`/`SetArrayElement` builders and their history labels, so
-//!   the shell's widgets and the scripted channel queue identical edits.
-//! - [`parse_field_value`]: text into a value's own kind - used by the
-//!   scripted channel and any text field.
-//! - [`element_field`]: one element of an array value.
-//! - The section model the tab draws: [`component_label`],
-//!   [`component_icon`], [`widget_for`] and [`rows`] - what each component
-//!   section holds and which widget each row asks for.
-//! - Asset reference rows: the [`EditorCommand::SetFieldAsset`]
-//!   builders ([`asset_edit`], [`selection_asset_edit`]) and the assets a
-//!   row's picker offers ([`asset_candidates`]).
+//! - The section the tab draws: its label ([`component_label`]), its icon
+//!   ([`component_icon`]) and its rows ([`rows`]) - which widget each field
+//!   asks for and the rows a field's decorators declare.
+//! - The grouped-row model: [`RowLeaf`], [`grouped_row`] and [`channel_run`]
+//!   fold a colour's channels or a struct's flattened axes into one row.
+//! - The cached row model ([`CachedRows`], [`take_component_rows`]), so a
+//!   section redraws without rebuilding its rows.
+//! - The edit builders and their history labels: `SetField`,
+//!   `SetArrayElement`, [`EditorCommand::SetFieldAsset`],
+//!   [`EditorCommand::SetFieldEntity`] and the resource field write, so the
+//!   shell's widgets and the scripted channel queue identical edits.
+//! - Text into a value and back: [`parse_field_value`], [`value_text`] and
+//!   one element of an array value ([`element_field`]).
+//! - Reference rows: the asset builders ([`asset_edit`],
+//!   [`selection_asset_edit`]) with the assets a picker offers
+//!   ([`picker_candidates`]), and the entity labels a reference takes
+//!   ([`parse_entity_reference`]).
 //! - Asset settings as editable data: key paths (`a.b[0]`), leaf reads and
 //!   patches, and the [`EditorCommand::SetAssetSettings`] builder.
 //!
@@ -40,16 +46,39 @@ use crate::editor_state::{
 use crate::icons::Icon;
 use crate::session::InspectorSession;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// How many side-by-side elements a vector row holds at most: X, Y, Z, W.
+pub const VECTOR_AXES_MAX: usize = 4;
+
+/// The channel suffixes a colour row reads, in order.
+pub const COLOR_CHANNELS: [&str; 4] = ["r", "g", "b", "a"];
+
+/// The axis suffixes a grouped vector row reads, in order.
+pub const VECTOR_AXES: [&str; 4] = ["x", "y", "z", "w"];
+
+/// How many channels a colour row needs at least: red, green and blue.
+pub const COLOR_CHANNELS_MIN: usize = 3;
+
+/// The shortest grouped vector row: two axes.
+pub const VECTOR_AXES_MIN: usize = 2;
+
+// =============================================================================
+// Labels and icons
+// =============================================================================
+
 /// The name after the last `::`, for labels and history entries.
-pub fn short_component_name(name: &str) -> &str {
-    name.rsplit("::").next().unwrap_or(name)
+pub fn short_component_name(type_name: &str) -> &str {
+    type_name.rsplit("::").next().unwrap_or(type_name)
 }
 
 /// The title a component section's header shows.
 ///
-/// Unity names a component without its type suffix (`Transform`,
-/// `Mesh Renderer`), so the engine's `TransformComponent` reads `Transform`;
-/// a type without that suffix keeps its own short name.
+/// A component is named the way Unity names it: without its type suffix, so
+/// the engine's `TransformComponent` reads `Transform`. A type without that
+/// suffix keeps its own short name.
 pub fn component_label(type_name: &str) -> &str {
     let short = short_component_name(type_name);
     short.strip_suffix("Component").unwrap_or(short)
@@ -57,12 +86,13 @@ pub fn component_label(type_name: &str) -> &str {
 
 /// The duotone icon a component section's header draws, from its type name.
 ///
-/// The engine's components carry no icon metadata, so the mark follows the
-/// name's words: a transform points in all directions, a mesh is a cube (a
-/// collider an outlined one), a sprite or texture is an image, a material a
-/// sphere, a light a power switch, a camera a monitor, audio a play mark, a
-/// script, behaviour or system a code mark, physics outward arrows, and
-/// anything else the property sliders.
+/// The engine's components carry no icon metadata, so the icon is chosen from
+/// the words in the type's name. A transform gets the arrows that point in all
+/// directions, a collider an outlined cube, a mesh a cube, a sprite or texture
+/// an image, a material a sphere, a light a power switch, and a camera a
+/// monitor. Audio gets a play mark, a script, behaviour or system a code mark,
+/// and physics names outward arrows. Every other name gets the property
+/// sliders.
 pub fn component_icon(type_name: &str) -> Icon {
     let lower = type_name.to_lowercase();
     if lower.contains("transform") {
@@ -94,12 +124,14 @@ pub fn component_icon(type_name: &str) -> Icon {
     }
 }
 
-/// The duotone icon a scene badge draws for an entity: the
-/// camera mark for something that can see, the light mark for something that
-/// shines, and nothing for everything else - which draws as a plain circle.
+/// The duotone icon a scene badge draws for an entity, or `None` when the
+/// entity gets no mark.
 ///
-/// The label is the component list the Hierarchy row already carries, so a new
-/// component type gains a badge by naming it here and nowhere else.
+/// A label that names a Camera component gets the camera icon, and one that
+/// names a Light component gets the light icon. Any other label returns
+/// `None`, which the badge draws as a plain circle. The label is the component
+/// list the Hierarchy row already carries, so a new component type gains a
+/// badge by naming it here and nowhere else.
 pub fn badge_icon(archetype_label: &str) -> Option<Icon> {
     if archetype_label.contains("Camera") {
         Some(Icon::MonitorPlay)
@@ -109,6 +141,10 @@ pub fn badge_icon(archetype_label: &str) -> Option<Icon> {
         None
     }
 }
+
+// =============================================================================
+// Field widgets
+// =============================================================================
 
 /// The widget a value's kind asks for.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -121,9 +157,11 @@ pub enum FieldWidget {
     Float,
     /// A string: a single-line text edit.
     Text,
-    /// A value the engine can locate but not interpret: shown as text.
+    /// A value the row shows as text with no editor: a heap-backed string, a
+    /// long array, a list or an opaque payload.
     ReadOnly,
-    /// A `[Range]` on a floating point field: a slider over the range.
+    /// A `[Range]` on a floating point field: a slider bounded by `min` and
+    /// `max`.
     FloatSlider {
         /// Lowest value the slider offers.
         min: f32,
@@ -175,31 +213,33 @@ pub fn widget_for(value: &FieldValue) -> FieldWidget {
         | FieldValue::Asset { .. }
         | FieldValue::Entity { .. }
         | FieldValue::Opaque { .. } => FieldWidget::ReadOnly,
-        // A heap-backed string is read-only through the field layer: its buffer
-        // is reached through the type's own accessors, so a text box here would
-        // queue an edit the writer refuses on every keystroke.
+        // A string whose bytes live behind the value itself is read-only
+        // through the field layer: the writer reaches its buffer through the
+        // type's own accessors, so a text box here would queue an edit it
+        // refuses on every keystroke.
         FieldValue::Text(_) => FieldWidget::ReadOnly,
     }
 }
 
 /// The widget a field's value asks for once its decorators are applied.
 ///
-/// Decorators that cannot apply to the value - a `[Range]` on a string, a
-/// `[TextArea]` on a number - are ignored rather than refused: the declaration
-/// is presentation, and a wrong one must not hide the field it decorates. A
-/// range wins over a minimum, since a slider already bounds below, and a text
-/// area's first row count is the box height.
+/// A decorator that cannot apply to the value is ignored, not refused: a
+/// `[Range]` on a string or a `[TextArea]` on a number still draws its field.
+/// The declaration only says how a field should look, and a wrong one must not
+/// hide the field it decorates. A range wins over a minimum, because a slider
+/// already bounds the value below. `[TextArea]` takes its `min_lines` as the
+/// box height, and `[Multiline]` its count.
 pub fn widget_for_decorated(value: &FieldValue, decorators: &[FieldDecorator]) -> FieldWidget {
     let mut widget = widget_for(value);
     let mut range: Option<(f32, f32)> = None;
-    let mut minimum: Option<f32> = None;
-    let mut lines: Option<usize> = None;
+    let mut minimum_value: Option<f32> = None;
+    let mut line_count: Option<usize> = None;
     for decorator in decorators {
         match decorator {
             FieldDecorator::Range { min, max } => range = Some((*min, *max)),
-            FieldDecorator::Min(value) => minimum = Some(*value),
-            FieldDecorator::TextArea { min_lines, .. } => lines = Some(*min_lines),
-            FieldDecorator::Multiline(count) => lines = Some(*count),
+            FieldDecorator::Min(value) => minimum_value = Some(*value),
+            FieldDecorator::TextArea { min_lines, .. } => line_count = Some(*min_lines),
+            FieldDecorator::Multiline(count) => line_count = Some(*count),
             FieldDecorator::HideInInspector
             | FieldDecorator::Header(_)
             | FieldDecorator::Space(_)
@@ -214,40 +254,29 @@ pub fn widget_for_decorated(value: &FieldValue, decorators: &[FieldDecorator]) -
             FieldWidget::Integer => FieldWidget::IntegerSlider { min, max },
             other => other,
         };
-    } else if let Some(min) = minimum {
+    } else if let Some(min) = minimum_value {
         widget = match widget {
             FieldWidget::Float => FieldWidget::FloatDrag { min },
             FieldWidget::Integer => FieldWidget::IntegerDrag { min },
             other => other,
         };
     }
-    if let (FieldWidget::Text, Some(lines)) = (widget, lines) {
-        widget = FieldWidget::MultilineText { lines };
+    if let (FieldWidget::Text, Some(line_count)) = (widget, line_count) {
+        widget = FieldWidget::MultilineText { lines: line_count };
     }
     widget
 }
 
-/// How many side-by-side elements a vector row holds at most: X, Y, Z, W.
-pub const VECTOR_AXES_MAX: usize = 4;
-
-/// The channel suffixes a colour row reads, in order.
-pub const COLOR_CHANNELS: [&str; 4] = ["r", "g", "b", "a"];
-
-/// The axis suffixes a grouped vector row reads, in order.
-pub const VECTOR_AXES: [&str; 4] = ["x", "y", "z", "w"];
-
-/// How many channels a colour row needs at least: red, green and blue.
-pub const COLOR_CHANNELS_MIN: usize = 3;
-
-/// The shortest grouped vector row: two axes.
-pub const VECTOR_AXES_MIN: usize = 2;
+// =============================================================================
+// Rows
+// =============================================================================
 
 /// One writable leaf of a grouped row.
 ///
-/// A leaf is one field, or one element inside a field's array value: a colour
-/// held as `[f32; 4]` writes `SetArrayElement` four times, one held as four
-/// scalar fields writes `SetField` four times. Either way the row's commit is
-/// one recorded step.
+/// A leaf is one field, or one element inside a field's array value. A colour
+/// held as `[f32; 4]` writes `SetArrayElement` four times; one held as four
+/// scalar fields writes `SetField` four times. Either way, committing the row
+/// records one step.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowLeaf {
     /// The field's position in the component's field list (the value's, too).
@@ -321,9 +350,9 @@ pub enum FieldRow {
         /// Text the field's `[Tooltip]` declared, shown on hover of the label.
         tooltip: Option<String>,
     },
-    /// A colour: one swatch whose popup holds the picker. Its leaves
-    /// are the channels, whether they are one array field's elements or one
-    /// scalar field each.
+    /// A colour: one swatch, and a popup that holds the picker. Its leaves are
+    /// the channels, which are either one array field's elements or one scalar
+    /// field each.
     Color {
         /// The channels the row writes, in R/G/B[/A] order.
         leaves: Vec<RowLeaf>,
@@ -333,8 +362,8 @@ pub enum FieldRow {
         tooltip: Option<String>,
     },
     /// A vector assembled from consecutive leaves that share a dotted prefix
-    /// and a `#[pill(vector)]` decorator: one row of X/Y/Z side-by-side
-    /// numeric fields, as a `[f32; 3]` field already draws.
+    /// and carry a `#[pill(vector)]` decorator. It draws as one row of X/Y/Z
+    /// numeric fields, the way a `[f32; 3]` field already draws.
     VectorGroup {
         /// The axes the row writes, in X/Y/Z[/W] order.
         leaves: Vec<RowLeaf>,
@@ -358,26 +387,28 @@ pub enum FieldRow {
 
 /// The rows a component section draws, in field order.
 ///
-/// A scalar array of two to four elements becomes one vector row (Unity draws
-/// a `Vector3` as three fields on one line); anything longer draws as one
-/// read-only row.
+/// A scalar array of two to four elements becomes one vector row, the way
+/// Unity draws a `Vector3` as three fields on one line. Anything longer draws
+/// as one read-only row.
 ///
-/// Decorators are applied here so the shell only draws what the model asks
-/// for: `[HideInInspector]` drops the field together with its header and gap,
-/// `[Header]` and `[Space]` emit their own rows above the field in declaration
-/// order, and `[Tooltip]` rides on the field's row.
+/// The decorators are applied here, so the shell only draws what the model
+/// asks for. `[HideInInspector]` drops the field together with its header and
+/// gap. `[Header]` and `[Space]` add their own rows above the field, in
+/// declaration order. A `[Tooltip]` is shown on the field's row.
 pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
     let mut rows = Vec::new();
     let mut index = 0;
     while index < component.fields.len() {
+        // Step 1: Read the field's descriptor and value, and skip a hidden
+        // field together with the rows it declared.
         let Some(descriptor) = component.fields.get(index) else {
             break;
         };
         let Some(value) = component.values.get(index) else {
             break;
         };
-        // A hidden field takes its decorations with it: drawing a header over
-        // nothing would be worse than drawing nothing at all.
+        // A hidden field takes its decorations with it. A header drawn over
+        // nothing would look worse than drawing nothing at all.
         if descriptor
             .decorators
             .iter()
@@ -386,6 +417,8 @@ pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
             index += 1;
             continue;
         }
+        // Step 2: Draw the rows the decorators declare, and keep the tooltip
+        // for the field's own row.
         let mut tooltip: Option<String> = None;
         for decorator in descriptor.decorators.iter() {
             match decorator {
@@ -403,15 +436,17 @@ pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
                 | FieldDecorator::Vector => {}
             }
         }
-        // A run of scalar leaves sharing a dotted prefix and a grouping
-        // decorator draws as one row: a colour's channels or a vector's axes.
-        // The run decides the row, so a nested struct the world flattened at
-        // registration reads as the value it is.
+        // Step 3: A run of scalar leaves sharing a dotted prefix and a
+        // grouping decorator draws as one row: a colour's channels or a
+        // vector's axes. The run decides the row, so a nested struct the world
+        // flattened at registration reads as the value it is.
         if let Some((row, consumed)) = grouped_row(component, index, tooltip.clone()) {
             rows.push(row);
             index += consumed;
             continue;
         }
+        // Step 4: Draw the one field with the widget its kind and its
+        // decorators ask for.
         let widget = widget_for_decorated(value, descriptor.decorators.as_ref());
         let row = match value {
             FieldValue::Array(elements)
@@ -489,25 +524,26 @@ pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
     rows
 }
 
-/// The grouped row that starts at `start`, with how many fields it consumed.
+/// The grouped row that starts at `start_index`, with how many fields it
+/// consumed.
 ///
-/// A colour wins over a vector: a field marked both reads as the colour it
-/// most likely is, and a group's first suffix decides which run is even
-/// possible.
+/// A field marked as both a colour and a vector draws as a colour. The first
+/// field's suffix decides which run can match at all, so only one grouping is
+/// tried.
 fn grouped_row(
     component: &ComponentView,
-    start: usize,
+    start_index: usize,
     tooltip: Option<String>,
 ) -> Option<(FieldRow, usize)> {
     if let Some(leaves) = channel_run(
         component,
-        start,
+        start_index,
         &COLOR_CHANNELS,
         &FieldDecorator::Color,
         COLOR_CHANNELS_MIN,
     ) {
         let consumed = leaves.len();
-        let field = grouped_label(component, start, "color");
+        let field = grouped_label(component, start_index, "color");
         return Some((
             FieldRow::Color {
                 leaves,
@@ -519,16 +555,16 @@ fn grouped_row(
     }
     let leaves = channel_run(
         component,
-        start,
+        start_index,
         &VECTOR_AXES,
         &FieldDecorator::Vector,
         VECTOR_AXES_MIN,
     )?;
     let consumed = leaves.len();
-    let field = grouped_label(component, start, "vector");
+    let field = grouped_label(component, start_index, "vector");
     let widget = component
         .values
-        .get(start)
+        .get(start_index)
         .map(widget_for)
         .unwrap_or(FieldWidget::Float);
     Some((
@@ -543,77 +579,91 @@ fn grouped_row(
 }
 
 /// The name a grouped row labels itself with: the dotted prefix its leaves
-/// share, or the row's kind when they have none (the `Color` component's own
-/// channels are `r`, `g`, `b`, `a`, with no prefix to name).
-fn grouped_label(component: &ComponentView, start: usize, kind: &str) -> String {
+/// share.
+///
+/// When the leaves have no prefix, the row is named after its kind. The
+/// `Color` component's own channels are `r`, `g`, `b` and `a`, with nothing in
+/// front of them.
+fn grouped_label(component: &ComponentView, start_index: usize, fallback_label: &str) -> String {
     match component
         .fields
-        .get(start)
+        .get(start_index)
         .map(|field| leaf_parts(field.name.as_str()))
     {
         Some((prefix, _)) if !prefix.is_empty() => prefix.to_string(),
-        _ => kind.to_string(),
+        _ => fallback_label.to_string(),
     }
 }
 
 /// The dotted prefix and last segment of a leaf field's name: `fill.g` is
 /// (`fill`, `g`), and a bare `g` is (`""`, `g`).
-pub fn leaf_parts(name: &str) -> (&str, &str) {
-    match name.rfind('.') {
-        Some(dot) => (&name[..dot], &name[dot + 1..]),
-        None => ("", name),
+pub fn leaf_parts(field_name: &str) -> (&str, &str) {
+    match field_name.rfind('.') {
+        Some(dot) => (&field_name[..dot], &field_name[dot + 1..]),
+        None => ("", field_name),
     }
 }
 
-/// A run of consecutive scalar leaves from `start` that are the channels of
-/// one grouped row: the same dotted prefix, the suffixes of `suffixes` in
-/// order, each carrying `decorator` and holding a numeric value.
+/// A run of consecutive scalar leaves, starting at `start_index`, that form
+/// the channels of one grouped row.
 ///
-/// The run stops at the first leaf that does not match, and one shorter than
-/// `minimum` is not a row at all - a `fill.r` with no `fill.g` is just a float.
+/// Every leaf in the run must share the first leaf's dotted prefix, carry
+/// `required_decorator`, hold a numeric value and use the next suffix from
+/// `suffixes` in order. The run stops at the first leaf that does not match.
+/// A run shorter than `minimum_leaf_count` is no row at all: a `fill.r` with
+/// no `fill.g` is just a float.
 fn channel_run(
     component: &ComponentView,
-    start: usize,
+    start_index: usize,
     suffixes: &[&str],
-    decorator: &FieldDecorator,
-    minimum: usize,
+    required_decorator: &FieldDecorator,
+    minimum_leaf_count: usize,
 ) -> Option<Vec<RowLeaf>> {
-    let first = component.fields.get(start)?;
+    let first = component.fields.get(start_index)?;
     let (prefix, first_suffix) = leaf_parts(first.name.as_str());
-    if first_suffix != suffixes[0] || !first.decorators.contains(decorator) {
+    // Step 1: The run starts only at the first suffix with the grouping
+    // decorator.
+    if first_suffix != suffixes[0] || !first.decorators.contains(required_decorator) {
         return None;
     }
+    // Step 2: Read the following leaves while the prefix, the suffix and the
+    // decorator still match.
     let mut leaves = Vec::new();
     for (offset, suffix) in suffixes.iter().enumerate() {
-        let Some(descriptor) = component.fields.get(start + offset) else {
+        let Some(descriptor) = component.fields.get(start_index + offset) else {
             break;
         };
-        let Some(value) = component.values.get(start + offset) else {
+        let Some(value) = component.values.get(start_index + offset) else {
             break;
         };
-        let (prefix_here, suffix_here) = leaf_parts(descriptor.name.as_str());
-        if prefix_here != prefix
-            || suffix_here != *suffix
-            || !descriptor.decorators.contains(decorator)
+        let (candidate_prefix, candidate_suffix) = leaf_parts(descriptor.name.as_str());
+        if candidate_prefix != prefix
+            || candidate_suffix != *suffix
+            || !descriptor.decorators.contains(required_decorator)
             || !matches!(widget_for(value), FieldWidget::Integer | FieldWidget::Float)
         {
             break;
         }
         leaves.push(RowLeaf {
-            index: start + offset,
+            index: start_index + offset,
             field: descriptor.name.to_string(),
             element: None,
         });
     }
-    (leaves.len() >= minimum).then_some(leaves)
+    (leaves.len() >= minimum_leaf_count).then_some(leaves)
 }
 
-/// The log lines a drawn row can emit, as bits: the row's own line and the
-/// `mixed` line a scalar or vector row adds when the selection disagrees.
+// =============================================================================
+// Cached rows
+// =============================================================================
+
+/// The log lines a drawn row can emit, held as bits. There are two: the row's
+/// own line, and the `mixed` line that a scalar or vector row adds when the
+/// selected entities disagree on its value.
 ///
-/// A cached row carries this, so a row that redraws every frame logs once per
-/// subject without rebuilding a key: the row's position in the cached model is
-/// its identity for the session.
+/// A cached row carries this, so a row that redraws every frame still logs
+/// once per subject. The row's position in the cached model identifies it for
+/// the session, so no key has to be built.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RowLogged(u8);
 
@@ -623,15 +673,15 @@ impl RowLogged {
     /// The `mixed` line a row adds when the selection disagrees on its value.
     pub const MIXED: u8 = 1 << 1;
 
-    /// Whether `flag`'s line has already been logged for this row.
+    /// Whether the line `line_bit` names has already been logged for this row.
     #[must_use]
-    pub fn has(self, flag: u8) -> bool {
-        self.0 & flag != 0
+    pub fn has(self, line_bit: u8) -> bool {
+        self.0 & line_bit != 0
     }
 
-    /// Mark `flag`'s line as logged.
-    pub fn mark(&mut self, flag: u8) {
-        self.0 |= flag;
+    /// Mark the line `line_bit` names as logged.
+    pub fn mark(&mut self, line_bit: u8) {
+        self.0 |= line_bit;
     }
 }
 
@@ -646,14 +696,14 @@ pub struct CachedRow {
 
 /// One component's cached row model and the selection's write targets.
 ///
-/// The rows are rebuilt only when [`row_layout`] moves; the targets only when
-/// the selection's per-component answer moves. Both live in the shared
-/// session, so a shell reload keeps them.
+/// The rows are rebuilt only when [`row_layout`] changes, and the targets only
+/// when the selection's answer for this component changes. Both live in the
+/// shared session, so a shell reload keeps them.
 #[derive(Default)]
 pub struct CachedRows {
     /// The layout the cached rows were built from.
     pub layout: Option<RowLayout>,
-    /// The rows, in field order, each with its log memory.
+    /// The rows, in field order, each with the lines it has already logged.
     pub rows: Vec<CachedRow>,
     /// The selection the cached targets were derived from.
     pub targets_stamp: Option<u64>,
@@ -661,9 +711,11 @@ pub struct CachedRows {
     pub targets: Vec<Entity>,
 }
 
-/// The layout fingerprint of one component's row model: the field names, the
-/// decorators and the value kinds [`rows`] reads - never the values
-/// themselves, so a value edit does not rebuild the model.
+/// The layout fingerprint of one component's row model.
+///
+/// It covers the field names, the decorators and the value kinds that [`rows`]
+/// reads, but never the values themselves, so editing a value does not rebuild
+/// the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowLayout(u64);
 
@@ -683,8 +735,8 @@ pub fn row_layout(component: &ComponentView) -> RowLayout {
     RowLayout(hasher.finish())
 }
 
-/// Hash what one decorator contributes to the row model: its kind and the
-/// payload the row shows or the widget derives from it.
+/// Hash what one decorator adds to the row model: its kind, plus the text or
+/// value that the row draws or the widget takes from it.
 fn hash_decorator(decorator: &FieldDecorator, hasher: &mut DefaultHasher) {
     match decorator {
         FieldDecorator::HideInInspector => 0u8.hash(hasher),
@@ -760,12 +812,12 @@ fn hash_value_kind(value: &FieldValue, hasher: &mut DefaultHasher) {
     }
 }
 
-/// A stamp over what changes a component's write targets: which entities are
-/// selected and whether each carries the component.
-fn selection_stamp(details: &[EntityDetail], component: &str) -> u64 {
+/// A stamp over the two facts that change a component's write targets: which
+/// entities are selected, and whether each of them carries the component.
+fn selection_stamp(selected_details: &[EntityDetail], component: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
-    details.len().hash(&mut hasher);
-    for detail in details {
+    selected_details.len().hash(&mut hasher);
+    for detail in selected_details {
         detail.entity.hash(&mut hasher);
         detail
             .components
@@ -779,31 +831,33 @@ fn selection_stamp(details: &[EntityDetail], component: &str) -> u64 {
 /// Take one component's cached rows and write targets out of the session,
 /// rebuilding whichever part moved.
 ///
-/// Taking them out is what lets the caller draw with the same
-/// `&mut InspectorSession` the model lives in: the draw also borrows the
-/// session for its pickers and rectangles. The caller hands both back with
+/// Taking them out lets the caller draw while it still holds the same
+/// `&mut InspectorSession` the model lives in, because the draw also borrows
+/// the session for its pickers and rectangles. The caller hands both back with
 /// [`store_component_rows`] after the section's rows.
 pub fn take_component_rows(
     session: &mut InspectorSession,
     component: &ComponentView,
-    selected: &[EntityDetail],
+    selected_details: &[EntityDetail],
     primary: Entity,
 ) -> (Vec<CachedRow>, Vec<Entity>) {
     let type_name = component.type_name.as_str();
     let layout = row_layout(component);
-    let targets_stamp = selection_stamp(selected, type_name);
+    let targets_stamp = selection_stamp(selected_details, type_name);
+    // Step 1: Create this component's cache entry the first time it draws.
     if !session.row_models.contains_key(type_name) {
         session
             .row_models
             .insert(type_name.to_string(), CachedRows::default());
     }
-    let entry = session
+    let row_model = session
         .row_models
         .get_mut(type_name)
         .expect("the row-model entry was inserted just above");
-    if entry.layout != Some(layout) {
-        entry.layout = Some(layout);
-        entry.rows = rows(component)
+    // Step 2: Rebuild the rows when the layout fingerprint moved.
+    if row_model.layout != Some(layout) {
+        row_model.layout = Some(layout);
+        row_model.rows = rows(component)
             .into_iter()
             .map(|row| CachedRow {
                 row,
@@ -811,13 +865,16 @@ pub fn take_component_rows(
             })
             .collect();
     }
-    if entry.targets_stamp != Some(targets_stamp) {
-        entry.targets_stamp = Some(targets_stamp);
-        selection_targets_into(selected, primary, type_name, &mut entry.targets);
+    // Step 3: Rebuild the write targets when the selection moved.
+    if row_model.targets_stamp != Some(targets_stamp) {
+        row_model.targets_stamp = Some(targets_stamp);
+        selection_targets_into(selected_details, primary, type_name, &mut row_model.targets);
     }
+    // Step 4: Hand both out. The cache keeps its slots, empty, until the
+    // caller stores the rows back.
     (
-        std::mem::take(&mut entry.rows),
-        std::mem::take(&mut entry.targets),
+        std::mem::take(&mut row_model.rows),
+        std::mem::take(&mut row_model.targets),
     )
 }
 
@@ -828,12 +885,16 @@ pub fn store_component_rows(
     rows: Vec<CachedRow>,
     targets: Vec<Entity>,
 ) {
-    let Some(entry) = session.row_models.get_mut(type_name) else {
+    let Some(row_model) = session.row_models.get_mut(type_name) else {
         return;
     };
-    entry.rows = rows;
-    entry.targets = targets;
+    row_model.rows = rows;
+    row_model.targets = targets;
 }
+
+// =============================================================================
+// Axis labels
+// =============================================================================
 
 /// The axis label a vector row shows for element `index`: `X`, `Y`, `Z`, `W`.
 pub fn axis_label(index: usize) -> &'static str {
@@ -845,8 +906,8 @@ pub fn axis_label(index: usize) -> &'static str {
     }
 }
 
-/// The colour a vector row's axis label takes: the gizmo's X red, Y green,
-/// Z blue (the guide's colours), W muted for a fourth element.
+/// The colour a vector row's axis label takes: X red, Y green, Z blue, and
+/// grey for a fourth element.
 pub fn axis_color(index: usize) -> Color32 {
     match index {
         0 => Color32::from_rgb(214, 96, 96),
@@ -855,6 +916,10 @@ pub fn axis_color(index: usize) -> Color32 {
         _ => Color32::GRAY,
     }
 }
+
+// =============================================================================
+// Edit builders
+// =============================================================================
 
 /// The recorded component attach, labelled `add {short}`: the Component
 /// menu's picker and the scripted channel share it.
@@ -898,8 +963,10 @@ pub fn field_edit(
 }
 
 /// The recorded asset reference edit: `SetFieldAsset` under the field edit's
-/// label (`set Component.field`). `reference` is a path relative to `res` or
-/// a guid; `None` clears the reference.
+/// label (`set Component.field`).
+///
+/// `reference` is a path relative to `res`, a guid, or the name the asset was
+/// added to the store under. `None` clears the reference.
 pub fn asset_edit(
     entity: Entity,
     component: &str,
@@ -932,8 +999,9 @@ pub fn selection_asset_edit(
 }
 
 /// The recorded entity reference edit: `SetFieldEntity` under the field edit's
-/// label (`set Component.field`). `reference` is the entity to point at;
-/// `None` clears the reference.
+/// label (`set Component.field`).
+///
+/// `reference` is the entity to point at, and `None` clears the reference.
 pub fn entity_edit(
     entity: Entity,
     component: &str,
@@ -965,52 +1033,58 @@ pub fn selection_entity_edit(
     })
 }
 
+// =============================================================================
+// Reference rows
+// =============================================================================
+
 /// The entities an entity row's picker offers: every entity the Hierarchy
 /// lists, in its order.
 ///
-/// The row's own entity stays in the list: a component that references its own
+/// The row's own entity stays in the list. A component that references its own
 /// entity is odd but harmless, and hiding it would make the picker disagree
-/// with the Hierarchy for no rule the user could see.
-pub fn entity_candidates(entries: &[EntityListEntry]) -> Vec<&EntityListEntry> {
-    entries.iter().collect()
+/// with the Hierarchy for a rule the user could not see.
+pub fn entity_candidates(hierarchy_entries: &[EntityListEntry]) -> Vec<&EntityListEntry> {
+    hierarchy_entries.iter().collect()
 }
 
-/// The rows a picker offers for `target`: the listing's files of the type
-/// first, then the store's own assets of it - the ones built in code, which no
-/// directory walk can find.
+/// The rows a picker offers for `asset_type`.
 ///
-/// Both sides compare on the type name's last segment, so a module's spelling
-/// of a type and the renderer's agree however each was registered. A field
+/// The listing's files of the type come first, then the store's own assets of
+/// that type - the ones built in code, which a directory walk cannot find.
+/// Both sides compare the type name's last segment, so a module's spelling of
+/// a type and the renderer's agree however each was registered. A field
 /// without a recorded type offers nothing, rather than every asset of every
 /// type.
 pub fn picker_candidates<'a>(
     listing: &'a [AssetListing],
     engine_assets: &'a [EngineAsset],
-    target: Option<&str>,
+    asset_type: Option<&str>,
 ) -> (Vec<&'a AssetListing>, Vec<&'a EngineAsset>) {
-    let Some(target) = target else {
+    let Some(asset_type) = asset_type else {
         return (Vec::new(), Vec::new());
     };
     (
         listing
             .iter()
-            .filter(|entry| names_type(entry.kind.text(), target))
+            .filter(|entry| names_type(entry.kind.text(), asset_type))
             .collect(),
         engine_assets
             .iter()
-            .filter(|asset| names_type(&asset.kind, target))
+            .filter(|asset| names_type(&asset.kind, asset_type))
             .collect(),
     )
 }
 
 /// Whether a row's type name is the one a field asked for, compared on the
 /// last `::` segment.
-fn names_type(kind: &str, target: &str) -> bool {
-    kind.rsplit("::").next() == target.rsplit("::").next()
+fn names_type(row_type_name: &str, field_type_name: &str) -> bool {
+    row_type_name.rsplit("::").next() == field_type_name.rsplit("::").next()
 }
 
-/// The assets an asset row's picker offers: every file of the listing whose
-/// type is the field's, in listing order.
+/// The listing's files of a field's type, in listing order.
+///
+/// This is the file half of what an asset row's picker offers;
+/// [`picker_candidates`] adds the store's own assets.
 pub fn asset_candidates<'a>(
     listing: &'a [AssetListing],
     asset_type: Option<&str>,
@@ -1018,8 +1092,8 @@ pub fn asset_candidates<'a>(
     picker_candidates(listing, &[], asset_type).0
 }
 
-/// Whether a scripted or typed value names "no asset": the word that clears an
-/// asset reference field.
+/// Whether a scripted or typed value names "no reference": the word that
+/// clears an asset or entity reference field.
 pub fn is_cleared_reference(text: &str) -> bool {
     matches!(text.trim(), "" | "none" | "None")
 }
@@ -1048,6 +1122,10 @@ pub fn parse_entity_reference(text: &str) -> Result<Option<Entity>, String> {
         .map_err(|_| format!("`{trimmed}` is not an entity label (`<id>v<generation>`)"))?;
     Ok(Some(Entity::from_raw(id, generation)))
 }
+
+// =============================================================================
+// Element edits
+// =============================================================================
 
 /// The recorded array-element edit: `SetArrayElement` labelled
 /// `set {short}[{index}].{field}`.
@@ -1087,34 +1165,33 @@ pub fn field_coalesce_key(entity: Entity, component: &str, field: &str) -> Strin
     format!("inspector.{entity}.{component}.{field}")
 }
 
-/// The selected entities one component's edit reaches: the
-/// primary first, then every other selected entity whose detail carries the
-/// component.
+/// The selected entities one component's edit reaches: the primary first, then
+/// every other selected entity that carries the component.
 ///
-/// A selection whose entities do not all carry a component edits the ones that
-/// do - writing to an entity without it would fail the command and put an
-/// error in the Console for a row that showed nothing.
+/// When a selection has entities without the component, only the ones that
+/// carry it are edited. Writing to an entity without it would fail the command
+/// and put an error in the Console for a row that showed nothing.
 pub fn selection_targets(
-    details: &[EntityDetail],
+    selected_details: &[EntityDetail],
     primary: Entity,
     component: &str,
 ) -> Vec<Entity> {
     let mut targets = Vec::new();
-    selection_targets_into(details, primary, component, &mut targets);
+    selection_targets_into(selected_details, primary, component, &mut targets);
     targets
 }
 
 /// [`selection_targets`], written into a caller's buffer so a redraw reuses
 /// the allocation.
 pub fn selection_targets_into(
-    details: &[EntityDetail],
+    selected_details: &[EntityDetail],
     primary: Entity,
     component: &str,
     targets: &mut Vec<Entity>,
 ) {
     targets.clear();
     targets.push(primary);
-    for detail in details {
+    for detail in selected_details {
         if detail.entity == primary {
             continue;
         }
@@ -1128,12 +1205,12 @@ pub fn selection_targets_into(
     }
 }
 
-/// One recorded batch writing `value` into `field` on every target, with its
-/// label and coalesce key.
+/// One recorded batch that writes `value` into `field` on every target, with
+/// its label and coalesce key.
 ///
 /// The label names the primary's component and field, so a step reads the same
-/// whether one entity or ten were written; the coalesce key is the primary's,
-/// so a drag across a multi-selection collapses into one undo step.
+/// whether one entity or ten were written. The coalesce key is the primary's,
+/// so one drag across a multi-selection is one undo step.
 pub fn selection_field_edit(
     targets: &[Entity],
     primary: Entity,
@@ -1146,11 +1223,11 @@ pub fn selection_field_edit(
     })
 }
 
-/// One recorded batch writing element `index` of `field` on every target.
+/// One recorded batch that writes element `index` of `field` on every target.
 ///
 /// The step is labelled and keyed on the element (`field[index]`), which is what
-/// [`element_write`] does for a single entity: a drag on one element of an
-/// array is one undo step, and two elements are two.
+/// [`element_write`] does for a single entity. A drag on one element of an
+/// array is one undo step, and drags on two elements are two.
 pub fn selection_element_edit(
     targets: &[Entity],
     primary: Entity,
@@ -1170,8 +1247,8 @@ pub fn selection_element_edit(
 
 /// One recorded field write on an editor-editable resource.
 ///
-/// `SetResourceField` labelled `set {resource}.{field}`; a resource has no
-/// selection, so the batch shape's per-entity half does not apply.
+/// The command is `SetResourceField`, labelled `set {resource}.{field}`. A
+/// resource has no selection, so there is no per-entity batch here.
 pub fn resource_edit(resource: &str, field: &str, value: FieldValue) -> (EditorCommand, String) {
     (
         EditorCommand::SetResourceField {
@@ -1189,30 +1266,29 @@ pub fn resource_coalesce_key(resource: &str, field: &str) -> String {
     format!("resource.{resource}.{field}")
 }
 
-/// The field name an array element's coalesce key and label name:
-/// `field[index]`.
+/// The field name an array element's coalesce key carries: `field[index]`.
 fn element_coalesce_field(field: &str, index: usize) -> String {
     format!("{field}[{index}]")
 }
 
-/// A selection's batch of one-entity edits: `make` runs once per target, and
-/// the primary's own run names the step.
+/// A selection's batch of one-entity edits.
 ///
-/// Every selection builder is this shape - one command per target, the
-/// primary's label and the primary's coalesce key - so a new reference kind is
-/// a new `make` rather than a fourth copy of the loop.
+/// `build_target_edit` runs once per target, and the run for the primary also
+/// names the step. Every selection builder has this shape: one command per
+/// target, with the primary's label and coalesce key. A new reference kind is
+/// therefore a new `build_target_edit`, not another copy of the loop.
 fn batch(
     targets: &[Entity],
     primary: Entity,
     component: &str,
     coalesce_field: &str,
-    make: impl Fn(Entity) -> (EditorCommand, String),
+    build_target_edit: impl Fn(Entity) -> (EditorCommand, String),
 ) -> (Vec<EditorCommand>, String, String) {
     let mut commands = Vec::with_capacity(targets.len());
     for target in targets {
-        commands.push(make(*target).0);
+        commands.push(build_target_edit(*target).0);
     }
-    let (_command, label) = make(primary);
+    let (_command, label) = build_target_edit(primary);
     (
         commands,
         label,
@@ -1228,6 +1304,10 @@ pub fn element_field(value: &FieldValue, index: usize) -> Option<FieldValue> {
     elements.get(index).cloned()
 }
 
+// =============================================================================
+// Writes
+// =============================================================================
+
 /// What one value edit queues: the step's commands, the label it records
 /// under, and the key that collapses consecutive writes from one drag.
 #[derive(Clone, Debug, PartialEq)]
@@ -1242,16 +1322,16 @@ pub struct RecordedEdit {
 
 impl RecordedEdit {
     /// One entity's edit, with the key its field coalesces on.
-    fn one(edit: (EditorCommand, String), coalesce: String) -> Self {
+    fn from_entity_edit(edit: (EditorCommand, String), coalesce_key: String) -> Self {
         Self {
             commands: vec![edit.0],
             label: edit.1,
-            coalesce,
+            coalesce: coalesce_key,
         }
     }
 
     /// A selection's batch, which carries its own label and key.
-    fn many(edit: (Vec<EditorCommand>, String, String)) -> Self {
+    fn from_selection_batch(edit: (Vec<EditorCommand>, String, String)) -> Self {
         Self {
             commands: edit.0,
             label: edit.1,
@@ -1271,9 +1351,9 @@ enum ReferenceWrite {
 /// The reference `text` names for `current`, or `None` when the field holds a
 /// plain value.
 ///
-/// The one place that knows how a reference row reads its text, shared by
-/// [`field_write`] and [`selection_write`]: the two differ in how many entities
-/// they write, never in what the text means.
+/// This is the one place that knows how a reference row reads its text, and
+/// [`field_write`] and [`selection_write`] both use it. The two differ in how
+/// many entities they write, never in what the text means.
 ///
 /// # Errors
 ///
@@ -1294,12 +1374,12 @@ fn reference_write(
 
 /// One field's write, decided in one place.
 ///
-/// A field's text means three different things depending on the value it
-/// edits: a path or guid for an asset reference, a Hierarchy label for an
-/// entity reference, and its own text otherwise. Every surface that writes a
-/// field - the Inspector, the scripted channel, a module panel - goes through
-/// here, so a new [`FieldValue`] family is one branch rather than five copies,
-/// and a surface cannot be missing one.
+/// What a field's text means depends on the value it edits. An asset reference
+/// takes a path, a guid or a store name. An entity reference takes a Hierarchy
+/// label. Any other value takes its own text. Every surface that writes a field
+/// goes through here - the Inspector, the scripted channel and a module panel -
+/// so a new [`FieldValue`] family is one branch rather than five copies, and no
+/// surface can be missing it.
 ///
 /// # Errors
 ///
@@ -1311,22 +1391,22 @@ pub fn field_write(
     current: &FieldValue,
     value_text: &str,
 ) -> Result<RecordedEdit, String> {
-    let coalesce = field_coalesce_key(entity, component, field);
+    let coalesce_key = field_coalesce_key(entity, component, field);
     match reference_write(current, value_text) {
-        Some(Ok(ReferenceWrite::Asset(reference))) => Ok(RecordedEdit::one(
+        Some(Ok(ReferenceWrite::Asset(reference))) => Ok(RecordedEdit::from_entity_edit(
             asset_edit(entity, component, field, reference),
-            coalesce,
+            coalesce_key,
         )),
-        Some(Ok(ReferenceWrite::Entity(reference))) => Ok(RecordedEdit::one(
+        Some(Ok(ReferenceWrite::Entity(reference))) => Ok(RecordedEdit::from_entity_edit(
             entity_edit(entity, component, field, reference),
-            coalesce,
+            coalesce_key,
         )),
         Some(Err(message)) => Err(message),
         None => {
             let value = parse_field_value(value_text, current)?;
-            Ok(RecordedEdit::one(
+            Ok(RecordedEdit::from_entity_edit(
                 field_edit(entity, component, field, value),
-                coalesce,
+                coalesce_key,
             ))
         }
     }
@@ -1335,7 +1415,7 @@ pub fn field_write(
 /// One array element's write, keyed on the element.
 ///
 /// The key names `field[index]`, so two drags on two elements of one array are
-/// two undo steps: keying on the whole field collapsed them into one.
+/// two undo steps.
 ///
 /// # Errors
 ///
@@ -1352,14 +1432,14 @@ pub fn element_write(
     let element = element_field(current, index)
         .ok_or_else(|| format!("`{field}[{index}]` is outside the array"))?;
     let value = parse_field_value(value_text, &element)?;
-    let coalesce = field_coalesce_key(entity, component, &element_coalesce_field(field, index));
-    Ok(RecordedEdit::one(
+    let coalesce_key = field_coalesce_key(entity, component, &element_coalesce_field(field, index));
+    Ok(RecordedEdit::from_entity_edit(
         element_edit(entity, component, field, index, value),
-        coalesce,
+        coalesce_key,
     ))
 }
 
-/// One field's write over a selection: the same three families as
+/// One field's write over a selection: the same three cases as
 /// [`field_write`], recorded once for the whole set.
 ///
 /// # Errors
@@ -1374,30 +1454,30 @@ pub fn selection_write(
     value_text: &str,
 ) -> Result<RecordedEdit, String> {
     match reference_write(current, value_text) {
-        Some(Ok(ReferenceWrite::Asset(reference))) => Ok(RecordedEdit::many(selection_asset_edit(
-            targets, primary, component, field, reference,
-        ))),
-        Some(Ok(ReferenceWrite::Entity(reference))) => Ok(RecordedEdit::many(
+        Some(Ok(ReferenceWrite::Asset(reference))) => Ok(RecordedEdit::from_selection_batch(
+            selection_asset_edit(targets, primary, component, field, reference),
+        )),
+        Some(Ok(ReferenceWrite::Entity(reference))) => Ok(RecordedEdit::from_selection_batch(
             selection_entity_edit(targets, primary, component, field, reference),
         )),
         Some(Err(message)) => Err(message),
         None => {
             let value = parse_field_value(value_text, current)?;
-            Ok(RecordedEdit::many(selection_field_edit(
+            Ok(RecordedEdit::from_selection_batch(selection_field_edit(
                 targets, primary, component, field, value,
             )))
         }
     }
 }
 
-/// One recorded batch writing every leaf of a grouped row: the colour
-/// or vector a row draws, across the whole selection, as one undo step.
+/// One recorded batch that writes every leaf of a grouped row, across the whole
+/// selection, as one undo step.
 ///
 /// `values` holds one value per leaf, in the row's own order. The label and the
-/// coalesce key both name the first leaf in the form the rest of the write path
-/// uses for it - `field[index]` for an array element, `field` otherwise - so a
-/// colour row's picker and its per-channel fields record the same step for one
-/// element instead of two names for one edit.
+/// coalesce key both name the first leaf, in the form the rest of the write
+/// path uses for it: `field[index]` for an array element, and `field`
+/// otherwise. So a colour row's picker and its per-channel fields record the
+/// same step for one element, not two names for one edit.
 pub fn selection_leaf_edit(
     targets: &[Entity],
     primary: Entity,
@@ -1406,6 +1486,7 @@ pub fn selection_leaf_edit(
     values: &[FieldValue],
 ) -> (Vec<EditorCommand>, String, String) {
     let mut commands = Vec::with_capacity(targets.len() * leaves.len());
+    // Step 1: One command per leaf, for every target.
     for target in targets {
         for (leaf, value) in leaves.iter().zip(values) {
             let command = match leaf.element {
@@ -1417,6 +1498,8 @@ pub fn selection_leaf_edit(
             commands.push(command);
         }
     }
+    // Step 2: Label and key the batch on the first leaf, in the form the
+    // single-field writes use for that leaf.
     let label = match leaves.first() {
         Some(leaf) => match leaf.element {
             Some(element) => element_label(component, &leaf.field, element),
@@ -1438,11 +1521,21 @@ pub fn selection_leaf_edit(
     (commands, label, key)
 }
 
+// =============================================================================
+// Text and values
+// =============================================================================
+
 /// Parse an edited text back into the kind `current` already holds.
 ///
-/// The scripted channel and a text field both commit through this: a float
-/// field takes a float, a text field the rest of the line, and a kind with
-/// no editor refuses.
+/// The scripted channel and a text field both commit through this. A float
+/// field takes a float, a text field takes the rest of the line, and a kind
+/// with no editor is refused.
+///
+/// # Errors
+///
+/// A message saying the text is not a float, an integer, an unsigned number or
+/// a boolean, as the field's kind requires, or that the field's kind has no
+/// editor here.
 pub fn parse_field_value(text: &str, current: &FieldValue) -> Result<FieldValue, String> {
     let text = text.trim();
     let parsed = match current {
@@ -1490,6 +1583,10 @@ pub fn value_text(value: &FieldValue) -> String {
     }
 }
 
+// =============================================================================
+// Settings documents
+// =============================================================================
+
 /// One segment of a settings key path: an object key or an array index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SettingsKey {
@@ -1501,10 +1598,17 @@ pub enum SettingsKey {
 
 /// Parse a settings key path: dotted object keys with `[i]` array indexes,
 /// like `waves[0].amplitude`.
+///
+/// # Errors
+///
+/// A message naming the text when a key is empty, a bracket is unbalanced, an
+/// index is not a number, or the path names no key at all.
 pub fn parse_settings_key_path(text: &str) -> Result<Vec<SettingsKey>, String> {
     let mut path = Vec::new();
     let mut key = String::new();
     let mut characters = text.chars().peekable();
+    // Step 1: Read the path one character at a time. A dot or a bracket ends
+    // the key being read; a bracket also starts an index.
     while let Some(character) = characters.next() {
         match character {
             '.' => {
@@ -1523,30 +1627,32 @@ pub fn parse_settings_key_path(text: &str) -> Result<Vec<SettingsKey>, String> {
                 if !key.is_empty() {
                     path.push(SettingsKey::Key(std::mem::take(&mut key)));
                 }
-                let mut digits = String::new();
+                let mut index_text = String::new();
                 let mut closed = false;
-                for digit in characters.by_ref() {
-                    if digit == ']' {
+                for index_character in characters.by_ref() {
+                    if index_character == ']' {
                         closed = true;
                         break;
                     }
-                    digits.push(digit);
+                    index_text.push(index_character);
                 }
-                // A run of digits that reaches the end of the input is an
-                // unbalanced bracket, not an index: accepting it would edit a
-                // leaf the person did not name.
+                // A bracket that never closes is an unbalanced `[`, not an
+                // index. Accepting it would edit a leaf the person did not
+                // name.
                 if !closed {
                     return Err(format!("`{text}` has an unbalanced `[`"));
                 }
-                let index: usize = digits
+                let index: usize = index_text
                     .parse()
-                    .map_err(|_| format!("`{text}` has a bad index `[{digits}]`"))?;
+                    .map_err(|_| format!("`{text}` has a bad index `[{index_text}]`"))?;
                 path.push(SettingsKey::Index(index));
             }
             ']' => return Err(format!("`{text}` has an unbalanced `]`")),
             other => key.push(other),
         }
     }
+    // Step 2: Read the key the input ended on, then refuse a path that names
+    // no key at all.
     if !key.is_empty() {
         path.push(SettingsKey::Key(key));
     }
@@ -1556,7 +1662,7 @@ pub fn parse_settings_key_path(text: &str) -> Result<Vec<SettingsKey>, String> {
     Ok(path)
 }
 
-/// The canonical text of a key path: what labels and coalescing keys use.
+/// The text form of a key path: what labels and coalescing keys use.
 pub fn settings_key_text(path: &[SettingsKey]) -> String {
     let mut text = String::new();
     for segment in path {
@@ -1589,8 +1695,15 @@ pub fn settings_field<'a>(document: &'a JsonValue, path: &[SettingsKey]) -> Opti
     Some(current)
 }
 
-/// Replace the settings leaf a key path names; the containers along the way
-/// must already exist (the editors only edit what they displayed).
+/// Replace the settings leaf a key path names.
+///
+/// The containers along the way must already exist, because the editors only
+/// edit what they displayed.
+///
+/// # Errors
+///
+/// A message naming the segment the document does not hold, or saying that the
+/// path is empty.
 pub fn patch_settings(
     document: &mut JsonValue,
     path: &[SettingsKey],
@@ -1600,6 +1713,7 @@ pub fn patch_settings(
         .split_last()
         .ok_or_else(|| "a settings key path cannot be empty".to_string())?;
     let mut current = document;
+    // Step 1: Walk to the leaf's parent, refusing a segment the document lacks.
     for segment in parents {
         current = match segment {
             SettingsKey::Key(key) => current
@@ -1610,6 +1724,7 @@ pub fn patch_settings(
                 .ok_or_else(|| format!("element [{index}] is not in the settings"))?,
         };
     }
+    // Step 2: Write the leaf itself.
     let slot = match last {
         SettingsKey::Key(key) => current
             .get_mut(key)
@@ -1625,12 +1740,17 @@ pub fn patch_settings(
 /// Replace the settings leaf a key path names, creating what is missing on the
 /// way.
 ///
-/// This is the asset-settings rule: a slot or a reference row is drawn from
-/// what the *type* declares, so the file may not hold the key yet - an unbound
-/// texture slot is exactly that - and the first write is the one that creates
-/// it. A missing parent object is made; an array index one past the end appends.
-/// The typed component and resource editors keep using [`patch_settings`], whose
-/// stricter rule is what stops a stale row from inventing a field.
+/// This follows the asset-settings rule. A slot or a reference row is drawn
+/// from what the *type* declares, so the file may not hold the key yet - an
+/// unbound texture slot is exactly that - and the first write is the one that
+/// creates it. A missing parent object is created, and an array index one past
+/// the end appends. [`patch_settings`] is the strict twin: it fails unless every
+/// segment the path names is already in the document.
+///
+/// # Errors
+///
+/// A message naming the segment it could not reach: a parent that is not an
+/// object or an array, an index past the end of an array, or an empty path.
 pub fn patch_settings_inserting(
     document: &mut JsonValue,
     path: &[SettingsKey],
@@ -1640,6 +1760,7 @@ pub fn patch_settings_inserting(
         .split_last()
         .ok_or_else(|| "a settings key path cannot be empty".to_string())?;
     let mut current = document;
+    // Step 1: Walk the parents, creating a missing object on the way.
     for (position, segment) in parents.iter().enumerate() {
         current = match segment {
             SettingsKey::Key(key) => {
@@ -1671,6 +1792,8 @@ pub fn patch_settings_inserting(
             }
         };
     }
+    // Step 2: Write the last segment, appending to an array when the index is
+    // one past its end.
     match last {
         SettingsKey::Key(key) => {
             let object = current
@@ -1692,6 +1815,12 @@ pub fn patch_settings_inserting(
 }
 
 /// Parse an edited text back into the JSON kind `current` already holds.
+///
+/// # Errors
+///
+/// A message saying the text is not a boolean, an integer or a number of the
+/// current kind, that a number is not finite, or that the document's kind has
+/// no editor here.
 pub fn parse_settings_value(text: &str, current: &JsonValue) -> Result<JsonValue, String> {
     let text = text.trim();
     let parsed = match current {
@@ -1713,11 +1842,15 @@ pub fn parse_settings_value(text: &str, current: &JsonValue) -> Result<JsonValue
 
 /// The recorded settings edit: `SetAssetSettings` under the label the
 /// history and the suite read.
-pub fn settings_edit(path: &str, settings: JsonValue, key_text: &str) -> (EditorCommand, String) {
+pub fn settings_edit(
+    asset_path: &str,
+    settings_document: JsonValue,
+    key_text: &str,
+) -> (EditorCommand, String) {
     (
         EditorCommand::SetAssetSettings {
-            path: path.to_string(),
-            settings,
+            path: asset_path.to_string(),
+            settings: settings_document,
         },
         format!("set asset {key_text}"),
     )
@@ -1728,6 +1861,10 @@ pub fn settings_coalesce_key(asset_path: &str, key_text: &str) -> String {
     format!("inspector.asset.{asset_path}.{key_text}")
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1736,10 +1873,10 @@ mod tests {
 
     /// A detail whose components are named by their short names, enough to
     /// answer which entities carry a component.
-    fn detail(entity: Entity, components: &[&str]) -> EntityDetail {
+    fn detail(entity: Entity, component_names: &[&str]) -> EntityDetail {
         EntityDetail {
             entity,
-            components: components
+            components: component_names
                 .iter()
                 .map(|name| ComponentView {
                     type_name: name.to_string(),
@@ -1792,9 +1929,11 @@ mod tests {
         }
     }
 
-    /// The row model is rebuilt on a layout change, not on a value edit: the
-    /// stamp reads kinds and lengths, and the cache keeps its rows - and their
-    /// log memory - across a frame that only changed a value.
+    /// The row model is rebuilt on a layout change, not on a value edit.
+    ///
+    /// The stamp reads kinds and lengths, and the cache keeps its rows - with
+    /// the lines they already logged - across a frame that only changed a
+    /// value.
     #[test]
     fn the_row_model_rebuilds_on_layout_not_on_values() {
         let mut view = single_field_view(FieldValue::F32(1.0));
@@ -1913,9 +2052,8 @@ mod tests {
             Ok(FieldValue::Text("hello world".to_string()))
         );
         assert!(parse_field_value("1", &FieldValue::Array(Vec::new())).is_err());
-        // Every kind the widget table calls an Integer parses: the two tables
-        // are read 800 lines apart, and the missing `Isize` arm made a drawn
-        // integer field refuse every edit with "not editable here".
+        // Every kind the widget table calls an Integer parses: a drawn integer
+        // field must accept its own edit.
         let integers = [
             (FieldValue::I8(0), FieldValue::I8(7)),
             (FieldValue::I16(0), FieldValue::I16(7)),
@@ -1938,8 +2076,9 @@ mod tests {
     }
 
     /// The write paths share one decision: an element write coalesces on the
-    /// element and a field write handles the reference kinds, so a module panel
-    /// reaches them the way the Inspector does.
+    /// element, and a field write handles the reference kinds.
+    ///
+    /// A module panel therefore reaches them the way the Inspector does.
     #[test]
     fn every_write_path_coalesces_and_branches_the_same() {
         let entity = Entity::from_raw(1, 0);
@@ -2008,15 +2147,14 @@ mod tests {
         assert!(parse_settings_key_path("").is_err());
         assert!(parse_settings_key_path("a..b").is_err());
         assert!(parse_settings_key_path("a[x]").is_err());
-        // Both halves of a broken bracket are refused: an index that runs off
-        // the end used to parse as `waves[0]`, editing a leaf nobody named.
+        // An unterminated index and a stray bracket are both refused.
         assert!(parse_settings_key_path("waves[0").is_err());
         assert!(parse_settings_key_path("waves[").is_err());
         assert!(parse_settings_key_path("waves]").is_err());
     }
 
     #[test]
-    fn settings_leafs_read_and_patch() {
+    fn settings_leaves_read_and_patch() {
         let mut document = json!({
             "flip_v": false,
             "waves": [{ "amplitude": 1.0 }],
@@ -2037,9 +2175,9 @@ mod tests {
         assert!(patch_settings(&mut document, &missing, json!(1)).is_err());
     }
 
-    /// The inserting patch is the asset-settings rule: a slot the type declares
-    /// but the file does not hold yet is created, with its parent if need be,
-    /// while the strict patch keeps refusing the same path.
+    /// The inserting patch follows the asset-settings rule: it creates a slot
+    /// that the type declares but the file does not hold yet, with the parent
+    /// it needs, while the strict patch keeps refusing the same path.
     #[test]
     fn the_inserting_patch_creates_the_leaf_the_file_lacks() {
         let mut document = json!({ "textures": { "albedo": "aa" } });
@@ -2113,14 +2251,14 @@ mod tests {
     }
 
     /// A component view over a field/value pair list.
-    fn component(name: &str, values: Vec<FieldValue>) -> ComponentView {
+    fn component(type_name: &str, values: Vec<FieldValue>) -> ComponentView {
         /// Field names for the fixture (the descriptor's name is a `&'static
         /// str`), indexed by the value's position.
         const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
         ComponentView {
             asset_labels: Vec::new(),
             entity_labels: Vec::new(),
-            type_name: name.to_string(),
+            type_name: type_name.to_string(),
             persistable: false,
             editable: true,
             fields: values
@@ -2420,9 +2558,9 @@ mod tests {
         );
     }
 
-    /// `[TextArea]` and `[Multiline]` shape a text box, and a text row has no
-    /// box to shape until heap-backed fields are writable: the row stays
-    /// read-only and the decorators are ignored rather than promising an edit
+    /// `[TextArea]` and `[Multiline]` shape a text box, but a text row has no
+    /// box to shape until heap-backed fields become writable. The row stays
+    /// read-only, and the decorators are ignored instead of promising an edit
     /// the field writer refuses.
     #[test]
     fn text_decorators_wait_for_a_writable_text_row() {
@@ -2612,8 +2750,8 @@ mod tests {
     }
 
     /// A picker offers the project's files of the type first, then the store's
-    /// own assets of it - the ones built in code, which no directory walk can
-    /// find - and a type no engine asset has adds nothing.
+    /// own assets of it - the ones built in code, which a directory walk cannot
+    /// find. A type that neither side has offers nothing.
     #[test]
     fn a_picker_offers_the_files_and_the_engines_own_assets() {
         let listing = |path: &str, kind: &str| AssetListing {
@@ -2660,7 +2798,7 @@ mod tests {
             ["pill.pbr.opaque", "pill.pbr.skybox"],
             "the module's passes come after the project's files"
         );
-        // A type no engine asset names offers the files alone.
+        // A type neither side names offers nothing.
         let (files, chosen) = picker_candidates(&assets, &engine_assets, Some("demo::Scene"));
         assert!(files.is_empty() && chosen.is_empty());
     }
@@ -2767,9 +2905,9 @@ mod tests {
 
     /// A component whose fields carry their own names and decorations, for the
     /// grouped-row tests: a nested type's leaves are dotted, so the fixture
-    /// has to name them.
+    /// names them itself.
     fn named_fields(
-        entries: Vec<(&'static str, FieldValue, Vec<FieldDecorator>)>,
+        field_entries: Vec<(&'static str, FieldValue, Vec<FieldDecorator>)>,
     ) -> ComponentView {
         ComponentView {
             asset_labels: Vec::new(),
@@ -2777,7 +2915,7 @@ mod tests {
             type_name: "demo::Grouped".to_string(),
             persistable: false,
             editable: true,
-            fields: entries
+            fields: field_entries
                 .iter()
                 .map(
                     |(name, _, decorators)| crate::editor_state::ComponentFieldView {
@@ -2786,7 +2924,10 @@ mod tests {
                     },
                 )
                 .collect(),
-            values: entries.into_iter().map(|(_, value, _)| value).collect(),
+            values: field_entries
+                .into_iter()
+                .map(|(_, value, _)| value)
+                .collect(),
         }
     }
 
@@ -2794,11 +2935,23 @@ mod tests {
     /// `b` and `a` share a (empty) prefix and carry the colour decorator.
     #[test]
     fn a_colour_components_channels_draw_as_one_colour_row() {
-        let colour = |value: f32| {
+        let colour = |channel_value: f32| {
             vec![
-                ("r", FieldValue::F32(value), vec![FieldDecorator::Color]),
-                ("g", FieldValue::F32(value), vec![FieldDecorator::Color]),
-                ("b", FieldValue::F32(value), vec![FieldDecorator::Color]),
+                (
+                    "r",
+                    FieldValue::F32(channel_value),
+                    vec![FieldDecorator::Color],
+                ),
+                (
+                    "g",
+                    FieldValue::F32(channel_value),
+                    vec![FieldDecorator::Color],
+                ),
+                (
+                    "b",
+                    FieldValue::F32(channel_value),
+                    vec![FieldDecorator::Color],
+                ),
                 ("a", FieldValue::F32(1.0), vec![FieldDecorator::Color]),
             ]
         };
@@ -2878,7 +3031,7 @@ mod tests {
         );
     }
 
-    /// Two dotted leaves marked as a vector draw as one vector row, and a lone
+    /// Dotted leaves marked as a vector draw as one vector row, and a lone
     /// channel without its partner stays a plain field.
     #[test]
     fn dotted_vector_leaves_collapse_into_one_row() {

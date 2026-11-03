@@ -1,31 +1,33 @@
-//! The plain draw data the UI library and the renderer contract share.
+//! The plain draw data a UI producer builds and a renderer draws.
 //!
 //! # Responsibilities
 //!
-//! - [`draw`]: the draw vocabulary a backend consumes - [`DrawList`] with
-//!   vertices, indices, clips and commands, and the values they carry
-//!   ([`UiVertex`], [`Color`], [`Rect`], [`TextureId`]).
-//! - [`frame`]: a frame of UI output, [`UiFrame`] and [`UiDraw`] - the draw
-//!   lists per surface plus the textures they sample.
-//! - [`texture`]: the versioned texture set ([`UiTextureSet`], [`UiTexture`])
-//!   a backend uploads by revision, so a rebuilt backend re-uploads instead of
-//!   drawing nothing.
-//! - [`slot`]: the world resource ([`UiFrameSlot`]) a producer publishes a
-//!   frame into and a renderer drains.
+//! - [`draw`]: the draw vocabulary a backend consumes. [`DrawList`] holds the
+//!   vertices, the indices and one command list of clip changes and draws,
+//!   with the values they use ([`UiVertex`], [`DrawCommand`], [`Color`],
+//!   [`Rect`], [`TextureId`]).
+//! - [`frame`]: a frame of UI output. [`UiFrame`] holds one [`UiDraw`] per
+//!   surface, and the frame carries the textures those lists sample.
+//! - [`texture`]: the versioned texture set ([`UiTextureSet`], [`UiTexture`],
+//!   [`UiTextureFilter`]). A backend uploads a texture again when its revision
+//!   changes, so a rebuilt backend uploads what it lacks instead of drawing
+//!   nothing.
+//! - [`slot`]: the world resource ([`UiFrameSlot`]) that carries a frame from
+//!   the producer to the renderer.
 //!
 //! # Design
 //!
-//! These types cross artifact boundaries - a UI built in one DLL, a renderer
-//! in another draws it (`pill_renderer_api::RenderFrame.ui`) - so they live
-//! in their own shared crate: one type identity across every artifact that
-//! builds or draws UI, without the renderer contract depending on the UI
-//! library. Everything here is owned plain data.
+//! These types cross DLL boundaries: one DLL builds the UI data and another
+//! draws it (`pill_renderer_api::RenderFrame.ui`). They live in their own
+//! shared crate so every artifact that builds or draws UI uses the same
+//! types, and so the renderer contract can carry them without depending on
+//! the UI library. Everything here is owned plain data.
 
 /// The draw vocabulary a backend consumes.
 pub mod draw;
 /// A frame of UI output.
 pub mod frame;
-/// The world resource a frame travels through.
+/// The world resource that carries a frame from the producer to the renderer.
 pub mod slot;
 /// The versioned textures a frame carries.
 pub mod texture;

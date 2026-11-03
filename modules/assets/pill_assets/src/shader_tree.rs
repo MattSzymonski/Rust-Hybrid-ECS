@@ -1,27 +1,28 @@
-//! A crate's whole shader directory, cooked by convention.
+//! Cooks a crate's shader directory by convention.
 //!
 //! # Responsibilities
 //!
-//! - Find a `shaders/` root's source and header directories
-//!   ([`shader_tree_layout`]) and cook every stale source in one call
-//!   ([`cook_shader_tree`]), with every header directory on the include path.
+//! - Find the directories under a shader root that hold stage sources, and the
+//!   ones that hold headers ([`shader_tree_layout`]).
+//! - Cook every stale source in one call ([`cook_shader_tree`]), with every
+//!   header directory on the include path.
 //!
 //! # Design
 //!
-//! One routine for the two places a crate's shaders are cooked: its build
-//! script, before the crate compiles, and the development host's shader
-//! watcher, while the crate runs. Both call it with the same root, so a runtime
-//! cook cannot compile a different set of files, or resolve a header
-//! differently, than the build did.
+//! A crate's shaders are cooked in two places: in its build script, before the
+//! crate compiles, and in the development host's shader watcher, while the
+//! crate runs. Both call this module with the same root. So a cook at runtime
+//! compiles the same files, and finds the same headers, as the build did.
 //!
 //! # Convention
 //!
-//! - A directory named `include` holds headers, and every one in the tree is
-//!   on every source's include path: its own `include/` first, then the rest.
+//! - A directory named `include` holds headers. Every one in the tree is on
+//!   every source's include path, in sorted path order.
 //! - Any other directory that directly holds `.hlsl` files is a source
-//!   directory. Its sources are cooked to `.wgsl` beside them, with the stage
-//!   named by the file (see [`HlslToWgsl`]).
-//! - Every other directory only groups; nothing in it is cooked.
+//!   directory. Its sources are cooked to `.wgsl` next to them, and the stage
+//!   comes from the file name (see [`HlslToWgsl`]).
+//! - In any other directory, only subdirectories matter: nothing it holds is
+//!   cooked.
 
 // Standard library
 use std::fs;
@@ -30,11 +31,19 @@ use std::path::{Path, PathBuf};
 // Current crate
 use crate::{walk_files, CookError, HlslToWgsl, Pipeline, Rule};
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// Name of a directory holding headers rather than stage sources.
 const INCLUDE_DIRECTORY_NAME: &str = "include";
 
-/// Extension of the stage sources and headers the shader rule reads.
+/// Extension of the stage source files this module looks for.
 const SOURCE_EXTENSION: &str = "hlsl";
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// Where a shader tree keeps its sources and its headers.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -46,8 +55,9 @@ pub struct ShaderTreeLayout {
 }
 
 impl ShaderTreeLayout {
-    /// Every directory an edit to a source or a header can land in: the ones a
-    /// watcher registers and a build script reports to cargo.
+    /// Returns every directory that holds a source or a header, which is where
+    /// an edit can change what the cook produces. A build script reports them
+    /// to cargo, and the development host watches the tree that contains them.
     pub fn watched_directories(&self) -> Vec<PathBuf> {
         let mut directories = self.source_directories.clone();
         directories.extend(self.include_directories.iter().cloned());
@@ -61,18 +71,23 @@ impl ShaderTreeLayout {
 pub struct ShaderTreeReport {
     /// The layout the cook ran against.
     pub layout: ShaderTreeLayout,
-    /// Every stage source the cook matched.
+    /// Every stage source the cook matched, whether or not it was stale.
     pub discovered_sources: Vec<PathBuf>,
-    /// Every file in an `include/` directory.
+    /// Every file inside an `include` directory, of any extension.
     pub header_files: Vec<PathBuf>,
     /// Outputs this run rebuilt, whether or not their text changed.
     pub rebuilt_outputs: Vec<PathBuf>,
 }
 
-/// Find the source and header directories under `root`.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Finds the directories under `root` that hold stage sources and the ones
+/// that hold headers.
 ///
-/// A `root` that does not exist has neither; that is not an error, so a crate
-/// without shaders can still run its build script.
+/// A missing `root` simply has no such directories, and that is not an error,
+/// so a crate without shaders can still run its build script.
 ///
 /// # Errors
 ///
@@ -85,11 +100,12 @@ pub fn shader_tree_layout(root: &Path) -> Result<ShaderTreeLayout, CookError> {
     Ok(layout)
 }
 
-/// Cook every stale stage source under `root` (a crate's `shaders/`).
+/// Cooks every stale stage source under `root`, a crate's `shaders/`
+/// directory.
 ///
-/// A source is stale when its `.wgsl` is missing or older than the source or
-/// than any header, so a header edit re-cooks every source that could include
-/// it, and an unchanged tree cooks nothing.
+/// A source is stale when its `.wgsl` output is missing, or older than the
+/// source, or older than any header. So a header edit re-cooks every source
+/// that could include it, and a tree nobody edited cooks nothing.
 ///
 /// # Errors
 ///
@@ -98,30 +114,35 @@ pub fn shader_tree_layout(root: &Path) -> Result<ShaderTreeLayout, CookError> {
 /// place, so a caller that keeps the previous shaders on failure still finds
 /// them on disk.
 pub fn cook_shader_tree(root: &Path) -> Result<ShaderTreeReport, CookError> {
+    // Step 1: Find the layout and list every header file.
     let layout = shader_tree_layout(root)?;
     let mut report = ShaderTreeReport::default();
     for include_directory in &layout.include_directories {
         report.header_files.extend(walk_files(include_directory)?);
     }
 
+    // Step 2: Cook each source directory, with every header directory in the
+    // tree on the include path, in sorted path order.
     for source_directory in &layout.source_directories {
-        // A source's own `include/` is searched by the rule first; the rest of
-        // the tree's header directories follow, in path order.
-        let mut rule = HlslToWgsl::flat();
+        let mut rule = HlslToWgsl::flat_tree();
         for include_directory in &layout.include_directories {
-            rule = rule.with_include(include_directory);
+            rule = rule.with_include_directory(include_directory);
         }
         let rules: Vec<Box<dyn Rule>> = vec![Box::new(rule)];
         let stats = Pipeline::with_rules(source_directory, rules).run()?;
-        report.discovered_sources.extend(stats.discovered);
-        report.rebuilt_outputs.extend(stats.rebuilt);
+        report.discovered_sources.extend(stats.discovered_inputs);
+        report.rebuilt_outputs.extend(stats.rebuilt_outputs);
     }
     report.layout = layout;
     Ok(report)
 }
 
-/// Walk `directory`, sorting each subdirectory into `layout`.
+/// Walks `directory` and every directory below it, recording the source
+/// directories and header directories it finds in `layout`.
 fn collect_layout(directory: &Path, layout: &mut ShaderTreeLayout) -> Result<(), CookError> {
+    // Step 1: Read the directory's entries, remembering its subdirectories and
+    // whether it directly holds `.hlsl` files. A missing directory is not an
+    // error: there is nothing to record for it.
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -151,8 +172,10 @@ fn collect_layout(directory: &Path, layout: &mut ShaderTreeLayout) -> Result<(),
         }
     }
 
-    // An `include/` is a header directory whatever it holds, and is not
-    // descended into: headers are found by `walk_files`, never cooked.
+    // Step 2: Record what this directory is, then walk its subdirectories. A
+    // directory named `include` is a header directory whatever it contains,
+    // and the walk does not go inside it. `walk_files` reads those headers,
+    // and they are never cooked.
     if directory
         .file_name()
         .is_some_and(|name| name == INCLUDE_DIRECTORY_NAME)
@@ -169,16 +192,21 @@ fn collect_layout(directory: &Path, layout: &mut ShaderTreeLayout) -> Result<(),
     Ok(())
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A scratch tree shaped like a renderer's `shaders/`: a flat group, a
-    /// group with a `shaders/` level, and a shared `include/`.
-    fn scratch_tree(name: &str) -> PathBuf {
+    /// Creates a scratch tree shaped like a renderer's `shaders/` directory: a
+    /// group whose sources sit directly in it, a group with a `shaders/` level
+    /// below it, a shared `include/`, and an empty group.
+    fn create_scratch_tree(scenario_name: &str) -> PathBuf {
         let root = std::env::temp_dir()
             .join("pill_assets_shader_tree")
-            .join(format!("{}_{name}", std::process::id()));
+            .join(format!("{}_{scenario_name}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for directory in ["common/include", "pipeline/shaders", "empty_group"] {
             fs::create_dir_all(root.join(directory)).expect("scratch directory");
@@ -192,7 +220,7 @@ mod tests {
 
     #[test]
     fn sources_and_headers_are_found_by_convention() {
-        let root = scratch_tree("layout");
+        let root = create_scratch_tree("layout");
 
         let layout = shader_tree_layout(&root).expect("readable");
 

@@ -10,20 +10,26 @@
 //!   scene and game views in the center, the entity column on the left, the
 //!   inspector above the system column on the right, the assets row below),
 //!   the schema version its documents carry, and
-//!   [`EditorDock::settled`] which replaces the placeholder rectangles an
-//!   unpacked layout has not computed yet.
+//!   [`EditorDock::settled`], which replaces the placeholder rectangles of a
+//!   layout that has not been drawn yet with finite ones.
+//! - [`activate_tab`]: bringing a tab to the front of its group, for the
+//!   Window menu and the scripted `tab` command.
 //!
 //! # Design
 //!
 //! The dock state is the shell's long-lived state, so it lives in the shared
-//! core crate rather than the reloadable shell module: a reload of the shell
-//! finds the layout exactly where the user left it, and persistence carries
-//! it across restarts.
+//! core crate rather than the reloadable shell module. A reload of the shell
+//! then finds the layout exactly where the user left it, and persistence
+//! carries it across restarts.
 
 // External crates
 use egui::Rect;
 use egui_dock::{DockState, Node, NodeIndex};
 use serde::{Deserialize, Serialize};
+
+// =============================================================================
+// Constants
+// =============================================================================
 
 /// The fraction of the window's width one side column takes in the default
 /// layout.
@@ -34,8 +40,13 @@ pub const SIDE_COLUMN_FRACTION: f32 = 0.22;
 pub const BOTTOM_ROW_FRACTION: f32 = 0.3;
 
 /// The fraction of the right column's height the Inspector takes in the
-/// default layout; the Systems list keeps the rest below it.
+/// default layout. The remaining height holds the Systems and Preferences
+/// tabs.
 pub const INSPECTOR_COLUMN_FRACTION: f32 = 0.4;
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// One tab of the egui editor.
 ///
@@ -70,63 +81,14 @@ pub enum EditorTab {
     /// remembered gizmo choices.
     Preferences,
     /// A panel a module registered: the payload is the panel's slot in the
-    /// registry, which is stable across that module's reload. The tab's title
-    /// comes from the registry, which marks a panel whose module unloaded.
+    /// registry, which stays the same across that module's reload. The tab's
+    /// title comes from the registry, which adds a note once the panel's
+    /// module has unloaded.
     Module(u16),
 }
 
-impl<'de> Deserialize<'de> for EditorTab {
-    /// Reads the current form (`{"Scene": 2}`) and the unit-name form a
-    /// stored layout document may hold (a bare `"Scene"`, `"SecondScene"`),
-    /// reading the latter as views 0 and 1 so the document keeps its layout.
-    /// Only JSON is read: the layout file is the only format.
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error as _;
-        let value = serde_json::Value::deserialize(deserializer)?;
-        if let Some(name) = value.as_str() {
-            return match name {
-                // The two viewports a document written before scene views were
-                // numbered names.
-                "Scene" => Ok(EditorTab::Scene(0)),
-                "SecondScene" => Ok(EditorTab::Scene(1)),
-                "Game" => Ok(EditorTab::Game),
-                "Entities" => Ok(EditorTab::Entities),
-                "Systems" => Ok(EditorTab::Systems),
-                "Inspector" => Ok(EditorTab::Inspector),
-                "Assets" => Ok(EditorTab::Assets),
-                "Console" => Ok(EditorTab::Console),
-                "Problems" => Ok(EditorTab::Problems),
-                "Statistics" => Ok(EditorTab::Statistics),
-                "Preferences" => Ok(EditorTab::Preferences),
-                other => Err(D::Error::custom(format!("unknown editor tab {other}"))),
-            };
-        }
-        let Some((name, index)) = value
-            .as_object()
-            .and_then(|object| object.iter().next())
-            .and_then(|(name, index)| Some((name.as_str(), index.as_u64()?)))
-        else {
-            return Err(D::Error::custom(
-                "an editor tab is a name, or a name with an index",
-            ));
-        };
-        let index = u16::try_from(index)
-            .map_err(|_| D::Error::custom(format!("editor tab {name} is out of range")))?;
-        match name {
-            "Scene" => Ok(EditorTab::Scene(index as u8)),
-            "Module" => Ok(EditorTab::Module(index)),
-            other => Err(D::Error::custom(format!(
-                "editor tab {other} takes no index"
-            ))),
-        }
-    }
-}
-
 impl EditorTab {
-    /// Every built-in tab, in tab-strip order.
+    /// Every built-in tab, in the order the Window menu lists them.
     pub const ALL: [EditorTab; 11] = [
         EditorTab::Scene(0),
         EditorTab::Scene(1),
@@ -167,7 +129,8 @@ impl EditorTab {
             EditorTab::Statistics => "Statistics".to_string(),
             EditorTab::Preferences => "Preferences".to_string(),
             // A module panel's title belongs to the registry, not here: the
-            // shell asks it, because it changes when the module unloads.
+            // shell asks the registry, because the title changes when the
+            // module unloads.
             EditorTab::Module(_) => "Module".to_string(),
         }
     }
@@ -199,27 +162,27 @@ impl EditorTab {
         }
     }
 
-    /// The tab a wire name names: the parser [`EditorTab::name`] is the
-    /// writer of.
+    /// The tab a wire name names: the inverse of [`EditorTab::name`].
     ///
-    /// The one parser every side uses - the scripted channel, the popout map
-    /// and the frontend's window bookkeeping - so a name that parses in one
-    /// place parses in all of them. A module panel's tab carries its slot
-    /// (`module:3`) because the bare word cannot identify one, and a scene
-    /// view is `scene`, `scene2`, `scene3`: one past the view's own index,
-    /// because a person counts views from one.
+    /// The scripted channel and the frontend's popout windows share this
+    /// parser, so a name that parses in one place parses in the other. A
+    /// module panel's tab carries its slot (`module:3`), because the bare
+    /// word cannot identify one. A scene view is `scene`, `scene2`,
+    /// `scene3`: the printed number is one more than the view's index,
+    /// because a person counts views from one. Returns `None` for a name no
+    /// tab answers to.
     pub fn from_wire(name: &str) -> Option<EditorTab> {
-        if let Some(slot) = name.strip_prefix("module:") {
-            return slot.parse().ok().map(EditorTab::Module);
+        if let Some(slot_text) = name.strip_prefix("module:") {
+            return slot_text.parse().ok().map(EditorTab::Module);
         }
-        if let Some(count) = name.strip_prefix("scene") {
-            if count.is_empty() {
+        if let Some(view_number_text) = name.strip_prefix("scene") {
+            if view_number_text.is_empty() {
                 return Some(EditorTab::Scene(0));
             }
-            return count
+            return view_number_text
                 .parse::<u16>()
                 .ok()
-                .and_then(|count| count.checked_sub(1))
+                .and_then(|view_number| view_number.checked_sub(1))
                 .and_then(|index| u8::try_from(index).ok())
                 .map(EditorTab::Scene);
         }
@@ -227,34 +190,79 @@ impl EditorTab {
     }
 }
 
+impl<'de> Deserialize<'de> for EditorTab {
+    /// Reads a tab from the saved layout: either the form this build writes
+    /// (`{"Scene": 2}`, `"Game"`) or a bare name an older document holds
+    /// (`"Scene"`, `"SecondScene"`). A bare name reads as a tab without an
+    /// index, so an older document keeps its layout.
+    ///
+    /// The layout file is JSON, and nothing else reads a tab document.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let serialized_tab = serde_json::Value::deserialize(deserializer)?;
+        if let Some(name) = serialized_tab.as_str() {
+            return match name {
+                // The two scene viewports an older document names without an
+                // index.
+                "Scene" => Ok(EditorTab::Scene(0)),
+                "SecondScene" => Ok(EditorTab::Scene(1)),
+                "Game" => Ok(EditorTab::Game),
+                "Entities" => Ok(EditorTab::Entities),
+                "Systems" => Ok(EditorTab::Systems),
+                "Inspector" => Ok(EditorTab::Inspector),
+                "Assets" => Ok(EditorTab::Assets),
+                "Console" => Ok(EditorTab::Console),
+                "Problems" => Ok(EditorTab::Problems),
+                "Statistics" => Ok(EditorTab::Statistics),
+                "Preferences" => Ok(EditorTab::Preferences),
+                other => Err(D::Error::custom(format!("unknown editor tab {other}"))),
+            };
+        }
+        let Some((name, index)) = serialized_tab
+            .as_object()
+            .and_then(|object| object.iter().next())
+            .and_then(|(name, index)| Some((name.as_str(), index.as_u64()?)))
+        else {
+            return Err(D::Error::custom(
+                "an editor tab is a name, or a name with an index",
+            ));
+        };
+        let index = u16::try_from(index)
+            .map_err(|_| D::Error::custom(format!("editor tab {name} is out of range")))?;
+        match name {
+            "Scene" => Ok(EditorTab::Scene(index as u8)),
+            "Module" => Ok(EditorTab::Module(index)),
+            other => Err(D::Error::custom(format!(
+                "editor tab {other} takes no index"
+            ))),
+        }
+    }
+}
+
 /// The editor's dock: an `egui_dock` state with the editor's default
 /// layout.
 ///
 /// The shell keeps one of these in its session resource, so a reload of the
-/// shell module finds the dock exactly where the user left it; persistence
+/// shell module finds the dock exactly where the user left it. Persistence
 /// carries it across restarts.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EditorDock {
     /// The schema this document was written with.
     schema_version: u32,
-    /// The panel id each module tab's slot named when the document was
-    /// written: a slot means nothing to the next run, the
-    /// id does, so a panel that registers again finds its tab.
+    /// The panel id that each module tab's slot meant when the document was
+    /// written. A slot number means nothing to the next run, but the id does,
+    /// so a panel that registers again finds its tab.
     #[serde(default)]
     panel_ids: Vec<String>,
-    /// The tabs popped out into their own OS windows. A
-    /// popped-out tab is *not* in the dock tree; redocking puts it back in the
-    /// focused leaf.
+    /// The tabs popped out into their own OS windows. A popped-out tab is
+    /// *not* in the dock tree; redocking puts it back in the focused leaf.
     #[serde(default)]
     popouts: Vec<EditorTab>,
     /// The dock's tabs and splits.
     state: DockState<EditorTab>,
-}
-
-impl Default for EditorDock {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl EditorDock {
@@ -269,8 +277,9 @@ impl EditorDock {
             EditorTab::Game,
         ]);
         let tree = state.main_surface_mut();
-        // The assets row spans the full width, so it splits off first; the
-        // old node keeps the space above it.
+        // Step 1: split the bottom row off the root first, because it spans
+        // the full window width. The node that was there keeps the space
+        // above it.
         let [upper, _assets] = tree.split_below(
             NodeIndex::root(),
             1.0 - BOTTOM_ROW_FRACTION,
@@ -281,21 +290,22 @@ impl EditorDock {
                 EditorTab::Statistics,
             ],
         );
-        // The entity column then splits the upper node; the old node keeps
-        // the space right of the column. Unlike `split_below`/`split_right`,
-        // whose fraction is taken by the old node, `split_left` puts the new
-        // node in the fraction-sized slot on the left.
+        // Step 2: split the entity column off the upper node. For
+        // `split_below` and `split_right` the fraction is the share the node
+        // already there keeps; `split_left` instead gives the fraction-sized
+        // slot on the left to the new node, so this fraction is the column's
+        // own share.
         let [middle, _entities] =
             tree.split_left(upper, SIDE_COLUMN_FRACTION, vec![EditorTab::Entities]);
-        // The right column takes as much of the middle node as a side
-        // column takes of the whole window; it carries the inspector.
-        let system_fraction = 1.0 - SIDE_COLUMN_FRACTION / (1.0 - SIDE_COLUMN_FRACTION);
+        // Step 3: split the right column off the middle node at the share of
+        // what is left that makes it as wide as the entity column.
+        let center_fraction = 1.0 - SIDE_COLUMN_FRACTION / (1.0 - SIDE_COLUMN_FRACTION);
         let [_center, right_column] =
-            tree.split_right(middle, system_fraction, vec![EditorTab::Inspector]);
-        // The inspector sits on top of the right column; `split_below`'s
-        // fraction is the share the old node keeps, so the systems list
-        // takes the space below it - with the preferences form tabbed
-        // beside it.
+            tree.split_right(middle, center_fraction, vec![EditorTab::Inspector]);
+        // Step 4: stack the inspector above the systems list in the right
+        // column. `split_below`'s fraction goes to the node already there,
+        // so the inspector keeps it, and the systems list - with the
+        // preferences form tabbed beside it - takes what is left.
         let [_inspector, _systems] = tree.split_below(
             right_column,
             INSPECTOR_COLUMN_FRACTION,
@@ -309,7 +319,9 @@ impl EditorDock {
         }
     }
 
-    /// The dock state, for the shell's `DockArea`.
+    /// The dock state, for reading. `egui_dock` edits the tree while it
+    /// draws, so the shell goes through [`EditorDock::state_mut`] instead and
+    /// this handle is for queries.
     pub fn state(&self) -> &DockState<EditorTab> {
         &self.state
     }
@@ -340,26 +352,29 @@ impl EditorDock {
     /// The tab a new scene view takes: one past the highest view index the
     /// dock holds today.
     ///
-    /// Highest plus one rather than "one per view", so a view the user closed
-    /// in the middle never hands its index to a second tab - the closed
-    /// view's child window and camera are gone, and a new tab taking the
-    /// index would find them in the frontend's list.
+    /// Highest plus one, rather than the number of views, so a view the user
+    /// closed in the middle never hands its index to a second tab. The
+    /// frontend keeps one window, surface and camera per view index for the
+    /// whole session, so a new tab on a reused index would take over the
+    /// closed view's window and camera.
     pub fn next_scene_view(&self) -> EditorTab {
-        let highest = self
+        let highest_view_index = self
             .state
             .iter_all_tabs()
             .filter_map(|(_path, tab)| tab.scene_view())
             .chain(self.popouts.iter().filter_map(|tab| tab.scene_view()))
             .max();
-        EditorTab::Scene(highest.map_or(0, |index| index.saturating_add(1)))
+        EditorTab::Scene(highest_view_index.map_or(0, |index| index.saturating_add(1)))
     }
 
     /// How many scene view slots the dock needs: one past its highest view
-    /// index, so a view whose tab is not shown keeps its slot.
+    /// index. The frontend holds one window, surface and camera per slot, so
+    /// the count has to reach the highest index in use, not the number of
+    /// views.
     ///
-    /// A popped-out view counts: it is still a view, its child window
-    /// replaced by a window of its own, and dropping its slot would hand its
-    /// index to the next view opened.
+    /// A popped-out view counts too: it is still a view, with its child
+    /// window replaced by a window of its own, and it reports its rectangle
+    /// through that slot.
     pub fn scene_view_count(&self) -> usize {
         self.state
             .iter_all_tabs()
@@ -369,7 +384,7 @@ impl EditorDock {
             .map_or(0, |index| index as usize + 1)
     }
 
-    /// Whether one more scene view fits: each view is a child window and a
+    /// Whether one more scene view fits. Each view is a child window and a
     /// renderer surface, so the frontend's limit is the dock's too.
     pub fn can_open_scene_view(&self) -> bool {
         self.scene_view_count() < crate::boundary::SCENE_VIEWS_MAX
@@ -382,8 +397,8 @@ impl EditorDock {
 
     /// Record the registry's panel ids, so the module tabs a save writes can be
     /// found again by id on the next run.
-    pub fn set_panel_ids(&mut self, ids: Vec<String>) {
-        self.panel_ids = ids;
+    pub fn set_panel_ids(&mut self, panel_ids: Vec<String>) {
+        self.panel_ids = panel_ids;
     }
 
     /// The panel ids the document carried.
@@ -401,9 +416,9 @@ impl EditorDock {
         self.popouts.contains(&tab)
     }
 
-    /// Pop `tab` out into its own window: it leaves the dock tree, so the dock
-    /// draws it nowhere, and joins `popouts` so the next save remembers it.
-    /// Returns whether the tab was docked and moved.
+    /// Pops `tab` out into its own window: it leaves the dock tree, so the
+    /// dock stops drawing it, and joins `popouts` so the next save remembers
+    /// it. Reports whether the tab was docked and moved.
     pub fn pop_out(&mut self, tab: EditorTab) -> bool {
         if self.popouts.contains(&tab) {
             return false;
@@ -423,8 +438,8 @@ impl EditorDock {
         true
     }
 
-    /// Put a popped-out `tab` back into the focused leaf.
-    /// Returns whether it was popped out.
+    /// Puts a popped-out `tab` back into the focused leaf and reports whether
+    /// it was popped out.
     pub fn redock(&mut self, tab: EditorTab) -> bool {
         let Some(index) = self.popouts.iter().position(|popped| *popped == tab) else {
             return false;
@@ -435,27 +450,27 @@ impl EditorDock {
     }
 
     /// Rewrite every module tab's slot from the ids the document carried to
-    /// the slots `ids` assigns today.
+    /// the slots the registry assigns today.
     ///
     /// A tab whose panel is not registered today points past the registry
     /// (`u16::MAX`): the tab is the user's and stays, and the shell titles it
     /// `Module panel` and draws its body as not loaded.
-    pub fn remap_panel_slots(&mut self, ids: &[String]) {
-        let recorded = std::mem::take(&mut self.panel_ids);
+    pub fn remap_panel_slots(&mut self, panel_ids: &[String]) {
+        let recorded_panel_ids = std::mem::take(&mut self.panel_ids);
         for (_path, tab) in self.state.iter_all_tabs_mut() {
             let Some(slot) = tab.module_slot() else {
                 continue;
             };
-            let resolved = recorded
+            let resolved_slot = recorded_panel_ids
                 .get(slot as usize)
-                .and_then(|id| ids.iter().position(|known| known == id))
+                .and_then(|id| panel_ids.iter().position(|known| known == id))
                 .map_or(u16::MAX, |index| index as u16);
-            *tab = EditorTab::Module(resolved);
+            *tab = EditorTab::Module(resolved_slot);
         }
-        self.set_panel_ids(ids.to_vec());
+        self.set_panel_ids(panel_ids.to_vec());
     }
 
-    /// A copy with placeholder geometry replaced by finite values.
+    /// Returns a copy with placeholder geometry replaced by finite values.
     ///
     /// A fresh dock's nodes start with `Rect::NOTHING` (`±INF`) until the
     /// first `DockArea::show` lays them out; serde_json writes non-finite
@@ -466,13 +481,13 @@ impl EditorDock {
         for (_surface, node) in dock.state.iter_all_nodes_mut() {
             match node {
                 Node::Leaf(leaf) => {
-                    leaf.rect = settle_rect(leaf.rect);
-                    leaf.viewport = settle_rect(leaf.viewport);
+                    leaf.rect = finite_rect(leaf.rect);
+                    leaf.viewport = finite_rect(leaf.viewport);
                 }
                 Node::Vertical(split) | Node::Horizontal(split) => {
-                    split.rect = settle_rect(split.rect);
+                    split.rect = finite_rect(split.rect);
                 }
-                // An empty node holds no geometry to settle.
+                // An empty node has no rectangle to make finite.
                 Node::Empty => {}
             }
         }
@@ -480,9 +495,20 @@ impl EditorDock {
     }
 }
 
-/// `rect`, or a finite zero rect when it still holds placeholder infinities.
-fn settle_rect(rect: Rect) -> Rect {
-    let finite = |value: f32| value.is_finite();
+impl Default for EditorDock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns `rect`, or a zero rect when it still holds the placeholder
+/// infinities.
+fn finite_rect(rect: Rect) -> Rect {
+    let finite = |coordinate: f32| coordinate.is_finite();
     if finite(rect.min.x) && finite(rect.min.y) && finite(rect.max.x) && finite(rect.max.y) {
         rect
     } else {
@@ -490,11 +516,13 @@ fn settle_rect(rect: Rect) -> Rect {
     }
 }
 
-/// Bring `tab` to the front of its group, returning whether the dock held it.
+/// Brings `tab` to the front of its group and reports whether the dock held
+/// it.
 ///
-/// The Window menu and the scripted `tab` share this path. `set_active_tab`
-/// takes the tab's index inside its leaf, and the node index must address the
-/// leaf on its own surface: a floating surface's tree is separate.
+/// The Window menu and the scripted `tab` command share this path.
+/// `set_active_tab` takes the tab's index inside its leaf; focusing the node
+/// needs the tab's whole path, because a node index only addresses the
+/// surface whose tree holds it - a floating surface's tree is separate.
 pub fn activate_tab(dock: &mut DockState<EditorTab>, tab: EditorTab) -> bool {
     let Some(path) = dock.find_tab(&tab) else {
         return false;
@@ -506,6 +534,10 @@ pub fn activate_tab(dock: &mut DockState<EditorTab>, tab: EditorTab) -> bool {
     dock.set_focused_node_and_surface(path.node_path());
     true
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -535,15 +567,16 @@ mod tests {
                 .tabs
                 .clone()
         };
-        // A split's fraction is the share of its top/left child, which is
-        // the slot each `split_*` call assigns by its own rule.
+        // A split's fraction is the share its top or left child keeps;
+        // each `split_*` call decides which node that is.
         let fraction_at = |index: NodeIndex| -> f32 {
             match &state[surface][index] {
                 Node::Vertical(split) | Node::Horizontal(split) => split.fraction,
                 _ => panic!("the layout index points at a split"),
             }
         };
-        // The root stacks the assets row below everything else.
+        // The root is a vertical split: the assets row sits below everything
+        // else.
         let root = NodeIndex::root();
         assert!(
             state[surface][root].is_vertical(),
@@ -565,7 +598,7 @@ mod tests {
             "the entity column is not a side split"
         );
         assert_eq!(tabs_at(upper.left()), vec![EditorTab::Entities]);
-        // The rest splits into the scene center and the system column; the
+        // The rest splits into the scene center and the system column. The
         // two scene viewports and the game view share the center group.
         let rest = upper.right();
         assert!(
@@ -588,10 +621,12 @@ mod tests {
             tabs_at(column.right()),
             vec![EditorTab::Systems, EditorTab::Preferences]
         );
-        // Each side column is one `SIDE_COLUMN_FRACTION` of its split, the
-        // assets row one `BOTTOM_ROW_FRACTION` of the window, the inspector
-        // one `INSPECTOR_COLUMN_FRACTION` of its column, and the scene
-        // keeps the rest.
+        // Each side column ends up one `SIDE_COLUMN_FRACTION` of the window's
+        // width: the entity split gives its column that share directly, and
+        // the right column takes a larger share of a node that is one side
+        // column narrower. The bottom row is one `BOTTOM_ROW_FRACTION` of the
+        // window, the inspector one `INSPECTOR_COLUMN_FRACTION` of its
+        // column, and the scene keeps the rest.
         assert!((fraction_at(root) - (1.0 - BOTTOM_ROW_FRACTION)).abs() < f32::EPSILON);
         assert!((fraction_at(upper) - SIDE_COLUMN_FRACTION).abs() < f32::EPSILON);
         let scene_share = 1.0 - SIDE_COLUMN_FRACTION / (1.0 - SIDE_COLUMN_FRACTION);
@@ -602,7 +637,7 @@ mod tests {
     #[test]
     fn a_layout_round_trips_through_serde() {
         let dock = EditorDock::new();
-        // The save path settles the placeholder rects first; a fresh dock is
+        // The save path replaces the placeholder rects first; a fresh dock is
         // the worst case and must round-trip.
         let json = serde_json::to_string(&dock.settled()).expect("serialize the dock");
         let restored: EditorDock = serde_json::from_str(&json).expect("deserialize the dock");
@@ -621,8 +656,8 @@ mod tests {
             "the tab is still docked"
         );
         assert_eq!(dock.popouts(), [EditorTab::Inspector]);
-        // Popping the same tab out twice changes nothing: the dock no longer
-        // holds it, so there is no second tab to move.
+        // Popping the same tab out twice changes nothing: it is already in
+        // `popouts`, so the second call returns false straight away.
         assert!(!dock.pop_out(EditorTab::Inspector));
     }
 
@@ -667,13 +702,13 @@ mod tests {
     #[test]
     fn a_popped_out_scene_view_keeps_its_slot() {
         let mut dock = EditorDock::new();
-        // The default layout opens two views; the third is the highest slot.
+        // The default layout opens two views, so the third is the highest
+        // slot.
         dock.state_mut().push_to_focused_leaf(EditorTab::Scene(2));
         assert_eq!(dock.scene_view_count(), 3);
         assert!(dock.pop_out(EditorTab::Scene(2)));
-        // The view left the tree but not the bookkeeping: its slot stays, so
-        // the frontend keeps its window and the next view does not take its
-        // index.
+        // The view left the tree but its slot stays, so the frontend keeps
+        // its window and the next view does not take its index.
         assert_eq!(dock.scene_view_count(), 3);
         assert_eq!(dock.next_scene_view(), EditorTab::Scene(3));
     }
@@ -724,9 +759,9 @@ mod tests {
     }
 
     #[test]
-    fn a_v11_document_reads_its_two_scene_tabs_as_views() {
-        // The unit-name form a stored document may hold: bare variant names,
-        // read as views instead of dropping the layout.
+    fn an_older_document_reads_its_unit_named_tabs() {
+        // The unit-name form a stored document may hold: a bare variant
+        // name, read as a tab rather than dropped, so the layout survives.
         let tab: EditorTab = serde_json::from_str("\"Scene\"").expect("the legacy scene tab");
         assert_eq!(tab, EditorTab::Scene(0));
         let tab: EditorTab =

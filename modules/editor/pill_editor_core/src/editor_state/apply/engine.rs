@@ -1,33 +1,52 @@
-//! The engine family's applier.
-//!
-//! The engine controls: pause, step, the gizmo tool, the grid and a
-//! system toggle.
+//! Applies the editor's engine controls: pause and step, the gizmo's tool,
+//! space and snapping, the scene grid's switch, and a system's on/off flag.
 //!
 //! # Responsibilities
 //!
-//! - Apply the engine controls: pause, step, the gizmo tool, the grid and a
-//!   system's enabled flag.
+//! - Apply those controls, and answer a system toggle with the inverse that
+//!   switches the system back.
 //!
 //! # Design
 //!
-//! One `match` over the family's own variants, called from
-//! [`EditorCommand::apply_one`](super::EditorCommand). Every arm ends in a
-//! [`CommandOutcome`]: the inverse the history records, or `plain()` for a
-//! command that cannot be undone.
+//! One `match` over this family's commands, called from
+//! [`EditorCommand::apply_one`](super::EditorCommand). A command that changed
+//! something returns a [`CommandOutcome`]: the inverse the undo history
+//! records, or `plain()` when there is nothing to undo. A command from another
+//! family never arrives here; it hits `unreachable!`.
 
+// External crates
 use pill_engine::Engine;
 
+// Current crate
 use super::CommandOutcome;
 use super::*;
 
-/// Apply one engine command.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Applies one engine command.
+///
+/// # Errors
+///
+/// Returns a message naming the command and the reason when:
+///
+/// - a system toggle names a registration index that has no system;
+/// - the gizmo state cannot be read back after this function created it;
+/// - the surface cameras cannot be read back after this function created
+///   them.
+///
+/// # Panics
+///
+/// Panics when `command` belongs to another family; `EditorCommand::apply_one`
+/// routes only engine commands here.
 pub(super) fn apply(
     engine: &mut Engine,
     command: &EditorCommand,
 ) -> Result<CommandOutcome, String> {
     match command {
         EditorCommand::SetSystemEnabled { index, enabled } => {
-            let previous = engine
+            let was_enabled = engine
                 .system_snapshots()
                 .get(*index)
                 .map(|system| system.enabled)
@@ -35,7 +54,7 @@ pub(super) fn apply(
             if engine.set_system_enabled_at(*index, *enabled) {
                 Ok(CommandOutcome::inverse(EditorCommand::SetSystemEnabled {
                     index: *index,
-                    enabled: previous,
+                    enabled: was_enabled,
                 }))
             } else {
                 Err(format!(
@@ -54,17 +73,19 @@ pub(super) fn apply(
             if world.get_resource::<crate::gizmo::GizmoState>().is_none() {
                 world.insert_resource(crate::gizmo::GizmoState::default());
             }
-            let Some(state) = world.get_resource_mut::<crate::gizmo::GizmoState>() else {
+            let Some(gizmo_state) = world.get_resource_mut::<crate::gizmo::GizmoState>() else {
                 return Err(format!("{command:?}: the gizmo state could not be claimed"));
             };
+            // A field the command leaves as `None` keeps its current value, so
+            // a row that changes one setting leaves the other two alone.
             if let Some(mode) = mode {
-                state.settings.mode = *mode;
+                gizmo_state.settings.mode = *mode;
             }
             if let Some(space) = space {
-                state.settings.space = *space;
+                gizmo_state.settings.space = *space;
             }
             if let Some(snap) = snap {
-                state.settings.snap = *snap;
+                gizmo_state.settings.snap = *snap;
             }
             Ok(CommandOutcome::plain())
         }
@@ -77,14 +98,17 @@ pub(super) fn apply(
             {
                 world.insert_resource(pill_renderer_api::SurfaceCameras::default());
             }
-            let Some(cameras) = world.get_resource_mut::<pill_renderer_api::SurfaceCameras>()
+            let Some(surface_cameras) =
+                world.get_resource_mut::<pill_renderer_api::SurfaceCameras>()
             else {
                 return Err(format!(
                     "{command:?}: the surface cameras could not be claimed"
                 ));
             };
-            if cameras.grid.enabled != *enabled {
-                cameras.grid.enabled = *enabled;
+            // Log only a real change, so sending the current state again adds
+            // no line.
+            if surface_cameras.grid.enabled != *enabled {
+                surface_cameras.grid.enabled = *enabled;
                 pill_core::info!(
                     target: pill_core::telemetry::telemetry_target::ENGINE,
                     enabled = *enabled,

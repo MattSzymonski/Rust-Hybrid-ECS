@@ -4,28 +4,29 @@
 //!
 //! - Create and place each scene view's child window and the game view's, and
 //!   keep every renderer surface bound to the window that shows it.
-//! - Run each popped-out tab's own egui pass and present it.
-//! - Present one editor frame: the composition overlay when it exists, the
-//!   window-surface posture when it does not, and the fallback UI when no
-//!   shell module is loaded.
+//! - Create and close the popped-out tab windows, and present each tab's frame
+//!   in its own window.
+//! - Present one editor frame through the overlay, drawing the fallback UI
+//!   while no shell module is loaded.
 //!
 //! # Design
 //!
-//! A surface lives and dies with its window, so the two are handled together:
-//! attaching, placing and hiding one is one method's job. The composition
-//! overlay is best-effort by design - a platform that refuses it leaves the
-//! window-surface posture, which is why every overlay step is retried on a
-//! cadence rather than treated as fatal.
+//! A view's window and its renderer surface are handled together, because a
+//! surface only draws into the window it is bound to. Drawing the UI is best
+//! effort: the composition overlay is the normal posture, the window's own
+//! surface is the fallback, and when the platform refuses both, creating the
+//! composition overlay is retried every 120 frames instead of failing.
 
 // Current crate
 use super::*;
 
 impl EditorWindow {
-    /// Handle a main-window resize.
+    /// Handles a resize of the main window, in physical pixels.
     pub(super) fn resize(&mut self, width: u32, height: u32) {
         self.size = (width.max(1), height.max(1));
-        // The primary surface lives on the game view's window when it
-        // exists; only the fallback posture sizes it from the main window.
+        // The primary surface lives on the game view's window when one
+        // exists, so only the fallback posture sizes the primary from the
+        // main window.
         if self.game_surface.is_none() {
             self.host
                 .resize_surface(SurfaceId::PRIMARY, width.max(1), height.max(1));
@@ -36,11 +37,13 @@ impl EditorWindow {
         self.place_views();
     }
 
-    /// One scene view's client-area origin in the main window's client
-    /// coordinates, in physical pixels: the position its last placement
-    /// applied. A resize never moves the window, so the origin stands even
-    /// while the placement cache is cleared mid-layout; a drag across the
-    /// separator therefore never sees the pointer jump.
+    /// Returns one scene view's client-area origin, in the main window's
+    /// client coordinates and in physical pixels: the position its last
+    /// placement applied.
+    ///
+    /// A resize never moves the window, so the origin stays valid even after
+    /// the layout clears the placement cache. A drag across a separator
+    /// therefore never makes the pointer jump.
     pub(super) fn view_origin(&self, view: usize) -> (f32, f32) {
         match &self.views[view] {
             Some(scene) => (scene.window.origin.0 as f32, scene.window.origin.1 as f32),
@@ -48,10 +51,11 @@ impl EditorWindow {
         }
     }
 
-    /// Handle a scene window's resize: the view's surface reconfigures with
-    /// its window - a stale render target draws the scene at the wrong size
-    /// inside the tab. The placement cache is cleared, so the next layout pass
-    /// re-applies the dock's rectangle.
+    /// Handles a resize of one scene view's window.
+    ///
+    /// The view's surface reconfigures with the window; without that, the
+    /// scene would be drawn at the old size inside the tab. The placement cache
+    /// is cleared, so the next layout pass re-applies the dock's rectangle.
     pub(super) fn resize_scene(&mut self, view: usize, width: u32, height: u32) {
         let Some(scene) = &mut self.views[view] else {
             return;
@@ -68,11 +72,12 @@ impl EditorWindow {
         );
     }
 
-    /// Handle the game window's resize: the primary surface reconfigures
-    /// with its window, like the scene view surfaces - a stale render
-    /// target draws the project at the wrong size inside the Game tab. The
-    /// placement cache is cleared, so the next layout pass re-applies the
-    /// dock's rectangle.
+    /// Handles a resize of the game window.
+    ///
+    /// The primary surface reconfigures with its window, as the scene view
+    /// surfaces do; without that, the project would be drawn at the old size
+    /// inside the Game tab. The placement cache is cleared, so the next layout
+    /// pass re-applies the dock's rectangle.
     pub(super) fn resize_game(&mut self, width: u32, height: u32) {
         let Some(game) = &mut self.game_surface else {
             return;
@@ -88,9 +93,9 @@ impl EditorWindow {
         );
     }
 
-    /// The game window's client-area origin in the main window's client
-    /// coordinates, in physical pixels: the same bridge the scene views
-    /// use for pointer positions.
+    /// Returns the game window's client-area origin, in the main window's
+    /// client coordinates and in physical pixels: the same bridge the scene
+    /// views use for pointer positions.
     pub(super) fn game_origin(&self) -> (f32, f32) {
         match &self.game_surface {
             Some(game) => (game.origin.0 as f32, game.origin.1 as f32),
@@ -98,43 +103,50 @@ impl EditorWindow {
         }
     }
 
-    /// Open the scene views the dock reports that this editor does not hold
+    /// Opens the scene views the dock reports that this editor does not hold
     /// yet.
     ///
     /// The shell reports one slot per view index the dock carries, so a view
     /// the person just added is the list's last slot. Each new view gets its
-    /// own window, surface and camera here - the same three the startup views
-    /// get - and starts hidden: the placement that follows this frame shows
-    /// it.
-    pub(super) fn ensure_scene_views(&mut self, count: usize, event_loop: &ActiveEventLoop) {
-        let wanted = count.min(pill_editor_core::boundary::SCENE_VIEWS_MAX);
-        while self.views.len() < wanted {
-            let view = self.views.len();
+    /// own window, surface and camera here, the same three the startup views
+    /// get, and starts hidden: the placement that follows this frame shows it.
+    pub(super) fn ensure_scene_views(
+        &mut self,
+        dock_view_count: usize,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let wanted_view_count = dock_view_count.min(pill_editor_core::boundary::SCENE_VIEWS_MAX);
+        while self.views.len() < wanted_view_count {
+            let view_index = self.views.len();
             self.cameras.push(OrbitCamera::default());
             self.left_down.push(false);
             self.camera_dirty.push(true);
             self.scene_cursor.push(None);
-            let opened = SceneView::open(event_loop, &self.window, view);
-            if let Some(mut scene) = opened {
-                scene.attach(&mut self.host, &self.cameras[view]);
+            let opened_scene = SceneView::open(event_loop, &self.window, view_index);
+            if let Some(mut scene) = opened_scene {
+                scene.attach(&mut self.host, &self.cameras[view_index]);
                 info!(
                     target: telemetry_target::ENGINE,
-                    view,
+                    view = view_index,
                     surface = scene.surface_id.0,
                     "[editor] scene view opened"
                 );
                 self.views.push(Some(scene));
             } else {
-                // A view without a window keeps its slots: the dock still
-                // holds its tab, and the tab shows the UI's chips alone.
+                // A view whose window could not be created still gets its
+                // slots: the dock keeps its tab, and that tab shows only the
+                // UI's chips.
                 self.views.push(None);
             }
         }
     }
 
-    /// Place the first scene view at the dock's default layout's center
-    /// inside the client area, until the shell's first scene rect arrives;
-    /// the other views stay hidden until their tabs show.
+    /// Places the first scene view at the dock's default layout's center
+    /// inside the client area.
+    ///
+    /// It runs at startup and on a resize, before the shell's own scene
+    /// rectangles are applied. The other views stay hidden until their tabs
+    /// show.
     pub(super) fn place_views(&mut self) {
         let Some(Some(scene)) = self.views.first_mut() else {
             return;
@@ -150,10 +162,12 @@ impl EditorWindow {
         scene.window.place(left, top, width, height, false);
     }
 
-    /// Give a popped-out scene view its top-level window, placed at the
-    /// pop-out's screen position. The first call replaces its
-    /// child window with a top-level one - a child can never reach another
-    /// monitor - and later calls just follow the pop-out as it moves.
+    /// Gives a popped-out scene view its top-level window and places it at the
+    /// pop-out's screen position.
+    ///
+    /// The first call replaces the view's child window with a top-level one,
+    /// because a child window can never reach another monitor. Later calls
+    /// only follow the pop-out as it moves.
     pub(super) fn pop_view_window(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -194,9 +208,11 @@ impl EditorWindow {
         }
     }
 
-    /// Give a scene view its child window back when its tab returns to the
-    /// dock. A view the platform forced to a detached window is left alone:
-    /// that window is its dock window, not a pop-out's.
+    /// Gives a scene view its child window back when its tab returns to the
+    /// dock.
+    ///
+    /// A view the platform forced onto a detached window is left alone: that
+    /// window is the view's dock window, not a pop-out's.
     pub(super) fn ensure_view_docked(&mut self, event_loop: &ActiveEventLoop, view: usize) {
         let popped = self
             .views
@@ -224,8 +240,8 @@ impl EditorWindow {
         }
     }
 
-    /// Place one scene view at the dock's scene rectangle, in logical
-    /// points, converted to the client area's physical pixels.
+    /// Places one scene view at the dock's scene rectangle, converted from
+    /// logical points to the client area's physical pixels.
     pub(super) fn place_view_rect(&mut self, view: usize, rect: ShellRect) {
         let (x, y, width, height) = self.view_rect_pixels(rect);
         let Some(scene) = &mut self.views[view] else {
@@ -234,8 +250,8 @@ impl EditorWindow {
         scene.window.place(x, y, width, height, false);
     }
 
-    /// Place the game window at the dock's game rectangle, in logical
-    /// points, converted to the client area's physical pixels.
+    /// Places the game window at the dock's game rectangle, converted from
+    /// logical points to the client area's physical pixels.
     pub(super) fn place_game_rect(&mut self, rect: ShellRect) {
         let (x, y, width, height) = self.view_rect_pixels(rect);
         let Some(game) = &mut self.game_surface else {
@@ -244,37 +260,39 @@ impl EditorWindow {
         game.place(x, y, width, height, false);
     }
 
-    /// A dock rectangle in logical points as the client area's physical
-    /// pixels, clamped inside it: the dock's rect can overshoot the window
-    /// while a split is being dragged.
+    /// Converts a dock rectangle from logical points to the client area's
+    /// physical pixels, clamped inside the client area.
+    ///
+    /// The dock's rectangle can overshoot the window while a split is being
+    /// dragged.
     pub(super) fn view_rect_pixels(&self, rect: ShellRect) -> (i32, i32, u32, u32) {
         scaled_view_rect(rect, self.scale_factor, self.size)
     }
 
-    /// Hide one scene view's window: its tab is not shown this pass
-    /// (another tab of its group is active, or the tab was closed).
+    /// Hides one scene view's window because its tab is not shown this pass:
+    /// another tab of its group is active, or the tab was closed.
     pub(super) fn hide_view(&mut self, view: usize) {
         if let Some(scene) = &mut self.views[view] {
             scene.window.hide();
         }
     }
 
-    /// Hide the game window: its tab is not shown this pass, so no child
-    /// window may paint over the tab that is.
+    /// Hides the game window because its tab is not shown this pass, so no
+    /// child window can paint over the tab that is.
     pub(super) fn hide_game(&mut self) {
         if let Some(game) = &mut self.game_surface {
             game.hide();
         }
     }
 
-    /// Route one scene window's event: activate the viewport on any press,
-    /// start camera navigation on its chord, start a gizmo drag or ask a
-    /// pick on a left press, feed a drag in flight its moves, and end what
-    /// the release ends.
+    /// Routes one scene window's event: activates the viewport on a press that
+    /// is not over the UI's chips, starts camera navigation on its chord,
+    /// starts a gizmo drag or asks for a pick on a left press, feeds a drag in
+    /// flight its moves, and ends whatever the release ends.
     ///
-    /// The viewport that owns an interaction keeps it: winit reports a
-    /// drag's moves to the window whose press started it even when the
-    /// pointer leaves it, so a gizmo drag or a navigation that crosses the
+    /// The viewport that owns an interaction keeps it: winit reports a drag's
+    /// moves to the window whose press started it, even when the pointer
+    /// leaves that window, so a gizmo drag or a navigation that crosses the
     /// viewport's edge carries on and no other viewport takes the pointer
     /// mid-drag.
     pub(super) fn scene_window_event(&mut self, view: usize, event: &WindowEvent) {
@@ -320,8 +338,8 @@ impl EditorWindow {
                     }
                     return;
                 }
-                // A press over the overlay's chips is the UI's: no activation
-                // and no scene interaction.
+                // A press over one of the overlay's chips belongs to the UI:
+                // it neither activates the viewport nor reaches the scene.
                 if self.scene_point_is_ui(view) {
                     return;
                 }
@@ -347,18 +365,19 @@ impl EditorWindow {
                 if lines == 0.0 {
                     return;
                 }
-                // The wheel zooms the viewport it arrived over without
-                // taking the active slot: a click is what activates.
+                // The wheel zooms the viewport it arrived over but does not
+                // make it the active one: only a click activates.
                 self.zoom_camera(view, lines);
             }
             _ => {}
         }
     }
 
-    /// Make `view` the active viewport: the one camera navigation, the
-    /// gizmo's handle length and the viewport commands address. Only a
-    /// press inside a scene view reaches here - a click on the editor's own
-    /// UI never activates a viewport.
+    /// Makes `view` the active viewport: the one that camera navigation, the
+    /// gizmo's handle length and the scripted viewport commands address.
+    ///
+    /// Only a press inside a scene view reaches here, so a click on the
+    /// editor's own UI never activates a viewport.
     pub(super) fn activate_view(&mut self, view: usize) {
         if self.active_view == view {
             return;
@@ -371,14 +390,14 @@ impl EditorWindow {
         );
     }
 
-    /// Reconcile the popped-out windows with the shell's frames and paint
+    /// Reconciles the popped-out windows with the shell's frames and paints
     /// them.
     ///
-    /// The shell reports one frame per popped-out tab, so the frames *are* the
-    /// window set: a tab that appears gets a window, a tab that disappears has
-    /// its window closed, and each remaining frame is painted into its own
-    /// swapchain through its own renderer. The pass ran in the shell, so
-    /// nothing here touches egui's context.
+    /// The shell reports one frame per popped-out tab, so those frames are the
+    /// windows: a tab that appears gets a window, a tab that disappears has its
+    /// window closed, and every other frame is painted into its own window
+    /// through its own renderer. The pass itself already ran in the shell, so
+    /// nothing here reads egui's context.
     pub(super) fn present_popouts(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -391,14 +410,14 @@ impl EditorWindow {
             self.open_popout(event_loop, &frame.tab, &frame.title);
         }
         // A tab that redocked (or was closed) loses its window.
-        let live: Vec<String> = frames.iter().map(|frame| frame.tab.clone()).collect();
-        let stale: Vec<String> = self
+        let live_tabs: Vec<String> = frames.iter().map(|frame| frame.tab.clone()).collect();
+        let stale_tabs: Vec<String> = self
             .popouts
             .keys()
-            .filter(|tab| !live.contains(tab))
+            .filter(|tab| !live_tabs.contains(tab))
             .cloned()
             .collect();
-        for tab in stale {
+        for tab in stale_tabs {
             if self.popouts.remove(&tab).is_some() {
                 info!(
                     target: telemetry_target::ENGINE,
@@ -412,7 +431,7 @@ impl EditorWindow {
                 continue;
             };
             // A popped-out Scene tab reports its viewport in the pop-out's own
-            // coordinates; the view's window follows it onto that window's
+            // coordinates. The view's window follows it onto that window's
             // screen position, which is what lets it cross monitors.
             if frame.frame.scene_rects.iter().all(|rect| rect.is_none()) {
                 continue;
@@ -455,11 +474,11 @@ impl EditorWindow {
                 textures,
                 frame.frame.pixels_per_point,
             ) {
-                Ok(drew) => {
-                    // The suite's observation point that the window is live,
-                    // logged once so a broken painter shows up as a missing
-                    // line rather than a silently painted-over window.
-                    if drew && !popout.presented {
+                Ok(has_drawn) => {
+                    // The suite's only signal that the window is live. It is
+                    // logged once, so a broken painter shows up as a missing
+                    // line instead of a window that was never painted.
+                    if has_drawn && !popout.presented {
                         popout.presented = true;
                         info!(
                             target: telemetry_target::ENGINE,
@@ -478,7 +497,7 @@ impl EditorWindow {
         }
     }
 
-    /// Open one popped-out tab's window: a plain top-level window with its own
+    /// Opens one popped-out tab's window, a plain top-level window with its own
     /// swapchain and its own egui renderer.
     pub(super) fn open_popout(&mut self, event_loop: &ActiveEventLoop, tab: &str, title: &str) {
         let attributes = Window::default_attributes()
@@ -540,8 +559,9 @@ impl EditorWindow {
         );
     }
 
-    /// Refresh each popped-out window's input record: its geometry and frame
-    /// rate this frame. Its events were appended as its window reported them.
+    /// Refreshes each popped-out window's input record with its geometry, its
+    /// focus and this frame's rate. The record's events were appended earlier,
+    /// as the window reported them.
     pub(super) fn publish_popout_geometry(&mut self) {
         if self.popouts.is_empty() {
             return;
@@ -561,7 +581,7 @@ impl EditorWindow {
                 )
             })
             .collect();
-        let time = self.started.elapsed().as_secs_f64();
+        let elapsed_seconds = self.started.elapsed().as_secs_f64();
         let frames_per_second = self.fps;
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(inputs) = world.get_resource_mut::<EguiPopoutInputs>() else {
@@ -572,19 +592,20 @@ impl EditorWindow {
             record.screen_size = pill_core::math::Vector2f::new(width.max(1.0), height.max(1.0));
             record.scale_factor = scale_factor;
             record.focused = focused;
-            record.time = time;
+            record.time = elapsed_seconds;
             record.frames_per_second = frames_per_second;
         }
     }
 
-    /// Close `tab`'s window and redock its tab: a window close is a redock,
-    /// so the tab is never lost by closing it.
+    /// Closes `tab`'s window and redocks its tab. Closing a window is a
+    /// redock, so the tab is never lost that way.
     pub(super) fn close_popout(&mut self, tab: &str) {
         if self.popouts.remove(tab).is_none() {
             return;
         }
-        // The tab comes back through the dock's own rule, matched by wire name
-        // (the shell owns the tab enum; this side only knows the name).
+        // The tab comes back through the dock's own redock rule, matched by
+        // wire name. The shell owns the tab enum, so this side only knows the
+        // name.
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(state) = world.get_resource_mut::<EguiShellState>() {
             if let Some(editor_tab) = EditorTab::from_wire(tab) {
@@ -598,8 +619,8 @@ impl EditorWindow {
         );
     }
 
-    /// Append one event to `tab`'s input record, the window's own cursor kept
-    /// alongside it.
+    /// Appends one event to `tab`'s input record, and keeps the window's own
+    /// cursor position alongside it.
     pub(super) fn popout_event(&mut self, tab: &str, event: InputEvent) {
         let cursor = match &event {
             InputEvent::CursorMoved { position } => Some(*position),
@@ -619,7 +640,7 @@ impl EditorWindow {
         record.events.push(event);
     }
 
-    /// Clear every popped-out window's event list once the frame that read it
+    /// Clears every popped-out window's event list once the frame that read it
     /// has been presented, so no event is replayed into a second pass.
     pub(super) fn clear_popout_events(&mut self) {
         if self.popouts.is_empty() {
@@ -633,11 +654,15 @@ impl EditorWindow {
         }
     }
 
-    /// Draw the shell's frame through the overlay; without a shell module,
-    /// draw the runner's own fallback.
+    /// Draws one editor frame: the shell's frame through the overlay, or the
+    /// runner's own fallback UI while no shell module is loaded.
+    ///
+    /// With no overlay at all, only the popped-out windows are painted; the
+    /// main window's frame is skipped, and creating the composition overlay is
+    /// retried.
     pub(super) fn present_ui(&mut self, event_loop: &ActiveEventLoop) {
-        // Step 1: take the shell frame, falling back to the runner's own
-        // minimal pass while no shell module is loaded.
+        // Step 1: take the shell's frame, or build the runner's own minimal
+        // one while no shell module is loaded.
         let frame = {
             let world = self.host.host_mut().engine_mut().world_mut();
             match world.get_resource_mut::<EguiShellFrame>() {
@@ -665,20 +690,20 @@ impl EditorWindow {
             // The menu bar's quit is drained at the frame boundary (Step 7b),
             // not while the frame is presented.
             quit_requested: _,
-            // egui's own cadence: the redraw decision at the end of the frame
-            // honours it.
+            // egui's repaint request: the redraw decision at the end of the
+            // frame counts it as a reason to draw.
             repaint_after,
-            // One frame per popped-out tab: each paints into
-            // its own window, below.
+            // One frame per popped-out tab; each is painted into its own
+            // window below.
             mut popout_frames,
         } = frame;
         self.repaint_after = repaint_after;
-        // Each scene viewport follows its dock rectangle, so the viewports
-        // track the layout when the user drags a splitter; a viewport whose
-        // tab is not shown hides its window. The list is one slot per view
-        // the dock holds, so a view the person just added opens here - on the
-        // frame its tab first drew - and a view whose tab was closed keeps
-        // its window hidden rather than dropped.
+        // Each scene viewport follows its dock rectangle, so the views track
+        // the layout while a splitter is dragged, and a viewport whose tab is
+        // not shown hides its window. The list has one slot per view the dock
+        // holds, so a view the person just added opens here, on the frame its
+        // tab first drew. A view whose tab was closed keeps its window hidden
+        // instead of losing it.
         self.ensure_scene_views(scene_rects.len(), event_loop);
         for view in 0..self.views.len() {
             match scene_rects.get(view).copied().flatten() {
@@ -692,16 +717,17 @@ impl EditorWindow {
             }
         }
         // The game viewport follows its own rectangle the same way: the
-        // primary surface's window sits where the Game tab's body is, and
+        // primary surface's window sits where the Game tab's body is, and it
         // disappears while another tab of its group is active.
         match game_rect {
             Some(rect) => self.place_game_rect(rect),
             None => self.hide_game(),
         }
-        // The chips the shell drew over the viewports, kept for the scene
-        // click routing: a click inside them is the UI's, not the scene's.
+        // The chips the shell drew over the viewports, kept for scene click
+        // routing: a click inside one belongs to the UI, not the scene.
         self.overlay_regions = overlay_regions;
-        // Step 2: the routing decision is visible in the log on change.
+        // Step 2: log the change when egui starts or stops claiming the
+        // pointer or the keyboard.
         if wants_pointer != self.claimed_pointer || wants_keyboard != self.claimed_keyboard {
             info!(
                 target: telemetry_target::ENGINE,
@@ -713,19 +739,19 @@ impl EditorWindow {
             self.claimed_keyboard = wants_keyboard;
         }
         self.apply_cursor_icon(cursor_icon);
-        // An IME the shell asked for: the window takes the
-        // candidate window, and the caret's rectangle places it. A text field
-        // that loses focus turns it off again.
+        // An IME the shell asked for: the window takes the candidate window,
+        // and the caret's rectangle places it. A text field that loses focus
+        // turns it off again.
         self.apply_ime(ime_allowed, ime_rect);
-        // A tile dragged past the window edge: the OS gets
-        // the file through an OLE drag, and the editor's thread runs the modal
-        // loop until the drop ends.
+        // A tile dragged past the window edge: the OS gets the file through
+        // an OLE drag, and the editor's thread runs the modal loop until the
+        // drop ends.
         if let Some(path) = drag_out {
             self.start_drag_out(&path);
         }
         if let Some(text) = clipboard_text {
-            // egui's own copy (a text field's selection) leaves under the same
-            // registered format the structured copy uses.
+            // egui's own copy (a text field's selection) goes through the
+            // same clipboard writer the editor's structured copy uses.
             match crate::clipboard::write(&text) {
                 Ok(()) => info!(
                     target: telemetry_target::ENGINE,
@@ -739,9 +765,9 @@ impl EditorWindow {
                 ),
             }
         }
-        // Step 2b: the popped-out windows - create the ones
-        // the shell reported for the first time, close the ones it stopped
-        // reporting, and paint each frame into its own swapchain.
+        // Step 2b: the popped-out windows - create the ones the shell reported
+        // for the first time, close the ones it stopped reporting, and paint
+        // each frame into its own window.
         self.present_popouts(event_loop, &mut popout_frames);
         // Step 3: draw through the overlay; retry a missing overlay rarely,
         // so a transient compositor failure heals.
@@ -765,19 +791,20 @@ impl EditorWindow {
                 "[editor] overlay frame failed"
             );
         }
-        // The popped-out windows' events have been through their passes: the
-        // next frame starts with none.
+        // The popped-out windows' events have been through their passes, so
+        // the next frame starts with none.
         self.clear_popout_events();
     }
 
-    /// The safe-mode pass, used while no shell module is loaded: the build
-    /// errors that stopped it, with their `file:line`, and a Retry that asks
-    /// the host to rebuild the module. The scene keeps rendering behind this
-    /// panel - the editor's own frame is untouched.
+    /// Builds the safe-mode panel's frame, used while no shell module is
+    /// loaded: the build errors that stopped it, each with its `file:line`,
+    /// and a Retry button that asks the host to rebuild the module. The scene
+    /// keeps rendering behind the panel, because the editor's own frame is
+    /// untouched.
     pub(super) fn fallback_frame(&mut self) -> EguiShellFrame {
-        // The fallback paints the same theme the shell would: a layer change
-        // reaches this posture too, and a theme change is a reason to draw
-        // once.
+        // The fallback uses the same theme the shell does, so a theme change
+        // has to reach this posture too: the theme is applied again whenever
+        // its generation moves.
         if self.fallback_theme_generation != self.theme_generation {
             self.fallback_theme_generation = self.theme_generation;
             pill_editor_core::style::apply_theme(
@@ -806,8 +833,8 @@ impl EditorWindow {
             )),
             ..Default::default()
         };
-        let context = self.fallback_context.clone();
-        let mut retry = false;
+        let fallback_context = self.fallback_context.clone();
+        let mut retry_requested = false;
         let problems: Vec<(String, String, String)> = self
             .notices
             .problems
@@ -825,7 +852,7 @@ impl EditorWindow {
                 )
             })
             .collect();
-        let output = context.run_ui(raw_input, |ui| {
+        let output = fallback_context.run_ui(raw_input, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.heading("Pill Editor - safe mode");
                 ui.label(format!(
@@ -855,21 +882,23 @@ impl EditorWindow {
                     .on_hover_text("rebuild and load the shell module")
                     .clicked()
                 {
-                    retry = true;
+                    retry_requested = true;
                 }
             });
         });
-        if retry {
+        if retry_requested {
             self.retry_shell_module();
         }
-        frame_from_output(&context, output)
+        frame_from_output(&fallback_context, output)
     }
 
-    /// Try to create the composition overlay again, at most every 120 frames.
+    /// Tries to create the composition overlay again, at most once every 120
+    /// frames.
     ///
-    /// The window posture is not retried: it was either asked for
-    /// (`PILL_EDITOR_NO_OVERLAY`) or already taken as the fallback, and a
-    /// composition overlay is the posture that failed.
+    /// The window-surface posture is never retried: either
+    /// `PILL_EDITOR_NO_OVERLAY` asked for it, or it was already taken as the
+    /// fallback. The composition overlay is the posture that failed, so it is
+    /// the one worth another attempt.
     pub(super) fn retry_overlay(&mut self) {
         if self.no_overlay {
             return;
@@ -903,14 +932,14 @@ impl EditorWindow {
         }
     }
 
-    /// Ask the host to rebuild the shell module, and say how it went.
+    /// Asks the host to rebuild the shell module and logs the outcome.
     ///
     /// `retry_extension` runs the same load a first start would, or asks a
-    /// loaded generation to rebuild as if its sources were saved, so a fix
-    /// made while the editor was in safe mode lands without a restart.
+    /// loaded generation to rebuild as if its sources had been saved, so a fix
+    /// made while the editor is in safe mode takes effect without a restart.
     pub(super) fn retry_shell_module(&mut self) {
-        let outcome = self.host.host_mut().retry_extension(SHELL_MODULE_NAME);
-        match outcome {
+        let retry_outcome = self.host.host_mut().retry_extension(SHELL_MODULE_NAME);
+        match retry_outcome {
             Ok(()) => {
                 info!(
                     target: telemetry_target::ENGINE,
@@ -930,11 +959,12 @@ impl EditorWindow {
         }
     }
 
-    /// Set the cursor shape egui asked for, when it maps onto one.
+    /// Sets the cursor shape egui asked for, when it maps onto one of winit's
+    /// shapes; any other icon leaves the cursor as it is.
     ///
-    /// The resize shapes matter as much as the pointing hand: the
-    /// dock reports one over a splitter, and without it the widened grab band
-    /// is invisible to the person dragging it.
+    /// The resize shapes matter as much as the pointing hand: the dock asks
+    /// for one over a splitter, and without it the wider grab area around the
+    /// splitter is invisible to the person dragging it.
     pub(super) fn apply_cursor_icon(&mut self, icon: egui::CursorIcon) {
         if icon != self.last_cursor {
             info!(
@@ -966,12 +996,12 @@ impl EditorWindow {
         self.window.set_cursor(shape);
     }
 
-    /// Apply the shell's IME state to the main window.
+    /// Applies the shell's IME state to the main window.
     ///
-    /// egui decides when a text field wants the input method and where its
-    /// caret is; this executable is what owns the window, so it is the only
-    /// place that can pass those decisions to the platform. The rect is in
-    /// logical points, which is the window's IME coordinate space.
+    /// egui decides when a text field wants the input method, and where its
+    /// caret is. This executable owns the window, so it is the only place that
+    /// can pass those decisions to the platform. The rectangle is in logical
+    /// points, the unit the window's IME cursor area takes.
     pub(super) fn apply_ime(
         &mut self,
         allowed: bool,

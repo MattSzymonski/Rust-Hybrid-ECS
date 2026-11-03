@@ -1,5 +1,5 @@
-//! Unit tests for [`Archetype`](super::Archetype) and the
-//! byte-storage columns it owns.
+//! Unit tests for the byte-storage pieces an archetype is built from:
+//! [`ColumnLayout`], [`FieldPlan`] and [`ComponentColumn`].
 //!
 //! # Responsibilities
 //!
@@ -8,16 +8,17 @@
 //!
 //! # Design
 //!
-//! Kept beside the code they exercise: the storage paths are where
-//! coverage is worth the most, and a sibling file lets
-//! `archetype.rs` read as implementation while these tests keep
-//! private access through `super::*`.
+//! Kept beside the code they exercise, because the storage paths are where
+//! coverage matters most. A sibling file also lets `archetype.rs` read as
+//! implementation, while these tests still reach private items through
+//! `super::*`.
 
+// Current crate
 use super::*;
 use crate::component::Tick;
 
-/// One row of a two-field layout: `a` at 0, `b` at 4.
-fn two_fields() -> ColumnLayout {
+/// The layout of a row of two `u32` fields: `a` at byte 0, `b` at byte 4.
+fn two_field_layout() -> ColumnLayout {
     ColumnLayout {
         size: 8,
         align: 4,
@@ -27,44 +28,50 @@ fn two_fields() -> ColumnLayout {
 }
 
 fn column_with_rows(rows: &[[u8; 8]]) -> ComponentColumn {
-    let mut column = ComponentColumn::new(two_fields()).expect("a valid layout");
+    let mut column = ComponentColumn::new(two_field_layout()).expect("a valid layout");
     for row in rows {
         column.push_bytes(row).expect("row matches the layout");
     }
     column
 }
 
-/// A layout carries its witness, and a column releases each live row once
-/// through its ops table - by `Drop` and by `swap_remove`.
+// =============================================================================
+// Column layouts and field plans
+// =============================================================================
+
+/// A layout keeps the `Blittability` value it was given, and a column frees
+/// each live row exactly once through its ops table - both in `Drop` and in
+/// `swap_remove_discard`.
 #[test]
 fn a_layout_keeps_its_witness_and_a_column_releases_through_its_ops() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let constructed =
+    let constructed_layout =
         ColumnLayout::new(4, 4, 7, Blittability::from_manifest_fields()).expect("a plain layout");
     assert_eq!(
-        constructed.blittability,
+        constructed_layout.blittability,
         Blittability::from_manifest_fields(),
         "the constructor stores the witness it was handed"
     );
 
-    // Release is the ops table's job, not a hook on the layout: one path
-    // serves a descriptor column (which reports `trivial_drop` and is skipped)
-    // and a native one (which runs the element type's glue). Counting calls
-    // holds both call sites - `Drop` and `swap_remove_discard` - to one
-    // release per row.
-    static RELEASES: AtomicUsize = AtomicUsize::new(0);
-    unsafe fn count_releases(_rows: *mut u8, count: usize) {
-        RELEASES.fetch_add(count, Ordering::SeqCst);
+    // Freeing a row is the ops table's job, not a hook on the layout, and the
+    // same table serves both call sites: `Drop` and `swap_remove_discard`. A
+    // plain-data table reports `trivial_drop` and is never called; a Rust
+    // type's table runs the element type's destructor. Counting the calls
+    // shows that each site frees its row exactly once.
+    static RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    unsafe fn count_releases(_row_pointer: *mut u8, row_count: usize) {
+        RELEASE_COUNT.fetch_add(row_count, Ordering::SeqCst);
     }
 
     let layout =
         ColumnLayout::new(4, 4, 7, Blittability::from_manifest_fields()).expect("a valid layout");
     let mut column = ComponentColumn::new(layout).expect("a column");
-    // Rows go in while the column still reports plain data, then the counting
-    // table is installed: the byte mutators refuse a column whose rows own
-    // resources, and a real column reaches a non-trivial table by re-homing
-    // rather than by being born with one and then filled with zeroed bytes.
+    // Rows go in while the column still reports plain data, because the byte
+    // mutators refuse a column whose rows own resources. The counting table is
+    // installed afterwards. A native column gets its table when it is built,
+    // from `T`'s own drop code, and is filled with `push`, which is why this
+    // test re-points a descriptor column instead.
     column
         .push_zeroed()
         .expect("the first row grows the column");
@@ -75,14 +82,14 @@ fn a_layout_keeps_its_witness_and_a_column_releases_through_its_ops() {
     });
     column.swap_remove_discard(0);
     assert_eq!(
-        RELEASES.load(Ordering::SeqCst),
+        RELEASE_COUNT.load(Ordering::SeqCst),
         1,
         "swap_remove_discard releases the row it overwrites"
     );
 
     drop(column);
     assert_eq!(
-        RELEASES.load(Ordering::SeqCst),
+        RELEASE_COUNT.load(Ordering::SeqCst),
         2,
         "Drop releases the one row still live"
     );
@@ -104,7 +111,7 @@ fn plan_between_matches_fields_by_name_not_by_position() {
             size: 4,
         },
     ];
-    // The same two fields, swapped in the new layout.
+    // The same two fields, listed in the opposite order in the new layout.
     let new = [
         LayoutField {
             name: "b",
@@ -172,8 +179,8 @@ fn plan_between_zeroes_the_new_fields_and_omits_the_removed_ones() {
 
     let plan = FieldPlan::between(&old, &new);
 
-    // The removed field leaves no instruction at all, and the added one is
-    // an explicit zero fill rather than a missing entry.
+    // The removed field leaves no instruction at all. The added field is an
+    // explicit zero fill, not a missing entry.
     assert_eq!(
         plan.fields(),
         &[
@@ -226,9 +233,78 @@ fn plan_between_copies_the_smaller_of_two_sizes() {
     assert_eq!(FieldPlan::between(&old, &new).fields()[0].bytes, 4);
 }
 
+/// A field that keeps its name but changes type is reset, not reinterpreted.
+#[test]
+fn plan_between_resets_a_field_whose_type_changed() {
+    let old = [LayoutField {
+        name: "health",
+        type_tag: "i32",
+        offset: 0,
+        size: 4,
+    }];
+    let new = [LayoutField {
+        name: "health",
+        type_tag: "f32",
+        offset: 0,
+        size: 4,
+    }];
+
+    let plan = FieldPlan::between(&old, &new);
+
+    // Copying would carry the bits across: `5i32` read as `f32` is 7e-45, so
+    // the same name would hold a different number.
+    assert_eq!(
+        plan.fields(),
+        &[PlannedField {
+            offset: 0,
+            bytes: 4,
+            source: FieldSource::ZeroFill,
+        }],
+        "a retyped field takes the zero fill, not the old bytes"
+    );
+    assert_eq!(
+        plan.retyped_fields(),
+        &["health".to_string()],
+        "and the reset is recorded so the caller can report it"
+    );
+}
+
+/// A field that keeps its name and type still carries its bytes over.
+#[test]
+fn plan_between_copies_a_field_whose_type_is_unchanged() {
+    let old = [LayoutField {
+        name: "health",
+        type_tag: "i32",
+        offset: 8,
+        size: 4,
+    }];
+    let new = [LayoutField {
+        name: "health",
+        type_tag: "i32",
+        offset: 0,
+        size: 4,
+    }];
+
+    let plan = FieldPlan::between(&old, &new);
+
+    assert_eq!(
+        plan.fields(),
+        &[PlannedField {
+            offset: 0,
+            bytes: 4,
+            source: FieldSource::OldOffset(8),
+        }],
+        "a moved field follows its name"
+    );
+    assert!(
+        plan.retyped_fields().is_empty(),
+        "nothing was reset, so nothing is reported"
+    );
+}
+
 #[test]
 fn applying_a_plan_writes_every_instruction() {
-    // One instruction per arm: a carried value, a zero fill and a default.
+    // One instruction of each kind: a copied value, a zero fill and a default.
     let mut plan = FieldPlan::new();
     plan.push(0, 4, FieldSource::OldOffset(8));
     plan.push(4, 4, FieldSource::ZeroFill);
@@ -296,7 +372,7 @@ fn relayout_moves_rows_through_the_plan() {
     ];
     let plan = FieldPlan::between(&old, &new);
 
-    let rows = column
+    let moved_row_count = column
         .relayout(
             ColumnLayout {
                 size: 16,
@@ -308,7 +384,7 @@ fn relayout_moves_rows_through_the_plan() {
         )
         .expect("the plan fits both layouts");
 
-    assert_eq!(rows, 2);
+    assert_eq!(moved_row_count, 2);
     assert_eq!(
         column.bytes(0).unwrap(),
         [2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].as_slice()
@@ -324,7 +400,7 @@ fn relayout_moves_rows_through_the_plan() {
 #[test]
 fn relayout_of_an_equal_shape_rewrites_rows_in_place() {
     let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0]]);
-    let before = column.as_mut_ptr();
+    let pointer_before = column.as_mut_ptr();
     let plan = FieldPlan::between(
         &[
             LayoutField {
@@ -370,7 +446,7 @@ fn relayout_of_an_equal_shape_rewrites_rows_in_place() {
 
     assert_eq!(
         column.as_mut_ptr(),
-        before,
+        pointer_before,
         "an unchanged shape must not reallocate: pointers into it may be live"
     );
     // The scratch copy is what makes this correct: `b` overwrites `a`'s
@@ -414,7 +490,7 @@ fn relayout_refuses_a_plan_that_leaves_a_row() {
     let mut plan = FieldPlan::new();
     plan.push(4, 8, FieldSource::OldOffset(0));
 
-    let result = column.relayout(
+    let relayout_result = column.relayout(
         ColumnLayout {
             size: 8,
             align: 4,
@@ -424,7 +500,7 @@ fn relayout_refuses_a_plan_that_leaves_a_row() {
         &plan,
     );
 
-    assert!(matches!(result, Err(WorldError::DescriptorRowInvalid)));
+    assert!(matches!(relayout_result, Err(WorldError::DescriptorRowInvalid)));
     assert_eq!(
         column.bytes(0).unwrap(),
         [1, 0, 0, 0, 2, 0, 0, 0].as_slice(),
@@ -460,22 +536,23 @@ fn relayout_refuses_a_layout_that_cannot_be_allocated() {
         Err(WorldError::DescriptorAlignmentInvalid)
     ));
 }
-// =========================================================================
-// Unified column: identity, ops and typed access
-// =========================================================================
 
-/// A native element type with real drop glue, so a POD column and a typed
-/// one can be told apart by behaviour rather than by construction.
+// =============================================================================
+// ComponentColumn: identity, ops, ticks and relayout
+// =============================================================================
+
+/// A native element type with a real destructor, so a plain-data column and a
+/// typed one can be told apart by what they do, not by how they were built.
 #[derive(Debug, PartialEq)]
 struct DropCounted(u32);
 
 thread_local! {
-    static DROPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DROP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Drop for DropCounted {
     fn drop(&mut self) {
-        DROPS.with(|count| count.set(count.get() + 1));
+        DROP_COUNT.with(|count| count.set(count.get() + 1));
     }
 }
 
@@ -514,8 +591,8 @@ fn a_descriptor_column_refuses_typed_access() {
     let _ = column.as_slice::<u64>();
 }
 
-/// A shared column checks layout instead of `TypeId`, because the two
-/// binaries that reach it have different ids for one type.
+/// A shared column checks the row layout instead of `TypeId`, because one
+/// type compiled into two binaries has a different `TypeId` in each.
 #[test]
 fn a_shared_column_accepts_a_layout_compatible_type() {
     let mut column = ComponentColumn::new_native::<u64>(7, true).expect("layout");
@@ -525,7 +602,7 @@ fn a_shared_column_accepts_a_layout_compatible_type() {
     assert_eq!(*column.get::<i64>(0), 5);
 }
 
-/// ...and still refuses one whose layout disagrees.
+/// The same column still refuses a type whose layout disagrees.
 #[test]
 #[should_panic(expected = "shared column layout")]
 fn a_shared_column_refuses_a_layout_mismatch() {
@@ -533,10 +610,10 @@ fn a_shared_column_refuses_a_layout_mismatch() {
     let _ = column.as_slice::<u32>();
 }
 
-/// The generic ops table reports that there is nothing to drop, and the
-/// generated one reports the truth about its element type.
+/// The plain-data ops table says there is nothing to drop, and the generated
+/// table says what the element type really does.
 #[test]
-fn ops_report_the_drop_behaviour_of_their_lane() {
+fn ops_report_the_drop_behaviour_of_their_column() {
     let layout = ColumnLayout::new(4, 4, 7, Blittability::engine_verified()).expect("layout");
     assert!(
         ComponentColumn::new(layout)
@@ -564,23 +641,25 @@ fn generated_ops_drop_each_row_once() {
     let mut column = ComponentColumn::new_native::<DropCounted>(7, false).expect("column");
     column.push(DropCounted(1));
     column.push(DropCounted(2));
-    DROPS.with(|count| count.set(0));
+    DROP_COUNT.with(|count| count.set(0));
 
     let ops = column.ops();
     // SAFETY: the column holds exactly two initialized `DropCounted` rows,
     // and nothing reads them afterwards.
     unsafe { (ops.drop_range)(column.as_mut_ptr(), 2) };
-    assert_eq!(DROPS.with(std::cell::Cell::get), 2);
+    assert_eq!(DROP_COUNT.with(std::cell::Cell::get), 2);
 
-    // The rows were consumed by hand, so the column must not drop them again.
+    // The rows were already dropped above, so the column must not drop them
+    // again.
     std::mem::forget(column);
 }
 
-/// A column's ticks track its rows through every mutator, by construction.
+/// A column's tick list stays in step with its rows through every operation
+/// that adds or removes a row.
 ///
-/// The ticks live beside the rows, so there is one length to maintain and the
-/// desync a parallel tick map would allow is unrepresentable rather than
-/// checked. This test pins that every mutator maintains it.
+/// The ticks live in the same struct as the rows, so there is one length to
+/// keep, and the mismatch a separately kept tick map could suffer cannot
+/// happen here. This test checks each mutator that changes the row set.
 #[test]
 fn a_columns_ticks_track_its_rows_through_every_mutator() {
     let mut column = ComponentColumn::new_native::<u32>(7, false).expect("column");
@@ -618,35 +697,35 @@ fn a_columns_ticks_track_its_rows_through_every_mutator() {
         "a moved row keeps the ticks it was carrying"
     );
 
-    // The byte lanes maintain it too.
-    let mut descriptor = ComponentColumn::new(two_fields()).expect("column");
-    descriptor.push_zeroed().expect("push");
-    descriptor.push_bytes(&[0; 8]).expect("push");
-    assert_eq!(descriptor.ticks().len(), 2);
-    assert_eq!(descriptor.ticks().len(), descriptor.len());
-    descriptor.swap_remove_discard(0);
-    assert_eq!(descriptor.ticks().len(), descriptor.len());
+    // The byte mutators keep the two in step as well.
+    let mut descriptor_column = ComponentColumn::new(two_field_layout()).expect("column");
+    descriptor_column.push_zeroed().expect("push");
+    descriptor_column.push_bytes(&[0; 8]).expect("push");
+    assert_eq!(descriptor_column.ticks().len(), 2);
+    assert_eq!(descriptor_column.ticks().len(), descriptor_column.len());
+    descriptor_column.swap_remove_discard(0);
+    assert_eq!(descriptor_column.ticks().len(), descriptor_column.len());
 }
 
-/// A relayout reshapes rows without disturbing their change ticks.
+/// A relayout reshapes the rows without disturbing their change ticks.
 ///
-/// The column reallocates its buffer, and the ticks it carries have to come
-/// across with it: a reshaped component has not been added or changed, so a
-/// `Changed<T>` system must not see the whole world light up after a hot
-/// reload that only moved a field.
+/// This relayout reallocates the column's buffer, and the ticks have to come
+/// across with it. A reshaped component has not been added or changed, so a
+/// system that filters on `Changed<T>` must not see the whole world light up
+/// after a hot reload that only moved a field.
 #[test]
 fn a_relayout_carries_the_column_ticks_across_the_reallocation() {
-    let mut column = ComponentColumn::new(two_fields()).expect("column");
+    let mut column = ComponentColumn::new(two_field_layout()).expect("column");
     column.push_bytes(&[1, 0, 0, 0, 2, 0, 0, 0]).expect("push");
     column.push_bytes(&[3, 0, 0, 0, 4, 0, 0, 0]).expect("push");
     column.set_row_ticks(0, ComponentTicks::new(Tick(11)));
     column.set_row_ticks(1, ComponentTicks::new(Tick(22)));
 
     // A wider, more strongly aligned shape forces a fresh allocation.
-    let widened =
+    let widened_layout =
         ColumnLayout::new(16, 8, 77, Blittability::engine_verified()).expect("a valid layout");
     column
-        .relayout(widened, &FieldPlan::new())
+        .relayout(widened_layout, &FieldPlan::new())
         .expect("an empty plan zeroes every row");
 
     assert_eq!(column.ticks().len(), column.len());
@@ -665,19 +744,22 @@ fn reserving_rows_preserves_contents() {
     column.push::<u32>(10);
     assert_eq!(column.as_slice::<u32>(), &[9, 10]);
 }
-/// A descriptor column that gains alignment reallocates rather than
-/// reinterpreting its old stride.
+
+/// A descriptor column that gains alignment moves its rows into a new buffer
+/// instead of reinterpreting the old one.
 ///
-/// The native lane's hazard is a column re-homed onto a newer ops table and
-/// then read through the incoming type at the old stride. A descriptor column
-/// has no typed reading at all, and a relayout that changes size or alignment
-/// moves every row into a freshly allocated, correctly aligned buffer, so that
-/// misaligned read is unrepresentable here.
+/// The relayout allocates a buffer aligned for the new shape and writes every
+/// row into it at the new stride, and the test checks that the buffer really is
+/// 8-aligned. A native column refuses a registration whose alignment grows,
+/// because its reload reads old rows with the incoming type. A descriptor
+/// column has no typed read at all: its rows are only reached as bytes at the
+/// layout's stride, so the buffer's alignment is what makes those reads valid.
 #[test]
 fn a_descriptor_relayout_that_widens_alignment_reallocates() {
     // A 12-byte row at align 4: three 4-byte values.
-    let old = ColumnLayout::new(12, 4, 1, Blittability::engine_verified()).expect("layout");
-    let mut column = ComponentColumn::new(old).expect("column");
+    let narrow_layout =
+        ColumnLayout::new(12, 4, 1, Blittability::engine_verified()).expect("layout");
+    let mut column = ComponentColumn::new(narrow_layout).expect("column");
     column
         .push_bytes(&[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])
         .expect("push");
@@ -685,14 +767,16 @@ fn a_descriptor_relayout_that_widens_alignment_reallocates() {
         .push_bytes(&[4, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0])
         .expect("push");
 
-    // Widen to align 8, the case the native lane refuses.
-    let new = ColumnLayout::new(16, 8, 2, Blittability::engine_verified()).expect("layout");
+    // Widen the row to align 8. A native column refuses this change at
+    // registration.
+    let widened_layout =
+        ColumnLayout::new(16, 8, 2, Blittability::engine_verified()).expect("layout");
     let mut plan = FieldPlan::new();
     plan.push(0, 4, FieldSource::OldOffset(0));
     plan.push(8, 4, FieldSource::OldOffset(4));
-    let migrated = column.relayout(new, &plan).expect("relayout");
+    let migrated_row_count = column.relayout(widened_layout, &plan).expect("relayout");
 
-    assert_eq!(migrated, 2, "both rows migrate");
+    assert_eq!(migrated_row_count, 2, "both rows migrate");
     assert_eq!(column.len(), 2, "row count and order survive");
     assert_eq!(column.alignment(), 8);
     assert_eq!(
@@ -704,71 +788,4 @@ fn a_descriptor_relayout_that_widens_alignment_reallocates() {
     assert_eq!(&column.bytes(0).expect("row")[8..12], &[2, 0, 0, 0]);
     assert_eq!(&column.bytes(1).expect("row")[0..4], &[4, 0, 0, 0]);
 }
-/// A field that keeps its name but changes type is reset, not reinterpreted.
-#[test]
-fn plan_between_resets_a_field_whose_type_changed() {
-    let old = [LayoutField {
-        name: "health",
-        type_tag: "i32",
-        offset: 0,
-        size: 4,
-    }];
-    let new = [LayoutField {
-        name: "health",
-        type_tag: "f32",
-        offset: 0,
-        size: 4,
-    }];
 
-    let plan = FieldPlan::between(&old, &new);
-
-    // Copying would have carried the bits across: `5i32` read as `f32` is
-    // 7e-45, a different number wearing the same name.
-    assert_eq!(
-        plan.fields(),
-        &[PlannedField {
-            offset: 0,
-            bytes: 4,
-            source: FieldSource::ZeroFill,
-        }],
-        "a retyped field takes the zero fill, not the old bytes"
-    );
-    assert_eq!(
-        plan.retyped_fields(),
-        &["health".to_string()],
-        "and the reset is recorded so the caller can report it"
-    );
-}
-
-/// A field that keeps its name and type still carries its bytes over.
-#[test]
-fn plan_between_copies_a_field_whose_type_is_unchanged() {
-    let old = [LayoutField {
-        name: "health",
-        type_tag: "i32",
-        offset: 8,
-        size: 4,
-    }];
-    let new = [LayoutField {
-        name: "health",
-        type_tag: "i32",
-        offset: 0,
-        size: 4,
-    }];
-
-    let plan = FieldPlan::between(&old, &new);
-
-    assert_eq!(
-        plan.fields(),
-        &[PlannedField {
-            offset: 0,
-            bytes: 4,
-            source: FieldSource::OldOffset(8),
-        }],
-        "a moved field follows its name"
-    );
-    assert!(
-        plan.retyped_fields().is_empty(),
-        "nothing was reset, so nothing is reported"
-    );
-}

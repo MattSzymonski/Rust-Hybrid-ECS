@@ -3,18 +3,17 @@
 //! # Responsibilities
 //!
 //! - Defines the [`Resource`] marker trait for global/shared state types.
-//! - Provides [`ResourceId`] for type-erased resource identification, stable
+//! - Provides [`ResourceId`], which names a resource type and stays the same
 //!   across artifacts when the type declares a shared name.
 //! - Implements [`ResHandle`] - a lightweight, copyable handle for deferred resource access.
 //! - Owns [`ErasedResource`], the storage one resource value lives in.
 //!
 //! # Design
 //!
-//! Resources represent global state such as time, input, configuration,
-//! and asset stores. They are accessed by systems through `Res<T>` (immutable)
-//! and `ResMut<T>` (mutable) system parameters. [`ResHandle<T>`] provides a
-//! zero-cost typed reference that can be stored and passed around without
-//! borrowing the [`World`].
+//! A resource holds global state: time, input, configuration, an asset store.
+//! Systems reach it through `Res<T>` (read-only) and `ResMut<T>` (read and
+//! write) parameters, and [`ResHandle<T>`] is a zero-cost typed handle that
+//! can be stored and passed around without borrowing the [`World`].
 //!
 //! # Examples
 //!
@@ -22,9 +21,9 @@
 //! # use pill_engine::*;
 //! # let mut world = World::new();
 //! #[derive(Debug)]
-//! struct ProjectTime { delta: f32, elapsed: f32 }
+//! struct ProjectTime { delta_seconds: f32, elapsed_seconds: f32 }
 //! impl Resource for ProjectTime {}
-//! world.insert_resource(ProjectTime { delta: 0.016, elapsed: 0.0 });
+//! world.insert_resource(ProjectTime { delta_seconds: 0.016, elapsed_seconds: 0.0 });
 //!
 //! // A handle is cheap and copyable.
 //! let handle = ResHandle::<ProjectTime>::new();
@@ -32,7 +31,7 @@
 //!
 //! // Systems take the same resource through Res/ResMut.
 //! fn my_system(time: Res<ProjectTime>) {
-//!     println!("Elapsed: {}", time.get().unwrap().elapsed);
+//!     println!("Elapsed: {}", time.get().unwrap().elapsed_seconds);
 //! }
 //! ```
 
@@ -53,11 +52,11 @@ use crate::world::World;
 // Resource
 // =============================================================================
 
-/// Resource marker trait - resources are singleton data stored in the World.
+/// Marks a type as a resource: one value of it lives in the [`World`].
 ///
-/// Unlike components, resources are not attached to entities; they hold global
-/// state such as time, input or configuration, and must be `Send + Sync` to
-/// support parallel system access.
+/// Unlike components, resources are not attached to entities. They hold
+/// global state such as time, input or configuration, and must be
+/// `Send + Sync` so systems can reach them in parallel.
 ///
 /// # Examples
 ///
@@ -65,28 +64,28 @@ use crate::world::World;
 /// use pill_engine::Resource;
 ///
 /// struct ProjectTime {
-///     delta: f32,
-///     elapsed: f32,
+///     delta_seconds: f32,
+///     elapsed_seconds: f32,
 /// }
 ///
 /// impl Resource for ProjectTime {}
 /// ```
 pub trait Resource: Send + Sync + 'static {
-    /// Stable, cross-artifact name for this resource, or `None` for the
-    /// ordinary per-binary identity.
+    /// A stable name for this resource, or `None` to be identified by its
+    /// [`TypeId`] inside this binary only.
     ///
-    /// The resource counterpart of
+    /// This is the resource counterpart of
     /// [`Component::shared_name`](crate::component::Component::shared_name),
-    /// and it exists for the same reason: a type compiled into two artifacts
-    /// with differing inputs gets a different [`TypeId`] in each, so
-    /// identifying a resource by `TypeId` splits it into two resources that
-    /// cannot see each other.
+    /// and it exists for the same reason: when two artifacts compile the type
+    /// with different inputs, each gets its own [`TypeId`], and the same type
+    /// would become two resources that cannot see each other. A shared name
+    /// gives both artifacts one identity.
     ///
-    /// The name must be unique across the whole process, so it should be
-    /// namespaced - `"pill_spline::SplineSettings"`, not `"Settings"`.
+    /// The name must be unique across the whole process, so namespace it -
+    /// `"pill_spline::SplineSettings"`, not `"Settings"`.
     ///
     /// Most resources do not need this: a type every artifact compiles
-    /// identically already agrees on its `TypeId` everywhere, which is why
+    /// identically already has the same `TypeId` everywhere, which is why
     /// `Time` and `AssetManager` cross the boundary untouched.
     fn shared_name() -> Option<&'static str>
     where
@@ -95,13 +94,13 @@ pub trait Resource: Send + Sync + 'static {
         None
     }
 
-    /// The stable identity [`Self::shared_name`] hashes to, or `None`.
+    /// The stable identity that [`Self::shared_name`] turns into, or `None`.
     ///
-    /// Defaulted in terms of `shared_name`, so an implementor writes only the
-    /// name and the two cannot disagree. Override it only with
-    /// `shared_component_identity(Self::shared_name())`; any other value
-    /// silently splits the resource's identity from the name every other
-    /// artifact derives it from.
+    /// The default derives it from `shared_name`, so an implementor writes
+    /// only the name and the two cannot disagree. Override it only with
+    /// `shared_component_identity(Self::shared_name())`: any other value would
+    /// give this resource an identity different from the one every other
+    /// artifact derives from the same name.
     fn shared_identity() -> Option<u128>
     where
         Self: Sized,
@@ -109,18 +108,17 @@ pub trait Resource: Send + Sync + 'static {
         Self::shared_name().map(crate::component::shared_component_identity)
     }
 
-    /// Structural hash of this resource's declared layout, or `None`.
+    /// A hash of this resource's field layout, or `None`.
     ///
-    /// The resource counterpart of a component's schema hash: size and
+    /// This is the resource counterpart of a component's schema hash. Size and
     /// alignment cannot tell `{u32, u32}` from `{f32, f32}`, so a shared
-    /// resource whose declaring types disagree only in field types is caught
-    /// by this instead of being read through the wrong `T`.
+    /// resource whose declaring types have different field types is caught
+    /// here instead of being read through the wrong `T`.
     ///
-    /// Defaulted to `None`, and only compared when **both** sides of a claim
-    /// carry a value, so a type that does not need the extra check is not
-    /// required to lie about having one. The natural source, when the type
-    /// has a field vocabulary, is
-    /// [`component_schema_hash`](crate::component::component_schema_hash).
+    /// The default is `None`, and a claim compares the hash only when both
+    /// sides carry one, so a type that does not need the check does not have
+    /// to make one up. When the type has a field vocabulary, derive the value
+    /// with [`component_schema_hash`](crate::component::component_schema_hash).
     fn shared_schema_hash() -> Option<u64>
     where
         Self: Sized,
@@ -133,13 +131,13 @@ pub trait Resource: Send + Sync + 'static {
 // ResourceId
 // =============================================================================
 
-/// Uniquely identifies a resource type.
+/// Identifies one resource type.
 ///
-/// Either the Rust [`TypeId`], or - for a resource declaring
-/// [`Resource::shared_name`] - a stable identity derived from that name, so
+/// This is either the Rust [`TypeId`], or, for a resource that declares
+/// [`Resource::shared_name`], a stable identity derived from that name, so
 /// artifacts that compiled the type with different inputs still agree.
 ///
-/// `Hash` is implemented by hand below rather than derived; see the impl.
+/// `Hash` is written by hand below rather than derived; the impl says why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ResourceId {
     /// Resource identified by its Rust [`TypeId`], which differs between
@@ -173,11 +171,11 @@ impl ResourceId {
     }
 }
 
-/// `Hash` is written by hand so a 128-bit identity feeds the hasher as 64 bits,
-/// exactly as [`ComponentId`](crate::component::ComponentId) does and for the
-/// same measured reason: a map resolves collisions with `Eq`, which still
-/// compares every bit, so the second 8-byte block buys no correctness and costs
-/// a compression round.
+/// `Hash` is written by hand so a 128-bit identity reaches the hasher as 64
+/// bits, exactly as [`ComponentId`](crate::component::ComponentId) does, and
+/// for the same reason: a hash map resolves a collision with `Eq`, which still
+/// compares every bit, so the second 8-byte block buys no correctness and
+/// costs a compression round.
 impl std::hash::Hash for ResourceId {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -197,11 +195,12 @@ const SHARED_RESOURCE_HASH_SALT: u64 = 0xd6e8_feb8_6659_fd93;
 // ResHandle
 // =============================================================================
 
-/// A lightweight, typed handle to a resource in the World.
+/// A cheap, typed handle to a resource in the [`World`].
 ///
-/// `ResHandle<T>` is a zero-cost abstraction carrying only the resource's type:
-/// handles are `Copy`, `Clone`, `Send` and `Sync`, so one can be stored or passed
-/// to another phase and resolved later without borrowing the [`World`].
+/// The handle stores only the resource's type and nothing else, so it is
+/// zero-sized. It is `Copy`, `Clone`, `Send` and `Sync`, which means it can be
+/// stored or passed to another phase and resolved later without borrowing the
+/// [`World`].
 ///
 /// # Examples
 /// ```no_run
@@ -238,19 +237,19 @@ impl<T: Resource> ResHandle<T> {
         }
     }
 
-    /// Gets the [`ResourceId`] for this handle's resource type.
+    /// Returns the [`ResourceId`] of this handle's resource type.
     pub fn id(&self) -> ResourceId {
         ResourceId::of::<T>()
     }
 
-    /// Gets an immutable reference to the resource from the [`World`].
+    /// Returns a shared reference to the resource from the [`World`].
     ///
     /// Returns `None` if the resource has not been inserted.
     pub fn get<'w>(&self, world: &'w World) -> Option<&'w T> {
         world.get_resource::<T>()
     }
 
-    /// Gets a mutable reference to the resource from the [`World`].
+    /// Returns a mutable reference to the resource from the [`World`].
     ///
     /// Returns `None` if the resource has not been inserted.
     pub fn get_mut<'w>(&self, world: &'w mut World) -> Option<&'w mut T> {
@@ -277,14 +276,12 @@ impl<T: Resource> Clone for ResHandle<T> {
 
 impl<T: Resource> Copy for ResHandle<T> {}
 
-// SAFETY: `ResHandle<T>` stores only `PhantomData<T>` and never owns or
-// references a value of type `T`, so no `T` data is moved, shared, or
-// aliased through a handle. Marking every handle `Send` and `Sync` is
-// therefore sound for any `T`: handles are inert, zero-sized type-level
-// markers with no data to race on, alias, or invalidate.
+// SAFETY: a `ResHandle<T>` holds only `PhantomData<T>`. It never owns or
+// refers to a value of type `T`, so there is no `T` data to move, share or
+// alias between threads, and the handle is sound as `Send` for any `T`.
 unsafe impl<T: Resource> Send for ResHandle<T> {}
-// SAFETY: As for `Send` above - a handle carries no `T` data to share, so
-// shared access across threads cannot race or alias anything.
+// SAFETY: as for `Send` above - a handle carries no `T` data at all, so
+// sharing one between threads cannot race or alias anything.
 unsafe impl<T: Resource> Sync for ResHandle<T> {}
 
 impl<T: Resource> std::fmt::Debug for ResHandle<T> {
@@ -297,22 +294,22 @@ impl<T: Resource> std::fmt::Debug for ResHandle<T> {
 // ErasedResource
 // =============================================================================
 
-/// Per-type behaviour an [`ErasedResource`] needs, plus the layout facts that
-/// go with it, as plain data.
+/// Everything an [`ErasedResource`] needs to know about its value's type, as
+/// plain data.
 ///
-/// Function pointers rather than a vtable, for the same reason
-/// [`ColumnOps`](crate::archetype::ColumnOps) is on the component side: a
-/// `Box<dyn Any>` carries its destructor in a vtable that lives in the image of
-/// whichever artifact created the value, and resources outlive the module that
-/// inserted them - nothing clears them on reload. A table that is plain data can
-/// be replaced when the code it points at is about to be unmapped.
+/// The table holds function pointers rather than a vtable, for the same reason
+/// [`ColumnOps`](crate::archetype::ColumnOps) does on the component side. A
+/// `Box<dyn Any>` keeps its destructor in a vtable owned by the artifact that
+/// created the value, and a resource outlives the module that inserted it -
+/// nothing clears resources on reload - so that destructor could end up
+/// pointing into an unmapped image. Plain data can be replaced instead, right
+/// before the code it points at goes away.
 ///
-/// One table answers every question about a registration: the drop, a value's
-/// size and alignment (which a box needs for its own allocation), and, for a
-/// declaration from another language, the schema hash its manifest carried.
-/// Only a drop is needed - unlike a component column, a resource is never upcast
-/// to a trait object, so there are no `up_ref`/`up_mut`/`take_boxed`
-/// counterparts.
+/// One table answers every question about a registration: the drop, the size
+/// and alignment a box needs for its own allocation, and, for a declaration
+/// from another language, the schema hash its manifest carried. The drop takes
+/// no row count, unlike a component column's `drop_range`, because a box holds
+/// exactly one value rather than a run of rows.
 #[derive(Clone, Copy)]
 pub struct ErasedResourceOps {
     /// Drop the initialized value at `ptr`.
@@ -332,15 +329,15 @@ pub struct ErasedResourceOps {
     /// Whether this table drops nothing because its values are blittable bytes
     /// owned by another language.
     ///
-    /// Read in two places: [`World::rehome_resources`] leaves such a box's
-    /// table alone - there is no newer code to point it at, and no destructor
-    /// to keep valid - and the raw byte accessors refuse to hand out anything
-    /// else.
+    /// [`World::rehome_resources`] leaves such a box's table alone - there is
+    /// no newer code to point it at, and no destructor to keep valid - and the
+    /// byte accessors and the relayout path read this flag to refuse a Rust
+    /// value.
     pub foreign: bool,
 }
 
 impl ErasedResourceOps {
-    /// Assemble the table for a concrete resource type.
+    /// Builds the table for a concrete Rust resource type.
     pub fn of<T: Resource>() -> Self {
         Self {
             drop_in_place: drop_in_place_of::<T>,
@@ -351,12 +348,12 @@ impl ErasedResourceOps {
         }
     }
 
-    /// Assemble the table for a foreign declaration.
+    /// Builds the table for a declaration from another language.
     ///
-    /// The drop is deliberately a no-op: a foreign resource is a run of
-    /// blittable bytes, enforced by the caller (the C# manifest path allows
-    /// only unmanaged value types), so there is nothing to release and no
-    /// artifact whose code could go away.
+    /// The drop is deliberately a no-op. A foreign resource is a run of
+    /// blittable bytes that owns nothing: the C# manifest path allows only
+    /// unmanaged value types, so there is no destructor to run and no artifact
+    /// whose code could go away.
     pub fn foreign(size: usize, align: usize, schema_hash: u64) -> Self {
         Self {
             drop_in_place: drop_nothing,
@@ -400,7 +397,7 @@ unsafe fn drop_nothing(_ptr: *mut u8) {}
 /// The allocation is owned by this value and released on drop.
 pub struct ErasedResource {
     /// Heap allocation holding the value, or dangling for a zero-sized type.
-    data: NonNull<u8>,
+    value_allocation: NonNull<u8>,
     /// Runtime type identity of the stored value, as the creating artifact
     /// sees it, or `None` when the value has no Rust type at all.
     type_id: Option<TypeId>,
@@ -410,63 +407,70 @@ pub struct ErasedResource {
     align: usize,
     /// Whether the stored value is identified by its layout rather than by
     /// `type_id`; set when the resource declares a shared name.
-    shared_identity: bool,
+    has_shared_identity: bool,
     /// Per-type function table; replaceable via [`Self::refresh_ops`].
-    ops: ErasedResourceOps,
+    function_table: ErasedResourceOps,
 }
 
-// SAFETY: `Resource` is `Send + Sync`, and this box only ever holds a value of
-// such a type. The raw pointer is owned exclusively by the box.
+// SAFETY: a Rust box holds a `Resource`, which is `Send + Sync`, and a foreign
+// box holds plain bytes. In both cases the box owns the only pointer to its
+// value, so moving the box between threads moves the value with it.
 unsafe impl Send for ErasedResource {}
-// SAFETY: as above.
+// SAFETY: as for `Send` above - the box owns its value exclusively, so a shared
+// borrow of the box cannot alias a mutable one.
 unsafe impl Sync for ErasedResource {}
 
 impl ErasedResource {
-    /// Move `value` into a fresh erased box.
-    pub fn new<T: Resource>(value: T) -> Self {
+    /// Move `resource_value` into a fresh erased box.
+    pub fn new<T: Resource>(resource_value: T) -> Self {
         let size = std::mem::size_of::<T>();
         let align = std::mem::align_of::<T>();
         // SAFETY: the allocation is `size` bytes at `align`, and the write
         // below fills it completely before it is read.
-        let data = Self::allocate(size, align, |pointer| unsafe {
-            std::ptr::write(pointer.cast::<T>(), value);
+        let value_allocation = Self::allocate(size, align, |pointer| unsafe {
+            std::ptr::write(pointer.cast::<T>(), resource_value);
         });
         Self {
-            data,
+            value_allocation,
             type_id: Some(TypeId::of::<T>()),
             size,
             align,
             // A shared resource is reached from an artifact whose `TypeId` for
             // the type differs, so its identity check has to be layout-based;
             // see `holds`.
-            shared_identity: T::shared_name().is_some(),
-            ops: ErasedResourceOps::of::<T>(),
+            has_shared_identity: T::shared_name().is_some(),
+            function_table: ErasedResourceOps::of::<T>(),
         }
     }
 
     /// Move another language's blittable bytes into a fresh erased box.
     ///
     /// The value has no Rust type: its identity is the shared name its
-    /// declaration carried, so `shared_identity` is set and `holds` compares
-    /// layout - which is all a foreign declaration can offer. The box owns a
-    /// copy of `bytes` and releases nothing on drop, because blittable bytes
-    /// own nothing and there is no artifact whose code could go away.
+    /// declaration carried, so the box is identified by layout and `holds`
+    /// compares layout - which is all a foreign declaration can offer. The box
+    /// owns a copy of `bytes` and releases nothing on drop, because blittable
+    /// bytes own nothing and there is no artifact whose code could go away.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `size` and `align` cannot describe an allocation. Aborts
+    /// when the allocation itself fails.
     pub fn new_foreign(bytes: &[u8], align: usize, schema_hash: u64) -> Self {
         let size = bytes.len();
         // SAFETY: the allocation is `bytes.len()` bytes, and the copy fills it
         // completely before it is read.
-        let data = Self::allocate(size, align, |pointer| unsafe {
+        let value_allocation = Self::allocate(size, align, |pointer| unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, size);
         });
         Self {
-            data,
+            value_allocation,
             // No Rust type names this value, which is exactly what the
             // layout-based `holds` branch above is for.
             type_id: None,
             size,
             align,
-            shared_identity: true,
-            ops: ErasedResourceOps::foreign(size, align, schema_hash),
+            has_shared_identity: true,
+            function_table: ErasedResourceOps::foreign(size, align, schema_hash),
         }
     }
 
@@ -474,6 +478,11 @@ impl ErasedResource {
     ///
     /// A zero-sized value needs no allocation: `drop_in_place` on a
     /// dangling-but-aligned pointer is well defined for one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `size` and `align` cannot describe an allocation. Aborts
+    /// when the allocation itself fails.
     fn allocate(size: usize, align: usize, fill: impl FnOnce(*mut u8)) -> NonNull<u8> {
         if size == 0 {
             return NonNull::dangling();
@@ -509,25 +518,25 @@ impl ErasedResource {
 
     /// Whether this box holds another language's blittable bytes.
     ///
-    /// The answer comes from the box's own creation - a Rust value was stored
-    /// with a `TypeId` and a foreign payload without one - never from the
-    /// function table, which a re-home can replace. A table cannot redefine
-    /// what the value is, which is what keeps this predicate honest after a
-    /// mismatched re-home would otherwise have flipped it.
+    /// The answer comes from the box's own creation: a Rust value was stored
+    /// with a `TypeId`, a foreign payload without one. It never comes from the
+    /// function table, which a re-home can replace, so a table cannot turn a
+    /// Rust value into a foreign one.
     pub fn is_foreign(&self) -> bool {
         self.type_id.is_none()
     }
 
     /// The stored value as raw bytes.
     ///
-    /// The bytes are what another language reads and writes, and what a
-    /// migration plan moves. They only mean anything to a caller that knows the
-    /// registered layout: a Rust value's bytes are its fields at their offsets,
-    /// and handing them out does not make the value any less the type it is.
+    /// These are the bytes another language reads and writes, and what a
+    /// migration plan moves. They only mean something to a caller that knows
+    /// the registered layout: for a Rust value they are its fields at their
+    /// offsets, and reading them does not make the value any less the type it
+    /// is.
     pub fn bytes(&self) -> &[u8] {
         // SAFETY: the box owns a live byte run of this size, and the borrow is
         // tied to `&self`.
-        unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.size) }
+        unsafe { std::slice::from_raw_parts(self.value_allocation.as_ptr(), self.size) }
     }
 
     /// The stored value as raw bytes, mutably.
@@ -537,21 +546,25 @@ impl ErasedResource {
     /// writers, which write component rows in place.
     pub fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: as above, and `&mut self` makes the borrow exclusive.
-        unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr(), self.size) }
+        unsafe { std::slice::from_raw_parts_mut(self.value_allocation.as_ptr(), self.size) }
     }
 
-    /// Rewrite the stored payload into a new shape, following a plan.
+    /// Rewrites the stored payload into a new shape, following `plan`.
     ///
-    /// Only a foreign payload may change size: a Rust value's size is its type,
-    /// and `World::relayout_foreign_resource` refuses that before it gets here.
-    /// The scratch copy is the discipline a descriptor column uses as well -
-    /// every source byte is read before the destination is zeroed - so a plan that
-    /// moves fields inside the value cannot read what it overwrote.
+    /// Only a foreign payload may change size, because a Rust value's size is
+    /// its type; `World::relayout_foreign_resource` refuses that before this
+    /// runs. The old bytes are copied aside first, the same way a descriptor
+    /// column migration works, so a plan that moves a field onto bytes it still
+    /// occupies reads the original value instead of what it just wrote.
     ///
     /// # Errors
     ///
     /// Returns [`WorldError::DescriptorRowInvalid`] when an instruction falls
     /// outside the old or the new payload. Nothing is modified in that case.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `size` and `align` cannot describe an allocation.
     pub(crate) fn migrate_bytes(
         &mut self,
         size: usize,
@@ -566,7 +579,11 @@ impl ErasedResource {
         // SAFETY: the box holds `self.size` initialized bytes, and the scratch
         // buffer is at least that long.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.data.as_ptr(), scratch.as_mut_ptr(), self.size);
+            std::ptr::copy_nonoverlapping(
+                self.value_allocation.as_ptr(),
+                scratch.as_mut_ptr(),
+                self.size,
+            );
         }
 
         if size != self.size || align != self.align {
@@ -574,11 +591,11 @@ impl ErasedResource {
                 let old_layout =
                     Layout::from_size_align(self.size, self.align).expect("valid resource layout");
                 // SAFETY: this is the live allocation, created with this layout.
-                unsafe { std::alloc::dealloc(self.data.as_ptr(), old_layout) };
+                unsafe { std::alloc::dealloc(self.value_allocation.as_ptr(), old_layout) };
             }
             // SAFETY: the allocation is `size` bytes at `align`, and the writes
             // below fill it before anything reads it.
-            self.data = Self::allocate(size, align, |_pointer| {});
+            self.value_allocation = Self::allocate(size, align, |_pointer| {});
             self.size = size;
             self.align = align;
         }
@@ -586,50 +603,54 @@ impl ErasedResource {
         // SAFETY: the destination holds `size` bytes, the plan was checked
         // against both sizes, and the scratch buffer holds the old payload.
         unsafe {
-            std::ptr::write_bytes(self.data.as_ptr(), 0, size);
+            std::ptr::write_bytes(self.value_allocation.as_ptr(), 0, size);
             plan.apply(
                 &scratch,
-                std::slice::from_raw_parts_mut(self.data.as_ptr(), size),
+                std::slice::from_raw_parts_mut(self.value_allocation.as_ptr(), size),
             );
         }
 
-        // The box's own table describes the value it now holds. A foreign box's
-        // table is never refreshed from the factories - that is what keeps a
-        // Rust type sharing the name from handing its drop to these bytes - so
-        // this is the one place it moves.
-        self.ops = ErasedResourceOps::foreign(size, align, self.ops.schema_hash.unwrap_or(0));
+        // Update the box's own table to describe the new shape. A foreign
+        // box's table is never refreshed from the resource factories - that is
+        // what stops a Rust type sharing the name from handing its drop to
+        // these bytes - so this is the one place it changes.
+        self.function_table = ErasedResourceOps::foreign(
+            size,
+            align,
+            self.function_table.schema_hash.unwrap_or(0),
+        );
         Ok(())
     }
 
-    /// Replace the per-type function table.
+    /// Replaces the per-type function table.
     ///
-    /// Lets the owner re-point the stored drop at code that is still mapped,
-    /// after the artifact that supplied it has been reloaded or retired. A
-    /// foreign box is not refreshed: see [`Self::is_foreign`] and
+    /// The owner uses this to point the stored drop at code that is still
+    /// mapped, after the artifact that supplied it was reloaded or retired. A
+    /// foreign box is never refreshed this way: see [`Self::is_foreign`] and
     /// `World::rehome_resources`.
     ///
-    /// The table has to agree with the box's own ownership; a disagreement
-    /// would install a drop the value never had, so the swap is refused and
-    /// reported rather than applied.
-    pub fn refresh_ops(&mut self, ops: ErasedResourceOps) {
-        // Keeping the existing table is the safe half of a disagreement: the
-        // value is still released by whatever produced it. `rehome_resources`
-        // filters this case out, so reaching it means a caller got it wrong.
-        if ops.foreign != self.type_id.is_none() {
+    /// The new table must agree with how the box was created. Installing a
+    /// foreign table over a Rust value, or the reverse, would give the value a
+    /// drop it never had, so the swap is refused and logged instead.
+    pub fn refresh_ops(&mut self, function_table: ErasedResourceOps) {
+        // Keeping the existing table is the safe choice: the value is still
+        // released by whatever produced it. `rehome_resources` never lets this
+        // case through, so reaching it means a caller made a mistake.
+        if function_table.foreign != self.type_id.is_none() {
             error!(
                 target: pill_core::telemetry::telemetry_target::ECS,
-                foreign_table = ops.foreign,
+                foreign_table = function_table.foreign,
                 foreign_box = self.type_id.is_none(),
                 "a resource's function table disagrees with the ownership its box was created with; keeping the existing table"
             );
             return;
         }
-        self.ops = ops;
+        self.function_table = function_table;
     }
 
     /// Whether this box is identified by layout rather than by `TypeId`.
     pub fn has_shared_identity(&self) -> bool {
-        self.shared_identity
+        self.has_shared_identity
     }
 
     /// Whether the stored value can be read as a `T`.
@@ -642,7 +663,7 @@ impl ErasedResource {
     /// agree on size and alignment - which is why a shared resource's name and
     /// shape are guarded at registration (see `World::register_resource`).
     pub fn holds<T: Resource>(&self) -> bool {
-        if self.shared_identity {
+        if self.has_shared_identity {
             self.size == std::mem::size_of::<T>() && self.align == std::mem::align_of::<T>()
         } else {
             self.type_id == Some(TypeId::of::<T>())
@@ -656,7 +677,7 @@ impl ErasedResource {
         }
         // SAFETY: the check above establishes that the allocation holds a live,
         // correctly aligned `T`.
-        Some(unsafe { &*self.data.as_ptr().cast::<T>() })
+        Some(unsafe { &*self.value_allocation.as_ptr().cast::<T>() })
     }
 
     /// Borrow the stored value mutably, or `None` when it is another type.
@@ -665,17 +686,19 @@ impl ErasedResource {
             return None;
         }
         // SAFETY: as for `get`, and `&mut self` makes the borrow exclusive.
-        Some(unsafe { &mut *self.data.as_ptr().cast::<T>() })
+        Some(unsafe { &mut *self.value_allocation.as_ptr().cast::<T>() })
     }
 
     /// Move the stored value out, consuming the box.
     ///
-    /// Returns the box unchanged when it holds another type, so a refused take
-    /// does not destroy the value.
-    ///
     /// This is the only path where ownership leaves the box, and the only one
     /// that must **not** run the drop: the value goes to the caller, who
     /// becomes responsible for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the box unchanged, as `Err`, when it holds another type, so a
+    /// refused take does not destroy the value.
     pub fn take<T: Resource>(self) -> Result<T, Self> {
         if !self.holds::<T>() {
             return Err(self);
@@ -683,18 +706,20 @@ impl ErasedResource {
         // The value moves out, so this box must release its allocation without
         // dropping the contents. `ManuallyDrop` suppresses `Drop for
         // ErasedResource`; the deallocation below replaces it.
-        let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: the check above establishes a live `T` at `data`, and
-        // `ManuallyDrop` guarantees nothing else reads or drops it.
-        let value = unsafe { std::ptr::read(this.data.as_ptr().cast::<T>()) };
-        if this.size != 0 {
-            let layout =
-                Layout::from_size_align(this.size, this.align).expect("valid resource layout");
+        let undropped_box = std::mem::ManuallyDrop::new(self);
+        // SAFETY: the check above establishes a live `T` at `value_allocation`,
+        // and `ManuallyDrop` guarantees nothing else reads or drops it.
+        let taken_value = unsafe {
+            std::ptr::read(undropped_box.value_allocation.as_ptr().cast::<T>())
+        };
+        if undropped_box.size != 0 {
+            let layout = Layout::from_size_align(undropped_box.size, undropped_box.align)
+                .expect("valid resource layout");
             // SAFETY: the allocation came from `alloc` with this layout in
             // `new`, and the value has been moved out, so nothing live is freed.
-            unsafe { std::alloc::dealloc(this.data.as_ptr(), layout) };
+            unsafe { std::alloc::dealloc(undropped_box.value_allocation.as_ptr(), layout) };
         }
-        Ok(value)
+        Ok(taken_value)
     }
 }
 
@@ -715,16 +740,20 @@ impl Drop for ErasedResource {
     fn drop(&mut self) {
         // SAFETY: the box owns a live value of the type its table was built
         // for, and this runs exactly once.
-        unsafe { (self.ops.drop_in_place)(self.data.as_ptr()) };
+        unsafe { (self.function_table.drop_in_place)(self.value_allocation.as_ptr()) };
         if self.size != 0 {
             let layout =
                 Layout::from_size_align(self.size, self.align).expect("valid resource layout");
             // SAFETY: the allocation came from `alloc` with this layout in
             // `new`, and the value was just dropped.
-            unsafe { std::alloc::dealloc(self.data.as_ptr(), layout) };
+            unsafe { std::alloc::dealloc(self.value_allocation.as_ptr(), layout) };
         }
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -736,20 +765,20 @@ mod tests {
 
     #[derive(Debug, PartialEq)]
     struct ProjectTime {
-        delta: f32,
-        elapsed: f32,
+        delta_seconds: f32,
+        elapsed_seconds: f32,
     }
     impl Resource for ProjectTime {}
 
     /// Verifies that `ResourceId` stores the correct TypeId internally.
     #[test]
     fn test_resource_id() {
-        let id1 = ResourceId::of::<Score>();
-        let id2 = ResourceId::of::<Score>();
-        let id3 = ResourceId::of::<ProjectTime>();
+        let score_id = ResourceId::of::<Score>();
+        let same_score_id = ResourceId::of::<Score>();
+        let project_time_id = ResourceId::of::<ProjectTime>();
 
-        assert_eq!(id1, id2);
-        assert_ne!(id1, id3);
+        assert_eq!(score_id, same_score_id);
+        assert_ne!(score_id, project_time_id);
     }
 
     /// Verifies that `ResHandle::new()` creates a handle for the correct type.
@@ -770,11 +799,11 @@ mod tests {
     #[test]
     fn test_res_handle_copy_clone() {
         let handle = ResHandle::<Score>::new();
-        let handle2 = handle;
-        let handle3 = handle;
+        let first_copy = handle;
+        let second_copy = handle;
         // All handles refer to the same resource type
-        assert_eq!(handle.id(), handle2.id());
-        assert_eq!(handle.id(), handle3.id());
+        assert_eq!(handle.id(), first_copy.id());
+        assert_eq!(handle.id(), second_copy.id());
     }
 
     /// Verifies that `ResHandle` implements Debug for diagnostic output.
@@ -796,7 +825,6 @@ mod tests {
         assert!(!handle.exists(&world));
         assert!(handle.get(&world).is_none());
 
-        // Insert resource
         world.insert_resource(Score(42));
 
         // Now accessible via handle
@@ -840,20 +868,20 @@ mod tests {
 
         world.insert_resource(Score(100));
         world.insert_resource(ProjectTime {
-            delta: 0.016,
-            elapsed: 0.0,
+            delta_seconds: 0.016,
+            elapsed_seconds: 0.0,
         });
 
         assert_eq!(score_handle.get(&world).unwrap().0, 100);
-        assert_eq!(time_handle.get(&world).unwrap().delta, 0.016);
+        assert_eq!(time_handle.get(&world).unwrap().delta_seconds, 0.016);
 
         // Different types, different IDs
         assert_ne!(score_handle.id(), time_handle.id());
     }
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
     // ErasedResource
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
     /// Counts its own drops, so a double drop or a leak is visible rather than
     /// merely suspected.
@@ -863,26 +891,26 @@ mod tests {
     /// `before + 1` assertion race with the others.
     #[derive(Debug)]
     struct Tracked {
-        value: u32,
-        drops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        carried_value: u32,
+        drop_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
     impl Resource for Tracked {}
 
     impl Drop for Tracked {
         fn drop(&mut self) {
-            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.drop_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
     /// A fresh `Tracked` and the counter watching it.
-    fn tracked(value: u32) -> (Tracked, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    fn tracked(carried_value: u32) -> (Tracked, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let drop_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         (
             Tracked {
-                value,
-                drops: std::sync::Arc::clone(&drops),
+                carried_value,
+                drop_count: std::sync::Arc::clone(&drop_count),
             },
-            drops,
+            drop_count,
         )
     }
 
@@ -895,7 +923,7 @@ mod tests {
     /// type check is not merely a size comparison.
     #[derive(Debug)]
     struct Lookalike {
-        _value: u32,
+        _same_layout_field: u32,
     }
     impl Resource for Lookalike {}
 
@@ -909,9 +937,9 @@ mod tests {
     fn an_erased_value_can_be_stored_and_borrowed() {
         let mut erased = ErasedResource::new(tracked(7).0);
 
-        assert_eq!(erased.get::<Tracked>().unwrap().value, 7);
-        erased.get_mut::<Tracked>().unwrap().value = 9;
-        assert_eq!(erased.get::<Tracked>().unwrap().value, 9);
+        assert_eq!(erased.get::<Tracked>().unwrap().carried_value, 7);
+        erased.get_mut::<Tracked>().unwrap().carried_value = 9;
+        assert_eq!(erased.get::<Tracked>().unwrap().carried_value, 9);
     }
 
     /// The box holds one type and says so; a same-sized other type is refused.
@@ -928,9 +956,9 @@ mod tests {
     /// Dropping the box drops the value exactly once.
     #[test]
     fn dropping_an_erased_box_drops_the_value_once() {
-        let (probe, drops) = tracked(1);
+        let (probe, drop_count) = tracked(1);
         drop(ErasedResource::new(probe));
-        assert_eq!(drops_of(&drops), 1);
+        assert_eq!(drops_of(&drop_count), 1);
     }
 
     /// Taking the value out moves it to the caller and must NOT also drop it.
@@ -939,20 +967,20 @@ mod tests {
     /// the drop, or the value is dropped twice.
     #[test]
     fn taking_an_erased_value_out_moves_it_exactly_once() {
-        let (probe, drops) = tracked(42);
+        let (probe, drop_count) = tracked(42);
         let erased = ErasedResource::new(probe);
 
         let taken = erased.take::<Tracked>().expect("the box holds a Tracked");
-        assert_eq!(taken.value, 42);
+        assert_eq!(taken.carried_value, 42);
         assert_eq!(
-            drops_of(&drops),
+            drops_of(&drop_count),
             0,
             "the value is alive in the caller's hands; nothing dropped yet"
         );
 
         drop(taken);
         assert_eq!(
-            drops_of(&drops),
+            drops_of(&drop_count),
             1,
             "the value must be dropped exactly once, by its new owner"
         );
@@ -961,17 +989,17 @@ mod tests {
     /// A refused take gives the box back rather than destroying the value.
     #[test]
     fn a_refused_take_returns_the_erased_box_intact() {
-        let (probe, drops) = tracked(3);
+        let (probe, drop_count) = tracked(3);
         let erased = ErasedResource::new(probe);
 
         let returned = erased
             .take::<Lookalike>()
             .expect_err("the box does not hold a Lookalike");
-        assert_eq!(drops_of(&drops), 0, "a refused take must not drop anything");
-        assert_eq!(returned.get::<Tracked>().unwrap().value, 3);
+        assert_eq!(drops_of(&drop_count), 0, "a refused take must not drop anything");
+        assert_eq!(returned.get::<Tracked>().unwrap().carried_value, 3);
 
         drop(returned);
-        assert_eq!(drops_of(&drops), 1);
+        assert_eq!(drops_of(&drop_count), 1);
     }
 
     /// A zero-sized resource takes the no-allocation path and still round trips.
@@ -997,15 +1025,15 @@ mod tests {
     /// whole point of re-homing across a reload.
     #[test]
     fn refreshing_an_erased_boxs_ops_leaves_the_value_alone() {
-        let (probe, drops) = tracked(11);
+        let (probe, drop_count) = tracked(11);
         let mut erased = ErasedResource::new(probe);
 
         erased.refresh_ops(ErasedResourceOps::of::<Tracked>());
 
-        assert_eq!(erased.get::<Tracked>().unwrap().value, 11);
-        assert_eq!(drops_of(&drops), 0, "nothing was dropped");
+        assert_eq!(erased.get::<Tracked>().unwrap().carried_value, 11);
+        assert_eq!(drops_of(&drop_count), 0, "nothing was dropped");
 
         drop(erased);
-        assert_eq!(drops_of(&drops), 1);
+        assert_eq!(drops_of(&drop_count), 1);
     }
 }

@@ -7,20 +7,22 @@
 //!
 //! # Design
 //!
-//! A value the engine copies between artifacts must be plain data:
-//! `#[repr(C)]`, no pointers, no owned allocation. A `String` breaks that
-//! twice: its buffer belongs to the allocator of whichever DLL created it, so
-//! a hot reload can leave one library freeing memory another allocated, and a
-//! struct holding one has no meaningful C layout, so it cannot be mirrored
-//! into C# or read across the module boundary. Inlining the bytes makes the
-//! value `Copy`, stably laid out, and memcpy-able between archetypes like a
-//! `u32` field; the cost is the length ceiling the type's name states.
+//! The engine copies values between DLLs, so a value it moves across must be
+//! plain data: `#[repr(C)]`, no pointers, no heap allocation. A `String`
+//! fails that in two ways. Its buffer belongs to the allocator of the DLL
+//! that created it, so after a hot reload one library can free memory another
+//! allocated. And a struct holding a `String` has no fixed C layout, so it
+//! cannot be read across the module boundary or mirrored into C#. Keeping the
+//! bytes in the value makes it `Copy`, gives it a fixed layout, and lets an
+//! archetype move it with a memcpy like a `u32` field. The price is the length
+//! ceiling the type's name states.
 //!
-//! [`FixedString64::new`] truncates rather than failing, always on a character
-//! boundary, which is what lets [`FixedString64::as_str`] be infallible, and a
-//! longer string from a build with a larger capacity still loads. Serde sees
-//! the string, not the backing array: `serde` implements its traits only up to
-//! 32-element arrays, and `"footstep"` is what a person can read in a snapshot.
+//! [`FixedString64::new`] truncates instead of failing, and it always cuts on
+//! a character boundary. That is what lets [`FixedString64::as_str`] return a
+//! `&str` without a `Result`, and it also means a string written by a build
+//! with a larger capacity still loads. Serde sees the string, not the backing
+//! array: `serde` implements its traits only up to 32-element arrays, and a
+//! quoted `"footstep"` is what a person can read in a snapshot.
 //!
 //! ```
 //! use pill_core::FixedString64;
@@ -33,100 +35,107 @@
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
-// FixedString64
+// Constants
 // =============================================================================
 
 /// Capacity of a [`FixedString64`], in bytes.
 ///
-/// Bytes, not characters: a multi-byte character consumes several. 64 is long
-/// enough for an asset name or a short path and keeps the value cheap to copy.
+/// The capacity counts bytes, not characters. One multi-byte character uses
+/// several of them. 64 is long enough for an asset name or a short path, and
+/// it keeps the value cheap to copy.
 pub const FIXED_STRING_64_CAPACITY: usize = 64;
+
+// =============================================================================
+// FixedString64
+// =============================================================================
 
 /// A UTF-8 string of up to [`FIXED_STRING_64_CAPACITY`] bytes, stored inline.
 ///
-/// `Copy` and `#[repr(C)]`, so it can live in a component, cross the module
-/// boundary, and be mirrored into C# without any allocation. See the module
-/// documentation for why a `String` cannot.
+/// It is `Copy` and `#[repr(C)]`, so it fits in a component, can cross the
+/// module boundary, and can be mirrored into C# with no allocation. The
+/// module documentation explains why a `String` cannot do that.
 ///
-/// Comparison and hashing act on the live bytes only, so two values that
-/// spell the same string are equal whatever their padding holds.
+/// Comparison and hashing use only the bytes the string uses, so two values
+/// holding the same text are equal however the unused bytes differ.
 #[repr(C)]
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(into = "String", from = "String")]
 pub struct FixedString64 {
-    /// UTF-8 bytes; only the first `length` are meaningful.
+    /// The string's bytes, stored inline in the value.
     ///
-    /// The remainder is zeroed by every constructor, but nothing reads it, so
-    /// two equal strings may still differ byte-for-byte here - which is why
-    /// `PartialEq` is written by hand below.
-    bytes: [u8; FIXED_STRING_64_CAPACITY],
-    /// How many leading bytes of `bytes` are in use.
+    /// Only the first `length` bytes are in use. Every constructor zeroes the
+    /// rest and nothing reads it, so the unused bytes are not part of the
+    /// value - which is why `PartialEq` is written by hand below.
+    storage_bytes: [u8; FIXED_STRING_64_CAPACITY],
+    /// How many leading bytes of `storage_bytes` hold the string.
     ///
-    /// `u8` suffices for a 64-byte capacity and keeps the struct compact.
+    /// A `u8` holds any value up to the 64-byte capacity and keeps the struct
+    /// small.
     length: u8,
 }
 
 impl FixedString64 {
-    /// The empty string.
+    /// Returns the empty string.
     pub const fn empty() -> Self {
         Self {
-            bytes: [0; FIXED_STRING_64_CAPACITY],
+            storage_bytes: [0; FIXED_STRING_64_CAPACITY],
             length: 0,
         }
     }
 
-    /// Store `text`, truncating at [`FIXED_STRING_64_CAPACITY`] bytes.
+    /// Creates a string from `text`, cutting it to
+    /// [`FIXED_STRING_64_CAPACITY`] bytes if it is longer.
     ///
-    /// Truncation steps back to a character boundary, so the stored value is
-    /// always valid UTF-8. Use [`Self::try_new`] when a caller needs to know
-    /// that the text did not fit.
+    /// The cut always falls on a character boundary, so the stored value is
+    /// valid UTF-8. Use [`Self::try_new`] instead when the caller needs to
+    /// know that the text did not fit.
     pub fn new(text: &str) -> Self {
-        let limit = Self::boundary_at_or_below(text, text.len().min(FIXED_STRING_64_CAPACITY));
-        let mut bytes = [0; FIXED_STRING_64_CAPACITY];
-        bytes[..limit].copy_from_slice(&text.as_bytes()[..limit]);
+        let stored_byte_count =
+            Self::boundary_at_or_below(text, text.len().min(FIXED_STRING_64_CAPACITY));
+        let mut storage_bytes = [0; FIXED_STRING_64_CAPACITY];
+        storage_bytes[..stored_byte_count].copy_from_slice(&text.as_bytes()[..stored_byte_count]);
         Self {
-            bytes,
-            length: limit as u8,
+            storage_bytes,
+            length: stored_byte_count as u8,
         }
     }
 
-    /// Store `text`, or `None` when it does not fit.
+    /// Creates a string from `text`, or returns `None` when it does not fit.
     ///
-    /// The checking counterpart of [`Self::new`], for a call site that would
-    /// rather reject a name than silently shorten it - a content pipeline
-    /// validating input, say.
+    /// This is the checking version of [`Self::new`]. Use it where a name
+    /// must be rejected rather than shortened, for example in a content
+    /// pipeline that validates its input.
     pub fn try_new(text: &str) -> Option<Self> {
         (text.len() <= FIXED_STRING_64_CAPACITY).then(|| Self::new(text))
     }
 
-    /// The stored text.
+    /// Returns the stored text.
     pub fn as_str(&self) -> &str {
-        // Infallible in practice: every constructor truncates on a character
-        // boundary, so the live bytes are always valid UTF-8. The fallback
-        // keeps that an invariant rather than a panic if one is ever added
-        // that does not.
-        std::str::from_utf8(&self.bytes[..self.length as usize]).unwrap_or("")
+        // Every constructor cuts on a character boundary, so the bytes in use
+        // are always valid UTF-8. Should a future constructor break that
+        // rule, this returns "" rather than panicking.
+        std::str::from_utf8(&self.storage_bytes[..self.length as usize]).unwrap_or("")
     }
 
-    /// The stored text as bytes.
+    /// Returns the stored text as bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.length as usize]
+        &self.storage_bytes[..self.length as usize]
     }
 
-    /// How many bytes are in use.
+    /// Returns how many bytes the string uses.
     pub const fn len(&self) -> usize {
         self.length as usize
     }
 
-    /// Whether the string is empty.
+    /// Returns `true` when the string holds no text.
     pub const fn is_empty(&self) -> bool {
         self.length == 0
     }
 
-    /// The largest character boundary of `text` at or below `limit`.
+    /// Returns the largest character boundary of `text` at or below `limit`.
     ///
-    /// Shared by the constructors so there is one definition of where a
-    /// truncation may land.
+    /// Both constructors end up here, so truncation has one rule for where
+    /// it may cut.
     fn boundary_at_or_below(text: &str, limit: usize) -> usize {
         let mut limit = limit;
         while limit > 0 && !text.is_char_boundary(limit) {
@@ -144,15 +153,16 @@ impl Default for FixedString64 {
 
 // --- Conversions ---
 
-/// The serde target; see the module documentation.
+/// Converts the value to an owned `String`, the form serde writes.
 impl From<FixedString64> for String {
     fn from(value: FixedString64) -> Self {
         value.as_str().to_owned()
     }
 }
 
-/// Truncating as [`FixedString64::new`] does, so a value written by a build
-/// with a larger capacity still loads.
+/// Converts an owned `String`, cutting it to the capacity the way
+/// [`FixedString64::new`] does, so a value written by a build with a larger
+/// capacity still loads.
 impl From<String> for FixedString64 {
     fn from(value: String) -> Self {
         Self::new(&value)
@@ -166,7 +176,7 @@ impl From<&str> for FixedString64 {
 }
 
 impl std::str::FromStr for FixedString64 {
-    /// Truncation is not an error, so parsing one cannot fail.
+    /// Cutting the text short is not an error, so parsing cannot fail.
     type Err = std::convert::Infallible;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
@@ -190,11 +200,11 @@ impl std::ops::Deref for FixedString64 {
 
 // --- Comparison ---
 
-/// Compares the live bytes only.
+/// Compares only the bytes the string uses.
 ///
-/// The padding past `length` is not part of the value: a string built by
-/// `new` and the same string loaded from a snapshot must compare equal
-/// whatever happens to sit behind them.
+/// The unused bytes are not part of the value. A string built by
+/// [`FixedString64::new`] and the same text loaded from a snapshot must
+/// compare equal even when those bytes differ.
 impl PartialEq for FixedString64 {
     fn eq(&self, other: &Self) -> bool {
         self.as_bytes() == other.as_bytes()
@@ -215,7 +225,8 @@ impl PartialEq<&str> for FixedString64 {
     }
 }
 
-/// Hashes the live bytes, so it agrees with the hand-written `PartialEq`.
+/// Hashes the bytes the string uses, so it agrees with the hand-written
+/// `PartialEq`.
 impl std::hash::Hash for FixedString64 {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.as_str().hash(state);
@@ -242,8 +253,8 @@ impl std::fmt::Display for FixedString64 {
     }
 }
 
-/// Prints the string, not the backing array - a 64-element byte dump in a log
-/// line is noise, and the padding means nothing.
+/// Prints the quoted text, not the backing array. A dump of 64 mostly unused
+/// bytes would only add noise to a log line.
 impl std::fmt::Debug for FixedString64 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{:?}", self.as_str())
@@ -267,8 +278,8 @@ mod tests {
         assert!(!value.is_empty());
     }
 
-    /// The empty string is the default, and reads as empty rather than as
-    /// whatever the zeroed buffer would decode to.
+    /// The default is the empty string, and it reads as empty text rather
+    /// than as the NUL bytes the buffer holds.
     #[test]
     fn empty_is_the_default() {
         let value = FixedString64::default();
@@ -278,7 +289,8 @@ mod tests {
         assert_eq!(FixedString64::empty(), value);
     }
 
-    /// A string exactly at capacity fits whole; the boundary is inclusive.
+    /// A string of exactly the capacity length fits whole, because the limit
+    /// is inclusive.
     #[test]
     fn a_string_at_capacity_is_kept_whole() {
         let text = "a".repeat(FIXED_STRING_64_CAPACITY);
@@ -296,24 +308,25 @@ mod tests {
         assert!(text.starts_with(value.as_str()));
     }
 
-    /// The property that makes `as_str` infallible: a cut that would land
-    /// mid-character steps back instead, so the result is always valid UTF-8.
+    /// This is what makes `as_str` infallible. A cut that would split a
+    /// character moves back to the previous boundary, so the stored bytes
+    /// stay valid UTF-8.
     #[test]
-    fn truncation_lands_on_a_character_boundary() {
-        // Three bytes per character, so 64 is not a whole number of them and
-        // a naive cut would split the 22nd.
+    fn truncation_cuts_on_a_character_boundary() {
+        // Each character is three bytes, and 64 is not a multiple of three,
+        // so a cut at 64 would split the 22nd character.
         let text = "\u{4f60}".repeat(FIXED_STRING_64_CAPACITY);
         let value = FixedString64::new(&text);
 
         assert!(value.len() <= FIXED_STRING_64_CAPACITY);
-        // 21 whole characters is 63 bytes; the 22nd would need 66.
+        // 21 whole characters take 63 bytes. The 22nd would end at byte 66.
         assert_eq!(value.len(), 63);
         assert_eq!(value.as_str().chars().count(), 21);
         assert!(text.starts_with(value.as_str()));
     }
 
-    /// `try_new` is the checking counterpart, for a caller that would rather
-    /// reject than shorten.
+    /// `try_new` is the checking version. It returns `None` instead of
+    /// shortening the text.
     #[test]
     fn try_new_refuses_what_does_not_fit() {
         assert!(FixedString64::try_new("footstep").is_some());
@@ -321,17 +334,17 @@ mod tests {
         assert!(FixedString64::try_new(&"a".repeat(FIXED_STRING_64_CAPACITY + 1)).is_none());
     }
 
-    /// Equality reads the live bytes only. Two values spelling one string must
-    /// compare equal even if their padding differs - which it does here,
-    /// because the longer string wrote bytes the shorter one never cleared.
+    /// Equality looks only at the bytes in use, so two values holding the same
+    /// text are equal even when their unused bytes differ. This test dirties
+    /// one unused byte by hand, the way a reused buffer would.
     #[test]
     fn equality_ignores_padding() {
-        let long = FixedString64::new("footstep_sound_effect");
-        let mut same = FixedString64::new("footstep_sound_effect");
-        // Dirty the padding the way a reused buffer would.
-        same.bytes[30] = b'x';
+        let original_value = FixedString64::new("footstep_sound_effect");
+        let mut copy_with_dirty_padding = FixedString64::new("footstep_sound_effect");
+        // Write into the unused bytes, the way a reused buffer would.
+        copy_with_dirty_padding.storage_bytes[30] = b'x';
 
-        assert_eq!(long, same);
+        assert_eq!(original_value, copy_with_dirty_padding);
 
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -340,7 +353,7 @@ mod tests {
             value.hash(&mut hasher);
             hasher.finish()
         };
-        assert_eq!(hash_of(&long), hash_of(&same));
+        assert_eq!(hash_of(&original_value), hash_of(&copy_with_dirty_padding));
     }
 
     /// Comparing against a plain string is the common case and needs no
@@ -353,8 +366,8 @@ mod tests {
         assert_eq!(value.as_str(), "footstep");
     }
 
-    /// Ordering follows the string, not the byte array, so a sorted list reads
-    /// the way a person expects.
+    /// Ordering compares the text, not the raw byte array, so a sorted list
+    /// comes out in the order a person expects.
     #[test]
     fn orders_lexicographically() {
         let mut values = [
@@ -368,8 +381,8 @@ mod tests {
         assert_eq!(values[2], "cherry");
     }
 
-    /// Serialized as a plain string, so a snapshot is readable and the
-    /// 32-element array limit in serde never comes up.
+    /// Written as a plain string, so a snapshot stays readable and serde's
+    /// 32-element array limit never applies.
     #[test]
     fn serializes_as_a_string() {
         let value = FixedString64::new("footstep");
@@ -380,8 +393,9 @@ mod tests {
         assert_eq!(restored, value);
     }
 
-    /// A value written by a build with a larger capacity still loads, cut to
-    /// what fits rather than failing the whole snapshot.
+    /// A string longer than the capacity, such as one written by a build with
+    /// more room, still loads: it is cut to fit instead of failing the whole
+    /// snapshot.
     #[test]
     fn deserializing_an_over_long_string_truncates() {
         let json = format!("\"{}\"", "a".repeat(FIXED_STRING_64_CAPACITY + 10));
@@ -389,24 +403,26 @@ mod tests {
         assert_eq!(restored.len(), FIXED_STRING_64_CAPACITY);
     }
 
-    /// The point of the type: plain data, no pointer, stable layout.
+    /// This is the point of the type. It is plain data, with no pointer and a
+    /// fixed layout.
     #[test]
     fn is_plain_data() {
-        // One byte per capacity slot plus the length, rounded to alignment 1.
+        // One byte for each capacity slot plus one for the length, with no
+        // padding because the alignment is 1.
         assert_eq!(
             std::mem::size_of::<FixedString64>(),
             FIXED_STRING_64_CAPACITY + 1
         );
         assert_eq!(std::mem::align_of::<FixedString64>(), 1);
 
-        // `Copy`, so an archetype move is a memcpy.
+        // `Copy`, so moving the value between archetypes is a memcpy.
         let value = FixedString64::new("footstep");
-        let copy = value;
-        assert_eq!(value, copy);
+        let copied_value = value;
+        assert_eq!(value, copied_value);
     }
 
-    /// `Deref` to `str` means the whole string API is available without an
-    /// explicit `as_str` at every call.
+    /// `Deref` to `str` makes the whole string API available without calling
+    /// `as_str` at every use.
     #[test]
     fn derefs_to_str() {
         let value = FixedString64::new("footstep");
@@ -414,8 +430,8 @@ mod tests {
         assert_eq!(value.to_uppercase(), "FOOTSTEP");
     }
 
-    /// `Display` writes the text; `Debug` quotes it rather than dumping the
-    /// backing array.
+    /// `Display` writes the text, and `Debug` writes it quoted instead of
+    /// dumping the backing array.
     #[test]
     fn formats_as_its_text() {
         let value = FixedString64::new("footstep");

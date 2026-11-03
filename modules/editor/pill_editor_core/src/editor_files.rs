@@ -1,33 +1,31 @@
-//! The editor's own state documents on disk.
+//! Reads, writes and removes the editor's own state documents on disk.
 //!
 //! # Responsibilities
 //!
-//! - One durability rule for the editor's JSON state files: create the
-//!   directory, write a temporary file beside the target and rename it into
+//! - One durability rule for the editor's JSON state files. Create the
+//!   directory, write a temporary file beside the target, then rename it into
 //!   place, so a crash mid-write never leaves a half-written document.
-//! - One error surface ([`FileError`]) for a read, a write, a parse and a
-//!   removal, whatever document it is.
+//! - One error type ([`FileError`]) for every read, write, parse and removal,
+//!   whatever document it belongs to.
 //!
 //! # Design
 //!
 //! The documents differ - a dock layout, the preferences map, the recovery
-//! snapshot, the open scene - so the helper is generic over `serde` and takes
-//! a full path. What they share is the file handling, and that is what lives
-//! here: three of the four call sites had their own `create_dir_all`, their own
-//! temporary name and their own failure story.
+//! snapshot, the open scene - so the JSON helpers are generic over `serde`
+//! and every function takes a full path. What the documents share is the file
+//! handling, and that is what this module holds.
 //!
 //! Two policies are stated once instead of per call site:
 //!
-//! - **A missing file is empty, not broken.** `read_json` answers `Ok(None)`
+//! - **A missing file is empty, not broken.** [`read_json`] answers `Ok(None)`
 //!   only for `NotFound`. A document that exists and cannot be read or parsed
-//!   is an error, never a blank slate: folding it into an empty one would let
+//!   is an error, never a blank slate. Folding it into an empty one would let
 //!   the next save write a file holding only the keys it set, erasing every
 //!   unrelated preference.
 //! - **A rename replaces.** `std::fs::rename` maps to `MoveFileExW` with
 //!   `MOVEFILE_REPLACE_EXISTING` on Windows and to `rename(2)` elsewhere, so it
 //!   replaces an existing target on every platform the editor ships on. The
-//!   layout writer used to keep a `.bak` fallback for the opposite belief; the
-//!   two-save tests in `preferences` and `layout::persistence` pin the fact.
+//!   two-save tests in `preferences` and `layout::persistence` check it.
 
 // Standard library
 use std::fmt;
@@ -38,37 +36,45 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-/// The suffix of the file a write stages beside its target.
-const TEMPORARY_SUFFIX: &str = "tmp";
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The extension of the temporary file a write creates beside its target.
+const TEMPORARY_FILE_EXTENSION: &str = "tmp";
+
+// =============================================================================
+// FileError
+// =============================================================================
 
 /// What can go wrong with one of the editor's state files.
 #[derive(Debug)]
 pub enum FileError {
-    /// The file could not be read. A missing file is not this: it is
-    /// `Ok(None)`.
+    /// The file could not be read. A missing file is reported as `Ok(None)`,
+    /// not as this.
     Read {
-        /// The file, as written in the message.
+        /// The file's path, spelled the way the messages show it.
         path: String,
         /// What the filesystem said.
         source: io::Error,
     },
     /// The file holds text that is not the JSON the caller expects.
     Parse {
-        /// The file, as written in the message.
+        /// The file's path, spelled the way the messages show it.
         path: String,
         /// What the parser said.
         message: String,
     },
-    /// The value could not be serialized.
+    /// The document could not be serialized.
     Serialize {
-        /// The file, as written in the message.
+        /// The file's path, spelled the way the messages show it.
         path: String,
         /// What the serializer said.
         message: String,
     },
     /// The file could not be written or replaced.
     Write {
-        /// The file, as written in the message.
+        /// The file's path, spelled the way the messages show it.
         path: String,
         /// What the filesystem said.
         source: io::Error,
@@ -76,8 +82,8 @@ pub enum FileError {
 }
 
 impl FileError {
-    /// The one-line text the Console and the callers that still report a
-    /// `String` show.
+    /// The one-line text for this error. `Display` prints it, and the Console
+    /// tab and the callers that report a `String` show it.
     #[must_use]
     pub fn message(&self) -> String {
         match self {
@@ -106,11 +112,15 @@ impl std::error::Error for FileError {
     }
 }
 
-/// Read one JSON document; `None` when the file does not exist.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Reads one JSON document, or `None` when the file does not exist.
 ///
 /// # Errors
 ///
-/// A [`FileError::Read`] when the file exists and cannot be read, and a
+/// Returns [`FileError::Read`] when the file exists and cannot be read, and
 /// [`FileError::Parse`] when its text is not the document the caller asked
 /// for.
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, FileError> {
@@ -132,49 +142,53 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, FileErro
         })
 }
 
-/// Serialize and write one JSON document.
+/// Serializes and writes one JSON document.
 ///
 /// # Errors
 ///
-/// A [`FileError::Serialize`] when the value cannot be serialized and a
+/// Returns [`FileError::Serialize`] when the document cannot be serialized and
 /// [`FileError::Write`] when the file cannot be replaced.
-pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), FileError> {
-    let text = serde_json::to_string_pretty(value).map_err(|error| FileError::Serialize {
+pub fn write_json<T: Serialize>(path: &Path, document: &T) -> Result<(), FileError> {
+    let text = serde_json::to_string_pretty(document).map_err(|error| FileError::Serialize {
         path: path.display().to_string(),
         message: error.to_string(),
     })?;
     write_bytes(path, text.as_bytes())
 }
 
-/// Write one document's bytes through a temporary file and a rename.
+/// Writes one document's bytes through a temporary file and a rename.
 ///
 /// # Errors
 ///
-/// A [`FileError::Write`] naming the directory, the temporary file or the
-/// target, whichever failed.
+/// Returns [`FileError::Write`] naming the directory, the temporary file or
+/// the target, whichever failed.
 pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), FileError> {
-    let failure = |target: &Path, source: io::Error| FileError::Write {
+    let write_error = |target: &Path, source: io::Error| FileError::Write {
         path: target.display().to_string(),
         source,
     };
+    // Step 1: Make the directory the document belongs in.
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| failure(parent, source))?;
+        std::fs::create_dir_all(parent).map_err(|source| write_error(parent, source))?;
     }
-    let temporary = path.with_extension(TEMPORARY_SUFFIX);
-    std::fs::write(&temporary, bytes).map_err(|source| failure(&temporary, source))?;
-    std::fs::rename(&temporary, path).map_err(|source| {
-        // A failed rename leaves the staged file behind; take it back so the
+    // Step 2: Write the whole document into a temporary file beside the target.
+    let temporary_file = path.with_extension(TEMPORARY_FILE_EXTENSION);
+    std::fs::write(&temporary_file, bytes)
+        .map_err(|source| write_error(&temporary_file, source))?;
+    // Step 3: Rename the temporary file over the target, replacing what is there.
+    std::fs::rename(&temporary_file, path).map_err(|source| {
+        // A failed rename leaves the temporary file behind. Remove it so the
         // next write does not find it.
-        let _ = std::fs::remove_file(&temporary);
-        failure(path, source)
+        let _ = std::fs::remove_file(&temporary_file);
+        write_error(path, source)
     })
 }
 
-/// Remove one document; a file that is already gone is not an error.
+/// Removes one document. A file that is already gone is not an error.
 ///
 /// # Errors
 ///
-/// A [`FileError::Write`] when the file exists and cannot be removed.
+/// Returns [`FileError::Write`] when the file exists and cannot be removed.
 pub fn remove(path: &Path) -> Result<(), FileError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -186,12 +200,17 @@ pub fn remove(path: &Path) -> Result<(), FileError> {
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A scratch directory of this test's own under the system temp directory,
-    /// named so parallel runs do not collide.
+    /// Creates a scratch directory of this test's own under the system temp
+    /// directory. Its name carries the process id and a nanosecond timestamp,
+    /// so parallel runs do not collide.
     fn scratch_directory(label: &str) -> std::path::PathBuf {
         let directory = std::env::temp_dir().join(format!(
             "ecs-editor-files-{label}-{}-{}",
@@ -221,7 +240,7 @@ mod tests {
     }
 
     /// A document that exists and cannot be parsed is an error, not an empty
-    /// one: the next save must not erase it.
+    /// one. Otherwise the next save would erase it.
     #[test]
     fn an_unparsable_document_is_an_error() {
         let directory = scratch_directory("unparsable");
@@ -236,9 +255,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// Writing the same document twice replaces it: the rename is a replace on
-    /// every platform the editor ships on, which is what the layout writer's
-    /// removed `.bak` fallback doubted.
+    /// Writing the same document twice replaces it. The rename replaces an
+    /// existing target on every platform the editor ships on.
     #[test]
     fn the_second_write_replaces_the_first() {
         let directory = scratch_directory("twice");
@@ -247,8 +265,8 @@ mod tests {
         write_json(&path, &serde_json::json!({ "generation": 2 })).expect("the second write");
         let read: serde_json::Value = read_json(&path).expect("the read").expect("the document");
         assert_eq!(read, serde_json::json!({ "generation": 2 }));
-        let staged = path.with_extension(TEMPORARY_SUFFIX);
-        assert!(!staged.exists(), "the staged file was left behind");
+        let staged_file = path.with_extension(TEMPORARY_FILE_EXTENSION);
+        assert!(!staged_file.exists(), "the staged file was left behind");
         let _ = std::fs::remove_dir_all(&directory);
     }
 

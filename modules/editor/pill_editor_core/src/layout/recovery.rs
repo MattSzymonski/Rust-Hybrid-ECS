@@ -1,22 +1,26 @@
-//! Editor-state recovery.
+//! The recovery document: editor state a run saves as it goes, so the next
+//! run can bring it back after an abrupt exit.
 //!
 //! # Responsibilities
 //!
-//! - [`RecoveryDocument`]: the dock, the selection and the version stamp an
-//!   abrupt exit leaves behind, as a JSON document beside the layout file.
-//! - [`write`] / [`read`] / [`remove`]: the executable's side of that file.
+//! - [`RecoveryDocument`]: the dock, the selection and the version stamp,
+//!   saved as a JSON document beside the layout file.
+//! - [`write`] / [`read`] / [`remove`]: the three operations the editor
+//!   executable calls on that file.
 //!
 //! # Design
 //!
-//! The layout file is written on a **clean** quit and describes a state the
-//! person chose to keep. The recovery file is written while the editor runs
-//! and removed on a clean exit, so its presence at startup means the last run
-//! did not finish: the document is then what the editor restores, and the
-//! person sees the arrangement they had rather than the default one.
+//! The layout file is saved when the editor quits cleanly, and it holds the
+//! arrangement the person kept. The recovery file is written while the editor
+//! runs and is deleted on a clean exit, so finding it at startup means the
+//! last run did not finish. The editor then restores that document, so the
+//! person gets back the arrangement they had instead of the default one.
 //!
-//! The selection travels as display handles and names - strings, never
-//! handles or type ids - because a recovery document outlives the process
-//! that wrote it (the cross-DLL rule the clipboard payload follows too).
+//! The selection is stored as text: entity display handles (`3v0`), the
+//! selected asset's project-relative path and the selected resource's stable
+//! name. No runtime handle or type id is written, because the document
+//! outlives the process that wrote it. The clipboard payload follows the same
+//! rule.
 
 // External crates
 use serde::{Deserialize, Serialize};
@@ -25,14 +29,16 @@ use serde::{Deserialize, Serialize};
 use crate::editor_state::EditorSelection;
 use crate::layout::EditorDock;
 
-/// The recovery document's version; a document from another version is
-/// ignored rather than half-applied.
+/// The recovery document's version. A document that carries any other version
+/// is ignored instead of being partly applied.
 pub const RECOVERY_VERSION: u32 = 1;
 
-/// The recovery document's file name, beside the layout document.
+/// The recovery document's file name, in the same folder as the layout
+/// document.
 pub const RECOVERY_FILE: &str = "editor_egui_recovery.json";
 
-/// What a run leaves behind so an unclean exit can be undone.
+/// The editor state a run saves as it goes, so the next run can restore it
+/// after an abrupt exit.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecoveryDocument {
     /// The document's version ([`RECOVERY_VERSION`]).
@@ -48,11 +54,12 @@ pub struct RecoveryDocument {
 }
 
 impl RecoveryDocument {
-    /// The document for the current state.
+    /// Builds the document for the current state.
     ///
-    /// The dock is settled first: a leaf the frame has not laid out yet holds
-    /// non-finite floats, which `serde_json` writes as `null` and cannot read
-    /// back - the same reason the layout document is written settled.
+    /// The dock is settled first (its placeholder rectangles are replaced with
+    /// finite ones). A node the frame has not laid out yet holds rectangles
+    /// with non-finite floats, and `serde_json` writes those as `null`, which
+    /// cannot be read back. The layout document is written the same way.
     pub fn capture(dock: &EditorDock, selection: &EditorSelection) -> Self {
         Self {
             version: RECOVERY_VERSION,
@@ -67,25 +74,27 @@ impl RecoveryDocument {
         }
     }
 
-    /// Whether this document was written by a build this one understands.
+    /// Whether this document's version is the one this build writes.
     pub fn is_current(&self) -> bool {
         self.version == RECOVERY_VERSION
     }
 }
 
-/// The recovery document's path in the editor's state directory.
+/// The recovery document's path: the layout directory, beside the layout
+/// document.
 pub fn recovery_path() -> std::path::PathBuf {
     crate::layout::layout_directory().join(RECOVERY_FILE)
 }
 
-/// Write the document, replacing the previous one.
+/// Writes the document, replacing the previous one.
 ///
-/// Returns whether it was written; a failure is logged and the editor keeps
-/// running, because losing recoverability must never stop the editor.
+/// Returns whether it was written. A failure is logged and the editor keeps
+/// running, because losing recoverability must not stop the editor.
 pub fn write(document: &RecoveryDocument) -> bool {
     let path = recovery_path();
-    let written = crate::editor_files::write_json(&path, document).map_err(|error| error.message());
-    match written {
+    let write_outcome =
+        crate::editor_files::write_json(&path, document).map_err(|error| error.message());
+    match write_outcome {
         Ok(()) => true,
         Err(message) => {
             pill_core::warn!(
@@ -98,8 +107,11 @@ pub fn write(document: &RecoveryDocument) -> bool {
     }
 }
 
-/// The document a previous run left behind, when it left one this build can
-/// use; `None` when the last run exited cleanly or the document is unusable.
+/// Reads the document a previous run left behind.
+///
+/// `None` when there is no document (a clean exit leaves none), or when this
+/// build cannot use the one it finds. A document that does not parse, or that
+/// carries another version, is deleted so the next run does not read it again.
 pub fn read() -> Option<RecoveryDocument> {
     let path = recovery_path();
     let contents = std::fs::read_to_string(&path).ok()?;
@@ -126,7 +138,7 @@ pub fn read() -> Option<RecoveryDocument> {
     }
 }
 
-/// Remove the document: the run it described is ending cleanly, so there is
+/// Removes the document. The run it described is ending cleanly, so there is
 /// nothing left to recover.
 pub fn remove() {
     let path = recovery_path();

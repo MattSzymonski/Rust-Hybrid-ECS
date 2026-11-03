@@ -1,4 +1,5 @@
-//! Per-DLL component, value-type, method, accessor and export registries.
+//! The per-DLL registries for components, value types, mirrored methods, field
+//! accessors and named exports.
 //!
 //! # Responsibilities
 //!
@@ -6,68 +7,72 @@
 //!   (`pill_engine_core::component_registry`) under this path.
 //! - Declare the descriptor types the derive and attribute macros submit into
 //!   [`inventory`] collections, and the collections themselves.
-//! - Provide the artifact-wide registration loop, the aggregate schema
-//!   fingerprint, and the readers the module/project entry-point macros and the
-//!   host call.
+//! - Provide the artifact-wide registration loop, the schema fingerprint of
+//!   the persistable components, and the readers the module/project
+//!   entry-point macros and the host call.
 //!
 //! # Design
 //!
-//! The registry is per linked artifact: every binary and every hot-reload
-//! generation DLL carries its own collection containing exactly the components
-//! its own sources declared with `#[derive(PillComponent)]`. That is what makes
-//! it safe across hot reload - a new generation's `init` sees only the new
-//! generation's components, so a type a newer build stops declaring is never
-//! re-registered from a stale copy, and an evicted generation DLL takes its
-//! descriptors with it.
+//! There is one registry per linked artifact. Every binary and every
+//! hot-reload generation DLL carries its own collection, holding exactly the
+//! components its own sources declared with `#[derive(PillComponent)]`. That
+//! is what makes the registry safe across hot reload: a new generation's
+//! `init` sees only the components that generation declares, so a type a
+//! newer build stops declaring is never registered again from a stale copy,
+//! and an evicted generation DLL takes its descriptors with it.
 //!
-//! It is per artifact because this crate is: `pill_engine` is embedded in every
-//! DLL, while the engine core holds what is the same for all of them. What the
-//! core needs from a collection (a value type's layout) the calling DLL passes
-//! in.
+//! It is per artifact because this crate is: `pill_engine` is compiled into
+//! every DLL, while the engine core holds only what is the same for all of
+//! them. When the core needs something only a collection knows - a value
+//! type's layout - the calling DLL passes it in.
 //!
-//! Registration order is unspecified (linker/initializer order), which is
-//! harmless: component registration is keyed by `TypeId` and idempotent.
+//! Registration order is unspecified (linker/initializer order), and that
+//! does no harm: component registration is keyed by `TypeId` and is idempotent.
 
 // Standard library
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-// Current crate
-use crate::error::WorldError;
-use crate::{Engine, World};
-
+// External crates
 /// Field layouts, the layout trait and the value-type resolver, which are the
 /// same for every DLL.
 pub use pill_engine_core::component_registry::*;
 
+// Current crate
+use crate::error::WorldError;
+use crate::{Engine, World};
+
 /// One component type declared with `#[derive(PillComponent)]`.
 ///
-/// Submitted into this artifact's registry by the derive macro; every field is
-/// const-constructible so the descriptor can live in a static.
+/// The derive macro submits one into this artifact's registry. Every field can
+/// be written in a `const`, so the descriptor can live in a `static`.
 pub struct PillComponentDescriptor {
-    /// Fully-qualified type name, as `std::any::type_name` would report it.
+    /// Fully-qualified type path: the declaring module's path plus the type's
+    /// name.
     pub type_name: &'static str,
     /// Whether the component is persistable (schema-migrated across reloads).
     pub persistable: bool,
-    /// Compile-time field layout used by the C# mirror codegen; empty for
-    /// components with no named fields (unit structs, tuple structs).
+    /// Compile-time field layout of the component; empty for components with
+    /// no named fields (unit structs, tuple structs).
     pub fields: &'static [ComponentFieldDescriptor],
     /// Registers the component into a world.
     pub register: fn(&mut World),
 }
 
-/// A plain value type (not a component) declared with `#[derive(PillMirror)]`.
+/// A plain value type (not a component) declared with `#[derive(PillMirror)]`
+/// or `pill_value_type!`.
 ///
-/// Submitted into the same per-artifact inventory as [`PillComponentDescriptor`]
-/// so the host can resolve `struct:<path>` field tags to typed C# structs when
-/// it generates mirrors. `Copy` so the module ABI can hand the array to the
-/// host by value; the inner `fields` slice stays a pointer into the declaring
-/// artifact's static data, which remains mapped for the artifact's lifetime.
-/// `PartialEq` only: a field's presentation decorators compare by value, and a
-/// float payload rules out `Eq`.
+/// The derive and the macro submit one into the same per-artifact inventory as
+/// [`PillComponentDescriptor`], so the host can resolve `struct:<path>` field
+/// tags to typed C# structs when it generates mirrors. It is `Copy` so the
+/// module ABI can hand the host a copy of each descriptor. The `fields` slice
+/// still points into the declaring artifact's static data, which stays mapped
+/// for the artifact's lifetime. It implements `PartialEq` but not `Eq`: the
+/// float payloads in a field's presentation decorators have no total equality.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PillValueTypeDescriptor {
-    /// Fully-qualified type name, as `std::any::type_name` would report it.
+    /// Fully-qualified type path: the module path plus the type's name, or the
+    /// path a `pill_value_type!` declaration spells.
     pub type_name: &'static str,
     /// The package that declared the type, from `env!("CARGO_PKG_NAME")` at
     /// the macro's expansion site.
@@ -88,15 +93,15 @@ pub struct PillValueTypeDescriptor {
 /// One heap-owning field accessor declared by `#[derive(PillComponent)]`,
 /// submitted into the same per-artifact inventory as the other descriptors.
 ///
-/// Unlike [`ComponentFieldDescriptor`], which says where a field sits in the
-/// row, an accessor says how the field's *buffer* is reached: the derive emits
-/// one `#[no_mangle]` trampoline per supported operation and records its
-/// symbol here. The host resolves those symbols at load time and hands their
+/// [`ComponentFieldDescriptor`] says where a field sits in the row. An accessor
+/// instead says how the field's buffer is reached: the derive emits one
+/// `#[no_mangle]` trampoline per supported operation and records its symbol
+/// here. The host resolves those symbols at load time and hands their
 /// addresses to the C# runtime under the operation names `<field>_view`,
 /// `<field>_resize`, `<field>_set`, `<field>_item`, `<field>_set_item` and
 /// `<field>_push`. Each trampoline takes the address of the live component
-/// value and works in place: no serialization, no buffer copy, no allocation
-/// on the read path.
+/// value and works in place: it does not serialize, copy the buffer, or
+/// allocate on the read path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PillFieldAccessorDescriptor {
     /// Fully-qualified component type name the field belongs to.
@@ -110,12 +115,14 @@ pub struct PillFieldAccessorDescriptor {
     /// allocated strings, so no span exists over them and managed code reaches
     /// each element through its own accessor instead.
     pub kind: &'static str,
-    /// Element type tag of a `vec` field (`f32`, `struct:<path>`, ...);
-    /// `string` for a `vecstring` field; empty for a `string` field.
+    /// Element type tag of a `vec` or `dynbuf` field (`f32`,
+    /// `struct:<path>`, ...); `string` for a `vecstring` field; empty for a
+    /// `string` field.
     pub element_tag: &'static str,
     /// Exported symbol of the view trampoline
-    /// (`pill_accessor_{Type}_{field}_view`); empty for a `vecstring` field,
-    /// whose elements cannot be viewed as one run.
+    /// (`pill_accessor_{Type}_{field}_view`). For a `vecstring` field the view
+    /// reports a null data pointer and the element count, because its elements
+    /// are separate allocations.
     pub view_symbol: &'static str,
     /// Exported symbol of the resize trampoline for a `vec`, `dynbuf` or
     /// `vecstring` field; empty for a `string` field.
@@ -140,12 +147,12 @@ pub struct PillFieldAccessorDescriptor {
 /// `#[pill_mirror_object]`/`#[pill_mirror_resource]`/`#[derive(PillMirror)]`
 /// for types.
 ///
-/// Every function gets a `#[no_mangle] extern "C"` trampoline with the one
-/// signature `pill_engine::mirror` defines - `(args, ret) -> status` - recorded
-/// here with its address, so a statically linked host reaches it with no symbol
-/// table and a loaded module's host reads the same address out of the module's
-/// copy of this descriptor. The mirror codegen then emits a typed C# member
-/// that calls it.
+/// Every function gets an `unsafe extern "C"` trampoline with the one
+/// signature `pill_engine::mirror` defines, `(args, ret) -> status`. Its
+/// address is recorded here, so the host needs no symbol table: a statically
+/// linked host reads the descriptor directly, and a host that loaded the
+/// artifact as a module copies the same address out of the module. The mirror
+/// codegen then emits a typed C# member that calls it.
 ///
 /// A row named [`MIRROR_TYPE_ROW`] describes a type rather than a function.
 /// Rows whose name starts with `__` are never emitted as C# members: the
@@ -153,7 +160,7 @@ pub struct PillFieldAccessorDescriptor {
 ///
 /// | Shape | `name` | `owner_kind` | `return_tag` | `arg_tags` | `arg_names` | `symbol` / `address` |
 /// | --- | --- | --- | --- | --- | --- | --- |
-/// | method (`#[pill_mirror_impl]`) | Rust method name | the owner's kind (`"value"` for a value type or component row) | return value | argument types | argument names | trampoline |
+/// | method (`#[pill_mirror_impl]`) | Rust method name | empty ([`OWNER_KIND_UNKNOWN`]; the codegen resolves the owner from the type rows) | return value | argument types | argument names | trampoline |
 /// | free function (`#[pill_mirror_fn]`) | function name | `"module"` | return value | argument types | argument names | trampoline |
 /// | object type row | [`MIRROR_TYPE_ROW`] | `"object"` | empty | empty | feature flags (`asset`, `import`, `standalone`) | drop trampoline |
 /// | object asset-operation row | `__asset_<op>` | `"object"` | empty | empty | empty | the operation's trampoline |
@@ -165,8 +172,8 @@ pub struct PillFieldAccessorDescriptor {
 /// `arg_tags`, and the `__asset_*` rows are reached by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PillMethodDescriptor {
-    /// Fully-qualified type name the method belongs to, as `std::any::type_name`
-    /// would report it (`pill_spline::OmoMO`).
+    /// Fully-qualified path of the owning type, written the way the macro
+    /// spells it: the module path plus the type's name (`pill_spline::OmoMO`).
     pub type_name: &'static str,
     /// Whether the declaration is a free function (`#[pill_mirror_fn]`) rather
     /// than a method (`#[pill_mirror_impl]`). A free-function entry's
@@ -182,8 +189,8 @@ pub struct PillMethodDescriptor {
     /// Rust method name, snake_case (`get_sum`); the codegen maps it to
     /// PascalCase for the C# instance method.
     pub name: &'static str,
-    /// Exported `#[no_mangle]` symbol of the generated C-ABI trampoline
-    /// (`pill_mirror_OmoMO_get_sum`), which the host resolves at load time.
+    /// Rust name of the generated trampoline (`pill_mirror_OmoMO_get_sum`).
+    /// The host calls the trampoline through `address`, not by this name.
     pub symbol: &'static str,
     /// Type tag of the return value (`u64`, `str`, `val:Mesh`,
     /// `result:handle:Mesh`, ...; see `pill_engine::mirror`); empty for `()`.
@@ -229,7 +236,7 @@ pub const OWNER_KIND_UNKNOWN: &str = "";
 
 /// A named C-ABI function an artifact offers to the host, found by name.
 ///
-/// Submitted with `pill_engine::submit!` beside the function, so a host that
+/// Submit one beside the function with `pill_engine::submit!`, so a host that
 /// links the artifact statically - a shipping build, or a host that links a
 /// data crate directly - finds it through [`find_export`] with no symbol table
 /// to search. A loaded module offers the same function as a `#[no_mangle]`
@@ -262,22 +269,23 @@ inventory::collect!(PillComponentDescriptor);
 inventory::collect!(PillValueTypeDescriptor);
 inventory::collect!(PillMethodDescriptor);
 inventory::collect!(PillExportDescriptor);
+inventory::collect!(PillFieldAccessorDescriptor);
 
-/// The address of the export named `name` among those linked into the calling
-/// artifact, if one was submitted.
+/// The address of the export named `export_name` among those linked into the
+/// calling artifact, if one was submitted.
 ///
 /// Sees only this artifact's own inventory: a function in a separately loaded
 /// module is not found here, and is resolved from that module's DLL instead.
-pub fn find_export(name: &str) -> Option<ExportAddress> {
+pub fn find_export(export_name: &str) -> Option<ExportAddress> {
     inventory::iter::<PillExportDescriptor>
         .into_iter()
-        .find(|descriptor| descriptor.name == name)
+        .find(|descriptor| descriptor.name == export_name)
         .map(|descriptor| descriptor.address)
 }
-inventory::collect!(PillFieldAccessorDescriptor);
 
-/// Every value type this artifact declares with `#[derive(PillMirror)]`,
-/// sorted by type name so the host consumes them deterministically.
+/// Every value type this artifact declares with `#[derive(PillMirror)]` or
+/// `pill_value_type!`, sorted by type name so the host consumes them
+/// deterministically.
 pub fn value_type_descriptors() -> Vec<&'static PillValueTypeDescriptor> {
     let mut descriptors: Vec<&'static PillValueTypeDescriptor> =
         inventory::iter::<PillValueTypeDescriptor>().collect();
@@ -285,9 +293,10 @@ pub fn value_type_descriptors() -> Vec<&'static PillValueTypeDescriptor> {
     descriptors
 }
 
-/// Every mirrored method this artifact declares with `#[pill_mirror_impl]` /
-/// `#[pill_mirror_method]`, sorted by type name then method name so the host
-/// consumes them deterministically.
+/// Every mirror row this artifact declares: methods
+/// (`#[pill_mirror_impl]`/`#[pill_mirror_method]`), free functions
+/// (`#[pill_mirror_fn]`) and type rows, sorted by type name then row name so
+/// the host consumes them deterministically.
 pub fn mirror_method_descriptors() -> Vec<&'static PillMethodDescriptor> {
     let mut descriptors: Vec<&'static PillMethodDescriptor> =
         inventory::iter::<PillMethodDescriptor>().collect();
@@ -308,27 +317,38 @@ pub fn field_accessor_descriptors() -> Vec<&'static PillFieldAccessorDescriptor>
     descriptors
 }
 
-/// Copy up to `max` descriptors into `out`, returning how many were written.
+/// Copy up to `max_descriptor_count` descriptors into `out_descriptors`,
+/// returning how many were written.
 ///
-/// Every `pill_copy_*_descriptors` export answers the same question - the host
-/// sizes a buffer from the matching `*_count` export, then asks for a copy of
-/// at most that many - so the clamp and the write loop live here once rather
-/// than in each expansion. A `max` larger than the list copies the list; a
-/// `max` of zero writes nothing.
+/// The three copy exports - value types, mirror methods, field accessors -
+/// answer the same question: the host sizes a buffer from the matching count
+/// export, then asks for a copy of at most that many. The clamp and the write
+/// loop live here once rather than in each expansion. A maximum larger than
+/// the list copies the list; a maximum of zero writes nothing.
 ///
 /// # Safety
 ///
-/// `out` must point at `max` writable `T` slots owned by the caller for the
-/// duration of this call, or be null when `max` is zero.
-pub unsafe fn copy_descriptors<T: Copy>(descriptors: &[&'static T], out: *mut T, max: u32) -> u32 {
-    let count = (descriptors.len() as u32).min(max);
-    for (index, descriptor) in descriptors.iter().take(count as usize).enumerate() {
-        // SAFETY: `index < count <= max`, so `out.add(index)` stays inside the
-        // buffer the caller promised, and `T: Copy` makes the write a copy out
-        // of the static descriptor.
-        unsafe { out.add(index).write(**descriptor) };
+/// `out_descriptors` must point at `max_descriptor_count` writable `T` slots
+/// owned by the caller for the duration of this call, or be null when
+/// `max_descriptor_count` is zero.
+pub unsafe fn copy_descriptors<T: Copy>(
+    descriptors: &[&'static T],
+    out_descriptors: *mut T,
+    max_descriptor_count: u32,
+) -> u32 {
+    let descriptor_count = (descriptors.len() as u32).min(max_descriptor_count);
+    for (index, descriptor) in descriptors
+        .iter()
+        .take(descriptor_count as usize)
+        .enumerate()
+    {
+        // SAFETY: `index < descriptor_count <= max_descriptor_count`, so
+        // `out_descriptors.add(index)` stays inside the buffer the caller
+        // promised, and `T: Copy` makes the write a copy out of the static
+        // descriptor.
+        unsafe { out_descriptors.add(index).write(**descriptor) };
     }
-    count
+    descriptor_count
 }
 
 /// Register every component this artifact declares with the derive.
@@ -349,11 +369,16 @@ pub unsafe fn copy_descriptors<T: Copy>(descriptors: &[&'static T], out: *mut T,
 /// already registered type - so the generated `init` can fail the reload
 /// transactionally instead of running with a half-registered component set.
 pub fn register_all_components(world: &mut World) -> Result<(), WorldError> {
-    let previous = install_value_type_layouts(world);
+    // Step 1: install this artifact's value types as the layout resolver for
+    // the duration of the loop.
+    let previous_resolver = install_value_type_layouts(world);
+    // Step 2: register every component this artifact declares.
     for descriptor in inventory::iter::<PillComponentDescriptor> {
         (descriptor.register)(world);
     }
-    restore_value_type_layouts(world, previous);
+    // Step 3: put the previous resolver back and report the first error a
+    // registration recorded.
+    restore_value_type_layouts(world, previous_resolver);
     world.take_registration_error().map_or(Ok(()), Err)
 }
 
@@ -369,35 +394,38 @@ fn install_value_type_layouts(world: &mut World) -> Option<ValueTypeLayoutResolv
 }
 
 /// Put back the resolver [`install_value_type_layouts`] replaced.
-fn restore_value_type_layouts(world: &mut World, previous: Option<ValueTypeLayoutResolver>) {
-    world.replace_value_type_layout_resolver(previous);
+fn restore_value_type_layouts(
+    world: &mut World,
+    previous_resolver: Option<ValueTypeLayoutResolver>,
+) {
+    world.replace_value_type_layout_resolver(previous_resolver);
 }
 
 /// Holds this artifact's value types installed as the world's layout resolver.
 ///
 /// Restores the previous resolver when it drops, which is the point: an `init`
 /// that unwinds would otherwise leave the world holding a resolver that is a
-/// function pointer into the generation the host just rejected - the one
-/// pointer into a DLL the world keeps.
+/// function pointer into the generation the host just rejected, and the world
+/// would call it after the reload.
 struct ValueTypeLayoutScope {
     /// World whose resolver this scope owns.
     ///
-    /// Raw because the guard must outlive the borrow that created it: the entry
-    /// point calls back into the engine between construction and drop, and no
-    /// reference is held across that.
+    /// Raw because the entry point calls back into the engine between
+    /// construction and drop, so no reference to the world can be held for
+    /// that whole span.
     world: *mut World,
     /// Resolver the world held before this scope installed its own.
-    previous: Option<ValueTypeLayoutResolver>,
+    previous_resolver: Option<ValueTypeLayoutResolver>,
 }
 
 impl ValueTypeLayoutScope {
     /// Installs this artifact's resolver and takes responsibility for it.
     fn install(engine: &mut Engine) -> Self {
         let world = engine.world_mut();
-        let previous = install_value_type_layouts(world);
+        let previous_resolver = install_value_type_layouts(world);
         Self {
             world: world as *mut World,
-            previous,
+            previous_resolver,
         }
     }
 }
@@ -409,7 +437,7 @@ impl Drop for ValueTypeLayoutScope {
         // borrow of the world outlives the call, and nothing else observes the
         // pointer in between, so it is still the live world here.
         let world = unsafe { &mut *self.world };
-        restore_value_type_layouts(world, self.previous);
+        restore_value_type_layouts(world, self.previous_resolver);
     }
 }
 
@@ -424,9 +452,9 @@ impl Drop for ValueTypeLayoutScope {
 ///    because the component types exist and the project has not yet seeded its
 ///    own entities over them;
 /// 4. the user's `init` runs;
-/// 5. the registration-error slot is read once more, because a `class:`- or
-///    `resource:`-tagged guard is raised from the user's own code after the
-///    drain in step 2 looked at it.
+/// 5. the registration-error slot is read once more, because `before_init` or
+///    the user's `init` can record an error after the drain in step 2 already
+///    looked at it.
 ///
 /// The resolver is held for the whole entry point - a `struct:`-tagged field (a
 /// value type, or an array of one) only expands into editable rows while one is
@@ -437,7 +465,11 @@ pub fn run_artifact_entry(
     before_init: impl FnOnce(&mut Engine),
     init: impl FnOnce(&mut Engine) -> u32,
 ) -> u32 {
+    // Step 1: install this artifact's value types as the world's layout
+    // resolver.
     let scope = ValueTypeLayoutScope::install(engine);
+    // Steps 2-4: register the components, load what `before_init` queued, then
+    // run the user's `init`.
     let mut status = match register_all_components(engine.world_mut()) {
         Ok(()) => {
             before_init(engine);
@@ -446,6 +478,7 @@ pub fn run_artifact_entry(
         // The failure was logged; a half-registered artifact must not run.
         Err(_error) => u32::MAX,
     };
+    // Step 5: catch a registration error raised after the drain in step 2.
     if status != u32::MAX && engine.world_mut().take_registration_error().is_some() {
         status = u32::MAX;
     }
@@ -482,7 +515,8 @@ pub fn run_project_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u3
 }
 
 /// The layout of the value type a `struct:<path>` field tag names, among the
-/// ones this artifact declares with `#[derive(PillMirror)]`.
+/// ones this artifact declares with `#[derive(PillMirror)]` or
+/// `pill_value_type!`.
 ///
 /// The tag is the path as written at the field site, usually an imported
 /// short name (`Color`), so an exact type name is tried first and a unique
@@ -490,23 +524,24 @@ pub fn run_project_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u3
 /// field is readable, a wrong one is not.
 pub fn resolve_value_type_layout(path: &str) -> Option<&'static [ComponentFieldDescriptor]> {
     let descriptors = value_type_descriptors();
-    let name = pill_engine_core::component_registry::resolve_unique_name(
+    let resolved_type_name = pill_engine_core::component_registry::resolve_unique_name(
         path,
         descriptors.iter().map(|descriptor| descriptor.type_name),
     )?;
     descriptors
         .into_iter()
-        .find(|descriptor| descriptor.type_name == name)
+        .find(|descriptor| descriptor.type_name == resolved_type_name)
         .map(|descriptor| descriptor.fields)
 }
 
-/// Aggregate schema fingerprint of every persistable component.
+/// Fingerprint of the set of persistable components this artifact declares.
 ///
-/// Deterministic across builds: descriptors are sorted by type name before
-/// hashing because the iterator makes no ordering guarantee. The project
-/// entry-point macro exports it as `project_schema_fingerprint`. Keeping it
-/// derived from the same registry that drives registration means a new
-/// persistable component cannot be missing from the fingerprint.
+/// The value is the hash of every persistable component's type name, taken in
+/// sorted order, so two builds that declare the same set produce the same
+/// fingerprint. The project entry-point macro exports it as
+/// `project_schema_fingerprint`. Keeping it derived from the same registry that
+/// drives registration means a new persistable component cannot be missing
+/// from the fingerprint.
 pub fn persistable_schema_fingerprint() -> u64 {
     let mut descriptors: Vec<&PillComponentDescriptor> = inventory::iter::<PillComponentDescriptor>
         .into_iter()
@@ -654,7 +689,7 @@ mod tests {
         assert_eq!(beta.symbol, "pill_mirror_Alpha_beta");
     }
 
-    /// The persistable-only fingerprint is stable across runs.
+    /// The persistable-only fingerprint is stable across calls.
     #[test]
     fn persistable_fingerprint_is_deterministic() {
         let first = persistable_schema_fingerprint();

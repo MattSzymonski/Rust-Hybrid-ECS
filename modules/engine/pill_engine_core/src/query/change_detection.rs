@@ -1,19 +1,21 @@
-//! [`Mut<T>`] smart pointer that records component mutation ticks on `DerefMut`.
+//! The [`Mut<T>`] handle a query yields for a component or resource it may
+//! change.
 //!
 //! # Responsibilities
 //!
-//! - Wraps `&mut T` in a [`Mut<T>`] that transparently dereferences to the inner value.
-//! - Bumps the component's `changed` tick on every mutable dereference for
-//!   frame-based change detection by [`Changed`](crate::query::Changed) and
-//!   [`Added`](crate::query::Added) filters.
+//! - Gives mutable access to a component through `DerefMut`, while keeping a
+//!   borrow of the component's [`ComponentTicks`].
+//! - Records the component as changed on every mutable dereference, so a
+//!   [`Changed`](crate::query::Changed) filter run later sees the row.
 //!
 //! # Design
 //!
-//! Queries requesting `&mut T` yield `Mut<'a, T>` instead of bare `&'a mut T`.
-//! The wrapper's `DerefMut` implementation updates the associated
-//! [`ComponentTicks::changed`] field to the current world tick. This per-row
-//! update requires no synchronization because the scheduler guarantees
-//! disjoint mutable access per thread.
+//! A query that asks for `&mut T` yields the row as `Mut<'a, T>` instead of a
+//! plain `&'a mut T`. Reading through `Deref` leaves the row's ticks alone,
+//! so a row only counts as changed once something is written. Writing through
+//! `DerefMut` sets [`ComponentTicks::changed`] to the tick of the current run.
+//! That store is per row and needs no locking: the scheduler never runs two
+//! systems that write the same component at the same time.
 
 // Standard library
 use std::ops::{Deref, DerefMut};
@@ -21,14 +23,18 @@ use std::ops::{Deref, DerefMut};
 // Current crate
 use crate::component::{ComponentTicks, Tick};
 
-/// Mutable, change-tracking access to a component (or resource) instance.
+// =============================================================================
+// Mut
+// =============================================================================
+
+/// Mutable, change-tracking access to one component (or resource) row.
 ///
-/// `Mut<'a, T>` carries a borrow of both the value and its
-/// [`ComponentTicks`], plus the current world tick (`this_run`). Mutating
-/// through `DerefMut` updates `ticks.changed = this_run`, so a later
-/// [`Changed`](crate::query::Changed) run sees the row. That write needs no
-/// synchronization because the scheduler only ever hands two threads
-/// disjoint rows.
+/// The handle holds a borrow of the component's value, a borrow of its
+/// [`ComponentTicks`], and the tick of the current run (`this_run`). Writing
+/// through `DerefMut` sets `ticks.changed` to that tick, so the next
+/// [`Changed`](crate::query::Changed) check sees the write. The store needs no
+/// synchronization because the scheduler never lets two threads write the same
+/// row.
 ///
 /// # Examples
 ///
@@ -39,22 +45,23 @@ use crate::component::{ComponentTicks, Tick};
 /// # #[derive(Debug, Clone)] struct Velocity { x: f32, y: f32 }
 /// # impl Component for Velocity {}
 /// fn movement(mut q: Query<(&mut Transform, &Velocity)>) {
-///     for (mut transform, vel) in q.iter_mut() {
-///         transform.x += vel.x; // DerefMut bumps the changed tick
+///     for (mut transform, velocity) in q.iter_mut() {
+///         transform.x += velocity.x; // DerefMut marks the row as changed
 ///     }
 /// }
 /// ```
 pub struct Mut<'a, T: ?Sized> {
-    /// The underlying component value wrapped by this `Mut`.
+    /// The component value this handle gives access to.
     pub(crate) value: &'a mut T,
-    /// Change-detection ticks shared with the owning component row.
+    /// The change-detection ticks of this row.
     pub(crate) ticks: &'a mut ComponentTicks,
-    /// The world tick against which mutations through this `Mut` are recorded.
+    /// The tick a write through this handle records as the change.
     pub(crate) this_run: Tick,
 }
 
 impl<'a, T: ?Sized> Mut<'a, T> {
-    /// Builds a [`Mut`] from its parts.
+    /// Builds a [`Mut`] from the component value, its row's ticks and the
+    /// run's tick.
     #[inline]
     pub fn new(value: &'a mut T, ticks: &'a mut ComponentTicks, this_run: Tick) -> Self {
         Self {
@@ -64,42 +71,42 @@ impl<'a, T: ?Sized> Mut<'a, T> {
         }
     }
 
-    /// Read access to the change-detection ticks for this row.
+    /// Returns the change-detection ticks of this row.
     #[inline]
     pub fn ticks(&self) -> &ComponentTicks {
         self.ticks
     }
 
-    /// Tick at which this component was added to its entity.
+    /// Returns the tick at which this component was added to its entity.
     #[inline]
     pub fn last_added(&self) -> Tick {
         self.ticks.added
     }
 
-    /// Tick at which this component was most recently mutated.
+    /// Returns the tick at which this component was last marked as changed.
     #[inline]
     pub fn last_changed(&self) -> Tick {
         self.ticks.changed
     }
 
-    /// The current world tick that mutations through this `Mut` will record.
+    /// Returns the tick that a write through this handle records as the
+    /// change.
     #[inline]
     pub fn this_run(&self) -> Tick {
         self.this_run
     }
 
-    /// Returns mutable access to the value WITHOUT bumping the change tick.
+    /// Returns mutable access to the component without recording a change.
     ///
-    /// Useful for read-modify-write paths that want to suppress change
-    /// detection (e.g., internal bookkeeping that user systems should not
-    /// observe as a change).
+    /// Use it for bookkeeping writes that should not count as a change: the
+    /// next [`Changed`](crate::query::Changed) run would otherwise see the row.
     #[inline]
     pub fn bypass_change_detection(&mut self) -> &mut T {
         self.value
     }
 
-    /// Marks this row as changed at the current tick, even if the underlying
-    /// value is never mutated.
+    /// Records this row as changed at the handle's run tick, even if nothing
+    /// is written through it.
     #[inline]
     pub fn set_changed(&mut self) {
         self.ticks.changed = self.this_run;
@@ -118,8 +125,9 @@ impl<T: ?Sized> Deref for Mut<'_, T> {
 impl<T: ?Sized> DerefMut for Mut<'_, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
-        // Per-row write: no atomics needed, because the query and scheduler
-        // guarantee disjoint access across threads.
+        // This store marks the row as changed. It touches only this row, so no
+        // atomics are needed: the query and the scheduler guarantee that no
+        // two threads hold the same row.
         self.ticks.changed = self.this_run;
         self.value
     }
@@ -143,47 +151,47 @@ impl<T: ?Sized + std::fmt::Debug> std::fmt::Debug for Mut<'_, T> {
 mod tests {
     use super::*;
 
-    /// Verifies that immutable `Deref` does not bump the changed tick.
+    /// Checks that reading through `Deref` leaves the `changed` tick alone.
     #[test]
     fn deref_does_not_bump_changed() {
-        let mut value = 42_i32;
+        let mut component_value = 42_i32;
         let mut ticks = ComponentTicks::new(Tick::new(1));
-        let m = Mut::new(&mut value, &mut ticks, Tick::new(5));
-        // Immutable deref
-        let _ = *m;
-        assert_eq!(m.last_changed(), Tick::new(1));
+        let component_access = Mut::new(&mut component_value, &mut ticks, Tick::new(5));
+        let _ = *component_access;
+        assert_eq!(component_access.last_changed(), Tick::new(1));
     }
 
-    /// Verifies that `DerefMut` bumps the changed tick to the current world tick.
+    /// Checks that `DerefMut` moves the `changed` tick to the handle's run
+    /// tick.
     #[test]
     fn deref_mut_bumps_changed() {
-        let mut value = 42_i32;
+        let mut component_value = 42_i32;
         let mut ticks = ComponentTicks::new(Tick::new(1));
-        let mut m = Mut::new(&mut value, &mut ticks, Tick::new(5));
-        *m += 1;
-        assert_eq!(m.last_changed(), Tick::new(5));
-        assert_eq!(*m, 43);
+        let mut component_access = Mut::new(&mut component_value, &mut ticks, Tick::new(5));
+        *component_access += 1;
+        assert_eq!(component_access.last_changed(), Tick::new(5));
+        assert_eq!(*component_access, 43);
     }
 
-    /// Verifies that `bypass_change_detection()` provides raw access without
-    /// bumping the changed tick.
+    /// Checks that `bypass_change_detection` writes the value without moving
+    /// the `changed` tick.
     #[test]
     fn bypass_skips_tick_bump() {
-        let mut value = 0_i32;
+        let mut component_value = 0_i32;
         let mut ticks = ComponentTicks::new(Tick::new(1));
-        let mut m = Mut::new(&mut value, &mut ticks, Tick::new(7));
-        *m.bypass_change_detection() = 99;
-        assert_eq!(m.last_changed(), Tick::new(1));
-        assert_eq!(*m, 99);
+        let mut component_access = Mut::new(&mut component_value, &mut ticks, Tick::new(7));
+        *component_access.bypass_change_detection() = 99;
+        assert_eq!(component_access.last_changed(), Tick::new(1));
+        assert_eq!(*component_access, 99);
     }
 
-    /// Verifies that `set_changed()` explicitly marks a row as changed at the given tick.
+    /// Checks that `set_changed` marks the row at the handle's run tick.
     #[test]
     fn set_changed_marks_row() {
-        let mut value = 0_i32;
+        let mut component_value = 0_i32;
         let mut ticks = ComponentTicks::new(Tick::new(1));
-        let mut m = Mut::new(&mut value, &mut ticks, Tick::new(9));
-        m.set_changed();
-        assert_eq!(m.last_changed(), Tick::new(9));
+        let mut component_access = Mut::new(&mut component_value, &mut ticks, Tick::new(9));
+        component_access.set_changed();
+        assert_eq!(component_access.last_changed(), Tick::new(9));
     }
 }

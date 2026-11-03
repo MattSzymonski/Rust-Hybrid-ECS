@@ -1,40 +1,42 @@
-//! The versioned texture set a UI frame carries, so a backend that was
-//! rebuilt mid-run re-uploads what it lacks instead of drawing nothing.
+//! The versioned texture set a UI frame carries, so a backend rebuilt mid-run
+//! can upload what it lacks instead of drawing nothing.
 //!
 //! # Responsibilities
 //!
-//! - [`UiTextureSet`]: the textures whose content moved since the producer
-//!   last carried them, each with a monotonically increasing revision, plus the
-//!   textures to free.
+//! - [`UiTextureSet`]: the textures whose content changed since the producer
+//!   last carried them, each with a revision number that only goes up, plus
+//!   the textures to free.
 //! - [`UiTexture`]: one texture's size, sampling and whole image at this
 //!   revision, as owned plain data.
 //!
 //! # Design
 //!
-//! The revision drives the uploads: a painter keeps `texture -> revision` for
-//! what it has applied and uploads whenever the carried revision is not the
-//! applied one. The producer therefore carries a texture only when that
-//! revision moved, not every texture every frame (`crate::frame::UiFrame`).
+//! The revision decides what gets uploaded. A painter remembers the revision
+//! it applied for each texture, and uploads the image again whenever the
+//! carried revision is a different number. The producer therefore carries a
+//! texture only when its revision changed, not every texture every frame
+//! ([`UiFrame`](crate::frame::UiFrame)).
 //!
 //! A carried set is applied once per frame, before any surface decides whether
-//! it draws: the textures belong to the update, not to a surface, so a frame
-//! that draws nothing - a minimized window, a surface that may not present yet -
-//! still hands them over and the next drawn frame has them. A painter's revision
-//! map makes the second and later application in a frame a no-op; it is an
+//! it draws. The textures belong to the frame update, not to a surface, so a
+//! frame that draws nothing - a minimized window, a surface that may not
+//! present yet - still hands them over, and the next drawn frame has them.
+//! Because the painter remembers the revisions it applied, applying the same
+//! set twice in one frame uploads nothing the second time; that is an
 //! optimisation, not the rule.
 //!
-//! A painter that starts with no textures at all needs more than the dirty set,
-//! because nothing is dirty by then: a renderer module that was just rebuilt
-//! asks for everything it holds through
+//! A painter that starts with no textures at all needs more than that set,
+//! because nothing has changed by then. A renderer module that was just
+//! rebuilt asks the producer to send every texture again through
 //! [`UiFrameSlot::request_texture_resend`](crate::slot::UiFrameSlot::request_texture_resend),
-//! and the producer re-carries its whole set when that request moves. An entry
-//! always carries the whole image rather than a patch, so a re-carried texture
-//! needs no history to apply.
+//! and the producer carries its whole set again when the request number
+//! changes. An entry always carries the whole image rather than a patch, so a
+//! re-carried texture needs no history to apply.
 //!
-//! Every buffer is an [`Arc`] allocated by the producing side's own code and
-//! handed over as plain data: a project reload may drop the producer while a
-//! renderer still holds the frame, so the bytes must be owned by the data,
-//! not borrowed from the producer.
+//! Every buffer is an [`Arc`] allocated by the code that produced it and
+//! handed over as plain data. A project reload may drop the producer while a
+//! renderer still holds the frame, so the bytes must be owned by the data, not
+//! borrowed from the producer.
 
 // Standard library
 use std::sync::Arc;
@@ -49,10 +51,12 @@ use crate::draw::TextureId;
 /// How a backend samples a UI texture.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum UiTextureFilter {
-    /// One texel per pixel, sharp edges: glyph atlases and pixel art.
+    /// One texel per pixel, keeping edges sharp. Used for glyph atlases and
+    /// pixel art.
     #[default]
     Nearest,
-    /// Smooth in between: photo-like textures and scaled drawings.
+    /// Blends between neighbouring texels, keeping gradients smooth. Used for
+    /// photo-like textures and scaled drawings.
     Linear,
 }
 
@@ -60,19 +64,19 @@ pub enum UiTextureFilter {
 // UiTexture
 // =============================================================================
 
-/// One texture a frame's draw lists sample, at one revision.
+/// One texture sampled by a frame's draw lists, at one revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiTexture {
-    /// Which draws sample it.
+    /// The id the draw lists use to sample this texture.
     pub id: TextureId,
     /// The image's width in texels.
     pub width: u32,
     /// The image's height in texels.
     pub height: u32,
-    /// The content revision this entry carries; it increases whenever the
-    /// texture's content changes.
+    /// The revision of the content this entry carries. It goes up every time
+    /// the texture's content changes.
     pub revision: u64,
-    /// The whole image: tightly packed straight-alpha sRGB RGBA8 rows,
+    /// The whole image as tightly packed straight-alpha sRGB RGBA8 rows,
     /// `width * height * 4` bytes.
     pub pixels: Arc<[u8]>,
     /// How the texture is sampled.
@@ -83,13 +87,13 @@ pub struct UiTexture {
 // UiTextureSet
 // =============================================================================
 
-/// A frame's textures: what to carry to the backend, and what to free.
+/// The textures a frame carries to the backend, and the ones it frees.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UiTextureSet {
-    /// The textures whose revision moved since the producer last carried them,
-    /// one entry per texture; empty when the backend already holds everything.
+    /// The textures whose content changed since the producer last carried
+    /// them, one entry per texture. Empty when nothing changed.
     pub textures: Vec<UiTexture>,
-    /// Textures the producer no longer uses; a backend drops them.
+    /// Textures the producer no longer uses. A backend drops them.
     pub frees: Vec<TextureId>,
 }
 
@@ -110,11 +114,15 @@ impl UiTextureSet {
         self.frees.clear();
     }
 
-    /// Add the whole image of `id` at `revision`.
+    /// Adds the whole image of `id` at `revision`.
     ///
-    /// `pixels` is straight-alpha sRGB RGBA8, `width * height * 4` bytes; a
-    /// shorter or longer slice is a producer bug the backend would otherwise
-    /// read past, so it is refused here rather than at the upload.
+    /// `pixels` is straight-alpha sRGB RGBA8 and exactly `width * height * 4`
+    /// bytes. Any other length is a producer bug that the backend would read
+    /// past, so it is refused here rather than at the upload.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `pixels` is not exactly `width * height * 4` bytes.
     pub fn push_full(
         &mut self,
         id: TextureId,
@@ -139,11 +147,15 @@ impl UiTextureSet {
         });
     }
 
-    /// Free `id` in every backend that applied the set.
+    /// Marks `id` to be freed in every backend that applied the set.
     pub fn push_free(&mut self, id: TextureId) {
         self.frees.push(id);
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

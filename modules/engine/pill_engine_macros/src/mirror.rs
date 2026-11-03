@@ -2,10 +2,10 @@
 //!
 //! # Responsibilities
 //!
-//! - Lower one Rust signature to the single trampoline shape
-//!   `pill_engine::mirror` defines - `(args, ret) -> status` - reading each
-//!   argument from its 16-byte slot and writing the result to `ret`.
-//! - Tag every argument and the result for the C# codegen, from the closed
+//! - Lower a Rust signature to the one trampoline shape `pill_engine::mirror`
+//!   defines, `(args, ret) -> status`. Each argument is read from its 16-byte
+//!   slot, and the result is written to `ret`.
+//! - Tag every argument and the result for the C# codegen, using the fixed
 //!   vocabulary `lower_parameter` and `lower_return` accept.
 //! - Emit what a mirrored type needs: the drop trampoline and asset store
 //!   operations of an object, the encodings of an enum or a value type, and
@@ -14,14 +14,14 @@
 //! # Design
 //!
 //! The lowering is syntactic, as every proc macro's must be: a parameter is
-//! classified by how it is written, and shapes with one meaning - `&str`,
-//! `impl Into<String>`, `Vec<T>`, `Handle<T>`, a tuple of primitives - are read
-//! here directly. A named type taken by value is read through `MirrorValue`,
-//! which the attribute declaring that type implemented, so a type nobody
-//! mirrored is a compile error here rather than a wrong read at run time. A named
-//! type taken by reference crosses as the address of the value - an object's box,
-//! a component row, a resource - which is why the codegen, not this macro,
-//! decides what the C# parameter looks like.
+//! classified by how it is written. Shapes that always mean the same thing -
+//! `&str`, `impl Into<String>`, `Vec<T>`, `Handle<T>`, a tuple of primitives -
+//! are read here directly. A named type taken by value is read through
+//! `MirrorValue`, which the attribute that declared the type implemented, so a
+//! type nobody mirrored is a compile error here instead of a wrong read at run
+//! time. A named type taken by reference crosses as the address of the value
+//! (an object's box, a component row, a resource), which is why the codegen,
+//! not this macro, decides what the C# parameter looks like.
 
 // External crates
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -32,8 +32,9 @@ use syn::spanned::Spanned;
 // Vocabulary
 // =============================================================================
 
-/// The primitive type names the vocabulary passes by value, with their width.
-const PRIMITIVES: &[(&str, usize)] = &[
+/// The primitive type names the vocabulary passes by value, each with its
+/// width in bytes.
+const PRIMITIVE_WIDTHS: &[(&str, usize)] = &[
     ("u8", 1),
     ("u16", 2),
     ("u32", 4),
@@ -51,21 +52,22 @@ const PRIMITIVES: &[(&str, usize)] = &[
 
 /// The width of a primitive type name, or `None` when it is not one.
 fn primitive_width(name: &str) -> Option<usize> {
-    PRIMITIVES
+    PRIMITIVE_WIDTHS
         .iter()
         .find(|(candidate, _)| *candidate == name)
         .map(|(_, width)| *width)
 }
 
-/// The type every mirrored function and type is owned by, as the trampoline
-/// sees it.
+/// The type a mirrored method or associated function belongs to, as the
+/// trampoline names it.
 #[derive(Clone)]
 pub(crate) struct Owner {
     /// The type's identifier; `Self` in a signature resolves to it.
     pub(crate) ident: syn::Ident,
 }
 
-/// The last segment of a path type, when the type is one.
+/// The last segment of a path type, looking through `Group` and `Paren`; `None`
+/// for a qualified path or any other type.
 fn last_segment(ty: &syn::Type) -> Option<&syn::PathSegment> {
     match ty {
         syn::Type::Path(path) if path.qself.is_none() => path.path.segments.last(),
@@ -90,8 +92,8 @@ fn generic_argument(segment: &syn::PathSegment, index: usize) -> Option<&syn::Ty
         .nth(index)
 }
 
-/// The name the codegen resolves a named type by: its last path segment, with
-/// `Self` replaced by the owner.
+/// The name the codegen uses for a named type: its last path segment, with
+/// `Self` replaced by the owner's identifier.
 fn type_name(ty: &syn::Type, owner: Option<&Owner>) -> Option<String> {
     let segment = last_segment(ty)?;
     let name = segment.ident.to_string();
@@ -103,6 +105,11 @@ fn type_name(ty: &syn::Type, owner: Option<&Owner>) -> Option<String> {
 
 /// `ty` with `Self` replaced by the owner, so it can be named outside the
 /// `impl` block the trampoline is emitted beside.
+///
+/// # Errors
+///
+/// Returns an error when `Self` appears outside an `impl` block, where it has
+/// no meaning.
 fn concrete_type(ty: &syn::Type, owner: Option<&Owner>) -> syn::Result<TokenStream2> {
     match last_segment(ty) {
         Some(segment) if segment.ident == "Self" => match owner {
@@ -126,7 +133,7 @@ fn primitive_name(ty: &syn::Type) -> Option<String> {
     primitive_width(&name).map(|_| name)
 }
 
-/// Whether a type is written as `Name<...>` with the given last segment.
+/// Whether a type's last path segment is `name`.
 fn is_named(ty: &syn::Type, name: &str) -> bool {
     last_segment(ty).is_some_and(|segment| segment.ident == name)
 }
@@ -142,7 +149,7 @@ fn is_str(ty: &syn::Type) -> bool {
 
 /// One parameter, lowered.
 pub(crate) struct LoweredParameter {
-    /// The codegen's tag for it.
+    /// The codegen's tag for this parameter.
     pub(crate) tag: String,
     /// The statement that reads it into its binding.
     pub(crate) binding: TokenStream2,
@@ -150,11 +157,18 @@ pub(crate) struct LoweredParameter {
     pub(crate) pass: TokenStream2,
 }
 
-/// The tag and reader of a named type taken by value.
+/// The tag of a named type taken by value.
 ///
-/// `Handle<T>` and `AssetLoader` are named by the vocabulary itself; any
-/// other type is read through `MirrorValue`, which the attribute that
-/// mirrored it implemented.
+/// `Handle<T>` and `AssetLoader` have tags of their own. Any other type is
+/// tagged `val:<name>` and read through `MirrorValue`, which the attribute that
+/// mirrored the type implemented.
+///
+/// # Errors
+///
+/// Returns an error for a `Handle` with no asset type, for a generic type, and
+/// for a type outside the vocabulary - including the standard containers
+/// (`String`, `Vec`, `Option`, `Result`, `Box`, `Arc`, `Rc`, `HashMap` and
+/// `BTreeMap`), which are refused by name.
 fn value_tag(ty: &syn::Type, owner: Option<&Owner>) -> syn::Result<String> {
     if let Some(primitive) = primitive_name(ty) {
         return Ok(primitive);
@@ -199,8 +213,15 @@ fn unsupported(ty: &impl ToTokens) -> syn::Error {
     )
 }
 
-/// Lower one slice element type: its tag, and the expression reading the
-/// whole slot as a `Vec` of it.
+/// Lower one slice element type.
+///
+/// Returns the element's tag and the expression that reads the whole slot as a
+/// `Vec` of that element.
+///
+/// # Errors
+///
+/// Returns an error for a slice of references, and for an element type outside
+/// the vocabulary.
 fn lower_element(
     element: &syn::Type,
     slot: &TokenStream2,
@@ -254,6 +275,10 @@ fn into_iterator_item(bound: &syn::TraitBound) -> Option<&syn::Type> {
 
 /// The field offsets of a tuple of primitives packed with natural alignment,
 /// and its total width.
+///
+/// # Errors
+///
+/// Returns an error when an element is not a primitive type.
 fn tuple_layout(elements: &[&syn::Type]) -> syn::Result<(Vec<usize>, usize)> {
     let mut offsets = Vec::new();
     let mut cursor = 0usize;
@@ -270,6 +295,11 @@ fn tuple_layout(elements: &[&syn::Type]) -> syn::Result<(Vec<usize>, usize)> {
 }
 
 /// The element type and length of a `[T; N]` of primitives.
+///
+/// # Errors
+///
+/// Returns an error when the element is not a primitive, when the length is not
+/// an integer literal, and when the array is empty or does not fit in 16 bytes.
 fn array_shape(array: &syn::TypeArray) -> syn::Result<(String, usize)> {
     let element = primitive_name(&array.elem)
         .ok_or_else(|| syn::Error::new_spanned(array, "a mirrored array holds primitives only"))?;
@@ -295,12 +325,21 @@ fn array_shape(array: &syn::TypeArray) -> syn::Result<(String, usize)> {
 
 /// Lower one parameter read from `slot` into the binding `binding`.
 ///
+/// # Errors
+///
+/// Returns an error for a type outside the vocabulary. That covers a
+/// `&mut [T]`, a primitive taken by reference, a slice of references, a `Vec`
+/// or slice whose element is outside the vocabulary, an `impl Trait` that is
+/// neither textual nor an `IntoIterator`, a tuple or array that holds a
+/// non-primitive or does not fit in 16 bytes, an array of `bool`, an array
+/// without a literal length, and a generic type name.
+///
 /// The vocabulary, as tags:
 ///
 /// | Rust | Tag |
 /// | --- | --- |
 /// | primitive | its name (`u32`, `bool`, ...) |
-/// | `&str`, `String`, `&String`, `&Path`, `PathBuf`, `impl Into<String>`, `impl AsRef<str>` | `str` |
+/// | `&str`, `String`, `&String`, `&Path`, `PathBuf`, `impl Into<String>`, `impl Into<PathBuf>`, `impl AsRef<str>`, `impl AsRef<Path>` | `str` |
 /// | `&[T]`, `Vec<T>`, `impl IntoIterator<Item = T>` | `slice:<element>` |
 /// | `Handle<T>`, `&Handle<T>` | `handle:<T>` |
 /// | `AssetLoader`, `&AssetLoader` | `loader` |
@@ -316,7 +355,7 @@ pub(crate) fn lower_parameter(
     display_name: &str,
     owner: Option<&Owner>,
 ) -> syn::Result<LoweredParameter> {
-    let what = format!("the `{display_name}` argument");
+    let argument_description = format!("the `{display_name}` argument");
     match ty {
         syn::Type::Reference(reference) => {
             let mutable = reference.mutability.is_some();
@@ -381,12 +420,12 @@ pub(crate) fn lower_parameter(
             let (tag, read) = if mutable {
                 (
                     format!("mut:{name}"),
-                    quote! { ::pill_engine::mirror::read_mut::<#target>(#slot, #what)? },
+                    quote! { ::pill_engine::mirror::read_mut::<#target>(#slot, #argument_description)? },
                 )
             } else {
                 (
                     format!("ref:{name}"),
-                    quote! { ::pill_engine::mirror::read_ref::<#target>(#slot, #what)? },
+                    quote! { ::pill_engine::mirror::read_ref::<#target>(#slot, #argument_description)? },
                 )
             };
             Ok(LoweredParameter {
@@ -559,13 +598,19 @@ pub(crate) struct LoweredReturn {
 
 /// Lower the plain (not `Result`) part of a result type.
 ///
-/// The vocabulary is the parameter one, minus borrows other than `&str`: a
-/// result outlives the call, so it has to be owned by the time it crosses.
+/// The vocabulary is the parameter vocabulary, without borrows other than
+/// `&str`: a result outlives the call, so it must be owned when it crosses.
+///
+/// # Errors
+///
+/// Returns an error for a returned reference other than `&str`, for a returned
+/// `AssetLoader`, for a tuple or array the vocabulary cannot write, and for any
+/// other type `value_tag` refuses.
 fn lower_plain_return(
     ty: &syn::Type,
     owner: Option<&Owner>,
 ) -> syn::Result<(String, TokenStream2)> {
-    let ret = quote! { __ret };
+    let return_buffer = quote! { __ret };
     if let syn::Type::Tuple(tuple) = ty {
         if tuple.elems.is_empty() {
             return Ok((String::new(), TokenStream2::new()));
@@ -578,12 +623,12 @@ fn lower_plain_return(
                 "a mirrored tuple must fit in 16 bytes",
             ));
         }
-        let names: Vec<syn::Ident> = (0..elements.len())
+        let element_names: Vec<syn::Ident> = (0..elements.len())
             .map(|index| format_ident!("__element{index}"))
             .collect();
-        let writes = names.iter().zip(&offsets).map(|(name, offset)| {
+        let writes = element_names.iter().zip(&offsets).map(|(name, offset)| {
             quote! {
-                ::pill_engine::mirror::MirrorReturn::write_return(#name, #ret.add(#offset));
+                ::pill_engine::mirror::MirrorReturn::write_return(#name, #return_buffer.add(#offset));
             }
         });
         let tag = elements
@@ -593,14 +638,14 @@ fn lower_plain_return(
             .join(",");
         return Ok((
             format!("tuple:{tag}"),
-            quote! { let (#(#names,)*) = __value; #(#writes)* },
+            quote! { let (#(#element_names,)*) = __value; #(#writes)* },
         ));
     }
     if let syn::Type::Array(array) = ty {
         let (element, length) = array_shape(array)?;
         return Ok((
             format!("array:{element}:{length}"),
-            quote! { ::pill_engine::mirror::write(#ret, __value); },
+            quote! { ::pill_engine::mirror::write(#return_buffer, __value); },
         ));
     }
     if let syn::Type::Reference(reference) = ty {
@@ -630,7 +675,7 @@ fn lower_plain_return(
         return Ok((
             format!("option:{tag}"),
             quote! {
-                ::pill_engine::mirror::write_option(#ret, __value, |at, value| {
+                ::pill_engine::mirror::write_option(#return_buffer, __value, |at, value| {
                     ::pill_engine::mirror::MirrorReturn::write_return(value, at)
                 });
             },
@@ -645,16 +690,20 @@ fn lower_plain_return(
     let tag = value_tag(ty, owner)?;
     Ok((
         tag,
-        quote! { ::pill_engine::mirror::MirrorReturn::write_return(__value, #ret); },
+        quote! { ::pill_engine::mirror::MirrorReturn::write_return(__value, #return_buffer); },
     ))
 }
 
 /// Lower a function's result.
 ///
-/// `Result<T, E>` (or an alias ending in `Result`) with `E: Display` fails the
-/// call with `E`'s message and is
-/// tagged `result:<tag of T>`; anything else is tagged as
-/// [`lower_plain_return`] describes.
+/// `Result<T, E>` (or an alias whose name ends in `Result`) is tagged
+/// `result:<tag of T>`. Its `E: Display` message fails the call. Anything else
+/// is tagged the way [`lower_plain_return`] describes.
+///
+/// # Errors
+///
+/// Returns an error when a `Result` names no value type, and for everything
+/// [`lower_plain_return`] refuses.
 pub(crate) fn lower_return(
     output: &syn::ReturnType,
     owner: Option<&Owner>,
@@ -667,8 +716,8 @@ pub(crate) fn lower_return(
             write: TokenStream2::new(),
         });
     };
-    // A `Result` alias (`AssetLoadResult<T>`, `io::Result<T>`) names its value
-    // first just as `Result` does; the macro sees only the spelling, so any
+    // A `Result` alias (`AssetLoadResult<T>`, `io::Result<T>`) takes its value
+    // type first, like `Result`. The macro only sees the spelling, so any
     // `...Result<T>` counts.
     if let Some(segment) = last_segment(ty)
         .filter(|segment| segment.ident.to_string().ends_with("Result"))
@@ -740,6 +789,11 @@ pub(crate) struct MirroredFunction<'a> {
 }
 
 /// Build the trampoline and descriptor submission for one function.
+///
+/// # Errors
+///
+/// Returns an error for a generic or `async` function, for a receiver outside
+/// an `impl` block, and for an argument or result the vocabulary refuses.
 pub(crate) fn emit_function(function: MirroredFunction<'_>) -> syn::Result<TokenStream2> {
     let MirroredFunction {
         ident,
@@ -748,6 +802,7 @@ pub(crate) fn emit_function(function: MirroredFunction<'_>) -> syn::Result<Token
         type_name,
         owner_kind,
     } = function;
+    // Step 1: refuse shapes one trampoline cannot describe.
     if !signature.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
             &signature.generics,
@@ -761,6 +816,7 @@ pub(crate) fn emit_function(function: MirroredFunction<'_>) -> syn::Result<Token
         ));
     }
 
+    // Step 2: read the receiver and lower each argument.
     let mut receiver = Receiver::None;
     let mut parameters = Vec::new();
     for input in &signature.inputs {
@@ -783,12 +839,12 @@ pub(crate) fn emit_function(function: MirroredFunction<'_>) -> syn::Result<Token
     }
 
     let first_slot = usize::from(receiver != Receiver::None);
-    let mut tags = Vec::new();
-    let mut names = Vec::new();
-    let mut bindings = Vec::new();
-    let mut passes = Vec::new();
+    let mut argument_tags = Vec::new();
+    let mut argument_names = Vec::new();
+    let mut argument_bindings = Vec::new();
+    let mut argument_passes = Vec::new();
     for (index, parameter) in parameters.iter().enumerate() {
-        let name = match &*parameter.pat {
+        let argument_name = match &*parameter.pat {
             syn::Pat::Ident(pattern) => pattern.ident.to_string(),
             _ => format!("arg{index}"),
         };
@@ -798,20 +854,24 @@ pub(crate) fn emit_function(function: MirroredFunction<'_>) -> syn::Result<Token
             &parameter.ty,
             quote! { ::pill_engine::mirror::slot(__args, #slot_index) },
             &binding,
-            &name,
+            &argument_name,
             owner.as_ref(),
         )?;
-        tags.push(lowered.tag);
-        names.push(name);
-        bindings.push(lowered.binding);
-        passes.push(lowered.pass);
+        argument_tags.push(lowered.tag);
+        argument_names.push(argument_name);
+        argument_bindings.push(lowered.binding);
+        argument_passes.push(lowered.pass);
     }
+    // Step 3: lower the result and choose how the function is called.
     let returned = lower_return(&signature.output, owner.as_ref())?;
 
     let (receiver_binding, call) = match (&owner, receiver) {
         (Some(owner), Receiver::None) => {
             let owner = &owner.ident;
-            (TokenStream2::new(), quote! { #owner::#ident(#(#passes),*) })
+            (
+                TokenStream2::new(),
+                quote! { #owner::#ident(#(#argument_passes),*) },
+            )
         }
         (Some(owner), Receiver::Ref) => {
             let owner = &owner.ident;
@@ -820,7 +880,7 @@ pub(crate) fn emit_function(function: MirroredFunction<'_>) -> syn::Result<Token
                     let __receiver = ::pill_engine::mirror::read_ref::<#owner>(
                         ::pill_engine::mirror::slot(__args, 0), "the receiver")?;
                 },
-                quote! { #owner::#ident(__receiver #(, #passes)*) },
+                quote! { #owner::#ident(__receiver #(, #argument_passes)*) },
             )
         }
         (Some(owner), Receiver::Mut) => {
@@ -830,7 +890,7 @@ pub(crate) fn emit_function(function: MirroredFunction<'_>) -> syn::Result<Token
                     let __receiver = ::pill_engine::mirror::read_mut::<#owner>(
                         ::pill_engine::mirror::slot(__args, 0), "the receiver")?;
                 },
-                quote! { #owner::#ident(__receiver #(, #passes)*) },
+                quote! { #owner::#ident(__receiver #(, #argument_passes)*) },
             )
         }
         (Some(owner), Receiver::Value) => {
@@ -840,12 +900,16 @@ pub(crate) fn emit_function(function: MirroredFunction<'_>) -> syn::Result<Token
                     let __receiver = <#owner as ::pill_engine::mirror::MirrorValue>::read_slot(
                         ::pill_engine::mirror::slot(__args, 0))?;
                 },
-                quote! { #owner::#ident(__receiver #(, #passes)*) },
+                quote! { #owner::#ident(__receiver #(, #argument_passes)*) },
             )
         }
-        (None, _) => (TokenStream2::new(), quote! { #ident(#(#passes),*) }),
+        (None, _) => (
+            TokenStream2::new(),
+            quote! { #ident(#(#argument_passes),*) },
+        ),
     };
 
+    // Step 4: build the body and emit the trampoline with its descriptor.
     let write = &returned.write;
     let body = match (returned.fallible, returned.has_value) {
         (false, false) => quote! { #call; },
@@ -865,19 +929,19 @@ pub(crate) fn emit_function(function: MirroredFunction<'_>) -> syn::Result<Token
     let symbol_literal = syn::LitStr::new(&symbol_name, ident.span());
     let name_literal = syn::LitStr::new(&ident.to_string(), ident.span());
     let return_tag = syn::LitStr::new(&returned.tag, ident.span());
-    let tag_literals = tags
+    let tag_literals = argument_tags
         .iter()
         .map(|tag| syn::LitStr::new(tag, Span::call_site()));
-    let name_literals = names
+    let name_literals = argument_names
         .iter()
         .map(|name| syn::LitStr::new(name, Span::call_site()));
     let receiver_tag = receiver.tag();
     let is_free_function = owner.is_none();
 
     // SAFETY: in the emitted body, the managed caller packs one slot per
-    // argument exactly as the descriptor's tags describe and reserves the
-    // result buffer the result's tag needs; every read and write below goes
-    // through `pill_engine::mirror`, which states that contract per encoding.
+    // argument as the descriptor's tags describe, and reserves a result buffer
+    // of the size the result's tag needs. Every read and write goes through
+    // `pill_engine::mirror`, which states that contract for each encoding.
     Ok(quote! {
         #[doc(hidden)]
         #[allow(unused_unsafe, unused_variables, non_snake_case, clippy::needless_borrow)]
@@ -885,7 +949,7 @@ pub(crate) fn emit_function(function: MirroredFunction<'_>) -> syn::Result<Token
             ::pill_engine::mirror::invoke(|| {
                 unsafe {
                     #receiver_binding
-                    #(#bindings)*
+                    #(#argument_bindings)*
                     #body
                 }
                 ::core::result::Result::Ok(())
@@ -920,7 +984,14 @@ pub(crate) fn qualified_name(ident: &syn::Ident) -> TokenStream2 {
 // =============================================================================
 
 /// Expand `#[pill_mirror_impl]` on an inherent `impl` block.
+///
+/// # Errors
+///
+/// Returns an error for a trait impl block, for a generic impl block, for a
+/// receiver type that is not a path, and for a marked method `emit_function`
+/// refuses.
 pub(crate) fn mirror_impl(impl_block: syn::ItemImpl) -> syn::Result<TokenStream2> {
+    // Step 1: refuse impl blocks that cannot be mirrored.
     if impl_block.trait_.is_some() {
         return Err(syn::Error::new_spanned(
             &impl_block,
@@ -933,6 +1004,7 @@ pub(crate) fn mirror_impl(impl_block: syn::ItemImpl) -> syn::Result<TokenStream2
             "`#[pill_mirror_impl]` does not support generic impl blocks",
         ));
     }
+    // Step 2: read the type the trampolines are named after.
     let owner_ident = match &*impl_block.self_ty {
         syn::Type::Path(path) => path
             .path
@@ -952,6 +1024,7 @@ pub(crate) fn mirror_impl(impl_block: syn::ItemImpl) -> syn::Result<TokenStream2
     };
     let type_name = qualified_name(&owner_ident);
 
+    // Step 3: emit one trampoline for each marked method.
     let mut emitted = Vec::new();
     for item in &impl_block.items {
         let syn::ImplItem::Fn(method) = item else {
@@ -988,6 +1061,11 @@ pub(crate) fn mirror_impl(impl_block: syn::ItemImpl) -> syn::Result<TokenStream2
 // =============================================================================
 
 /// Expand `#[pill_mirror_fn]` on a free function.
+///
+/// # Errors
+///
+/// Returns an error for a generic or `async` function, and for an argument or
+/// result the vocabulary refuses.
 pub(crate) fn mirror_fn(item: syn::ItemFn) -> syn::Result<TokenStream2> {
     let trampoline = emit_function(MirroredFunction {
         ident: &item.sig.ident,
@@ -1015,7 +1093,7 @@ struct TypeRow<'a> {
     name: proc_macro2::TokenStream,
     /// The owner kind it declares, as a path to the facade constant that names
     /// it - the same constant the host matches against.
-    kind: proc_macro2::TokenStream,
+    owner_kind: proc_macro2::TokenStream,
     /// `return_tag`.
     return_tag: String,
     /// `arg_tags`.
@@ -1023,18 +1101,18 @@ struct TypeRow<'a> {
     /// `arg_names`.
     arg_names: Vec<String>,
     /// The trampoline, when the row has one.
-    address: Option<syn::Ident>,
+    trampoline: Option<syn::Ident>,
 }
 
 /// Submit one type row.
 fn type_row(row: TypeRow<'_>) -> TokenStream2 {
     let type_name = qualified_name(row.ident);
     let name = row.name;
-    let kind = row.kind;
+    let owner_kind = row.owner_kind;
     let return_tag = row.return_tag;
     let arg_tags = row.arg_tags;
     let arg_names = row.arg_names;
-    let (symbol, address) = match &row.address {
+    let (symbol, address) = match &row.trampoline {
         Some(trampoline) => (
             trampoline.to_string(),
             quote! { ::pill_engine::component_registry::ExportAddress(#trampoline as *const ()) },
@@ -1056,7 +1134,7 @@ fn type_row(row: TypeRow<'_>) -> TokenStream2 {
                 arg_tags: &[#(#arg_tags),*],
                 arg_names: &[#(#arg_names),*],
                 receiver: "",
-                owner_kind: #kind,
+                owner_kind: #owner_kind,
                 address: #address,
             }
         }
@@ -1071,18 +1149,24 @@ fn type_row(row: TypeRow<'_>) -> TokenStream2 {
 #[derive(Default)]
 struct ObjectFlags {
     /// The type is an `Asset`: emit the asset store operations.
-    asset: bool,
+    is_asset: bool,
     /// The type is an `ImportedAsset`: emit the import operation.
-    import: bool,
+    is_imported_asset: bool,
     /// The type is a `StandaloneAsset`: emit the standalone import.
-    standalone: bool,
+    is_standalone_asset: bool,
     /// The type's pinned shared name, when it declares one: an `Asset` whose
     /// copies in several binaries are one column.
-    shared: Option<syn::LitStr>,
+    shared_name: Option<syn::LitStr>,
 }
 
 /// Parse the attribute's comma-separated flags and `shared = "..."` option.
+///
+/// # Errors
+///
+/// Returns an error for an unknown flag or option, for a `shared` value that is
+/// not a string, and for `shared` without `asset`.
 fn object_flags(attribute: TokenStream2) -> syn::Result<ObjectFlags> {
+    // Step 1: read each flag and each `shared = "..."` option.
     let mut flags = ObjectFlags::default();
     let parser = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated;
     let items = syn::parse::Parser::parse2(parser, attribute)?;
@@ -1095,9 +1179,9 @@ fn object_flags(attribute: TokenStream2) -> syn::Result<ObjectFlags> {
                 ));
             };
             match ident.to_string().as_str() {
-                "asset" => flags.asset = true,
-                "import" => flags.import = true,
-                "standalone" => flags.standalone = true,
+                "asset" => flags.is_asset = true,
+                "import" => flags.is_imported_asset = true,
+                "standalone" => flags.is_standalone_asset = true,
                 other => {
                     return Err(syn::Error::new_spanned(
                         ident,
@@ -1125,7 +1209,7 @@ fn object_flags(attribute: TokenStream2) -> syn::Result<ObjectFlags> {
             ));
         };
         match option_name.as_deref() {
-            Some("shared") => flags.shared = Some(shared_name.clone()),
+            Some("shared") => flags.shared_name = Some(shared_name.clone()),
             other => {
                 return Err(syn::Error::new_spanned(
                     &option.path,
@@ -1136,10 +1220,11 @@ fn object_flags(attribute: TokenStream2) -> syn::Result<ObjectFlags> {
             }
         }
     }
-    if (flags.import || flags.standalone) && !flags.asset {
-        flags.asset = true;
+    // Step 2: fill in the flags another flag implies, and check the pair.
+    if (flags.is_imported_asset || flags.is_standalone_asset) && !flags.is_asset {
+        flags.is_asset = true;
     }
-    if flags.shared.is_some() && !flags.asset {
+    if flags.shared_name.is_some() && !flags.is_asset {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "`shared` describes an `Asset`, so it goes with `asset`",
@@ -1150,18 +1235,26 @@ fn object_flags(attribute: TokenStream2) -> syn::Result<ObjectFlags> {
 
 /// Expand `#[pill_mirror_object]` on a struct or enum.
 ///
-/// The type crosses to C# as a box the managed side owns: a class whose
-/// methods are the `#[pill_mirror_impl]` ones, created by the functions that
-/// return the type, moved into the functions that take it by value, and
-/// dropped through the drop trampoline emitted here. With `asset` the type
-/// also gets the asset store operations the runtime's `AssetManager`
-/// extension methods reach (`__asset_add`, ...); `import` and `standalone`
-/// add the two import paths for an `ImportedAsset` or `StandaloneAsset`.
+/// C# holds the type as a box the managed side owns: a class whose methods are
+/// the `#[pill_mirror_impl]` ones. Functions that return the type create the
+/// box, functions that take it by value move it in, and the drop trampoline
+/// emitted here drops it.
 ///
-/// `shared = "my_crate::MyAsset"` pins the identity every binary's copy of an
-/// asset type is known by, and emits its `Asset` impl from it: the name, and
+/// With `asset`, the type also gets the asset store operations that the
+/// runtime's `AssetManager` extension methods call (`__asset_add`, ...).
+/// `import` and `standalone` add the two import paths, for an `ImportedAsset`
+/// or a `StandaloneAsset`.
+///
+/// `shared = "my_crate::MyAsset"` pins the identity that every binary's copy of
+/// an asset type is known by, and emits its `Asset` impl from it: the name and
 /// the identity hashed from that name at compile time.
+///
+/// # Errors
+///
+/// Returns an error for an item that is not a struct or an enum, for a generic
+/// type, and for an attribute `object_flags` refuses.
 pub(crate) fn mirror_object(attribute: TokenStream2, item: syn::Item) -> syn::Result<TokenStream2> {
+    // Step 1: read the flags and check the item they describe.
     let flags = object_flags(attribute)?;
     let (ident, generics) = match &item {
         syn::Item::Struct(item) => (&item.ident, &item.generics),
@@ -1180,30 +1273,31 @@ pub(crate) fn mirror_object(attribute: TokenStream2, item: syn::Item) -> syn::Re
         ));
     }
 
+    // Step 2: build the type row and one trampoline per asset operation.
     let drop_trampoline = format_ident!("pill_mirror_{}___drop", ident);
     let mut flag_names = Vec::new();
-    if flags.asset {
+    if flags.is_asset {
         flag_names.push("asset".to_string());
     }
-    if flags.import {
+    if flags.is_imported_asset {
         flag_names.push("import".to_string());
     }
-    if flags.standalone {
+    if flags.is_standalone_asset {
         flag_names.push("standalone".to_string());
     }
     let mut rows = vec![type_row(TypeRow {
         ident,
         name: quote! { ::pill_engine::component_registry::MIRROR_TYPE_ROW },
-        kind: quote! { ::pill_engine::component_registry::OWNER_KIND_OBJECT },
+        owner_kind: quote! { ::pill_engine::component_registry::OWNER_KIND_OBJECT },
         return_tag: String::new(),
         arg_tags: Vec::new(),
         arg_names: flag_names,
-        address: Some(drop_trampoline.clone()),
+        trampoline: Some(drop_trampoline.clone()),
     })];
     let mut trampolines = Vec::new();
 
     let mut operations: Vec<(&str, TokenStream2)> = Vec::new();
-    if flags.asset {
+    if flags.is_asset {
         operations.extend([
             ("add", quote! { add }),
             ("add_named", quote! { add_named }),
@@ -1215,10 +1309,10 @@ pub(crate) fn mirror_object(attribute: TokenStream2, item: syn::Item) -> syn::Re
             ("guid_of", quote! { guid_of }),
         ]);
     }
-    if flags.import {
+    if flags.is_imported_asset {
         operations.push(("import", quote! { import }));
     }
-    if flags.standalone {
+    if flags.is_standalone_asset {
         operations.push(("import_standalone", quote! { import_standalone }));
     }
     for (operation, function) in operations {
@@ -1237,19 +1331,20 @@ pub(crate) fn mirror_object(attribute: TokenStream2, item: syn::Item) -> syn::Re
         rows.push(type_row(TypeRow {
             ident,
             name: quote! { #row_name },
-            kind: quote! { ::pill_engine::component_registry::OWNER_KIND_OBJECT },
+            owner_kind: quote! { ::pill_engine::component_registry::OWNER_KIND_OBJECT },
             return_tag: String::new(),
             arg_tags: Vec::new(),
             arg_names: Vec::new(),
-            address: Some(trampoline),
+            trampoline: Some(trampoline),
         }));
     }
 
-    // The pinned identity, emitted only by the attribute that declares it: it
-    // is the contract that makes every binary's copy of the type one asset
-    // column, and its correct form (a name, hashed at compile time) is the
-    // same for every asset - so it is stated once, here, instead of per type.
-    let shared_identity = match &flags.shared {
+    // Step 3: emit the encodings, the pinned identity and all rows.
+    // The pinned identity is emitted only by the attribute that declares it.
+    // This is the contract that makes every binary's copy of the type one asset
+    // column. Its correct form is the same for every asset - a name, hashed at
+    // compile time - so it is stated once here instead of once per type.
+    let shared_identity = match &flags.shared_name {
         Some(name) => quote! {
             impl ::pill_engine::Asset for #ident {
                 fn shared_name() -> ::core::option::Option<&'static str> {
@@ -1257,10 +1352,10 @@ pub(crate) fn mirror_object(attribute: TokenStream2, item: syn::Item) -> syn::Re
                 }
 
                 fn shared_identity() -> ::core::option::Option<u128> {
-                    // A `const` item, not the trait's default: that would hash
-                    // the name on every `AssetManager` lookup, which the
-                    // renderer makes several times per drawn entity, every
-                    // frame. Bound here, it is folded at compile time.
+                    // A `const` item, not the trait's default. The default would
+                    // hash the name on every `AssetManager` lookup, and the
+                    // renderer makes several of those per drawn entity, every
+                    // frame. Bound here, the hash is folded at compile time.
                     const IDENTITY: u128 =
                         ::pill_engine::component::shared_component_identity(#name);
                     ::core::option::Option::Some(IDENTITY)
@@ -1321,14 +1416,20 @@ pub(crate) fn mirror_object(attribute: TokenStream2, item: syn::Item) -> syn::Re
 
 /// Expand `#[pill_mirror_resource("shared::Name")]` on a struct.
 ///
-/// Implements `Resource` with that shared name - the identity C# computes for
-/// the generated marker type - and declares the type, so its
-/// `#[pill_mirror_impl]` methods become extension methods on
-/// `Res<T>`/`ResMut<T>` and a mirrored function can take it as `&T`/`&mut T`.
+/// Implements `Resource` with that shared name, which is the identity C#
+/// computes for the generated marker type. It also declares the type, so its
+/// `#[pill_mirror_impl]` methods become extension methods on `Res<T>` and
+/// `ResMut<T>`, and a mirrored function can take it as `&T` or `&mut T`.
+///
+/// # Errors
+///
+/// Returns an error when the attribute is not a string literal, and when the
+/// item is not a non-generic struct.
 pub(crate) fn mirror_resource(
     attribute: TokenStream2,
     item: syn::Item,
 ) -> syn::Result<TokenStream2> {
+    // Step 1: read the shared name the attribute carries.
     let name: syn::LitStr = syn::parse2(attribute).map_err(|error| {
         syn::Error::new(
             error.span(),
@@ -1336,6 +1437,7 @@ pub(crate) fn mirror_resource(
              `#[pill_mirror_resource(\"my_crate::MyResource\")]`",
         )
     })?;
+    // Step 2: check that the item is a non-generic struct.
     let ident = match &item {
         syn::Item::Struct(item) if item.generics.params.is_empty() => &item.ident,
         other => {
@@ -1345,14 +1447,15 @@ pub(crate) fn mirror_resource(
             ))
         }
     };
+    // Step 3: emit the `Resource` impl and the type row.
     let row = type_row(TypeRow {
         ident,
         name: quote! { ::pill_engine::component_registry::MIRROR_TYPE_ROW },
-        kind: quote! { ::pill_engine::component_registry::OWNER_KIND_RESOURCE },
+        owner_kind: quote! { ::pill_engine::component_registry::OWNER_KIND_RESOURCE },
         return_tag: String::new(),
         arg_tags: Vec::new(),
         arg_names: vec![name.value()],
-        address: None,
+        trampoline: None,
     });
     Ok(quote! {
         #item
@@ -1373,7 +1476,7 @@ pub(crate) fn mirror_resource(
 
 /// The `MirrorValue` and `MirrorReturn` implementations of a value type.
 ///
-/// A slot carries the address of the value (it may be larger than a slot); a
+/// A slot carries the address of the value, which may be larger than a slot. A
 /// slice element and a result carry the value's own bytes.
 pub(crate) fn value_type_encodings(ident: &syn::Ident) -> TokenStream2 {
     quote! {
@@ -1413,9 +1516,15 @@ pub(crate) fn value_type_encodings(ident: &syn::Ident) -> TokenStream2 {
 
 /// Expand `#[derive(PillMirror)]` on a fieldless enum with an integer `repr`.
 ///
-/// The enum crosses as its discriminant; reading an unknown one is an error,
+/// The enum crosses as its discriminant. Reading an unknown one is an error,
 /// never a transmute. The `__type` row carries the representation and the
 /// variants, which the codegen turns into a C# `enum`.
+///
+/// # Errors
+///
+/// Returns an error for a generic type, for a `repr` that does not parse or is
+/// not an integer, for a variant that has fields, and for a discriminant that
+/// is not an integer literal.
 pub(crate) fn mirror_enum(
     input: &syn::DeriveInput,
     data: &syn::DataEnum,
@@ -1427,6 +1536,7 @@ pub(crate) fn mirror_enum(
             "`PillMirror` cannot be derived for a generic type",
         ));
     }
+    // Step 1: read the integer representation.
     let mut representation = None;
     for attribute in &input.attrs {
         if !attribute.path().is_ident("repr") {
@@ -1453,9 +1563,10 @@ pub(crate) fn mirror_enum(
     })?;
     let repr_type = syn::Ident::new(&representation, Span::call_site());
 
-    let mut names = Vec::new();
-    let mut values: Vec<i128> = Vec::new();
-    let mut next = 0i128;
+    // Step 2: collect the variants and their discriminants.
+    let mut variant_names = Vec::new();
+    let mut discriminant_values: Vec<i128> = Vec::new();
+    let mut next_discriminant_value = 0i128;
     for variant in &data.variants {
         if !matches!(variant.fields, syn::Fields::Unit) {
             return Err(syn::Error::new_spanned(
@@ -1463,19 +1574,24 @@ pub(crate) fn mirror_enum(
                 "a mirrored enum has fieldless variants only",
             ));
         }
-        let value = match &variant.discriminant {
-            None => next,
+        let discriminant = match &variant.discriminant {
+            None => next_discriminant_value,
             Some((_, expression)) => discriminant_value(expression)?,
         };
-        names.push(variant.ident.clone());
-        values.push(value);
-        next = value + 1;
+        variant_names.push(variant.ident.clone());
+        discriminant_values.push(discriminant);
+        next_discriminant_value = discriminant + 1;
     }
 
-    let arms = names.iter().zip(&values).map(|(name, value)| {
-        let literal = proc_macro2::Literal::i128_unsuffixed(*value);
-        quote! { #literal => ::core::result::Result::Ok(#ident::#name), }
-    });
+    // Step 3: emit the value encodings and the type row.
+    let arms =
+        variant_names
+            .iter()
+            .zip(&discriminant_values)
+            .map(|(variant_name, discriminant)| {
+                let literal = proc_macro2::Literal::i128_unsuffixed(*discriminant);
+                quote! { #literal => ::core::result::Result::Ok(#ident::#variant_name), }
+            });
     // SAFETY: in the emitted read, `at` is a slot or element the managed side
     // wrote for this enum, holding its representation's bytes.
     let read = quote! {
@@ -1490,11 +1606,14 @@ pub(crate) fn mirror_enum(
     let row = type_row(TypeRow {
         ident,
         name: quote! { ::pill_engine::component_registry::MIRROR_TYPE_ROW },
-        kind: quote! { ::pill_engine::component_registry::OWNER_KIND_ENUM },
+        owner_kind: quote! { ::pill_engine::component_registry::OWNER_KIND_ENUM },
         return_tag: representation.clone(),
-        arg_tags: values.iter().map(ToString::to_string).collect(),
-        arg_names: names.iter().map(ToString::to_string).collect(),
-        address: None,
+        arg_tags: discriminant_values
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        arg_names: variant_names.iter().map(ToString::to_string).collect(),
+        trampoline: None,
     });
     Ok(quote! {
         // SAFETY: the discriminant is read as the declared representation and
@@ -1513,7 +1632,8 @@ pub(crate) fn mirror_enum(
             }
         }
 
-        // SAFETY: the discriminant, as the declared representation.
+        // SAFETY: the discriminant is written as its declared representation,
+        // into the bytes the managed side reserved for this type.
         unsafe impl ::pill_engine::mirror::MirrorReturn for #ident {
             unsafe fn write_return(self, ret: *mut u8) {
                 unsafe { ::pill_engine::mirror::write(ret, self as #repr_type) }
@@ -1525,6 +1645,11 @@ pub(crate) fn mirror_enum(
 }
 
 /// The value of a literal (possibly negated) enum discriminant.
+///
+/// # Errors
+///
+/// Returns an error when the expression is not an integer literal, optionally
+/// negated or in parentheses.
 fn discriminant_value(expression: &syn::Expr) -> syn::Result<i128> {
     match expression {
         syn::Expr::Lit(syn::ExprLit {
@@ -1543,6 +1668,10 @@ fn discriminant_value(expression: &syn::Expr) -> syn::Result<i128> {
         )),
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

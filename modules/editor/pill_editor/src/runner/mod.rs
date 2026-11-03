@@ -1,5 +1,5 @@
-//! Native editor executable: the egui frontend's frame loop, window and
-//! device.
+//! The native editor executable: the egui frontend's frame loop, its window
+//! and its GPU device.
 //!
 //! # Responsibilities
 //!
@@ -17,12 +17,13 @@
 //!
 //! # Design
 //!
-//! The window redraws on request - every presented frame asks for the next,
-//! so the engine steps while the window is visible and the compositor idles a
-//! hidden one. The shell boundary is plain data in the world (the shared
+//! The window redraws only when asked to. Input, a changed editor snapshot, a
+//! resize, or something moving draws the next frame at once; an idle editor
+//! waits for the periodic poll instead of drawing. The boundary between this
+//! executable and the shell module is plain data in the world (the shared
 //! `pill_editor_core::boundary` resources), so the frontend and the reloadable
-//! shell module never share a type that could dangle across a reload, and with
-//! no shell module loaded the runner draws a minimal egui fallback of its own.
+//! shell never share a type that could dangle across a reload. When no shell
+//! module is loaded, the runner draws a small egui UI of its own.
 
 // Standard library
 use std::sync::Arc;
@@ -105,6 +106,19 @@ use crate::frontend::EditorError;
 use crate::overlay::OverlayMode;
 use crate::overlay::OverlaySurface;
 use crate::test_channel::{self, TestChannel};
+// The window's state and the helper types its methods take, imported here so
+// the method modules read them through `use super::*`.
+use editor_window::{EditorWindow, FontSource, ScriptedDrag, ScriptedDragStage};
+
+// One module per concern: the asset pipeline, the window's state, the frame,
+// the scripted channel, the transform gizmo and the windows. The window's
+// state itself stays in this file.
+mod assets_pipeline;
+mod editor_window;
+mod frame;
+mod scripted_channel;
+mod transform_gizmo;
+mod windows;
 
 // =============================================================================
 // Constants
@@ -113,21 +127,110 @@ use crate::test_channel::{self, TestChannel};
 /// The environment variable that forces the window-surface posture.
 pub const NO_OVERLAY_ENV: &str = "PILL_EDITOR_NO_OVERLAY";
 
+/// The shell module's crate name - the editor-only module's convention.
+const SHELL_MODULE_NAME: &str = "pill_editor_shell_egui_editor";
+
+/// The window's initial size in logical pixels.
+const INITIAL_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 800.0);
+
+/// The window's minimum size in logical pixels: the dock's minimum layout
+/// plus room for the menu bar, so a drag of the window's edge cannot leave the
+/// panels unusable.
+const MINIMUM_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(960.0, 600.0);
+
+/// The scene view's initial size in logical pixels.
+const INITIAL_SCENE_SIZE: LogicalSize<f64> = LogicalSize::new(640.0, 480.0);
+
+/// A popped-out tab window's initial size in logical pixels: tall and narrow
+/// enough for the Inspector and the Assets panel, and the person resizes it
+/// from there.
+const POPOUT_INITIAL_SIZE: LogicalSize<f64> = LogicalSize::new(520.0, 720.0);
+
+/// The scene view's rectangle before the shell reports its first scene rect:
+/// the center of the dock's default layout, in logical pixels. The measured
+/// rect replaces it on the first frame.
+const SCENE_DEFAULT_TOP_MARGIN: f64 = 32.0;
+const SCENE_DEFAULT_MARGIN: f64 = 4.0;
+
+/// How much of each new frame goes into the displayed FPS. The rest is the
+/// running average, so the number moves smoothly.
+const FPS_SMOOTHING: f32 = 0.1;
+
+/// The gizmo's handle length as a fraction of the camera distance. This keeps
+/// the handles the same size on screen at any distance.
+const GIZMO_SCREEN_FRACTION: f32 = 0.18;
+
+/// Where along a straight handle the scripted grab presses it, as a
+/// fraction of its length.
+const GIZMO_PRESS_FRACTION: f32 = 0.92;
+
+/// Frames between the run's own frame-rate heartbeats, for the person reading
+/// the log.
+const FRAME_HEARTBEAT_FRAMES: u64 = 210;
+
+/// The wall-clock backstop for the same heartbeat, so a slow posture still
+/// reports inside a measurement window.
+const FRAME_HEARTBEAT_SECONDS: f32 = 2.0;
+
+/// Frames between gizmo anchor logs while the handle layout stands still.
+const GIZMO_HEARTBEAT_FRAMES: u64 = 210;
+
+/// How far the axis constraint guide reaches on both sides of the gizmo, as
+/// a fraction of the handle length. It is long enough to run past the edge of
+/// any view.
+const GIZMO_GUIDE_SPAN: f32 = 200.0;
+
+/// The default radius around a handle that the hover test uses, as a fraction
+/// of the handle length. It is about as wide as the line the overlay draws.
+/// The preferences' `editor.gizmo_hit_radius` overrides it, and the hover and
+/// the press both read the one value.
+const GIZMO_HIT_RADIUS_DEFAULT: f32 = preferences::GIZMO_HIT_RADIUS_DEFAULT;
+
+/// One dash (and one gap) of the translation displacement line, as a
+/// fraction of the handle length.
+const GIZMO_DASH: f32 = 0.05;
+
+/// Frames between periodic asset-listing refreshes. A file command refreshes
+/// the listing at once instead of waiting for this cadence.
+const ASSET_REFRESH_FRAMES: u64 = 120;
+
+/// Frames between checks of whether the recovery document's key changed, so
+/// the document is written at most once in that many frames instead of every
+/// frame.
+const RECOVERY_AUTOSAVE_FRAMES: u64 = 120;
+
+/// Frames between unconditional re-reads of the editor's state files - the
+/// theme's layers poll on it, and the watchers in
+/// [`pill_editor_core::state_watch`] do.
+const STATE_FILE_POLL_FRAMES: u64 = pill_editor_core::state_watch::STATE_FILE_POLL_FRAMES;
+
+/// How many asset rows the listing keeps, before the frame adds the module
+/// group rows on top.
+const ASSET_ROWS_MAX: usize = 256;
+
+/// The format the editor draws in. The overlay's swapchain and egui's renderer
+/// must both use it, and it is one the composition swapchains offer.
+const EDITOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
+
+// =============================================================================
+// Overlay Surface
+// =============================================================================
+
 /// Whether [`NO_OVERLAY_ENV`] asks for the window-surface posture.
 ///
-/// The switch, like the continuous-redraw one, is on for anything but an empty
-/// string or `0`, so `PILL_EDITOR_NO_OVERLAY=1` in a shell is enough.
+/// As with the continuous-redraw switch, any value except an empty string or
+/// `0` turns this on, so `PILL_EDITOR_NO_OVERLAY=1` in a shell is enough.
 fn no_overlay_requested() -> bool {
     std::env::var(NO_OVERLAY_ENV)
         .map(|value| !value.is_empty() && value != "0")
         .unwrap_or(false)
 }
 
-/// Build the UI's surface in the posture the editor starts in.
+/// Build the UI surface for the posture the editor starts in.
 ///
-/// The composition overlay is the normal one and the window surface is the
-/// fallback: a refusal is logged once and the editor keeps running, with the
-/// UI on the window's own surface.
+/// The composition overlay is the normal case and the window's own surface is
+/// the fallback. A refusal is logged once and the editor keeps running, with
+/// the UI on the window surface.
 fn create_overlay(
     no_overlay: bool,
     instance: &wgpu::Instance,
@@ -185,97 +288,6 @@ fn create_window_overlay(
     }
 }
 
-/// The shell module's crate name - the editor-only module's convention.
-const SHELL_MODULE_NAME: &str = "pill_editor_shell_egui_editor";
-
-/// The window's initial size in logical pixels.
-const INITIAL_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 800.0);
-
-/// The window's minimum size in logical pixels: the dock's minimum layout
-/// plus room for the menu bar, so a drag of the window's edge cannot leave the
-/// panels unusable.
-const MINIMUM_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(960.0, 600.0);
-
-/// The scene view's initial size in logical pixels.
-const INITIAL_SCENE_SIZE: LogicalSize<f64> = LogicalSize::new(640.0, 480.0);
-
-/// A popped-out tab window's initial size in logical pixels: tall and narrow
-/// enough for the Inspector and the Assets panel, and the person resizes it
-/// from there.
-const POPOUT_INITIAL_SIZE: LogicalSize<f64> = LogicalSize::new(520.0, 720.0);
-
-/// The scene views' surface ids: view `n` draws through surface `n + 1`, so
-/// each view keeps its surface however many views the person opens. Surface
-/// 0 is the renderer's primary, which the game window carries.
-fn scene_surface(view: usize) -> SurfaceId {
-    SurfaceId(1 + view as u32)
-}
-
-/// The scene view's rectangle before the shell's first scene rect arrives:
-/// the dock's default layout's center, in logical pixels. The shell's
-/// measured scene rect replaces it on the first frame.
-const SCENE_DEFAULT_TOP_MARGIN: f64 = 32.0;
-const SCENE_DEFAULT_MARGIN: f64 = 4.0;
-
-/// How much of each new frame feeds the displayed FPS, the rest being the
-/// running average.
-const FPS_SMOOTHING: f32 = 0.1;
-
-/// The gizmo's handle length as a fraction of the camera distance: a
-/// constant screen size that neither shrinks away nor swallows the scene.
-const GIZMO_SCREEN_FRACTION: f32 = 0.18;
-
-/// Where along a straight handle the scripted grab presses it, as a
-/// fraction of its length.
-const GIZMO_PRESS_FRACTION: f32 = 0.92;
-
-/// Frames between the run's own frame-rate heartbeats, for the person reading
-/// the log.
-const FRAME_HEARTBEAT_FRAMES: u64 = 210;
-
-/// The wall-clock backstop for the same heartbeat, so a slow posture still
-/// reports inside a measurement window.
-const FRAME_HEARTBEAT_SECONDS: f32 = 2.0;
-
-/// Frames between gizmo anchor logs while the handle layout stands still.
-const GIZMO_HEARTBEAT_FRAMES: u64 = 210;
-
-/// How far the axis constraint guide reaches on both sides of the gizmo, as
-/// a fraction of the handle length: long enough to leave any view.
-const GIZMO_GUIDE_SPAN: f32 = 200.0;
-
-/// The hover test's default radius around a handle, as a fraction of the
-/// handle length: roughly the width the overlay draws a line with. The
-/// preferences' `editor.gizmo_hit_radius` overrides it, and both the hover
-/// and the press read the one value.
-const GIZMO_HIT_RADIUS_DEFAULT: f32 = preferences::GIZMO_HIT_RADIUS_DEFAULT;
-
-/// One dash (and one gap) of the translation displacement line, as a
-/// fraction of the handle length.
-const GIZMO_DASH: f32 = 0.05;
-
-/// Frames between periodic asset-listing walks; a file command refreshes
-/// the listing at once instead of waiting for the cadence.
-const ASSET_REFRESH_FRAMES: u64 = 120;
-
-/// Frames between recovery-document writes when nothing it watches changed:
-/// a slow cadence that still lands an arrangement the key cannot see, without
-/// rewriting the file every frame.
-const RECOVERY_AUTOSAVE_FRAMES: u64 = 120;
-
-/// Frames between unconditional re-reads of the editor's state files - the
-/// theme's layers poll on it, and the watchers in
-/// [`pill_editor_core::state_watch`] do.
-const STATE_FILE_POLL_FRAMES: u64 = pill_editor_core::state_watch::STATE_FILE_POLL_FRAMES;
-
-/// How many walked asset rows the listing keeps, before the module group
-/// rows the frame adds on top.
-const ASSET_ROWS_MAX: usize = 256;
-
-/// The editor's format: the overlay's swapchain and egui's renderer must
-/// share it, and composition swapchains offer it.
-const EDITOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
-
 // =============================================================================
 // Run
 // =============================================================================
@@ -284,13 +296,18 @@ const EDITOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 ///
 /// `log_buffer` is the console's capture ring: every frame the editor folds
 /// the lines it has not seen into the Console tab's history.
+///
+/// # Errors
+///
+/// Returns [`EditorError::EventLoopCreation`] when the platform refuses the
+/// event loop, and [`EditorError::EventLoopRun`] when running it fails.
 pub fn run(log_buffer: pill_core::telemetry::capture::LogBuffer) -> Result<(), EditorError> {
     let event_loop =
         EventLoop::new().map_err(|source| EditorError::EventLoopCreation { source })?;
     let mut application = EditorApplication {
-        window: None,
+        editor_window: None,
         log_buffer,
-        timer: WakeTimer::new(),
+        wake_timer: WakeTimer::new(),
     };
     event_loop
         .run_app(&mut application)
@@ -300,85 +317,23 @@ pub fn run(log_buffer: pill_core::telemetry::capture::LogBuffer) -> Result<(), E
 /// The `winit` application: one editor window, created on resume.
 struct EditorApplication {
     /// The window and its host, once the loop resumed.
-    window: Option<EditorWindow>,
+    editor_window: Option<EditorWindow>,
     /// The telemetry capture ring the window's Console tab reads.
     log_buffer: pill_core::telemetry::capture::LogBuffer,
     /// The loop's timed wake, when the last frame asked for one.
-    timer: WakeTimer,
-}
-
-/// The loop's timed wake: the moment the next frame is owed.
-///
-/// `std::time::Instant` is the type `ControlFlow::WaitUntil` takes; this
-/// frontend is native-only, so the platform clock's web-safety rule does not
-/// reach here (the deadline itself is never compared across targets).
-#[allow(clippy::disallowed_types)]
-struct WakeTimer {
-    /// When the loop must wake, when it is waiting for a deadline.
-    deadline: Option<std::time::Instant>,
-}
-
-#[allow(clippy::disallowed_types)]
-impl WakeTimer {
-    /// A timer with nothing scheduled.
-    fn new() -> Self {
-        Self { deadline: None }
-    }
-
-    /// Schedule the next wake `after` from now.
-    fn schedule(&mut self, after: Duration) {
-        self.deadline = Some(std::time::Instant::now() + after);
-    }
-
-    /// Forget any scheduled wake: something asked for a frame now.
-    fn clear(&mut self) {
-        self.deadline = None;
-    }
-
-    /// Whether the deadline has passed, clearing it when it has.
-    fn take_due(&mut self) -> bool {
-        let Some(deadline) = self.deadline else {
-            return false;
-        };
-        if std::time::Instant::now() >= deadline {
-            self.deadline = None;
-            return true;
-        }
-        false
-    }
-
-    /// What the loop should do until the next event.
-    fn control_flow(&self) -> ControlFlow {
-        match self.deadline {
-            Some(deadline) => ControlFlow::WaitUntil(deadline),
-            None => ControlFlow::Wait,
-        }
-    }
-}
-
-/// Owes the loop one frame now: the timer off, a redraw asked for, and the
-/// loop waiting for whatever asks next.
-///
-/// This is the one statement of the wake rule. `window_event` owes a frame
-/// twice - once for a dropped file, which skips the rest of the walk, and once
-/// at the tail for everything else - and both answer here, so a changed rule
-/// (a delayed wake, a second window) changes in one place.
-fn owe_frame(editor: &EditorWindow, timer: &mut WakeTimer, event_loop: &ActiveEventLoop) {
-    timer.clear();
-    editor.window.request_redraw();
-    event_loop.set_control_flow(ControlFlow::Wait);
+    wake_timer: WakeTimer,
 }
 
 impl ApplicationHandler for EditorApplication {
     /// Create the editor window on the first resume.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.editor_window.is_some() {
             return;
         }
         match EditorWindow::open(event_loop, self.log_buffer.clone()) {
             Ok(window) => {
                 window.window.request_redraw();
-                self.window = Some(window);
+                self.editor_window = Some(window);
             }
             Err(error) => {
                 pill_core::error!(
@@ -391,18 +346,19 @@ impl ApplicationHandler for EditorApplication {
         }
     }
 
-    /// Route the window events: main-window frames drive everything, the
-    /// scene and game child windows contribute their own input to the
-    /// engine.
+    /// Handle one window event: only the main window draws frames, while the
+    /// scene and game child windows report input.
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(editor) = &mut self.window else {
+        let Some(editor) = &mut self.editor_window else {
             return;
         };
+        // Step 1: Find which of the editor's windows sent the event. An event
+        // from a window the editor did not create is dropped.
         let is_main = window_id == editor.window.id();
         let child_view = editor.views.iter().position(|view| {
             view.as_ref()
@@ -412,9 +368,8 @@ impl ApplicationHandler for EditorApplication {
             .game_surface
             .as_ref()
             .is_some_and(|game| game.window.id() == window_id);
-        // A popped-out tab's window: its events are its own
-        // pass's, never the main window's - a click in it lands at that
-        // window's coordinates.
+        // A popped-out tab's window belongs to that tab's own egui pass, never
+        // to the main window: a click in it uses that window's coordinates.
         let popout_tab = editor
             .popouts
             .iter()
@@ -423,8 +378,8 @@ impl ApplicationHandler for EditorApplication {
         if !is_main && child_view.is_none() && !is_game && popout_tab.is_none() {
             return;
         }
-        // A popped-out window only needs its own resize and close handling
-        // here; its redraws ride the main window's frame.
+        // Step 2: Give a popped-out tab's window its own resize and close
+        // handling. Its redraws ride the main window's frame.
         if let Some(tab) = &popout_tab {
             match &event {
                 WindowEvent::Resized(size) => {
@@ -440,6 +395,8 @@ impl ApplicationHandler for EditorApplication {
                 _ => {}
             }
         }
+        // Step 3: Handle the event itself - drawing, resizing, or turning
+        // input into the engine's events.
         let redraw_request = matches!(event, WindowEvent::RedrawRequested);
         match event {
             WindowEvent::CloseRequested => {
@@ -458,17 +415,17 @@ impl ApplicationHandler for EditorApplication {
                         } else {
                             match editor.next_wake() {
                                 FrameWake::Immediate => {
-                                    self.timer.clear();
+                                    self.wake_timer.clear();
                                     editor.window.request_redraw();
                                 }
                                 FrameWake::After(delay) => {
                                     // The loop sleeps instead of drawing:
                                     // input still wakes it, and the deadline
                                     // covers the host's own changes.
-                                    self.timer.schedule(delay);
+                                    self.wake_timer.schedule(delay);
                                 }
                             }
-                            event_loop.set_control_flow(self.timer.control_flow());
+                            event_loop.set_control_flow(self.wake_timer.control_flow());
                         }
                     }
                     Err(error) => {
@@ -500,8 +457,8 @@ impl ApplicationHandler for EditorApplication {
                 }
             }
             WindowEvent::Focused(focused) => {
-                // A window losing focus takes every press with it: no
-                // release is coming, so no interaction may stay in flight.
+                // A window that loses focus will not report the matching
+                // release, so no interaction may stay in progress.
                 if !focused {
                     editor.cancel_interactions("focus lost");
                 }
@@ -524,11 +481,11 @@ impl ApplicationHandler for EditorApplication {
                 if let WindowEvent::KeyboardInput { event, .. } = &other {
                     editor.gizmo_shortcut(event);
                 }
-                // A file dragged in from the OS: every
-                // editor window reports it - the scene views must not swallow
-                // the drop - and the executable is what turns it into an
-                // import. These events carry no pointer or key state, so they
-                // are handled here and the rest of the walk is skipped.
+                // A file dragged in from the OS. Every editor window reports
+                // it, so the scene views cannot hide the drop, and the
+                // executable turns it into an import. These events carry no
+                // pointer or key state, so they are handled here and the rest
+                // of this handler is skipped.
                 let mut handled = false;
                 match &other {
                     WindowEvent::HoveredFile(path) => {
@@ -547,14 +504,14 @@ impl ApplicationHandler for EditorApplication {
                 }
                 if handled {
                     if editor.demand.any() {
-                        owe_frame(editor, &mut self.timer, event_loop);
+                        owe_frame(editor, &mut self.wake_timer, event_loop);
                     }
                     return;
                 }
                 // A release over the editor's own UI still finishes a gizmo
-                // drag or a navigation that left its viewport's window: no
-                // pointer capture is platform-independent, so the release
-                // is honoured wherever it lands.
+                // drag or a navigation that left its viewport's window.
+                // Pointer capture is not available on every platform, so the
+                // release is accepted wherever it arrives.
                 if let WindowEvent::MouseInput { state, button, .. } = &other {
                     if is_main
                         && *button == winit::event::MouseButton::Left
@@ -570,21 +527,20 @@ impl ApplicationHandler for EditorApplication {
                 // The scene and game windows' pointer positions are relative
                 // to their own client areas, while the engine - which also
                 // feeds the shell's egui pass - works in the main window's
-                // client coordinates. The window's placed origin bridges the
-                // two, so hovering and clicking the overlay strip works.
+                // client coordinates. The window's placed origin converts one
+                // into the other, so hovering and clicking the overlay strip
+                // works.
                 let origin = match child_view {
                     Some(view) => editor.view_origin(view),
                     None if is_game => editor.game_origin(),
                     None => (0.0, 0.0),
                 };
-                // The focus rule: the game's window is the
-                // game's, so its events become the engine's input and the
-                // shell never sees them. The editor's own windows - the main
-                // one and the scene views - are the UI's: their events feed
-                // the shell, and a project system never receives a keystroke
-                // meant for the Inspector. A popped-out tab's window is its
-                // own pass's: its events go to that tab's
-                // record and no further.
+                // The focus rule: an event from the game's window becomes the
+                // engine's input and never reaches the shell. An event from
+                // the editor's own windows (the main window and the scene
+                // views) goes to the shell, so a project system never receives
+                // a keystroke meant for the Inspector. A popped-out tab's
+                // window belongs to that tab and goes no further.
                 for event in translate_window_event(&other) {
                     let event = offset_pointer(event, origin);
                     if let Some(tab) = &popout_tab {
@@ -605,44 +561,97 @@ impl ApplicationHandler for EditorApplication {
                         }
                     }
                 }
-                // Input is why a waiting loop wakes: the
-                // event itself asks for the frame that consumes it.
+                // Input is what wakes a waiting loop: the event asks for the
+                // frame that consumes it.
                 editor.demand.input = true;
             }
         }
-        // A frame is owed as soon as anything here happened; a redraw request
-        // already is one.
+        // Step 4: Ask for the frame that consumes what happened. A redraw
+        // request already is one.
         if editor.demand.any() && !redraw_request {
-            owe_frame(editor, &mut self.timer, event_loop);
+            owe_frame(editor, &mut self.wake_timer, event_loop);
         }
     }
 
-    /// The loop is about to sleep: wake the editor when its deadline passed.
+    /// Run before the loop sleeps: wake the editor if its deadline has passed.
     ///
     /// The timed wake is what keeps an idle editor's Console tab and notices
     /// current without drawing frames the display never sees.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.timer.take_due() {
-            if let Some(editor) = &mut self.window {
+        if self.wake_timer.take_due() {
+            if let Some(editor) = &mut self.editor_window {
                 editor.window.request_redraw();
             }
         }
-        event_loop.set_control_flow(self.timer.control_flow());
+        event_loop.set_control_flow(self.wake_timer.control_flow());
     }
 }
 
-// The frame's phases, the scripted channel and the asset pipeline,
-// one module each: the state stays in this module.
-mod assets_pipeline;
-mod editor_window;
-mod frame;
-mod scripted_channel;
-mod transform_gizmo;
-mod windows;
+/// The loop's timed wake: the moment the next frame is owed.
+///
+/// `std::time::Instant` is the type `ControlFlow::WaitUntil` takes. This
+/// frontend is native-only, so the platform clock's rule for the web does not
+/// apply here: the deadline is never compared across targets.
+#[allow(clippy::disallowed_types)]
+struct WakeTimer {
+    /// When the loop must wake, when it is waiting for a deadline.
+    deadline: Option<std::time::Instant>,
+}
 
-// The window's state and its constructor, re-exported so the method
-// modules above read them through `use super::*`.
-use editor_window::{EditorWindow, FontSource, ScriptedDrag, ScriptedDragStage};
+#[allow(clippy::disallowed_types)]
+impl WakeTimer {
+    /// A timer with nothing scheduled.
+    fn new() -> Self {
+        Self { deadline: None }
+    }
+
+    /// Schedule the next wake `delay` from now.
+    fn schedule(&mut self, delay: Duration) {
+        self.deadline = Some(std::time::Instant::now() + delay);
+    }
+
+    /// Forget any scheduled wake: something asked for a frame now.
+    fn clear(&mut self) {
+        self.deadline = None;
+    }
+
+    /// Whether the deadline has passed, clearing it when it has.
+    fn take_due(&mut self) -> bool {
+        let Some(deadline) = self.deadline else {
+            return false;
+        };
+        if std::time::Instant::now() >= deadline {
+            self.deadline = None;
+            return true;
+        }
+        false
+    }
+
+    /// What the loop should do until the next event.
+    fn control_flow(&self) -> ControlFlow {
+        match self.deadline {
+            Some(deadline) => ControlFlow::WaitUntil(deadline),
+            None => ControlFlow::Wait,
+        }
+    }
+}
+
+/// Ask for one frame now: clear the wake timer, request a redraw, and leave
+/// the loop waiting for whatever asks next.
+///
+/// This is the only place that says what asking for a frame means.
+/// `window_event` asks in two spots - once for a dropped file, which returns
+/// early, and once at the end for everything else - and both come here, so the
+/// rule changes in one place.
+fn owe_frame(
+    editor_window: &EditorWindow,
+    wake_timer: &mut WakeTimer,
+    event_loop: &ActiveEventLoop,
+) {
+    wake_timer.clear();
+    editor_window.window.request_redraw();
+    event_loop.set_control_flow(ControlFlow::Wait);
+}
 
 // =============================================================================
 // EditorWindow
@@ -658,15 +667,13 @@ impl EditorWindow {
         camera::navigation_binding(self.keymap, button, self.modifiers)
     }
 
-    /// Ask what is under a left press, while the button is held: a handle the
-    /// hover test names starts its drag in this same press, and only a miss
-    /// queues the object pick.
+    /// Handle a left press: a handle under the pointer starts its drag in this
+    /// same press, and only a miss queues the object pick.
     ///
-    /// The CPU test answers first: the pick's answer arrives a frame
-    /// later and only covers a couple of pixels, so a handle that highlighted
-    /// under the pointer could lose the press to the pick and clear the
-    /// selection. One hitbox, read by the hover and the press alike, is what
-    /// keeps the highlight and the grab in agreement.
+    /// The CPU hit test answers first because the pick's answer arrives a frame
+    /// later. Without it, a handle highlighted under the pointer could lose the
+    /// press to the pick, which would clear the selection. The hover and the
+    /// press read the same hitbox, so the highlight and the grab always agree.
     fn press_scene(&mut self, view: usize, x: f32, y: f32) {
         if self.gizmo_drag.is_none() {
             if let Some(handle) = self.handle_at(view, x, y) {
@@ -691,7 +698,7 @@ impl EditorWindow {
             view,
             x: physical_x as f32,
             y: physical_y as f32,
-            id,
+            request_id: id,
         });
         info!(
             target: telemetry_target::ENGINE,
@@ -731,7 +738,7 @@ impl EditorWindow {
         self.camera_drag = Some(CameraDrag {
             view,
             navigation,
-            last: start,
+            last_point: start,
         });
         info!(
             target: telemetry_target::ENGINE,
@@ -741,22 +748,22 @@ impl EditorWindow {
         );
     }
 
-    /// Apply one navigation move: the pixel delta since the last move goes
-    /// through the gesture's own clamped math.
+    /// Apply one navigation move. The pixel delta since the last move is
+    /// applied through the gesture's own limits.
     fn update_camera_navigation(&mut self, point: (f32, f32)) {
         let Some(mut drag) = self.camera_drag.take() else {
             return;
         };
-        let (delta_x, delta_y) = (point.0 - drag.last.0, point.1 - drag.last.1);
-        drag.last = point;
+        let (delta_x, delta_y) = (point.0 - drag.last_point.0, point.1 - drag.last_point.1);
+        drag.last_point = point;
         self.apply_camera_gesture(drag.view, drag.navigation, delta_x, delta_y);
         if self.camera_drag.is_none() {
             self.camera_drag = Some(drag);
         }
     }
 
-    /// Move one view's camera by a gesture's pixel delta; the drags and the
-    /// scripted channel both land here.
+    /// Move one view's camera by a gesture's pixel delta. The mouse drags and
+    /// the scripted channel both call this.
     fn apply_camera_gesture(
         &mut self,
         view: usize,
@@ -768,7 +775,7 @@ impl EditorWindow {
             return;
         }
         let (_, height) = self.scene_pixel_size(view).unwrap_or((1.0, 1.0));
-        let fov = CameraComponent::default()
+        let vertical_fov_radians = CameraComponent::default()
             .vertical_fov
             .clamp(1.0, 179.0)
             .to_radians();
@@ -776,7 +783,8 @@ impl EditorWindow {
         match navigation {
             CameraNavigation::Orbit => camera.orbit(delta_x, delta_y),
             CameraNavigation::Pan => {
-                let world_per_pixel = 2.0 * camera.distance * (fov * 0.5).tan() / height.max(1.0);
+                let world_per_pixel =
+                    2.0 * camera.distance * (vertical_fov_radians * 0.5).tan() / height.max(1.0);
                 camera.pan(delta_x, delta_y, world_per_pixel);
             }
             CameraNavigation::Dolly => camera.dolly(delta_y),
@@ -810,9 +818,9 @@ impl EditorWindow {
         );
     }
 
-    /// The hovered handle from the pointer's ray, against the handles the
-    /// last frame drew. The radius follows the handle length, so it reads
-    /// like the drawn line rather than a fixed world distance, and the
+    /// Update the hovered handle from the pointer's ray, tested against the
+    /// handles the last frame drew. The radius follows the handle length, so it
+    /// matches the drawn line rather than a fixed world distance, and the
     /// preference scales it.
     fn update_hover(&mut self, view: usize, point: (f32, f32)) {
         if self.gizmo_drag.is_some() || self.camera_drag.is_some() {
@@ -874,9 +882,9 @@ impl EditorWindow {
         }
     }
 
-    /// Whether a scene view's pointer is over one of the overlay's chips:
-    /// its child-local physical pixels mapped into the main window's
-    /// logical points, which is where the shell reported the chips.
+    /// Whether a scene view's pointer is over one of the overlay's chips. The
+    /// pointer's child-local pixels are mapped into the main window's logical
+    /// points, because that is where the shell reported the chips.
     fn scene_point_is_ui(&self, view: usize) -> bool {
         let Some((x, y)) = self.scene_cursor[view] else {
             return false;
@@ -914,9 +922,9 @@ impl EditorWindow {
         None
     }
 
-    /// Queue one pick at an explicit surface pixel and return its id,
-    /// leaving the answer to [`Self::drain_scene_picks`]: the shared half of
-    /// the click pick and the scripted gizmo grab.
+    /// Queue one pick at an explicit surface pixel and return its id. The
+    /// answer arrives in [`Self::drain_scene_picks`]. This is the half the
+    /// click pick and the scripted gizmo grab share.
     fn queue_scene_pick_at(&mut self, view: usize, x: u32, y: u32) -> Option<u64> {
         self.views.get(view)?.as_ref()?;
         let world = self.host.host_mut().engine_mut().world_mut();
@@ -927,26 +935,27 @@ impl EditorWindow {
         Some(requests.request(scene_surface(view), x, y))
     }
 
-    /// Apply the answers to scene picks: an entity moves the shared selection
-    /// onto it, empty space clears the selection, and a handle starts a gizmo
-    /// drag. The outline follows from the selection, and the handles from it,
-    /// on the next publish.
+    /// Apply the answers to scene picks. An entity moves the shared selection
+    /// to it, empty space clears the selection, and a handle starts a gizmo
+    /// drag. The next publish derives the outline and the handles from the new
+    /// selection.
     fn drain_scene_picks(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
-        let Some(results) = world.get_resource_mut::<PickResults>() else {
+        let Some(pick_results_resource) = world.get_resource_mut::<PickResults>() else {
             return;
         };
-        let results = results.take();
+        let pick_results = pick_results_resource.take();
         // A handle press starts a drag through methods that borrow all of
-        // `self`, while the world borrow below is still alive; it is
-        // collected here and acted on once that borrow ends: the view, the
-        // handle, the press pixel and the scripted delta.
+        // `self`, but the world borrow below is still alive here. The press is
+        // collected into this tuple and acted on once the borrow ends. The
+        // tuple is the view, the handle, the press pixel and the scripted
+        // delta.
         type HandlePress = (usize, u32, f32, f32, Option<(f32, f32)>);
         let mut handle_press: Option<HandlePress> = None;
-        for result in results {
-            // A scripted press answers on any pixel of its neighbourhood:
-            // the first that names a handle starts the drag, and only a
-            // full miss refuses it.
+        for result in pick_results {
+            // A scripted press accepts an answer from any pixel near it: the
+            // first answer that names a handle starts the drag, and only an
+            // answer that names nothing refuses it.
             if let Some(index) = self
                 .synthetic_press_ids
                 .iter()
@@ -991,7 +1000,7 @@ impl EditorWindow {
             let Some(press) = self
                 .press_pick
                 .as_ref()
-                .filter(|press| press.id == result.request.id)
+                .filter(|press| press.request_id == result.request.id)
                 .map(|press| (press.view, press.x, press.y))
             else {
                 continue;
@@ -1008,28 +1017,28 @@ impl EditorWindow {
                     // An armed Inspector row takes the click as its reference
                     // and leaves the selection alone: the person is naming a
                     // target, not changing what they are editing.
-                    let armed = world
+                    let armed_request = world
                         .get_resource_mut::<EntityPickRequest>()
                         .and_then(|request| request.take());
-                    if let Some(target) = armed {
+                    if let Some(armed_request) = armed_request {
                         let (edit, label) = inspector::entity_edit(
-                            target.entity,
-                            &target.component,
-                            &target.field,
+                            armed_request.entity,
+                            &armed_request.component,
+                            &armed_request.field,
                             Some(entity),
                         );
                         let coalesce = inspector::field_coalesce_key(
-                            target.entity,
-                            &target.component,
-                            &target.field,
+                            armed_request.entity,
+                            &armed_request.component,
+                            &armed_request.field,
                         );
                         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
                             pending.push_recorded(vec![edit], label, Some(coalesce));
                         }
                         info!(
                             target: telemetry_target::ENGINE,
-                            component = target.component.as_str(),
-                            field = target.field.as_str(),
+                            component = armed_request.component.as_str(),
+                            field = armed_request.field.as_str(),
                             "[editor] inspector entity pick answered"
                         );
                     } else if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
@@ -1096,15 +1105,14 @@ impl EditorWindow {
     /// Project every visible entity into every visible scene view, for the
     /// shell's badges.
     ///
-    /// The executable owns the views' cameras and the renderer's projection
-    /// terms, so it is the only side that can say where an entity lands on
-    /// screen. Each view is capped at
-    /// [`pill_editor_core::boundary::BADGES_PER_VIEW_MAX`] and an entity
-    /// behind the camera or outside its viewport is left out, so the overlay
-    /// stays a map of the scene rather than a wall of chips.
+    /// Only this side can say where an entity appears on screen, because it
+    /// owns the views' cameras and the renderer's projection terms. Each view
+    /// is capped at [`pill_editor_core::boundary::BADGES_PER_VIEW_MAX`], and an
+    /// entity behind the camera or outside the viewport is left out, so the
+    /// overlay stays readable instead of covering the scene with chips.
     fn publish_badges(&mut self) {
         self.badges.clear();
-        let rows = {
+        let entity_rows = {
             let world = self.host.host_mut().engine_mut().world_mut();
             world.entity_rows()
         };
@@ -1120,7 +1128,7 @@ impl EditorWindow {
             };
             let (origin_x, origin_y) = self.view_origin(view);
             let mut drawn = 0usize;
-            for row in &rows {
+            for row in &entity_rows {
                 if drawn >= pill_editor_core::boundary::BADGES_PER_VIEW_MAX {
                     break;
                 }
@@ -1177,12 +1185,12 @@ impl EditorWindow {
 
     /// Apply the recovery document a previous run left behind.
     ///
-    /// It is applied on the first frame the shell's session exists, because
-    /// the dock lives there: the shell builds its own default-or-saved dock
-    /// when it loads, and the recovered arrangement replaces it before that
-    /// frame draws. The selection follows as display handles resolved against
-    /// the live table - a recovered run spawns the same entities, and one that
-    /// does not simply selects less.
+    /// The document is applied on the first frame where the shell's session
+    /// exists, because the dock lives in that session. The shell builds its
+    /// own default or saved dock when it loads, and the recovered arrangement
+    /// replaces it before that frame draws. The selection is restored from
+    /// display handles looked up in the live entity table: a recovered run
+    /// spawns the same entities, and a run that does not simply selects less.
     fn apply_recovered_state(&mut self) {
         let Some(recovered) = self.recovered.take() else {
             return;
@@ -1204,7 +1212,7 @@ impl EditorWindow {
             .iter()
             .filter_map(|handle| resolve_display_entity(world, handle))
             .collect();
-        let restored = entities.len();
+        let restored_entity_count = entities.len();
         let mut selection = selection;
         selection.set_entities(entities);
         selection.asset = recovered.asset.clone();
@@ -1215,14 +1223,14 @@ impl EditorWindow {
         info!(
             target: telemetry_target::ENGINE,
             surfaces,
-            entities = restored,
+            entities = restored_entity_count,
             "[editor] recovered editor state after an unclean exit"
         );
     }
 
-    /// Write the recovery document when the arrangement or the selection
-    /// changed, and on a slow cadence so a change the key cannot see still
-    /// lands.
+    /// Write the recovery document when the key built from the arrangement and
+    /// the selection changed. The key is compared on a slow cadence, so a
+    /// change reaches the file within [`RECOVERY_AUTOSAVE_FRAMES`] frames.
     fn autosave_recovery(&mut self) {
         if !(self.frame_index.is_multiple_of(RECOVERY_AUTOSAVE_FRAMES)
             || self.last_recovery_key.is_none())
@@ -1237,7 +1245,7 @@ impl EditorWindow {
             .get_resource::<EditorSelection>()
             .cloned()
             .unwrap_or_default();
-        let key = format!(
+        let recovery_key = format!(
             "{}|{}|{}|{}",
             session.dock.state().surfaces_count(),
             session.dock.panel_ids().len(),
@@ -1249,12 +1257,12 @@ impl EditorWindow {
                 .join(","),
             selection.asset.as_deref().unwrap_or("")
         );
-        if self.last_recovery_key.as_deref() == Some(key.as_str()) {
+        if self.last_recovery_key.as_deref() == Some(recovery_key.as_str()) {
             return;
         }
         let document =
             pill_editor_core::layout::RecoveryDocument::capture(&session.dock, &selection);
-        self.last_recovery_key = Some(key);
+        self.last_recovery_key = Some(recovery_key);
         pill_editor_core::layout::write_recovery(&document);
     }
 
@@ -1292,22 +1300,22 @@ impl EditorWindow {
         }
     }
 
-    /// Runs the command the active keymap binds to a chord, if any, and
-    /// reports whether one ran.
+    /// Run the command the active keymap binds to a chord, if any, and report
+    /// whether a command was bound.
     ///
-    /// The registry is the one source of chords: a preset or a keybindings
-    /// override changes what a key does, without a restart and without a
-    /// second table in the executable. A chord bound to a command this
-    /// executable does not implement resolves and logs
-    /// `[editor] shortcut has no action yet`, then does nothing.
+    /// The registry is the only source of chords, so a preset or a keybindings
+    /// override changes what a key does without a restart and without a second
+    /// table in this executable. A chord bound to a command this executable
+    /// does not implement is found, logs `[editor] shortcut has no action
+    /// yet`, and does nothing.
     fn run_bound_command(&mut self, key: KeyCode, modifiers: EngineModifiers) -> bool {
         let world = self.host.host_mut().engine_mut().world_mut();
         CommandRegistry::ensure(world);
-        let resolved = world
+        let resolved_command_id = world
             .get_resource::<CommandRegistry>()
             .and_then(|registry| registry.resolve(key, modifiers))
             .map(|spec| spec.id.clone());
-        let Some(command) = resolved else {
+        let Some(command) = resolved_command_id else {
             return false;
         };
         if let Some(action) = command_action(&command) {
@@ -1344,6 +1352,11 @@ impl EditorWindow {
 
     /// Resolve a scripted edit's target: the entity, the registered
     /// component name and the field's current value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the entity, the component or the field that
+    /// could not be found, which the scripted channel reports back.
     fn resolve_edit_target(
         &mut self,
         entity_text: &str,
@@ -1372,12 +1385,12 @@ impl EditorWindow {
         }
     }
 
-    /// Queue the edit a picker row's choice would make: the chosen guid in the
-    /// shape the field's document uses.
+    /// Queue the edit a picker row's choice makes: the chosen guid, written in
+    /// the shape the field's document uses.
     ///
-    /// The shape is the row's own answer - the object form for a named
-    /// reference, a bare guid for a texture slot - so a scripted pick and a
-    /// click cannot write different documents.
+    /// The row decides the shape - the object form for a named reference, a
+    /// bare guid for a texture slot - so a scripted pick and a click cannot
+    /// write different documents.
     fn pick_reference(&mut self, path: &str, key: &str, guid: &str) {
         let Some(document) = self.read_asset_settings(path) else {
             warn!(
@@ -1387,22 +1400,23 @@ impl EditorWindow {
             );
             return;
         };
-        let kind = self
+        let asset_kind = self
             .asset_entries
             .iter()
             .find(|row| row.path == path || row.key() == path)
             .map(|row| row.kind.text().to_string())
             .unwrap_or_default();
         let nested = self
-            .asset_reference_fields(&kind, &Some(document.clone()))
+            .asset_reference_fields(&asset_kind, &Some(document.clone()))
             .into_iter()
             .find(|field| field.key == key)
             .map(|field| field.nested)
-            // A slot the shader has not declared yet (its shader reference is
-            // still another one) still writes the texture-slot shape, so the
-            // document does not gain an object a renderer would not read.
+            // A slot the shader has not declared yet (its shader reference
+            // still points at another shader) still writes the texture-slot
+            // shape. Otherwise the document would gain an object the renderer
+            // does not read.
             .unwrap_or_else(|| !key.starts_with("textures."));
-        let value = if nested {
+        let reference_value = if nested {
             serde_json::json!({ "guid": guid })
         } else {
             serde_json::Value::String(guid.to_owned())
@@ -1416,7 +1430,9 @@ impl EditorWindow {
             return;
         };
         let mut patched = document;
-        if let Err(message) = inspector::patch_settings_inserting(&mut patched, &key_path, value) {
+        if let Err(message) =
+            inspector::patch_settings_inserting(&mut patched, &key_path, reference_value)
+        {
             warn!(
                 target: telemetry_target::ENGINE,
                 key,
@@ -1428,13 +1444,12 @@ impl EditorWindow {
         self.queue_settings_value(path, key, patched);
     }
 
-    /// Drain the module panels' registration requests.
+    /// Apply the module panels' registration requests.
     ///
     /// A request names a draw function that lives in the requesting module's
-    /// image, so it is bound here, in the executable, to that module's
-    /// liveness marker: the registry hands the function out only while the
-    /// marker is alive, and a reload drops the marker (see
-    /// [`Self::fold_host_notices`]).
+    /// image, so the executable ties it to that module's liveness marker. The
+    /// registry hands the function out only while the marker is alive, and a
+    /// reload drops the marker (see [`Self::fold_host_notices`]).
     fn sync_panels(&mut self) {
         let requests = {
             let world = self.host.host_mut().engine_mut().world_mut();
@@ -1484,11 +1499,11 @@ impl EditorWindow {
 
     /// Carry out the clipboard request the shell queued.
     ///
-    /// A write puts the payload on the OS clipboard; a read decodes what it
-    /// carries and applies the paste as one recorded step. What could not be
-    /// pasted - an unregistered component, a field this build no longer
+    /// A write puts the payload on the OS clipboard. A read decodes what it
+    /// carries and applies the paste as one recorded step. Anything that could
+    /// not be pasted - an unregistered component, a field this build no longer
     /// carries - is named in a notice, because a paste that quietly dropped
-    /// half an entity is worse than one that says what it left behind.
+    /// part of an entity is worse than one that says what it left out.
     fn apply_clipboard(&mut self) {
         let request = {
             let world = self.host.host_mut().engine_mut().world_mut();
@@ -1522,6 +1537,7 @@ impl EditorWindow {
 
     /// Read the OS clipboard and apply what it carries, as one recorded step.
     fn apply_paste(&mut self) {
+        // Step 1: Read the clipboard's text.
         let text = match crate::clipboard::read() {
             Ok(Some(text)) => text,
             Ok(None) => {
@@ -1542,11 +1558,12 @@ impl EditorWindow {
             }
         };
         let world = self.host.host_mut().engine_mut().world_mut();
+        // Step 2: Keep the raw text and decode what it carries.
         if let Some(clipboard) = world.get_resource_mut::<EditorClipboard>() {
             clipboard.text = text.clone();
         }
-        let payload = match clipboard::decode(&text) {
-            Ok(payload) => payload,
+        let clipboard_payload = match clipboard::decode(&text) {
+            Ok(clipboard_payload) => clipboard_payload,
             Err(message) => {
                 warn!(
                     target: telemetry_target::ENGINE,
@@ -1565,7 +1582,7 @@ impl EditorWindow {
             .get_resource::<EditorSnapshot>()
             .cloned()
             .unwrap_or_default();
-        let plan = match clipboard::paste_plan(&payload, &selection, &snapshot) {
+        let plan = match clipboard::paste_plan(&clipboard_payload, &selection, &snapshot) {
             Ok(plan) => plan,
             Err(message) => {
                 warn!(
@@ -1577,6 +1594,8 @@ impl EditorWindow {
                 return;
             }
         };
+        // Step 3: Queue the paste as one recorded step, and report what could
+        // not be pasted.
         if !plan.commands.is_empty() {
             if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
                 pending.push_recorded(plan.commands, plan.label.clone(), None);
@@ -1587,7 +1606,7 @@ impl EditorWindow {
         }
         info!(
             target: telemetry_target::ENGINE,
-            kind = payload.kind(),
+            kind = clipboard_payload.kind(),
             label = plan.label.as_str(),
             skipped = plan.skipped.len(),
             reader = crate::clipboard::process_id(),
@@ -1730,7 +1749,8 @@ impl EditorWindow {
             );
             return;
         };
-        // The scripted channel's own element write: one rule, one coalesce key.
+        // The same element write the scripted channel makes, so both use one
+        // rule and one coalesce key.
         let recorded = match inspector::element_write(
             entity, &component, field, &current, index, value_text,
         ) {
@@ -1758,17 +1778,19 @@ impl EditorWindow {
         );
     }
 
-    /// Capture the editor snapshot the shell's tabs read, when the shell
-    /// loaded and registered it.
+    /// Capture the editor snapshot the shell's tabs read, when the shell loaded
+    /// and registered one.
     ///
-    /// The asset listing refreshes on its cadence - or at once after a file
-    /// command - because the walk touches the filesystem; the detail tier,
-    /// the Inspector's data, is rebuilt for the current selection every
-    /// frame: it is one entity's components, cheap, and it keeps the tab's
-    /// values live.
+    /// The asset listing refreshes on its slow cadence, or at once after a file
+    /// command, because reading it touches the filesystem. The detail tier (the
+    /// Inspector's data) is rebuilt for the current selection every frame: that
+    /// is one entity's components, cheap to read, and it keeps the tab's values
+    /// current.
     fn publish_snapshot(&mut self) {
+        // Step 1: Refresh the asset listing and the selected asset's detail.
         let listing_refreshed = self.refresh_asset_listing();
         self.refresh_asset_detail(listing_refreshed);
+        // Step 2: Capture this frame's snapshot.
         let engine = self.host.host_mut().engine_mut();
         if engine.world().get_resource::<EditorSnapshot>().is_none() {
             return;
@@ -1802,9 +1824,9 @@ impl EditorWindow {
             &self.preferences_document,
             self.gizmo_project.as_deref(),
         );
-        // The theme the shell installs: the executable is
-        // the side that owns the layers, so the merge travels on the snapshot
-        // with the generation that tells the shell whether to install it.
+        // The theme the shell installs. The executable owns the layers, so the
+        // merged theme travels on the snapshot together with the generation
+        // number that tells the shell whether to install it again.
         snapshot.theme = self.theme.clone();
         snapshot.theme_generation = self.theme_generation;
         snapshot.theme_layers = self.theme_layers.clone();
@@ -1816,28 +1838,30 @@ impl EditorWindow {
             .unwrap_or((0, 0));
         snapshot.undo_depth = undo_depth;
         snapshot.redo_depth = redo_depth;
-        // The redraw cadence's change detector: this frame's capture is
-        // compared field by field against the snapshot resource in place. The
-        // frame index is not compared, since it is this frame's, and neither
-        // are the two tiers a frame itself feeds: its own log lines reach the
-        // console, so treating them as a reason to draw would make every
-        // frame owe the next one. They are bounded-latency data instead - the
-        // idle poll draws them within its interval - which is what keeps an
-        // idle editor idle while its console still fills.
-        let fields = engine
+        // Step 3: Compare this frame's capture with the stored snapshot,
+        // field by field, and store it. The frame index is not compared
+        // because it belongs to this frame, and neither are the two tiers a
+        // frame fills itself: its own log lines reach the console, so
+        // treating them as a reason to draw would make every frame owe the
+        // next one. They are bounded-latency data instead, and the idle poll
+        // draws them within its interval, which is what keeps an idle editor
+        // idle while its console still fills.
+        let changed_fields = engine
             .world()
             .get_resource::<EditorSnapshot>()
             .map(|previous| previous.changed_fields(&snapshot))
             .unwrap_or_default();
-        self.demand.snapshot = !fields.is_empty();
-        // Which fields moved is the answer to "why is the editor drawing every
-        // frame?"; one line per new combination keeps the log honest without
-        // streaming.
-        if self.demand.snapshot && self.snapshot_changed_field.as_deref() != Some(fields.as_str()) {
-            self.snapshot_changed_field = Some(fields.clone());
+        self.demand.snapshot = !changed_fields.is_empty();
+        // The changed field names answer the question "why is the editor
+        // drawing every frame?". One line per new combination keeps the log
+        // useful without streaming a line every frame.
+        if self.demand.snapshot
+            && self.snapshot_changed_field.as_deref() != Some(changed_fields.as_str())
+        {
+            self.snapshot_changed_field = Some(changed_fields.clone());
             info!(
                 target: telemetry_target::ENGINE,
-                fields = fields.as_str(),
+                fields = changed_fields.as_str(),
                 "[editor] snapshot changed"
             );
         }
@@ -1846,47 +1870,50 @@ impl EditorWindow {
         }
     }
 
-    /// Apply the batches the shell's assets actions and the scripted channel
+    /// Apply the batches the shell's asset actions and the scripted channel
     /// queued, then publish what the frame needs to follow them.
     ///
-    /// The application itself is the shared core drain
-    /// ([`pill_editor_core::drain::apply_pending`]), so the browser
-    /// editor runs exactly this contract; the only executable-owned half is
-    /// the asset listing walk a file batch asks for and the reveal requests,
-    /// which only this side can carry out.
+    /// The batches themselves are applied by the shared core drain
+    /// ([`pill_editor_core::drain::apply_pending`]), so the browser editor runs
+    /// exactly this contract. The parts only this executable can do are the
+    /// asset listing refresh a file batch asks for and the reveal and focus
+    /// requests.
     fn apply_pending_commands(&mut self) {
+        // Step 1: Carry out the requests only this side can: file-manager
+        // reveals and focus changes.
         self.apply_reveals();
         self.apply_focuses();
+        // Step 2: Apply the queued batches through the shared drain.
         let now_millis = self.started.elapsed().as_millis() as u64;
-        let outcome = drain::apply_pending(self.host.host_mut().engine_mut(), now_millis);
-        if outcome.files_changed {
+        let drain_outcome = drain::apply_pending(self.host.host_mut().engine_mut(), now_millis);
+        if drain_outcome.files_changed {
             self.asset_listing_dirty = true;
         }
-        if outcome.settings_changed {
-            // The Inspector's rows draw the document the command just wrote;
-            // forgetting the captured path is what makes the next frame read it
-            // again, so a committed row shows its new value (and a reordered
-            // list its new order) at once.
+        if drain_outcome.settings_changed {
+            // The Inspector's rows draw the document the command just wrote.
+            // Forgetting the captured path makes the next frame read it again,
+            // so a committed row shows its new value at once, and a reordered
+            // list shows its new order.
             self.asset_detail_path = None;
         }
     }
 
-    /// Show every queued focus request: the selection moves to the asset and
-    /// the Assets panel opens the folder that holds it.
+    /// Carry out every queued focus request: the selection moves to the asset
+    /// and the Assets panel opens the folder that holds it.
     ///
-    /// The shell cannot do either - the selection is a world resource and the
-    /// open folder lives in the session it only borrows per pass - so the
-    /// request crosses here and lands in one place, which is also what makes it
-    /// one log line a suite can read.
+    /// The shell cannot do either. The selection is a world resource, and the
+    /// open folder lives in the session the shell only borrows for one pass, so
+    /// the request comes here. Handling it in one place also produces the one
+    /// log line a suite can read.
     fn apply_focuses(&mut self) {
-        let keys = {
+        let focus_keys = {
             let world = self.host.host_mut().engine_mut().world_mut();
             world
                 .get_resource_mut::<PendingEditorCommands>()
                 .map(|pending| pending.take_focuses())
                 .unwrap_or_default()
         };
-        for key in keys {
+        for key in focus_keys {
             let world = self.host.host_mut().engine_mut().world_mut();
             if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
                 selection.asset = Some(key.clone());
@@ -1908,20 +1935,20 @@ impl EditorWindow {
 
     /// Open the platform's file manager for every queued reveal.
     ///
-    /// The shell knows the project-relative path; this side knows where the
-    /// project lives and which file manager the OS has, so the request
-    /// crosses as a path and the answer is an OS process. A refusal - no
-    /// mounted directory, a path that left the root or no longer exists - is a
-    /// console line, never a panic.
+    /// The shell knows the project-relative path, while this side knows where
+    /// the project lives and which file manager the OS has. The request
+    /// therefore crosses as a path, and the answer is an OS process. A refusal
+    /// (no mounted directory, a path that left the root, a path that no longer
+    /// exists) becomes a console line, never a panic.
     fn apply_reveals(&mut self) {
-        let paths = {
+        let reveal_paths = {
             let world = self.host.host_mut().engine_mut().world_mut();
             world
                 .get_resource_mut::<PendingEditorCommands>()
                 .map(|pending| pending.take_reveals())
                 .unwrap_or_default()
         };
-        if paths.is_empty() {
+        if reveal_paths.is_empty() {
             return;
         }
         let Some(root) = self
@@ -1930,7 +1957,7 @@ impl EditorWindow {
             .asset_directory()
             .map(std::path::Path::to_path_buf)
         else {
-            for path in paths {
+            for path in reveal_paths {
                 warn!(
                     target: telemetry_target::ENGINE,
                     path = path.as_str(),
@@ -1946,7 +1973,7 @@ impl EditorWindow {
                 .into_iter()
                 .map(|root| (root.module, root.directory))
                 .collect();
-        for path in paths {
+        for path in reveal_paths {
             match assets::reveal_target_in(&root, &module_roots, &path) {
                 Ok(target) => {
                     open_in_file_manager(&target);
@@ -1970,34 +1997,34 @@ impl EditorWindow {
     /// Write a changed gizmo choice to the project's preferences entry.
     ///
     /// The executable owns this write because it is the side that knows the
-    /// project; the file arriving back through the live reader is what keeps
-    /// the snapshot's remembered entry honest. An unchanged tool writes
+    /// project. The file coming back through the live reader is what keeps the
+    /// snapshot's remembered entry accurate. An unchanged choice writes
     /// nothing.
     fn persist_gizmo_settings(&mut self) {
-        let settings = self
+        let gizmo_settings = self
             .host
             .host_mut()
             .engine_mut()
             .world()
             .get_resource::<GizmoState>()
             .map(|state| state.settings);
-        let Some(settings) = settings else {
+        let Some(gizmo_settings) = gizmo_settings else {
             return;
         };
-        if self.gizmo_persisted == Some(settings) {
+        if self.gizmo_persisted == Some(gizmo_settings) {
             return;
         }
-        self.gizmo_persisted = Some(settings);
-        let Some(project) = self.gizmo_project.clone() else {
+        self.gizmo_persisted = Some(gizmo_settings);
+        let Some(project_key) = self.gizmo_project.clone() else {
             return;
         };
         let directory = layout_directory();
-        match write_gizmo_preferences(&directory, &project, &settings) {
+        match write_gizmo_preferences(&directory, &project_key, &gizmo_settings) {
             Ok(()) => info!(
                 target: telemetry_target::ENGINE,
-                project = project.as_str(),
-                mode = ?settings.mode,
-                snap = settings.snap,
+                project = project_key.as_str(),
+                mode = ?gizmo_settings.mode,
+                snap = gizmo_settings.snap,
                 "[editor] gizmo preferences written"
             ),
             Err(error) => warn!(
@@ -2008,26 +2035,32 @@ impl EditorWindow {
         }
     }
 
-    /// Read the preferences file; when its text changes, apply the live
-    /// halves - the history limits and the gizmo's snapping steps - and
-    /// refresh the document the snapshot's view and the dump read.
+    /// Read the preferences file and apply its settings whenever its text
+    /// changes.
     ///
-    /// The file is only read when its metadata moved, and once per
+    /// The applied settings are the camera keymap, the gizmo's hit radius and
+    /// snapping steps, the asset previews and the history limits. The parsed
+    /// document that the snapshot's preferences view and the dump read is
+    /// refreshed here too.
+    ///
+    /// The file is read when its metadata moved, and once per
     /// [`STATE_FILE_POLL_FRAMES`] regardless, so a coarse or unchanged
     /// timestamp still reaches the editor within a fraction of a second. The
-    /// tool's mode, space and toggle stay whatever the world state holds, so
+    /// tool's mode, space and toggle keep whatever the world state holds, so
     /// the stale copy a persisting write leaves behind never moves the live
-    /// tool; the snapping steps are the file's, one set for every project.
+    /// tool. The snapping steps come from the file, one set for every project.
     fn watch_preferences(&mut self) {
         if self.preferences.poll(self.frame_index).is_none() {
             return;
         }
-        let text = self.preferences.text().map(str::to_string);
-        let preferences = text
+        // Step 1: Read the file's text and parse the document the panels and
+        // the dump read.
+        let preferences_text = self.preferences.text().map(str::to_string);
+        let file_preferences = preferences_text
             .as_deref()
             .and_then(|text| serde_json::from_str::<EditorPreferences>(text).ok())
             .unwrap_or_default();
-        self.preferences_document = match text.as_deref() {
+        self.preferences_document = match preferences_text.as_deref() {
             Some(text) => match preferences::parse_document(text) {
                 Ok(document) => document,
                 Err(message) => {
@@ -2044,8 +2077,9 @@ impl EditorWindow {
             },
             None => serde_json::Map::new(),
         };
-        // The keymap preset the file names drives the viewport navigation
-        // chords; Blender's table stands until the file says otherwise.
+        // Step 2: Apply the settings that change while the editor runs. The
+        // keymap preset the file names drives the viewport navigation chords;
+        // Blender's table stands until the file says otherwise.
         let keymap = preferences::keymap_preset(&self.preferences_document);
         if keymap != self.keymap {
             self.keymap = keymap;
@@ -2101,33 +2135,34 @@ impl EditorWindow {
                 "[editor] asset previews"
             );
         }
+        // Step 3: Apply the history limits and the snapping steps.
         let world = self.host.host_mut().engine_mut().world_mut();
-        let step_cap = preferences
+        let step_cap = file_preferences
             .history_step_cap
             .unwrap_or(CommandHistory::DEFAULT_STEP_CAP);
-        let memory_mb = preferences
+        let memory_mb = file_preferences
             .history_memory_budget_mb
             .unwrap_or(CommandHistory::DEFAULT_MEMORY_BUDGET_BYTES / (1024 * 1024));
         if let Some(history) = world.get_resource_mut::<CommandHistory>() {
-            let outcome = history.set_limits(step_cap, memory_mb * 1024 * 1024);
+            let trim_outcome = history.set_limits(step_cap, memory_mb * 1024 * 1024);
             info!(
                 target: telemetry_target::ENGINE,
                 step_cap,
                 memory_mb,
                 "[editor] preferences applied"
             );
-            if outcome.trimmed > 0 {
+            if trim_outcome.trimmed > 0 {
                 info!(
                     target: telemetry_target::ENGINE,
-                    dropped = outcome.trimmed,
-                    reason = ?outcome.trim_reason,
+                    dropped = trim_outcome.trimmed,
+                    reason = ?trim_outcome.trim_reason,
                     "[editor] history trimmed"
                 );
             }
         }
         if let (Some(state), Some(steps)) = (
             world.get_resource_mut::<GizmoState>(),
-            preferences.snapping_steps,
+            file_preferences.snapping_steps,
         ) {
             state.settings.translate_step = steps.translation;
             state.settings.rotate_step_degrees = steps.rotation_degrees;
@@ -2135,16 +2170,18 @@ impl EditorWindow {
         }
     }
 
-    /// Re-resolve the editor's theme layers and record a new generation when
-    /// the result changed.
+    /// Resolve the editor's theme layers again, and record a new generation
+    /// when the result changed.
     ///
     /// Two layers sit over the code default: the user's file, named by the
     /// `theme` preference and read from disk, and the project's, named by
     /// `editor_settings.yaml` and loaded through the project's asset store so
-    /// the host's watcher reimports an edited file. The project wins where two
-    /// name the same item. A layer that cannot be read, loaded or merged warns
-    /// and is skipped, one broken file never costing the others' values, and a
-    /// resolution that repeats the theme already applied leaves the generation
+    /// the host's watcher reimports an edited file. Where both name the same
+    /// item, the project wins.
+    ///
+    /// A layer that cannot be read, loaded or merged logs a warning and is
+    /// skipped, so one broken file never costs the other layers' values. A
+    /// result that matches the theme already applied leaves the generation
     /// alone. The poll re-merges at least once per [`STATE_FILE_POLL_FRAMES`]
     /// frames and whenever a stamp moves.
     fn watch_theme(&mut self) {
@@ -2166,8 +2203,8 @@ impl EditorWindow {
             selection != self.theme_watch.selection || user_stamp != self.theme_watch.user_stamp;
         self.theme_watch.selection = selection.clone();
         self.theme_watch.user_stamp = user_stamp;
-        // A name an earlier build understood names no file; saying so once per
-        // value is all there is to do about it.
+        // A name an earlier build understood names no file now. There is
+        // nothing to do about it beyond warning once per value.
         if let UserThemeSelection::Legacy(name) = &selection {
             if self.theme_watch.legacy_logged.as_deref() != Some(name.as_str()) {
                 self.theme_watch.legacy_logged = Some(name.clone());
@@ -2213,8 +2250,9 @@ impl EditorWindow {
         };
         let path_moved = project_path != self.theme_watch.project_path;
         self.theme_watch.project_path = project_path;
-        // The file itself, so an edit reaches the editor even when the host's
-        // watcher has not reimported it yet: one stat per poll.
+        // The file itself is stamped too, so an edit reaches the editor even
+        // when the host's watcher has not reimported it yet. That is one stat
+        // per poll.
         let project_stamp = self
             .host
             .host()
@@ -2224,9 +2262,9 @@ impl EditorWindow {
             .unwrap_or_default();
         let file_moved = project_stamp != self.theme_watch.project_stamp;
         self.theme_watch.project_stamp = project_stamp;
-        // The font files the applied theme names move the
-        // same way: a stamp per family, and an edit re-installs the fonts
-        // without waiting for a theme change.
+        // The font files the applied theme names are watched the same way,
+        // with one stamp per family. An edit to a font re-installs it without
+        // waiting for a theme change.
         let fonts_moved = self.stamp_fonts();
         if !user_moved
             && !path_moved
@@ -2323,8 +2361,8 @@ impl EditorWindow {
 
     /// Stamp each family's resolved font source and report whether one moved.
     ///
-    /// One `stat` per family per poll; the bytes are only read when a stamp
-    /// moved, which is what keeps a 30-frame poll from re-reading fonts.
+    /// One `stat` per family per poll; a moved stamp makes the poll run the
+    /// merge, which re-reads the fonts and installs them again.
     fn stamp_fonts(&mut self) -> bool {
         let mut moved = false;
         for (index, source) in self.theme_watch.font_sources.iter().enumerate() {
@@ -2346,37 +2384,37 @@ impl EditorWindow {
         moved
     }
 
-    /// Resolve the fonts the applied layers name into the bytes the kit
+    /// Load the fonts the applied layers name, as the bytes the UI kit
     /// installs.
     ///
     /// The merged theme's paths say which family each layer named, so a layer
     /// that names only `body` keeps the lower layer's other two. A project font
-    /// loads through the asset store (it must be under `editor/`); a user font
+    /// loads through the asset store and must be under `editor/`; a user font
     /// is a file relative to the user document's own directory. A font that
-    /// cannot be loaded warns and leaves its family to the built-in ones, with
-    /// the family name still registered.
+    /// cannot be loaded logs a warning and leaves its family to the built-in
+    /// ones, with the family name still registered.
     fn refresh_fonts(
         &mut self,
         theme: &pill_ui_theme::Theme,
-        user: Option<&ThemeOverrides>,
-        project: Option<&ThemeOverrides>,
+        user_overrides: Option<&ThemeOverrides>,
+        project_overrides: Option<&ThemeOverrides>,
         user_directory: Option<&std::path::Path>,
     ) {
         let families: [(&Option<String>, Option<&String>, Option<&String>); 3] = [
             (
                 &theme.fonts.body,
-                user.and_then(|overrides| overrides.fonts.body.as_ref()),
-                project.and_then(|overrides| overrides.fonts.body.as_ref()),
+                user_overrides.and_then(|overrides| overrides.fonts.body.as_ref()),
+                project_overrides.and_then(|overrides| overrides.fonts.body.as_ref()),
             ),
             (
                 &theme.fonts.display,
-                user.and_then(|overrides| overrides.fonts.display.as_ref()),
-                project.and_then(|overrides| overrides.fonts.display.as_ref()),
+                user_overrides.and_then(|overrides| overrides.fonts.display.as_ref()),
+                project_overrides.and_then(|overrides| overrides.fonts.display.as_ref()),
             ),
             (
                 &theme.fonts.monospace,
-                user.and_then(|overrides| overrides.fonts.monospace.as_ref()),
-                project.and_then(|overrides| overrides.fonts.monospace.as_ref()),
+                user_overrides.and_then(|overrides| overrides.fonts.monospace.as_ref()),
+                project_overrides.and_then(|overrides| overrides.fonts.monospace.as_ref()),
             ),
         ];
         let mut fonts = pill_editor_core::kit::style::ThemeFonts::default();
@@ -2385,8 +2423,8 @@ impl EditorWindow {
             let Some(path) = merged.as_deref() else {
                 continue;
             };
-            // The layer that named this family wins; the merged path is one of
-            // the two layer paths by construction.
+            // The layer that named this family wins. The merged path always
+            // equals one of the two layer paths.
             let source = if project_path.map(String::as_str) == Some(path) {
                 FontSource::Project(path.to_string())
             } else if user_path.map(String::as_str) == Some(path) {
@@ -2396,11 +2434,11 @@ impl EditorWindow {
                 };
                 FontSource::User(file)
             } else {
-                // Named by the code default, which the editor does not do;
-                // there is no layer to resolve it against.
+                // The code default named this path, which the editor does not
+                // do, so there is no layer to resolve it against.
                 continue;
             };
-            let bytes = self.read_font(&source);
+            let bytes = self.read_font_bytes(&source);
             sources[index] = Some(source);
             match index {
                 0 => fonts.body = bytes,
@@ -2413,7 +2451,7 @@ impl EditorWindow {
     }
 
     /// The bytes one font source holds, or `None` with the refusal logged.
-    fn read_font(&mut self, source: &FontSource) -> Option<Vec<u8>> {
+    fn read_font_bytes(&mut self, source: &FontSource) -> Option<Vec<u8>> {
         match source {
             FontSource::Project(path) => {
                 let world = self.host.host_mut().engine_mut().world_mut();
@@ -2468,10 +2506,10 @@ impl EditorWindow {
 
     /// Load the project layer's document, reusing the cached handle.
     ///
-    /// `path_moved` means the resolved path is not the one the handle was
-    /// loaded from, so the file is imported (and scope-checked) again;
-    /// `file_moved` means the same file changed, so the store's copy is
-    /// re-read.
+    /// `path_moved` means the resolved path differs from the one the handle was
+    /// loaded from, so the file is imported (and scope-checked) again.
+    /// `file_moved` means the same file changed, so the store's copy is read
+    /// again.
     fn load_project_layer(&mut self, path_moved: bool, file_moved: bool) -> Option<ThemeOverrides> {
         let Some(path) = self.theme_watch.project_path.clone() else {
             self.theme_watch.project_handle = None;
@@ -2512,13 +2550,14 @@ impl EditorWindow {
         assets.get(handle).cloned()
     }
 
-    /// Applies the keybindings file whenever it changes.
+    /// Apply the keybindings file whenever it changes.
     ///
-    /// The registry owns the preset and the overrides; this only reads the
-    /// file, hands it over and reports what came out of it - the preset, the
-    /// number of overrides, every problem the file's text had, and one line
-    /// per chord that two commands now answer to. A missing or malformed file
-    /// is an empty one: the built-ins' own bindings stand.
+    /// The registry owns the preset and the overrides. This function reads the
+    /// file, hands it over and reports what came back: the preset, the number
+    /// of overrides, every problem the file had, and one line per chord that
+    /// two commands now answer to. A missing or malformed file falls back to
+    /// [`editor_default_keybindings`], so Unity's table stands until the file
+    /// names a preset.
     fn watch_keybindings(&mut self) {
         // Until the registry has applied a file, every frame re-reads it: a
         // file that could not be applied is retried rather than skipped as
@@ -2581,12 +2620,12 @@ impl EditorWindow {
 
     /// Open the Problems row at `index` in the configured code editor.
     ///
-    /// One body for both callers: the frame-boundary drain when a shell pass
+    /// Both callers share this body: the frame-boundary drain when a shell pass
     /// asked for a row, and the scripted channel's `problem open`, which runs
     /// it at once so a suite's wait cannot race the spawn.
     ///
-    /// The `code_editor_command` preference names the program and its flags;
-    /// the row's `file:line` goes last as one argument, which is the form VS
+    /// The `code_editor_command` preference names the program and its flags.
+    /// The row's `file:line` is appended as one argument, which is the form VS
     /// Code, CLion and every other editor's command line accepts. A missing
     /// or empty preference falls back to `code`.
     fn open_problem(&mut self, index: usize) {
@@ -2613,12 +2652,12 @@ impl EditorWindow {
             .and_then(|preferences| preferences.code_editor_command)
             .filter(|command| !command.trim().is_empty())
             .unwrap_or_else(|| "code".to_string());
-        let mut parts = split_command(&command).into_iter();
-        let Some(program) = parts.next() else {
+        let mut command_parts = split_command(&command).into_iter();
+        let Some(program) = command_parts.next() else {
             return;
         };
         match std::process::Command::new(&program)
-            .args(parts)
+            .args(command_parts)
             .arg(&target)
             .spawn()
         {
@@ -2645,7 +2684,7 @@ impl EditorWindow {
     fn publish_console_lines(&mut self) {
         // The handle is cloned out first: the world borrow below holds `self`
         // mutably, and the ring is a shared handle rather than the window's.
-        let buffer = self.log_buffer.clone();
+        let log_buffer = self.log_buffer.clone();
         let world = self.host.host_mut().engine_mut().world_mut();
         // The tab's filters live in the shell session; applying them here means
         // this frame's snapshot already shows what the person just chose.
@@ -2660,8 +2699,8 @@ impl EditorWindow {
         let Some(state) = world.get_resource_mut::<ConsoleState>() else {
             return;
         };
-        let after = state.last_seq;
-        for line in buffer.since(after) {
+        let after_sequence = state.last_seq;
+        for line in log_buffer.since(after_sequence) {
             let channel = ConsoleChannel::of_target(&line.target);
             state.push(ConsoleLine {
                 seq: line.seq,
@@ -2678,7 +2717,7 @@ impl EditorWindow {
     /// The title is recomputed every frame from the session resource and
     /// logged only when it changed, so the log names each state the document
     /// went through - which is what the editor suite waits for. The window's
-    /// own title names the project, so nothing here touches it.
+    /// own title is fixed (`Pill`), so nothing here touches it.
     fn report_scene_title(&mut self) {
         let title = {
             let world = self.host.host_mut().engine_mut().world_mut();
@@ -2748,8 +2787,8 @@ impl EditorWindow {
             ),
             crate::drag_out::DragOutOutcome::Failed => {}
         }
-        // A drag is a frame's worth of interaction of its own: the frame after
-        // it owes a redraw, so the editor visibly settles.
+        // A drag takes a frame of its own: the frame after it owes a redraw,
+        // so the editor shows the result at once.
         self.demand.input = true;
     }
 
@@ -2760,6 +2799,8 @@ impl EditorWindow {
     /// behind. The resource is rewritten only when something arrived, so the
     /// shell's read stays cheap.
     fn fold_host_notices(&mut self) {
+        // Step 1: Take the notices the host queued; there is nothing to do
+        // when it queued none.
         let notices = take_notices();
         if notices.is_empty() {
             return;
@@ -2769,6 +2810,8 @@ impl EditorWindow {
             count = notices.len(),
             "[editor] notices drained"
         );
+        // Step 2: Turn each notice into a toast, and a failure into Problems
+        // rows for its module.
         for notice in &notices {
             let (level, text) = notice_toast(notice);
             let seq = self.notices.next_event_seq;
@@ -2846,6 +2889,7 @@ impl EditorWindow {
                 HostNotice::PatchApplied { .. } => {}
             }
         }
+        // Step 3: Publish the updated list to the shell.
         self.notices.revision = self.notices.revision.wrapping_add(1);
         let world = self.host.host_mut().engine_mut().world_mut();
         match world.get_resource_mut::<EditorNotices>() {
@@ -2971,9 +3015,9 @@ impl EditorWindow {
     /// walk, a dock tab through the shared activation, a Problems row through
     /// [`Self::open_problem`], and a quit through the frame's flag.
     fn drain_shell_requests(&mut self) {
-        let (requests, quit) = {
+        let (requests, quit_requested) = {
             let world = self.host.host_mut().engine_mut().world_mut();
-            let quit = world
+            let quit_requested = world
                 .get_resource::<EguiShellFrame>()
                 .is_some_and(|frame| frame.quit_requested);
             // One take for every ask: the frame's value is cleared as a whole,
@@ -2982,7 +3026,7 @@ impl EditorWindow {
                 .get_resource_mut::<EguiShellFrame>()
                 .map(|frame| frame.requests.drain())
                 .unwrap_or_default();
-            (requests, quit)
+            (requests, quit_requested)
         };
         for request in requests.history {
             match request {
@@ -2996,7 +3040,7 @@ impl EditorWindow {
         if let Some(index) = requests.problem_open {
             self.open_problem(index);
         }
-        if quit {
+        if quit_requested {
             info!(
                 target: telemetry_target::ENGINE,
                 "[editor] quit requested"
@@ -3043,6 +3087,10 @@ impl EditorWindow {
     }
 }
 
+// =============================================================================
+// Scene Views
+// =============================================================================
+
 /// One scene view: its child window and its renderer surface.
 struct SceneView {
     /// The child window the project's renderer presents the scene into.
@@ -3078,10 +3126,80 @@ impl SceneView {
             popped: false,
         })
     }
+
+    /// Attach the view's surface to the window it has now and publish the
+    /// view's camera binding for that surface.
+    ///
+    /// The one attach path: the startup window, a popped-out top-level and a
+    /// redocked child all come through here, so the camera publish cannot be
+    /// forgotten on one of them.
+    fn attach_to(&mut self, host: &mut RenderingHost, camera: &OrbitCamera, rebound: bool) {
+        let size = self.window.size();
+        match host.attach_surface(
+            self.surface_id,
+            Arc::clone(&self.window.window),
+            size.0,
+            size.1,
+            SurfaceOptions::default(),
+        ) {
+            Ok(()) => {
+                host.set_surface_camera(self.surface_id, Some(camera_binding(camera)));
+                if rebound {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        surface = self.surface_id.0,
+                        popped = self.popped,
+                        "[editor] scene view rebound"
+                    );
+                } else {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        surface = self.surface_id.0,
+                        detached = self.window.detached,
+                        "[editor] scene surface attached"
+                    );
+                }
+            }
+            Err(error) => warn!(
+                target: telemetry_target::ENGINE,
+                surface = self.surface_id.0,
+                error = %error,
+                "[editor] scene surface refused; the scene view stays empty"
+            ),
+        }
+    }
+
+    /// Attach the view to the window it was opened with.
+    fn attach(&mut self, host: &mut RenderingHost, camera: &OrbitCamera) {
+        self.attach_to(host, camera, false);
+    }
+
+    /// Move the view onto `window` and attach to it: a popped-out view needs a
+    /// top-level window, and a redocked one needs a child of the editor window
+    /// again. The surface's previous window is dropped by the host when the new
+    /// one replaces it.
+    fn rebind_window(
+        &mut self,
+        host: &mut RenderingHost,
+        window: SurfaceWindow,
+        popped: bool,
+        camera: &OrbitCamera,
+    ) {
+        self.window = window;
+        self.popped = popped;
+        self.attach_to(host, camera, true);
+    }
+}
+
+/// The scene views' surface ids: view `n` draws through surface `n + 1`, so
+/// each view keeps its surface however many views the person opens. Surface
+/// 0 is the renderer's primary, which the game window carries.
+fn scene_surface(view: usize) -> SurfaceId {
+    SurfaceId(1 + view as u32)
 }
 
 // =============================================================================
-// Host notices to editor notices
+// Shell Input
 // =============================================================================
 
 /// Whether one frame's shell events carry a paste chord.
@@ -3095,6 +3213,10 @@ fn paste_chord(events: &[InputEvent]) -> bool {
         _ => false,
     })
 }
+
+// =============================================================================
+// Editor Notices
+// =============================================================================
 
 /// The toast a host notice becomes: its level and its one line.
 fn notice_toast(notice: &HostNotice) -> (NoticeLevel, String) {
@@ -3174,7 +3296,7 @@ fn problems_from_build_output(module: &str, output: &str) -> Vec<ProblemRow> {
 }
 
 // =============================================================================
-// SurfaceWindow
+// Windows
 // =============================================================================
 
 /// One popped-out tab's window: the window, its own
@@ -3220,6 +3342,12 @@ struct SurfaceWindow {
 impl SurfaceWindow {
     /// Create a view window: a child of the main window when the platform
     /// allows one, the detached fallback otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::WindowCreation`] when the detached fallback
+    /// cannot be created; a refused child window only logs before the fallback
+    /// is tried.
     fn open(
         event_loop: &ActiveEventLoop,
         main: &Window,
@@ -3298,8 +3426,8 @@ impl SurfaceWindow {
     /// and the client origin is read back after the move, because decorations
     /// make it differ from the outer position. A docked view instead ignores
     /// the position when the platform forced it to the detached fallback - it
-    /// is its own top-level window then - and its origin is the rectangle's
-    /// own corner.
+    /// is its own top-level window then - and a docked child takes its origin
+    /// from the rectangle's own corner.
     fn place(&mut self, x: i32, y: i32, width: u32, height: u32, screen_owned: bool) {
         // A placement means the dock shows this window's tab again after a
         // switch or an undock; a hidden window still sits where it was, so
@@ -3315,7 +3443,7 @@ impl SurfaceWindow {
             self.window.set_outer_position(PhysicalPosition::new(x, y));
         }
         // The client origin is what a pointer event from this window is
-        // relative to: a docked view's is the rectangle's corner, and a
+        // relative to: a docked child's is the rectangle's corner, and a
         // screen-owned one's is read back. Both are recorded outside the
         // placement cache, because a resize clears the cache and never moves
         // the window.
@@ -3334,6 +3462,11 @@ impl SurfaceWindow {
 
     /// Create a top-level window for a popped-out scene view: decorated, so the
     /// person can move and close it like any window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::WindowCreation`] when the platform refuses the
+    /// window.
     fn open_top_level(
         event_loop: &ActiveEventLoop,
         title: &str,
@@ -3370,71 +3503,31 @@ impl SurfaceWindow {
     }
 }
 
-impl SceneView {
-    /// Attach the view's surface to the window it has now and publish the
-    /// view's camera binding for that surface.
-    ///
-    /// The one attach path: the startup window, a popped-out top-level and a
-    /// redocked child all come through here, so the camera publish cannot be
-    /// forgotten on one of them - which is what happened while the startup and
-    /// rebind copies were separate.
-    fn attach_to(&mut self, host: &mut RenderingHost, camera: &OrbitCamera, rebound: bool) {
-        let size = self.window.size();
-        match host.attach_surface(
-            self.surface_id,
-            Arc::clone(&self.window.window),
-            size.0,
-            size.1,
-            SurfaceOptions::default(),
-        ) {
-            Ok(()) => {
-                host.set_surface_camera(self.surface_id, Some(camera_binding(camera)));
-                if rebound {
-                    info!(
-                        target: telemetry_target::ENGINE,
-                        surface = self.surface_id.0,
-                        popped = self.popped,
-                        "[editor] scene view rebound"
-                    );
-                } else {
-                    info!(
-                        target: telemetry_target::ENGINE,
-                        surface = self.surface_id.0,
-                        detached = self.window.detached,
-                        "[editor] scene surface attached"
-                    );
-                }
-            }
-            Err(error) => warn!(
-                target: telemetry_target::ENGINE,
-                surface = self.surface_id.0,
-                error = %error,
-                "[editor] scene surface refused; the scene view stays empty"
-            ),
-        }
-    }
-
-    /// Attach the view to the window it was opened with.
-    fn attach(&mut self, host: &mut RenderingHost, camera: &OrbitCamera) {
-        self.attach_to(host, camera, false);
-    }
-
-    /// Move the view onto `window` and attach to it: a popped-out view needs a
-    /// top-level window, and a redocked one needs a child of the editor window
-    /// again. The surface's previous window is dropped by the host when the new
-    /// one replaces it.
-    fn rebind_window(
-        &mut self,
-        host: &mut RenderingHost,
-        window: SurfaceWindow,
-        popped: bool,
-        camera: &OrbitCamera,
-    ) {
-        self.window = window;
-        self.popped = popped;
-        self.attach_to(host, camera, true);
-    }
+/// A shell rectangle in logical points as the child window's own client
+/// pixels: scaled, rounded, kept at least one pixel wide, and clamped inside
+/// the window so a viewport that overhangs an edge never asks for pixels the
+/// window does not have.
+fn scaled_view_rect(
+    rect: ShellRect,
+    scale_factor: f32,
+    window_size: (u32, u32),
+) -> (i32, i32, u32, u32) {
+    let scale = scale_factor as f64;
+    let x = (rect.x as f64 * scale).round() as i32;
+    let y = (rect.y as f64 * scale).round() as i32;
+    let width = (rect.width as f64 * scale).round().max(1.0) as i32;
+    let height = (rect.height as f64 * scale).round().max(1.0) as i32;
+    let (client_width, client_height) = (window_size.0 as i32, window_size.1 as i32);
+    let x = x.clamp(0, (client_width - 1).max(0));
+    let y = y.clamp(0, (client_height - 1).max(0));
+    let width = width.min((client_width - x).max(1)) as u32;
+    let height = height.min((client_height - y).max(1)) as u32;
+    (x, y, width, height)
 }
+
+// =============================================================================
+// Event Routing
+// =============================================================================
 
 /// Where one translated window event belongs, by the focus rule.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3463,20 +3556,20 @@ fn route_event(is_game_window: bool) -> EventRoute {
 /// Shift a pointer event the scene window reported into the main window's
 /// client coordinates. Only cursor positions move: buttons and wheels carry
 /// no position of their own, and egui reads the cursor's for them.
-fn offset_pointer(event: InputEvent, (dx, dy): (f32, f32)) -> InputEvent {
-    if dx == 0.0 && dy == 0.0 {
+fn offset_pointer(event: InputEvent, (delta_x, delta_y): (f32, f32)) -> InputEvent {
+    if delta_x == 0.0 && delta_y == 0.0 {
         return event;
     }
     match event {
         InputEvent::CursorMoved { position } => InputEvent::CursorMoved {
-            position: pill_core::math::Vector2f::new(position.x + dx, position.y + dy),
+            position: pill_core::math::Vector2f::new(position.x + delta_x, position.y + delta_y),
         },
         other => other,
     }
 }
 
 // =============================================================================
-// EditorCamera
+// Camera
 // =============================================================================
 
 /// The camera binding the scene surface draws through: the view's orbit
@@ -3504,8 +3597,28 @@ fn quaternion_product(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
     ]
 }
 
+/// A camera navigation drag in flight.
+struct CameraDrag {
+    /// The view whose camera the drag moves.
+    view: usize,
+    /// The gesture the press matched.
+    navigation: CameraNavigation,
+    /// The last pointer position, in the view's physical pixels: every move
+    /// applies its delta since this one.
+    last_point: (f32, f32),
+}
+
+/// The display name of a camera navigation gesture.
+fn camera_navigation_name(navigation: CameraNavigation) -> &'static str {
+    match navigation {
+        CameraNavigation::Orbit => "orbit",
+        CameraNavigation::Pan => "pan",
+        CameraNavigation::Dolly => "dolly",
+    }
+}
+
 // =============================================================================
-// Scripted dump helpers
+// Scripted Dump Helpers
 // =============================================================================
 
 /// Resolve an `NvG` display handle against the live entity table, so a
@@ -3538,7 +3651,7 @@ fn resolve_component_name(world: &pill_engine_core::World, name: &str) -> Option
 }
 
 // =============================================================================
-// Gizmo helpers
+// Gizmo Geometry
 // =============================================================================
 
 /// The wire name of a tool mode, for logs and suite tokens.
@@ -3547,84 +3660,6 @@ fn gizmo_mode_name(mode: GizmoMode) -> &'static str {
         GizmoMode::Translate => "translate",
         GizmoMode::Rotate => "rotate",
         GizmoMode::Scale => "scale",
-    }
-}
-
-/// What a registry command id does in this executable.
-///
-/// The registry owns the ids, the titles and the chords; this maps an id to
-/// the action it runs, so a rebinding reaches the same code a menu row or a
-/// scripted command does. A command with no action here stays inert.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommandAction {
-    /// Select a gizmo tool.
-    GizmoTool(GizmoMode),
-    /// Step the history back one entry.
-    Undo,
-    /// Step the history forward one entry.
-    Redo,
-    /// Flip the engine's pause flag.
-    PauseToggle,
-    /// Advance exactly one frame.
-    Step,
-}
-
-/// A state file's metadata: what a frame compares to decide whether the file
-/// needs reading at all.
-///
-/// The theme's layers keep their own stamps - they name a selection to
-/// re-resolve rather than a document to read - and the rule itself lives in
-/// [`pill_editor_core::state_watch`], where the two plain watchers share it.
-type FileStamp = pill_editor_core::state_watch::FileStamp;
-
-/// Split a command line into a program and its arguments.
-///
-/// Whitespace separates the parts, except inside one pair of double quotes:
-/// a program path with a space in it (`"C:\Program Files\...\python.exe"`)
-/// has to stay one argument, or the spawn looks for `C:\Program`.
-fn split_command(text: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    for character in text.chars() {
-        match character {
-            '"' => quoted = !quoted,
-            whitespace if whitespace.is_whitespace() && !quoted => {
-                if !current.is_empty() {
-                    parts.push(std::mem::take(&mut current));
-                }
-            }
-            other => current.push(other),
-        }
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
-}
-
-/// The action a command id runs, if this executable implements it.
-fn command_action(command_id: &str) -> Option<CommandAction> {
-    match command_id {
-        "editor.tool_translate" => Some(CommandAction::GizmoTool(GizmoMode::Translate)),
-        "editor.tool_rotate" => Some(CommandAction::GizmoTool(GizmoMode::Rotate)),
-        "editor.tool_scale" => Some(CommandAction::GizmoTool(GizmoMode::Scale)),
-        "editor.undo" => Some(CommandAction::Undo),
-        "editor.redo" => Some(CommandAction::Redo),
-        "editor.pause_toggle" => Some(CommandAction::PauseToggle),
-        "editor.step" => Some(CommandAction::Step),
-        _ => None,
-    }
-}
-
-/// The bindings the editor starts with when there is no keybindings file.
-///
-/// Unity's table, whose W/E/R the tool shortcuts use; the file's own `preset`
-/// replaces it as soon as one names a preset.
-fn editor_default_keybindings() -> KeybindingsFile {
-    KeybindingsFile {
-        preset: Some(KeymapPreset::Unity),
-        ..Default::default()
     }
 }
 
@@ -3697,19 +3732,109 @@ fn gizmo_basis(space: GizmoSpace, transform: &TransformComponent) -> [[f32; 3]; 
 
 /// The tangent of half the vertical field of view, and the aspect ratio.
 fn projection_terms(width: f32, height: f32) -> (f32, f32) {
-    let fov = CameraComponent::default().vertical_fov.clamp(1.0, 179.0);
-    let tan = (fov.to_radians() * 0.5).tan();
-    (tan, (width / height).max(1e-3))
+    let vertical_fov_degrees = CameraComponent::default().vertical_fov.clamp(1.0, 179.0);
+    let tangent = (vertical_fov_degrees.to_radians() * 0.5).tan();
+    (tangent, (width / height).max(1e-3))
 }
+
+// =============================================================================
+// Commands
+// =============================================================================
+
+/// What a registry command id does in this executable.
+///
+/// The registry owns the ids, the titles and the chords; this maps an id to
+/// the action it runs, so a rebinding reaches the same code a menu row or a
+/// scripted command does. A command with no action here stays inert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandAction {
+    /// Select a gizmo tool.
+    GizmoTool(GizmoMode),
+    /// Step the history back one entry.
+    Undo,
+    /// Step the history forward one entry.
+    Redo,
+    /// Flip the engine's pause flag.
+    PauseToggle,
+    /// Advance exactly one frame.
+    Step,
+}
+
+/// Split a command line into a program and its arguments.
+///
+/// Whitespace separates the parts, except inside one pair of double quotes:
+/// a program path with a space in it (`"C:\Program Files\...\python.exe"`)
+/// has to stay one argument, or the spawn looks for `C:\Program`.
+fn split_command(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for character in text.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            whitespace if whitespace.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            other => current.push(other),
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+/// The action a command id runs, if this executable implements it.
+fn command_action(command_id: &str) -> Option<CommandAction> {
+    match command_id {
+        "editor.tool_translate" => Some(CommandAction::GizmoTool(GizmoMode::Translate)),
+        "editor.tool_rotate" => Some(CommandAction::GizmoTool(GizmoMode::Rotate)),
+        "editor.tool_scale" => Some(CommandAction::GizmoTool(GizmoMode::Scale)),
+        "editor.undo" => Some(CommandAction::Undo),
+        "editor.redo" => Some(CommandAction::Redo),
+        "editor.pause_toggle" => Some(CommandAction::PauseToggle),
+        "editor.step" => Some(CommandAction::Step),
+        _ => None,
+    }
+}
+
+/// The bindings the editor starts with when there is no keybindings file.
+///
+/// Unity's table, whose W/E/R the tool shortcuts use; the file's own `preset`
+/// replaces it as soon as one names a preset.
+fn editor_default_keybindings() -> KeybindingsFile {
+    KeybindingsFile {
+        preset: Some(KeymapPreset::Unity),
+        ..Default::default()
+    }
+}
+
+// =============================================================================
+// State Files
+// =============================================================================
+
+/// A state file's metadata: what a frame compares to decide whether the file
+/// needs reading at all.
+///
+/// The theme's layers keep their own stamps - they name a selection to
+/// re-resolve rather than a document to read - and the rule itself lives in
+/// [`pill_editor_core::state_watch`], where the two plain watchers share it.
+type FileStamp = pill_editor_core::state_watch::FileStamp;
+
+// =============================================================================
+// Scene Presses and Drags
+// =============================================================================
 
 /// One gizmo drag in flight.
 ///
-/// The press records where the drag started - the axis parameter, ring
-/// angle or in-plane coordinates the cursor ray named, the transform it
-/// started from and the basis its handles were built in - so every move
-/// applies a delta against the press and nothing jumps on the first pixel.
-/// The start pivot stays put for the displacement line while the current
-/// one follows the object.
+/// The press records where the drag started: the axis parameter, ring angle or
+/// in-plane coordinates the cursor ray named, the transform it began from, and
+/// the basis its handles were built in. Every move then applies a delta to
+/// those recorded values, so nothing jumps on the first pixel. The start pivot
+/// stays fixed for the displacement line while the current pivot follows the
+/// object.
 struct GizmoDrag {
     /// The scene view the drag belongs to: every move re-reads that view's
     /// ray.
@@ -3758,18 +3883,7 @@ struct PressPick {
     /// pixels.
     y: f32,
     /// The pick request the answer is matched by.
-    id: u64,
-}
-
-/// A camera navigation drag in flight.
-struct CameraDrag {
-    /// The view whose camera the drag moves.
-    view: usize,
-    /// The gesture the press matched.
-    navigation: CameraNavigation,
-    /// The last pointer position, in the view's physical pixels: every move
-    /// applies its delta since this one.
-    last: (f32, f32),
+    request_id: u64,
 }
 
 /// The tool mode a handle's drag edits: a plane square translates.
@@ -3790,14 +3904,14 @@ fn gizmo_plane_name(first: usize, second: usize) -> &'static str {
 }
 
 /// Draw the drag guides: the axis constraint line through a single-axis
-/// handle's axis, and - for a translation drag - the dotted line from the
-/// press's pivot to the current one.
+/// handle's axis and, for a translation drag, the dotted line from the press's
+/// pivot to the current one.
 ///
-/// They are plain debug lines, not gizmo geometry: no handle id, so a pick
-/// never names them and they cannot be grabbed. They are marked as the
-/// editor's chrome, which is what keeps them off a game surface - the game
-/// viewport shows the project's frame, not the editor's drag. The axis guide
-/// uses the handle's own colour; the displacement line is neutral so it never
+/// They are plain debug lines, not gizmo geometry, so they carry no handle id:
+/// a pick never names them and they cannot be grabbed. They are marked as the
+/// editor's chrome, which keeps them off a game surface, where the viewport
+/// shows the project's frame rather than the editor's drag. The axis guide uses
+/// the handle's own colour; the displacement line stays neutral so it never
 /// reads as a fourth axis.
 fn draw_gizmo_guides(
     debug: &mut DebugDraw,
@@ -3828,36 +3942,9 @@ fn draw_gizmo_guides(
     }
 }
 
-/// The display name of a camera navigation gesture.
-fn camera_navigation_name(navigation: CameraNavigation) -> &'static str {
-    match navigation {
-        CameraNavigation::Orbit => "orbit",
-        CameraNavigation::Pan => "pan",
-        CameraNavigation::Dolly => "dolly",
-    }
-}
-
-/// A shell rectangle in logical points as the child window's own client
-/// pixels: scaled, rounded, kept at least one pixel wide, and clamped inside
-/// the window so a viewport that overhangs an edge never asks for pixels the
-/// window does not have.
-fn scaled_view_rect(
-    rect: ShellRect,
-    scale_factor: f32,
-    window_size: (u32, u32),
-) -> (i32, i32, u32, u32) {
-    let scale = scale_factor as f64;
-    let x = (rect.x as f64 * scale).round() as i32;
-    let y = (rect.y as f64 * scale).round() as i32;
-    let width = (rect.width as f64 * scale).round().max(1.0) as i32;
-    let height = (rect.height as f64 * scale).round().max(1.0) as i32;
-    let (client_width, client_height) = (window_size.0 as i32, window_size.1 as i32);
-    let x = x.clamp(0, (client_width - 1).max(0));
-    let y = y.clamp(0, (client_height - 1).max(0));
-    let width = width.min((client_width - x).max(1)) as u32;
-    let height = height.min((client_height - y).max(1)) as u32;
-    (x, y, width, height)
-}
+// =============================================================================
+// Asset Helpers
+// =============================================================================
 
 /// The guid a settings reference holds, in either spelling: the value itself
 /// when the document writes a bare guid, or the object form's `guid`.
@@ -3871,6 +3958,59 @@ fn reference_guid(value: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
+/// The store's own assets that no file in the project backs - a chain's
+/// built-in passes, the renderer's default material - in the form the pickers
+/// offer them.
+///
+/// An asset the listing already holds is left out, because the file names that
+/// same asset and two rows for one asset would be two ways to pick one thing.
+fn engine_asset_rows(
+    world: &pill_engine_core::World,
+    listing: &[AssetListing],
+) -> Vec<pill_editor_core::editor_state::EngineAsset> {
+    let Some(registry) = world
+        .get_resource::<pill_engine_core::ImportRegistry>()
+        .cloned()
+    else {
+        return Vec::new();
+    };
+    let Some(assets) = world.get_resource::<pill_engine_core::AssetManager>() else {
+        return Vec::new();
+    };
+    registry
+        .loaded_assets(assets)
+        .into_iter()
+        .filter(|(_kind, guid, name)| {
+            let guid = guid.map(|guid| guid.to_string());
+            !listing_shows_asset(listing, guid.as_deref(), name)
+        })
+        .map(
+            |(kind, guid, name)| pill_editor_core::editor_state::EngineAsset {
+                kind,
+                name,
+                guid: guid.map(|guid| guid.to_string()),
+            },
+        )
+        .collect()
+}
+
+/// Whether the listing already shows the store asset `name` carries.
+///
+/// One asset is one row: a guid the file declares, or the path the store holds
+/// it under. A code-built asset has neither and keeps its own row.
+fn listing_shows_asset(listing: &[AssetListing], guid: Option<&str>, name: &str) -> bool {
+    if let Some(guid) = guid {
+        return listing.iter().any(|row| row.guid.as_deref() == Some(guid));
+    }
+    listing
+        .iter()
+        .any(|row| row.path == name || row.path.ends_with(&format!("/{name}")))
+}
+
+// =============================================================================
+// File Manager
+// =============================================================================
+
 /// Ask the platform's file manager to show `target`: Windows and macOS select
 /// the file beside its siblings, and the FreeDesktop helper opens the folder
 /// that holds it.
@@ -3881,17 +4021,17 @@ fn open_in_file_manager(target: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let native = native_path(target);
+        let native_target = native_path(target);
         let mut command = std::process::Command::new("explorer");
         if target.is_dir() {
-            command.arg(&native);
+            command.arg(&native_target);
         } else {
             // Explorer parses `/select,<path>` itself and wants the *path*
             // quoted, not the whole token: a token quoted whole is rejected and
             // explorer falls back to the default folder. A raw argument is the
             // only way to put exactly that text on the command line, since
             // Rust would otherwise quote the token as one word.
-            command.raw_arg(format!("/select,\"{}\"", native.display()));
+            command.raw_arg(format!("/select,\"{}\"", native_target.display()));
         }
         let _ = command.spawn();
     }
@@ -3911,64 +4051,16 @@ fn open_in_file_manager(target: &std::path::Path) {
     }
 }
 
-/// `target` rebuilt from its components, so its text carries the platform's
+/// Rebuild `target` from its components, so its text carries the platform's
 /// own separators.
 ///
 /// A reveal target is joined from a `/`-separated relative path, and
-/// `Path::display` prints the string the path was built from - so the same
-/// path can read `res/materials/x.material` on Windows, which Explorer's
-/// `/select,` rejects before falling back to the user's Documents folder.
+/// `Path::display` prints the string the path was built from. That is why the
+/// same path can read `res/materials/unlit.material` on Windows, where
+/// Explorer's `/select,` rejects it and opens the user's Documents folder
+/// instead.
 fn native_path(target: &std::path::Path) -> std::path::PathBuf {
     target.components().collect()
-}
-
-/// The store's own assets that no file of the project's backs - a chain's
-/// built-in passes, the renderer's default material - as the pickers offer
-/// them.
-///
-/// A row the listing already holds is left out: the file names that same asset,
-/// and two rows for one asset would be two ways to pick one thing.
-fn engine_asset_rows(
-    world: &pill_engine_core::World,
-    listing: &[AssetListing],
-) -> Vec<pill_editor_core::editor_state::EngineAsset> {
-    let Some(registry) = world
-        .get_resource::<pill_engine_core::ImportRegistry>()
-        .cloned()
-    else {
-        return Vec::new();
-    };
-    let Some(assets) = world.get_resource::<pill_engine_core::AssetManager>() else {
-        return Vec::new();
-    };
-    registry
-        .loaded_assets(assets)
-        .into_iter()
-        .filter(|(_kind, guid, name)| {
-            let guid = guid.map(|guid| guid.to_string());
-            !listing_backs(listing, guid.as_deref(), name)
-        })
-        .map(
-            |(kind, guid, name)| pill_editor_core::editor_state::EngineAsset {
-                kind,
-                name,
-                guid: guid.map(|guid| guid.to_string()),
-            },
-        )
-        .collect()
-}
-
-/// Whether the listing already shows the store asset `name` carries.
-///
-/// One asset is one row: a guid the file declares, or the path the store holds
-/// it under. A code-built asset has neither and keeps its own row.
-fn listing_backs(listing: &[AssetListing], guid: Option<&str>, name: &str) -> bool {
-    if let Some(guid) = guid {
-        return listing.iter().any(|row| row.guid.as_deref() == Some(guid));
-    }
-    listing
-        .iter()
-        .any(|row| row.path == name || row.path.ends_with(&format!("/{name}")))
 }
 
 // =============================================================================
@@ -4019,19 +4111,19 @@ mod tests {
         ];
 
         assert!(
-            listing_backs(&listing, None, "defaults/pill.pbr.material"),
+            listing_shows_asset(&listing, None, "defaults/pill.pbr.material"),
             "the store's own path is the same row"
         );
         assert!(
-            listing_backs(&listing, Some("6a1e"), "anything"),
+            listing_shows_asset(&listing, Some("6a1e"), "anything"),
             "a guid the file declares is the row, whatever the store names it"
         );
         assert!(
-            !listing_backs(&listing, None, "pill.pbr.opaque"),
+            !listing_shows_asset(&listing, None, "pill.pbr.opaque"),
             "a pass built in code has no file, so its row stays"
         );
         assert!(
-            !listing_backs(&listing, Some("ffff"), "pill.pbr.skybox"),
+            !listing_shows_asset(&listing, Some("ffff"), "pill.pbr.skybox"),
             "a guid no file declares leaves the store's row alone"
         );
     }
@@ -4044,7 +4136,7 @@ mod tests {
         assert_eq!(route_event(false), EventRoute::Shell);
     }
 
-    /// A rectangle inside the window scales with the display and lands where
+    /// A rectangle inside the window scales with the display and ends up where
     /// the shell drew it.
     #[test]
     fn a_view_rect_scales_with_the_display() {
@@ -4103,8 +4195,8 @@ mod tests {
     }
 
     /// The change detector compares the two captures field by field, so an
-    /// empty answer is the "nothing to draw" one - and the tiers a frame feeds
-    /// itself are not part of the comparison.
+    /// empty answer means "nothing to draw". The tiers a frame feeds itself are
+    /// not part of the comparison.
     #[test]
     fn a_snapshot_only_demands_a_frame_when_a_drawn_field_moved() {
         let snapshot = EditorSnapshot::default();

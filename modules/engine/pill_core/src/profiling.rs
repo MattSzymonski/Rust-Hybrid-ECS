@@ -3,9 +3,9 @@
 //!
 //! # Responsibilities
 //!
-//! - Provide the macros instrumentation calls: `profile_scope!`,
+//! - Provide the macros call sites use: `profile_scope!`,
 //!   `profile_frame_mark!`, `profile_plot!` and the rest.
-//! - Compute the parallel-utilisation metrics of a frame.
+//! - Compute the parallel-utilization metrics of a frame.
 //! - Compile every entry point away to a no-op when no profiling feature is
 //!   enabled.
 //!
@@ -18,48 +18,52 @@
 //! | Zone text, native plots, messages, threads   | +           | -                   |
 //! | Context switches, system info, code transfer | +           | -                   |
 //!
-//! `profile_init!()` must run once at startup to start the Tracy client;
-//! without it every call no-ops even with a feature on. With no profiling
-//! feature at all, every entry point is a no-op stub the compiler drops.
+//! A zone is recorded only when the telemetry builder installed its Tracy
+//! lane (`TelemetryBuilder::with_tracy`) and a profiler is connected; until
+//! then every call returns without recording anything. `profile_init!()`
+//! creates the shared client handle. With no profiling feature at all, every
+//! entry point is a no-op stub the compiler drops.
 
 // =============================================================================
 // Profiling Targets
 // =============================================================================
 
-/// The `tracing` target the coarse profiling lane is filtered under
+/// The `tracing` target that filters the coarse profiling lane
 /// (`profile::coarse`).
 ///
-/// With the `tracy` feature, [`TelemetryBuilder::with_tracy`] installs a layer
-/// that enables this target at `TRACE`, independently of terminal verbosity,
-/// and a zone asks that filter whether the profiler wants it.
+/// With the `tracy` feature, [`TelemetryBuilder::with_tracy`] adds a layer
+/// that turns this target on at `TRACE`, whatever the terminal's own
+/// verbosity is. A zone checks that filter to learn whether the profiler
+/// wants it.
 ///
 /// [`TelemetryBuilder::with_tracy`]: crate::telemetry::TelemetryBuilder::with_tracy
 pub const PROFILE_COARSE_TARGET: &str = crate::telemetry::telemetry_target::PROFILE_COARSE;
 
-/// The `tracing` target the fine investigative lane is filtered under
+/// The `tracing` target that filters the fine investigative lane
 /// (`profile::fine`).
 ///
-/// Enabled only when the telemetry builder was asked for fine profiling: those
-/// zones perturb timing measurements, so they stay off by default.
+/// It is turned on only when the telemetry builder was asked for fine
+/// profiling. Fine zones change the timing they measure, so they stay off by
+/// default.
 pub const PROFILE_FINE_TARGET: &str = crate::telemetry::telemetry_target::PROFILE_FINE;
 
-// ============================================================================
-// Compile-time safeguards
-// ============================================================================
+// =============================================================================
+// Compile-Time Safeguards
+// =============================================================================
 
 #[cfg(all(feature = "profiling", feature = "profiling-minimal"))]
 compile_error!("`profiling` and `profiling-minimal` are mutually exclusive. Enable only one.");
 
-// ============================================================================
-// Shared profiling data
-// ============================================================================
+// =============================================================================
+// Shared Profiling Data
+// =============================================================================
 
-// These two name no Tracy type, so they are declared once for every posture and
-// re-exported from whichever `enabled` module is compiled. A field added here is
-// checked by every feature set, including the one shipping builds use.
+// Neither type names anything from Tracy, so both are declared once for every
+// build and re-exported from whichever `enabled` module is compiled. A field
+// added here is compiled by every feature set, including a shipping build's.
 
-/// The graphics API a GPU timeline's timestamps come from, for its label in
-/// Tracy.
+/// The graphics API a GPU timeline's timestamps come from, so Tracy can label
+/// the timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuApi {
     /// Vulkan.
@@ -72,28 +76,31 @@ pub enum GpuApi {
     Other,
 }
 
-/// One geometry pass's pipeline statistics, for [`plot_gpu_statistics`].
+/// The pipeline statistics of one geometry pass.
+///
+/// A frame's totals go to [`plot_gpu_statistics`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GpuStatistics {
     /// Vertex shader invocations.
     pub vertex_invocations: u64,
     /// Primitives that entered clipping.
     pub clipper_invocations: u64,
-    /// Primitives that survived clipping and were rasterized.
+    /// Primitives that passed clipping.
     pub clipper_primitives_out: u64,
     /// Fragment shader invocations.
     pub fragment_invocations: u64,
 }
 
-// ============================================================================
-// Tracy-enabled implementation (shared by both `profiling` and `profiling-minimal`)
-// ============================================================================
+// =============================================================================
+// Tracy-Enabled Implementation (Either Profiling Feature)
+// =============================================================================
 
 #[cfg(any(feature = "profiling", feature = "profiling-minimal"))]
 mod enabled {
     // Standard library
     use std::fmt::Arguments;
     use std::mem::ManuallyDrop;
+    use std::sync::OnceLock;
 
     // External crates
     use tracy_client::Client;
@@ -101,29 +108,31 @@ mod enabled {
     // Current crate
     pub use super::{GpuApi, GpuStatistics};
 
-    /// Lazy-initialized client handle. The first call to `client()` starts Tracy.
+    /// The shared Tracy client handle, created the first time it is asked for.
     pub(crate) fn client() -> Client {
-        use std::sync::OnceLock;
         static CLIENT: OnceLock<Client> = OnceLock::new();
         CLIENT.get_or_init(Client::start).clone()
     }
 
-    /// Call once at startup to initialize Tracy. Idempotent - safe to call
-    /// multiple times. Without this, all instrumentation silently no-ops.
+    /// Creates the shared Tracy client handle.
+    ///
+    /// Safe to call more than once. Later calls reuse the handle made by the
+    /// first.
     #[inline]
     pub fn init() {
         let _ = client();
     }
 
-    /// A Tracy zone opened straight through the client.
+    /// A Tracy zone opened through the client itself.
     ///
-    /// Every call into Tracy's C API (open, text, close) happens in a function
-    /// of this crate that is never inlined. Those C functions live inside
-    /// `pill_core.dll`, which exports only Rust symbols, so a call inlined
-    /// into an extension or project DLL would fail to link there with
-    /// "undefined symbol ___tracy_emit_zone_*". The span sits in a
-    /// `ManuallyDrop` for the same reason: its drop must run in [`Drop::drop`]
-    /// below, not in drop glue generated wherever the zone ends.
+    /// Every call into Tracy's C API (open, add text, close) is made from a
+    /// function in this crate marked `#[inline(never)]`. The C functions exist
+    /// only inside `pill_core.dll`, which exports Rust symbols alone. A call
+    /// the compiler inlined into an extension or project DLL would therefore
+    /// fail to link there with "undefined symbol ___tracy_emit_zone_*". The
+    /// span is wrapped in `ManuallyDrop` for the same reason. Its drop has to
+    /// run in [`Drop::drop`] below, not in drop code generated wherever the
+    /// zone ends.
     struct DirectZone {
         span: ManuallyDrop<tracy_client::Span>,
     }
@@ -157,30 +166,31 @@ mod enabled {
     /// Whether a zone on the fine (`profile::fine`) or coarse
     /// (`profile::coarse`) lane would reach a connected profiler.
     ///
-    /// The lanes are switched through the telemetry stack's `tracing` filter:
-    /// the builder's Tracy layer turns `profile::coarse`, and fine profiling
-    /// `profile::fine`, on at `TRACE`, independently of terminal verbosity.
-    /// Checked before a dynamic name is formatted, so a run without a profiler
-    /// attached allocates nothing.
+    /// The lanes are switched by the telemetry stack's `tracing` filter. The
+    /// builder's Tracy layer turns `profile::coarse` on at `TRACE`, and fine
+    /// profiling does the same for `profile::fine`. Both happen whatever the
+    /// terminal's own verbosity is. The answer is checked before a dynamic
+    /// name is formatted, so a run with no profiler connected allocates
+    /// nothing.
     #[inline(never)]
-    fn lane_wanted(fine: bool) -> bool {
+    fn lane_wanted(fine_lane: bool) -> bool {
         if !Client::is_running() || !Client::is_connected() {
             return false;
         }
-        if fine {
+        if fine_lane {
             tracing::enabled!(target: crate::profiling::PROFILE_FINE_TARGET, tracing::Level::TRACE)
         } else {
             tracing::enabled!(target: crate::profiling::PROFILE_COARSE_TARGET, tracing::Level::TRACE)
         }
     }
 
-    /// RAII guard for a CPU zone. Created by `profile_scope!` and
-    /// `profile_scope_fine!`; the zone closes when the guard drops.
+    /// Keeps a CPU zone open until it is dropped.
     ///
-    /// The zone is opened through the Tracy client directly, not as a
-    /// `tracing` span: a span is named when it is entered, from its static name
-    /// and the fields recorded so far, so a dynamic name or text recorded
-    /// afterwards could never reach Tracy.
+    /// `profile_scope!` and `profile_scope_fine!` create one, and the zone
+    /// closes when the guard drops. The zone is opened through the Tracy
+    /// client itself, not as a `tracing` span. A span gets its name when it is
+    /// created, from its fixed name and the fields known then, so a name or
+    /// text recorded later could never reach Tracy.
     #[must_use = "zone closes on drop - bind to a variable"]
     pub struct TracyZone {
         // `None` when the lane is off or no profiler is connected.
@@ -191,8 +201,8 @@ mod enabled {
     impl TracyZone {
         /// Opens a zone called `name` on the given lane.
         #[inline]
-        fn open(fine: bool, name: &str, function: &str, file: &str, line: u32) -> Self {
-            if !lane_wanted(fine) {
+        fn open(fine_lane: bool, name: &str, function: &str, file: &str, line: u32) -> Self {
+            if !lane_wanted(fine_lane) {
                 return Self { zone: None };
             }
             Self {
@@ -203,13 +213,13 @@ mod enabled {
         /// Opens a zone whose name is built only when the lane is wanted.
         #[inline]
         fn open_lazy(
-            fine: bool,
+            fine_lane: bool,
             name: impl FnOnce() -> String,
             function: &str,
             file: &str,
             line: u32,
         ) -> Self {
-            if !lane_wanted(fine) {
+            if !lane_wanted(fine_lane) {
                 return Self { zone: None };
             }
             Self {
@@ -264,40 +274,43 @@ mod enabled {
             Self::open_lazy(true, name, function, file, line)
         }
 
-        /// Attach a diagnostic message to this zone. The text appears in
-        /// Tracy's zone tooltip and detail view.
+        /// Adds a diagnostic message to this zone. Tracy shows it in the
+        /// zone's tooltip and detail view.
         #[cfg(feature = "profiling")]
         #[inline]
-        pub fn text(&self, msg: Arguments<'_>) {
+        pub fn text(&self, message_text: Arguments<'_>) {
             if let Some(zone) = &self.zone {
-                zone.text(&msg.to_string());
+                zone.text(&message_text.to_string());
             }
         }
 
         /// No-op detail recording under `profiling-minimal`.
         #[cfg(not(feature = "profiling"))]
         #[inline]
-        pub fn text(&self, _msg: Arguments<'_>) {}
+        pub fn text(&self, _message_text: Arguments<'_>) {}
 
-        /// Attach a lazily-built diagnostic message. The closure is only
-        /// invoked when the zone is recorded, so expensive operations
-        /// (String allocation, archetype info formatting) are skipped
-        /// during normal execution.
+        /// Adds a diagnostic message that is built only when the zone is
+        /// recorded.
+        ///
+        /// Because the closure runs only then, work such as allocating a
+        /// `String` or formatting archetype details is skipped while the game
+        /// runs without a profiler.
         #[cfg(feature = "profiling")]
         #[inline]
-        pub fn text_lazy(&self, f: impl FnOnce() -> String) {
+        pub fn text_lazy(&self, build_message_text: impl FnOnce() -> String) {
             if let Some(zone) = &self.zone {
-                zone.text(&f());
+                zone.text(&build_message_text());
             }
         }
 
         /// No-op lazy detail recording under `profiling-minimal`.
         #[cfg(not(feature = "profiling"))]
         #[inline]
-        pub fn text_lazy(&self, _f: impl FnOnce() -> String) {}
+        pub fn text_lazy(&self, _build_message_text: impl FnOnce() -> String) {}
     }
-    /// A GPU timeline in Tracy: GPU work shown as zones on a track of its
-    /// own, beside the CPU threads.
+
+    /// Shows GPU work as zones on a track of its own in Tracy, beside the CPU
+    /// threads.
     ///
     /// Every call into Tracy's C API happens in a function of this crate that
     /// is never inlined, for the reason given on `DirectZone`: those functions
@@ -307,9 +320,11 @@ mod enabled {
     }
 
     impl GpuTimeline {
-        /// Creates a timeline whose clock reads `gpu_timestamp` now, in ticks
-        /// of `period_nanoseconds` each. `None` when Tracy is not running, or
-        /// the process has used up Tracy's 255 GPU contexts.
+        /// Creates a timeline whose clock reads `gpu_timestamp` now.
+        ///
+        /// One tick of that clock lasts `period_nanoseconds`. Returns `None`
+        /// when Tracy is not running, or when the process has already created
+        /// Tracy's 255 GPU contexts.
         #[inline(never)]
         pub fn new(
             name: &str,
@@ -353,11 +368,12 @@ mod enabled {
         }
     }
 
-    /// One GPU zone of a [`GpuTimeline`]: begun and ended as its commands are
-    /// recorded, timed once the GPU's timestamps are read back.
+    /// One GPU zone of a [`GpuTimeline`].
     ///
-    /// A span dropped before its timestamps are uploaded is placed at the
-    /// timeline's start, out of the way of the real ones.
+    /// It is begun and ended as its commands are recorded, and it is timed
+    /// once the GPU's timestamps are read back. A span dropped before its
+    /// timestamps are uploaded is placed at the start of the timeline, so it
+    /// does not overlap the real zones.
     pub struct GpuTimelineSpan {
         span: ManuallyDrop<tracy_client::GpuSpan>,
     }
@@ -376,9 +392,10 @@ mod enabled {
             self.span.upload_timestamp_end(end_timestamp);
         }
 
-        /// Lets go of the zone without telling Tracy anything, for a zone whose
-        /// timeline the profiler no longer knows: dropping it would send its
-        /// end there.
+        /// Drops the zone without reporting anything to Tracy.
+        ///
+        /// It is for a zone whose timeline the profiler no longer knows: a
+        /// normal drop would send its end there.
         pub fn discard(self) {
             std::mem::forget(self);
         }
@@ -395,11 +412,11 @@ mod enabled {
 
     /// Whether a Tracy profiler is connected right now.
     ///
-    /// Tracy runs on demand: until a profiler connects, every event is
-    /// dropped. Anything that sends a one-time setup event, such as a GPU
-    /// timeline's context, has to wait for a connection and send it again
-    /// after a reconnect, or later events refer to something the profiler
-    /// never saw (`tracy-capture` crashes on GPU zones of an unknown context).
+    /// Tracy records on demand: until a profiler connects, it drops every
+    /// event. So a one-time setup event, such as a GPU timeline's context,
+    /// has to wait for a connection and be sent again after a reconnect.
+    /// Otherwise later events refer to something the profiler never saw, and
+    /// `tracy-capture` crashes on GPU zones of an unknown context.
     #[inline(never)]
     pub fn profiler_connected() -> bool {
         Client::is_running() && Client::is_connected()
@@ -408,8 +425,8 @@ mod enabled {
     /// Adds one frame's pipeline statistics to Tracy's plots.
     ///
     /// The plot names are this crate's statics. Tracy reads a plot's name
-    /// through the pointer it is given, long after the call, so a name in a
-    /// DLL the host reloads would leave it reading unmapped memory.
+    /// through the pointer it is given, long after the call. A name in a DLL
+    /// the host reloads would therefore leave Tracy reading unmapped memory.
     #[inline(never)]
     pub fn plot_gpu_statistics(statistics: GpuStatistics) {
         let Some(client) = Client::running() else {
@@ -433,7 +450,7 @@ mod enabled {
         );
     }
 
-    /// Mark end of a frame for Tracy's frame-time graphs.
+    /// Marks the end of a frame for Tracy's frame-time graphs.
     #[inline]
     pub fn frame_mark() {
         if Client::is_running() {
@@ -441,7 +458,7 @@ mod enabled {
         }
     }
 
-    /// Mark end of a secondary (named) continuous frame.
+    /// Marks the end of a secondary (named) continuous frame.
     #[inline]
     pub fn secondary_frame_mark(name: tracy_client::FrameName) {
         if Client::is_running() {
@@ -449,26 +466,27 @@ mod enabled {
         }
     }
 
-    /// RAII guard for a non-continuous frame. Frame ends on drop.
+    /// RAII guard for a non-continuous frame. The frame ends on drop.
     #[must_use = "non-continuous frame ends on drop - bind to a variable"]
     pub struct NonContinuousFrame {
         #[allow(dead_code)]
-        inner: Option<tracy_client::Frame>,
+        tracy_frame: Option<tracy_client::Frame>,
     }
 
-    /// Begin a non-continuous frame (one-shot operation, not in a loop).
+    /// Begins a non-continuous frame (a one-shot operation, not in a loop).
     #[inline]
     pub fn non_continuous_frame_begin(name: tracy_client::FrameName) -> NonContinuousFrame {
-        let inner = Client::running().map(|c| c.non_continuous_frame(name));
-        NonContinuousFrame { inner }
+        let tracy_frame = Client::running().map(|client| client.non_continuous_frame(name));
+        NonContinuousFrame { tracy_frame }
     }
 }
 
-// ============================================================================
-// Full `profiling` feature - plots, messages, thread naming
-// ============================================================================
+// =============================================================================
+// Full `profiling` Feature - Plots, Messages, Thread Names
+// =============================================================================
 
-/// Extended profiling helpers, compiled only with the `profiling` feature.
+/// Helpers that need the full `profiling` feature: plots, messages and thread
+/// names.
 #[cfg(feature = "profiling")]
 pub mod profiling_extras {
     // Standard library
@@ -480,9 +498,10 @@ pub mod profiling_extras {
     // Current crate
     use super::enabled::client;
 
-    /// Emit a data point on a named time-series plot.
-    /// Uses Tracy's native plot system - renders as an actual graph in the UI.
-    /// Skips work when no profiler is connected.
+    /// Adds one value to a named time-series plot.
+    ///
+    /// The plots are Tracy's own, so the profiler draws them as a graph. The
+    /// call does nothing while no profiler is connected.
     #[inline]
     pub fn plot(name: tracy_client::PlotName, value: f64) {
         if Client::is_running() && Client::is_connected() {
@@ -490,7 +509,7 @@ pub mod profiling_extras {
         }
     }
 
-    /// Configure how a plot appears in the Tracy profiler UI.
+    /// Configures how a plot appears in the Tracy profiler UI.
     #[inline]
     pub fn plot_config(
         name: tracy_client::PlotName,
@@ -501,35 +520,36 @@ pub mod profiling_extras {
         }
     }
 
-    /// Emit a diagnostic message (white). Skips formatting when no profiler is connected.
+    /// Emits a diagnostic message, shown in white.
+    ///
+    /// The text is built only when a profiler is connected.
     #[inline]
-    pub fn message(msg: Arguments<'_>) {
+    pub fn message(message_text: Arguments<'_>) {
         if Client::is_running() && Client::is_connected() {
-            let text = format!("{}", msg);
+            let text = format!("{}", message_text);
             client().message(&text, 0);
         }
     }
 
-    /// Emit a warning message (orange, RGBA 0xFF8800FF).
+    /// Emits a warning message, shown in orange (RGBA 0xFF8800FF).
     #[inline]
-    pub fn warn(msg: Arguments<'_>) {
+    pub fn warn(message_text: Arguments<'_>) {
         if Client::is_running() && Client::is_connected() {
-            let text = format!("{}", msg);
+            let text = format!("{}", message_text);
             client().color_message(&text, 0xFF8800FF, 0);
         }
     }
 
-    /// Emit an error message (red, RGBA 0xFF0000FF).
+    /// Emits an error message, shown in red (RGBA 0xFF0000FF).
     #[inline]
-    pub fn error(msg: Arguments<'_>) {
+    pub fn error(message_text: Arguments<'_>) {
         if Client::is_running() && Client::is_connected() {
-            let text = format!("{}", msg);
+            let text = format!("{}", message_text);
             client().color_message(&text, 0xFF0000FF, 0);
         }
     }
 
-    /// Set the display name of the current thread.
-    /// Goes through the safe `Client::set_thread_name` API.
+    /// Sets the display name of the current thread in Tracy.
     #[inline]
     pub fn set_thread_name(name: &str) {
         if Client::is_running() {
@@ -538,9 +558,9 @@ pub mod profiling_extras {
     }
 }
 
-// ============================================================================
-// Disabled (no-op) implementation - neither feature enabled
-// ============================================================================
+// =============================================================================
+// Disabled (No-Op) Implementation - Neither Feature Enabled
+// =============================================================================
 
 #[cfg(not(any(feature = "profiling", feature = "profiling-minimal")))]
 mod enabled {
@@ -596,11 +616,11 @@ mod enabled {
 
         /// Compile-time no-op: records nothing on this zone.
         #[inline(always)]
-        pub fn text(&self, _msg: Arguments<'_>) {}
+        pub fn text(&self, _message_text: Arguments<'_>) {}
 
         /// Compile-time no-op: never evaluates the lazy message closure.
         #[inline(always)]
-        pub fn text_lazy(&self, _f: impl FnOnce() -> String) {}
+        pub fn text_lazy(&self, _build_message_text: impl FnOnce() -> String) {}
     }
 
     /// Compile-time no-op guard for a non-continuous frame.
@@ -666,12 +686,15 @@ mod enabled {
     /// Compile-time no-op: Tracy is never initialized.
     #[inline(always)]
     pub fn init() {}
+
     /// Compile-time no-op: no frame is ever marked.
     #[inline(always)]
     pub fn frame_mark() {}
+
     /// Compile-time no-op: no secondary frame is ever marked.
     #[inline(always)]
     pub fn secondary_frame_mark(_name: OpaqueFrameName) {}
+
     /// Compile-time no-op: returns a guard that ends nothing.
     #[inline(always)]
     pub fn non_continuous_frame_begin(_name: OpaqueFrameName) -> NonContinuousFrame {
@@ -681,8 +704,9 @@ mod enabled {
 
 pub use enabled::*;
 
-// `profiling_extras` is only compiled under `profiling`. The macros reference it
-// via `$crate::profiling::extras::*` which only exists under `#[cfg(feature = "profiling")]`.
+// `extras` exists only under the `profiling` feature. The macros reach the
+// module through `$crate::profiling::extras::*`, so the alias is cfg-gated the
+// same way.
 #[cfg(feature = "profiling")]
 pub use profiling_extras as extras;
 
@@ -690,12 +714,12 @@ pub use profiling_extras as extras;
 // Free Functions
 // =============================================================================
 
-/// Computes the thread-utilization percentage of a single frame.
+/// Returns how much of a frame's thread capacity was busy, as a percentage.
 ///
-/// The utilization is the total of `system_durations_ns` divided by the
-/// frame's full thread capacity (`frame_wall_time_ns` times `thread_count`),
-/// as a percentage: 100% means every thread was busy for the entire frame,
-/// below that some CPU-time went idle.
+/// The total of `system_durations_ns` is divided by the frame's full thread
+/// capacity (`frame_wall_time_ns` times `thread_count`). 100% means every
+/// thread was busy for the whole frame; anything below that left some
+/// capacity idle.
 ///
 /// This is a lower-bound estimate because each system's wall-clock
 /// duration already includes internal Rayon parallelism - a system that
@@ -718,9 +742,12 @@ pub fn compute_parallel_utilization(
     frame_wall_time_ns: u64,
     thread_count: usize,
 ) -> f64 {
-    // Step 1: Sum the per-system durations to obtain the total CPU work done.
-    let total_work: u128 = system_durations_ns.iter().map(|&d| d as u128).sum();
-    // Step 2: Scale the total work against the frame's full thread capacity.
+    // Step 1: Add up the per-system durations to get the total CPU work done.
+    let total_work: u128 = system_durations_ns
+        .iter()
+        .map(|&duration_nanoseconds| duration_nanoseconds as u128)
+        .sum();
+    // Step 2: Divide the total work by the frame's full thread capacity.
     let capacity = frame_wall_time_ns as u128 * thread_count as u128;
     if capacity == 0 {
         return 0.0;
@@ -728,14 +755,16 @@ pub fn compute_parallel_utilization(
     (total_work as f64 / capacity as f64) * 100.0
 }
 
-/// Computes batch-packing efficiency: how evenly the systems of each parallel
-/// batch balance each other.
+/// Returns how evenly the systems of each parallel batch share their work,
+/// as a percentage.
 ///
-/// Per batch the score is the batch's total duration over its longest system's
-/// duration times the batch size; the frame score is a total-work-weighted
-/// average of those. 100% means every system of every batch takes the same
-/// time. Below that, the shorter systems' threads go idle while the longest
-/// one runs, because Rayon work-stealing is intra-system, not inter-system.
+/// For one batch the score is its total duration divided by the product of its
+/// longest system's duration and the batch size. The frame score averages
+/// those batch scores, each weighted by the batch's ideal work (its longest
+/// duration times its size). 100% means every system of every batch takes the
+/// same time. Below that, the threads of the shorter systems sit idle while
+/// the longest one runs, because Rayon steals work inside a system, not
+/// between systems.
 ///
 /// # Examples
 ///
@@ -756,29 +785,29 @@ pub fn compute_batch_packing_efficiency(
     let mut total_ideal: u128 = 0;
     let mut total_actual: u128 = 0;
 
-    // Step 1: Accumulate ideal (max duration × batch size) and actual (sum of
-    // durations) work across every parallel batch.
+    // Step 1: Add up the ideal work (longest duration × batch size) and the
+    // actual work (sum of durations) of every parallel batch.
     for batch in execution_graph {
         if batch.is_empty() {
             continue;
         }
         let max_duration = batch
             .iter()
-            .filter_map(|&idx| system_durations_ns.get(idx).copied())
+            .filter_map(|&system_index| system_durations_ns.get(system_index).copied())
             .max()
             .unwrap_or(0);
         let sum_durations: u64 = batch
             .iter()
-            .filter_map(|&idx| system_durations_ns.get(idx).copied())
+            .filter_map(|&system_index| system_durations_ns.get(system_index).copied())
             .sum();
 
         total_ideal += max_duration as u128 * batch.len() as u128;
         total_actual += sum_durations as u128;
     }
 
-    // Step 2: Convert the accumulated totals into a percentage.
+    // Step 2: Turn the two totals into a percentage.
     if total_ideal == 0 {
-        return 100.0; // No systems → vacuously perfect
+        return 100.0; // No systems at all: nothing can be uneven.
     }
     (total_actual as f64 / total_ideal as f64) * 100.0
 }
@@ -817,11 +846,11 @@ pub fn emit_parallel_utilization_plots(
     crate::profile_plot!(batch_packing_pct, batch_packing);
 }
 
-// ============================================================================
-// Public macros - the only API call sites use
-// ============================================================================
+// =============================================================================
+// Public Macros - the Only API Call Sites Use
+// =============================================================================
 
-/// Initializes the Tracy profiler client. Call once at startup.
+/// Creates the shared Tracy client handle. Safe to call more than once.
 /// Active under both `profiling` and `profiling-minimal`.
 #[cfg(any(feature = "profiling", feature = "profiling-minimal"))]
 #[macro_export]
@@ -831,6 +860,7 @@ macro_rules! profile_init {
     };
 }
 
+/// Compile-time no-op of [`profile_init!`] when no profiling feature is on.
 #[cfg(not(any(feature = "profiling", feature = "profiling-minimal")))]
 #[macro_export]
 macro_rules! profile_init {
@@ -839,8 +869,8 @@ macro_rules! profile_init {
 
 /// Creates a scoped CPU profiling zone on the `profile::coarse` lane.
 ///
-/// Active under both `profiling` and `profiling-minimal`. Zone text/details
-/// (the `[...]` form) only emit under `profiling`.
+/// Active under both `profiling` and `profiling-minimal`. Zone details (the
+/// `[...]` form) are recorded only under `profiling`.
 ///
 /// The zone opens through the Tracy client directly, on the lane the telemetry
 /// builder enables for `profile::coarse`. A dynamic name is formatted only when
@@ -913,8 +943,13 @@ macro_rules! profile_scope {
 /// Creates a fine-grained investigative CPU zone on the `profile::fine` lane.
 ///
 /// Only active under `profiling-fine` (which implies `profiling`). Fine zones
-/// perturb timing and are intended for temporary deep investigation; they
-/// compile away completely when `profiling-fine` is disabled.
+/// perturb the timing they measure and are meant for temporary deep
+/// investigation. They compile away completely when `profiling-fine` is
+/// disabled.
+///
+/// A `profiling-fine` build records nothing here unless the telemetry builder
+/// also turned the fine lane on (`with_fine_profiling`), because the zone asks
+/// that filter first.
 #[cfg(feature = "profiling-fine")]
 #[macro_export]
 macro_rules! profile_scope_fine {
@@ -957,6 +992,8 @@ macro_rules! profile_scope_detail {
     };
 }
 
+/// Compile-time no-op of the detail helper in [`profile_scope!`] when the
+/// `profiling` feature is off.
 #[cfg(not(feature = "profiling"))]
 #[doc(hidden)]
 #[macro_export]
@@ -975,6 +1012,8 @@ macro_rules! profile_frame_mark {
     };
 }
 
+/// Compile-time no-op of [`profile_frame_mark!`] when no profiling feature is
+/// on.
 #[cfg(not(any(feature = "profiling", feature = "profiling-minimal")))]
 #[macro_export]
 macro_rules! profile_frame_mark {
@@ -991,13 +1030,15 @@ macro_rules! profile_secondary_frame_mark {
     };
 }
 
+/// Compile-time no-op of [`profile_secondary_frame_mark!`] when no profiling
+/// feature is on.
 #[cfg(not(any(feature = "profiling", feature = "profiling-minimal")))]
 #[macro_export]
 macro_rules! profile_secondary_frame_mark {
     ($name:literal) => {};
 }
 
-/// Begins a non-continuous frame (one-shot operation).
+/// Begins a non-continuous frame (a one-shot operation, not in a loop).
 /// Returns an RAII guard that ends the frame on drop.
 /// Active under both `profiling` and `profiling-minimal`.
 #[cfg(any(feature = "profiling", feature = "profiling-minimal"))]
@@ -1008,6 +1049,8 @@ macro_rules! profile_non_continuous_frame {
     };
 }
 
+/// Compile-time no-op of [`profile_non_continuous_frame!`] when no profiling
+/// feature is on: the guard it returns ends nothing.
 #[cfg(not(any(feature = "profiling", feature = "profiling-minimal")))]
 #[macro_export]
 macro_rules! profile_non_continuous_frame {
@@ -1017,10 +1060,10 @@ macro_rules! profile_non_continuous_frame {
 }
 
 /// Emits a data point on a named time-series plot.
-/// Uses Tracy's native plot system - renders as an actual graph in the UI.
 /// Only active under `profiling` (not `profiling-minimal`).
 ///
-/// The plot name is a Rust identifier (not a string literal).
+/// The plot name is a Rust identifier (not a string literal). Tracy draws each
+/// plot as a graph in its UI.
 ///
 /// ```ignore
 /// profile_plot!(entity_count, world.entity_count() as f64);
@@ -1037,6 +1080,8 @@ macro_rules! profile_plot {
     };
 }
 
+/// Compile-time no-op of [`profile_plot!`] when the `profiling` feature is
+/// off: no plot point is emitted.
 #[cfg(not(feature = "profiling"))]
 #[macro_export]
 macro_rules! profile_plot {
@@ -1062,6 +1107,8 @@ macro_rules! profile_plot_config {
     };
 }
 
+/// Compile-time no-op of [`profile_plot_config!`] when the `profiling`
+/// feature is off: no plot is configured.
 #[cfg(not(feature = "profiling"))]
 #[macro_export]
 macro_rules! profile_plot_config {
@@ -1078,6 +1125,8 @@ macro_rules! profile_message {
     };
 }
 
+/// Compile-time no-op of [`profile_message!`] when the `profiling` feature is
+/// off: no message is emitted.
 #[cfg(not(feature = "profiling"))]
 #[macro_export]
 macro_rules! profile_message {
@@ -1094,6 +1143,8 @@ macro_rules! profile_warn {
     };
 }
 
+/// Compile-time no-op of [`profile_warn!`] when the `profiling` feature is
+/// off: no warning is emitted.
 #[cfg(not(feature = "profiling"))]
 #[macro_export]
 macro_rules! profile_warn {
@@ -1110,6 +1161,8 @@ macro_rules! profile_error {
     };
 }
 
+/// Compile-time no-op of [`profile_error!`] when the `profiling` feature is
+/// off: no error message is emitted.
 #[cfg(not(feature = "profiling"))]
 #[macro_export]
 macro_rules! profile_error {
@@ -1126,6 +1179,8 @@ macro_rules! profile_thread {
     };
 }
 
+/// Compile-time no-op of [`profile_thread!`] when the `profiling` feature is
+/// off: the thread keeps its default name.
 #[cfg(not(feature = "profiling"))]
 #[macro_export]
 macro_rules! profile_thread {

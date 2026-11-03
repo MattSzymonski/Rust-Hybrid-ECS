@@ -5,26 +5,27 @@
 //!
 //! - [`OverlaySurface`]: the DirectComposition target and visual over the
 //!   editor window, the `wgpu` surface drawn through it, the size that keeps
-//!   the swapchain in step with the window, and the empty-frame gate.
+//!   the swapchain matching the window, and the gate that skips empty frames.
 //!
 //! # Design
 //!
 //! A flip-model swapchain on the window's `HWND` cannot be transparent over
-//! the scene's child window, but a DirectComposition visual on a `topmost`
+//! the scene's child window. A DirectComposition visual on a `topmost`
 //! target can: the desktop compositor draws it above every child surface, so
-//! the overlay's pixels are per-pixel alpha over the scene. `wgpu` draws into
-//! it through `SurfaceTargetUnsafe::CompositionVisual`, which its DX12
-//! backend implements by setting the swapchain as the visual's content - so
-//! the tree is committed after every configure and the visual outlives the
-//! surface.
+//! each overlay pixel blends with the scene through its own alpha. `wgpu`
+//! draws into the overlay through `SurfaceTargetUnsafe::CompositionVisual`.
+//! Its DX12 backend implements that by setting the swapchain as the visual's
+//! content, so the tree is committed after every configure and the visual
+//! outlives the surface.
 //!
-//! The content is the shell's `EguiShellFrame`, drawn premultiplied with
-//! `egui-wgpu`'s renderer on the editor's own device, which is what the
-//! compositor multiplies back out.
+//! The content is the shell's `EguiShellFrame`. `egui-wgpu`'s renderer draws
+//! it on the editor's own device with premultiplied alpha (each colour
+//! already multiplied by its alpha), which is the form the compositor
+//! expects.
 //!
-//! The DirectComposition device is created through the `windows` crate in the
-//! binary only, never in a shared dylib, whose every hot patch would otherwise
-//! import `dcomp.dll`.
+//! Only the editor binary creates the DirectComposition device, through the
+//! `windows` crate. A shared dylib must not: every hot patch of it would
+//! otherwise import `dcomp.dll`.
 
 // Standard library
 use std::sync::Arc;
@@ -34,21 +35,9 @@ use pill_editor_core::egui::epaint::ClippedPrimitive;
 use pill_editor_core::egui::TexturesDelta;
 use winit::window::Window;
 
-/// Why an overlay could not be created; the executable logs it once and
-/// keeps running without the UI layer.
-pub type OverlayError = String;
-
-/// Where the UI's pixels go.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OverlayMode {
-    /// The composition visual above the scene: transparent where the shell
-    /// drew nothing, so the scene shows through the UI's gaps.
-    Composition,
-    /// The window's own surface, with no composition (`PILL_EDITOR_NO_OVERLAY`
-    /// or a failed overlay): the UI is opaque, and a scene child window -
-    /// always above its parent - hides whatever the UI draws under it.
-    Window,
-}
+// =============================================================================
+// Constants
+// =============================================================================
 
 /// The colour the window posture clears to: a dark neutral, so an uncovered
 /// region of the window is not black.
@@ -60,6 +49,27 @@ const WINDOW_CLEAR: wgpu::Color = wgpu::Color {
 };
 
 // =============================================================================
+// Overlay types
+// =============================================================================
+
+/// Why an overlay could not be created. The executable logs it, falls back to
+/// the window surface and retries the composition overlay every so often.
+pub type OverlayError = String;
+
+/// Where the UI's pixels go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayMode {
+    /// The composition visual above the scene: transparent where the shell
+    /// drew nothing, so the scene shows through the UI's gaps.
+    Composition,
+    /// The window's own surface, with no composition: `PILL_EDITOR_NO_OVERLAY`
+    /// asked for it, or a failed overlay fell back to it. The UI is opaque,
+    /// and a scene child window sits above its parent, so it hides whatever
+    /// the UI draws under it.
+    Window,
+}
+
+// =============================================================================
 // OverlaySurface
 // =============================================================================
 
@@ -67,36 +77,39 @@ const WINDOW_CLEAR: wgpu::Color = wgpu::Color {
 pub struct OverlaySurface {
     /// The posture this surface was created in.
     mode: OverlayMode,
-    /// The DirectComposition tree the surface is set on; kept alive (and
-    /// committed) for the surface's whole life. Only the composition posture
-    /// has one.
+    /// The DirectComposition tree the surface is set on. It is kept alive
+    /// and committed for the surface's whole life; only the composition
+    /// posture has one.
     #[cfg(windows)]
-    composition: Option<composition::CompositionTree>,
+    composition: Option<composition::Tree>,
     /// The overlay's swapchain, drawn through the composition visual.
     surface: wgpu::Surface<'static>,
     /// The swapchain's configuration: the window's client area in physical
     /// pixels, the editor's format, the posture's composition mode.
-    configuration: wgpu::SurfaceConfiguration,
+    surface_configuration: wgpu::SurfaceConfiguration,
     /// Whether the last frame drew content, so the first blank frame after
     /// content clears the swapchain and later blanks cost no GPU work.
-    drew_content: bool,
+    has_drawn_content: bool,
     /// Overlay frames presented since startup.
-    frames: u64,
+    frame_count: u64,
 }
 
 impl OverlaySurface {
     /// Create the composition overlay for `window`.
     ///
-    /// Fails - with the reason the executable logs - when the adapter is not
-    /// DX12, when the compositor is unavailable, or when the overlay's
-    /// swapchain cannot carry the given format and premultiplied alpha.
+    /// # Errors
+    ///
+    /// Returns the reason, which the executable logs, when the adapter is not
+    /// DX12, when the composition tree cannot be built or committed, when the
+    /// surface cannot be created from the visual, or when the swapchain cannot
+    /// carry the given format and premultiplied alpha.
     pub fn new(
         instance: &wgpu::Instance,
         adapter: &wgpu::Adapter,
         device: &wgpu::Device,
         window: Arc<Window>,
         format: wgpu::TextureFormat,
-        size: (u32, u32),
+        window_size: (u32, u32),
     ) -> Result<OverlaySurface, OverlayError> {
         // Step 1: the composition visual comes first - the surface is created
         // from it, and wgpu keeps the visual alive as long as the surface.
@@ -106,7 +119,7 @@ impl OverlaySurface {
                 adapter.get_info().backend
             ));
         }
-        let composition = composition::CompositionTree::new(&window)?;
+        let composition = composition::Tree::new(&window)?;
         // Step 2: the surface, from the visual's COM pointer.
         // SAFETY: the visual is a live `IDCompositionVisual` owned by
         // `composition`, which outlives the surface, and the pointer is its
@@ -131,29 +144,29 @@ impl OverlaySurface {
         {
             return Err("the overlay surface does not offer premultiplied composition".to_string());
         }
-        let configuration = wgpu::SurfaceConfiguration {
+        let surface_configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: size.0.max(1),
-            height: size.1.max(1),
+            width: window_size.0.max(1),
+            height: window_size.1.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
             view_formats: vec![],
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
-        surface.configure(device, &configuration);
-        // Step 4: the swapchain became the visual's content inside
-        // `configure`; the tree only shows it once committed.
+        surface.configure(device, &surface_configuration);
+        // Step 4: `configure` set the swapchain as the visual's content, so
+        // the tree only shows it once committed.
         composition.commit()?;
         Ok(OverlaySurface {
             mode: OverlayMode::Composition,
             #[cfg(windows)]
             composition: Some(composition),
             surface,
-            configuration,
-            drew_content: false,
-            frames: 0,
+            surface_configuration,
+            has_drawn_content: false,
+            frame_count: 0,
         })
     }
 
@@ -161,15 +174,20 @@ impl OverlaySurface {
     /// window's own surface, with no composition and no transparency.
     ///
     /// This is the posture `PILL_EDITOR_NO_OVERLAY` asks for, and the one a
-    /// failed composition overlay falls back to. It needs nothing the format
-    /// does not already offer, so it works on every backend.
+    /// failed composition overlay falls back to. It needs no composition and
+    /// no transparency, so every backend can provide it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason, which the executable logs, when the window surface
+    /// cannot be created or does not offer the editor's format.
     pub fn new_window(
         instance: &wgpu::Instance,
         adapter: &wgpu::Adapter,
         device: &wgpu::Device,
         window: Arc<Window>,
         format: wgpu::TextureFormat,
-        size: (u32, u32),
+        window_size: (u32, u32),
     ) -> Result<OverlaySurface, OverlayError> {
         // Step 1: a plain surface on the window.
         let surface = instance
@@ -181,53 +199,55 @@ impl OverlaySurface {
                 "the window surface does not offer the editor's format {format:?}"
             ));
         }
-        // Step 2: the first composition mode the platform offers that is not
-        // transparent: the window posture draws an opaque UI.
+        // Step 2: pick the first alpha mode that is not premultiplied; the
+        // window posture draws an opaque UI. `Auto` is the fallback when every
+        // mode is premultiplied.
         let alpha_mode = capabilities
             .alpha_modes
             .iter()
             .copied()
             .find(|mode| *mode != wgpu::CompositeAlphaMode::PreMultiplied)
             .unwrap_or(wgpu::CompositeAlphaMode::Auto);
-        let configuration = wgpu::SurfaceConfiguration {
+        let surface_configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: size.0.max(1),
-            height: size.1.max(1),
+            width: window_size.0.max(1),
+            height: window_size.1.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
-        surface.configure(device, &configuration);
+        surface.configure(device, &surface_configuration);
         Ok(OverlaySurface {
             mode: OverlayMode::Window,
             #[cfg(windows)]
             composition: None,
             surface,
-            configuration,
-            drew_content: false,
-            frames: 0,
+            surface_configuration,
+            has_drawn_content: false,
+            frame_count: 0,
         })
     }
 
-    /// The posture this surface draws in.
+    /// Returns the posture this surface draws in.
     pub fn mode(&self) -> OverlayMode {
         self.mode
     }
 
-    /// Resize the swapchain to `size` physical pixels (the window's client
-    /// area) and commit the new content.
-    pub fn resize(&mut self, device: &wgpu::Device, size: (u32, u32)) {
-        let width = size.0.max(1);
-        let height = size.1.max(1);
-        if self.configuration.width == width && self.configuration.height == height {
+    /// Resize the swapchain to `window_size` physical pixels (the window's
+    /// client area), and commit the composition tree when there is one.
+    pub fn resize(&mut self, device: &wgpu::Device, window_size: (u32, u32)) {
+        let width = window_size.0.max(1);
+        let height = window_size.1.max(1);
+        if self.surface_configuration.width == width && self.surface_configuration.height == height
+        {
             return;
         }
-        self.configuration.width = width;
-        self.configuration.height = height;
-        self.surface.configure(device, &self.configuration);
+        self.surface_configuration.width = width;
+        self.surface_configuration.height = height;
+        self.surface.configure(device, &self.surface_configuration);
         #[cfg(windows)]
         if let Some(composition) = &self.composition {
             if let Err(error) = composition.commit() {
@@ -239,17 +259,23 @@ impl OverlaySurface {
         }
     }
 
-    /// The overlay's frames presented since startup.
+    /// Returns the number of overlay frames presented since startup.
     pub fn frames(&self) -> u64 {
-        self.frames
+        self.frame_count
     }
 
-    /// Draw the shell frame's meshes over the scene and present them.
+    /// Draw the shell frame's meshes and present them.
     ///
-    /// An empty mesh list clears the overlay to fully transparent and
-    /// presents that once, so the previous frame's content disappears; a
+    /// An empty mesh list clears the overlay and presents that once, so the
+    /// previous frame's content disappears. The composition posture clears to
+    /// fully transparent; the window posture clears to `WINDOW_CLEAR`. A
     /// still-empty list after that is not drawn at all. Returns whether GPU
     /// work happened.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the swapchain gives no frame this time; the
+    /// caller logs it and tries again on the next frame.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -261,14 +287,16 @@ impl OverlaySurface {
         pixels_per_point: f32,
     ) -> Result<bool, OverlayError> {
         let has_content = !meshes.is_empty();
-        if !has_content && !self.drew_content {
+        if !has_content && !self.has_drawn_content {
             // Nothing is drawn, so nothing the shell uploaded is used: the
-            // delta is cleared rather than left to panic in epaint's drop.
+            // texture delta is cleared rather than left to trip epaint's debug
+            // assertion when it drops.
             textures.clear();
             return Ok(false);
         }
-        // A suboptimal frame is still drawable; anything else means the
-        // swapchain must be recreated by the frontend, which owns that path.
+        // A suboptimal frame is still drawable; any other status means there
+        // is no frame this time. The error goes back to the caller, which logs
+        // it and skips the UI for this frame.
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -278,7 +306,10 @@ impl OverlaySurface {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [self.configuration.width, self.configuration.height],
+            size_in_pixels: [
+                self.surface_configuration.width,
+                self.surface_configuration.height,
+            ],
             pixels_per_point: pixels_per_point.max(0.01),
         };
         // Step 1: apply this frame's texture updates before drawing with
@@ -302,11 +333,11 @@ impl OverlaySurface {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // The composition posture clears to fully transparent -
+                        // The composition posture clears to fully transparent:
                         // the visual is composited over the scene, so whatever
                         // the meshes leave out must show the scene through. The
                         // window posture owns every pixel of its surface, so it
-                        // clears to the shell's background instead.
+                        // clears to `WINDOW_CLEAR` instead.
                         load: wgpu::LoadOp::Clear(match self.mode {
                             OverlayMode::Composition => wgpu::Color::TRANSPARENT,
                             OverlayMode::Window => WINDOW_CLEAR,
@@ -320,9 +351,9 @@ impl OverlaySurface {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // The lifetime erasure extends the pass's borrows to `'static`;
-            // it stays inside this block, so nothing outlives `view` or the
-            // encoder.
+            // `forget_lifetime` widens the pass's borrows to `'static`. The
+            // pass stays inside this block, so nothing here outlives `view` or
+            // the encoder.
             let mut pass = pass.forget_lifetime();
             renderer.render(&mut pass, meshes, &screen_descriptor);
         }
@@ -330,12 +361,13 @@ impl OverlaySurface {
         for texture_id in &textures.free {
             renderer.free_texture(texture_id);
         }
-        // Every delta is applied: an unapplied one panics in epaint's drop.
+        // Every delta is applied: an unapplied one trips epaint's debug
+        // assertion when it drops.
         textures.clear();
         queue.submit(user_buffers.into_iter().chain(Some(encoder.finish())));
         queue.present(frame);
-        self.drew_content = has_content;
-        self.frames += 1;
+        self.has_drawn_content = has_content;
+        self.frame_count += 1;
         Ok(true)
     }
 }
@@ -344,7 +376,8 @@ impl OverlaySurface {
 // Window handle
 // =============================================================================
 
-/// The window's `HWND`, as the composition target needs it.
+/// The window's `HWND`, as the composition target needs it. Returns `None`
+/// when the window's raw handle is not a Win32 one.
 #[cfg(windows)]
 pub fn hwnd_of(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -377,23 +410,30 @@ mod composition {
     // Current crate
     use crate::overlay::hwnd_of;
 
-    /// One window's composition tree: the device, the `topmost` target on the
-    /// window, and the visual the overlay's swapchain is set as the content
-    /// of.
-    pub struct CompositionTree {
+    /// One window's composition tree: the composition device, a `topmost`
+    /// target on the window, and the visual whose content becomes the
+    /// overlay's swapchain.
+    pub struct Tree {
         /// The composition device; every tree change is committed through it.
         device: IDCompositionDevice,
-        /// The target on the window. Held so the target outlives the visual:
-        /// dropping it would tear the tree down.
+        /// The target on the window: the root the visual is set on. Held for
+        /// as long as the tree, so the root stays alive.
         _target: IDCompositionTarget,
-        /// The visual the overlay's swapchain becomes the content of.
+        /// The visual whose content becomes the overlay's swapchain.
         visual: IDCompositionVisual,
     }
 
-    impl CompositionTree {
+    impl Tree {
         /// Create the tree over `window`, with the visual on top of the
         /// window's child surfaces.
-        pub fn new(window: &Window) -> Result<CompositionTree, String> {
+        ///
+        /// # Errors
+        ///
+        /// Returns a message when the window has no Win32 handle, when the
+        /// composition device, the target or the visual cannot be created,
+        /// when the visual cannot be set as the target's root, or when the
+        /// first commit fails.
+        pub fn new(window: &Window) -> Result<Tree, String> {
             let hwnd = hwnd_of(window).ok_or("the window has no Win32 handle")?;
             // SAFETY: `DCompositionCreateDevice3` is given no rendering
             // device (the composition device makes its own), and returns a
@@ -411,10 +451,10 @@ mod composition {
             let visual = unsafe { device.CreateVisual() }
                 .map_err(|error| format!("CreateVisual failed: {error}"))?;
             // SAFETY: the target and the visual are alive and belong to this
-            // device, which is the order `SetRoot` requires.
+            // device, which is the precondition `SetRoot` requires.
             unsafe { target.SetRoot(&visual) }
                 .map_err(|error| format!("SetRoot failed: {error}"))?;
-            let tree = CompositionTree {
+            let tree = Tree {
                 device,
                 _target: target,
                 visual,
@@ -431,6 +471,10 @@ mod composition {
 
         /// Publish the tree: the composition device only shows a change once
         /// it is committed.
+        ///
+        /// # Errors
+        ///
+        /// Returns a message when the composition device refuses the commit.
         pub fn commit(&self) -> Result<(), String> {
             // SAFETY: the device is alive for as long as the tree is.
             unsafe { self.device.Commit() }.map_err(|error| format!("Commit failed: {error}"))

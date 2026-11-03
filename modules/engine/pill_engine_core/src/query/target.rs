@@ -9,12 +9,15 @@
 //!
 //! # Design
 //!
-//! Each `QueryTarget` implementation reports its component IDs (for mask building),
-//! creates per-archetype state (raw pointers into component storage), and fetches
-//! one row of data at a given index. For parallel iteration, the state must be
-//! `Send + Sync` so it can be shared across Rayon threads.
-
-// External crates
+//! Each implementation reports the components it reads and the components it
+//! writes. A query builds its component mask from that report, and a system
+//! declares the same access to the scheduler. The mask and the declared access
+//! then cannot disagree about what the target touches.
+//!
+//! An implementation also builds the state a query keeps for one archetype and
+//! reads one row out of it by index. That state holds raw pointers into
+//! component storage, so the parallel iterator can share it only when it is
+//! `Send + Sync`.
 
 // Current crate
 use super::change_detection::Mut;
@@ -35,52 +38,83 @@ use crate::entity::Entity;
 /// - `&mut T`: Mutable component reference (yielded as [`Mut<T>`])
 /// - Tuples up to arity 5
 ///
-/// State is used to cache archetype-specific data (e.g. storage pointers)
-/// for efficient access during parallel iteration. Each archetype that
-/// matches a query has its state initialized once via [`init_state`].
+/// A query keeps one [`State`](QueryTarget::State) per archetype it matches.
+/// [`init_state`] builds that state once for an archetype, usually by caching
+/// a raw pointer into the archetype's storage.
+/// [`fetch_with_state`](QueryTarget::fetch_with_state) then reads one row out
+/// of it.
 ///
 /// [`init_state`]: QueryTarget::init_state
 pub trait QueryTarget {
     /// The type yielded per row by this query target.
     type Item<'a>;
-    /// Cached per-archetype state (e.g. storage pointers) for this target.
+    /// The state a query keeps for one matching archetype, usually a pointer
+    /// into that archetype's storage.
     type State;
 
-    /// Get the component ids this query target touches.
+    /// Returns the component ids this target reads, followed by the ids it
+    /// writes.
     ///
-    /// Derived from [`report_component_access`](QueryTarget::report_component_access)
-    /// rather than spelled a second time: the mask a query builds and the
-    /// access a system reports come from one description, so they cannot
-    /// disagree about what the target touches.
+    /// The default takes both lists from
+    /// [`report_component_access`](QueryTarget::report_component_access)
+    /// rather than have each implementation spell the ids out a second time.
+    /// The mask a query builds and the access a system reports then come from
+    /// one description, so they cannot disagree.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a tuple target that reads and writes the same component,
+    /// because `report_component_access` refuses it there.
     fn component_ids() -> Vec<ComponentId> {
-        let (reads, writes) = Self::report_component_access();
-        reads.into_iter().chain(writes).collect()
+        let (read_component_ids, write_component_ids) = Self::report_component_access();
+        read_component_ids.into_iter().chain(write_component_ids).collect()
     }
 
-    /// Report component access for system dependency analysis.
-    /// Returns `(reads, writes)` as vectors of `ComponentId`.
+    /// Reports which components this target reads and which it writes, for
+    /// system dependency analysis.
+    ///
+    /// The first vector holds the ids read, the second the ids written.
+    ///
+    /// # Panics
+    ///
+    /// A tuple target panics here when it reads and writes the same component,
+    /// or writes one twice, because iterating it would create overlapping
+    /// borrows of one row. The check runs in every build, not only in debug
+    /// builds.
     fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>);
 
-    /// The shared components this target reads or writes, each with the
-    /// schema hash this binary's type declares for it.
+    /// Reports the shared components this target reads or writes, each with
+    /// the schema hash (a hash of the field layout) that this binary's type
+    /// declares for it.
     ///
-    /// [`crate::Query::new`] compares these with the registry so a binary built
-    /// against an older layout of a shared component can't read the current
-    /// rows through stale field offsets. Components that aren't shared, or
-    /// whose type declares no layout, are left out: `TypeId` or size and
-    /// alignment already cover them. Defaults to none.
+    /// [`crate::Query::new`] compares each hash with the one the component
+    /// registry holds. A mismatch means this binary was built against a
+    /// different layout of the component than the one registered now. Reading
+    /// the current rows through its field offsets would then be undefined
+    /// behavior, so the query matches nothing instead.
+    ///
+    /// Components that are not shared, and components whose type declares no
+    /// layout, are left out because there is no hash to compare. For those,
+    /// the component's identity or its size and alignment is the only check
+    /// there is. The default reports none.
     fn declared_shared_schemas() -> Vec<(ComponentId, u64)> {
         Vec::new()
     }
 
-    /// Initialize state for fetching from an archetype (caches storage pointers).
+    /// Builds the state this target keeps for one archetype, usually by
+    /// caching a pointer into the archetype's storage.
     ///
-    /// `this_run` is the current world tick used by mutable fetches to populate
-    /// `Mut<T>::this_run`. Read-only targets ignore it.
+    /// `this_run` is the tick of the current run. Mutable targets store it so
+    /// a write through [`Mut<T>`] can record when it happened. Read-only
+    /// targets ignore it.
     fn init_state(archetype: &mut Archetype, this_run: Tick) -> Self::State;
 
-    /// Fetch components using cached state (used by both sequential and
-    /// parallel iteration paths).
+    /// Returns the row at `index`, read through the state [`init_state`] built.
+    ///
+    /// The sequential and the parallel iterator both call this, so a target
+    /// keeps one fetch implementation for the two paths.
+    ///
+    /// [`init_state`]: QueryTarget::init_state
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a>;
 }
 
@@ -107,13 +141,12 @@ impl QueryTarget for Entity {
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        // SAFETY: The query loop invariant guarantees `index <
-        // archetype.len()`, and the archetype's entity vector length always
-        // equals its entity count, so the unchecked index is in bounds. The
-        // pointer was captured from `&archetype.entities` in `init_state`
-        // and the entity storage is not reallocated during iteration, so
-        // the reference is valid for `'a`. `Entity` is `Copy`, so copying
-        // the value out cannot create aliasing references.
+        // SAFETY: The query loop only calls this with `index` below
+        // `archetype.len()`, which is the length of its entity vector, so the
+        // unchecked index is in bounds. `init_state` captured the pointer from
+        // `&archetype.entities`, and the vector is not reallocated while a
+        // query iterates, so the reference is valid for `'a`. `Entity` is
+        // `Copy`, so returning a copy creates no second reference to the row.
         unsafe { *(&*state.as_ptr()).get_unchecked(index) }
     }
 }
@@ -123,14 +156,14 @@ impl QueryTarget for Entity {
 // =============================================================================
 
 /// Allows queries to include immutable component references, e.g.
-/// `Query<(&Transform, &Velocity)>`. Read-only access yields a plain `&T`
-/// and reports the component as a read for system dependency analysis.
+/// `Query<(&Transform, &Velocity)>`. A read yields a plain `&T` and is
+/// reported as a read for system dependency analysis.
 ///
-/// `Sync` is what makes the shared reference sound: two systems that only read
-/// a component report no conflict, so the scheduler batches them and each
-/// thread iterating the batch holds a `&T` into the same column. A component
-/// with interior mutability would then be read from two threads at once, so
-/// the `T: Sync` bound is what keeps that impossible.
+/// The `T: Sync` bound is what makes the shared reference sound. Two systems
+/// that only read a component do not conflict, so the scheduler may run them
+/// in the same parallel batch, and each thread then holds a `&T` into the same
+/// column. A type with interior mutability would then be read from two
+/// threads at once, which `Sync` rules out.
 impl<T: Component + Sync> QueryTarget for &T {
     type Item<'a> = &'a T;
     type State = SendPtr<crate::archetype::ComponentColumn>;
@@ -156,10 +189,9 @@ impl<T: Component + Sync> QueryTarget for &T {
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        // SAFETY: The query loop invariant guarantees `index < archetype.len()`,
-        // and the ECS invariant guarantees `archetype.len() == storage.len()`
-        // for every component type in the archetype. Therefore `index` is
-        // always in bounds for this storage.
+        // SAFETY: The query loop only calls this with `index` below
+        // `archetype.len()`. Every column in an archetype holds one value per
+        // entity, so the index is in bounds for this column too.
         unsafe { (*state.as_ptr()).get_unchecked::<T>(index) }
     }
 }
@@ -168,40 +200,45 @@ impl<T: Component + Sync> QueryTarget for &T {
 // MutFetchState
 // =============================================================================
 
-/// Cached pointers used by mutable component queries to construct `Mut<T>`
-/// without re-locating the underlying storage on every access.
+/// The state a mutable component query keeps for one archetype. It holds a
+/// pointer to the component column, so a row fetch does not look the column up
+/// again.
 pub struct MutFetchState<T: Component> {
-    /// Raw pointer to the component column, cached to avoid re-locating the
-    /// storage on every row fetch. The column owns its change-detection ticks,
-    /// so one pointer reaches both the value and its metadata.
-    values: SendPtrMut<crate::archetype::ComponentColumn>,
-    /// The world tick for this run, stored on `Mut<T>` at fetch time.
+    /// Pointer to the component column. The column owns both the row values
+    /// and their change-detection ticks, so this one pointer reaches the value
+    /// and its metadata.
+    component_column: SendPtrMut<crate::archetype::ComponentColumn>,
+    /// The tick of the current run. Every `Mut<T>` this state yields copies
+    /// it, so a write can record when it happened.
     this_run: Tick,
-    /// Ties the state to the queried component type.
+    /// Makes the state carry the component type it was built for.
     _marker: std::marker::PhantomData<T>,
 }
 
-// SAFETY: Both inner pointers wrap raw addresses backed by storage that
-// outlives the query.
+// SAFETY: The cached pointer names a component column that outlives the
+// query, and no other thread mutates it while this state is in use.
 //
-// Disjoint access is established by `SystemAccess::conflicts_with`, which the
-// scheduler consults before placing two systems in the same parallel batch. It
-// compares each system's declared component and resource sets directly, so two
-// systems writing the same component always conflict and are never batched
+// Two systems in one parallel batch touch disjoint components.
+// `SystemAccess::conflicts_with` compares the component and resource sets the
+// two systems declared, and the scheduler never puts two systems that conflict
+// in the same batch. Two systems writing one component therefore never run
 // together.
 //
-// Within one batch, `ParQueryIter` assigns each thread a disjoint entity range,
-// so no two threads fetch the same row.
+// Inside a batch, `ParQueryIter` gives each thread its own ranges of rows, so
+// no two threads fetch the same row.
 unsafe impl<T: Component> Send for MutFetchState<T> {}
-// SAFETY: Shared access to the fetch state only permits reading the row
-// pointers and metadata; per-row mutation stays exclusive through the same
-// disjoint-access guarantee the `Send` impl above cites.
+// SAFETY: Code that shares the state only reads the cached pointer and the
+// run tick. The mutation a `Mut<T>` performs stays exclusive by the same
+// disjoint-row guarantee the `Send` impl above explains.
 unsafe impl<T: Component> Sync for MutFetchState<T> {}
 
+// =============================================================================
+// &mut T (Mutable Reference)
+// =============================================================================
+
 /// Allows queries to include mutable component references, e.g.
-/// `Query<&mut Velocity>`. Mutable access yields [`Mut<T>`] with change
-/// detection and reports the component as a write for system dependency
-/// analysis.
+/// `Query<&mut Velocity>`. A write yields [`Mut<T>`], which records the change,
+/// and is reported as a write for system dependency analysis.
 impl<T: Component> QueryTarget for &mut T {
     type Item<'a> = Mut<'a, T>;
     type State = MutFetchState<T>;
@@ -222,28 +259,35 @@ impl<T: Component> QueryTarget for &mut T {
                 ("Component type (mutable): {}", std::any::type_name::<T>())
             ]
         );
-        let values = SendPtrMut::new(archetype.component_storages.column_of_mut::<T>()
+        let component_column = SendPtrMut::new(archetype.component_storages.column_of_mut::<T>()
             as *mut crate::archetype::ComponentColumn);
         MutFetchState {
-            values,
+            component_column,
             this_run,
             _marker: std::marker::PhantomData,
         }
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        // SAFETY: Disjoint per-row access guaranteed by the scheduler. The
-        // pointer is valid for the lifetime of the iteration. The query loop
-        // invariant guarantees `index < archetype.len() == column.len()`, so
-        // unchecked access is sound, and the row and its ticks are separate
-        // fields of the column, so the two references do not overlap. Mutating
-        // through Mut::deref_mut updates the row's `changed` tick without
-        // requiring atomics because no other thread observes this row.
+        // SAFETY: The scheduler never runs two systems that write one
+        // component in the same batch, and inside a batch each row belongs to
+        // one thread. This is therefore the only borrow of the row.
+        //
+        // The cached pointer stays valid for the whole iteration. The query
+        // holds the world exclusively, and nothing reallocates the column while
+        // it runs.
+        //
+        // The query loop only calls this with `index` below
+        // `archetype.len()`, and a column holds one row per entity, so the
+        // unchecked index is in bounds. The row values and the ticks live in
+        // two allocations owned by the column, so the two mutable references
+        // do not overlap. A write through `Mut::deref_mut` updates only this
+        // row's `changed` tick, which is why it needs no atomics.
         unsafe {
-            let column = state.values.as_ptr();
-            let value: &'a mut T = (*column).get_mut_unchecked::<T>(index);
-            let ticks: &'a mut ComponentTicks = (*column).row_ticks_mut_unchecked(index);
-            Mut::new(value, ticks, state.this_run)
+            let column = state.component_column.as_ptr();
+            let component_value: &'a mut T = (*column).get_mut_unchecked::<T>(index);
+            let row_ticks: &'a mut ComponentTicks = (*column).row_ticks_mut_unchecked(index);
+            Mut::new(component_value, row_ticks, state.this_run)
         }
     }
 }
@@ -267,25 +311,25 @@ macro_rules! impl_query_target_tuple {
             }
 
             fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
-                let mut reads = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
-                let mut writes = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
+                let mut read_component_ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
+                let mut write_component_ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
                 $(
-                    let (r, w) = $T::report_component_access();
-                    reads.extend(r);
-                    writes.extend(w);
+                    let (element_read_ids, element_write_ids) = $T::report_component_access();
+                    read_component_ids.extend(element_read_ids);
+                    write_component_ids.extend(element_write_ids);
                 )*
 
                 // A tuple that aliases one component - two writes, or a read
-                // beside a write - produces overlapping borrows of one row,
-                // which is undefined behavior the moment iteration starts.
-                // The check runs in every build, not just debug ones, so an
-                // optimized build cannot start iteration on aliasing rows.
+                // beside a write - hands out two borrows of the same row. That
+                // is undefined behavior as soon as iteration starts. The check
+                // runs in every build, not only in debug builds, so a release
+                // build cannot iterate an aliasing tuple either.
                 assert!(
-                    $crate::query::target::find_aliasing_component(&reads, &writes).is_none(),
+                    $crate::query::target::find_aliasing_component(&read_component_ids, &write_component_ids).is_none(),
                     "query tuple reads and writes the same component; \
                      Query<(&mut T, &mut T)> and Query<(&T, &mut T)> are not allowed"
                 );
-                (reads, writes)
+                (read_component_ids, write_component_ids)
             }
 
             #[allow(non_snake_case)]
@@ -295,14 +339,14 @@ macro_rules! impl_query_target_tuple {
                     [("Entities in archetype: {}", archetype.entity_count())]
                 );
                 let archetype_ptr = archetype as *mut Archetype;
-                // SAFETY: Each tuple element re-derives its own `&mut
-                // Archetype` from the same raw pointer and uses it only
-                // within its own `init_state` call, so the mutable borrows
-                // never overlap. The archetype is a `&mut` parameter that
-                // outlives the whole call, so the pointer remains valid for
-                // every element. `init_state` only reads out storage
-                // pointers and never reallocates or otherwise invalidates
-                // the archetype, so all derived references stay valid.
+                // SAFETY: Every element gets its own `&mut Archetype` derived
+                // from the same raw pointer, and uses it only inside its own
+                // `init_state` call, so the mutable borrows never overlap. The
+                // archetype came in as a `&mut` that outlives this call, so the
+                // pointer is valid for every element. `init_state` only reads
+                // storage pointers out of the archetype and never adds or
+                // reallocates a column, so the references it hands back stay
+                // valid.
                 unsafe { ($($T::init_state(&mut *archetype_ptr, this_run),)*) }
             }
 
@@ -325,33 +369,35 @@ impl_query_target_tuple!(A, B, C, D, E);
 // Free Functions
 // =============================================================================
 
-/// `T`'s component id and the schema hash `T` declares, when `T` is a shared
-/// component that declares a layout; the unit of
-/// [`QueryTarget::declared_shared_schemas`].
+/// Returns `T`'s component id together with the schema hash `T` declares, or
+/// `None` when `T` is not shared or declares no layout.
+///
+/// This is the single-type half of [`QueryTarget::declared_shared_schemas`].
 fn declared_shared_schema<T: Component>() -> Option<(ComponentId, u64)> {
     T::shared_name()?;
     Some((ComponentId::of::<T>(), T::declared_schema_hash()?))
 }
 
-/// Returns the first [`ComponentId`] a target both reads and writes, or writes
-/// twice - the aliasing that produces overlapping `&`/`&mut` borrows of one
-/// row, which is undefined behavior.
+/// Returns the first component that a target writes twice or both reads and
+/// writes, or `None` when nothing is aliased.
 ///
-/// Catches both shapes: two writes of one component
-/// (`Query<(&mut T, &mut T)>`) and a read aliasing a write
-/// (`Query<(&T, &mut T)>`, where `Mut<T>` writes the value *and* the tick the
-/// `&T` reads).
+/// Such a component produces overlapping `&` and `&mut` borrows of one row,
+/// which is undefined behavior. Two shapes are caught: writing one component
+/// twice (`Query<(&mut T, &mut T)>`) and reading one while also writing it
+/// (`Query<(&T, &mut T)>`).
 #[inline]
 pub(crate) fn find_aliasing_component(
-    reads: &[ComponentId],
-    writes: &[ComponentId],
+    read_component_ids: &[ComponentId],
+    write_component_ids: &[ComponentId],
 ) -> Option<ComponentId> {
-    // Small-N linear scan: a query tuple contributes a handful of ids, so a
-    // quadratic scan is cheaper than allocating a HashSet on the construction
-    // path.
-    for (index, write) in writes.iter().enumerate() {
-        if writes[index + 1..].contains(write) || reads.contains(write) {
-            return Some(*write);
+    // Small-N linear scan: a query tuple names a handful of components, so a
+    // quadratic scan over them is cheaper than building a HashSet on the
+    // construction path.
+    for (index, component_id) in write_component_ids.iter().enumerate() {
+        if write_component_ids[index + 1..].contains(component_id)
+            || read_component_ids.contains(component_id)
+        {
+            return Some(*component_id);
         }
     }
     None

@@ -1,90 +1,29 @@
-//! Integration tests for heap-owning component fields.
+//! Integration tests for components whose fields own heap memory.
 //!
-//! Covers the container pipeline end to end: the derive's registered tag
-//! vocabulary, the generated accessor trampolines reached through a raw row
-//! address, and the reload-migration behavior that heap data depends on —
-//! serde round-tripping a changed schema while an unchanged one keeps the live
-//! allocation in place.
+//! Three things are pinned here. The derive records each container field with
+//! a tag that says what it holds (`vec:f32`, `vec:string`, `string`). The
+//! generated accessor functions reach the live value through the address of
+//! its row. And a reload that changes a component's schema migrates the stored
+//! values through serde, while a reload that changes nothing leaves the
+//! existing allocations where they are.
 //!
 //! # Responsibilities
 //!
-//! - Cover the derive's container tag vocabulary end to end.
-//! - Exercise the generated accessor trampolines reached through row addresses.
-//! - Pin reload migration of heap fields, live allocation included.
+//! - Cover the tags the derive registers for container fields.
+//! - Exercise the generated accessor functions through row addresses.
+//! - Pin reload migration of heap fields, including the path that leaves an
+//!   unchanged allocation in place.
 
+// Standard library
 use std::collections::HashSet;
 
+// External crates
 use pill_engine::archetype::Blittability;
 use pill_engine::component_registry::{register_all_components, ComponentFieldDescriptor};
 use pill_engine::{ComponentId, PillComponent, World};
 
-/// A descriptor component's registered layout is validated: a descriptor that
-/// reaches past the row or claims a container tag is refused, and the accepted
-/// layout stays in place.
-#[test]
-fn an_overflowing_field_layout_is_refused() {
-    let mut world = World::new();
-    // SAFETY: this row is eight bytes the test never reads as anything but
-    // bytes; no pointer or owner is involved.
-    let witness = unsafe { Blittability::assume() };
-    let component_id = world
-        .register_component_descriptor(0x51, "Heap.LayoutProbe", 8, 4, 1, witness)
-        .expect("the component registers");
-
-    let good = vec![ComponentFieldDescriptor {
-        name: "value",
-        type_tag: "u32",
-        offset: 0,
-        size: 4,
-        align: 4,
-        element_count: 0,
-        decorators: std::borrow::Cow::Borrowed(&[]),
-    }];
-    world
-        .register_component_descriptor_with_layout(component_id, good.clone())
-        .expect("a fitting layout is accepted");
-
-    let overflow = vec![ComponentFieldDescriptor {
-        name: "whole",
-        type_tag: "u32",
-        offset: usize::MAX,
-        size: 4,
-        align: 4,
-        element_count: 0,
-        decorators: std::borrow::Cow::Borrowed(&[]),
-    }];
-    assert!(
-        world
-            .register_component_descriptor_with_layout(component_id, overflow)
-            .is_err(),
-        "an overflowing field range is refused"
-    );
-
-    let container = vec![ComponentFieldDescriptor {
-        name: "text",
-        type_tag: "string",
-        offset: 0,
-        size: 8,
-        align: 4,
-        element_count: 0,
-        decorators: std::borrow::Cow::Borrowed(&[]),
-    }];
-    assert!(
-        world
-            .register_component_descriptor_with_layout(component_id, container)
-            .is_err(),
-        "a container tag on a descriptor row is refused"
-    );
-
-    // Both refusals left the accepted layout in place.
-    assert_eq!(
-        world.component_field_layout(component_id),
-        Some(good.as_slice())
-    );
-}
-
-/// A persistable component mixing both container kinds with an inline scalar,
-/// the way real gameplay data does.
+/// A persistable component with a `Vec` field, a `String` field and an inline
+/// scalar field.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PillComponent)]
 #[pill(persistable)]
 struct HeapProbe {
@@ -92,13 +31,14 @@ struct HeapProbe {
     values: Vec<f32>,
     /// Heap-owning text field.
     label: String,
-    /// Inline field, pinning that blittable fields still mirror normally.
+    /// Inline scalar: it keeps a plain `u32` tag beside the container fields,
+    /// and its value survives migration unchanged.
     weight: u32,
 }
 
-/// The derive's own layout for [`HeapProbe`], spelled out so a test can watch
-/// the hash move when only a container tag differs.
-static DERIVE_LAYOUT: &[ComponentFieldDescriptor] = &[
+/// The field layout the derive records for [`HeapProbe`], written out by hand
+/// so a test can change one tag and watch the schema hash move.
+static HEAP_PROBE_LAYOUT: &[ComponentFieldDescriptor] = &[
     ComponentFieldDescriptor {
         name: "values",
         type_tag: "vec:f32",
@@ -128,9 +68,10 @@ static DERIVE_LAYOUT: &[ComponentFieldDescriptor] = &[
     },
 ];
 
-/// A deliberately altered layout for the same Rust type, standing in for a
-/// build where the declared shape moved, which forces the migration path.
-static ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
+/// The same [`HeapProbe`] layout with a different element tag, standing in for
+/// a build where the declared shape moved. The new tag gives the registration
+/// a different schema hash.
+static HEAP_PROBE_ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
     ComponentFieldDescriptor {
         name: "values",
         type_tag: "vec:f64",
@@ -160,9 +101,10 @@ static ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
     },
 ];
 
-/// The collision case the layout-aware hash exists for: same size and same
-/// default JSON shape, different element kind.
-static STRING_ELEMENT_LAYOUT: &[ComponentFieldDescriptor] = &[
+/// The case the layout-aware hash exists for: the same offsets and sizes as
+/// `HeapProbe`'s own layout, but a different element type, which a default
+/// value alone cannot tell apart.
+static HEAP_PROBE_STRING_LAYOUT: &[ComponentFieldDescriptor] = &[
     ComponentFieldDescriptor {
         name: "values",
         type_tag: "vec:string",
@@ -192,8 +134,8 @@ static STRING_ELEMENT_LAYOUT: &[ComponentFieldDescriptor] = &[
     },
 ];
 
-/// A persistable component whose list holds individually allocated strings,
-/// the shape that has no element span and needs per-element accessors.
+/// A persistable component holding a list of strings, each in its own
+/// allocation, so the list cannot be read as one contiguous run of bytes.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PillComponent)]
 #[pill(persistable)]
 struct NameList {
@@ -203,8 +145,8 @@ struct NameList {
     weight: u32,
 }
 
-/// The derive's layout for [`NameList`].
-static NAME_LAYOUT: &[ComponentFieldDescriptor] = &[
+/// The field layout the derive records for [`NameList`].
+static NAME_LIST_LAYOUT: &[ComponentFieldDescriptor] = &[
     ComponentFieldDescriptor {
         name: "names",
         type_tag: "vec:string",
@@ -225,9 +167,9 @@ static NAME_LAYOUT: &[ComponentFieldDescriptor] = &[
     },
 ];
 
-/// A deliberately altered layout for [`NameList`]: the declared element kind
-/// moved, which forces the migration path on the next reload.
-static NAME_ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
+/// [`NameList`]'s layout with the element tag changed from `vec:string` to
+/// `vec:f32`, standing in for a build whose declared shape moved.
+static NAME_LIST_ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
     ComponentFieldDescriptor {
         name: "names",
         type_tag: "vec:f32",
@@ -248,8 +190,86 @@ static NAME_ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
     },
 ];
 
-/// The derive registers container fields with their element-carrying tags, so
-/// the C# codegen and the schema hash both see the real shape.
+/// Returns the schema hash of the registered `HeapProbe`, read from the
+/// manifest the reload path compares.
+fn schema_hash(world: &World) -> u64 {
+    world
+        .persist_type_manifest()
+        .into_iter()
+        .find(|entry| entry.type_name.ends_with("HeapProbe"))
+        .expect("the component is registered")
+        .schema_hash
+}
+
+/// A descriptor component's field layout is checked before it is stored. A
+/// field whose range overflows and a field that claims a container tag are
+/// refused, and the layout accepted before them stays in place.
+#[test]
+fn an_overflowing_field_layout_is_refused() {
+    let mut world = World::new();
+    // SAFETY: the registered layout describes eight bytes of plain data, and
+    // this test never creates an entity or a column from it, so no pointer or
+    // owner is ever read.
+    let witness = unsafe { Blittability::assume() };
+    let component_id = world
+        .register_component_descriptor(0x51, "Heap.LayoutProbe", 8, 4, 1, witness)
+        .expect("the component registers");
+
+    let fitting_layout = vec![ComponentFieldDescriptor {
+        name: "value",
+        type_tag: "u32",
+        offset: 0,
+        size: 4,
+        align: 4,
+        element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
+    }];
+    world
+        .register_component_descriptor_with_layout(component_id, fitting_layout.clone())
+        .expect("a fitting layout is accepted");
+
+    let overflowing_layout = vec![ComponentFieldDescriptor {
+        name: "whole",
+        type_tag: "u32",
+        offset: usize::MAX,
+        size: 4,
+        align: 4,
+        element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
+    }];
+    assert!(
+        world
+            .register_component_descriptor_with_layout(component_id, overflowing_layout)
+            .is_err(),
+        "an overflowing field range is refused"
+    );
+
+    let container_tag_layout = vec![ComponentFieldDescriptor {
+        name: "text",
+        type_tag: "string",
+        offset: 0,
+        size: 8,
+        align: 4,
+        element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
+    }];
+    assert!(
+        world
+            .register_component_descriptor_with_layout(component_id, container_tag_layout)
+            .is_err(),
+        "a container tag on a descriptor row is refused"
+    );
+
+    // Both refusals left the accepted layout in place.
+    assert_eq!(
+        world.component_field_layout(component_id),
+        Some(fitting_layout.as_slice())
+    );
+}
+
+/// The derive registers every container field with a tag that names its
+/// element type, so both the C# code generator and the schema hash see the
+/// real shape.
 #[test]
 fn derive_registers_container_tags() {
     let mut world = World::new();
@@ -269,9 +289,9 @@ fn derive_registers_container_tags() {
     assert_eq!(tag("weight"), Some("u32"));
 }
 
-/// The generated view/resize/set trampolines reach the live value: a view
-/// answers the real buffer, a resize grows the real `Vec`, and a set replaces
-/// the real `String` while refusing invalid UTF-8.
+/// The generated accessor functions work on the live value. The view reports
+/// the real buffer, resize grows the real `Vec`, and set replaces the real
+/// `String` and refuses invalid UTF-8.
 #[test]
 fn accessor_trampolines_operate_on_the_live_value() {
     let mut probe = HeapProbe {
@@ -310,7 +330,7 @@ fn accessor_trampolines_operate_on_the_live_value() {
             &[1.0, 2.5, 0.0, 0.0]
         );
 
-        // Text: a valid replacement lands, invalid UTF-8 is refused.
+        // A valid replacement is stored; invalid UTF-8 is refused.
         let replacement = "after";
         assert_eq!(
             pill_accessor_HeapProbe_label_set(row, replacement.as_ptr(), replacement.len()),
@@ -334,15 +354,16 @@ fn accessor_trampolines_operate_on_the_live_value() {
     assert_eq!(probe.label, "after");
 }
 
-/// An element-kind change alone reaches the schema hash, so a reload migrates
-/// the values instead of keeping the old buffer and reinterpreting it.
+/// Changing only the element type changes the schema hash, so a reload
+/// migrates the values instead of keeping the old buffer and reinterpreting
+/// it under the new layout.
 #[test]
 fn container_element_kind_changes_the_schema_hash() {
     let mut world = World::new();
-    world.register_persistable_component_with_layout::<HeapProbe>(DERIVE_LAYOUT);
+    world.register_persistable_component_with_layout::<HeapProbe>(HEAP_PROBE_LAYOUT);
     let hash_with_float_elements = schema_hash(&world);
 
-    world.register_persistable_component_with_layout::<HeapProbe>(STRING_ELEMENT_LAYOUT);
+    world.register_persistable_component_with_layout::<HeapProbe>(HEAP_PROBE_STRING_LAYOUT);
     let hash_with_string_elements = schema_hash(&world);
 
     assert_ne!(
@@ -351,12 +372,12 @@ fn container_element_kind_changes_the_schema_hash() {
     );
 }
 
-/// A changed schema migrates heap contents through serde; an unchanged one
-/// leaves the live allocation exactly where it was.
+/// A changed schema migrates the stored heap values through serde. An
+/// unchanged schema leaves the live allocation exactly where it was.
 #[test]
 fn heap_fields_migrate_with_serde_and_survive_the_fast_path() {
     let mut world = World::new();
-    world.register_persistable_component_with_layout::<HeapProbe>(DERIVE_LAYOUT);
+    world.register_persistable_component_with_layout::<HeapProbe>(HEAP_PROBE_LAYOUT);
     let entity = world
         .create_entity()
         .with(HeapProbe {
@@ -376,11 +397,15 @@ fn heap_fields_migrate_with_serde_and_survive_the_fast_path() {
 
     // Simulate a reload whose declared shape moved: capture the retiring
     // generation's metadata, register the new shape, then migrate.
-    let previous = world.capture_persist_type_metadata();
-    world.register_persistable_component_with_layout::<HeapProbe>(ALTERED_LAYOUT);
+    let previous_metadata_by_name = world.capture_persist_type_metadata();
+    world.register_persistable_component_with_layout::<HeapProbe>(HEAP_PROBE_ALTERED_LAYOUT);
 
-    let changed: HashSet<String> = HashSet::from([type_name.clone()]);
-    let report = world.migrate_changed_persistable_components(&previous, &changed, None);
+    let changed_type_names: HashSet<String> = HashSet::from([type_name.clone()]);
+    let report = world.migrate_changed_persistable_components(
+        &previous_metadata_by_name,
+        &changed_type_names,
+        None,
+    );
     assert_eq!(report.migrated_type_count, 1);
     assert_eq!(report.migrated_entity_count, 1);
 
@@ -390,23 +415,28 @@ fn heap_fields_migrate_with_serde_and_survive_the_fast_path() {
     assert_eq!(probe.values, vec![3.5, 4.5]);
     assert_eq!(probe.label, "kept");
     assert_eq!(probe.weight, 9);
-    let buffer = probe.values.as_ptr();
+    let original_buffer_address = probe.values.as_ptr();
 
-    // The unchanged-schema fast path visits no value at all: the same buffer
-    // remains in place, which is what makes the common reload cheap and keeps
-    // outstanding heap pointers valid.
-    let previous = world.capture_persist_type_metadata();
-    let report = world.migrate_changed_persistable_components(&previous, &HashSet::new(), None);
+    // With no type reported as changed, the migration visits no value at all.
+    // The vector keeps its buffer, which is what makes the common reload cheap
+    // and keeps outstanding heap pointers valid.
+    let previous_metadata_by_name = world.capture_persist_type_metadata();
+    let report = world.migrate_changed_persistable_components(
+        &previous_metadata_by_name,
+        &HashSet::new(),
+        None,
+    );
     assert_eq!(report.migrated_type_count, 0);
     let probe = world
         .get_component::<HeapProbe>(entity)
         .expect("data survived the fast path");
-    assert_eq!(probe.values.as_ptr(), buffer);
+    assert_eq!(probe.values.as_ptr(), original_buffer_address);
     assert_eq!(probe.values, vec![3.5, 4.5]);
 }
 
-/// A `Vec<String>` field registers as `vec:string`, the tag that tells the
-/// codegen its elements have no span and travel through element accessors.
+/// A `Vec<String>` field registers as `vec:string`. That tag tells the C#
+/// code generator the elements have no contiguous run and must be read one at
+/// a time.
 #[test]
 fn vec_string_field_registers_the_elementwise_tag() {
     let mut world = World::new();
@@ -415,16 +445,17 @@ fn vec_string_field_registers_the_elementwise_tag() {
     let layout = world
         .component_field_layout(ComponentId::of::<NameList>())
         .expect("the derive registers a field layout");
-    let names = layout
+    let names_field = layout
         .iter()
         .find(|field| field.name == "names")
         .expect("the list field is declared");
-    assert_eq!(names.type_tag, "vec:string");
+    assert_eq!(names_field.type_tag, "vec:string");
 }
 
-/// The per-element trampolines reach the live list: the view answers a count
-/// and a null run, item/set/push move one string each, out-of-range and
-/// invalid UTF-8 are refused, and growing fills empty strings.
+/// The per-element accessor functions work on the live list. The view reports
+/// the element count and a null data pointer, item, set and push each move one
+/// string, an out-of-range index and invalid UTF-8 are refused, and growing
+/// fills the new slots with empty strings.
 #[test]
 fn vec_string_trampolines_reach_each_element() {
     let mut list = NameList {
@@ -438,9 +469,9 @@ fn vec_string_trampolines_reach_each_element() {
     // SAFETY: `row` addresses the live `NameList` above for the whole test,
     // and every out pointer is a valid local the trampoline may write.
     unsafe {
-        // The view reports the count only: elements are separately allocated,
-        // so there is no run to point a span at, and the data pointer is null
-        // no matter what the caller seeded it with.
+        // The view reports the element count and writes a null data pointer:
+        // each element is its own allocation, so there is no contiguous run to
+        // point at. The seeded pointer is always overwritten.
         let mut data: *const u8 = 0x1234_usize as *const u8;
         let mut length = 0usize;
         assert_eq!(
@@ -464,8 +495,9 @@ fn vec_string_trampolines_reach_each_element() {
             2
         );
 
-        // Replacing an element, with the two refusals: out of range, bad
-        // UTF-8 - the slot must keep its old text when either fires.
+        // Replace one element, then the two refusals: an index out of range
+        // and bytes that are not UTF-8. The slot keeps its old text in both
+        // cases.
         let replacement = "gamma";
         assert_eq!(
             pill_accessor_NameList_names_set_item(row, 1, replacement.as_ptr(), replacement.len()),
@@ -480,7 +512,8 @@ fn vec_string_trampolines_reach_each_element() {
             3
         );
 
-        // Appending, then growing: the new elements are empty strings.
+        // Append one element, then grow the list. The added slots hold empty
+        // strings.
         let appended = "delta";
         assert_eq!(
             pill_accessor_NameList_names_push(row, appended.as_ptr(), appended.len()),
@@ -493,13 +526,14 @@ fn vec_string_trampolines_reach_each_element() {
     assert_eq!(list.weight, 3);
 }
 
-/// String lists migrate through serde when the schema changes, and stay in
-/// place on the fast path - the same reload contract the other containers
-/// follow, only with each element's allocation inside the serialized text.
+/// String lists migrate through serde when the schema changes and stay in
+/// place on the fast path, like the other containers. The difference is that
+/// each element's text, not one contiguous buffer, travels through the
+/// serialized form.
 #[test]
 fn vec_string_contents_migrate_with_serde_and_survive_the_fast_path() {
     let mut world = World::new();
-    world.register_persistable_component_with_layout::<NameList>(NAME_LAYOUT);
+    world.register_persistable_component_with_layout::<NameList>(NAME_LIST_LAYOUT);
     let entity = world
         .create_entity()
         .with(NameList {
@@ -516,10 +550,14 @@ fn vec_string_contents_migrate_with_serde_and_survive_the_fast_path() {
         .find(|name| name.ends_with("NameList"))
         .expect("the component is persistable");
 
-    let previous = world.capture_persist_type_metadata();
-    world.register_persistable_component_with_layout::<NameList>(NAME_ALTERED_LAYOUT);
-    let changed: HashSet<String> = HashSet::from([type_name.clone()]);
-    let report = world.migrate_changed_persistable_components(&previous, &changed, None);
+    let previous_metadata_by_name = world.capture_persist_type_metadata();
+    world.register_persistable_component_with_layout::<NameList>(NAME_LIST_ALTERED_LAYOUT);
+    let changed_type_names: HashSet<String> = HashSet::from([type_name.clone()]);
+    let report = world.migrate_changed_persistable_components(
+        &previous_metadata_by_name,
+        &changed_type_names,
+        None,
+    );
     assert_eq!(report.migrated_type_count, 1);
     assert_eq!(report.migrated_entity_count, 1);
 
@@ -528,25 +566,18 @@ fn vec_string_contents_migrate_with_serde_and_survive_the_fast_path() {
         .expect("data survived the migration");
     assert_eq!(list.names, vec!["one", "two"]);
     assert_eq!(list.weight, 12);
-    let buffer = list.names.as_ptr();
+    let original_buffer_address = list.names.as_ptr();
 
-    let previous = world.capture_persist_type_metadata();
-    let report = world.migrate_changed_persistable_components(&previous, &HashSet::new(), None);
+    let previous_metadata_by_name = world.capture_persist_type_metadata();
+    let report = world.migrate_changed_persistable_components(
+        &previous_metadata_by_name,
+        &HashSet::new(),
+        None,
+    );
     assert_eq!(report.migrated_type_count, 0);
     let list = world
         .get_component::<NameList>(entity)
         .expect("data survived the fast path");
-    assert_eq!(list.names.as_ptr(), buffer);
+    assert_eq!(list.names.as_ptr(), original_buffer_address);
     assert_eq!(list.names, vec!["one", "two"]);
-}
-
-/// The schema hash of the one registered `HeapProbe`, read through the
-/// manifest the reload path compares.
-fn schema_hash(world: &World) -> u64 {
-    world
-        .persist_type_manifest()
-        .into_iter()
-        .find(|entry| entry.type_name.ends_with("HeapProbe"))
-        .expect("the component is registered")
-        .schema_hash
 }

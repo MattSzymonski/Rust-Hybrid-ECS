@@ -3,26 +3,26 @@
 //! # Responsibilities
 //!
 //! - Registers a component type that also carries an `update` method, and
-//!   records the per-type updater that reaches it.
+//!   records the per-type updater that calls it.
 //! - Runs every script component once per frame, through a context that defers
-//!   structural mutation to the command queue.
+//!   structural changes to the command queue.
 //!
 //! # Design
 //!
 //! A script component is an ordinary component first: it registers through the
 //! same path as any other, and the script half is one table of updaters keyed by
-//! component id. Dispatching asks the registry for the component's bit each
-//! frame instead of storing it, so a retired and re-registered type cannot be
-//! dispatched through a stale bit, and registering twice cannot queue the same
-//! update twice. Dispatch goes through a plain function pointer rather than a
-//! trait object, so the only thing an updater can be is a non-capturing
-//! function: it cannot capture state, stash the raw pointers it is handed, or
-//! keep anything alive past the call. Registering the type again overwrites its
-//! entry.
+//! component id. Each frame, dispatch asks the registry for the component's bit
+//! instead of storing it, so a type that was removed and registered again on a
+//! new bit is still found. Dispatch goes through a plain function pointer
+//! rather than a trait object, so an updater must be a non-capturing function:
+//! it cannot capture state and has no closure environment in which to keep the
+//! raw pointers, or anything else, after the call. Registering a type twice
+//! overwrites its entry, so it has one updater, not two.
 //!
 //! The updater receives raw pointers to the world and the command queue because
-//! it needs both while the world is already borrowed to walk the columns. They
-//! are valid for exactly the duration of one dispatch.
+//! the dispatch loop already borrows the archetype storage it passes in, so it
+//! cannot lend out `&mut World` at the same time. Each pointer is valid only
+//! for the call that receives it.
 
 use super::*;
 
@@ -33,16 +33,16 @@ use super::*;
 /// Function that updates a script component.
 ///
 /// Arguments: the component storage, the row index, the entity, and raw
-/// pointers to the world and command queue that `update_scripts` turns into a
-/// [`ScriptContext`] for one dispatch.
+/// pointers to the world and the command queue, from which the updater builds
+/// a [`ScriptContext`] for one dispatch.
 ///
 /// # Safety
 ///
 /// The two raw-pointer arguments are valid only for the duration of the call
 /// that passes them. An implementation must not store either one, and a caller
 /// must pass pointers that stay valid for the whole call. Being a plain `fn`
-/// and not a closure is part of the contract: it cannot capture, so it has
-/// nowhere to keep them.
+/// and not a closure is part of the contract: it cannot capture, so it has no
+/// closure state in which to keep them.
 pub(super) type ScriptUpdater =
     fn(&mut ComponentColumns, usize, Entity, *mut World, *mut CommandQueue);
 
@@ -73,8 +73,8 @@ impl World {
         self.register_component::<T>();
 
         // Step 2: Store the updater. The closure captures nothing, so it
-        // coerces to the function pointer; the raw pointers are handed in
-        // fresh on every dispatch.
+        // coerces to the function pointer. The raw pointers are passed again
+        // on every dispatch.
         self.script_updaters.insert(
             ComponentId::of::<T>(),
             (|storage: &mut ComponentColumns,
@@ -86,9 +86,9 @@ impl World {
                 // SAFETY: `world_ptr` and `commands_ptr` are derived from
                 // `&mut World` / `&mut CommandQueue` that are valid for the
                 // entire duration of `update_scripts`, which is the sole
-                // caller of every stored updater. The function-pointer
-                // representation prevents these pointers from being cached
-                // across calls.
+                // caller of every stored updater. An updater is a plain `fn`
+                // with no closure environment, so it has nowhere to keep the
+                // pointers for a later call.
                 unsafe {
                     let mut script_context =
                         ScriptContext::new(&mut *world_ptr, &mut *commands_ptr, entity);
@@ -116,9 +116,9 @@ impl World {
         );
         // Step 1: Reserve the per-frame work list and capture raw pointers to
         // self and the command queue before any field borrows on self.
-        let total_entities = self.entity_locations.len();
+        let entity_count = self.entity_locations.len();
         let mut entities_to_update: Vec<(Entity, ArchetypeId, usize)> =
-            Vec::with_capacity(total_entities);
+            Vec::with_capacity(entity_count);
 
         // Taken once, before any field borrow of `self`.
         let world_ptr = self as *mut World;
@@ -126,8 +126,8 @@ impl World {
 
         // Step 2: For each registered script type, gather every entity that
         // carries it. The bit is read from the registry here rather than
-        // stored at registration time, so a type that was retired and
-        // re-registered on another bit is still found.
+        // stored at registration time, so a type that was removed and
+        // registered again on another bit is still found.
         for (&component_id, &updater) in &self.script_updaters {
             let Some(script_bit) = self.component_registry.get_bit(&component_id) else {
                 continue;
@@ -145,7 +145,7 @@ impl World {
             // Step 3: Sort the gathered entities for deterministic order
             // across runs, then dispatch each one to its updater with the
             // captured raw pointers.
-            entities_to_update.sort_by_key(|(_, aid, idx)| (*aid, *idx));
+            entities_to_update.sort_by_key(|(_, archetype_id, index)| (*archetype_id, *index));
 
             for (entity, archetype_id, index) in entities_to_update.drain(..) {
                 if let Some(archetype) = self.archetypes.get_mut(&archetype_id) {

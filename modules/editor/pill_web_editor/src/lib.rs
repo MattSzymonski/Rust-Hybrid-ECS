@@ -1,36 +1,40 @@
-//! The browser editor frontend: the egui editor in a page, the scene on one
-//! canvas and the shell's UI on a transparent canvas above it.
+//! The browser editor frontend: the egui editor in a page, with the scene on
+//! one canvas and the shell's UI on a transparent canvas above it.
 //!
 //! # Responsibilities
 //!
-//! - [`run`]: put the scene on one canvas and the shell's epaint output on a
-//!   canvas above it, and drive the shell's plain-data boundary
+//! - [`run`]: put the scene on one canvas and the shell's tessellated draw
+//!   lists on the canvas above it, and feed the shell's plain-data boundary
 //!   (`EguiShellInput`/`EguiShellFrame`) the way the native executable does.
-//! - One update per redraw: engine input, the queued command batches and
-//!   scripted lines, the boundary input and snapshot, the world update (the
-//!   shell's egui pass runs inside it), then the UI draw.
+//! - Run one update per redraw, in this order: engine input, the queued command
+//!   batches and scripted lines, the boundary input and snapshot, the world
+//!   update (the shell's egui pass runs inside it), then the UI draw.
 //! - [`scripted::editor_command`]: the scripted channel, the web counterpart of
 //!   `PILL_EDITOR_TEST_COMMANDS`.
 //!
 //! # Design
 //!
 //! The browser counterpart of `pill_editor`, paired with `pill_web` the way
-//! the native editor is paired with `pill_standalone`: the game frontend owns
-//! the page loop, the start-up and the canvas helpers, and this crate owns the
-//! editor's canvases, UI device and update order. The shell crate registers
-//! itself when the bundle's module init calls `register`, and its system runs
-//! inside every engine update; this crate owns the browser-only half. The scene
-//! canvas carries the project's own renderer; the UI canvas gets its own `wgpu`
-//! device and `egui-wgpu` renderer, because egui's meshes are plain data and
-//! the UI must not depend on a renderer that can reload or fail. The UI canvas
-//! stays transparent where the dock draws nothing, so the scene shows through
-//! the viewport holes - the browser counterpart of the native composition
-//! overlay.
+//! the native editor is paired with `pill_standalone`. `pill_web` runs the
+//! start-up both browser frontends share (telemetry, the asset pack, project
+//! setup) and holds the canvas helpers; this crate owns the editor's canvases,
+//! its UI device and the order of one update. The shell crate registers itself
+//! when the bundle's module init calls `register`, and its system runs inside
+//! every engine update, so this crate only owns the browser-only half.
 //!
-//! Wasm only: on native targets this crate compiles to nothing, like
-//! `pill_web`.
+//! The scene canvas carries the project's own renderer. The UI canvas gets its
+//! own `wgpu` device and `egui-wgpu` renderer, because egui's meshes are plain
+//! data and the UI must not depend on a renderer that can reload or fail. The
+//! UI canvas stays transparent where the dock drew nothing, so the scene shows
+//! through the viewport holes; that is the browser counterpart of the native
+//! composition overlay.
+//!
+//! Wasm only: on native targets this crate compiles to nothing, like `pill_web`.
 
 #![cfg(target_arch = "wasm32")]
+
+/// The scripted channel the page drives the editor through.
+pub mod scripted;
 
 // Standard library
 use std::cell::RefCell;
@@ -65,72 +69,48 @@ use winit::window::{Window, WindowId};
 // Current crate
 use crate::scripted::take_scripted_lines;
 
-/// The scripted channel the page drives the editor through.
-pub mod scripted;
+// =============================================================================
+// Constants
+// =============================================================================
 
-/// How much of each new frame feeds the displayed FPS, the rest being the
-/// running average: the same smoothing the native runner uses.
+/// How much of each new frame's rate goes into the displayed FPS; the rest
+/// keeps the running average. The native runner smooths the same way.
 const FPS_SMOOTHING: f32 = 0.1;
 
-/// Frames between console heartbeats, for the person reading the log and
-/// the scripted suite.
+/// Frames between console heartbeats, for the person reading the log.
 const FRAME_HEARTBEAT_FRAMES: u64 = 60;
 
-/// Run `project` as the egui editor in the page: the scene on the canvas
-/// named `scene_canvas_id`, the shell's UI on the canvas named
-/// `ui_canvas_id`.
-///
-/// Returns once the event loop is handed to the browser; the editor then
-/// runs on the scene's animation frames. Every failure is reported to the
-/// browser console.
-pub fn run(project: StaticProject, scene_canvas_id: &str, ui_canvas_id: &str) {
-    let scene_canvas_id = scene_canvas_id.to_owned();
-    let ui_canvas_id = ui_canvas_id.to_owned();
-    // The asset pack, the telemetry and the project registration are
-    // `pill_web`'s start-up; only the event loop differs.
-    start_project(project, move |runtime| {
-        // Step 1: hand the event loop to the browser; the canvases and the
-        // renderers follow in `resumed`.
-        let event_loop = match EventLoop::new() {
-            Ok(event_loop) => event_loop,
-            Err(error) => return report_failure("event loop creation", &error),
-        };
-        info!(
-            target: telemetry_target::ENGINE,
-            scene = %scene_canvas_id,
-            ui = %ui_canvas_id,
-            "starting the editor in the browser"
-        );
-        event_loop.spawn_app(WebEditorApplication {
-            scene_canvas_id: scene_canvas_id.clone(),
-            ui_canvas_id: ui_canvas_id.clone(),
-            runtime: Some(runtime),
-            scene_window: None,
-            ui_window: None,
-            driver: Rc::new(RefCell::new(None)),
-            ui_surface: Rc::new(RefCell::new(None)),
-            pending_events: Vec::new(),
-            focused: true,
-            started: Instant::now(),
-            frames_per_second: 0.0,
-            last_frame_time: None,
-            frame_index: 0,
-        });
-    });
-}
+// =============================================================================
+// Types
+// =============================================================================
 
 /// The UI canvas's own device, surface and egui renderer.
 struct EditorUiSurface {
-    /// The swapchain the UI is drawn into.
+    /// The surface the UI frame is presented on.
     surface: wgpu::Surface<'static>,
-    /// The swapchain's configuration, kept for resizes.
+    /// The surface's configuration, kept so a resize can update it.
     configuration: wgpu::SurfaceConfiguration,
-    /// egui's meshes drawn through this device.
+    /// Draws egui's meshes through the device and queue below.
     renderer: egui_wgpu::Renderer,
     /// The device the surface and renderer were created on.
     device: wgpu::Device,
     /// The queue of that device.
     queue: wgpu::Queue,
+}
+
+impl EditorUiSurface {
+    /// Resize the surface to the UI window's physical extent and reconfigure
+    /// it.
+    fn resize(&mut self, width: u32, height: u32) {
+        let width = width.max(1);
+        let height = height.max(1);
+        if self.configuration.width == width && self.configuration.height == height {
+            return;
+        }
+        self.configuration.width = width;
+        self.configuration.height = height;
+        self.surface.configure(&self.device, &self.configuration);
+    }
 }
 
 /// State `winit` keeps for the lifetime of the page.
@@ -145,9 +125,10 @@ struct WebEditorApplication {
     scene_window: Option<Arc<Window>>,
     /// The UI canvas's window: input and size only, no renderer of its own.
     ui_window: Option<Arc<Window>>,
-    /// The scene's rendering driver, filled in when the attach resolves.
+    /// The scene's rendering driver, filled in when the renderer attach
+    /// resolves.
     driver: Rc<RefCell<Option<RenderingRuntime>>>,
-    /// The UI canvas's device, surface and renderer, filled in when its own
+    /// The UI canvas's device, surface and renderer, filled in when the UI
     /// attach resolves.
     ui_surface: Rc<RefCell<Option<EditorUiSurface>>>,
     /// UI input events since the last frame, in physical pixels.
@@ -155,12 +136,12 @@ struct WebEditorApplication {
     /// Whether the UI window has keyboard focus.
     focused: bool,
     /// The editor's monotonic clock origin, for the shell's input.
-    started: Instant,
+    started_at: Instant,
     /// The scene's smoothed frame rate, for the shell's input and overlays.
     frames_per_second: f32,
     /// When the previous frame ran, for the frame-rate smoothing.
     last_frame_time: Option<Instant>,
-    /// Frames presented since startup.
+    /// Frames run since startup.
     frame_index: u64,
 }
 
@@ -171,7 +152,9 @@ impl ApplicationHandler for WebEditorApplication {
             return;
         };
 
-        // Step 1: the scene canvas, exactly like the game-only runner.
+        // Step 1: put a window on the scene canvas. It is built like the
+        // game-only runner's window but is not focusable, because the UI
+        // canvas takes the input.
         let scene_canvas = match canvas_element(&self.scene_canvas_id) {
             Ok(canvas) => canvas,
             Err(message) => {
@@ -179,17 +162,18 @@ impl ApplicationHandler for WebEditorApplication {
                 return;
             }
         };
-        let laid_out = canvas_physical_size(&scene_canvas);
-        let attributes = Window::default_attributes()
+        let laid_out_size = canvas_physical_size(&scene_canvas);
+        let scene_attributes = Window::default_attributes()
             .with_canvas(Some(scene_canvas))
             .with_focusable(false);
-        let scene_window = match event_loop.create_window(attributes) {
+        let scene_window = match event_loop.create_window(scene_attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => return report_failure("scene canvas window creation", &error),
         };
         self.scene_window = Some(Arc::clone(&scene_window));
 
-        // Step 2: the UI canvas above it, with its own window for input.
+        // Step 2: put a window on the UI canvas above it. That window receives
+        // the keyboard and pointer input.
         let ui_canvas = match canvas_element(&self.ui_canvas_id) {
             Ok(canvas) => canvas,
             Err(message) => {
@@ -198,7 +182,7 @@ impl ApplicationHandler for WebEditorApplication {
             }
         };
         let focus_target = ui_canvas.clone();
-        let ui_laid_out = canvas_physical_size(&ui_canvas);
+        let ui_laid_out_size = canvas_physical_size(&ui_canvas);
         let ui_attributes = Window::default_attributes()
             .with_canvas(Some(ui_canvas.clone()))
             .with_focusable(true);
@@ -215,12 +199,14 @@ impl ApplicationHandler for WebEditorApplication {
         }
         self.ui_window = Some(Arc::clone(&ui_window));
 
-        // Step 3: attach the game renderer to the scene canvas.
+        // Step 3: attach the game renderer to the scene canvas. WebGPU refuses
+        // a zero-sized surface, so a canvas winit has not measured yet is
+        // attached at its laid-out size.
         let size = scene_window.inner_size();
         let (width, height) = if size.width > 0 && size.height > 0 {
             (size.width, size.height)
         } else {
-            laid_out
+            laid_out_size
         };
         let driver = Rc::clone(&self.driver);
         pill_core::platform::futures::spawn(async move {
@@ -228,8 +214,8 @@ impl ApplicationHandler for WebEditorApplication {
                 pill_player::attach_renderer(runtime, Arc::clone(&scene_window), width, height);
             match attach.await {
                 Ok(mut attached) => {
-                    // A resize that arrived during the attach went nowhere;
-                    // apply the canvas's size as winit now measures it.
+                    // A resize that arrived during the attach went nowhere, so
+                    // apply the canvas's size as winit measures it now.
                     let size = scene_window.inner_size();
                     if size.width > 0
                         && size.height > 0
@@ -245,11 +231,11 @@ impl ApplicationHandler for WebEditorApplication {
             }
         });
 
-        // Step 4: build the UI canvas's own device and egui renderer above
+        // Step 4: give the UI canvas its own device and egui renderer, above
         // the scene.
         let ui_surface = Rc::clone(&self.ui_surface);
         pill_core::platform::futures::spawn(async move {
-            match attach_ui_surface(ui_canvas, ui_laid_out).await {
+            match attach_ui_surface(ui_canvas, ui_laid_out_size).await {
                 Ok(surface) => {
                     info!(target: telemetry_target::RENDERING, "UI renderer attached to the UI canvas");
                     *ui_surface.borrow_mut() = Some(surface);
@@ -262,16 +248,16 @@ impl ApplicationHandler for WebEditorApplication {
         });
     }
 
-    /// Route each window's events: the scene window drives the game, the UI
-    /// window collects the shell's input.
+    /// Route each window's events: the scene window's input goes to the game,
+    /// and the UI window's goes to the shell.
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let ui_window = self.ui_window.as_ref();
         if ui_window.is_some_and(|window| window.id() == id) {
             match event {
                 WindowEvent::Focused(focused) => self.focused = focused,
                 WindowEvent::Resized(size) => {
-                    if let Some(surface) = self.ui_surface.borrow_mut().as_mut() {
-                        surface.resize(size.width, size.height);
+                    if let Some(ui_surface) = self.ui_surface.borrow_mut().as_mut() {
+                        ui_surface.resize(size.width, size.height);
                     }
                 }
                 WindowEvent::RedrawRequested => self.frame(),
@@ -299,8 +285,8 @@ impl ApplicationHandler for WebEditorApplication {
         }
     }
 
-    /// Forward raw mouse motion, which winit reports per device rather than
-    /// per window; it joins the UI's input stream.
+    /// Forward raw mouse motion. winit reports it per device rather than per
+    /// window, so it is added to the UI's input stream here.
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let Some(input) = pill_input::winit_events::translate_device_event(&event) {
             self.pending_events.push(input);
@@ -309,34 +295,35 @@ impl ApplicationHandler for WebEditorApplication {
 }
 
 impl WebEditorApplication {
-    /// One editor frame: input, the command drain, the boundary input and
-    /// snapshot, the world frame (the shell's egui pass runs inside it), then
-    /// the UI draw.
+    /// Run one editor frame: take in the input, apply the queued commands,
+    /// publish the boundary input and the snapshot, run the world frame (the
+    /// shell's egui pass runs inside it), then draw the UI.
     fn frame(&mut self) {
         let Some(scene_window) = self.scene_window.clone() else {
             return;
         };
         self.frame_index += 1;
 
-        // Step 1: the smoothed frame rate, for the shell's overlays.
+        // Step 1: measure this frame's rate and smooth it for the shell.
         let now = Instant::now();
         if let Some(last) = self.last_frame_time {
             let delta_time = now.duration_since(last).as_secs_f32();
             if delta_time > 0.0 {
-                let instant = 1.0 / delta_time;
+                let instant_frames_per_second = 1.0 / delta_time;
                 self.frames_per_second = if self.frames_per_second > 0.0 {
-                    self.frames_per_second * (1.0 - FPS_SMOOTHING) + instant * FPS_SMOOTHING
+                    self.frames_per_second * (1.0 - FPS_SMOOTHING)
+                        + instant_frames_per_second * FPS_SMOOTHING
                 } else {
-                    instant
+                    instant_frames_per_second
                 };
             }
         }
         self.last_frame_time = Some(now);
 
-        // Step 2: the UI window's events become engine input; the shell's
-        // egui pass reads the same stream.
+        // Step 2: pass the UI window's events on as engine input. The shell's
+        // egui pass reads the same events.
         let events: Vec<InputEvent> = std::mem::take(&mut self.pending_events);
-        let scripted = take_scripted_lines();
+        let scripted_lines = take_scripted_lines();
         let ui_surface = Rc::clone(&self.ui_surface);
         let mut driver_slot = self.driver.borrow_mut();
         let Some(driver) = driver_slot.as_mut() else {
@@ -346,9 +333,9 @@ impl WebEditorApplication {
             driver.push_input(event.clone());
         }
 
-        // Step 3: the resources the executable owns natively - the gizmo's
-        // state and the command registry/inbox/pending sets - exist before
-        // the shell's first pass reads them.
+        // Step 3: create the resources the shell expects to find (the gizmo
+        // state and the command registry, inbox and pending batches) before
+        // its first pass reads them.
         {
             let world = driver.engine_mut().world_mut();
             ensure_command_resources(world);
@@ -358,13 +345,13 @@ impl WebEditorApplication {
             }
         }
 
-        // Step 4: apply the batches the shell queued last frame and the lines
-        // the page scripted, then publish this frame's boundary input and
-        // snapshot.
+        // Step 4: apply the batches the shell queued in the previous frame and
+        // the lines the page scripted, then publish this frame's boundary
+        // input and snapshot.
         apply_pending_commands(
             driver.engine_mut(),
-            now.duration_since(self.started),
-            &scripted,
+            now.duration_since(self.started_at),
+            &scripted_lines,
         );
         let scale_factor = self
             .ui_window
@@ -382,10 +369,10 @@ impl WebEditorApplication {
         {
             let world = driver.engine_mut().world_mut();
             if let Some(input) = world.get_resource_mut::<EguiShellInput>() {
-                // The pointer's last position is this frame's newest move, or
-                // the one the previous frame left: a release that arrives
-                // without a move still needs a place to land.
-                let carried = input.cursor;
+                // The pointer position is this frame's newest move, or the one
+                // the previous frame left: a release can arrive with no move
+                // in front of it and still needs a position.
+                let carried_cursor = input.cursor;
                 let cursor = events
                     .iter()
                     .rev()
@@ -393,35 +380,36 @@ impl WebEditorApplication {
                         InputEvent::CursorMoved { position } => Some(*position),
                         _ => None,
                     })
-                    .or(carried);
+                    .or(carried_cursor);
                 *input = EguiShellInput {
                     screen_size: logical_size,
                     scale_factor,
                     focused: self.focused,
-                    time: now.duration_since(self.started).as_secs_f64(),
+                    time: now.duration_since(self.started_at).as_secs_f64(),
                     frames_per_second: self.frames_per_second,
-                    // The browser's window is the whole editor, so every
-                    // event is the shell's as well as the game's.
+                    // The browser's window is the whole editor, so every event
+                    // belongs to the shell as well as to the game.
                     events: events.clone(),
                     cursor,
-                    // A page has no OS clipboard the editor can write; the
-                    // clipboard verbs are native (see the dispatch below).
+                    // This posture never reads or writes the OS clipboard, so
+                    // paste text stays empty; the clipboard verbs only exist
+                    // in the native editor (see the dispatch below).
                     paste_text: None,
-                    // Gizmo badges are the desktop runner's: the browser
-                    // projects nothing into a scene view, so the list stays
-                    // empty.
+                    // Only the desktop runner fills in gizmo badges. The
+                    // browser does not project entities into a scene view, so
+                    // the list stays empty.
                     badges: Vec::new(),
                     // The page drives the editor through
-                    // `window.pillEditor.command`, so its row geometry is a
-                    // suite's to read.
+                    // `window.pillEditor.command`, so the shell's row
+                    // rectangles are logged for a suite to read.
                     scripted: true,
                 };
             }
         }
         publish_snapshot(driver.engine_mut(), self.frame_index);
 
-        // Step 5: run the world frame; the shell's egui pass runs inside it
-        // and leaves `EguiShellFrame` for Step 6.
+        // Step 5: run the world frame. The shell's egui pass runs inside it and
+        // leaves `EguiShellFrame` for Step 6.
         match driver.run_frame() {
             Ok(()) => {
                 self.frames_per_second = driver.frames_per_second() as f32;
@@ -454,34 +442,85 @@ impl WebEditorApplication {
     }
 }
 
-/// Apply the batches the shell queued last frame and the lines the page
-/// scripted.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Run `project` as the egui editor in the page: the scene on the canvas
+/// named `scene_canvas_id`, the shell's UI on the canvas named
+/// `ui_canvas_id`.
 ///
-/// The scripted lines go through the shared grammar
-/// ([`pill_editor_core::scripted`]) and then the shared core drain, so
-/// the browser parses, refuses and applies exactly what the desktop editor
-/// does - including the history recording, the remap and the selection
-/// follow. The drain's `files_changed` flag has no work here: the browser has
-/// no asset panel to refresh.
+/// Returns once the event loop is handed to the browser; the editor then runs
+/// on the scene canvas's animation frames. Every failure is logged to the
+/// browser console.
+pub fn run(project: StaticProject, scene_canvas_id: &str, ui_canvas_id: &str) {
+    let scene_canvas_id = scene_canvas_id.to_owned();
+    let ui_canvas_id = ui_canvas_id.to_owned();
+    // The asset pack, the telemetry and the project registration belong to
+    // `pill_web`'s shared start-up; only the event loop differs.
+    start_project(project, move |runtime| {
+        // Step 1: hand the event loop to the browser. The canvases and their
+        // renderers are created in `resumed`.
+        let event_loop = match EventLoop::new() {
+            Ok(event_loop) => event_loop,
+            Err(error) => return report_failure("event loop creation", &error),
+        };
+        info!(
+            target: telemetry_target::ENGINE,
+            scene = %scene_canvas_id,
+            ui = %ui_canvas_id,
+            "starting the editor in the browser"
+        );
+        event_loop.spawn_app(WebEditorApplication {
+            scene_canvas_id: scene_canvas_id.clone(),
+            ui_canvas_id: ui_canvas_id.clone(),
+            runtime: Some(runtime),
+            scene_window: None,
+            ui_window: None,
+            driver: Rc::new(RefCell::new(None)),
+            ui_surface: Rc::new(RefCell::new(None)),
+            pending_events: Vec::new(),
+            focused: true,
+            started_at: Instant::now(),
+            frames_per_second: 0.0,
+            last_frame_time: None,
+            frame_index: 0,
+        });
+    });
+}
+
+/// Apply the batches the shell queued in the previous frame and the lines the
+/// page scripted.
+///
+/// Scripted lines go through the shared grammar
+/// ([`pill_editor_core::scripted`]) and then the shared core drain, so a line
+/// this posture supports parses, applies and is recorded exactly as it is in
+/// the desktop editor: the history step, the remap of undo entries to an
+/// entity's new handle, and the selection following a move. The drain's
+/// `files_changed` flag needs nothing here, because the browser has no asset
+/// panel to refresh.
 fn apply_pending_commands(
     engine: &mut pill_engine_core::Engine,
-    elapsed: std::time::Duration,
-    scripted: &[String],
+    elapsed_since_start: std::time::Duration,
+    scripted_lines: &[String],
 ) {
-    run_scripted_lines(engine, scripted);
-    let now_millis = elapsed.as_millis() as u64;
+    // Step 1: run the scripted lines the page appended.
+    run_scripted_lines(engine, scripted_lines);
+    // Step 2: apply everything the shell queued, recording history the way
+    // the desktop editor does.
+    let now_millis = elapsed_since_start.as_millis() as u64;
     let _ = drain::apply_pending(engine, now_millis);
 }
 
-/// Run the scripted lines the page appended, through the shared grammar.
+/// Run every scripted line the page has appended through the shared grammar.
 ///
-/// A line the grammar refuses takes the same `[editor] scripted command
-/// rejected` path the desktop editor's channel uses, so a suite that drives
-/// the page sees a refusal instead of a wait.
+/// A line the grammar refuses is logged with the same `[editor] scripted
+/// command rejected` message the desktop editor's channel uses, so a suite that
+/// drives the page sees a refusal at once instead of waiting for an answer.
 fn run_scripted_lines(engine: &mut pill_engine_core::Engine, lines: &[String]) {
     for line in lines {
         match ScriptedCommand::parse(line) {
-            Ok(command) => run_scripted(engine, line, command),
+            Ok(command) => run_scripted_command(engine, line, command),
             Err(error) => warn!(
                 target: telemetry_target::ENGINE,
                 command = line.as_str(),
@@ -492,12 +531,16 @@ fn run_scripted_lines(engine: &mut pill_engine_core::Engine, lines: &[String]) {
     }
 }
 
-/// Run one parsed command the browser posture carries.
+/// Run one parsed command that this posture supports.
 ///
-/// The verbs whose machinery this posture does not carry - window placement,
-/// the asset panel, picking - are refused by name: a vocabulary that silently
+/// Verbs whose machinery this posture does not have - window placement, the
+/// asset panel, picking - are refused by name. A vocabulary that silently
 /// ignores a line is worse than one that says which verb is missing.
-fn run_scripted(engine: &mut pill_engine_core::Engine, line: &str, command: ScriptedCommand) {
+fn run_scripted_command(
+    engine: &mut pill_engine_core::Engine,
+    line: &str,
+    command: ScriptedCommand,
+) {
     match command {
         ScriptedCommand::Undo => {
             drain::step_history(engine, HistoryDirection::Undo);
@@ -507,11 +550,11 @@ fn run_scripted(engine: &mut pill_engine_core::Engine, line: &str, command: Scri
         }
         ScriptedCommand::PauseToggle => {
             let paused = engine.systems_paused();
-            if let Some(pending) = engine
+            if let Some(pending_commands) = engine
                 .world_mut()
                 .get_resource_mut::<PendingEditorCommands>()
             {
-                pending.push(vec![systems::pause_toggle_command(paused)]);
+                pending_commands.push(vec![systems::pause_toggle_command(paused)]);
             }
             info!(
                 target: telemetry_target::ENGINE,
@@ -520,21 +563,21 @@ fn run_scripted(engine: &mut pill_engine_core::Engine, line: &str, command: Scri
             );
         }
         ScriptedCommand::Step => {
-            if let Some(pending) = engine
+            if let Some(pending_commands) = engine
                 .world_mut()
                 .get_resource_mut::<PendingEditorCommands>()
             {
-                pending.push(vec![EditorCommand::StepOnce]);
+                pending_commands.push(vec![EditorCommand::StepOnce]);
             }
             info!(target: telemetry_target::ENGINE, "[editor] step queued");
         }
         ScriptedCommand::EntityCreate => {
             let (command, label) = entities::entity_create();
-            if let Some(pending) = engine
+            if let Some(pending_commands) = engine
                 .world_mut()
                 .get_resource_mut::<PendingEditorCommands>()
             {
-                pending.push_recorded(vec![command], label, None);
+                pending_commands.push_recorded(vec![command], label, None);
             }
             info!(target: telemetry_target::ENGINE, "[editor] new entity queued");
         }
@@ -552,11 +595,11 @@ fn run_scripted(engine: &mut pill_engine_core::Engine, line: &str, command: Scri
                 return;
             };
             let (commands, label) = entities::entity_delete(entity, asset);
-            if let Some(pending) = engine
+            if let Some(pending_commands) = engine
                 .world_mut()
                 .get_resource_mut::<PendingEditorCommands>()
             {
-                pending.push_recorded(commands, label, None);
+                pending_commands.push_recorded(commands, label, None);
             }
             info!(
                 target: telemetry_target::ENGINE,
@@ -578,8 +621,8 @@ fn run_scripted(engine: &mut pill_engine_core::Engine, line: &str, command: Scri
             };
             queue_gizmo_tool(engine, None, Some(space), None);
         }
-        // The page's data channel: the entity and system counts the shell's
-        // tabs list.
+        // The page's data channel: the entity and system counts that the
+        // shell's tabs list.
         ScriptedCommand::Dump(Dump::Tabs) => {
             let (entities, systems) = engine
                 .world()
@@ -598,8 +641,8 @@ fn run_scripted(engine: &mut pill_engine_core::Engine, line: &str, command: Scri
     }
 }
 
-/// Refuse a command this posture has no code for, naming the line and the
-/// verb so the gap is readable in the page's console.
+/// Refuse a command this posture cannot run, naming the line and its verb so
+/// the gap is visible in the page's console.
 fn refuse_in_browser(line: &str, command: &ScriptedCommand) {
     let reason = format!(
         "'{}' is not available in the browser editor yet",
@@ -613,7 +656,7 @@ fn refuse_in_browser(line: &str, command: &ScriptedCommand) {
     );
 }
 
-/// The wire name of one parsed command, for a refusal line.
+/// The name one parsed command is written with, for a refusal line.
 fn scripted_name(command: &ScriptedCommand) -> &'static str {
     match command {
         ScriptedCommand::Quit => "quit",
@@ -671,9 +714,9 @@ fn scripted_name(command: &ScriptedCommand) -> &'static str {
         ScriptedCommand::EntityDelete => "command editor.entity_delete",
         ScriptedCommand::SnapToggle => "command editor.tool_snap_toggle",
         ScriptedCommand::SpaceToggle => "command editor.tool_space_toggle",
-        // The native-only verbs: a page has no OS clipboard, no OLE
-        // drag, one fixed scene view and no second OS window to pop a tab
-        // into, so these parse but cannot run here.
+        // The native-only verbs: a page has no OS clipboard, no OLE drag, a
+        // single fixed scene view and no second OS window to move a tab into,
+        // so these parse but cannot run here.
         ScriptedCommand::Copy => "command editor.copy",
         ScriptedCommand::Cut => "command editor.cut",
         ScriptedCommand::Paste => "command editor.paste",
@@ -682,14 +725,15 @@ fn scripted_name(command: &ScriptedCommand) -> &'static str {
         ScriptedCommand::Drop(_) => "drop",
         ScriptedCommand::HoverFile(_) => "hover file",
         ScriptedCommand::DragOut(_) => "drag out",
-        // A page's file manager is the download shelf, so neither verb has
-        // anything to open or repoint here.
+        // The browser has no file manager to reveal a file in and no asset
+        // picker for a settings row, so neither verb has anything to open.
         ScriptedCommand::Reveal(_) => "reveal",
         ScriptedCommand::PickReference { .. } => "pick reference",
     }
 }
 
-/// The gizmo settings the world holds, defaults when none was registered.
+/// The gizmo settings held by the world, or the defaults when no state
+/// resource was registered.
 fn gizmo_settings(engine: &pill_engine_core::Engine) -> GizmoSettings {
     engine
         .world()
@@ -698,29 +742,29 @@ fn gizmo_settings(engine: &pill_engine_core::Engine) -> GizmoSettings {
         .unwrap_or_default()
 }
 
-/// Queue one `SetGizmoTool` edit: the same control edit the desktop editor's
-/// menu, shortcuts and scripted channel queue.
+/// Queue one `SetGizmoTool` edit: the same edit the desktop editor's menus,
+/// shortcuts and scripted channel queue.
 fn queue_gizmo_tool(
     engine: &mut pill_engine_core::Engine,
     mode: Option<GizmoMode>,
     space: Option<GizmoSpace>,
     snap: Option<bool>,
 ) {
-    if let Some(pending) = engine
+    if let Some(pending_commands) = engine
         .world_mut()
         .get_resource_mut::<PendingEditorCommands>()
     {
-        pending.push(vec![EditorCommand::SetGizmoTool { mode, space, snap }]);
+        pending_commands.push(vec![EditorCommand::SetGizmoTool { mode, space, snap }]);
     }
 }
 
 /// Capture the snapshot the shell's tabs read.
 ///
-/// The entity, system and component tiers come from the world; the asset
-/// rows, the standalone types and the preferences document stay at their
-/// defaults.
-fn publish_snapshot(engine: &mut pill_engine_core::Engine, frame_index: u64) {
-    let selected = engine
+/// The entity, system and component tiers come from the world. The asset rows,
+/// the standalone types and the preferences document keep their defaults.
+fn publish_snapshot(engine: &mut pill_engine_core::Engine, revision: u64) {
+    // Step 1: read the entity selection the detail rows come from.
+    let selected_entity = engine
         .world()
         .get_resource::<EditorSelection>()
         .and_then(|selection| selection.primary());
@@ -729,43 +773,47 @@ fn publish_snapshot(engine: &mut pill_engine_core::Engine, frame_index: u64) {
         .get_resource::<EditorSelection>()
         .map(|selection| selection.entities().to_vec())
         .unwrap_or_default();
-    let mut snapshot = EditorSnapshot::capture_engine_tiers(engine, frame_index, &[], Vec::new());
-    snapshot.detail = selected.and_then(|entity| EditorSnapshot::capture_detail(engine, entity));
+    // Step 2: capture the engine-owned tiers and the selected entities' rows.
+    let mut snapshot = EditorSnapshot::capture_engine_tiers(engine, revision, &[], Vec::new());
+    snapshot.detail =
+        selected_entity.and_then(|entity| EditorSnapshot::capture_detail(engine, entity));
     snapshot.selected_details = selected_entities
         .iter()
         .take(pill_editor_core::editor_state::SELECTED_DETAILS_MAX)
         .filter_map(|entity| EditorSnapshot::capture_detail(engine, *entity))
         .collect();
+    // Step 3: publish the snapshot for the shell.
     if let Some(resource) = engine.world_mut().get_resource_mut::<EditorSnapshot>() {
         *resource = snapshot;
     }
 }
 
-/// Draw the shell's frame into the UI canvas: apply its texture deltas, then
+/// Draw the shell's frame into the UI canvas: apply its texture uploads, then
 /// draw the meshes over a fully transparent clear.
 ///
-/// The frame is a world resource, so the delta is cleared here whatever the
-/// path: epaint panics on a delta it is asked to drop unapplied.
+/// The frame is a world resource, so its texture delta is cleared here on every
+/// path. epaint debug-asserts that a dropped delta is empty, so leaving an
+/// unapplied upload behind would panic a debug build.
 fn draw_ui(
     ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>,
     engine: &mut pill_engine_core::Engine,
 ) {
-    let Some(frame) = engine.world_mut().get_resource_mut::<EguiShellFrame>() else {
+    let Some(shell_frame) = engine.world_mut().get_resource_mut::<EguiShellFrame>() else {
         return;
     };
-    draw_ui_frame(ui_surface, frame);
-    frame.textures.clear();
+    draw_ui_frame(ui_surface, shell_frame);
+    shell_frame.textures.clear();
 }
 
-/// The drawing half of [`draw_ui`], which owns the delta's lifetime.
-fn draw_ui_frame(ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>, frame: &EguiShellFrame) {
+/// The drawing half of [`draw_ui`]. `draw_ui` owns the delta's lifetime.
+fn draw_ui_frame(ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>, shell_frame: &EguiShellFrame) {
     let mut ui_surface = ui_surface.borrow_mut();
-    let Some(ui) = ui_surface.as_mut() else {
+    let Some(editor_ui_surface) = ui_surface.as_mut() else {
         return;
     };
-    // A suboptimal frame is still drawable; anything else is reported and
-    // retried next frame.
-    let texture = match ui.surface.get_current_texture() {
+    // A suboptimal frame can still be drawn. Any other result is reported, and
+    // the next frame tries again.
+    let texture = match editor_ui_surface.surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(texture)
         | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
         other => {
@@ -777,29 +825,37 @@ fn draw_ui_frame(ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>, frame: &Egui
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
     let screen_descriptor = egui_wgpu::ScreenDescriptor {
-        size_in_pixels: [ui.configuration.width, ui.configuration.height],
-        pixels_per_point: frame.pixels_per_point.max(0.01),
+        size_in_pixels: [
+            editor_ui_surface.configuration.width,
+            editor_ui_surface.configuration.height,
+        ],
+        pixels_per_point: shell_frame.pixels_per_point.max(0.01),
     };
-    // Step 1: the texture updates before anything samples them. One texture
-    // may carry several deltas in one frame.
-    for (texture_id, deltas) in &frame.textures.set {
+    // Step 1: apply the texture updates before anything samples them. One
+    // texture can carry several deltas in one frame.
+    for (texture_id, deltas) in &shell_frame.textures.set {
         for image_delta in deltas {
-            ui.renderer
-                .update_texture(&ui.device, &ui.queue, *texture_id, image_delta);
+            editor_ui_surface.renderer.update_texture(
+                &editor_ui_surface.device,
+                &editor_ui_surface.queue,
+                *texture_id,
+                image_delta,
+            );
         }
     }
-    // Step 2: the draw commands, its own command buffers submitted with the
-    // pass.
-    let mut encoder = ui
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("pill editor egui"),
-        });
-    let user_buffers = ui.renderer.update_buffers(
-        &ui.device,
-        &ui.queue,
+    // Step 2: build the draw commands. egui's own vertex and index buffers go
+    // into the same submission as the pass.
+    let mut encoder =
+        editor_ui_surface
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pill editor egui"),
+            });
+    let user_buffers = editor_ui_surface.renderer.update_buffers(
+        &editor_ui_surface.device,
+        &editor_ui_surface.queue,
         &mut encoder,
-        &frame.meshes,
+        &shell_frame.meshes,
         &screen_descriptor,
     );
     {
@@ -809,8 +865,8 @@ fn draw_ui_frame(ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>, frame: &Egui
                 view: &view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    // Transparent where the dock drew nothing: the scene
-                    // canvas below shows through the viewport holes.
+                    // Clear to transparent where the dock drew nothing, so the
+                    // scene canvas below shows through the viewport holes.
                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     store: wgpu::StoreOp::Store,
                 },
@@ -821,40 +877,36 @@ fn draw_ui_frame(ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>, frame: &Egui
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        // The lifetime erasure extends the pass's borrows to `'static`;
-        // it stays inside this block, so nothing outlives `view`.
+        // `forget_lifetime` extends the pass's borrows to `'static`, which
+        // egui's render call requires. The pass stays inside this block, so
+        // nothing outlives `view`.
         let mut pass = pass.forget_lifetime();
-        ui.renderer
-            .render(&mut pass, &frame.meshes, &screen_descriptor);
+        editor_ui_surface
+            .renderer
+            .render(&mut pass, &shell_frame.meshes, &screen_descriptor);
     }
     // Step 3: release the textures the shell asked to free, then submit.
-    for texture_id in &frame.textures.free {
-        ui.renderer.free_texture(texture_id);
+    for texture_id in &shell_frame.textures.free {
+        editor_ui_surface.renderer.free_texture(texture_id);
     }
-    ui.queue
+    editor_ui_surface
+        .queue
         .submit(user_buffers.into_iter().chain(Some(encoder.finish())));
-    ui.queue.present(texture);
-}
-
-impl EditorUiSurface {
-    /// Resize the swapchain to the UI window's physical extent.
-    fn resize(&mut self, width: u32, height: u32) {
-        let width = width.max(1);
-        let height = height.max(1);
-        if self.configuration.width == width && self.configuration.height == height {
-            return;
-        }
-        self.configuration.width = width;
-        self.configuration.height = height;
-        self.surface.configure(&self.device, &self.configuration);
-    }
+    editor_ui_surface.queue.present(texture);
 }
 
 /// Build the UI canvas's device, surface and egui renderer.
+///
+/// # Errors
+///
+/// Returns a message naming the step that failed: the canvas refused a
+/// surface, no adapter accepted it, the device request was refused, or the
+/// adapter offered no surface configuration.
 async fn attach_ui_surface(
     canvas: HtmlCanvasElement,
-    laid_out: (u32, u32),
+    laid_out_size: (u32, u32),
 ) -> Result<EditorUiSurface, String> {
+    // Step 1: create the WebGPU instance and a surface on the UI canvas.
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         flags: wgpu::InstanceFlags::from_build_config(),
@@ -864,6 +916,7 @@ async fn attach_ui_surface(
     let surface = instance
         .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
         .map_err(|error| format!("UI canvas surface refused: {error}"))?;
+    // Step 2: pick an adapter and request its device and queue.
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
@@ -884,31 +937,37 @@ async fn attach_ui_surface(
         })
         .await
         .map_err(|error| format!("UI canvas device refused: {error}"))?;
+    // Step 3: choose the configuration, build the renderer and configure the
+    // surface.
     let capabilities = surface.get_capabilities(&adapter);
-    let format = capabilities
+    let surface_format = capabilities
         .formats
         .iter()
         .copied()
         .find(wgpu::TextureFormat::is_srgb)
         .unwrap_or(capabilities.formats[0]);
     let mut configuration = surface
-        .get_default_config(&adapter, laid_out.0.max(1), laid_out.1.max(1))
+        .get_default_config(&adapter, laid_out_size.0.max(1), laid_out_size.1.max(1))
         .ok_or("the UI canvas offers no surface configuration")?;
-    configuration.format = format;
-    // egui's output is premultiplied and the page stacks this canvas over the
-    // scene one, so the canvas must composite with alpha. The web backend
-    // draws it but reports only `Opaque` in its surface capabilities (that
-    // list is hard-coded in wgpu's web backend), so the mode is requested
-    // directly rather than picked from the list.
+    configuration.format = surface_format;
+    // egui's colours are premultiplied, and the page draws this canvas over
+    // the scene one, so the canvas must composite with alpha. wgpu's web
+    // backend draws that mode but lists only `Opaque` in the surface
+    // capabilities (the list is hard-coded there), so the mode is set directly
+    // instead of being picked from the list.
     configuration.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
     info!(
         target: telemetry_target::RENDERING,
-        format = ?format,
+        format = ?surface_format,
         alpha_mode = ?configuration.alpha_mode,
         "UI canvas configured"
     );
     surface.configure(&device, &configuration);
-    let renderer = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+    let renderer = egui_wgpu::Renderer::new(
+        &device,
+        surface_format,
+        egui_wgpu::RendererOptions::default(),
+    );
     Ok(EditorUiSurface {
         surface,
         configuration,

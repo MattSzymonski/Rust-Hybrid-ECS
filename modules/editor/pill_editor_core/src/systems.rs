@@ -1,28 +1,32 @@
-//! The Systems tab's shared logic: the row labels, the recorded toggle a
-//! state button queues, and the pause/step controls' commands.
+//! The Systems tab's shared logic: the row and button labels, and the editor
+//! command each control queues.
 //!
 //! # Responsibilities
 //!
-//! - [`system_row_label`]: the `name (owner)` text with its `[ambiguous]`
-//!   marker, the spelling the Systems tab shows.
-//! - [`system_state_label`] and [`system_toggle`]: the `on`/`off` button
-//!   text and the recorded `SetSystemEnabled` edit it queues, with the
-//!   history label `system {index} on|off`.
+//! - [`system_row_label`]: the row text `name (owner)`, with `[ambiguous]`
+//!   added when another system has the same name.
+//! - [`system_state_label`] and [`system_toggle`]: the `on`/`off` button text
+//!   and the recorded `SetSystemEnabled` edit it queues, under the history
+//!   label `system {index} on|off`.
 //! - [`pause_button_label`] and [`pause_toggle_command`]: the Pause/Resume
-//!   control, whose flip the button and the scripted channel both build
-//!   from the engine's current pause state.
+//!   control. Its button, the View menu's row and the scripted channel all
+//!   read the engine's current pause state and queue the opposite.
 //!
 //! # Design
 //!
-//! The tab's widgets and the scripted channel take these same helpers, so a
-//! state button's click and a scripted `edit system` produce one recorded
-//! step under one label, and the pause control flips one state whichever
-//! entry point asked. The commands themselves ride the shared
-//! [`PendingEditorCommands`](crate::commands::PendingEditorCommands) queue
-//! and apply at the frame boundary like every other editor edit.
+//! The tab's widgets and the scripted channel call these same helpers. A
+//! state button's click and a scripted `edit system` therefore record the
+//! same undo entry, under the same label. The pause control likewise changes
+//! the same pause flag whichever entry point asked. The commands ride the
+//! shared [`PendingEditorCommands`](crate::commands::PendingEditorCommands)
+//! queue and apply at the frame boundary like every other editor edit.
 
 // Current crate
 use crate::editor_state::{EditorCommand, SystemSummary};
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// The row label for one system: `name (owner)`, marked `[ambiguous]` when
 /// another system shares the name.
@@ -43,8 +47,8 @@ pub fn system_state_label(enabled: bool) -> &'static str {
     }
 }
 
-/// The recorded toggle a state button queues: the `SetSystemEnabled` edit
-/// and the history label it is recorded under.
+/// The recorded toggle a state button queues: a `SetSystemEnabled` edit
+/// paired with the label its undo entry takes.
 pub fn system_toggle(index: usize, enabled: bool) -> (EditorCommand, String) {
     (
         EditorCommand::SetSystemEnabled { index, enabled },
@@ -61,23 +65,29 @@ pub fn pause_button_label(paused: bool) -> &'static str {
     }
 }
 
-/// The pause toggle a button queues: the engine's pause flag flipped.
+/// The pause toggle the Pause/Resume control queues: a `SetPaused` edit that
+/// flips the engine's pause flag. It applies without being recorded, so
+/// pausing never becomes an undo entry.
 pub fn pause_toggle_command(paused: bool) -> EditorCommand {
     EditorCommand::SetPaused { paused: !paused }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn summary(name: &str, owner: &str, ambiguous: bool) -> SystemSummary {
+    fn summary(name: &str, owner_label: &str, name_is_ambiguous: bool) -> SystemSummary {
         SystemSummary {
             index: 0,
             name: name.to_string(),
-            owner_label: owner.to_string(),
+            owner_label: owner_label.to_string(),
             enabled: true,
             hot_patchable: false,
-            name_is_ambiguous: ambiguous,
+            name_is_ambiguous,
         }
     }
 

@@ -1,26 +1,46 @@
-//! The selection family's applier.
+//! Applies the selection command family.
 //!
-//! The selection commands and the request that arms the next scene click.
+//! These commands change the editor's shared selection, and `ArmEntityPick`
+//! arms the request the next scene click answers.
 //!
 //! # Responsibilities
 //!
 //! - Apply the selection edits (`SetSelection`, `SelectResource`,
-//!   `RestoreSelection`) with the inverse that returns the previous selection.
+//!   `RestoreSelection`), each answering with the inverse that puts the
+//!   previous selection back.
 //! - Arm the next scene click (`ArmEntityPick`) without recording anything.
 //!
 //! # Design
 //!
 //! One `match` over the family's own variants, called from
-//! [`EditorCommand::apply_one`](super::EditorCommand). Every arm ends in a
-//! [`CommandOutcome`]: the inverse the history records, or `plain()` for a
-//! command that cannot be undone.
+//! [`EditorCommand::apply_one`](super::EditorCommand). Every arm for a
+//! selection command ends in a [`CommandOutcome`]: the inverse the history
+//! records, or `plain()` for a command that cannot be undone. A command of
+//! another family hits `unreachable!`.
 
+// External crates
 use pill_engine::Engine;
 
+// Current crate
 use super::CommandOutcome;
 use super::*;
 
-/// Apply one selection command.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Applies one selection command.
+///
+/// # Errors
+///
+/// Returns an error message when the selection resource cannot be claimed
+/// after this function inserted it, or when `ArmEntityPick` finds no
+/// `EntityPickRequest` resource in the world.
+///
+/// # Panics
+///
+/// Panics when `command` belongs to another family; `EditorCommand::apply_one`
+/// routes only selection commands here.
 pub(super) fn apply(
     engine: &mut Engine,
     command: &EditorCommand,
@@ -31,14 +51,13 @@ pub(super) fn apply(
             if world.get_resource::<EditorSelection>().is_none() {
                 world.insert_resource(EditorSelection::default());
             }
-            // A selection that names an entity the world no longer
-            // carries drops that entity; the asset half still applies.
-            let mut taken = Vec::with_capacity(entities.len());
+            // Entities the world no longer has are dropped from the
+            // selection. The asset slot is still applied.
+            let mut existing_entities = Vec::with_capacity(entities.len());
             for entity in entities {
                 if world.is_entity_valid(*entity) {
-                    taken.push(*entity);
+                    existing_entities.push(*entity);
                 } else {
-                    // NOTE: asserted on by the editor's recovery suite.
                     pill_core::info!(
                         target: pill_core::telemetry::telemetry_target::ENGINE,
                         entity = %entity,
@@ -49,13 +68,13 @@ pub(super) fn apply(
             let Some(selection) = world.get_resource_mut::<EditorSelection>() else {
                 return Err(format!("{command:?}: the selection could not be claimed"));
             };
-            let previous = EditorCommand::SetSelection {
+            let previous_selection_command = EditorCommand::SetSelection {
                 entities: selection.entities().to_vec(),
                 asset: selection.asset.clone(),
             };
-            selection.set_entities(taken);
+            selection.set_entities(existing_entities);
             selection.asset = asset.clone();
-            Ok(CommandOutcome::inverse(previous))
+            Ok(CommandOutcome::inverse(previous_selection_command))
         }
 
         EditorCommand::SelectResource { resource } => {
@@ -66,10 +85,11 @@ pub(super) fn apply(
             let Some(selection) = world.get_resource_mut::<EditorSelection>() else {
                 return Err(format!("{command:?}: the selection could not be claimed"));
             };
-            let previous = selection.resource.clone();
-            // One thing at a time in the Inspector: picking a resource
-            // drops the entity and asset halves, and their undo restores
-            // them through their own commands.
+            let previous_resource = selection.resource.clone();
+            // The Inspector shows one thing at a time. Choosing a resource
+            // drops the entity and asset selections; the `RestoreSelection`
+            // inverse brings all three slots back on undo. Clearing the
+            // resource (`None`) leaves the other two slots alone.
             let previous_entities = selection.entities().to_vec();
             let previous_asset = selection.asset.clone();
             selection.resource = resource.clone();
@@ -77,8 +97,9 @@ pub(super) fn apply(
                 selection.clear_entities();
                 selection.asset = None;
             }
-            // NOTE: asserted on by the egui editor's suite: the selection a
-            // resource row makes, and the one its undo restores.
+            // The egui editor's suite matches this line, so its token and
+            // fields are a contract: it checks the selection a resource row
+            // makes, and the one its undo restores.
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,
                 resource = resource.as_deref().unwrap_or("none"),
@@ -87,7 +108,7 @@ pub(super) fn apply(
             Ok(CommandOutcome::inverse(EditorCommand::RestoreSelection {
                 entities: previous_entities,
                 asset: previous_asset,
-                resource: previous,
+                resource: previous_resource,
             }))
         }
 
@@ -103,7 +124,7 @@ pub(super) fn apply(
             let Some(selection) = world.get_resource_mut::<EditorSelection>() else {
                 return Err(format!("{command:?}: the selection could not be claimed"));
             };
-            let previous = EditorCommand::RestoreSelection {
+            let previous_selection_command = EditorCommand::RestoreSelection {
                 entities: selection.entities().to_vec(),
                 asset: selection.asset.clone(),
                 resource: selection.resource.clone(),
@@ -111,9 +132,10 @@ pub(super) fn apply(
             selection.set_entities(entities.clone());
             selection.asset = asset.clone();
             selection.resource = resource.clone();
-            // NOTE: asserted on by the egui editor's suite: an undone
-            // resource selection brings the entity slot back, not just an
-            // empty resource slot.
+            // The egui editor's suite matches this line as well. After the
+            // undo it requires an `entity` that is not `none`, because the
+            // undo has to bring the entity slot back. Clearing only the
+            // resource slot is not enough.
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,
                 entity = selection
@@ -125,7 +147,7 @@ pub(super) fn apply(
                 entities = selection.entities().len(),
                 "[editor] selection restored"
             );
-            Ok(CommandOutcome::inverse(previous))
+            Ok(CommandOutcome::inverse(previous_selection_command))
         }
 
         EditorCommand::ArmEntityPick {
@@ -134,10 +156,10 @@ pub(super) fn apply(
             field,
         } => {
             let world = engine.world_mut();
-            let request = world
+            let entity_pick_request = world
                 .get_resource_mut::<crate::editor_state::EntityPickRequest>()
                 .ok_or("the world has no entity pick request slot")?;
-            request.target = Some(crate::editor_state::EntityPickTarget {
+            entity_pick_request.target = Some(crate::editor_state::EntityPickTarget {
                 entity: *entity,
                 component: component.clone(),
                 field: field.clone(),

@@ -2,45 +2,47 @@
 //!
 //! # Responsibilities
 //!
-//! - Parse an asset pack ([`AssetPack`]): the files of a project's `res`
-//!   directory in one blob, written at build time by `pill_assets`.
-//! - Keep the mount points an [`AssetLoader::Path`](crate::AssetLoader::Path)
-//!   resolves through - packs ([`mount_pack`]) and the project's asset directory
-//!   ([`mount_directory`]) - and the read-only directories extension modules
-//!   contribute ([`declare_module_root`]), which resolve by name like the
-//!   project's and are never written ([`is_module_asset`]).
-//! - Read a path's bytes from the first mount that has it ([`read`]).
-//! - Write a file beside an asset that lives on the filesystem
-//!   ([`write_beside`]) - how a development build records an asset's metadata -
-//!   or a new file that must not exist yet ([`write_new`]). Packs are never
-//!   written.
+//! - Parse an asset pack ([`AssetPack`]). A pack holds the files of a
+//!   project's `res` directory, plus the module resources a shipped build
+//!   adds. `pill_assets` writes it at build time.
+//! - Keep the places an [`AssetLoader::Path`](crate::AssetLoader::Path) looks
+//!   in: the packs ([`mount_pack`]), the project's asset directory
+//!   ([`mount_directory`]) and the read-only directories extension modules
+//!   declare ([`declare_module_root`]). A module resource is found by the same
+//!   relative path as a project asset, and it is never written
+//!   ([`is_module_asset`]).
+//! - Read a path's bytes from the first place that has it ([`read`]).
+//! - Write a file beside an asset on the filesystem ([`write_beside`]), which
+//!   is how a development build records an asset's metadata, or write a file
+//!   that must not exist yet ([`write_new`]). A pack is never written.
 //!
 //! # Design
 //!
-//! Loading code names a path relative to the project's `res` directory and never
-//! the target it runs on; what differs per target is only what is mounted:
+//! Loading code names a path relative to the project's `res` directory and
+//! never the target it runs on. Only what is mounted differs per target:
 //!
 //! - **development:** the filesystem - the project's asset directory, every
-//!   module root, then the working directory, its `res`, `$PROJECT_PATH/res` and
-//!   the executable's `res`;
+//!   module root, then the working directory, its `res`, `$PROJECT_PATH/res`
+//!   and the executable's `res`;
 //! - **native shipping:** the pack the shipping bundle embeds, mounted by the
 //!   runtime before any module initializes;
 //! - **web:** a pack the frontend fetched, mounted the same way.
 //!
-//! Packs are searched before the filesystem, newest mount first: a shipped game
-//! reads the assets it was built with, not whatever sits at a development path
-//! on the machine it runs on. The store is a process-wide static of this crate,
-//! and `pill_engine_core` is a shared `dylib` - one copy per process - so the
-//! host, every module and every project resolve a path against one set of
-//! mounts.
+//! Packs are searched before the filesystem, newest mount first. A shipped
+//! game therefore reads the assets it was built with, not whatever file
+//! happens to sit at a development path on the machine. The store's state is
+//! a static in this crate, and `pill_engine_core` is a shared `dylib` (one
+//! copy per process), so the host, every module and every project all resolve
+//! against one set of mounts.
 //!
 //! # Pack format (version 1)
 //!
-//! Little-endian throughout. `PILLPACK`, a `u32` version, a `u32` entry count,
-//! then per entry a `u32` path length, the path (UTF-8, `/`-separated,
-//! relative), and a `u64` offset and `u64` length counted from the start of the
-//! pack. The bytes follow the index. `pill_assets::write_asset_pack` is the
-//! writer; the two change together.
+//! Every number is little-endian. The pack starts with `PILLPACK`, a `u32`
+//! format version and a `u32` entry count. Each entry then holds a `u32` path
+//! length, the path itself (UTF-8, `/`-separated and relative), a `u64` offset
+//! and a `u64` length. Both count from the start of the pack. The file bytes
+//! follow the index. `pill_assets::write_asset_pack_with_roots` writes this
+//! format, so the two change together.
 
 // Standard library
 use std::borrow::Cow;
@@ -60,7 +62,9 @@ use crate::asset::{AssetLoadError, AssetLoadResult};
 // AssetPack
 // =============================================================================
 
-/// A parsed asset pack: the files of a `res` directory, by relative path.
+/// A parsed asset pack: the pack's bytes, and where each file sits in them.
+///
+/// A file is looked up by its `/`-separated path relative to its asset root.
 #[derive(Debug)]
 pub struct AssetPack {
     /// The whole pack, borrowed when embedded in the binary, owned when fetched.
@@ -68,6 +72,10 @@ pub struct AssetPack {
     /// Each file's byte range within `bytes`, by `/`-separated relative path.
     entries: HashMap<String, (usize, usize)>,
 }
+
+// =============================================================================
+// AssetPackError
+// =============================================================================
 
 /// Why bytes could not be read as an asset pack.
 #[derive(Debug, thiserror::Error)]
@@ -103,6 +111,8 @@ impl AssetPack {
     /// Returns an [`AssetPackError`] when the bytes are not a pack of this
     /// version, or its index does not fit in it.
     pub fn parse(bytes: impl Into<Cow<'static, [u8]>>) -> Result<Self, AssetPackError> {
+        // Step 1: Read the header: the magic, the format version and the
+        // entry count.
         let bytes = bytes.into();
         let mut reader = PackReader {
             bytes: &bytes,
@@ -117,16 +127,17 @@ impl AssetPack {
         }
         let count = reader.u32()?;
 
-        // The count comes from the header and is not to be trusted: sizing the
-        // map from it alone asks the allocator for hundreds of gigabytes before
-        // the first entry is read. An entry cannot be shorter than its path
-        // length, an empty path and the two `u64`s, so the bytes that are left
-        // bound how many there can really be; the loop below still refuses a
-        // count that overstates that bound.
+        // Step 2: Size the map from the bytes that are left, not from the
+        // count. The count comes from the header and is not to be trusted:
+        // sizing the map from it alone asks the allocator for hundreds of
+        // gigabytes before the first entry is read. An entry cannot be shorter
+        // than its path length, an empty path and the two `u64`s, so the bytes
+        // that are left bound how many there can really be. The loop below
+        // still refuses a count that overstates that bound.
         let remaining = bytes.len() - reader.position;
         let mut entries = HashMap::with_capacity((count as usize).min(remaining / MIN_ENTRY_LEN));
-        // Each entry's range is checked here, once, so a lookup can slice
-        // without checking again.
+        // Step 3: Read each entry and check its byte range here, once, so a
+        // lookup can slice without checking again.
         for index in 0..count {
             let path_length = reader.u32()? as usize;
             let path = std::str::from_utf8(reader.take(path_length)?)
@@ -167,9 +178,13 @@ impl AssetPack {
     }
 }
 
-/// The fewest bytes one index entry can occupy: a `u32` path length, an empty
-/// path, and the `u64` offset and length.
+/// The fewest bytes one index entry can take. It holds a `u32` path length,
+/// an empty path, and the `u64` offset and `u64` length.
 const MIN_ENTRY_LEN: usize = 4 + 8 + 8;
+
+// =============================================================================
+// PackReader
+// =============================================================================
 
 /// A cursor over a pack's index.
 struct PackReader<'bytes> {
@@ -179,6 +194,10 @@ struct PackReader<'bytes> {
 
 impl<'bytes> PackReader<'bytes> {
     /// The next `length` bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`AssetPackError::Truncated`] when fewer than `length` bytes are left.
     fn take(&mut self, length: usize) -> Result<&'bytes [u8], AssetPackError> {
         let end = self
             .position
@@ -191,6 +210,10 @@ impl<'bytes> PackReader<'bytes> {
     }
 
     /// The next little-endian `u32`.
+    ///
+    /// # Errors
+    ///
+    /// [`AssetPackError::Truncated`] when fewer than four bytes are left.
     fn u32(&mut self) -> Result<u32, AssetPackError> {
         let mut value = [0; 4];
         value.copy_from_slice(self.take(4)?);
@@ -198,6 +221,10 @@ impl<'bytes> PackReader<'bytes> {
     }
 
     /// The next little-endian `u64`.
+    ///
+    /// # Errors
+    ///
+    /// [`AssetPackError::Truncated`] when fewer than eight bytes are left.
     fn u64(&mut self) -> Result<u64, AssetPackError> {
         let mut value = [0; 8];
         value.copy_from_slice(self.take(8)?);
@@ -209,22 +236,23 @@ impl<'bytes> PackReader<'bytes> {
 // Mount points
 // =============================================================================
 
-/// What is mounted: packs, newest first, the project's asset directory, and
-/// the directories extension modules contribute.
+/// Everything the store can read from: the packs in search order, the
+/// project's asset directory and the directories extension modules declared.
 #[derive(Default)]
 struct Mounts {
     packs: Vec<Arc<AssetPack>>,
-    directory: Option<PathBuf>,
-    roots: Vec<ModuleAssetRoot>,
+    project_directory: Option<PathBuf>,
+    module_roots: Vec<ModuleAssetRoot>,
 }
 
-/// The process-wide mounts of this image.
+/// The process-wide mounts, created on first use.
 fn mounts() -> &'static RwLock<Mounts> {
     static MOUNTS: OnceLock<RwLock<Mounts>> = OnceLock::new();
     MOUNTS.get_or_init(Default::default)
 }
 
-/// Mount `pack`: its files are found before every earlier mount's.
+/// Mounts `pack`. Its files are found before the files of any pack mounted
+/// earlier.
 pub fn mount_pack(pack: AssetPack) {
     let mut mounts = mounts()
         .write()
@@ -238,7 +266,7 @@ pub fn mount_directory(directory: impl Into<PathBuf>) {
     let mut mounts = mounts()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    mounts.directory = Some(directory.into());
+    mounts.project_directory = Some(directory.into());
 }
 
 /// The project's asset directory, when one is mounted.
@@ -247,7 +275,7 @@ pub fn mounted_directory() -> Option<PathBuf> {
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     mounts
-        .directory
+        .project_directory
         .clone()
         .filter(|directory| !directory.as_os_str().is_empty())
 }
@@ -258,15 +286,16 @@ pub fn mounted_directory() -> Option<PathBuf> {
 
 /// A read-only directory an extension module contributes to the store.
 ///
-/// The module declares it with the files it cannot run without: the
-/// declaration asserts both, so a build that loses a default resource stops
-/// with the module and the path in the message instead of loading a blank
-/// texture three systems later. Nothing writes into a root - the editor shows
-/// it read-only - because a module's resources ship with the module.
+/// The module declares the directory and the files under it that it cannot
+/// run without. The declaration panics when either is missing, so a build that
+/// loses a default resource stops with the module and the path in the message
+/// instead of loading a blank texture three systems later. Nothing writes into
+/// a root, because a module's resources ship with the module; the editor shows
+/// the root read-only.
 ///
-/// One module may contribute several of these (its `res`, the sources it is
-/// configured from, the images it ships); the editor merges them into one row
-/// tree under the module's name.
+/// One module may contribute several roots: its `res`, the sources its
+/// configuration is read from, the images it ships. The editor shows all of
+/// them under one tree named after the module.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleAssetRoot {
     /// The module that declared the root, as the host names it.
@@ -276,8 +305,9 @@ pub struct ModuleAssetRoot {
     /// The files below `directory` the module cannot run without.
     pub files: Vec<String>,
     /// File extensions, lowercase and without the dot, that the listing leaves
-    /// out: the cooked output beside a module's sources is a build product, not
-    /// content, and the store still answers it by name.
+    /// out. A module's cooked output sits beside the sources it was built from
+    /// and is a build product, not content, so the editor's tree hides it. The
+    /// store still answers those files by name.
     pub hidden: Vec<String>,
 }
 
@@ -285,24 +315,31 @@ pub struct ModuleAssetRoot {
 ///
 /// Loading code names a module resource by a path relative to one of these
 /// roots, exactly as it names a project asset relative to `res`. A module
-/// registers once per generation, so declaring the same root again is what a
-/// reload does and changes nothing.
+/// registers once per generation, so a reload declares the same root again;
+/// that changes nothing.
 ///
 /// # Panics
 ///
 /// Panics when `directory` is not a directory, when one of `required_files`
 /// is not a file below it, or when the same directory is declared twice with
-/// different required files: each is a packaging mistake, and each names the
-/// module and the path.
+/// a different file or hidden-extension list: each is a packaging mistake,
+/// and each names the module and the path.
 pub fn declare_module_root(module: &str, directory: impl Into<PathBuf>, required_files: &[&str]) {
     declare_module_root_hiding(module, directory, required_files, &[]);
 }
 
 /// [`declare_module_root`], with file extensions the listing leaves out.
 ///
-/// A directory whose sources are cooked into a file beside them says so here:
-/// the cooked file stays readable through the store - a shader's stages are
-/// read by path - while the editor's tree shows the sources the person authors.
+/// A directory whose sources are cooked into a file beside them passes the
+/// cooked file's extension here. The store still reads the cooked file by path
+/// (a shader's stages, for example), and the editor's tree shows only the
+/// sources a person edits.
+///
+/// # Panics
+///
+/// Panics on the same mistakes as [`declare_module_root`]: a missing
+/// directory or file, or the same directory declared twice with a different
+/// file or hidden-extension list.
 pub fn declare_module_root_hiding(
     module: &str,
     directory: impl Into<PathBuf>,
@@ -326,7 +363,7 @@ pub fn declare_module_root_hiding(
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(declared) = mounts
-        .roots
+        .module_roots
         .iter_mut()
         .find(|declared| declared.module == root.module && declared.directory == root.directory)
     {
@@ -338,30 +375,32 @@ pub fn declare_module_root_hiding(
         );
         return;
     }
-    mounts.roots.push(root);
+    mounts.module_roots.push(root);
 }
 
 /// Assert every declared module root still holds its resources.
 ///
-/// A module declares its roots while its init runs, and the host runs that
-/// inside `catch_unwind`: this re-checks them outside it, so a file that went
-/// missing stops the process with the module and the path in the message. Two
-/// roots of one module that list the same relative path are refused here too:
-/// the editor would show one file twice, under two keys.
+/// A module declares its roots while its init runs, and the host runs init
+/// inside `catch_unwind`. This re-checks the roots outside that, so a file
+/// that went missing stops the process with the module and the path in the
+/// message. It also refuses two roots of one module that hold a file at the
+/// same relative path, which the editor would show twice under two keys.
 ///
 /// # Panics
 ///
 /// Panics when a declared directory or required file is missing, or when two
 /// of a module's roots claim one path.
 pub fn verify_module_roots() {
+    // Step 1: Refuse two roots of one module that hold the same path.
     let roots = module_roots();
     assert_roots_do_not_overlap(&roots);
+    // Step 2: Check that every root still holds its directory and its files.
     for root in &roots {
         assert_module_root_complete(root);
     }
 }
 
-/// Panic when two roots of one module list the same relative path.
+/// Panic when two roots of one module hold a file at the same relative path.
 fn assert_roots_do_not_overlap(roots: &[ModuleAssetRoot]) {
     let mut claimed: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for root in roots {
@@ -421,40 +460,41 @@ pub fn module_roots() -> Vec<ModuleAssetRoot> {
     mounts()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .roots
+        .module_roots
         .clone()
 }
 
-/// Forget every root `module` declared: a host unloaded the module, so its
-/// resources stop resolving and stop being listed.
+/// Forget every root `module` declared, so its resources stop resolving and
+/// stop being listed.
 pub fn forget_module_root(module: &str) {
     mounts()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .roots
+        .module_roots
         .retain(|root| root.module != module);
 }
 
 /// Forget every declared root.
 ///
-/// A host calls this before it mounts the modules of a fresh manifest, so a
-/// root from a previous set cannot answer a path; the store's tests call it
-/// so one test does not decide the others.
+/// The store's tests call it so one test does not decide the others. A host
+/// that replaces its whole module set can call it before it mounts the new
+/// one, so a root from the previous set cannot answer a path.
 pub fn forget_all_module_roots() {
     mounts()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .roots
+        .module_roots
         .clear();
 }
 
-/// Whether `path` is one of a module's resources: an absolute path inside a
-/// declared root, or a relative one that only a root has.
+/// Whether `path` is one of a module's resources.
 ///
-/// The project's directory answers first, exactly as [`resolve_file`] orders
-/// it, so a project file that happens to share a module resource's path is the
+/// An absolute path counts when it lies inside a declared root. A relative
+/// path counts when a root holds it and the project's asset directory does
+/// not. The project's directory is checked first, exactly as [`resolve_file`]
+/// orders them, so a project file that shares a module resource's path is the
 /// project's and stays writable. The editor asks this before it writes
-/// anything, so a module's resources are never an authoring target.
+/// anything, which keeps module resources out of the authoring tools.
 pub fn is_module_asset(path: &Path) -> bool {
     if path.is_absolute() {
         return module_roots()
@@ -469,24 +509,30 @@ pub fn is_module_asset(path: &Path) -> bool {
         .any(|root| root.directory.join(path).is_file())
 }
 
-/// Read the bytes of the asset at `path` from the first mount that has it.
+// =============================================================================
+// Reading
+// =============================================================================
+
+/// Read the bytes of the asset at `path` from the first place that has it.
 ///
-/// An absolute path is read from the filesystem as is. A relative one is looked
-/// up in every pack, then below the project's asset directory, then in each
-/// module root, then the development fallbacks: the working directory itself,
-/// its `res`, `$PROJECT_PATH/res` and the executable's `res`.
+/// An absolute path is read from the filesystem as it is. A relative path is
+/// looked up in every pack, then below the project's asset directory, then in
+/// each module root, and last in the development fallbacks: the working
+/// directory itself, its `res`, `$PROJECT_PATH/res` and the executable's
+/// `res`.
 ///
-/// Once [`restrict_to_packs`] has been called - a shipped build, right after it
-/// mounts the pack it was built with - only the packs and a deliberately mounted
-/// directory are read, so a pack miss is a missing asset rather than a file the
-/// machine happens to have.
+/// Once [`restrict_to_packs`] has been called, only the packs, a mounted
+/// directory and the module roots are read. A shipped build calls it right
+/// after it mounts the pack it was built with, so a pack miss is a missing
+/// asset rather than a file the machine happens to have.
 ///
 /// # Errors
 ///
 /// [`AssetLoadError::PathNotFound`] when no mount has the path, or
 /// [`AssetLoadError::Read`] when the file was found but could not be read.
 pub fn read(path: &Path) -> AssetLoadResult<Vec<u8>> {
-    // Packs first: a shipped game reads what it was built with.
+    // Step 1: Look in the packs first. A shipped game reads what it was built
+    // with.
     if let Some(key) = pack_key(path) {
         let packs = mounts()
             .read()
@@ -497,19 +543,22 @@ pub fn read(path: &Path) -> AssetLoadResult<Vec<u8>> {
             return Ok(bytes.to_vec());
         }
     }
+    // Step 2: Fall back to the filesystem in the order `resolve_file` lists.
     let file = resolve_file(path).ok_or_else(|| AssetLoadError::PathNotFound {
         path: path.to_owned(),
     })?;
     std::fs::read(&file).map_err(|source| AssetLoadError::Read { path: file, source })
 }
 
-/// The key `path` is packed under: its components joined with `/`. `None` for
-/// a path no pack can hold - absolute, climbing out with `..`, or not UTF-8.
+/// The key `path` is packed under: its components joined with `/`.
 ///
-/// Also the canonical name of an asset loaded from that path, so the name and
-/// the pack key can never disagree. `\` separates components on every
-/// target, not only on Windows: a path written on one machine must name the
-/// same asset on another.
+/// Returns `None` for a path no pack can hold: an empty path, an absolute
+/// path, one that climbs out with `..`, or one that is not UTF-8.
+///
+/// The key is also the name an asset loaded from this path gets, so the two
+/// can never disagree. A `\` separates components on every target, not only
+/// on Windows, so a path written on one machine names the same asset on
+/// another.
 pub(crate) fn pack_key(path: &Path) -> Option<String> {
     let unified = path.to_str()?.replace('\\', "/");
     let mut parts = Vec::new();
@@ -523,21 +572,23 @@ pub(crate) fn pack_key(path: &Path) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-/// Find `path` on the filesystem: as is when absolute, else below the mounted
-/// directory, each module root and the development fallbacks.
+/// Find `path` on the filesystem. An absolute path is used as it is. Otherwise
+/// the search runs below the mounted directory, then each module root, then
+/// the development fallbacks.
 ///
-/// The fallbacks are off once [`restrict_to_packs`] has been called - a
-/// shipped build reads what it was built with - while an absolute path and a
-/// deliberately mounted directory keep working.
+/// The fallbacks are off once [`restrict_to_packs`] has been called, because a
+/// shipped build reads what it was built with. An absolute path, a mounted
+/// directory and the module roots keep working.
 fn resolve_file(path: &Path) -> Option<PathBuf> {
     if path.is_absolute() {
         return path.is_file().then(|| path.to_owned());
     }
+    // Step 1: Collect the candidate paths in lookup order.
     let mut candidates = Vec::new();
     if let Some(directory) = mounted_directory() {
         candidates.push(directory.join(path));
     }
-    // Then every module's own resources, in declaration order: a default an
+    // The module roots come next, in declaration order. A default that an
     // extension ships lives beside the module, not in the project.
     for root in module_roots() {
         candidates.push(root.directory.join(path));
@@ -545,8 +596,8 @@ fn resolve_file(path: &Path) -> Option<PathBuf> {
     if !packs_only() {
         candidates.push(path.to_owned());
         candidates.push(Path::new("res").join(path));
-        if let Some(project) = std::env::var_os("PROJECT_PATH") {
-            candidates.push(PathBuf::from(project).join("res").join(path));
+        if let Some(project_path) = std::env::var_os("PROJECT_PATH") {
+            candidates.push(PathBuf::from(project_path).join("res").join(path));
         }
         if let Some(parent) = std::env::current_exe()
             .ok()
@@ -555,21 +606,26 @@ fn resolve_file(path: &Path) -> Option<PathBuf> {
             candidates.push(parent.join("res").join(path));
         }
     }
+    // Step 2: Return the first candidate that is a file.
     candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
+// =============================================================================
+// Pack-only store
+// =============================================================================
+
 /// Whether the store reads only what its packs hold.
 ///
-/// Off until [`restrict_to_packs`] says otherwise: a development host runs a
-/// project straight out of its source tree, and the fallbacks are how it finds
-/// the files.
+/// It is off until [`restrict_to_packs`] turns it on. A development host runs
+/// a project straight out of its source tree, and the fallbacks are how it
+/// finds the files.
 static PACKS_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Read only what the mounted packs hold, never a development fallback.
 ///
-/// A shipped build calls this where it mounts the pack it was built with: from
-/// then on a pack miss is a missing asset, not a file the machine it runs on
-/// happens to have at the same name.
+/// A shipped build calls this where it mounts the pack it was built with.
+/// From then on, a pack miss is a missing asset, not a file the machine it
+/// runs on happens to have at the same name.
 pub fn restrict_to_packs() {
     PACKS_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -586,26 +642,45 @@ fn set_packs_only(packs_only: bool) {
     PACKS_ONLY.store(packs_only, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The filesystem path the asset at `path` resolves to, or `None` when it is
-/// not on the filesystem - packed only, or missing.
+/// The filesystem path the asset at `path` resolves to, or `None` when the
+/// asset is packed only or missing.
 ///
 /// Resolves exactly as [`read`] does after the packs: as is when absolute,
-/// else below the mounted directory and the development fallbacks.
+/// else below the mounted directory, the module roots and the development
+/// fallbacks.
 pub fn locate_file(path: &Path) -> Option<PathBuf> {
     resolve_file(path)
 }
 
-/// Write `bytes` to a file named like `target` in the directory of the asset
+// =============================================================================
+// Writing
+// =============================================================================
+
+/// How a file being placed treats a destination that already exists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Existing {
+    /// Someone else's file is as good as this one: leave it in place.
+    Keep,
+    /// A create must never replace one: report the collision.
+    Refuse,
+}
+
+/// The link operation [`place_file`] tries first, so a test can stand in a
+/// filesystem that has no hard links.
+type Link = fn(&Path, &Path) -> std::io::Result<()>;
+
+/// Write `bytes` to a file named like `target`, in the directory of the asset
 /// `source`, unless that file already exists.
 ///
-/// Returns the written (or already present) file, or `None` when `source` is
-/// not on the filesystem: a packed asset - every asset of a shipping or web
-/// build - has no directory to write into, and that is not an error.
+/// Returns the written file, or the one that was already there. Returns
+/// `None` when `source` is not on the filesystem: a packed asset (every asset
+/// of a shipping or web build) has no directory to write into, and that is
+/// not an error.
 ///
 /// The bytes go to a temporary sibling first and are linked into place only
-/// when complete, so a crash or a second writer never leaves a half-written
-/// file. An existing file is never replaced, even one that appears while this
-/// runs: it may hold a person's edits.
+/// when they are complete, so a crash or a second writer never leaves a
+/// half-written file. An existing file is never replaced, even one that
+/// appears while this runs, because it may hold a person's edits.
 ///
 /// # Errors
 ///
@@ -615,6 +690,8 @@ pub fn write_beside(
     target: &Path,
     bytes: &[u8],
 ) -> AssetLoadResult<Option<PathBuf>> {
+    // Step 1: Find the source on the filesystem. A packed source has no
+    // directory to write into.
     let Some(source_file) = resolve_file(source) else {
         return Ok(None);
     };
@@ -624,9 +701,11 @@ pub fn write_beside(
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"),
     })?;
     let destination = directory.join(file_name);
+    // Step 2: Leave an existing file alone. It may hold a person's edits.
     if destination.exists() {
         return Ok(Some(destination));
     }
+    // Step 3: Write through a temporary sibling and link it into place.
     write_then_place(&destination, bytes, |temporary| {
         place_file(temporary, &destination, Existing::Keep, hard_link)
     })?;
@@ -645,6 +724,7 @@ pub fn write_beside(
 /// [`AssetLoadError::Write`] with [`std::io::ErrorKind::AlreadyExists`] when
 /// the file exists, or with the underlying error when it cannot be written.
 pub fn write_new(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> {
+    // Step 1: Refuse a destination with no file name, and one that exists.
     let write_error = |source| AssetLoadError::Write {
         path: destination.to_owned(),
         source,
@@ -661,9 +741,9 @@ pub fn write_new(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> {
             "the file already exists",
         )));
     }
-    // A hard link fails when the destination exists, which is the guarantee
-    // wanted here; unlike `write_beside`, an existing file is an error rather
-    // than someone else's equally good copy.
+    // Step 2: Place the new file. The hard link fails when the destination
+    // exists, which is the guarantee wanted here: unlike `write_beside`, an
+    // existing file is an error and not someone else's equally good copy.
     write_then_place(destination, bytes, |temporary| {
         place_file(temporary, destination, Existing::Refuse, hard_link)
     })
@@ -671,9 +751,10 @@ pub fn write_new(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> {
 
 /// Write `bytes` as `destination`, replacing a file that is already there.
 ///
-/// The overwrite counterpart of [`write_new`]: the bytes go to a temporary
-/// sibling first and are renamed over the destination only when complete, so a
-/// crash never leaves a half-written asset and a reader never sees one.
+/// The overwrite counterpart of [`write_new`]. The bytes go to a temporary
+/// sibling first and are renamed over the destination only when they are
+/// complete, so a crash never leaves a half-written asset and a reader never
+/// sees one.
 ///
 /// # Errors
 ///
@@ -685,13 +766,18 @@ pub fn write_replacing(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> 
     })
 }
 
-/// Write `bytes` to a temporary sibling of `destination` and let `place` move
-/// it into place, cleaning the sibling up whatever happened.
+/// Write `bytes` to a temporary sibling of `destination`, let `place` move it
+/// into place, and clean the sibling up whatever happened.
 ///
 /// The three writers differ only in how they treat a destination that already
-/// exists, so the temporary-file half - the sibling name, the complete write,
-/// the cleanup - lives here once. A crash or a second writer therefore never
-/// sees a half-written file, whichever writer ran.
+/// exists. The temporary-file half (choosing the sibling name, writing it
+/// whole, removing it) lives here once, so no writer leaves a half-written
+/// file behind.
+///
+/// # Errors
+///
+/// [`AssetLoadError::Write`] when the temporary file cannot be written, or
+/// with the error `place` reports when it cannot move the file into place.
 fn write_then_place(
     destination: &Path,
     bytes: &[u8],
@@ -707,12 +793,14 @@ fn write_then_place(
             "no file name",
         ))
     })?;
+    // Step 1: Write the whole file under a temporary sibling name.
     let directory = destination.parent().unwrap_or(Path::new("."));
     let temporary = directory.join(temporary_name(file_name));
     std::fs::write(&temporary, bytes).map_err(write_error)?;
+    // Step 2: Move the sibling into place, then remove it. A successful
+    // fallback rename consumed the temporary, so a failed removal says nothing
+    // about the write.
     let placed = place(&temporary);
-    // A successful fallback rename consumed the temporary; ignoring that error
-    // keeps it from looking like a failed write.
     let _ = std::fs::remove_file(&temporary);
     placed.map_err(write_error)
 }
@@ -728,33 +816,25 @@ fn temporary_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
     name
 }
 
-/// How a file being placed treats a destination that already exists.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Existing {
-    /// Someone else's file is as good as this one: leave it in place.
-    Keep,
-    /// A create must never replace one: report the collision.
-    Refuse,
-}
-
-/// The link operation [`place_file`] tries first, so a test can stand in a
-/// filesystem that has no hard links.
-type Link = fn(&Path, &Path) -> std::io::Result<()>;
-
-/// A hard link, as the one [`Link`] a real write uses.
+/// Creates a hard link, as the [`Link`] a real write passes to [`place_file`].
 fn hard_link(temporary: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::hard_link(temporary, destination)
 }
 
-/// Move the complete file `temporary` to `destination`, treating an existing
-/// `destination` as `existing` says.
+/// Move the complete file `temporary` to `destination`, treating a
+/// destination that already exists as `existing` says.
 ///
-/// A hard link fails atomically when the destination exists, which no rename on
-/// Windows does, so it is tried first. A filesystem that has no hard links -
-/// exFAT, FAT, some network shares - takes the rename instead, and there the
-/// existence check below stands in for the link's refusal: the check and the
-/// rename are not one operation, but only two writers racing on one file could
-/// slip between them.
+/// The hard link is tried first, because it fails when the destination exists
+/// and no rename does. A filesystem without hard links (exFAT, FAT, some
+/// network shares) falls back to a rename. There the existence check below
+/// stands in for the link's refusal. The check and the rename are not one
+/// operation, but only two writers racing on one file could slip between them.
+///
+/// # Errors
+///
+/// [`std::io::ErrorKind::AlreadyExists`] when the destination exists and
+/// `existing` is [`Existing::Refuse`], or the error the link or the rename
+/// reports.
 fn place_file(
     temporary: &Path,
     destination: &Path,
@@ -778,6 +858,10 @@ fn place_file(
     }
 }
 
+// =============================================================================
+// Test locks
+// =============================================================================
+
 /// Serializes tests that change the process-wide mounted directory.
 ///
 /// `mount_directory` replaces one global, and tests run in parallel threads,
@@ -786,12 +870,12 @@ fn place_file(
 #[cfg(test)]
 pub(crate) fn mounted_directory_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // A test that failed while holding the lock poisons it; the directory is
-    // re-mounted by the next holder anyway.
+    // A test that failed while holding the lock poisons it. The next holder
+    // re-mounts the directory anyway, so the poison does not matter.
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Serializes tests that declare module roots: the registry is process-wide.
+/// Serializes tests that declare module roots. The registry is process-wide.
 #[cfg(test)]
 pub(crate) fn module_roots_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -803,6 +887,10 @@ pub(crate) fn module_roots_test_lock() -> std::sync::MutexGuard<'static, ()> {
 pub(crate) fn clear_module_roots() {
     forget_all_module_roots();
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -876,8 +964,8 @@ mod tests {
         assert!(message.contains("pill_test_module"), "{message}");
     }
 
-    /// A module registers once per generation, so the same declaration twice
-    /// is a reload; the same directory with a different file list is a
+    /// A module registers once per generation, so declaring the same root
+    /// twice is a reload. The same directory with a different file list is a
     /// mistake.
     #[test]
     fn declaring_the_same_root_again_changes_nothing() {
@@ -923,7 +1011,7 @@ mod tests {
         std::fs::remove_dir_all(&sources).unwrap();
     }
 
-    /// Two roots of one module that list one path would show it twice, so the
+    /// Two roots of one module that hold one path would show it twice, so the
     /// verification refuses them by name.
     #[test]
     fn two_roots_of_one_module_may_not_claim_one_path() {
@@ -965,13 +1053,13 @@ mod tests {
     }
 
     /// The message a caught panic carried.
-    fn panic_message(panic: std::thread::Result<()>) -> String {
-        let payload = panic.expect_err("the call was expected to panic");
-        payload
+    fn panic_message(panic_result: std::thread::Result<()>) -> String {
+        let panic_payload = panic_result.expect_err("the call was expected to panic");
+        panic_payload
             .downcast_ref::<String>()
             .cloned()
             .or_else(|| {
-                payload
+                panic_payload
                     .downcast_ref::<&str>()
                     .map(|text| (*text).to_owned())
             })
@@ -998,9 +1086,9 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    /// A filesystem with no hard links - exFAT, FAT, some network shares -
-    /// refuses the link every writer tries first, so a create has to fall back
-    /// to the rename rather than surface that refusal.
+    /// A filesystem with no hard links (exFAT, FAT, some network shares)
+    /// refuses the link every writer tries first. A create must then fall back
+    /// to the rename instead of reporting that refusal.
     fn no_hard_links(_: &Path, _: &Path) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -1024,7 +1112,7 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"first");
         assert!(!temporary.exists(), "the temporary moved into place");
 
-        // The fallback must not turn a create into a replace: the file that is
+        // The fallback must not turn a create into a replace. The file that is
         // already there stays, and the second write is refused.
         std::fs::write(&temporary, b"second").unwrap();
         let error = place_file(&temporary, &destination, Existing::Refuse, no_hard_links)
@@ -1148,8 +1236,9 @@ mod tests {
         assert_eq!(locate_file(&scratch.0.join("absent.txt")), None);
     }
 
-    /// The metadata path: written into the source's own directory, under the
-    /// target's file name, with no temporary left behind.
+    /// Checks that the metadata file is written into the source's own
+    /// directory, under the target's file name, and that no temporary file is
+    /// left behind.
     #[test]
     fn write_beside_writes_next_to_the_source() {
         let scratch = ScratchDirectory::new("write");
@@ -1170,7 +1259,7 @@ mod tests {
         assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
     }
 
-    /// An existing file may hold a person's edits: it is kept as it is.
+    /// An existing file may hold a person's edits, so it is kept as it is.
     #[test]
     fn write_beside_never_replaces_an_existing_file() {
         let scratch = ScratchDirectory::new("keep");
@@ -1185,8 +1274,8 @@ mod tests {
         assert_eq!(std::fs::read(&existing).unwrap(), b"edited by hand");
     }
 
-    /// A source no filesystem mount has - packed only, as in every shipping
-    /// and web build - has nowhere to write beside, and that is not an error.
+    /// A source that is packed only, as in every shipping and web build, has
+    /// no directory to write beside, and that is not an error.
     #[test]
     fn write_beside_a_source_not_on_disk_writes_nothing() {
         let key = "pill-store-test/packed-only-source.jpg";
@@ -1227,8 +1316,8 @@ mod tests {
         let decoy = PathBuf::from(format!("pill-store-decoy-{}.txt", std::process::id()));
         std::fs::write(&decoy, b"a file the machine happens to have").unwrap();
 
-        // The development posture resolves it: that is what the fallbacks are
-        // for.
+        // The development posture resolves it, because that is what the
+        // fallbacks are for.
         assert_eq!(read(&decoy).unwrap(), b"a file the machine happens to have");
 
         set_packs_only(true);

@@ -1,4 +1,4 @@
-//! Native editor executable: the PILL engine's editor frontend.
+//! Native editor executable: the Pill engine's editor frontend.
 //!
 //! # Responsibilities
 //!
@@ -12,11 +12,11 @@
 //!
 //! # Design
 //!
-//! The executable is the part of the editor that cannot change while it
-//! runs: the platform layer, the loop, and the UI presentation. Everything
-//! that should reload - panels, their commands and their state - lives in the
-//! shell module this binary hosts. Changes to this binary require a restart;
-//! changes to the shell module hot-patch or reload.
+//! Nothing in this executable can change while it runs: the shared platform
+//! layer, the loop and the UI presentation never reload. Everything that
+//! should reload - panels, their commands and their state - lives in the
+//! shell module this binary hosts. A change here needs a restart; a change
+//! to the shell module hot-patches or reloads.
 
 // Standard library
 use std::path::PathBuf;
@@ -28,15 +28,17 @@ use pill_core::error::{engine_report, install_engine_report_handler};
 // Current crate
 use crate::frontend::EditorError;
 
-/// The OS clipboard bridge the runner drives for copy, cut and paste.
+/// Reads and writes the OS clipboard for the runner's copy, cut and paste.
 mod clipboard;
+/// Hands one project asset to the OS as a file drag.
 mod drag_out;
 /// The editor's errors, with their stable diagnostic codes.
 mod frontend;
-/// The composition overlay over the editor window: a DirectComposition
-/// visual on Windows, its wgpu surface, and the egui-wgpu draw path.
+/// The overlay drawn above the editor window: a DirectComposition visual on
+/// Windows, the wgpu surface it presents, and the egui-wgpu renderer that
+/// fills it.
 mod overlay;
-/// The window, the GPU device and the frame loop.
+/// The windows, the GPU device and the frame loop.
 mod runner;
 /// The devops suite's scripted input channel.
 mod test_channel;
@@ -45,51 +47,54 @@ mod test_channel;
 // Telemetry
 // =============================================================================
 
-/// Install the shared telemetry stack before the run loop starts.
+/// Installs the shared telemetry stack before the run loop starts.
 ///
-/// Terminal logging is always active, and the editor console's capture ring
-/// is installed with it. A file lane is added when `ECS_LOG_DIR` is set.
+/// Logging to the terminal is always on, and so is the console panel's
+/// capture ring (the in-memory ring of log lines it reads). The return value
+/// carries that ring. A file lane (a rolling log file) is added when
+/// `ECS_LOG_DIR` is set.
+///
 /// Setup is best-effort: a failure only degrades telemetry and is reported
 /// to stderr without aborting the run.
 fn init_telemetry() -> pill_core::telemetry::capture::LogBuffer {
-    // Step 1: resolve the optional log directory from the environment.
-    let file_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
-    // Step 2: install the stack, reporting setup failures to stderr. The
-    // buffer survives a failed install so the console panel still reads an
-    // (empty) ring rather than nothing.
-    let buffer = pill_core::telemetry::capture::LogBuffer::default();
+    // Step 1: read the optional log directory from `ECS_LOG_DIR`.
+    let file_log_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
+    // Step 2: install the stack, printing setup failures to stderr. The call
+    // gets a clone of the buffer, so even a failed install still returns an
+    // empty ring the console panel can read.
+    let log_buffer = pill_core::telemetry::capture::LogBuffer::default();
     if let Err(error) =
-        pill_player::init_telemetry_with_capture(file_directory, Some(buffer.clone()))
+        pill_player::init_telemetry_with_capture(file_log_directory, Some(log_buffer.clone()))
     {
-        // The one message that cannot go through the logger: it reports that
+        // This message cannot go through the logger, because it reports that
         // the logger itself did not install.
         eprintln!("[editor] telemetry setup failed: {error}");
     }
-    buffer
+    log_buffer
 }
 
 // =============================================================================
 // Reporting Boundary
 // =============================================================================
 
-/// Install the report handler once and report the final error once.
+/// Runs the editor and reports its final error once.
 ///
 /// # Errors
 ///
-/// Returns the styled [`engine_report`] when the run terminates with an
-/// error, after also recording the failure on the tracing lane for
-/// correlation with active spans and log files.
+/// Returns a styled report built by [`engine_report`] when the run ends with
+/// an error. Before that, the failure is also sent to the log, so it appears
+/// inside any active spans and in the log files.
 fn main() -> miette::Result<()> {
     // Step 1: install the miette report handler before anything can fail.
     install_engine_report_handler();
-    // Step 2: bring up the shared telemetry stack (best-effort) and keep
-    // the console's capture ring.
+    // Step 2: bring up the shared telemetry stack and keep the console
+    // panel's capture ring.
     let log_buffer = init_telemetry();
-    // Step 3: run the editor and convert the error once.
-    let outcome: Result<(), EditorError> = runner::run(log_buffer);
-    outcome.map_err(|error| {
-        // Error correlation: the fatal failure also enters the tracing lane
-        // so it appears inside any active spans and log files.
+    // Step 3: run the editor, then turn a failure into one report.
+    let editor_run: Result<(), EditorError> = runner::run(log_buffer);
+    editor_run.map_err(|error| {
+        // The fatal error is also logged, so it appears inside any active
+        // spans and in the log files next to the run's other messages.
         error!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
             error = %error,

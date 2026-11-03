@@ -1,30 +1,35 @@
-//! The components the crate's unit tests build worlds out of, and one way to
-//! register them.
+//! The component types the crate's unit tests share, and one helper that
+//! registers them all.
 //!
 //! # Responsibilities
 //!
-//! - Define the crate's test fixtures once: [`Position`], [`Velocity`] and
+//! - Define the shared test fixtures: [`Position`], [`Velocity`] and
 //!   [`Health`].
 //! - Offer [`setup_world`], a [`World`] with all three registered, for tests
 //!   whose subject is not registration itself.
 //!
 //! # Design
 //!
-//! One definition serves every suite, so the world, query and commands tests
-//! build their worlds out of the same shapes. A fixture that drifts between
-//! suites makes a passing test prove less than it reads like it does.
+//! The world, query and commands tests build their worlds out of the same
+//! shapes, so a fixture cannot drift between those suites. If one did drift,
+//! a passing test would prove less than it appears to.
 //!
-//! `Health` is a tuple struct on purpose: the query suite writes it as a
-//! literal throughout, and a named field buys nothing a comment cannot.
+//! `Health` is a tuple struct on purpose: the query tests write it as a
+//! literal throughout, and a named field would add nothing a comment does not
+//! already say.
 
 // Current crate
 use crate::component::Component;
 use crate::world::World;
 
-/// 2D position component used as a test fixture across the crate's suites.
+// =============================================================================
+// Position
+// =============================================================================
+
+/// A 2D position, shared by the crate's test suites as a fixture.
 ///
-/// Plain `f32` fields keep the fixture minimal so tests focus on the system
-/// under test rather than component behaviour.
+/// The plain `f32` fields keep it minimal, so a test can focus on the system
+/// it checks rather than on component behaviour.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Position {
     /// Horizontal coordinate.
@@ -35,10 +40,14 @@ pub(crate) struct Position {
 
 impl Component for Position {}
 
-/// 2D velocity component used as a test fixture across the crate's suites.
+// =============================================================================
+// Velocity
+// =============================================================================
+
+/// A 2D velocity, shared by the crate's test suites as a fixture.
 ///
-/// Paired with [`Position`] in tests that exercise multi-component queries
-/// and parallel mutation.
+/// It is paired with [`Position`] in tests for multi-component queries, and
+/// used on its own where a filter needs a second component to choose between.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Velocity {
     /// Horizontal coordinate.
@@ -49,20 +58,30 @@ pub(crate) struct Velocity {
 
 impl Component for Velocity {}
 
-/// Health value component used as a test fixture across the crate's suites.
+// =============================================================================
+// Health
+// =============================================================================
+
+/// A health value, shared by the crate's test suites as a fixture.
 ///
-/// A tuple struct that creates archetypes distinct from the
-/// [`Position`]/[`Velocity`] pair, giving filters disjoint sets to match.
+/// It is a tuple struct, so an entity holding it goes into a different
+/// archetype from one holding [`Position`] or [`Velocity`]. The filter tests
+/// rely on that to get sets of entities that do not overlap.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Health(pub i32);
 
 impl Component for Health {}
 
-/// A fresh [`World`] with the three fixture components registered.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Creates a fresh [`World`] with the three fixture components registered.
 ///
-/// The order is fixed so component ids are deterministic; a test that needs
-/// a different registration should register its own components after this
-/// one rather than forking the fixture.
+/// The registration order is fixed, so every run gives each component the
+/// same bit index (its slot in a world's component mask). A test that needs
+/// other components registered should add them to the returned world rather
+/// than writing its own version of this helper.
 pub(crate) fn setup_world() -> World {
     let mut world = World::new();
     world.register_component::<Position>();

@@ -1,24 +1,27 @@
 //! Demonstrates parallel system execution in the Pill ECS.
 //!
-//! Registers four systems, enables parallel execution on the engine, prints
-//! the scheduler's execution graph, then runs five frames of the simulation.
+//! Registers four systems, turns parallel execution on (it is already the
+//! engine's default), prints the scheduler's execution graph, then runs five
+//! frames of the simulation.
 //!
 //! # Responsibilities
 //!
 //! - Defines the `Position`, `Velocity`, and `Health` components used by the
 //!   demo.
-//! - Defines systems that move entities, decay and apply damage to health,
-//!   and spawn a fresh entity each frame.
+//! - Defines four systems that move entities, decay health, apply damage, and
+//!   spawn a fresh entity each frame.
 //! - Runs the engine's frame loop with parallel execution enabled and prints
 //!   the execution graph and per-frame output.
 //!
 //! # Design
 //!
-//! The demo builds an [`Engine`] with parallel execution enabled. The
-//! scheduler derives the dependency graph from each system's read/write
-//! access to components, so systems without conflicting access (movement
-//! writes `Position` and reads `Velocity`, while health writes `Health`) run
-//! in parallel, and conflicting systems are serialised automatically.
+//! The demo builds an [`Engine`] with parallel execution on. The scheduler
+//! builds its dependency graph from the components each system reads and
+//! writes, and rebuilds it only when the registered systems change. Systems
+//! that share no component sit in one batch and run at the same time; a
+//! system that touches a component another one uses waits in a later batch.
+//! Movement writes `Position` and reads `Velocity`, while health only writes
+//! `Health`, so those two share the first batch.
 
 // =============================================================================
 // Imports
@@ -33,8 +36,9 @@ use pill_engine::*;
 
 /// 2D position of an entity in the demo world.
 ///
-/// Moved by `movement_system` and read by `damage_system` to decide whether
-/// an entity is close enough to the origin to take damage.
+/// Written by `movement_system` and `move_and_spawn_system`. Read by
+/// `damage_system`, which checks whether the entity is within one unit of the
+/// origin.
 #[derive(Debug, Clone)]
 struct Position {
     /// Horizontal coordinate in world units.
@@ -44,9 +48,10 @@ struct Position {
 }
 impl Component for Position {}
 
-/// Velocity of an entity, applied to its [`Position`] every frame.
+/// Velocity of an entity, added to its [`Position`] every frame.
 ///
-/// Read by `movement_system` and `ttt_system` to displace entities each frame.
+/// Read by `movement_system` and `move_and_spawn_system`. Both also write
+/// `Position`, so the scheduler runs them one after the other.
 #[derive(Debug, Clone)]
 struct Velocity {
     /// Horizontal velocity in world units per frame.
@@ -58,8 +63,8 @@ impl Component for Velocity {}
 
 /// Hit points of an entity, decaying over time.
 ///
-/// Decayed by `health_system` each frame and reduced by `damage_system` for
-/// entities near the origin.
+/// `health_decay_system` removes a tenth of a point every frame, and
+/// `damage_system` removes one point from an entity near the origin.
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
@@ -68,19 +73,20 @@ impl Component for Health {}
 // Systems
 // =============================================================================
 
-/// Moves every entity by its velocity and spawns one fresh entity per frame.
+/// Moves every entity by its velocity and queues one fresh entity per frame.
 ///
-/// Writes `Position` and reads `Velocity`, which conflicts with
-/// `movement_system`; the scheduler serialises the two systems.
-fn ttt_system(mut commands: Commands, mut query: Query<(&mut Position, &Velocity)>) {
-    // Step 1: Displace every entity by its velocity.
-    for (mut pos, vel) in query.iter_mut() {
-        pos.x += vel.vx;
-        pos.y += vel.vy;
+/// Writes `Position` and reads `Velocity`, so it conflicts with
+/// `movement_system` and runs in a later batch.
+fn move_and_spawn_system(mut commands: Commands, mut query: Query<(&mut Position, &Velocity)>) {
+    // Step 1: Add each entity's velocity to its position.
+    for (mut position, velocity) in query.iter_mut() {
+        position.x += velocity.vx;
+        position.y += velocity.vy;
     }
 
-    // Step 2: Spawn a fresh entity at the origin with a starting velocity.
-    let _x = commands
+    // Step 2: Queue a new entity at the origin with velocity (1, 1) and 50
+    // health points.
+    let _queued_entity = commands
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
         .with(Velocity { vx: 1.0, vy: 1.0 })
@@ -90,30 +96,32 @@ fn ttt_system(mut commands: Commands, mut query: Query<(&mut Position, &Velocity
 
 /// Moves every entity by its velocity.
 ///
-/// Writes `Position` and reads `Velocity`; runs in parallel with systems that
-/// do not touch those components.
+/// Writes `Position` and reads `Velocity`. Nothing it touches is also touched
+/// by `health_decay_system`, so the two share the first batch.
 fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
-    for (mut pos, vel) in query.iter_mut() {
-        pos.x += vel.vx;
-        pos.y += vel.vy;
+    for (mut position, velocity) in query.iter_mut() {
+        position.x += velocity.vx;
+        position.y += velocity.vy;
     }
 }
 
-/// Decays every entity's health by a small amount each frame.
+/// Takes a tenth of a point of health off every entity each frame.
 ///
-/// Writes `Health`; runs in parallel with systems that do not touch `Health`.
-fn health_system(mut query: Query<&mut Health>) {
+/// Writes `Health`, which no component of `movement_system` overlaps, so the
+/// two share the first batch.
+fn health_decay_system(mut query: Query<&mut Health>) {
     for mut health in query.iter_mut() {
         health.0 = (health.0 - 0.1).max(0.0);
     }
 }
 
-/// Applies damage to entities whose position is within one unit of the origin.
+/// Takes one point of health off every entity within one unit of the origin.
 ///
-/// Writes `Health` and reads `Position`.
+/// Writes `Health` and reads `Position`, so it shares a component with each
+/// system in the first batch and runs in the second one.
 fn damage_system(mut query: Query<(&mut Health, &Position)>) {
-    for (mut health, pos) in query.iter_mut() {
-        if pos.x.abs() < 1.0 && pos.y.abs() < 1.0 {
+    for (mut health, position) in query.iter_mut() {
+        if position.x.abs() < 1.0 && position.y.abs() < 1.0 {
             health.0 = (health.0 - 1.0).max(0.0);
         }
     }
@@ -129,12 +137,13 @@ fn damage_system(mut query: Query<(&mut Health, &Position)>) {
 /// components and systems, prints the scheduler's execution graph, then steps
 /// through five frames of the simulation.
 fn main() {
-    // Route this program's output, and the engine's own reports, through
-    // the engine logger.
+    // Install the engine logger, so this program's `pill_core::info!` lines
+    // and the engine's own log lines both reach the terminal.
     let _ = pill_core::telemetry::TelemetryBuilder::new().init();
     pill_core::info!("=== Parallel Systems Demo ===");
 
-    // Step 1: Create the engine with parallel execution enabled.
+    // Step 1: Create the engine. Parallel execution is already on by default;
+    // the call states it for the reader.
     let mut engine = Engine::new();
     engine.set_parallel_execution(true);
 
@@ -143,19 +152,22 @@ fn main() {
     engine.world_mut().register_component::<Velocity>();
     engine.world_mut().register_component::<Health>();
 
-    // Step 3: Register the systems. `movement` and `health` touch disjoint
-    // components, so they share a batch; `damage` and `xxx` touch the same data
-    // as those two and are serialised behind them.
+    // Step 3: Register the four systems. `movement` and `health` touch
+    // different components, so they share the first batch. `damage` touches
+    // both, so it runs in the second batch, and `xxx` writes `Position` too,
+    // so it runs in the third.
     engine.register_system("movement", movement_system);
-    engine.register_system("health", health_system);
+    engine.register_system("health", health_decay_system);
     engine.register_system("damage", damage_system);
-    engine.register_system("xxx", ttt_system);
+    engine.register_system("xxx", move_and_spawn_system);
 
-    // Step 4: Print the execution graph built by the scheduler.
+    // Step 4: Print the execution graph, which lists each batch and the
+    // systems it holds.
     pill_core::info!("System Execution Graph:");
     engine.print_execution_graph();
 
-    // Step 5: Create entities spread out along the x-axis.
+    // Step 5: Create five entities at x = 0, 1, 2, 3 and 4, each with
+    // velocity (1, 0.5) and 100 health points.
     for i in 0..5 {
         engine
             .world_mut()
@@ -170,7 +182,7 @@ fn main() {
             .unwrap();
     }
 
-    // Step 6: Run five frames of the simulation.
+    // Step 6: Run five frames, logging the frame number as each one starts.
     pill_core::info!("Running 5 frames...");
     for frame in 0..5 {
         pill_core::info!("Frame {}", frame);

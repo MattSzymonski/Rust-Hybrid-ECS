@@ -1,27 +1,30 @@
 //! The world resource a UI producer publishes a frame into and a renderer
-//! drains it from.
+//! takes it from.
 //!
 //! # Responsibilities
 //!
-//! - [`UiFrameSlot`]: one world resource holding the newest [`UiFrame`] a UI
-//!   producer built - `publish` and `take` for the frame, the pair that asks
-//!   for and reports a texture resend, and the emptiness checks that go with
-//!   holding nothing.
+//! - [`UiFrameSlot`]: the world resource holding the newest [`UiFrame`] a UI
+//!   producer built. It offers `publish` and `take` for the frame, `is_empty`,
+//!   and `clear` to drop a frame but keep its buffers.
+//! - `request_texture_resend` and `texture_resend_generation`: the pair a
+//!   painter uses to ask for every texture again, and a producer to tell
+//!   whether that request is new.
 //!
 //! # Design
 //!
 //! A UI producer and a renderer meet here rather than naming each other. The
-//! producer (a project's egui pass) writes what it drew; the renderer drains
-//! it and draws it. Neither side depends on the other's crate, which is what
-//! lets a project link the game-UI library and the renderer module keep
-//! drawing without linking it as well - on Windows a single link unit cannot
-//! hold two copies of the same third-party graph in different formats.
+//! producer (a project's egui pass) writes what it drew; the renderer takes
+//! the frame and draws it. Neither side depends on the other's crate, which
+//! lets a project link the game-UI library while the renderer module draws
+//! without linking it too. On Windows a single link unit cannot hold two
+//! copies of the same third-party graph in different formats.
 //!
-//! The slot lives beside the data it holds, so the engine core names no UI
-//! types: both sides already link this crate. Its [`Resource::shared_name`]
-//! is pinned: a project DLL and the host register the resource separately,
-//! and the name is what makes the host's slot and the project's writes the
-//! same resource.
+//! The slot lives beside the data it holds rather than in the engine core, so
+//! the core names no UI types. Both sides link this crate, so they share one
+//! slot type, and its [`Resource::shared_name`] is pinned. The resource id
+//! comes from that name rather than from a per-artifact type id, so the
+//! project's DLL and the renderer module reach one resource. A changed name
+//! would register a second one.
 
 // External crates
 use pill_engine_core::resource::Resource;
@@ -33,25 +36,20 @@ use crate::frame::UiFrame;
 // UiFrameSlot
 // =============================================================================
 
-/// The frame the last UI pass published, waiting for the renderer.
+/// Holds the frame the last UI pass published until the renderer takes it.
 #[derive(Debug, Default)]
 pub struct UiFrameSlot {
-    /// The frame a producer published; `None` until something drew.
+    /// The frame waiting for the renderer; `None` until the first publish.
     frame: Option<UiFrame>,
-    /// Bumped by a painter that starts with no textures of its own.
+    /// The generation of the newest resend request a painter made.
     ///
-    /// A renderer module is rebuilt and swapped like any other, and its new
-    /// image begins with an empty texture map while the producer - a shared
-    /// library that outlives it - has already carried every image once. The
-    /// request is the way back: the producer compares this number with the one
-    /// it last served and re-carries every texture it holds when it changed.
+    /// A rebuilt renderer module starts with an empty texture map. The
+    /// producer, a shared library that outlives it, already carried every
+    /// image once, so nothing new is waiting to be sent. A painter that starts
+    /// empty asks for everything again; the producer compares this number with
+    /// the one it last served and re-carries every texture it holds when the
+    /// two differ.
     texture_resend_generation: u64,
-}
-
-impl Resource for UiFrameSlot {
-    fn shared_name() -> Option<&'static str> {
-        Some("pill_ui_frame::UiFrameSlot")
-    }
 }
 
 impl UiFrameSlot {
@@ -67,9 +65,9 @@ impl UiFrameSlot {
 
     /// Hand `frame` to the renderer, replacing anything not yet drained.
     ///
-    /// The newest frame is the one worth drawing: a producer that ran twice
-    /// between two renderer passes leaves the second pass' work behind, not a
-    /// queue of stale frames.
+    /// The newest frame is the one worth drawing. When a producer runs twice
+    /// between two renderer passes, the second frame replaces the first, so a
+    /// renderer never works through a queue of older frames.
     pub fn publish(&mut self, frame: UiFrame) {
         self.frame = Some(frame);
     }
@@ -88,16 +86,16 @@ impl UiFrameSlot {
 
     /// Ask the producer to carry every texture again.
     ///
-    /// Called by a painter whose texture map starts empty - a renderer module
-    /// that was just rebuilt - because the producer's dirty set is empty by
-    /// then and a one-shot push has no other way to know the images were lost.
-    /// [`crate::texture`] states the whole rule, the dirty set and this request
-    /// together.
+    /// A painter calls this when its texture map starts empty, which happens
+    /// after a renderer module is rebuilt. The producer carries a texture only
+    /// when its revision changed, so without this request a rebuilt painter
+    /// would wait for each image to change again. The full rule, covering the
+    /// revision set and this request, is in [`crate::texture`].
     pub fn request_texture_resend(&mut self) {
         self.texture_resend_generation = self.texture_resend_generation.wrapping_add(1);
     }
 
-    /// The newest resend request the painter has made.
+    /// The generation of the newest resend request a painter made.
     ///
     /// A producer re-carries its textures when this differs from the value it
     /// last served.
@@ -105,6 +103,16 @@ impl UiFrameSlot {
         self.texture_resend_generation
     }
 }
+
+impl Resource for UiFrameSlot {
+    fn shared_name() -> Option<&'static str> {
+        Some("pill_ui_frame::UiFrameSlot")
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -163,8 +171,8 @@ mod tests {
         );
     }
 
-    /// A painter that starts empty asks for the textures again, and the ask is
-    /// visible to the producer as a number it can compare.
+    /// A painter that starts with no textures asks for them again, and the
+    /// producer can see the request as a number it compares.
     #[test]
     fn a_resend_request_bumps_the_generation_the_producer_watches() {
         let mut slot = UiFrameSlot::new();
@@ -181,10 +189,10 @@ mod tests {
         assert_eq!(slot.texture_resend_generation(), asked);
     }
 
-    /// A frame's textures wait for the renderer however few surfaces the frame
-    /// draws: they belong to the update, not to a surface. The renderer applies
-    /// them before it decides what to draw, so a frame that drew nothing still
-    /// carries them on the next update.
+    /// A frame's textures wait for the renderer even when the frame draws into
+    /// no surface: they belong to the update, not to a surface. The renderer
+    /// applies them before it decides what to draw, so a frame that drew
+    /// nothing still hands them over.
     #[test]
     fn a_frame_keeps_its_textures_until_a_renderer_takes_it() {
         let mut slot = UiFrameSlot::new();
@@ -200,7 +208,7 @@ mod tests {
         slot.publish(frame);
 
         // A frame with no draws is still not an empty slot while it carries
-        // textures: the renderer has something to apply.
+        // textures. The renderer has something to apply.
         assert!(!slot.is_empty());
         let taken = slot.take();
         assert_eq!(taken.textures.textures.len(), 1);

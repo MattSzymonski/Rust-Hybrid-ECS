@@ -9,12 +9,14 @@
 //!
 //! # Design
 //!
-//! Picking reads a GPU buffer back, and a readback never stalls a frame: a
-//! request made now is answered when the GPU has finished, a frame or more
-//! later. Each request carries an id so its answer can be matched however late
-//! it arrives. A gizmo handle drawn with [`pill_engine::DebugDraw::gizmo_line`]
-//! or [`pill_engine::DebugDraw::gizmo_triangle`] is drawn over the scene in the
-//! pick buffer too, so a handle in front of an entity is what a pick finds.
+//! A pick reads the pick buffer back from the GPU, and waiting for that answer
+//! never blocks a frame. A request made now is answered once the GPU has
+//! finished with it, a frame or more later. Each request carries an id, so its
+//! answer can be matched however late it arrives. The pick buffer also draws
+//! the gizmo handles over the scene, with the same lines and triangles that
+//! [`pill_engine::DebugDraw::gizmo_line`] and
+//! [`pill_engine::DebugDraw::gizmo_triangle`] draw, so a pick finds a handle
+//! that lies in front of an entity.
 
 // External crates
 use pill_engine::{Entity, Resource};
@@ -22,10 +24,23 @@ use pill_engine::{Entity, Resource};
 // Current crate
 use crate::SurfaceId;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// What one pixel of the pick buffer holds: `0` for nothing, `1 + index` for
+/// the instance at `index` of the frame's instance list, and a gizmo handle
+/// with the top bit set.
+pub const PICK_HANDLE_BIT: u32 = 0x8000_0000;
+
+// =============================================================================
+// SelectionOutlines
+// =============================================================================
+
 /// The entities a renderer outlines, in one colour.
 #[derive(Debug, Clone)]
 pub struct SelectionOutlines {
-    /// The entities outlined; an entity that draws nothing outlines nothing.
+    /// The entities to outline. An entity that draws nothing shows no outline.
     pub entities: Vec<Entity>,
     /// The outline colour, linear RGBA.
     pub color: [f32; 4],
@@ -46,6 +61,10 @@ impl Resource for SelectionOutlines {
     }
 }
 
+// =============================================================================
+// PickRequest
+// =============================================================================
+
 /// One request to find what is under a pixel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PickRequest {
@@ -59,16 +78,25 @@ pub struct PickRequest {
     pub y: u32,
 }
 
+// =============================================================================
+// PickHit
+// =============================================================================
+
 /// What a pick found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickHit {
-    /// Nothing is drawn there, or the pixel is outside the surface.
+    /// Nothing is drawn there, the pixel is outside the surface, or the
+    /// renderer could not read the pick buffer back.
     Nothing,
     /// The entity whose mesh is nearest at that pixel.
     Entity(Entity),
     /// The gizmo handle drawn there.
     Handle(u32),
 }
+
+// =============================================================================
+// PickResult
+// =============================================================================
 
 /// The answer to one [`PickRequest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,10 +107,15 @@ pub struct PickResult {
     pub hit: PickHit,
 }
 
+// =============================================================================
+// PickRequests
+// =============================================================================
+
 /// The picks asked for and not yet handed to a renderer.
 ///
-/// A world resource: a frontend or an editor tool pushes requests, the frame
-/// carries them to the renderer, and the answers arrive in [`PickResults`].
+/// It is a world resource. A frontend or an editor tool adds requests, the
+/// next frame carries them to the renderer, and the answers arrive in
+/// [`PickResults`].
 #[derive(Debug, Clone, Default)]
 pub struct PickRequests {
     /// Requests waiting for the next frame.
@@ -92,8 +125,8 @@ pub struct PickRequests {
 }
 
 impl PickRequests {
-    /// Ask what is under pixel (`x`, `y`) of `surface`; returns the id its
-    /// answer will carry.
+    /// Asks what is under pixel (`x`, `y`) of `surface`, and returns the id
+    /// the answer will carry.
     pub fn request(&mut self, surface: SurfaceId, x: u32, y: u32) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
@@ -108,15 +141,19 @@ impl Resource for PickRequests {
     }
 }
 
+// =============================================================================
+// PickResults
+// =============================================================================
+
 /// The answers renderers delivered and nobody took yet.
 #[derive(Debug, Clone, Default)]
 pub struct PickResults {
-    /// Answers, oldest first.
+    /// Answers in the order the renderers delivered them.
     pub results: Vec<PickResult>,
 }
 
 impl PickResults {
-    /// Take every answer delivered so far.
+    /// Takes every answer delivered so far.
     pub fn take(&mut self) -> Vec<PickResult> {
         std::mem::take(&mut self.results)
     }
@@ -128,12 +165,15 @@ impl Resource for PickResults {
     }
 }
 
-/// What the pick buffer holds at a pixel: `0` for nothing, `1 + index` for the
-/// frame's instance at `index`, and a gizmo handle with the top bit set.
-pub const PICK_HANDLE_BIT: u32 = 0x8000_0000;
+// =============================================================================
+// Free Functions
+// =============================================================================
 
-/// Decode one pick-buffer value against the instances' entities of the frame
-/// it was drawn from.
+/// Decodes one pick-buffer value against the instance entities of the frame
+/// that drew it.
+///
+/// `instance_entities[index]` is the entity of the instance the buffer numbers
+/// `index + 1`. A number past the end of the list answers [`PickHit::Nothing`].
 pub fn decode_pick_value(value: u32, instance_entities: &[Entity]) -> PickHit {
     if value == 0 {
         PickHit::Nothing
@@ -146,11 +186,15 @@ pub fn decode_pick_value(value: u32, instance_entities: &[Entity]) -> PickHit {
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Request ids count up, so answers can be matched.
+    /// Request ids count up, so an answer can be matched to its request.
     #[test]
     fn request_ids_are_unique() {
         let mut requests = PickRequests::default();
@@ -160,7 +204,8 @@ mod tests {
         assert_eq!(requests.pending.len(), 2);
     }
 
-    /// Zero is nothing, the top bit a handle, anything else an instance.
+    /// Zero is nothing, the top bit marks a handle, and any other value is an
+    /// instance position.
     #[test]
     fn pick_values_decode() {
         let mut world = pill_engine::World::new();

@@ -1,26 +1,29 @@
-//! Editor-owned state and commands over the engine.
+//! The editor's own view of the engine's state, and the commands that edit it.
 //!
-//! It depends on `pill_engine` directly; `pill_development_host` only hands the engine
-//! over through `RenderingHost::engine()/engine_mut()`.
+//! This module uses `pill_engine` directly. `pill_development_host` only hands
+//! the engine over, through `DevHost::engine()` and `DevHost::engine_mut()`.
 //!
 //! # Responsibilities
 //!
 //! - Own the tiered [`EditorSnapshot`] types rebuilt from a live `&Engine`.
-//! - Own the [`EditorCommand`] queue applied at the frame boundary.
+//! - Own the [`EditorCommand`] types and the applier that runs one batch.
+//! - Own the shared [`EditorSelection`] and the armed [`EntityPickRequest`],
+//!   the two world resources the editor reads and writes.
 //!
 //! # Design
 //!
 //! - **Reads** are tiered snapshots ([`EditorSnapshot`]) rebuilt from a live
-//!   `&Engine` at the frame boundary. Nothing is cached between refreshes
-//!   except `Entity` handles, so hot reload can never leave stale metadata
-//!   behind: components are addressed by name and re-resolved per capture.
-//! - **Mutations** are queued [`EditorCommand`]s flushed in one batch at the
-//!   frame boundary, before the frame runs. Engine state is transactional per
-//!   command - every engine call this dispatches is all-or-nothing - and
-//!   failures are returned as `(index, message)` pairs for the Console panel.
-//!   The asset-file commands are the exception, because a filesystem is not a
-//!   transaction: they copy, write and remove files, attempt a rollback when a
-//!   later step fails, and name every file the rollback could not take back.
+//!   `&Engine` at the frame boundary. A capture reads everything it shows from
+//!   the live engine instead of from a cache, so a hot reload cannot leave
+//!   stale rows behind. Components are addressed by name and looked up again
+//!   on every capture.
+//! - **Mutations** are queued [`EditorCommand`]s applied at the frame
+//!   boundary, before the frame runs. Each command's engine change is all or
+//!   nothing, and a failure comes back as an `(index, message)` pair for the
+//!   Console panel. The asset-file commands are the exception, because a
+//!   filesystem is not a transaction. They copy, write and remove files, try a
+//!   rollback when a later step fails, and name every file the rollback could
+//!   not take back.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -29,16 +32,41 @@ use std::path::{Path, PathBuf};
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{Engine, Entity, FieldValue, SystemOwner};
 
-mod apply;
-mod command;
-
+// Current crate
 use command::CommandOutcome;
 pub use command::{CommandFamily, EditorCommand, RecordedApply};
 
-/// One line of the Hierarchy list: cheap to build, rebuilt every refresh.
+mod apply;
+mod command;
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// How many selected entities the snapshot captures a detail for.
+///
+/// A larger selection still edits the primary entity and the entities it has
+/// details for. The cap keeps a Ctrl+A over a large scene from rebuilding
+/// hundreds of component views every frame.
+pub const SELECTED_DETAILS_MAX: usize = 64;
+
+/// The Assets panel's second root: the folder that holds every extension's
+/// read-only resources. It sits beside the project's own tree, not inside it.
+pub const EXTENSIONS_ROOT: &str = "extensions";
+
+/// The listing label a folder row carries. Every other label is a file's type.
+pub const FOLDER_KIND: &str = "folder";
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/// One line of the Hierarchy list. It is cheap to build and is rebuilt on
+/// every refresh.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntityListEntry {
-    /// The generation-tagged handle; also the selection identity.
+    /// The generation-tagged handle, which is also how the selection names an
+    /// entity.
     pub entity: Entity,
     /// `"{id}v{generation}"` display label.
     pub display: String,
@@ -61,10 +89,10 @@ impl EntityListEntry {
 /// One field of a component's layout, as the editor's own snapshot keeps it.
 ///
 /// The registry's [`ComponentFieldDescriptor`] borrows its name and its
-/// decorators from the artifact that declared them, and that artifact can be
-/// unloaded between two captures - a project module a reload replaced. This
-/// type owns both, so nothing reachable from [`EditorSnapshot`] extends a
-/// module image's lifetime.
+/// decorators from the artifact that declared them. That artifact can be
+/// unloaded between two captures, for example a project module replaced by a
+/// reload. This type owns both, so nothing reachable from [`EditorSnapshot`]
+/// keeps a module image alive.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComponentFieldView {
     /// The field's registered name.
@@ -74,9 +102,11 @@ pub struct ComponentFieldView {
 }
 
 impl ComponentFieldView {
-    /// The editor's own copy of one registry descriptor: the two things the
-    /// editor reads from it, owned rather than borrowed.
-    fn of(descriptor: &ComponentFieldDescriptor) -> Self {
+    /// Builds the editor's own copy of one registry descriptor.
+    ///
+    /// It copies the two things the editor reads from the descriptor, so the
+    /// snapshot does not borrow from the registry.
+    fn from_descriptor(descriptor: &ComponentFieldDescriptor) -> Self {
         Self {
             name: descriptor.name.to_string(),
             decorators: descriptor.decorators.to_vec(),
@@ -93,38 +123,62 @@ pub struct ComponentView {
     pub persistable: bool,
     /// Whether the component has a non-empty field layout and is editable.
     pub editable: bool,
-    /// The field layout, owned: the declaring image may unload before the next
-    /// capture.
+    /// The field layout, owned by this view. The image that declared it may
+    /// be unloaded before the next capture.
     pub fields: Vec<ComponentFieldView>,
     /// One current value per field, parallel to `fields`.
     pub values: Vec<FieldValue>,
-    /// What each asset reference field names, parallel to `values`: `None`
-    /// for a field that is not an asset reference. Resolved when
-    /// the view is captured, since the shell sees no asset store.
+    /// What each asset reference field names, parallel to `values`.
+    ///
+    /// It holds `None` for a field that is not an asset reference. The labels
+    /// are resolved when the view is captured, because the shell cannot read
+    /// the asset store.
     pub asset_labels: Vec<Option<AssetReferenceLabel>>,
-    /// What each entity reference field names, parallel to `values`: `None`
-    /// for a field that is not an entity reference. Resolved
-    /// when the view is captured, for the same reason.
+    /// What each entity reference field names, parallel to `values`.
+    ///
+    /// It holds `None` for a field that is not an entity reference. The labels
+    /// are resolved when the view is captured, for the same reason.
     pub entity_labels: Vec<Option<EntityReferenceLabel>>,
+}
+
+/// One component to place on a newly created entity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComponentSeed {
+    /// Registered component type name.
+    pub type_name: String,
+    /// Field values to write over the zero-initialised image. Fields left out
+    /// stay zero.
+    pub fields: Vec<(String, FieldValue)>,
+}
+
+/// One entry of the Inspector's "add component" picker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegisteredComponent {
+    /// Registered type name (the stable cross-reload key).
+    pub type_name: String,
+    /// True when some generation of this type has a non-empty field layout,
+    /// so the editor can zero-initialise an image of it.
+    pub addable: bool,
 }
 
 /// What an asset reference field currently names, as the Inspector shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AssetReferenceLabel {
-    /// The field is cleared: it holds the invalid handle.
+    /// The field is cleared and holds the invalid handle.
     Unset,
     /// The field addresses a live asset, named by its path (or the name its
     /// creator gave it).
     Named(String),
     /// The field addresses a live asset that has no name.
     Unnamed,
-    /// The field addresses nothing live: the asset was removed or the handle
-    /// is stale.
+    /// The field addresses nothing live, because the asset was removed or the
+    /// handle is stale.
     Missing,
 }
 
 impl AssetReferenceLabel {
-    /// The label of an asset value, read through the world's import registry.
+    /// Returns the label of an asset value, read through the world's import
+    /// registry.
     pub fn of(world: &pill_engine::World, value: &FieldValue) -> Option<Self> {
         let FieldValue::Asset {
             asset_type,
@@ -151,7 +205,7 @@ impl AssetReferenceLabel {
         })
     }
 
-    /// The text the Inspector draws for this label.
+    /// Returns the text the Inspector draws for this asset label.
     pub fn text(&self) -> &str {
         match self {
             Self::Unset => "None",
@@ -165,17 +219,17 @@ impl AssetReferenceLabel {
 /// What an entity reference field currently names, as the Inspector shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntityReferenceLabel {
-    /// The field is cleared: it holds the null handle.
+    /// The field is cleared and holds the null handle.
     Unset,
     /// The field addresses a live entity, shown by its Hierarchy label.
     Live(String),
-    /// The field addresses nothing live: the entity was destroyed, or the
+    /// The field addresses nothing live. The entity was destroyed, or the
     /// handle names a slot whose occupant has since been replaced.
     Missing,
 }
 
 impl EntityReferenceLabel {
-    /// The label of an entity value, checked against the world.
+    /// Returns the label of an entity value, checked against the world.
     pub fn of(world: &pill_engine::World, value: &FieldValue) -> Option<Self> {
         let FieldValue::Entity { id, generation } = value else {
             return None;
@@ -201,8 +255,8 @@ impl EntityReferenceLabel {
     }
 }
 
-/// What an entity reference row is waiting for: the field a scene click should
-/// name, and which entity it belongs to.
+/// The field an armed entity reference row waits for a scene click to name,
+/// together with the entity it belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntityPickTarget {
     /// The entity the field belongs to.
@@ -213,12 +267,12 @@ pub struct EntityPickTarget {
     pub field: String,
 }
 
-/// The world resource carrying an armed entity pick.
+/// The world resource that carries an armed entity pick.
 ///
-/// The Inspector row arms it through [`EditorCommand::ArmEntityPick`] and the
-/// executable that answers scene picks reads it: the shell draws rows and has
-/// no world, and the picking code lives in the executable, so a world resource
-/// is the one place both can reach.
+/// The Inspector row arms it through [`EditorCommand::ArmEntityPick`], and the
+/// executable that answers scene picks reads it. The shell draws the rows and
+/// has no world, while the picking code lives in the executable, so a world
+/// resource is the one place both can reach.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EntityPickRequest {
     /// The field the next scene click should name, if a row is waiting.
@@ -226,8 +280,9 @@ pub struct EntityPickRequest {
 }
 
 impl EntityPickRequest {
-    /// Take the armed target, leaving the request clear: the one caller that
-    /// consumes it is the click that answers it.
+    /// Takes the armed target and leaves the request clear.
+    ///
+    /// The click that answers the request is the only caller that consumes it.
     pub fn take(&mut self) -> Option<EntityPickTarget> {
         self.target.take()
     }
@@ -235,7 +290,7 @@ impl EntityPickRequest {
 
 impl pill_engine::Resource for EntityPickRequest {}
 
-/// The expensive tier of the snapshot: only built for the selection.
+/// The expensive tier of the snapshot, built only for the selected entities.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntityDetail {
     /// The entity this detail describes.
@@ -244,21 +299,16 @@ pub struct EntityDetail {
     pub components: Vec<ComponentView>,
 }
 
-/// How many selected entities the snapshot captures a detail for. A
-/// selection past this size still edits the primary and the entities it has
-/// details for; the cap keeps a Ctrl+A over a large scene from rebuilding
-/// hundreds of component views every frame.
-pub const SELECTED_DETAILS_MAX: usize = 64;
-
 /// One row of the Systems tab.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SystemSummary {
-    /// Registration index; the unambiguous toggle key.
+    /// Registration index, which is the unambiguous key for a toggle.
     pub index: usize,
     /// Registration name.
     pub name: String,
-    /// Human label of the owning module ("project", a module name, or
-    /// "unknown").
+    /// Human label of the owning module: `"project"`, `"engine"`,
+    /// `"renderer"`, a module's name, or `"extension <n>"` when the host does
+    /// not name it.
     pub owner_label: String,
     /// Whether the system participates in frame execution.
     pub enabled: bool,
@@ -268,47 +318,40 @@ pub struct SystemSummary {
     pub name_is_ambiguous: bool,
 }
 
-/// The Assets panel's second root: the folder every extension's read-only
-/// resources hang under, beside the project's own tree rather than inside it.
-pub const EXTENSIONS_ROOT: &str = "extensions";
-
-/// The listing label a folder row carries; every other label is a file's type.
-pub const FOLDER_KIND: &str = "folder";
-
-/// What a listing row is: the one kind the browser treats differently, or the
-/// type the host's listing reported for the file.
+/// What a listing row is: a folder, or the type the host's listing reported
+/// for the file.
 ///
-/// The kind is an enum parsed once, where the snapshot is built, and every
-/// branch that cares asks the type: a misspelt label cannot silently
-/// reclassify a row, which would let Rename and Delete queue a move against a
-/// directory.
+/// The kind is parsed once, where the snapshot is built, and every branch that
+/// cares asks this type. A misspelt label therefore cannot quietly reclassify
+/// a row, which would let Rename and Delete queue a move against a directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AssetKind {
     /// A directory: the tree expands it, the grid opens it, and no toolbar
     /// action writes to it.
     Folder,
     /// A file's type, as the host reported it: `Texture`, `file`, or a
-    /// registered path like `pill_master_renderer::Material`.
+    /// registered path like `pill_master_renderer::assets::Material`.
     Type(String),
 }
 
 impl AssetKind {
-    /// The kind a listing label names: [`FOLDER_KIND`] is the folder, anything
-    /// else the type path it spells.
-    pub fn parse(text: &str) -> Self {
-        if text == FOLDER_KIND {
+    /// Parses a listing label into the kind it names.
+    ///
+    /// [`FOLDER_KIND`] is the folder; any other label spells a type path.
+    pub fn parse(label: &str) -> Self {
+        if label == FOLDER_KIND {
             Self::Folder
         } else {
-            Self::Type(text.to_string())
+            Self::Type(label.to_string())
         }
     }
 
-    /// Whether the row is a directory.
+    /// Returns whether the row is a directory.
     pub fn is_folder(&self) -> bool {
         matches!(self, Self::Folder)
     }
 
-    /// The label a dump, a scripted channel or a settings document prints:
+    /// Returns the label a dump, a scripted channel or a panel row prints:
     /// [`FOLDER_KIND`] or the type path.
     pub fn text(&self) -> &str {
         match self {
@@ -317,8 +360,8 @@ impl AssetKind {
         }
     }
 
-    /// The type name's last `::` segment, which is what a preview and a picker
-    /// compare; `None` for a folder, which has no type.
+    /// Returns the type name's last `::` segment, which is what a preview and
+    /// a picker compare. It is `None` for a folder, which has no type.
     pub fn type_leaf(&self) -> Option<&str> {
         match self {
             Self::Folder => None,
@@ -330,9 +373,9 @@ impl AssetKind {
 /// One row of the Assets panel: a file or folder the browser knows about.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssetListing {
-    /// The root the row came from: empty for the project's own `res`, else the
-    /// name of the module whose read-only resources it is. A root's
-    /// own row has an empty [`Self::path`].
+    /// The root the row came from. It is empty for the project's own `res`,
+    /// and otherwise the name of the module whose read-only resources the row
+    /// belongs to. A root's own row has an empty [`Self::path`].
     pub root: String,
     /// The path within its root, forward slashes.
     pub path: String,
@@ -343,24 +386,26 @@ pub struct AssetListing {
     pub kind: AssetKind,
     /// Whether the entry is a standalone asset (it holds its own header).
     pub standalone: bool,
-    /// Whether a `.meta` sidecar - or a standalone header - carries a guid;
-    /// a sourced file without one can get a written sidecar.
+    /// Whether a `.meta` sidecar, or a standalone header, carries a guid.
+    /// A sourced file without one can get a written sidecar.
     pub has_meta: bool,
     /// The asset's guid when the file names one, in its sidecar or its own
-    /// header: what a settings document's reference writes, and the key that
-    /// names the asset behind such a reference.
+    /// header. A settings document's reference writes this value, and it is
+    /// the key that names the asset behind such a reference.
     pub guid: Option<String>,
 }
 
 impl AssetListing {
-    /// The row as the tree and the grid name it: [`Self::path`] inside the
-    /// project, `extensions/root/path` inside an extension's resources (the
-    /// root alone for the root's own row).
+    /// Returns the row as the tree and the grid name it.
+    ///
+    /// A project row is its [`Self::path`]. An extension's row is
+    /// `extensions/<root>/<path>`, or just `extensions/<root>` for the root's
+    /// own row.
     ///
     /// Project rows keep their plain path, so a selection, a command and a
-    /// scripted verb name a project asset by the path it carries. The
-    /// extension rows hang under [`EXTENSIONS_ROOT`], which is a root of the
-    /// panel in its own right, never a folder inside the project's tree.
+    /// scripted verb name a project asset by the path it carries. Extension
+    /// rows sit under [`EXTENSIONS_ROOT`], which is a root of the panel in its
+    /// own right and never a folder inside the project's tree.
     pub fn key(&self) -> String {
         if self.root.is_empty() {
             self.path.clone()
@@ -372,13 +417,13 @@ impl AssetListing {
     }
 }
 
-/// An asset the store holds with no file of the project's behind it: a chain's
-/// built-in passes, the renderer's default material, a pass a module builds in
-/// code.
+/// An asset the store holds that has no file of the project's behind it.
+/// Examples are a chain's built-in passes, the renderer's default material, and
+/// a pass a module builds in code.
 ///
-/// A picker offers these beside the listing's rows, badged as the engine's: no
-/// directory walk can find them, and a document that references one names its
-/// guid.
+/// A picker offers these beside the listing's rows and badges them as the
+/// engine's. No directory walk can find them, and a document that references
+/// one names its guid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineAsset {
     /// The registered type name a picker matches on, as a listing row's
@@ -390,8 +435,9 @@ pub struct EngineAsset {
     pub guid: Option<String>,
 }
 
-/// One standalone asset type a new file can be created for: a row of the
-/// create dialog, straight from the loaded modules' registrations.
+/// One standalone asset type that a new file can be created for. It is a row
+/// of the create dialog, built straight from the loaded modules'
+/// registrations.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StandaloneTypeInfo {
     /// The registered type name, written to the file's `asset_type`.
@@ -408,11 +454,11 @@ pub struct StandaloneTypeInfo {
 pub struct AssetDetail {
     /// The listing row the detail was captured from. Its
     /// [`AssetListing::key`] is the selection identity the Inspector matches
-    /// on, so the row - not a copy of five of its fields - is what the detail
-    /// carries.
+    /// on, so the detail carries the row itself rather than copies of its
+    /// fields.
     pub row: AssetListing,
-    /// The import settings document (a standalone asset's body, or the
-    /// sidecar's `settings`); `None` for folders and unknown extensions.
+    /// The import settings document: a standalone asset's body, or the
+    /// sidecar's `settings`. It is `None` for folders and unknown extensions.
     pub settings: Option<serde_json::Value>,
     /// The reference fields the asset's type declares, expanded: one entry per
     /// picker the Inspector draws, whether or not the document binds it yet.
@@ -422,7 +468,8 @@ pub struct AssetDetail {
 /// One reference field of an asset's settings, as the Inspector draws it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssetReferenceField {
-    /// The settings key the edit writes: `shader`, or `textures.<slot>`.
+    /// The settings key the edit writes: a field name such as `shader`,
+    /// `textures.<slot>`, or `passes[<index>]`.
     pub key: String,
     /// The registered type name its picker offers, as a listing row's kind.
     pub target: String,
@@ -432,15 +479,15 @@ pub struct AssetReferenceField {
     /// than a bare guid string (a texture slot).
     pub nested: bool,
     /// What the row reads for the asset the guid names: its path when the
-    /// listing holds it, otherwise the name the store loaded it under - a
-    /// chain's built-in passes have no file of their own - and `None` when
-    /// neither knows the guid.
+    /// listing holds it. Otherwise it is the name the store loaded the asset
+    /// under, because a chain's built-in passes have no file of their own. It
+    /// is `None` when neither knows the guid.
     pub label: Option<String>,
 }
 
 impl AssetDetail {
-    /// The asset as the tree, the grid and the selection name it: the row's
-    /// own key, so a detail and the row it came from cannot disagree.
+    /// Returns the asset as the tree, the grid and the selection name it: the
+    /// row's own key, so a detail and the row it came from cannot disagree.
     pub fn key(&self) -> String {
         self.row.key()
     }
@@ -457,37 +504,38 @@ pub enum SelectionClick {
     Range,
 }
 
-/// The editor's shared selection, read by every data panel and the scene.
+/// The editor's shared selection, read by every data panel and by the scene.
 ///
-/// One entity set, one asset slot and one resource slot: the Hierarchy and the
-/// viewports select entities, the Assets panel selects files, and the
-/// Inspector follows whichever slot holds - a resource selection is exclusive
-/// with the other two.
+/// It holds one entity set, one asset slot and one resource slot. The
+/// Hierarchy and the viewports select entities, the Assets panel selects
+/// files, and the Inspector follows whichever slot holds a selection. A
+/// resource selection excludes the other two.
 ///
-/// The entity slot is a **set**: the last entity in it is the
-/// primary, which is what the gizmo acts on, what the scene outlines most
-/// brightly and what the Inspector edits first. Ctrl extends the set, Shift
-/// extends it over the Entities list's range, and a plain click replaces it.
+/// The entity slot is a **set**. The last entity in it is the primary: the
+/// one the gizmo acts on, the one the scene outlines most brightly and the one
+/// the Inspector edits first. Ctrl extends the set, Shift extends it over the
+/// Entities list's range, and a plain click replaces it.
 #[derive(Clone, Default)]
 pub struct EditorSelection {
-    /// The selected entities, in the order they were selected; the last is
+    /// The selected entities, in the order they were selected. The last one is
     /// the primary.
     entities: Vec<Entity>,
-    /// The selected asset's project-relative path, when one is.
+    /// The selected asset's project-relative path, when one is selected.
     pub asset: Option<String>,
-    /// The selected world resource's stable name, when one is. A resource
-    /// selection is exclusive with the other two: the Inspector shows one
-    /// thing at a time.
+    /// The selected world resource's stable name, when one is selected. A
+    /// resource selection excludes the other two, because the Inspector shows
+    /// one thing at a time.
     pub resource: Option<String>,
 }
 
 impl EditorSelection {
-    /// The set a click produces, given the list's own row order.
+    /// Returns the entity set a click produces, given the list's own row
+    /// order.
     ///
-    /// Pure so the shell (which reads the modifiers) and the scripted channel
-    /// (which names the mode) share one rule for what a click means. A range
-    /// click needs the primary as its anchor and both rows present in `rows`;
-    /// without them it behaves like a plain click.
+    /// The function is pure, so the shell (which reads the modifiers) and the
+    /// scripted channel (which names the mode) share one rule for what a click
+    /// means. A range click needs the primary as its anchor and both rows
+    /// present in `rows`. Without them it behaves like a plain click.
     pub fn clicked(&self, click: SelectionClick, entity: Entity, rows: &[Entity]) -> Vec<Entity> {
         match click {
             SelectionClick::Reset => vec![entity],
@@ -515,42 +563,42 @@ impl EditorSelection {
                         };
                         rows[first..=last].to_vec()
                     }
-                    // A range needs an anchor the list shows; without one the
-                    // click is a plain one.
+                    // A range needs an anchor that the list shows. Without one
+                    // the click is a plain one.
                     None => vec![entity],
                 }
             }
         }
     }
 
-    /// The entity the gizmo acts on and the Inspector edits first: the one
-    /// selected last.
+    /// Returns the entity the gizmo acts on and the Inspector edits first,
+    /// which is the one selected last.
     pub fn primary(&self) -> Option<Entity> {
         self.entities.last().copied()
     }
 
-    /// Every selected entity, in selection order.
+    /// Returns every selected entity, in selection order.
     pub fn entities(&self) -> &[Entity] {
         &self.entities
     }
 
-    /// Whether `entity` is selected.
+    /// Returns whether `entity` is selected.
     pub fn contains(&self, entity: Entity) -> bool {
         self.entities.contains(&entity)
     }
 
-    /// Replace the whole entity selection.
+    /// Replaces the whole entity selection.
     pub fn set_entities(&mut self, entities: Vec<Entity>) {
         self.entities = entities;
     }
 
-    /// Select exactly one entity.
+    /// Selects exactly one entity.
     pub fn select_only(&mut self, entity: Entity) {
         self.entities.clear();
         self.entities.push(entity);
     }
 
-    /// Add one entity to the selection, making it the primary.
+    /// Adds one entity to the selection and makes it the primary.
     ///
     /// Adding an entity that is already selected only makes it primary, so a
     /// Ctrl-click on a selected row does not lose the rest of the set.
@@ -559,12 +607,12 @@ impl EditorSelection {
         self.entities.push(entity);
     }
 
-    /// Deselect one entity without disturbing the others.
+    /// Deselects one entity without disturbing the others.
     pub fn remove_entity(&mut self, entity: Entity) {
         self.entities.retain(|selected| *selected != entity);
     }
 
-    /// Drop the entity selection.
+    /// Drops the entity selection.
     pub fn clear_entities(&mut self) {
         self.entities.clear();
     }
@@ -574,13 +622,14 @@ impl pill_engine::Resource for EditorSelection {}
 
 /// The complete per-refresh view the editor renders.
 ///
-/// Captured from a live engine each frame and published as a world resource;
-/// the shell and the executable's dumps read the captured copy.
+/// It is captured from a live engine on every frame and published as a world
+/// resource. The shell and the executable's dumps read the captured copy.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EditorSnapshot {
-    /// Host reload/rollback/patch counter at capture time.
+    /// The editor's frame index at capture time.
     pub revision: u64,
-    /// Live entities, cheapest tier.
+    /// One row per live entity. This is the tier whose cost grows with the
+    /// world.
     pub entities: Vec<EntityListEntry>,
     /// Detail of the selected entity, if the selection is still alive.
     pub detail: Option<EntityDetail>,
@@ -591,12 +640,12 @@ pub struct EditorSnapshot {
     pub selected_details: Vec<EntityDetail>,
     /// Registered systems with owner labels.
     pub systems: Vec<SystemSummary>,
-    /// Registered components with a usable field layout (the Inspector's
-    /// add picker).
+    /// Every registered component type, and whether the add picker can offer
+    /// it.
     pub components: Vec<RegisteredComponent>,
     /// The asset browser's rows (the Assets panel).
     pub assets: Vec<AssetListing>,
-    /// The store's own assets that no file backs: what a picker offers beside
+    /// The store's own assets that no file backs. A picker offers them beside
     /// [`Self::assets`], badged as the engine's.
     pub engine_assets: Vec<EngineAsset>,
     /// The live standalone asset types: what a create dialog may
@@ -607,28 +656,29 @@ pub struct EditorSnapshot {
     pub asset_detail: Option<AssetDetail>,
     /// Whether the engine's system phase is paused.
     pub paused: bool,
-    /// The gizmo tool's settings (mode, space, snapping); the Scene tab's
+    /// The gizmo tool's settings: mode, space and snapping. The Scene tab's
     /// context menu checks its items against them.
     pub gizmo: crate::gizmo::GizmoSettings,
-    /// Whether the scene grid is on; the toolbox's grid row and
-    /// the Scene tab's menu check it against the renderer's switch.
+    /// Whether the scene grid is on. The toolbox's grid row and the Scene tab's
+    /// menu check it against the renderer's switch.
     pub grid_enabled: bool,
     /// The preferences file's values and the current project's remembered
-    /// entry; the Preferences tab's rows read them.
+    /// entry. The Preferences tab's rows read them.
     pub preferences: crate::preferences::PreferencesView,
     /// The theme the editor's UI paints with: the code
     /// default merged with the user's and the project's layers.
     pub theme: pill_ui_theme::Theme,
-    /// How many themes the executable has resolved. The shell installs
+    /// The generation the executable last resolved the theme at. It moves
+    /// whenever a layer, an override or a font changes. The shell installs
     /// [`Self::theme`] when this differs from the generation it applied.
     pub theme_generation: u64,
-    /// The layers [`Self::theme`] was merged from, in apply order; the code
+    /// The layers [`Self::theme`] was merged from, in apply order. The code
     /// default is always first.
     pub theme_layers: Vec<crate::style::ThemeLayerInfo>,
     /// The font bytes the theme's layers resolved, installed
     /// with the theme.
     pub theme_fonts: crate::kit::style::ThemeFonts,
-    /// How many steps the undo history holds; the menu bar's Undo row greys
+    /// How many steps the undo history holds. The menu bar's Undo row greys
     /// out at zero.
     pub undo_depth: usize,
     /// How many steps the redo history holds.
@@ -636,20 +686,22 @@ pub struct EditorSnapshot {
     /// What the title bar shows for the open scene: the file name, or
     /// `untitled`, with a trailing `*` while it has unsaved edits.
     pub scene_title: String,
-    /// Whether a scene file is open; Save greys out when nothing is.
+    /// Whether a scene file is open. Save greys out when nothing is.
     pub scene_open: bool,
     /// Where Save As writes by default: the open scene's path, or
-    /// `scenes/untitled.scene` for a world that was never saved.
+    /// `scenes/untitled.scene` when no scene file is open.
     pub scene_save_path: String,
-    /// Every registered command in registration order: the
-    /// menu bar draws a row per command whose menu path names the menu, and
-    /// a spec that is not here has no row.
+    /// Every registered command in registration order. The menu bar draws a
+    /// row per command whose menu path names the menu, and a spec that is not
+    /// here has no row.
     pub commands: Vec<crate::commands::CommandView>,
     /// The Console tab's filters and newest rows.
     pub console: crate::console::ConsoleView,
-    /// Build errors and warnings, grouped by the module that reported them.
+    /// Build errors and warnings, one row per diagnostic with the module that
+    /// reported it.
     pub problems: Vec<crate::notices::ProblemRow>,
-    /// Command failures from the last apply batch, newest first.
+    /// Command failures handed to the capture. Both executables pass an empty
+    /// list and report failures in the Console instead.
     pub errors: Vec<String>,
     /// The editable world resources and their field values.
     pub resources: Vec<ResourceView>,
@@ -680,14 +732,14 @@ pub struct ResourceFieldView {
 impl pill_engine::Resource for EditorSnapshot {}
 
 impl EditorSnapshot {
-    /// The engine-owned tiers, rebuilt from a live engine. Never mutates the
-    /// world.
+    /// Builds the tiers this crate can read from a live engine. It never
+    /// mutates the world.
     ///
-    /// This is a partial build, and the name says so. It fills what the model
-    /// crate can read for itself - `entities`, `systems`, `components`, the
-    /// command registry, the console, the problems, the resources, the scene's
-    /// document state and the paused, gizmo and grid settings - and leaves the
-    /// rest for the frame's caller to supply before publishing:
+    /// This is a partial build, and the name says so. It fills the tiers the
+    /// model crate can read for itself: `entities`, `systems`, `components`,
+    /// the command registry, the console, the problems, the resources, the
+    /// scene's document state, and the paused, gizmo and grid settings. It
+    /// leaves the rest for the frame's caller to supply before publishing:
     ///
     /// - `assets`, `engine_assets`, `standalone_types` and `asset_detail` (the
     ///   listing the executable walks),
@@ -697,7 +749,7 @@ impl EditorSnapshot {
     /// - `undo_depth` and `redo_depth` (the executable owns the history).
     ///
     /// The shell only ever reads the published value, so a tier added here
-    /// still has to be filled - or published - by the executable.
+    /// still has to be filled, or published, by the executable.
     pub fn capture_engine_tiers(
         engine: &Engine,
         revision: u64,
@@ -727,8 +779,8 @@ impl EditorSnapshot {
                 .map(|cameras| cameras.grid.enabled)
                 .unwrap_or(false),
             preferences: crate::preferences::PreferencesView::default(),
-            // The code default until the executable resolves its layers,
-            // so that every posture's first frame paints the editor's look
+            // The code default, until the executable resolves its layers. This
+            // way every posture's first frame paints the editor's own look
             // rather than the crate's neutral fallback.
             theme: crate::style::default_theme(),
             theme_generation: 1,
@@ -770,20 +822,22 @@ impl EditorSnapshot {
         }
     }
 
-    /// The snapshot fields that differ from `previous`, comma-joined.
+    /// Returns the snapshot fields that differ from `previous`, comma-joined.
     ///
     /// The redraw cadence treats any change as a reason to draw, so this
     /// answers the question that follows: which fields moved. A field that
-    /// changes on its own - a timer, a counter, an unordered collection -
-    /// would keep the editor drawing forever, and naming it in the log is how
-    /// that is caught rather than suspected.
+    /// changes on its own, such as a timer, a counter or an unordered
+    /// collection, would keep the editor drawing forever. Naming it in the log
+    /// is how that is caught rather than suspected.
     ///
-    /// This is also the change test itself: an empty answer means the two
-    /// captures draw the same data. The frame index and the two tiers a frame
-    /// feeds itself - the console and the problems - are deliberately not
-    /// compared, so a capture that only added log lines is not a reason to
-    /// draw. The test lives here, beside the fields it walks, so a new field
-    /// is one line away from the decision that has to include it.
+    /// This is also the change test itself, so an empty answer means the two
+    /// captures draw the same data. Four fields are deliberately not compared,
+    /// so a capture that only added log lines is not a reason to draw: the
+    /// frame index, `theme_fonts` (a font change always moves the theme
+    /// generation, which is compared) and the two tiers a frame feeds itself,
+    /// the console and the problems. The test lives here, beside the fields it
+    /// walks, so a new field is one line away from the decision that has to
+    /// include it.
     #[must_use]
     pub fn changed_fields(&self, current: &Self) -> String {
         let previous = self;
@@ -853,15 +907,15 @@ impl EditorSnapshot {
         changed.join(",")
     }
 
-    /// The editable resources' values, read through their curated tables.
+    /// Reads the editable resources' values through their curated tables.
     ///
     /// The engine keeps no resource reflection, so a resource that is not in
-    /// [`crate::resources::EDITABLE_RESOURCES`] is not captured at all - there
-    /// is nothing to read it through. Every row of a table reads, because the
-    /// table is the same one the write path goes through.
+    /// [`crate::resources::EDITABLE_RESOURCES`] is not captured at all, because
+    /// there is nothing to read it through. Every row of a table reads, because
+    /// the table is the same one the write path goes through.
     fn capture_resources(engine: &Engine) -> Vec<ResourceView> {
         let world = engine.world();
-        let Some(settings) = world
+        let Some(gizmo_settings) = world
             .get_resource::<crate::gizmo::GizmoState>()
             .map(|state| state.settings)
         else {
@@ -878,31 +932,33 @@ impl EditorSnapshot {
                     .map(|field| ResourceFieldView {
                         field: field.name.to_string(),
                         label: field.label.to_string(),
-                        value: (field.read)(&settings),
+                        value: (field.read)(&gizmo_settings),
                     })
                     .collect(),
             })
             .collect()
     }
 
-    /// The entity tier - the only expensive one: one row per live entity,
-    /// each with owned label strings. A 200k-entity world spends real time
-    /// here in debug builds. The editor captures it every frame, because the
-    /// rows must follow a system that spawns, despawns or re-composes an
-    /// entity; caching it needs a change signal the world does not expose:
-    /// `entity_count` alone misses a spawn and a despawn in the same frame.
+    /// Builds the entity tier: one row per live entity, each with owned label
+    /// strings. This is the tier whose cost grows with the world, and a
+    /// 200k-entity world spends real time here in debug builds.
+    ///
+    /// The editor captures it every frame because the rows must follow a
+    /// system that spawns, despawns or recomposes an entity. Caching would need
+    /// a change signal the world does not expose: `entity_count` alone misses
+    /// a spawn and a despawn in the same frame.
     pub fn capture_entities(engine: &Engine) -> Vec<EntityListEntry> {
         engine
             .world()
             .entity_rows()
             .into_iter()
             .map(|row| {
-                let display = EntityListEntry::display_of(row.entity);
+                let display_label = EntityListEntry::display_of(row.entity);
                 let archetype_label = row.components.join(", ");
                 let component_count = row.components.len();
                 EntityListEntry {
                     entity: row.entity,
-                    display,
+                    display: display_label,
                     component_count,
                     archetype_label,
                 }
@@ -910,14 +966,14 @@ impl EditorSnapshot {
             .collect()
     }
 
-    /// The system tier: one summary per registered system; cheap.
+    /// Builds the system tier: one summary per registered system. It is cheap.
     pub fn capture_systems(engine: &Engine, extension_names: &[String]) -> Vec<SystemSummary> {
         engine
             .system_snapshots()
             .into_iter()
             .map(|system| SystemSummary {
                 index: system.index,
-                owner_label: owner_label(system.owner, extension_names),
+                owner_label: system_owner_label(system.owner, extension_names),
                 name: system.name,
                 enabled: system.enabled,
                 hot_patchable: system.hot_patchable,
@@ -926,12 +982,13 @@ impl EditorSnapshot {
             .collect()
     }
 
-    /// The component tier: the registry's usable field layouts; cheap.
+    /// Builds the component tier: every registered component type and whether
+    /// it can be added. It is cheap.
     pub fn capture_components(engine: &Engine) -> Vec<RegisteredComponent> {
         registered_components(engine.world())
     }
 
-    /// Rebuild the expensive detail tier for one selected entity.
+    /// Rebuilds the expensive detail tier for one selected entity.
     pub fn capture_detail(engine: &Engine, entity: Entity) -> Option<EntityDetail> {
         let world = engine.world();
         if !world.is_entity_valid(entity) {
@@ -944,29 +1001,33 @@ impl EditorSnapshot {
                 let component_id = world.resolve_entity_component_id(entity, &type_name)?;
                 let persistable = world.component_is_persistable(component_id);
                 let (fields, editable) = match world.component_field_layout(component_id) {
-                    // The registry's descriptors borrow from the declaring
-                    // artifact; the snapshot keeps its own copy, so a module
-                    // reloaded between two captures cannot dangle under the
-                    // shell.
-                    Some(layout) if !layout.is_empty() => {
-                        (layout.iter().map(ComponentFieldView::of).collect(), true)
-                    }
+                    // The registry's descriptors borrow from the artifact that
+                    // declared them. The snapshot keeps its own copy, so a
+                    // module reloaded between two captures cannot dangle under
+                    // the shell.
+                    Some(layout) if !layout.is_empty() => (
+                        layout
+                            .iter()
+                            .map(ComponentFieldView::from_descriptor)
+                            .collect(),
+                        true,
+                    ),
                     _ => (Vec::new(), false),
                 };
-                // Values are only decodable when a layout exists; a component
+                // Values can only be decoded when a layout exists. A component
                 // with no layout still appears, read-only.
-                let values = if editable {
+                let field_values = if editable {
                     world
                         .read_component_fields(entity, &type_name)
                         .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
-                let asset_labels = values
+                let asset_labels = field_values
                     .iter()
                     .map(|value| AssetReferenceLabel::of(world, value))
                     .collect();
-                let entity_labels = values
+                let entity_labels = field_values
                     .iter()
                     .map(|value| EntityReferenceLabel::of(world, value))
                     .collect();
@@ -975,7 +1036,7 @@ impl EditorSnapshot {
                     persistable,
                     editable,
                     fields,
-                    values,
+                    values: field_values,
                     asset_labels,
                     entity_labels,
                 })
@@ -985,19 +1046,29 @@ impl EditorSnapshot {
     }
 }
 
-/// The asset value `reference` names - a path relative to `res`, a guid the
-/// project's files carry, or a name the store already holds - loading the asset
-/// first when it is not loaded.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Resolves the asset value `asset_reference` names, and loads the asset when
+/// it is not loaded yet.
 ///
-/// The value carries the type the asset loaded as, so the field write that
-/// follows refuses an asset of another type than the field references.
-fn resolve_asset_reference(engine: &mut Engine, reference: &str) -> Result<FieldValue, String> {
+/// The reference is a path relative to `res`, a guid the project's files
+/// carry, or a name the store already holds. The returned value carries the
+/// type the asset loaded as, so the field write that follows refuses an asset
+/// of a different type than the field references.
+fn resolve_asset_reference(
+    engine: &mut Engine,
+    asset_reference: &str,
+) -> Result<FieldValue, String> {
+    // Step 1: work out what the reference names - a path to load, or an asset
+    // the store already holds.
     let world = engine.world_mut();
     let registry = world
         .get_resource::<pill_engine::ImportRegistry>()
         .cloned()
         .ok_or("no asset types are registered")?;
-    let path = match pill_engine::AssetGuid::parse(reference) {
+    let asset_path = match pill_engine::AssetGuid::parse(asset_reference) {
         Some(guid) => match world
             .get_resource::<pill_engine::AssetDatabase>()
             .and_then(|database| database.by_guid(guid))
@@ -1005,8 +1076,8 @@ fn resolve_asset_reference(engine: &mut Engine, reference: &str) -> Result<Field
         {
             Some(path) => path,
             None => {
-                // No file names the guid: the asset was built in code, and the
-                // store already holds it, so the handle is the whole answer.
+                // No file names the guid, so the asset was built in code and
+                // the store already holds it. Its handle is the whole answer.
                 let assets = world
                     .get_resource::<pill_engine::AssetManager>()
                     .ok_or("the world has no asset store")?;
@@ -1021,29 +1092,31 @@ fn resolve_asset_reference(engine: &mut Engine, reference: &str) -> Result<Field
             }
         },
         None => {
-            // A name the store holds is an asset with no file to load - a
-            // chain's built-in pass, the renderer's default material - so it
-            // is addressed by the name it was added under.
-            let held = world
+            // A name the store holds is an asset with no file to load, such as
+            // a chain's built-in pass or the renderer's default material. It is
+            // addressed by the name it was added under.
+            let held_asset = world
                 .get_resource::<pill_engine::AssetManager>()
-                .and_then(|assets| registry.loaded_by_name(assets, reference));
-            if let Some((asset_type, index, generation)) = held {
+                .and_then(|assets| registry.loaded_by_name(assets, asset_reference));
+            if let Some((asset_type, index, generation)) = held_asset {
                 return Ok(FieldValue::Asset {
                     asset_type: Some(asset_type),
                     index,
                     generation,
                 });
             }
-            reference.to_owned()
+            asset_reference.to_owned()
         }
     };
+    // Step 2: load the file the reference names, and hand back the handle it
+    // loaded as.
     let assets = world
         .get_resource_mut::<pill_engine::AssetManager>()
         .ok_or("the world has no asset store")?;
     let outcome = registry
         .load_by_path(
             assets,
-            std::path::Path::new(&path),
+            std::path::Path::new(&asset_path),
             pill_engine::MetadataPolicy::CreateIfMissing,
         )
         .map_err(|error| error.to_string())?;
@@ -1054,176 +1127,163 @@ fn resolve_asset_reference(engine: &mut Engine, reference: &str) -> Result<Field
     })
 }
 
-/// Label a system owner using the host's extension names.
+/// Labels a system owner using the host's extension names.
 ///
-/// The numbering is decoded by [`SystemOwner::extension_index`]; an extension
-/// the host does not name falls back to the owner's own rendering.
-fn owner_label(owner: SystemOwner, extension_names: &[String]) -> String {
-    match owner.extension_index() {
-        None => owner.to_string(),
+/// The owner's index is decoded by [`SystemOwner::extension_index`]. An
+/// extension the host does not name falls back to the owner's own rendering.
+fn system_owner_label(system_owner: SystemOwner, extension_names: &[String]) -> String {
+    match system_owner.extension_index() {
+        None => system_owner.to_string(),
         Some(index) => extension_names
             .get(index)
             .cloned()
-            .unwrap_or_else(|| owner.to_string()),
+            .unwrap_or_else(|| system_owner.to_string()),
     }
 }
 
-/// One component to place on a newly created entity.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ComponentSeed {
-    /// Registered component type name.
-    pub type_name: String,
-    /// Field values to write over the zero-initialised image. Fields left out
-    /// stay zero.
-    pub fields: Vec<(String, FieldValue)>,
-}
-
-/// One entry of the Inspector's "add component" picker.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RegisteredComponent {
-    /// Registered type name (the stable cross-reload key).
-    pub type_name: String,
-    /// True when some generation of this type has a non-empty field layout,
-    /// so the editor can zero-initialise an image of it.
-    pub addable: bool,
-}
-
-/// Registered component types, deduplicated by name, for the add picker.
+/// Returns the registered component types for the add picker, one entry per
+/// type name.
 ///
-/// The registry legitimately remembers one entry per reload generation of a
-/// type name, so a type is offered once and is addable when any of its
+/// The registry keeps one entry per reload generation of a type name, which is
+/// expected. A type is offered once and counts as addable when any of its
 /// generations carries a field layout.
 pub fn registered_components(world: &pill_engine::World) -> Vec<RegisteredComponent> {
     use std::collections::HashMap;
-    let mut addable_by_name: HashMap<String, bool> = HashMap::new();
-    for (name, component_id) in world.registered_components() {
+    let mut addable_by_type_name: HashMap<String, bool> = HashMap::new();
+    for (type_name, component_id) in world.registered_components() {
         let addable = world
             .component_field_layout(component_id)
             .is_some_and(|layout| !layout.is_empty());
-        addable_by_name
-            .entry(name)
-            .and_modify(|flag| *flag |= addable)
+        addable_by_type_name
+            .entry(type_name)
+            .and_modify(|is_addable| *is_addable |= addable)
             .or_insert(addable);
     }
-    let mut options = addable_by_name
+    let mut addable_components = addable_by_type_name
         .into_iter()
         .map(|(type_name, addable)| RegisteredComponent { type_name, addable })
         .collect::<Vec<_>>();
-    options.sort_by(|left, right| left.type_name.cmp(&right.type_name));
-    options
+    addable_components.sort_by(|left, right| left.type_name.cmp(&right.type_name));
+    addable_components
 }
 
-/// The mounted asset directory the asset commands resolve their relative
-/// paths against.
+/// Returns the mounted asset directory that the asset commands resolve their
+/// relative paths against.
 fn asset_authoring_root() -> Result<PathBuf, String> {
     pill_engine::asset_store::mounted_directory().ok_or("no asset directory is mounted".to_owned())
 }
 
-/// Refuse `relative` when it names one of a module's resources.
+/// Returns an error when `relative_path` names one of a module's resources.
 ///
-/// A module's resources are listed and inspected, never written: the
-/// check sits in every mutation arm, so the widget, the context menu and the
-/// scripted channel all hit it. The [`EXTENSIONS_ROOT`] itself is refused too:
-/// no asset of the project's lives there, so a command carrying a key that
-/// deep is a bug rather than an edit.
-fn refuse_module_resource(command: &EditorCommand, relative: &Path) -> Result<(), String> {
-    let grouped = relative
+/// A module's resources are listed and inspected, never written. The check sits
+/// in every mutation arm, so the widget, the context menu and the scripted
+/// channel all reach it. The [`EXTENSIONS_ROOT`] itself is refused too: no
+/// asset of the project's lives there, so a command carrying a key that deep is
+/// a bug rather than an edit.
+fn refuse_module_resource(command: &EditorCommand, relative_path: &Path) -> Result<(), String> {
+    let under_extensions_root = relative_path
         .components()
         .next()
         .is_some_and(|first| first.as_os_str() == EXTENSIONS_ROOT);
-    if grouped || pill_engine::asset_store::is_module_asset(relative) {
+    if under_extensions_root || pill_engine::asset_store::is_module_asset(relative_path) {
         return Err(format!(
             "{command:?}: `{}` is a module's resource and cannot be modified",
-            asset_slash(relative)
+            asset_slash(relative_path)
         ));
     }
     Ok(())
 }
 
-/// `path` as a `/`-separated string, the form asset commands carry.
+/// Returns `path` as a `/`-separated string, the form asset commands carry.
 fn asset_slash(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// The guid a standalone asset's own header holds, when its bytes are one and
-/// the guid parses.
+/// Returns the guid a standalone asset's own header holds, when its bytes are a
+/// document and the guid parses.
 fn document_guid(bytes: &[u8]) -> Option<pill_engine::AssetGuid> {
     let document: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     pill_engine::AssetGuid::parse(document.get("guid")?.as_str()?)
 }
 
-/// Write `bytes` to `file` through a temporary sibling, so a reader never
-/// sees a half-written file; the parent directory is created when missing.
-fn write_asset_bytes(file: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(parent) = file.parent() {
+/// Writes `bytes` to `file_path` through a temporary file beside it, so a
+/// reader never sees a half-written file. The parent directory is created when
+/// it is missing.
+fn write_asset_bytes(file_path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = file_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create `{}`: {error}", parent.display()))?;
     }
-    let file_name = file
+    let file_name = file_path
         .file_name()
-        .ok_or_else(|| format!("`{}` has no file name", file.display()))?;
-    let temporary = file.with_file_name(format!(
+        .ok_or_else(|| format!("`{}` has no file name", file_path.display()))?;
+    let temporary_path = file_path.with_file_name(format!(
         ".{}.{}.tmp",
         file_name.to_string_lossy(),
         std::process::id()
     ));
-    std::fs::write(&temporary, bytes)
-        .map_err(|error| format!("cannot write `{}`: {error}", temporary.display()))?;
-    std::fs::rename(&temporary, file).map_err(|error| {
-        let _ = std::fs::remove_file(&temporary);
-        format!("cannot write `{}`: {error}", file.display())
+    std::fs::write(&temporary_path, bytes)
+        .map_err(|error| format!("cannot write `{}`: {error}", temporary_path.display()))?;
+    std::fs::rename(&temporary_path, file_path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary_path);
+        format!("cannot write `{}`: {error}", file_path.display())
     })
 }
 
-/// Remove the files a command created, and report the ones it could not.
+/// Removes the files a command created and returns the ones it could not
+/// remove.
 ///
-/// A failed asset-file command takes its own work back so a half-applied change
-/// is not left for the asset watcher to import as an unrecorded edit. The
-/// removal can fail too - a locked file, a permission, a disk error - and that
-/// is the case this reports: the paths that are still on disk.
+/// A failed asset-file command takes its own work back, so a half-applied
+/// change is not left for the asset watcher to import as an unrecorded edit.
+/// The removal can fail as well, from a locked file, a permission or a disk
+/// error, and those cases are what this reports: the paths still on disk.
 fn roll_back_files(paths: &[String]) -> Vec<String> {
     roll_back_files_with(paths, &mut |path| std::fs::remove_file(path))
 }
 
-/// [`roll_back_files`] with the remover the caller supplies, so the failing
-/// branch is testable without a permission change.
+/// Same as [`roll_back_files`] with a file remover the caller supplies, so the
+/// failing branch can be tested without a permission change.
 fn roll_back_files_with(
     paths: &[String],
-    remove: &mut dyn FnMut(&str) -> std::io::Result<()>,
+    remove_file: &mut dyn FnMut(&str) -> std::io::Result<()>,
 ) -> Vec<String> {
-    let mut left_behind = Vec::new();
+    let mut left_behind_paths = Vec::new();
     for path in paths {
-        if remove(path).is_err() && Path::new(path).exists() {
-            left_behind.push(path.clone());
+        if remove_file(path).is_err() && Path::new(path).exists() {
+            left_behind_paths.push(path.clone());
         }
     }
-    left_behind
+    left_behind_paths
 }
 
-/// Report files a command meant to take back and could not.
-fn warn_left_behind(left_behind: &[String]) {
-    if left_behind.is_empty() {
+/// Logs the files a command meant to take back and could not.
+fn warn_left_behind(left_behind_paths: &[String]) {
+    if left_behind_paths.is_empty() {
         return;
     }
     pill_core::warn!(
         target: pill_core::telemetry::telemetry_target::ECS,
-        paths = left_behind.join(","),
+        paths = left_behind_paths.join(","),
         "[editor] rollback left files behind"
     );
 }
 
-/// A failed command's message, extended with the paths its rollback left on
-/// disk: the Console has to say what is still there, not only what failed.
-fn with_rollback_paths(message: String, left_behind: &[String]) -> String {
-    if left_behind.is_empty() {
+/// Extends a failed command's message with the paths its rollback left on
+/// disk. The Console has to say what is still there, not only what failed.
+fn with_rollback_paths(message: String, left_behind_paths: &[String]) -> String {
+    if left_behind_paths.is_empty() {
         return message;
     }
-    warn_left_behind(left_behind);
+    warn_left_behind(left_behind_paths);
     format!(
         "{message} (rollback incomplete: {})",
-        left_behind.join(", ")
+        left_behind_paths.join(", ")
     )
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1234,32 +1294,44 @@ mod tests {
     #[test]
     fn selection_clicks_reset_add_and_range() {
         let rows: Vec<Entity> = (1..=4).map(|id| Entity::from_raw(id, 0)).collect();
-        let (a, b, c, d) = (rows[0], rows[1], rows[2], rows[3]);
+        let (first, second, third, fourth) = (rows[0], rows[1], rows[2], rows[3]);
 
         let selection = EditorSelection::default();
-        assert_eq!(selection.clicked(SelectionClick::Reset, b, &rows), vec![b]);
+        assert_eq!(
+            selection.clicked(SelectionClick::Reset, second, &rows),
+            vec![second]
+        );
 
         // Ctrl adds, and re-adding an entity already selected only makes it
         // primary rather than duplicating it.
         let mut selection = EditorSelection::default();
-        selection.set_entities(vec![a]);
-        let added = selection.clicked(SelectionClick::Add, c, &rows);
-        assert_eq!(added, vec![a, c]);
+        selection.set_entities(vec![first]);
+        let added = selection.clicked(SelectionClick::Add, third, &rows);
+        assert_eq!(added, vec![first, third]);
         selection.set_entities(added);
-        assert_eq!(selection.clicked(SelectionClick::Add, a, &rows), vec![c, a]);
-
-        // Shift ranges over the list's own order, in either direction.
-        let mut selection = EditorSelection::default();
-        selection.set_entities(vec![a, b]);
         assert_eq!(
-            selection.clicked(SelectionClick::Range, d, &rows),
-            vec![b, c, d]
+            selection.clicked(SelectionClick::Add, first, &rows),
+            vec![third, first]
         );
-        assert_eq!(selection.clicked(SelectionClick::Range, b, &rows), vec![b]);
+
+        // Shift selects over the list's own order, in either direction.
+        let mut selection = EditorSelection::default();
+        selection.set_entities(vec![first, second]);
+        assert_eq!(
+            selection.clicked(SelectionClick::Range, fourth, &rows),
+            vec![second, third, fourth]
+        );
+        assert_eq!(
+            selection.clicked(SelectionClick::Range, second, &rows),
+            vec![second]
+        );
 
         // A range with no anchor the list shows is a plain click.
         let empty = EditorSelection::default();
-        assert_eq!(empty.clicked(SelectionClick::Range, c, &rows), vec![c]);
+        assert_eq!(
+            empty.clicked(SelectionClick::Range, third, &rows),
+            vec![third]
+        );
     }
 
     /// A plain component with a field layout, so entity create and field
@@ -1273,7 +1345,7 @@ mod tests {
     impl pill_engine::Component for DemoComponent {}
 
     /// Hand-written layout mirroring what `#[derive(PillComponent)]` emits.
-    static DEMO_FIELDS: &[ComponentFieldDescriptor] = &[
+    static DEMO_COMPONENT_FIELDS: &[ComponentFieldDescriptor] = &[
         ComponentFieldDescriptor {
             name: "strength",
             type_tag: "f32",
@@ -1302,7 +1374,7 @@ mod tests {
         let mut engine = Engine::new();
         engine
             .world_mut()
-            .register_component_with_layout::<DemoComponent>(DEMO_FIELDS);
+            .register_component_with_layout::<DemoComponent>(DEMO_COMPONENT_FIELDS);
         engine
     }
 
@@ -1367,11 +1439,11 @@ mod tests {
         );
         // One bad value type; the good write still applied.
         assert_eq!(failures.len(), 1);
-        let value = engine
+        let field_value = engine
             .world()
             .read_component_field(entity, &component, "strength")
             .expect("read");
-        assert_eq!(value, FieldValue::F32(5.0));
+        assert_eq!(field_value, FieldValue::F32(5.0));
     }
 
     /// A component with a fixed-size scalar array, for element writes.
@@ -1382,7 +1454,7 @@ mod tests {
     }
     impl pill_engine::Component for ArrayComponent {}
 
-    static ARRAY_FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
+    static ARRAY_COMPONENT_FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
         name: "values",
         type_tag: "array:i16",
         offset: 0,
@@ -1459,7 +1531,7 @@ mod tests {
     }
 
     /// The editor's generic field write reaches a component's registered
-    /// field layout - the path the Inspector uses to edit values live.
+    /// field layout, which is the path the Inspector uses to edit values live.
     #[test]
     fn set_field_updates_a_registered_layout() {
         let mut engine = demo_engine();
@@ -1472,12 +1544,12 @@ mod tests {
             })
             .build()
             .unwrap();
-        let name = demo_component_name();
+        let component_type_name = demo_component_name();
         let failures = EditorCommand::apply(
             &mut engine,
             &[EditorCommand::SetField {
                 entity,
-                component: name.clone(),
+                component: component_type_name.clone(),
                 field: "strength".into(),
                 value: FieldValue::F32(0.8),
             }],
@@ -1485,7 +1557,7 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
         assert!(engine
             .world()
-            .read_component_fields(entity, &name)
+            .read_component_fields(entity, &component_type_name)
             .unwrap()
             .contains(&FieldValue::F32(0.8)));
     }
@@ -1496,7 +1568,7 @@ mod tests {
         let array_component = array_component_name();
         engine
             .world_mut()
-            .register_component_with_layout::<ArrayComponent>(ARRAY_FIELDS);
+            .register_component_with_layout::<ArrayComponent>(ARRAY_COMPONENT_FIELDS);
         let entity = engine
             .world_mut()
             .create_entity()
@@ -1562,7 +1634,7 @@ mod tests {
         let component = array_component_name();
         engine
             .world_mut()
-            .register_component_with_layout::<ArrayComponent>(ARRAY_FIELDS);
+            .register_component_with_layout::<ArrayComponent>(ARRAY_COMPONENT_FIELDS);
         let entity = engine
             .world_mut()
             .create_entity()
@@ -1581,12 +1653,12 @@ mod tests {
             }],
         );
         assert!(failures.is_empty(), "array write failed: {failures:?}");
-        let value = engine
+        let field_value = engine
             .world()
             .read_component_field(entity, &component, "values")
             .expect("read");
         assert_eq!(
-            value,
+            field_value,
             FieldValue::Array(vec![
                 FieldValue::I16(1),
                 FieldValue::I16(9),
@@ -1637,17 +1709,22 @@ mod tests {
         assert!(after[1].enabled);
     }
 
-    /// Apply a recorded batch, undo it, and check a field's value.
-    fn round_trip_field(engine: &mut Engine, entity: Entity, component: &str, value: FieldValue) {
+    /// Applies a recorded batch, undoes it, and checks a field's value.
+    fn round_trip_field(
+        engine: &mut Engine,
+        entity: Entity,
+        component_type_name: &str,
+        new_value: FieldValue,
+    ) {
         let before = engine
             .world()
-            .read_component_field(entity, component, "strength")
+            .read_component_field(entity, component_type_name, "strength")
             .expect("read before");
         let command = EditorCommand::SetField {
             entity,
-            component: component.to_string(),
+            component: component_type_name.to_string(),
             field: "strength".to_string(),
-            value: value.clone(),
+            value: new_value.clone(),
         };
         let recorded = EditorCommand::apply_recorded(engine, std::slice::from_ref(&command));
         assert!(recorded.failures.is_empty());
@@ -1659,16 +1736,16 @@ mod tests {
         assert!(undo.failures.is_empty());
         let restored = engine
             .world()
-            .read_component_field(entity, component, "strength")
+            .read_component_field(entity, component_type_name, "strength")
             .expect("read restored");
         assert_eq!(restored, before);
         let redo = EditorCommand::apply_recorded(engine, std::slice::from_ref(&command));
         assert!(redo.failures.is_empty());
         let reapplied = engine
             .world()
-            .read_component_field(entity, component, "strength")
+            .read_component_field(entity, component_type_name, "strength")
             .expect("read reapplied");
-        assert_eq!(reapplied, value);
+        assert_eq!(reapplied, new_value);
     }
 
     #[test]
@@ -1692,7 +1769,7 @@ mod tests {
         let mut engine = demo_engine();
         engine
             .world_mut()
-            .register_component_with_layout::<ArrayComponent>(ARRAY_FIELDS);
+            .register_component_with_layout::<ArrayComponent>(ARRAY_COMPONENT_FIELDS);
         let entity = engine
             .world_mut()
             .create_entity()
@@ -1796,20 +1873,25 @@ mod tests {
         assert_eq!(*previous, entity);
         let undo = EditorCommand::apply_recorded(&mut engine, &recorded.inverses);
         assert!(undo.failures.is_empty(), "{:?}", undo.failures);
-        let [(old, restored)] = undo.remaps.as_slice() else {
+        let [(dead_handle, restored_handle)] = undo.remaps.as_slice() else {
             panic!("restore must report the remap, got {:?}", undo.remaps);
         };
-        assert_eq!(*old, entity);
+        assert_eq!(*dead_handle, entity);
         let strength = engine
             .world()
-            .read_component_field(*restored, &component, "strength")
+            .read_component_field(*restored_handle, &component, "strength")
             .expect("restored value");
         assert_eq!(strength, FieldValue::F32(6.5));
 
         // The remap rewrites a command naming the dead handle.
-        let mut later = destroy.clone();
-        later.remap_entity(entity, *restored);
-        assert_eq!(later, EditorCommand::DestroyEntity { entity: *restored });
+        let mut queued_after_destroy = destroy.clone();
+        queued_after_destroy.remap_entity(entity, *restored_handle);
+        assert_eq!(
+            queued_after_destroy,
+            EditorCommand::DestroyEntity {
+                entity: *restored_handle
+            }
+        );
     }
 
     #[test]
@@ -1817,7 +1899,7 @@ mod tests {
         let mut engine = demo_engine();
         engine
             .world_mut()
-            .register_component_with_layout::<ArrayComponent>(ARRAY_FIELDS);
+            .register_component_with_layout::<ArrayComponent>(ARRAY_COMPONENT_FIELDS);
         let entity = engine
             .world_mut()
             .create_entity()
@@ -1924,7 +2006,7 @@ mod tests {
         );
         assert!(failures.is_empty(), "{failures:?}");
 
-        // The delete the menu records: clear the selection, then destroy.
+        // The delete the menu records clears the selection, then destroys.
         let (commands, label) =
             crate::entities::entity_delete(entity, Some("textures/x.png".to_string()));
         assert_eq!(label, "delete entity");
@@ -2045,12 +2127,13 @@ mod tests {
         .to_string()
     }
 
-    /// An engine with both test asset types, a mounted scratch `res` holding
-    /// `a.note`, `b.note` and `c.card` (each with a `.meta`), the asset
-    /// database over it, and one entity whose note field references nothing.
-    fn reference_engine(label: &str) -> (Engine, Entity, String, std::path::PathBuf) {
+    /// Builds an engine with both test asset types registered and a mounted
+    /// scratch `res` that holds `a.note`, `b.note` and `c.card`, each with a
+    /// `.meta`. The asset database is built over that folder, and one entity's
+    /// note field references nothing.
+    fn reference_engine(scenario_name: &str) -> (Engine, Entity, String, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "pill-editor-asset-reference-{label}-{}",
+            "pill-editor-asset-reference-{scenario_name}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -2098,11 +2181,12 @@ mod tests {
             })
             .build()
             .unwrap();
-        let name = pill_engine::component::ComponentRegistry::registered_name::<NoteHolder>();
-        (engine, entity, name, root)
+        let component_type_name =
+            pill_engine::component::ComponentRegistry::registered_name::<NoteHolder>();
+        (engine, entity, component_type_name, root)
     }
 
-    /// The note field's label as the Inspector would show it.
+    /// Returns the note field's label as the Inspector would show it.
     fn note_label(engine: &Engine, entity: Entity) -> AssetReferenceLabel {
         let detail = EditorSnapshot::capture_detail(engine, entity).unwrap();
         let view = detail
@@ -2116,29 +2200,28 @@ mod tests {
     }
 
     /// One `SetFieldAsset` for the note field.
-    fn pick(entity: Entity, component: &str, reference: Option<&str>) -> EditorCommand {
+    fn pick(entity: Entity, component_type_name: &str, reference: Option<&str>) -> EditorCommand {
         EditorCommand::SetFieldAsset {
             entity,
-            component: component.to_owned(),
+            component: component_type_name.to_owned(),
             field: "note".to_owned(),
             reference: reference.map(str::to_owned),
         }
     }
 
-    /// Picking an unloaded asset by path loads it and points the field at it;
-    /// a guid names an asset as well as its path; the recorded inverse
-    /// restores the previous reference; `None` clears.
-    ///
-    /// The two asset reference tests mount one directory each, so they run as
-    /// one test: the mounted directory is process-wide.
+    /// Picking an unloaded asset by path loads it and points the field at it.
+    /// A guid names an asset just as well as its path, the recorded inverse
+    /// restores the previous reference, and `None` clears the field.
     #[test]
     fn asset_picks_load_assign_undo_clear_and_refuse() {
         let _mount = crate::test_support::asset_mount_lock();
-        let (mut engine, entity, name, root) = reference_engine("pick");
+        let (mut engine, entity, component_type_name, root) = reference_engine("pick");
         assert_eq!(note_label(&engine, entity), AssetReferenceLabel::Unset);
 
-        let applied =
-            EditorCommand::apply_recorded(&mut engine, &[pick(entity, &name, Some("a.note"))]);
+        let applied = EditorCommand::apply_recorded(
+            &mut engine,
+            &[pick(entity, &component_type_name, Some("a.note"))],
+        );
         assert!(applied.failures.is_empty(), "{:?}", applied.failures);
         assert_eq!(
             note_label(&engine, entity),
@@ -2149,7 +2232,7 @@ mod tests {
             &mut engine,
             &[pick(
                 entity,
-                &name,
+                &component_type_name,
                 Some("000000000000000000000000000000b1"),
             )],
         );
@@ -2170,8 +2253,10 @@ mod tests {
         // Another asset type, a path the project lacks and an unknown guid
         // are refused, and the field keeps what it had.
         for reference in ["c.card", "missing.note", "000000000000000000000000000000ff"] {
-            let refused =
-                EditorCommand::apply_recorded(&mut engine, &[pick(entity, &name, Some(reference))]);
+            let refused = EditorCommand::apply_recorded(
+                &mut engine,
+                &[pick(entity, &component_type_name, Some(reference))],
+            );
             assert_eq!(refused.failures.len(), 1, "{reference} is refused");
             assert_eq!(
                 note_label(&engine, entity),
@@ -2179,15 +2264,16 @@ mod tests {
             );
         }
 
-        let cleared = EditorCommand::apply_recorded(&mut engine, &[pick(entity, &name, None)]);
+        let cleared =
+            EditorCommand::apply_recorded(&mut engine, &[pick(entity, &component_type_name, None)]);
         assert!(cleared.failures.is_empty(), "{:?}", cleared.failures);
         assert_eq!(note_label(&engine, entity), AssetReferenceLabel::Unset);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A pick may name a guid the store holds with no file behind it: an asset
-    /// built in code resolves to its own handle instead of failing as an
-    /// unknown project guid, and a guid nothing holds is still refused by name.
+    /// built in code then resolves to its own handle instead of failing as an
+    /// unknown project guid. A guid nothing holds is still refused by name.
     #[test]
     fn a_pick_takes_a_guid_the_store_holds_without_a_file() {
         let mut engine = Engine::new();
@@ -2206,9 +2292,9 @@ mod tests {
                 )
                 .expect("the name is free");
         }
-        let value = resolve_asset_reference(&mut engine, &guid.to_string())
+        let field_value = resolve_asset_reference(&mut engine, &guid.to_string())
             .expect("a stored guid resolves");
-        match value {
+        match field_value {
             FieldValue::Asset {
                 asset_type,
                 index,
@@ -2250,9 +2336,9 @@ mod tests {
                 )
                 .expect("the name is free");
         }
-        let value = resolve_asset_reference(&mut engine, "pill.theme.default")
+        let field_value = resolve_asset_reference(&mut engine, "pill.theme.default")
             .expect("a stored name resolves");
-        match value {
+        match field_value {
             FieldValue::Asset {
                 asset_type,
                 index,
@@ -2322,7 +2408,7 @@ mod tests {
         (engine, holder, first, second)
     }
 
-    /// The holder's reference label as the Inspector would show it.
+    /// Returns the holder's reference label as the Inspector would show it.
     fn target_label(engine: &Engine, entity: Entity) -> EntityReferenceLabel {
         let detail = EditorSnapshot::capture_detail(engine, entity).unwrap();
         let view = detail
@@ -2336,31 +2422,36 @@ mod tests {
     }
 
     /// One `SetFieldEntity` for the target field.
-    fn retarget(entity: Entity, component: &str, reference: Option<Entity>) -> EditorCommand {
+    fn retarget(
+        entity: Entity,
+        component_type_name: &str,
+        reference: Option<Entity>,
+    ) -> EditorCommand {
         EditorCommand::SetFieldEntity {
             entity,
-            component: component.to_owned(),
+            component: component_type_name.to_owned(),
             field: "target".to_owned(),
             reference,
         }
     }
 
-    /// Arming a row records the field a scene press names, and the request the
-    /// runner takes is what the press turns into one recorded step - the same
+    /// Arming a row records the field a scene press names. The request the
+    /// runner takes is what the press turns into one recorded step, the same
     /// `entity_edit` the row's own picker and drop queue.
     #[test]
     fn an_armed_row_answers_the_scene_press_with_one_recorded_step() {
         let (mut engine, holder, first, second) = holder_engine();
         crate::commands::ensure_command_resources(engine.world_mut());
-        let name = pill_engine::component::ComponentRegistry::registered_name::<TargetHolder>();
+        let component_type_name =
+            pill_engine::component::ComponentRegistry::registered_name::<TargetHolder>();
         let armed = EditorCommand::ArmEntityPick {
             entity: holder,
-            component: name.clone(),
+            component: component_type_name.clone(),
             field: "target".to_owned(),
         };
-        // Arming is not an edit: it neither records nor dirties the document,
-        // so clicking a reference row's target button does not make the title
-        // claim unsaved changes.
+        // Arming is not an edit, so it neither records a step nor dirties the
+        // document. Clicking a reference row's target button therefore does not
+        // make the title claim unsaved changes.
         assert!(!armed.recordable(), "arming an entity pick is not an edit");
         let outcome = EditorCommand::apply_recorded(&mut engine, &[armed]);
         assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
@@ -2388,8 +2479,8 @@ mod tests {
             "the press takes the request once"
         );
 
-        // What the runner does with the answer: one recorded step, which
-        // undoes back to the reference the field held.
+        // The runner turns the answer into one recorded step, which undoes back
+        // to the reference the field held.
         let (edit, label) = crate::inspector::entity_edit(
             target.entity,
             &target.component,
@@ -2410,16 +2501,19 @@ mod tests {
     }
 
     /// A reference reads as unset, names its entity by the Hierarchy label,
-    /// writes, undoes and clears; a dangling reference reads as missing, and a
+    /// writes, undoes and clears. A dangling reference reads as missing, and a
     /// reference to an entity that is gone is refused rather than written.
     #[test]
     fn entity_references_read_write_undo_clear_and_go_missing() {
         let (mut engine, holder, first, second) = holder_engine();
-        let name = pill_engine::component::ComponentRegistry::registered_name::<TargetHolder>();
+        let component_type_name =
+            pill_engine::component::ComponentRegistry::registered_name::<TargetHolder>();
         assert_eq!(target_label(&engine, holder), EntityReferenceLabel::Unset);
 
-        let applied =
-            EditorCommand::apply_recorded(&mut engine, &[retarget(holder, &name, Some(first))]);
+        let applied = EditorCommand::apply_recorded(
+            &mut engine,
+            &[retarget(holder, &component_type_name, Some(first))],
+        );
         assert!(applied.failures.is_empty(), "{:?}", applied.failures);
         assert_eq!(
             target_label(&engine, holder),
@@ -2434,8 +2528,10 @@ mod tests {
             first
         );
 
-        let rewritten =
-            EditorCommand::apply_recorded(&mut engine, &[retarget(holder, &name, Some(second))]);
+        let rewritten = EditorCommand::apply_recorded(
+            &mut engine,
+            &[retarget(holder, &component_type_name, Some(second))],
+        );
         assert!(rewritten.failures.is_empty(), "{:?}", rewritten.failures);
         assert_eq!(
             target_label(&engine, holder),
@@ -2453,8 +2549,10 @@ mod tests {
         // The target dies: the row shows the reference as missing, because the
         // field still holds the handle it was given.
         let _ = engine.world_mut().destroy_entity(second);
-        let pointed_at_dead =
-            EditorCommand::apply_recorded(&mut engine, &[retarget(holder, &name, Some(second))]);
+        let pointed_at_dead = EditorCommand::apply_recorded(
+            &mut engine,
+            &[retarget(holder, &component_type_name, Some(second))],
+        );
         assert_eq!(
             pointed_at_dead.failures.len(),
             1,
@@ -2464,7 +2562,10 @@ mod tests {
         let _ = engine.world_mut().destroy_entity(first);
         assert_eq!(target_label(&engine, holder), EntityReferenceLabel::Missing);
 
-        let cleared = EditorCommand::apply_recorded(&mut engine, &[retarget(holder, &name, None)]);
+        let cleared = EditorCommand::apply_recorded(
+            &mut engine,
+            &[retarget(holder, &component_type_name, None)],
+        );
         assert!(cleared.failures.is_empty(), "{:?}", cleared.failures);
         assert_eq!(target_label(&engine, holder), EntityReferenceLabel::Unset);
     }
@@ -2501,7 +2602,7 @@ mod tests {
     struct RefusedDocument {}
 
     /// A rollback that cannot take a file back names it, in the command's
-    /// message and in the log: a failure that changed the disk has to say so.
+    /// message and in the log. A failure that changed the disk has to say so.
     #[test]
     fn a_rollback_that_cannot_finish_names_the_file_it_left() {
         let path = std::env::temp_dir().join(format!(
@@ -2511,11 +2612,15 @@ mod tests {
         std::fs::write(&path, b"kept").unwrap();
         let path_text = path.display().to_string();
 
-        let left = roll_back_files_with(std::slice::from_ref(&path_text), &mut |_| {
+        let left_behind_paths = roll_back_files_with(std::slice::from_ref(&path_text), &mut |_| {
             Err(std::io::Error::other("a handle holds it"))
         });
-        assert_eq!(left, vec![path_text.clone()], "the file is still there");
-        let message = with_rollback_paths("import failed".to_string(), &left);
+        assert_eq!(
+            left_behind_paths,
+            vec![path_text.clone()],
+            "the file is still there"
+        );
+        let message = with_rollback_paths("import failed".to_string(), &left_behind_paths);
         assert!(message.starts_with("import failed"), "{message}");
         assert!(
             message.contains(&path_text),
@@ -2567,10 +2672,10 @@ mod tests {
             "a create whose import refused the file must not leave it behind"
         );
 
-        // A delete removes the asset file and then its sidecar. A sidecar
-        // another handle holds without delete sharing is the one state where
-        // the second step fails after the first one succeeded; a platform that
-        // cannot set that up has no way to reach the arm's rollback.
+        // A delete removes the asset file and then its sidecar. The one state
+        // where the second step fails after the first one succeeded is a sidecar
+        // that another handle holds open without delete sharing. A platform that
+        // cannot set that up has no way to reach the rollback.
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -2587,7 +2692,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let held = std::fs::OpenOptions::new()
+            let held_sidecar = std::fs::OpenOptions::new()
                 .read(true)
                 .share_mode(FILE_SHARE_READ)
                 .open(&meta)
@@ -2613,16 +2718,16 @@ mod tests {
                 "a delete that could not finish must put the asset back: {}",
                 failures[0].1
             );
-            drop(held);
+            drop(held_sidecar);
         }
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A created asset that an undo deleted comes back when the step is
-    /// redone: the delete unloads the asset with its file, so the redo's
-    /// create can import the fresh file instead of colliding on a guid the
-    /// store still holds.
+    /// A created asset that an undo deleted comes back when the step is redone.
+    /// The delete unloads the asset together with its file, so the redo's create
+    /// can import the fresh file instead of colliding with a guid the store
+    /// still holds.
     #[test]
     fn a_redone_create_writes_the_file_again() {
         let _mount = crate::test_support::asset_mount_lock();
@@ -2641,10 +2746,10 @@ mod tests {
             .world_mut()
             .insert_resource(crate::commands::PendingEditorCommands::default());
 
-        // What the store holds for the path: whether it is loaded, and the
-        // guid it is loaded under.
+        // What the store holds for a path: whether it is loaded, and under
+        // which guid.
         let asset_path = std::path::Path::new("probe.theme");
-        let held = |engine: &Engine| {
+        let store_state = |engine: &Engine| {
             let registry = engine
                 .world()
                 .get_resource::<pill_engine::ImportRegistry>()
@@ -2694,7 +2799,7 @@ mod tests {
         crate::drain::apply_pending(&mut engine, 1);
         assert!(!path.exists(), "the undo deletes the file");
         assert_eq!(
-            held(&engine),
+            store_state(&engine),
             (false, None),
             "the undo's delete unloads the asset with its file"
         );
@@ -2715,14 +2820,17 @@ mod tests {
         let recorded = EditorCommand::apply_recorded(&mut engine, &replay[0].commands);
         assert!(recorded.failures.is_empty(), "{:?}", recorded.failures);
         assert!(path.exists(), "the redo writes the file again");
-        assert!(held(&engine).0, "the redo's create loads the asset again");
+        assert!(
+            store_state(&engine).0,
+            "the redo's create loads the asset again"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A replace keeps the identity the store already holds at the path, even
-    /// when the file's own header disagrees with it - and the value reloads,
-    /// because the handle stays what it was.
+    /// when the file's own header disagrees with it. The value reloads, because
+    /// the handle stays what it was.
     #[test]
     fn a_replace_keeps_the_guid_the_store_holds_and_reloads_the_value() {
         let _mount = crate::test_support::asset_mount_lock();
@@ -2762,11 +2870,11 @@ mod tests {
             (guid, version)
         };
 
-        // A file whose header carries another guid - the state the person hit:
-        // the store cannot import it at that path, so the replace has to keep
-        // the guid the store knows instead of the one the file claims.
-        let other = pill_engine::AssetGuid::random().unwrap();
-        std::fs::write(&path, theme_document(other)).unwrap();
+        // A file whose header carries another guid. The store cannot import it
+        // at that path, so the replace has to keep the guid the store knows
+        // instead of the one the file claims.
+        let other_guid = pill_engine::AssetGuid::random().unwrap();
+        std::fs::write(&path, theme_document(other_guid)).unwrap();
 
         let failures = EditorCommand::apply(&mut engine, &[create(Some(true))]);
         assert!(failures.is_empty(), "{:?}", failures);
@@ -2794,9 +2902,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A path the store still holds with no file behind it binds the fresh
-    /// guid a create writes: the stale entry goes instead of refusing the
-    /// write the person asked for.
+    /// A path the store still holds with no file behind it binds the fresh guid
+    /// a create writes. The stale entry goes instead of refusing the write the
+    /// person asked for.
     #[test]
     fn a_create_over_a_stale_loaded_path_binds_the_fresh_guid() {
         let _mount = crate::test_support::asset_mount_lock();
@@ -2817,16 +2925,16 @@ mod tests {
         let path = root.join("ghost.theme");
         let failures = EditorCommand::apply(&mut engine, &[create(None)]);
         assert!(failures.is_empty(), "{:?}", failures);
-        let stale = document_guid(&std::fs::read(&path).unwrap()).unwrap();
+        let stale_guid = document_guid(&std::fs::read(&path).unwrap()).unwrap();
 
-        // The file goes, the store keeps the path loaded: nothing tells the
-        // editor the asset left.
+        // The file is gone while the store keeps the path loaded, because
+        // nothing tells the editor the asset left.
         std::fs::remove_file(&path).unwrap();
 
         let failures = EditorCommand::apply(&mut engine, &[create(None)]);
         assert!(failures.is_empty(), "{:?}", failures);
-        let fresh = document_guid(&std::fs::read(&path).unwrap()).unwrap();
-        assert_ne!(fresh, stale, "the create binds a fresh guid");
+        let fresh_guid = document_guid(&std::fs::read(&path).unwrap()).unwrap();
+        assert_ne!(fresh_guid, stale_guid, "the create binds a fresh guid");
         let bound = {
             let world = engine.world();
             let registry = world
@@ -2836,7 +2944,7 @@ mod tests {
             let assets = world.get_resource::<pill_engine::AssetManager>().unwrap();
             registry.guid_by_path(assets, std::path::Path::new("ghost.theme"))
         };
-        assert_eq!(bound, Some(fresh), "the store holds the new identity");
+        assert_eq!(bound, Some(fresh_guid), "the store holds the new identity");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2855,8 +2963,8 @@ mod tests {
         let mut engine = Engine::new();
         engine.world_mut().register_standalone_asset::<Refused>();
         let path = root.join("kept.refused");
-        let previous = b"{\"format_version\": 1, \"asset_type\": \"pill_editor_core::tests::Refused\", \"guid\": \"000000000000000000000000000000e1\", \"asset\": {}}".to_vec();
-        std::fs::write(&path, &previous).unwrap();
+        let previous_bytes = b"{\"format_version\": 1, \"asset_type\": \"pill_editor_core::tests::Refused\", \"guid\": \"000000000000000000000000000000e1\", \"asset\": {}}".to_vec();
+        std::fs::write(&path, &previous_bytes).unwrap();
 
         let failures = EditorCommand::apply(
             &mut engine,
@@ -2870,7 +2978,7 @@ mod tests {
         assert_eq!(failures.len(), 1, "the refusing import fails the replace");
         assert_eq!(
             std::fs::read(&path).unwrap(),
-            previous,
+            previous_bytes,
             "a replace that could not load leaves the file it replaced"
         );
 

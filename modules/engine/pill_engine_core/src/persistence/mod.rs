@@ -1,44 +1,52 @@
-//! Component persistence and schema migration for hot-reload.
+//! Component and resource persistence across a hot reload: what each
+//! persistable type registers, and the migration a reload runs on it.
 //!
 //! # Responsibilities
 //!
-//! - Stores per-component-type serialize/deserialize/insert function pointers
-//!   registered alongside each persistable component.
+//! - Stores the serialize, deserialize and insert functions of every
+//!   persistable component type, registered alongside the component itself.
 //! - Migrates, in place, only the component types whose schema a reload
-//!   changed, matching old→new components by type name (not `TypeId`), which is
-//!   what lets a rebuilt image's fresh `TypeId` map back onto the rows the
-//!   previous generation owns.
-//! - Keeps the registration bookkeeping the reload transaction compares across
-//!   the swap: the persistable type manifest, the sequence markers, and the
-//!   forget paths for registrations whose owner is gone.
+//!   changed. Old and new components are matched by type name, not by
+//!   `TypeId`, because a rebuilt image gives every type a fresh `TypeId` and
+//!   the name is the only thing two generations agree on.
+//! - Owns the resource snapshot, its restore path and the resource half of
+//!   the reload migration.
+//! - Keeps the reload bookkeeping the host compares across a swap: the
+//!   component and resource manifests, the registration counters, and the
+//!   records of registrations whose module is gone.
 //!
 //! # Design
 //!
-//! The reload transaction captures each persistable type's metadata before the
-//! swap, registers the arriving generation, and migrates only the columns whose
-//! schema hash moved. Everything else keeps its bytes, so a reload costs work
-//! proportional to what actually changed rather than to the size of the world.
+//! Before the swap, the reload captures the metadata of every persistable
+//! type. After the arriving generation registers its types, only the columns
+//! whose schema hash changed are migrated. Every other column keeps its
+//! bytes, so a reload costs work in proportion to what changed, not to the
+//! size of the world.
 //!
 //! The payload is serde_json rather than a binary format because JSON is
-//! self-describing: field names travel with the values, so an added field takes
-//! `Default::default()` and a removed one is ignored.
+//! self-describing: field names travel with the values, so an added field
+//! takes `Default::default()` and a removed one is ignored.
 //!
 //! Each persistable component type registers three monomorphized functions,
 //! stored in the [`World`] as plain `fn` pointers:
 //!
-//! | Function        | Signature | Purpose |
-//! |-----------------|-----------|---------|
-//! | `serialize`     | `fn(&ComponentColumns, index) → Option<Vec<u8>>` | Read concrete component from archetype column, JSON-encode it; `None` when the type's `Serialize` refuses |
-//! | `deserialize`   | `fn(&[u8]) → Option<Box<dyn Component>>` | Decode JSON bytes back into a component; returns None on schema mismatch |
-//! | `insert_boxed`  | `fn(&mut ComponentColumns, Box<dyn Component>)` | Downcast and push into the archetype's column |
+//! | Function | Signature | Purpose |
+//! |----------|-----------|---------|
+//! | `serialize_component` | `fn(&ComponentColumns, index) → Option<Vec<u8>>` | Read the component from its archetype column and encode it as JSON; `None` when the type's own `Serialize` refuses the value |
+//! | `deserialize_component` | `fn(&[u8]) → Option<Box<dyn Component>>` | Decode JSON bytes back into a component; `None` when the bytes cannot be decoded into the type |
+//! | `insert_boxed_component` | `fn(&mut ComponentColumns, Box<dyn Component>)` | Downcast the box and push the value into the archetype column |
 //!
 //! They are monomorphized in the DLL that defines the concrete types, so a
-//! reload replaces them with `HashMap::insert` - no destructor and no vtable
-//! call ever runs through an image that is about to be unmapped.
+//! reload replaces them with a plain `HashMap::insert` of the new function.
+//! No destructor and no vtable call then runs through an image that is about
+//! to be unmapped.
 //!
-//! During migration: read each row of a changed column through the *retiring*
-//! generation's `serialize`, decode it with the arriving generation's
-//! `deserialize`, and place it with that generation's `insert_boxed`.
+//! During migration, each old row of a changed column is read through the
+//! *retiring* generation's `serialize_component`, decoded with the arriving
+//! generation's `deserialize_component`, and placed with its
+//! `insert_boxed_component`. Rows the arriving generation spawned during its
+//! `init` already hold values in the new layout, so they are read with the
+//! current serializer instead.
 
 // Standard library
 use std::collections::hash_map::DefaultHasher;
@@ -94,8 +102,8 @@ mod tests {
     }
     impl Component for DropTestKeptComponent {}
 
-    /// A distinct type that *declares* another type's name, standing in for the
-    /// registration a rebuilt image makes: same name, fresh `TypeId`.
+    /// A separate type that declares another type's name, which is what a
+    /// rebuilt image registers: the same name under a fresh `TypeId`.
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct DropTestSupersedingComponent {
         value: u32,
@@ -108,7 +116,8 @@ mod tests {
         }
     }
 
-    /// A persistable component whose column is 8 bytes / align 4.
+    /// A persistable component whose column takes 8 bytes per row and is
+    /// 4-byte aligned.
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct LayoutHostComponent {
         a: u32,
@@ -116,8 +125,9 @@ mod tests {
     }
     impl Component for LayoutHostComponent {}
 
-    /// Declares the host's name while widening `b` to `f64` - the f32-to-f64
-    /// shape that registers 16 bytes / align 8 over the host's column.
+    /// Declares the host's name while widening `b` to `f64`. This is the
+    /// widening shape that registers 16 bytes per row with 8-byte alignment
+    /// over the host's column.
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct LayoutWidenedComponent {
         a: u32,
@@ -129,8 +139,8 @@ mod tests {
         }
     }
 
-    /// Same name, same alignment, one field more: the add-a-field shape that
-    /// must keep registering (and migrating).
+    /// Same name and same alignment, one field more: the add-a-field shape
+    /// that must keep registering and keep migrating.
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct LayoutGrownComponent {
         a: u32,
@@ -143,8 +153,9 @@ mod tests {
         }
     }
 
-    /// The refusal sentence is printed verbatim into host logs and grepped by
-    /// humans, so it carries no source-wrap artifacts.
+    /// The refusal sentence reaches host logs verbatim and people search the
+    /// logs for it, so it must carry no line break or double space left by
+    /// source wrapping.
     #[test]
     fn collision_refusal_message_has_no_wrap_spaces() {
         assert!(
@@ -155,9 +166,9 @@ mod tests {
         assert!(COMPONENT_NAME_COLLISION_REFUSAL.ends_with("persist entries"));
     }
 
-    /// A superseding registration whose layout the old column cannot host is
-    /// refused before anything registers: the host rolls the reload back and
-    /// the running generation keeps its storage, instead of the migration
+    /// A superseding registration whose layout the old column cannot hold is
+    /// refused before anything registers. The host then rolls the reload back,
+    /// so the running generation keeps its storage instead of the migration
     /// reading the new alignment out of the old column's slots.
     #[test]
     fn a_layout_the_old_column_cannot_host_is_refused() {
@@ -198,7 +209,8 @@ mod tests {
             other => panic!("expected a ComponentLayoutChanged refusal, got {other:?}"),
         }
 
-        // Nothing registered, and the predecessor kept its registration.
+        // Nothing new was registered, and the predecessor kept its
+        // registration.
         assert_eq!(
             world.component_registry().registered_components().count(),
             1,
@@ -211,9 +223,9 @@ mod tests {
             .contains_key(&ComponentId::of::<LayoutWidenedComponent>()));
     }
 
-    /// A size change that keeps the alignment registers: the old column's
-    /// slots stay validly aligned for the incoming type, which is what the
-    /// add-a-field reload scenarios depend on.
+    /// A size change that keeps the alignment registers, because the old
+    /// column's slots stay correctly aligned for the incoming type. The
+    /// add-a-field reload cases depend on this.
     #[test]
     fn a_size_change_that_keeps_the_alignment_registers() {
         let mut world = World::new();
@@ -235,8 +247,9 @@ mod tests {
         assert_eq!((grown_layout.size, grown_layout.align), (12, 4));
     }
 
-    /// Dropping a forgotten type removes its columns from every entity while
-    /// entities that carry other components survive with those intact.
+    /// Dropping a forgotten type removes its data from every entity. Entities
+    /// that also carry other components survive with those intact; entities
+    /// that carried only the forgotten type are destroyed.
     #[test]
     fn drop_forgotten_components_removes_only_the_forgotten_data() {
         let mut world = World::new();
@@ -269,11 +282,15 @@ mod tests {
 
         let type_name =
             crate::type_names::stable_type_name::<DropTestForgottenComponent>().to_string();
-        let dropped = world.drop_forgotten_components(std::slice::from_ref(&type_name));
-        assert_eq!(dropped, 2, "both entities carried the forgotten component");
+        let dropped_entity_count =
+            world.drop_forgotten_components(std::slice::from_ref(&type_name));
+        assert_eq!(
+            dropped_entity_count, 2,
+            "both entities carried the forgotten component"
+        );
 
-        // The entity that only carried the forgotten component is destroyed;
-        // the entity that also carries a kept component survives.
+        // The entity that carried only the forgotten component is destroyed.
+        // The entity that also carries a kept component survives.
         assert!(!world.entity_locations.contains_key(&entity_only_forgotten));
         assert!(world.entity_locations.contains_key(&entity_with_both));
         assert_eq!(world.entity_locations.len(), 1);
@@ -286,10 +303,10 @@ mod tests {
         assert!(!archetype.component_types.contains(&forgotten_id));
 
         // The kept component's value survives untouched.
-        let kept = world
+        let kept_component = world
             .get_component::<DropTestKeptComponent>(entity_with_both)
             .expect("kept component should still be readable");
-        assert_eq!(kept.value, 3);
+        assert_eq!(kept_component.value, 3);
 
         // The persistable manifest no longer knows the forgotten type.
         assert!(world
@@ -307,60 +324,64 @@ mod tests {
         assert!(world.entity_locations.contains_key(&reseeded));
     }
 
-    /// Every native id sharing the forgotten name loses its rows, not just the
-    /// one a name resolver returns: an ambiguous name resolves to nothing at
-    /// all, so a single-id purge would leave both generations' rows behind
-    /// while `forget_component_type` removed their registrations.
+    /// Every native id that shares the forgotten name loses its rows, not only
+    /// the one a name resolver would return. An ambiguous name resolves to
+    /// nothing, so a purge driven by one id would leave the other generation's
+    /// rows behind while `forget_component_type` removed all their
+    /// registrations.
     #[test]
     fn forget_strips_rows_for_every_id_sharing_the_name() {
         let mut world = World::new();
         world.register_persistable_component::<DropTestForgottenComponent>();
-        let first_id = ComponentId::of::<DropTestForgottenComponent>();
+        let native_id = ComponentId::of::<DropTestForgottenComponent>();
         let type_name =
             crate::type_names::stable_type_name::<DropTestForgottenComponent>().to_string();
 
-        let first_entity = world
+        let native_entity = world
             .create_entity()
             .with(DropTestForgottenComponent { value: 1 })
             .build()
             .unwrap();
-        assert_eq!(world.live_row_count(first_id), 1);
+        assert_eq!(world.live_row_count(native_id), 1);
 
         // A rebuilt image's registration: same name, fresh id, its own rows.
         world.supersede_persist_registrations(std::slice::from_ref(&type_name));
         world.register_persistable_component::<DropTestSupersedingComponent>();
-        let second_id = ComponentId::of::<DropTestSupersedingComponent>();
-        assert_ne!(second_id, first_id);
-        let second_entity = world
+        let successor_id = ComponentId::of::<DropTestSupersedingComponent>();
+        assert_ne!(successor_id, native_id);
+        let successor_entity = world
             .create_entity()
             .with(DropTestSupersedingComponent { value: 2 })
             .build()
             .unwrap();
-        assert_eq!(world.live_row_count(second_id), 1);
+        assert_eq!(world.live_row_count(successor_id), 1);
 
-        let dropped = world.drop_forgotten_components(std::slice::from_ref(&type_name));
+        let dropped_entity_count =
+            world.drop_forgotten_components(std::slice::from_ref(&type_name));
         assert_eq!(
-            dropped, 2,
+            dropped_entity_count, 2,
             "both generations' rows are stripped, not just one id's"
         );
-        assert!(!world.entity_locations.contains_key(&first_entity));
-        assert!(!world.entity_locations.contains_key(&second_entity));
-        assert!(!world.storage_factories.contains_key(&first_id));
-        assert!(!world.storage_factories.contains_key(&second_id));
+        assert!(!world.entity_locations.contains_key(&native_entity));
+        assert!(!world.entity_locations.contains_key(&successor_entity));
+        assert!(!world.storage_factories.contains_key(&native_id));
+        assert!(!world.storage_factories.contains_key(&successor_id));
     }
 
-    /// A refused persistable registration changes nothing: the guard runs
-    /// before the registration does, so no bit, name entry, storage factory or
-    /// log entry is created for a call that returns without registering.
+    /// A refused persistable registration changes nothing. The guard runs
+    /// before the registration does, so a call that returns without
+    /// registering creates no bit, no name entry, no storage factory and no
+    /// registration-log entry.
     #[test]
     fn a_refused_persistable_registration_changes_nothing() {
         let mut world = World::new();
         world.register_persistable_component::<DropTestForgottenComponent>();
-        // A peer with live rows under the same name: without the supersede
-        // announcement the guard refuses instead of evicting it.
+        // A peer holds live rows under the same name. Without an announcement
+        // that this name supersedes the peer, the guard refuses the
+        // registration rather than evicting the peer.
         world.register_persistable_component::<DropTestSupersedingComponent>();
         let peer_id = ComponentId::of::<DropTestSupersedingComponent>();
-        let peer = world
+        let peer_entity = world
             .create_entity()
             .with(DropTestSupersedingComponent { value: 1 })
             .build()
@@ -381,7 +402,7 @@ mod tests {
                 "a refused attempt leaves the registry as it was"
             );
         }
-        assert!(world.entity_locations.contains_key(&peer));
+        assert!(world.entity_locations.contains_key(&peer_entity));
         assert_eq!(
             world.live_row_count(peer_id),
             1,
@@ -389,9 +410,9 @@ mod tests {
         );
     }
 
-    /// The id-keyed purge removes the rows and every registration artifact of
-    /// the ids it is given, while a same-name re-registration - the rollback
-    /// generation, with a fresh id - keeps the name-keyed entries alive.
+    /// The id-keyed purge removes the rows and all registration entries of the
+    /// ids it is given. A rollback generation that re-registers the same name
+    /// under a fresh id keeps the name-keyed entries alive.
     #[test]
     fn stranded_ids_lose_their_rows_and_factories() {
         let mut world = World::new();
@@ -414,8 +435,11 @@ mod tests {
         let successor_id = ComponentId::of::<DropTestSupersedingComponent>();
         assert_ne!(successor_id, stranded_id);
 
-        let dropped = world.retire_component_storage(&[stranded_id]);
-        assert_eq!(dropped, 1, "the stranded type's row was removed with it");
+        let dropped_entity_count = world.retire_component_storage(&[stranded_id]);
+        assert_eq!(
+            dropped_entity_count, 1,
+            "the stranded type's row was removed with it"
+        );
 
         // The failed generation's id holds nothing anywhere...
         assert!(!world.entity_locations.contains_key(&entity));
@@ -431,36 +455,40 @@ mod tests {
         assert!(world.persist_schema_hashes.contains_key(&type_name));
     }
 
-    /// The registration log distinguishes a type that was dropped entirely
-    /// from one merely downgraded to a plain component.
+    /// The two registration logs differ: the component log lists every type
+    /// registered since a point, the persistable log only the persistable
+    /// ones. That difference is what tells a dropped type apart from one
+    /// downgraded to a plain component.
     #[test]
     fn registered_component_names_since_covers_plain_components() {
         let mut world = World::new();
-        let sequence = world.component_registration_sequence();
+        let registration_sequence = world.component_registration_sequence();
 
         world.register_persistable_component::<DropTestForgottenComponent>();
         world.register_component::<DropTestKeptComponent>();
 
-        let registered = world.registered_component_names_since(sequence);
-        assert!(registered
+        let registered_component_names =
+            world.registered_component_names_since(registration_sequence);
+        assert!(registered_component_names
             .iter()
             .any(|name| name.contains("DropTestForgottenComponent")));
-        assert!(registered
+        assert!(registered_component_names
             .iter()
             .any(|name| name.contains("DropTestKeptComponent")));
 
-        let persistable = world.persist_type_names_registered_since(sequence);
-        assert!(persistable
+        let persistable_type_names =
+            world.persist_type_names_registered_since(registration_sequence);
+        assert!(persistable_type_names
             .iter()
             .any(|name| name.contains("DropTestForgottenComponent")));
-        assert!(!persistable
+        assert!(!persistable_type_names
             .iter()
             .any(|name| name.contains("DropTestKeptComponent")));
     }
 
-    /// Re-registering the same persistable type is idempotent across the
-    /// persist maps: one serializer/inserter per ComponentId and one
-    /// deserializer/schema hash per name.
+    /// Re-registering the same persistable type changes nothing in the persist
+    /// maps: there is still one serializer and one inserter for its
+    /// `ComponentId`, and one deserializer and one schema hash for its name.
     #[test]
     fn persistable_registration_is_idempotent_across_repeated_calls() {
         let mut world = World::new();
@@ -481,14 +509,14 @@ mod tests {
         assert!(world.persist_schema_hashes.contains_key(&type_name));
     }
 
-    // =========================================================================
+    // =============================================================================
     // Concurrent-peer guard
-    // =========================================================================
+    // =============================================================================
 
-    /// A second registration of a type name whose existing column still holds
-    /// rows is a concurrent peer, not a superseded generation, so it is
-    /// reported instead of evicting the peer's persist entries and silently
-    /// dropping its rows at the next reload.
+    /// A second registration of a type name whose column still holds rows
+    /// belongs to a concurrent peer, not to a superseded generation. It is
+    /// reported as a collision instead of replacing the peer's persist entries
+    /// and silently dropping its rows at the next reload.
     #[test]
     fn a_same_name_registration_over_live_rows_is_reported_not_evicted() {
         let mut world = World::new();
@@ -506,8 +534,8 @@ mod tests {
             .unwrap();
         assert_eq!(world.live_row_count(native_id), 1);
 
-        // A second component claiming the same name arrives - the in-process
-        // stand-in for a second binary that linked the same type.
+        // A second component claims the same name. This stands in for a second
+        // binary in the same process that linked the same type.
         let error = world
             .register_component_descriptor(
                 0x5EED,
@@ -538,8 +566,8 @@ mod tests {
         assert!(world.persist_serializers.contains_key(&native_id));
     }
 
-    /// The same collision is allowed through once the existing column has no
-    /// rows left: that is a superseded generation, and replacing it is the
+    /// The same collision is allowed through once the existing column holds no
+    /// rows. That is a superseded generation, and replacing it is the
     /// behaviour hot reload depends on.
     #[test]
     fn a_same_name_registration_over_an_empty_column_still_succeeds() {
@@ -568,10 +596,10 @@ mod tests {
         );
     }
 
-    /// The same collision shape as the peer test above - same name, different
-    /// id, live rows - but announced by the host as the retiring generation.
-    /// That registration is the predecessor and must replace the entries, which
-    /// is the case every project reload runs through.
+    /// The same collision shape as the peer test above (same name, different
+    /// id, live rows), but here the host announces the name as the retiring
+    /// generation's. That registration is the predecessor, and replacing its
+    /// entries is the path every project reload runs through.
     #[test]
     fn an_announced_name_replaces_its_live_predecessor() {
         let mut world = World::new();
@@ -595,13 +623,13 @@ mod tests {
         assert!(!world.persist_serializers.contains_key(&predecessor_id));
         assert!(world.persist_serializers.contains_key(&successor_id));
         assert!(world.persist_inserters.contains_key(&successor_id));
-        // The predecessor's rows are untouched: rehoming them is the reload's
-        // step, not the registry's.
+        // The predecessor's rows are untouched. Moving them to the successor
+        // is the reload's job, not the registry's.
         assert_eq!(world.live_row_count(predecessor_id), 1);
 
-        // The announcement was consumed with that one registration. With the
-        // successor now holding a row of its own, the same arrival the mark
-        // permitted a moment ago is refused again.
+        // That one registration used up the announcement. The successor now
+        // holds a row of its own, so the same arrival that the announcement
+        // allowed a moment ago is refused again.
         world
             .create_entity()
             .with(DropTestSupersedingComponent { value: 1 })
@@ -614,22 +642,22 @@ mod tests {
         ));
     }
 
-    // =========================================================================
-    // Retiring drop glue across an in-place migration
-    // =========================================================================
+    // =============================================================================
+    // Retiring destructors across an in-place migration
+    // =============================================================================
 
-    /// Rows dropped by each stand-in's glue, so a migration can be asked
-    /// *which* generation's destructor released the old values.
-    static RETIRING_GLUE_DROPS: std::sync::atomic::AtomicUsize =
+    /// How many rows each stand-in's destructor has dropped. A migration test
+    /// reads these counters to tell which generation released the old values.
+    static RETIRING_GLUE_DROP_COUNT: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
-    static ARRIVING_GLUE_DROPS: std::sync::atomic::AtomicUsize =
+    static ARRIVING_GLUE_DROP_COUNT: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
     /// The retiring generation of a shared persistable type.
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct RetiringGlueComponent {
-        // The field carries the shape the serde row and the size check see;
-        // the drop accounting never reads it.
+        // The field gives the type the shape its serde row and the size check
+        // see. The drop counter never reads it.
         #[allow(dead_code)]
         value: u32,
     }
@@ -640,15 +668,15 @@ mod tests {
     }
     impl Drop for RetiringGlueComponent {
         fn drop(&mut self) {
-            RETIRING_GLUE_DROPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            RETIRING_GLUE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
-    /// The arriving generation: same declared name and shape, different glue.
+    /// The arriving generation: the same declared name and shape, but a
+    /// different destructor.
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct ArrivingGlueComponent {
-        // Same shape as the retiring copy; nothing reads the value here
-        // either.
+        // Same shape as the retiring copy. Nothing reads this value either.
         #[allow(dead_code)]
         value: u32,
     }
@@ -659,14 +687,14 @@ mod tests {
     }
     impl Drop for ArrivingGlueComponent {
         fn drop(&mut self) {
-            ARRIVING_GLUE_DROPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ARRIVING_GLUE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
-    /// The in-place migration drops old-layout rows through the glue that wrote
-    /// them. The sequence it defends against: the arriving generation's
-    /// registration replaces the factory, `rehome_native_columns` stamps the
-    /// arriving table onto the still-old column, and only then does the
+    /// The in-place migration drops old-layout rows through the destructor
+    /// that allocated them. The dangerous order is: the arriving generation's
+    /// registration replaces the factory, `rehome_native_columns` points the
+    /// still-old column at the arriving function table, and only then does the
     /// migration consume that column.
     #[test]
     fn in_place_migration_drops_old_rows_through_the_retiring_glue() {
@@ -689,50 +717,50 @@ mod tests {
 
         // Capture the retiring generation's serializer while it is still the
         // registered one, then stand in for the rebuilt image's registration.
-        let serialize_old = world.persist_serializers[&component_id];
+        let serialize_retiring_component = world.persist_serializers[&component_id];
         world.register_persistable_component::<ArrivingGlueComponent>();
-        let serialize_current = world.persist_serializers[&component_id];
-        let deserialize_new = world.persist_deserializers[&type_name];
-        let insert_new = world.persist_inserters[&component_id];
+        let serialize_current_component = world.persist_serializers[&component_id];
+        let deserialize_current_component = world.persist_deserializers[&type_name];
+        let insert_current_component = world.persist_inserters[&component_id];
 
-        // The re-home the reload runs before migration stamps the arriving
-        // generation's table onto the old column - the state that produced the
-        // invalid free.
+        // The re-home the reload runs before migration points the old column
+        // at the arriving generation's function table. The migration must
+        // still release the old rows through the retiring destructor.
         world.rehome_native_columns();
 
-        let retiring_before = RETIRING_GLUE_DROPS.load(Ordering::SeqCst);
-        let arriving_before = ARRIVING_GLUE_DROPS.load(Ordering::SeqCst);
-        let migrated = world
+        let retiring_glue_drop_count_before = RETIRING_GLUE_DROP_COUNT.load(Ordering::SeqCst);
+        let arriving_glue_drop_count_before = ARRIVING_GLUE_DROP_COUNT.load(Ordering::SeqCst);
+        let migrated_row_count = world
             .migrate_component_column_in_place(
                 component_id,
-                serialize_old,
-                serialize_current,
-                deserialize_new,
-                insert_new,
+                serialize_retiring_component,
+                serialize_current_component,
+                deserialize_current_component,
+                insert_current_component,
                 None,
             )
             .expect("the in-place migration runs on a native column");
-        assert_eq!(migrated, 1);
+        assert_eq!(migrated_row_count, 1);
 
         assert_eq!(
-            RETIRING_GLUE_DROPS.load(Ordering::SeqCst),
-            retiring_before + 1,
+            RETIRING_GLUE_DROP_COUNT.load(Ordering::SeqCst),
+            retiring_glue_drop_count_before + 1,
             "the old row is released by the generation that allocated it"
         );
-        // `deserialize_component` materializes a `T::default()` schema baseline
-        // per row, and that baseline is dropped through the arriving type's
-        // glue. One row was migrated, so exactly one arriving drop is the
-        // baseline - the old row itself must not be among them.
+        // `deserialize_component` builds a `T::default()` schema baseline per
+        // row, and that baseline is dropped by the arriving type's destructor.
+        // One row was migrated, so exactly one arriving drop is the baseline;
+        // the old row itself must not be among them.
         assert_eq!(
-            ARRIVING_GLUE_DROPS.load(Ordering::SeqCst),
-            arriving_before + 1,
+            ARRIVING_GLUE_DROP_COUNT.load(Ordering::SeqCst),
+            arriving_glue_drop_count_before + 1,
             "the arriving glue released only its own schema baseline, never the old row"
         );
     }
 
     /// Re-registering a persistable type while its own column holds rows is
-    /// the ordinary hot-reload path and must not trip the peer guard: the
-    /// guard only looks at *other* component ids.
+    /// the ordinary hot-reload path and must not trip the peer guard, which
+    /// only looks at *other* component ids.
     #[test]
     fn re_registering_the_same_type_over_live_rows_is_not_a_collision() {
         let mut world = World::new();
@@ -750,9 +778,9 @@ mod tests {
         );
     }
 
-    // =========================================================================
+    // =============================================================================
     // Name resolution
-    // =========================================================================
+    // =============================================================================
 
     /// A name claimed by exactly one registration resolves to it, through both
     /// the persistable-filtered resolver and the unfiltered one.
@@ -774,8 +802,9 @@ mod tests {
     }
 
     /// A name claimed by two registrations is reported as ambiguous instead of
-    /// being resolved by a bit-index tiebreak: the bit index is not a recency
-    /// ordering, so picking one could bind callers to the wrong column.
+    /// being resolved by a bit-index tiebreak. The bit index does not record
+    /// which registration is newer, so picking one could bind callers to the
+    /// wrong column.
     #[test]
     fn a_name_claimed_twice_resolves_to_an_ambiguity_error() {
         let mut world = World::new();
@@ -784,8 +813,8 @@ mod tests {
             crate::type_names::stable_type_name::<DropTestForgottenComponent>().to_string();
 
         // The native column is empty, so a second claim on the name registers
-        // (see the empty-column test above) and both are now visible to the
-        // unfiltered resolver.
+        // (see the empty-column test above). Both registrations are now
+        // visible to the unfiltered resolver.
         world
             .register_component_descriptor(
                 0x5EED,
@@ -837,11 +866,13 @@ mod tests {
             None
         );
     }
-    // =========================================================================
-    // Resource persistence
-    // =========================================================================
 
-    /// An ordinary project resource: private identity, serde-able shape.
+    // =============================================================================
+    // Resource persistence
+    // =============================================================================
+
+    /// An ordinary project resource: registered under its Rust type path, not
+    /// a shared name, with a shape serde can handle.
     #[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
     struct PersistProbeScore {
         points: u32,
@@ -849,43 +880,46 @@ mod tests {
     }
     impl crate::resource::Resource for PersistProbeScore {}
 
-    /// A resource registered without persistence, to pin the opt-in.
+    /// A resource that is registered but not for persistence, so the opt-in
+    /// stays pinned.
     #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
     struct PersistProbeOpaque {
         counter: u32,
     }
     impl crate::resource::Resource for PersistProbeOpaque {}
 
-    /// Two builds of one resource, the second a field wider.
+    /// The first build of the settings resource, which stores only `volume`.
     ///
     /// The test process cannot rebuild itself, so a reload is modelled the way
-    /// the component suite models it: two distinct Rust types registered under
+    /// the component tests model it: two distinct Rust types registered under
     /// one persistence name. A real reload produces exactly this state - the
     /// arriving build is a different type to this process, and the name is the
     /// only thing the two generations agree on.
     ///
-    /// Deliberately *not* shared resources: a shared name is claimed by one
-    /// declaring type and one layout, so two types could never both hold it.
-    /// The persistence name is a separate string for precisely this reason.
+    /// These are deliberately not shared resources. A shared name is claimed
+    /// by one declaring type with one layout, so two types could never both
+    /// hold it, which is why the two builds use a separate persistence name.
     #[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-    struct PersistProbeSettingsV1 {
+    struct PersistProbeVolumeSettings {
         volume: f32,
     }
-    impl crate::resource::Resource for PersistProbeSettingsV1 {}
+    impl crate::resource::Resource for PersistProbeVolumeSettings {}
 
+    /// The arriving build of the settings resource: the same persistence name,
+    /// one field wider.
     #[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-    struct PersistProbeSettingsV2 {
+    struct PersistProbeVolumeBrightnessSettings {
         volume: f32,
         brightness: f32,
     }
-    impl crate::resource::Resource for PersistProbeSettingsV2 {}
+    impl crate::resource::Resource for PersistProbeVolumeBrightnessSettings {}
 
     /// The persistence name both builds of the settings resource register under.
     const PROBE_SETTINGS_NAME: &str = "probe::Settings";
 
-    /// A registered resource's value survives a snapshot and restore: without
-    /// the resource lane a saved world comes back with every resource missing
-    /// while looking complete.
+    /// A registered resource's value survives a snapshot and a restore.
+    /// Without the resource half of persistence, a loaded world comes back
+    /// with every resource missing while looking complete.
     #[test]
     fn a_persistable_resource_round_trips_through_a_snapshot() {
         let mut world = World::new();
@@ -898,7 +932,7 @@ mod tests {
         let snapshot = world.snapshot_resources();
         assert_eq!(snapshot.resource_count(), 1, "the resource was captured");
 
-        // A fresh world stands in for the loading process: it declares the
+        // A fresh world stands in for the loading process. It declares the
         // resource but has never been given a value.
         let mut loaded = World::new();
         loaded.register_persistable_resource::<PersistProbeScore>();
@@ -972,23 +1006,26 @@ mod tests {
         );
     }
 
-    /// A field added since the snapshot arrives at the new type's default.
+    /// A field added since the snapshot takes the new type's default value.
     #[test]
     fn a_field_added_since_the_resource_snapshot_restores_defaulted() {
         let mut world = World::new();
-        world.register_persistable_resource_as::<PersistProbeSettingsV1>(PROBE_SETTINGS_NAME);
-        world.insert_resource(PersistProbeSettingsV1 { volume: 0.75 });
+        world.register_persistable_resource_as::<PersistProbeVolumeSettings>(PROBE_SETTINGS_NAME);
+        world.insert_resource(PersistProbeVolumeSettings { volume: 0.75 });
         let snapshot = world.snapshot_resources();
 
         // The next build of the same resource, one field wider, registered
         // under the same persistence name.
         let mut loaded = World::new();
-        loaded.register_persistable_resource_as::<PersistProbeSettingsV2>(PROBE_SETTINGS_NAME);
+        loaded
+            .register_persistable_resource_as::<PersistProbeVolumeBrightnessSettings>(
+                PROBE_SETTINGS_NAME,
+            );
         loaded.restore_resources(&snapshot);
 
         assert_eq!(
-            loaded.get_resource::<PersistProbeSettingsV2>(),
-            Some(&PersistProbeSettingsV2 {
+            loaded.get_resource::<PersistProbeVolumeBrightnessSettings>(),
+            Some(&PersistProbeVolumeBrightnessSettings {
                 volume: 0.75,
                 brightness: 0.0,
             }),
@@ -1053,37 +1090,40 @@ mod tests {
         );
     }
 
-    /// A snapshot is byte-reproducible across two identical captures.
+    /// A snapshot comes out in name order, which is what makes two identical
+    /// captures byte-reproducible.
     #[test]
     fn a_resource_snapshot_is_ordered_by_name() {
         let mut world = World::new();
         world.register_persistable_resource::<PersistProbeScore>();
-        world.register_persistable_resource_as::<PersistProbeSettingsV1>(PROBE_SETTINGS_NAME);
+        world.register_persistable_resource_as::<PersistProbeVolumeSettings>(PROBE_SETTINGS_NAME);
         world.insert_resource(PersistProbeScore::default());
-        world.insert_resource(PersistProbeSettingsV1::default());
+        world.insert_resource(PersistProbeVolumeSettings::default());
 
-        let names: Vec<String> = world
+        let snapshot_names: Vec<String> = world
             .snapshot_resources()
             .entries
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        let mut sorted = names.clone();
-        sorted.sort();
-        assert_eq!(names, sorted, "entries come out in name order");
+        let mut sorted_snapshot_names = snapshot_names.clone();
+        sorted_snapshot_names.sort();
+        assert_eq!(
+            snapshot_names, sorted_snapshot_names,
+            "entries come out in name order"
+        );
     }
 
-    /// A reshaped resource is migrated across a reload rather than
-    /// reinterpreted.
+    /// A reshaped resource is migrated across a reload, not reinterpreted.
     ///
-    /// `rehome_resources` swaps a live resource's function table but never its
-    /// bytes, so without this pass the arriving generation would read the old
-    /// value's memory through the new shape.
+    /// `rehome_resources` gives a live resource the arriving function table
+    /// but leaves its bytes alone. Without this pass, the arriving generation
+    /// would read the old value's memory through the new shape.
     #[test]
     fn a_reshaped_resource_is_migrated_across_a_reload() {
         let mut world = World::new();
-        world.register_persistable_resource_as::<PersistProbeSettingsV1>(PROBE_SETTINGS_NAME);
-        world.insert_resource(PersistProbeSettingsV1 { volume: 0.5 });
+        world.register_persistable_resource_as::<PersistProbeVolumeSettings>(PROBE_SETTINGS_NAME);
+        world.insert_resource(PersistProbeVolumeSettings { volume: 0.5 });
 
         // What the host captures immediately before the swap.
         let previous_manifest = world.persist_resource_manifest();
@@ -1091,13 +1131,20 @@ mod tests {
 
         // The arriving generation registers the wider shape under the same
         // persistence name, which supersedes the outgoing build's entries.
-        world.register_persistable_resource_as::<PersistProbeSettingsV2>(PROBE_SETTINGS_NAME);
-        let migrated = world.migrate_changed_persistable_resources(&previous_manifest);
+        world
+            .register_persistable_resource_as::<PersistProbeVolumeBrightnessSettings>(
+                PROBE_SETTINGS_NAME,
+            );
+        let migrated_resource_names =
+            world.migrate_changed_persistable_resources(&previous_manifest);
 
-        assert_eq!(migrated, vec![PROBE_SETTINGS_NAME.to_string()]);
         assert_eq!(
-            world.get_resource::<PersistProbeSettingsV2>(),
-            Some(&PersistProbeSettingsV2 {
+            migrated_resource_names,
+            vec![PROBE_SETTINGS_NAME.to_string()]
+        );
+        assert_eq!(
+            world.get_resource::<PersistProbeVolumeBrightnessSettings>(),
+            Some(&PersistProbeVolumeBrightnessSettings {
                 volume: 0.5,
                 brightness: 0.0,
             }),
@@ -1109,12 +1156,12 @@ mod tests {
     #[test]
     fn an_unchanged_resource_is_not_migrated() {
         let mut world = World::new();
-        world.register_persistable_resource_as::<PersistProbeSettingsV1>(PROBE_SETTINGS_NAME);
-        world.insert_resource(PersistProbeSettingsV1 { volume: 0.25 });
+        world.register_persistable_resource_as::<PersistProbeVolumeSettings>(PROBE_SETTINGS_NAME);
+        world.insert_resource(PersistProbeVolumeSettings { volume: 0.25 });
 
         let previous_manifest = world.persist_resource_manifest();
-        // The same shape re-registers, as an unedited reload does.
-        world.register_persistable_resource_as::<PersistProbeSettingsV1>(PROBE_SETTINGS_NAME);
+        // The same shape registers again, as an unedited reload does.
+        world.register_persistable_resource_as::<PersistProbeVolumeSettings>(PROBE_SETTINGS_NAME);
 
         assert!(
             world
@@ -1123,28 +1170,33 @@ mod tests {
             "an unchanged schema takes the fast path"
         );
         assert_eq!(
-            world.get_resource::<PersistProbeSettingsV1>(),
-            Some(&PersistProbeSettingsV1 { volume: 0.25 }),
+            world.get_resource::<PersistProbeVolumeSettings>(),
+            Some(&PersistProbeVolumeSettings { volume: 0.25 }),
             "and the value is left exactly as it was"
         );
     }
 
     /// Changing only a default *value* is not a schema change.
     ///
-    /// The hash normalizes values to kind markers, so editing a literal in a
-    /// `Default` impl does not cost every player their stored settings.
+    /// The schema hash keeps only the kind of each value (string, number,
+    /// array, ...), so editing a literal in a `Default` impl does not make
+    /// every stored value look reshaped.
     #[test]
     fn a_changed_default_value_does_not_count_as_a_reshape() {
         let mut world = World::new();
-        world.register_persistable_resource_as::<PersistProbeSettingsV1>(PROBE_SETTINGS_NAME);
-        world.insert_resource(PersistProbeSettingsV1 { volume: 0.9 });
-        let first = world.persist_resource_manifest();
+        world.register_persistable_resource_as::<PersistProbeVolumeSettings>(PROBE_SETTINGS_NAME);
+        world.insert_resource(PersistProbeVolumeSettings { volume: 0.9 });
+        let first_world_manifest = world.persist_resource_manifest();
 
-        let mut other = World::new();
-        other.register_persistable_resource_as::<PersistProbeSettingsV1>(PROBE_SETTINGS_NAME);
-        let second = other.persist_resource_manifest();
+        let mut other_world = World::new();
+        other_world
+            .register_persistable_resource_as::<PersistProbeVolumeSettings>(PROBE_SETTINGS_NAME);
+        let second_world_manifest = other_world.persist_resource_manifest();
 
-        assert_eq!(first[0].schema_hash, second[0].schema_hash);
+        assert_eq!(
+            first_world_manifest[0].schema_hash,
+            second_world_manifest[0].schema_hash
+        );
     }
 
     /// A component whose own `Serialize` refuses every value.
@@ -1165,10 +1217,11 @@ mod tests {
 
     /// A refused serialization reports `None` instead of aborting the reload.
     ///
-    /// The migration reads every row through this glue, and its inverse already
-    /// reports a type it cannot decode as a skipped type. A type it cannot
-    /// encode must reach that same report: the panic this replaced fired inside
-    /// the transaction, after earlier archetypes of the type had been swapped.
+    /// The migration reads every row through this function, and its inverse
+    /// already reports a type it cannot decode as a skipped type. A type it
+    /// cannot encode must reach the same report: a panic here would abort the
+    /// transaction after earlier archetypes of the type had already been
+    /// swapped.
     #[test]
     fn a_refusing_serializer_reports_none_instead_of_panicking() {
         let mut world = World::new();
@@ -1180,7 +1233,7 @@ mod tests {
             .expect("the entity builds");
 
         let component_id = ComponentId::of::<RefusingSerializeComponent>();
-        let mut serialized = None;
+        let mut serialize_answer = None;
         for archetype in world.archetypes_iter() {
             if archetype.component_types.contains(&component_id) {
                 let column = archetype
@@ -1191,14 +1244,14 @@ mod tests {
                     7,
                     "the row the glue refused to encode is the one this test wrote"
                 );
-                serialized = Some(super::components::serialize_component::<
+                serialize_answer = Some(super::components::serialize_component::<
                     RefusingSerializeComponent,
                 >(&archetype.component_storages, 0));
             }
         }
 
         assert!(
-            matches!(serialized, Some(None)),
+            matches!(serialize_answer, Some(None)),
             "a refused serialization is a report, not a panic"
         );
     }

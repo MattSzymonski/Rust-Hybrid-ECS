@@ -1,27 +1,31 @@
-//! The Assets pipeline: the dialogs' state and the recorded file batches
-//! the toolbar, the dialogs and the scripted channel queue.
+//! The Assets pipeline: the state the create and rename dialogs edit, and the
+//! recorded file batches the menus, the dialogs and the scripted channel
+//! queue.
 //!
 //! # Responsibilities
 //!
-//! - [`AssetDialog`]: the state the create and rename dialogs edit while
-//!   one is open, owned by the session so it survives shell reloads.
+//! - [`AssetDialog`]: the state the create and rename dialogs edit while one
+//!   is open, owned by the session so it survives shell reloads.
 //! - The open, submit and cancel helpers every entry point shares - the
-//!   toolbar buttons, the dialog windows and the scripted channel - so each
-//!   action takes one path and logs one token set.
-//! - The immediate toolbar actions: [`queue_delete`], [`queue_write_meta`] and
-//!   [`queue_move`], each a recorded [`EditorCommand`] batch.
-//! - [`reveal_target`]: the absolute path a "show in the file manager"
-//!   request opens, refused when it would leave the asset directory.
+//!   menus, the dialog windows and the scripted channel - so each action
+//!   takes one path and logs one token set.
+//! - The enablement predicates [`can_delete`] and [`can_write_meta`], and the
+//!   acting functions [`delete_selection`] and [`write_meta_selection`] that
+//!   ask them the same question.
+//! - The file actions that queue one recorded [`EditorCommand`] batch each:
+//!   [`queue_delete`], [`queue_write_meta`] and [`queue_move`].
+//! - [`reveal_target`] and [`reveal_target_in`]: the absolute path a "show in
+//!   the file manager" request opens, refused when it would leave the root.
 //!
 //! # Design
 //!
-//! The dialogs are egui windows drawn by the shell; the file work is
-//! [`EditorCommand`](crate::EditorCommand)'s asset commands, applied by the
-//! executable at the frame boundary and recorded in the history. Nothing here
-//! touches the engine: the batches land in [`PendingEditorCommands`] and the
-//! executable's drain does the rest. A reveal is the one exception: nothing in
-//! the world changes, so the shell queues it beside the batches and the
-//! executable opens the folder.
+//! The dialogs are egui windows drawn by the shell. File edits are
+//! [`EditorCommand`](crate::EditorCommand)'s asset commands: this module
+//! queues them in [`PendingEditorCommands`], and the frame boundary applies
+//! them and records them in the undo history. Nothing here changes the world
+//! directly. A reveal is the only action that is not a command: it asks the
+//! executable to open a folder, so the shell puts the path in the same queue
+//! as a plain request.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -34,12 +38,17 @@ use crate::browser;
 use crate::commands::PendingEditorCommands;
 use crate::editor_state::{AssetListing, EditorCommand, EditorSelection, StandaloneTypeInfo};
 
-/// The asset dialog that is open, if one is.
+// =============================================================================
+// Types
+// =============================================================================
+
+/// The asset dialog that is open, if any.
 ///
-/// The create dialog carries its choice, its name and its target folder;
-/// the rename dialog the current path and the typed name. The state lives
-/// in [`crate::session::EguiShellState::asset_dialog`], so a shell reload
-/// keeps an open dialog exactly as it was.
+/// The create variant holds the type, folder and name the dialog will write,
+/// plus the answer to a file of that name already existing. The rename
+/// variant holds the current path and the typed name. The state lives in
+/// [`crate::session::EguiShellState::asset_dialog`], so a shell reload keeps
+/// an open dialog exactly as it was.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AssetDialog {
     /// The create dialog: a standalone type, a name and the destination
@@ -54,13 +63,16 @@ pub enum AssetDialog {
         name: String,
         /// What confirming writes.
         kind: CreateKind,
-        /// Set once the person confirmed an existing name: `Some(true)` keeps
-        /// that file's guid, `Some(false)` writes a fresh one.
+        /// The answer to a file of that name already existing: `Some(true)`
+        /// keeps that file's guid, `Some(false)` writes a fresh one, and
+        /// `None` means the person has not answered yet.
         overwrite: Option<bool>,
     },
     /// The rename dialog: the path being renamed and the typed new name.
     Rename {
-        /// The asset's current path, relative to the asset directory.
+        /// The asset's current path, as the listing reported it: relative to
+        /// the project's asset directory for a project row. The recorded move
+        /// resolves the new path below that directory.
         from: String,
         /// The typed new name; the file keeps its extension.
         name: String,
@@ -78,8 +90,12 @@ pub enum CreateKind {
     SaveWorld,
 }
 
-/// The selected asset's row, when the selection names one the snapshot
-/// still holds.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns the selected asset's listing row, or `None` when no asset is
+/// selected or the snapshot no longer lists it.
 pub fn selected_row<'a>(
     selection: &EditorSelection,
     assets: &'a [AssetListing],
@@ -88,14 +104,15 @@ pub fn selected_row<'a>(
     assets.iter().find(|row| row.key() == key)
 }
 
-/// Whether `key` names an extension's resource tree - the extensions root
-/// itself, one module's root row, or anything below them.
+/// Returns whether `key` names an extension's resource tree: the extensions
+/// root itself, one module's root row, or anything below them.
 ///
-/// An extension's resources are listed and inspected, never written: the
-/// toolbar, the grid's strip and the row menus ask this before they offer a
-/// mutation. Everything under the root is read-only whatever rows the listing
-/// happens to hold, so a module that just loaded or unloaded cannot open a
-/// window where a write would be offered.
+/// An extension's resources are listed and inspected, never written. The
+/// create dialog and a folder's menu ask this before they offer to create
+/// something there; the file actions ask the row's own `read_only` flag for
+/// the same reason. Everything under the root counts as read-only whatever
+/// rows the listing happens to hold, so a module that has just loaded or
+/// unloaded still never offers a write.
 pub fn is_read_only_key(assets: &[AssetListing], key: &str) -> bool {
     if crate::browser::root_of(key).read_only {
         return true;
@@ -107,15 +124,20 @@ pub fn is_read_only_key(assets: &[AssetListing], key: &str) -> bool {
         .any(|read_only_key| read_only_key == key || key.starts_with(&format!("{read_only_key}/")))
 }
 
-/// Open the create dialog: the target folder follows the selection (the
-/// folder itself, the selected file's folder, or the root) and the first
-/// standalone type stands preselected.
+/// Opens the create dialog with the first registered standalone type
+/// selected.
+///
+/// The target folder follows the selection: a selected folder is the target, a
+/// selected file's folder is, and with nothing selected it is the root. A
+/// target inside a module's read-only resource tree is refused with a warning,
+/// and the dialog stays closed.
 pub fn open_create(
     dialog: &mut Option<AssetDialog>,
     selection: &EditorSelection,
     assets: &[AssetListing],
     types: &[StandaloneTypeInfo],
 ) {
+    // Step 1: work out the target folder from the selection.
     let folder = match assets
         .iter()
         .find(|row| Some(row.key().as_str()) == selection.asset.as_deref())
@@ -129,8 +151,8 @@ pub fn open_create(
         }
         None => String::new(),
     };
-    // Nothing is created inside a module's resources: the dialog would offer a
-    // file the drain refuses.
+    // Step 2: refuse a target inside a module's resources, because the create
+    // would be refused when it runs.
     if is_read_only_key(assets, &folder) {
         pill_core::warn!(
             target: telemetry_target::ECS,
@@ -139,6 +161,7 @@ pub fn open_create(
         );
         return;
     }
+    // Step 3: seed the dialog and report that it opened.
     let type_name = types
         .first()
         .map(|info| info.type_name.clone())
@@ -158,13 +181,15 @@ pub fn open_create(
     );
 }
 
-/// Open the create dialog for a scene: the same window a material or a pass is
-/// created in, with the scene type chosen and the folder following the
-/// selection.
+/// Opens the create dialog for a scene, with the scene type already chosen.
 ///
-/// `kind` says what confirming writes - an empty scene (the Create menu's row)
-/// or the current world (Save Scene As) - and nothing touches the world until
-/// the step runs, so cancelling leaves the open scene as it was.
+/// It is the same window a material or a pass is created in, and the target
+/// folder follows the selection the same way. `kind` says what confirming
+/// writes: an empty scene (the Create menu's row) or the current world (Save
+/// Scene As). Neither touches the world until the queued step runs, so
+/// cancelling leaves the open scene as it was.
+///
+/// A project with no scene type registered gets a warning and no dialog.
 pub fn open_create_scene(
     dialog: &mut Option<AssetDialog>,
     selection: &EditorSelection,
@@ -185,12 +210,12 @@ pub fn open_create_scene(
     open_create(dialog, selection, assets, types);
     if let Some(AssetDialog::Create {
         type_name,
-        kind: chosen,
+        kind: chosen_kind,
         ..
     }) = dialog.as_mut()
     {
         *type_name = scene_type.type_name.clone();
-        *chosen = kind;
+        *chosen_kind = kind;
     }
     pill_core::info!(
         target: telemetry_target::ECS,
@@ -199,10 +224,13 @@ pub fn open_create_scene(
     );
 }
 
-/// The path a create would write, when the name already exists: the dialog
-/// asks before it replaces anything.
+/// Returns the path a create would write when a file is already there, so the
+/// dialog can ask before it replaces one.
 ///
-/// `None` when the type or name is incomplete, or when nothing is in the way.
+/// `None` when the dialog is not a create, when its type is missing, when the
+/// name is missing or fails the type's naming rules, or when nothing is in the
+/// way. Only the project's own tree is compared, because that is where the
+/// create writes.
 pub fn create_collision(
     dialog: &AssetDialog,
     types: &[StandaloneTypeInfo],
@@ -224,11 +252,11 @@ pub fn create_collision(
         .iter()
         .find(|info| info.type_name == *type_name)
         .map(|info| info.extension.clone())?;
-    let file = pill_engine::asset_metadata::standalone_file_name(name, &extension).ok()?;
+    let file_name = pill_engine::asset_metadata::standalone_file_name(name, &extension).ok()?;
     let path = if folder.is_empty() {
-        file
+        file_name
     } else {
-        format!("{folder}/{file}")
+        format!("{folder}/{file_name}")
     };
     assets
         .iter()
@@ -236,8 +264,10 @@ pub fn create_collision(
         .then_some(path)
 }
 
-/// Open the rename dialog for the selected file; the name field arrives
-/// with the file's stem in it.
+/// Opens the rename dialog for the selected file, with the file's stem already
+/// in the name field.
+///
+/// A folder, or a selection that names no file, gets a warning and no dialog.
 pub fn open_rename(
     dialog: &mut Option<AssetDialog>,
     selection: &EditorSelection,
@@ -264,17 +294,18 @@ pub fn open_rename(
     );
 }
 
-/// The create dialog's Create button: queue the recorded step and close the
-/// dialog; a missing type or name warns and keeps it open.
+/// Runs the create dialog's submit button: queues the recorded step and closes
+/// the dialog.
 ///
-/// What the step is depends on what the dialog was opened for: a standalone
-/// asset's default document, an empty scene, or the current world saved as a
-/// scene. A scene step only touches the world once it runs, so cancelling the
-/// dialog leaves the current scene exactly as it was.
+/// A missing type or name warns and leaves the dialog open. What the step is
+/// depends on what the dialog was opened for: a standalone asset's default
+/// document, a new empty scene, or the current world saved as a scene. Every
+/// kind queues commands, so the world and the files change only when they run.
 pub fn submit_create(
     dialog: &mut Option<AssetDialog>,
     pending: &mut PendingEditorCommands,
 ) -> bool {
+    // Step 1: the dialog must exist and name a type and a file.
     let Some(AssetDialog::Create {
         folder,
         type_name,
@@ -296,6 +327,7 @@ pub fn submit_create(
         );
         return false;
     }
+    // Step 2: queue the recorded step the dialog was opened for.
     let folder = folder.clone();
     let type_name = type_name.clone();
     let name = name.clone();
@@ -327,34 +359,39 @@ pub fn submit_create(
         };
         pending.push_recorded(commands, label, None);
     }
+    // Step 3: report the command and close the dialog.
     pill_core::info!(
         target: telemetry_target::ECS,
         type_name = type_name.as_str(),
         name = name.as_str(),
         "[editor] asset create queued"
     );
-    close(dialog, "create");
+    close_dialog(dialog, "create");
     true
 }
 
-/// The path a scene create writes: the dialog's folder and the typed name with
-/// the scene extension.
+/// Returns the path a scene create writes: the dialog's folder plus the typed
+/// name with the scene extension.
 fn scene_path(folder: &str, name: &str) -> String {
-    let file = crate::scene_workflow::scene_file_name(name);
+    let file_name = crate::scene_workflow::scene_file_name(name);
     if folder.is_empty() {
-        file
+        file_name
     } else {
-        format!("{folder}/{file}")
+        format!("{folder}/{file_name}")
     }
 }
 
-/// The rename dialog's Rename button: build the new path from the typed
-/// name - the extension stays - queue the recorded move and close the
-/// dialog.
+/// Runs the rename dialog's submit button: builds the new path from the typed
+/// name, queues the recorded move and closes the dialog.
+///
+/// The extension stays with the file unless the typed name already ends with
+/// it. An empty name, or one containing a path separator, warns and leaves the
+/// dialog open.
 pub fn submit_rename(
     dialog: &mut Option<AssetDialog>,
     pending: &mut PendingEditorCommands,
 ) -> bool {
+    // Step 1: the dialog must exist and name something.
     let Some(AssetDialog::Rename { from, name }) = dialog.as_ref() else {
         pill_core::warn!(
             target: telemetry_target::ECS,
@@ -363,53 +400,53 @@ pub fn submit_rename(
         return false;
     };
     let from = from.clone();
-    let typed = name.trim().to_string();
-    if from.is_empty() || typed.is_empty() {
+    let typed_name = name.trim().to_string();
+    if from.is_empty() || typed_name.is_empty() {
         pill_core::warn!(
             target: telemetry_target::ECS,
             "[editor] rename asset needs a name"
         );
         return false;
     }
-    if typed.contains(['/', '\\']) {
+    if typed_name.contains(['/', '\\']) {
         pill_core::warn!(
             target: telemetry_target::ECS,
-            name = typed.as_str(),
+            name = typed_name.as_str(),
             "[editor] rename asset refuses a path separator"
         );
         return false;
     }
-    // The extension stays with the file unless the typed name already ends
-    // with it.
+    // Step 2: work out the new file name and the path it moves to.
     let file_name = from.rsplit('/').next().unwrap_or(&from);
     let extension = file_name
         .split_once('.')
         .map(|(_, extension)| extension.to_owned());
-    let new_file = match &extension {
+    let new_file_name = match &extension {
         Some(extension)
-            if !typed
+            if !typed_name
                 .to_ascii_lowercase()
                 .ends_with(&extension.to_ascii_lowercase()) =>
         {
-            format!("{typed}.{extension}")
+            format!("{typed_name}.{extension}")
         }
-        _ => typed.clone(),
+        _ => typed_name.clone(),
     };
     let folder = from
         .rsplit_once('/')
         .map(|(folder, _)| folder.to_string())
         .unwrap_or_default();
     let to = if folder.is_empty() {
-        new_file.clone()
+        new_file_name.clone()
     } else {
-        format!("{folder}/{new_file}")
+        format!("{folder}/{new_file_name}")
     };
+    // Step 3: queue the move, report it and close the dialog.
     pending.push_recorded(
         vec![EditorCommand::MoveAssetFile {
             from: from.clone(),
             to: to.clone(),
         }],
-        format!("rename asset {new_file}"),
+        format!("rename asset {new_file_name}"),
         None,
     );
     pill_core::info!(
@@ -418,29 +455,29 @@ pub fn submit_rename(
         to = to.as_str(),
         "[editor] asset rename queued"
     );
-    close(dialog, "rename");
+    close_dialog(dialog, "rename");
     true
 }
 
-/// Close the open dialog, whatever it is; `false` when none was open.
+/// Closes the open dialog, create or rename, and returns whether one was open.
 pub fn cancel(dialog: &mut Option<AssetDialog>) -> bool {
-    let Some(current) = dialog.as_ref() else {
+    let Some(open_dialog) = dialog.as_ref() else {
         return false;
     };
-    let kind = match current {
+    let dialog_kind = match open_dialog {
         AssetDialog::Create { .. } => "create",
         AssetDialog::Rename { .. } => "rename",
     };
     *dialog = None;
     pill_core::info!(
         target: telemetry_target::ECS,
-        dialog = kind,
+        dialog = dialog_kind,
         "[editor] asset dialog closed"
     );
     true
 }
 
-/// Queue the recorded delete for `path` (the file and its `.meta` sidecar).
+/// Queues the recorded delete of `path`: the file and its `.meta` sidecar.
 pub fn queue_delete(pending: &mut PendingEditorCommands, path: &str) {
     pending.push_recorded(
         vec![EditorCommand::DeleteAssetFile {
@@ -456,7 +493,8 @@ pub fn queue_delete(pending: &mut PendingEditorCommands, path: &str) {
     );
 }
 
-/// Queue the recorded `.meta` write for `path`.
+/// Queues the recorded `.meta` write for `path`, which gives a sourced file the
+/// sidecar it is missing.
 pub fn queue_write_meta(pending: &mut PendingEditorCommands, path: &str) {
     pending.push_recorded(
         vec![EditorCommand::WriteAssetMeta {
@@ -472,8 +510,10 @@ pub fn queue_write_meta(pending: &mut PendingEditorCommands, path: &str) {
     );
 }
 
-/// Queue the recorded move of `from` to `to` (the `.meta` sidecar travels
-/// along, so the loaded asset keeps its handle and guid).
+/// Queues the recorded move of `from` to `to`.
+///
+/// The `.meta` sidecar travels with the file, so the loaded asset keeps its
+/// handle and guid.
 pub fn queue_move(pending: &mut PendingEditorCommands, from: &str, to: &str) {
     pending.push_recorded(
         vec![EditorCommand::MoveAssetFile {
@@ -491,30 +531,38 @@ pub fn queue_move(pending: &mut PendingEditorCommands, from: &str, to: &str) {
     );
 }
 
-/// Whether the row is a file a `.meta` sidecar can be written for, ignoring
-/// whether its tree is read-only - the per-row half of
-/// [`can_write_meta`] and of [`write_meta_selection`]'s refusal.
-fn takes_meta(row: &AssetListing) -> bool {
+/// Returns whether the row is a file a `.meta` sidecar can be written for,
+/// ignoring whether its tree is read-only.
+///
+/// A folder has no sidecar, a standalone asset carries its own header, and a
+/// file that already has a sidecar needs no second one. This is the per-row
+/// half of [`can_write_meta`] and of [`write_meta_selection`]'s refusal.
+fn takes_meta_write(row: &AssetListing) -> bool {
     !browser::is_folder(row) && !row.standalone && !row.has_meta
 }
 
-/// Whether the toolbar's Write Asset Meta can act on the selection.
+/// Returns whether the File menu's Write Asset Meta row can act on the
+/// selection: a sourced file without a sidecar, in a tree this editor may
+/// write.
 ///
-/// The one answer the menu row, the assets panel and the scripted path read,
-/// so an enabled row cannot be a write [`write_meta_selection`] refuses.
+/// The menu row and [`write_meta_selection`] read this one answer, so a row
+/// the menu enables is never a write that function refuses.
 pub fn can_write_meta(selection: &EditorSelection, assets: &[AssetListing]) -> bool {
-    selected_row(selection, assets).is_some_and(|row| takes_meta(row) && !row.read_only)
+    selected_row(selection, assets).is_some_and(|row| takes_meta_write(row) && !row.read_only)
 }
 
-/// Whether the toolbar's Delete Asset can act on the selection: a file, in a
-/// tree this editor may write.
+/// Returns whether a file tile's Delete Asset row can act on the selection: a
+/// file, in a tree this editor may write.
 pub fn can_delete(selection: &EditorSelection, assets: &[AssetListing]) -> bool {
     selected_row(selection, assets).is_some_and(|row| !browser::is_folder(row) && !row.read_only)
 }
 
-/// The toolbar's Delete Asset: needs a selected file; refuses (and warns)
-/// otherwise, so the scripted path takes the same rule the button's
-/// enablement does.
+/// Runs Delete Asset: queues the recorded delete of the selected file and
+/// returns whether it queued anything.
+///
+/// A selection that names no file is refused with a warning, and so is a file
+/// in a module's read-only tree. The file tile's menu and the scripted
+/// `toolbar delete` line both land here, so one rule covers them.
 pub fn delete_selection(
     pending: &mut PendingEditorCommands,
     selection: &EditorSelection,
@@ -528,7 +576,7 @@ pub fn delete_selection(
         return false;
     };
     if !can_delete(selection, assets) {
-        // The only remaining refusal once a file is selected.
+        // The row is a file, so a read-only tree is the only refusal left.
         pill_core::warn!(
             target: telemetry_target::ECS,
             path = row.key().as_str(),
@@ -540,14 +588,19 @@ pub fn delete_selection(
     true
 }
 
-/// The toolbar's Write Asset Meta: needs a selected sourced file that has
-/// no sidecar (nor a standalone header) yet.
+/// Runs Write Asset Meta: queues the recorded sidecar write for the selected
+/// sourced file and returns whether it queued anything.
+///
+/// The file must have no sidecar and no standalone header yet, because either
+/// one already carries a guid. A selection that names no such file is refused
+/// with a warning, and so is a file in a module's read-only tree. The File
+/// menu's row and the scripted `toolbar meta` line both land here.
 pub fn write_meta_selection(
     pending: &mut PendingEditorCommands,
     selection: &EditorSelection,
     assets: &[AssetListing],
 ) -> bool {
-    let Some(row) = selected_row(selection, assets).filter(|row| takes_meta(row)) else {
+    let Some(row) = selected_row(selection, assets).filter(|row| takes_meta_write(row)) else {
         pill_core::warn!(
             target: telemetry_target::ECS,
             "[editor] write asset meta needs a sourced file without one"
@@ -555,7 +608,8 @@ pub fn write_meta_selection(
         return false;
     };
     if !can_write_meta(selection, assets) {
-        // The only remaining refusal once a sidecar-less file is selected.
+        // The row takes a sidecar, so a read-only tree is the only refusal
+        // left.
         pill_core::warn!(
             target: telemetry_target::ECS,
             path = row.key().as_str(),
@@ -567,8 +621,11 @@ pub fn write_meta_selection(
     true
 }
 
-/// The destination a dragged file lands at inside `folder`: its own file
-/// name under the folder's path; `None` when the file already lives there.
+/// Returns where a file dragged onto `folder` goes: its own name below the
+/// folder's path.
+///
+/// `None` when the file already lives there, so a drop that changes nothing
+/// queues no command.
 pub fn drop_destination(from: &str, folder: &str) -> Option<String> {
     let file_name = from.rsplit('/').next().unwrap_or(from);
     let to = if folder.is_empty() {
@@ -579,33 +636,36 @@ pub fn drop_destination(from: &str, folder: &str) -> Option<String> {
     (to != from).then_some(to)
 }
 
-/// The absolute path a reveal opens, for a key that may name an extension's
-/// resource.
+/// Returns the absolute path a reveal opens, for a key that may name an
+/// extension's resource.
 ///
 /// A key under the extensions root (`extensions/<module>/<path>`) resolves
 /// below that module's own directory, because a module's resources do not live
-/// under the project's asset directory at all; every other key resolves the way
-/// [`reveal_target`] does. An unknown module is a refusal that names it, since
-/// a row for a module that has since unloaded must not open some other tree.
+/// under the project's asset directory. Every other key resolves the way
+/// [`reveal_target`] does. A module that is no longer loaded is refused with a
+/// message, so a stale row never opens a folder of some other tree.
 ///
 /// # Errors
 ///
-/// A message naming the refusal, which the executable logs instead of opening
-/// anything.
+/// Returns a message naming the refusal when the module is not loaded, when the
+/// path is absolute or climbs out of the module's roots, or when no root holds
+/// the file. The executable logs the message instead of opening anything.
 pub fn reveal_target_in(
     asset_root: &Path,
     module_roots: &[(String, PathBuf)],
     path: &str,
 ) -> Result<PathBuf, String> {
+    // Step 1: a key outside the extensions root is a project path.
     let relative = path.trim().replace('\\', "/");
     let extensions_prefix = format!("{}/", crate::editor_state::EXTENSIONS_ROOT);
     let Some(rest) = relative.strip_prefix(extensions_prefix.as_str()) else {
         return reveal_target(asset_root, path);
     };
     let (module, below) = rest.split_once('/').unwrap_or((rest, ""));
-    // A module may declare several roots (its `res`, its shader sources, the
-    // images it ships); the listing merges them under the module's name, so a
-    // reveal looks for the one root that actually holds the file.
+    // Step 2: collect the roots of the module the key names. A module may
+    // declare several (its `res`, its shader sources, the images it ships),
+    // and the listing merges them under the module's name, so the roots are
+    // searched for the one that holds the file.
     let directories: Vec<&PathBuf> = module_roots
         .iter()
         .filter(|(name, _)| name == module)
@@ -614,6 +674,8 @@ pub fn reveal_target_in(
     if directories.is_empty() {
         return Err(format!("`{path}` names no loaded extension"));
     }
+    // Step 3: refuse a path that leaves the roots, then return the root that
+    // holds the file.
     if below.starts_with('/') || Path::new(below).is_absolute() {
         return Err(format!("`{path}` is not a path below the extension's root"));
     }
@@ -632,17 +694,20 @@ pub fn reveal_target_in(
     Err(format!("`{path}` is not on disk"))
 }
 
-/// The absolute path a reveal opens, for a project-relative asset path.
+/// Returns the absolute path a reveal opens, for a project-relative asset
+/// path.
 ///
-/// The empty path is the asset root itself - the Assets panel's open folder at
-/// the top - and a nested path is joined below it. A path that climbs out of
-/// the root, or one that names nothing on disk, is refused with a message
-/// rather than opened, so a stale row never makes the OS open something else.
+/// The empty path is the asset root itself, which is the Assets panel's open
+/// folder at the top; a nested path is joined below it. A path that climbs out
+/// of the root, or one that names nothing on disk, is refused with a message
+/// instead of being opened, so a stale row never makes the OS open something
+/// else.
 ///
 /// # Errors
 ///
-/// A message naming the refusal, which the executable logs instead of opening
-/// anything.
+/// Returns a message naming the refusal when the path is absolute, climbs out
+/// of the asset directory, or is not on disk. The executable logs the message
+/// instead of opening anything.
 pub fn reveal_target(asset_root: &Path, path: &str) -> Result<PathBuf, String> {
     let relative = path.trim().replace('\\', "/");
     if relative.starts_with('/') || Path::new(&relative).is_absolute() {
@@ -662,15 +727,19 @@ pub fn reveal_target(asset_root: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-/// Close the dialog, logging it under the given kind.
-fn close(dialog: &mut Option<AssetDialog>, kind: &str) {
+/// Closes the dialog and logs it under `dialog_kind`.
+fn close_dialog(dialog: &mut Option<AssetDialog>, dialog_kind: &str) {
     *dialog = None;
     pill_core::info!(
         target: telemetry_target::ECS,
-        dialog = kind,
+        dialog = dialog_kind,
         "[editor] asset dialog closed"
     );
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -694,8 +763,9 @@ mod tests {
         directory
     }
 
-    /// A reveal resolves below the asset root, refuses leaving it, and
-    /// reports a path that is not on disk instead of opening its parent.
+    /// A reveal resolves a path below the asset root, refuses a path that
+    /// leaves it, and refuses a missing file instead of opening its parent
+    /// folder.
     #[test]
     fn a_reveal_resolves_below_the_asset_root_and_refuses_escapes() {
         let root = scratch_folder("targets");
@@ -720,9 +790,9 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A reveal of an extension's resource resolves below the module root that
-    /// holds it - a module may declare several - and an unloaded module is
-    /// refused by name.
+    /// A reveal of an extension's resource finds the module root that holds it
+    /// (a module may declare several), and refuses a module that is no longer
+    /// loaded.
     #[test]
     fn an_extension_reveal_resolves_below_its_module_root() {
         let project = scratch_folder("project");
@@ -756,8 +826,9 @@ mod tests {
             project.join("models/cube.obj")
         );
         // An unloaded module, an escape and a missing file are refusals.
-        let unloaded = reveal_target_in(&project, &roots, "extensions/pill_gone/a.hlsl");
-        assert!(unloaded.is_err());
+        let unloaded_module_reveal =
+            reveal_target_in(&project, &roots, "extensions/pill_gone/a.hlsl");
+        assert!(unloaded_module_reveal.is_err());
         assert!(reveal_target_in(&project, &roots, "extensions/pill_demo/../../outside").is_err());
         assert!(reveal_target_in(&project, &roots, "extensions/pill_demo/missing.hlsl").is_err());
         std::fs::remove_dir_all(&project).ok();
@@ -839,10 +910,10 @@ mod tests {
         assert!(!write_meta_selection(&mut pending, &folder, &rows));
     }
 
-    /// Every action that writes refuses a folder row, and only a folder row: a
-    /// file whose type happens to spell `Folder` is a file. The predicate is
-    /// the one the actions and the panels share, so these answers are one
-    /// decision rather than four string comparisons.
+    /// Every asset action refuses a folder row, and refuses nothing else just
+    /// for being a folder: a file whose type happens to spell `Folder` is a
+    /// file. The actions and the panels share one predicate, so these answers
+    /// all come from one rule.
     #[test]
     fn every_asset_action_refuses_a_folder_row() {
         let assets = vec![
@@ -855,7 +926,7 @@ mod tests {
             selection
         };
         let folder = select("materials");
-        let typed = select("materials/odd.folder");
+        let folder_typed_file = select("materials/odd.folder");
         let mut dialog = None;
         let mut pending = PendingEditorCommands::default();
 
@@ -866,12 +937,12 @@ mod tests {
         assert!(!delete_selection(&mut pending, &folder, &assets));
         assert!(!write_meta_selection(&mut pending, &folder, &assets));
 
-        open_rename(&mut dialog, &typed, &assets);
+        open_rename(&mut dialog, &folder_typed_file, &assets);
         assert!(
             dialog.is_some(),
             "a type named Folder is not the folder sentinel"
         );
-        assert!(can_delete(&typed, &assets));
+        assert!(can_delete(&folder_typed_file, &assets));
     }
 
     /// A module's resource tree is recognised by the extensions root and every
@@ -908,8 +979,8 @@ mod tests {
         assert!(!is_read_only_key(&rows, "pill_master_renderer_data"));
     }
 
-    /// A module's resource is found by its key, and neither the toolbar's
-    /// delete nor its meta write queues anything for it.
+    /// A module's resource is found by its key, and neither the delete nor the
+    /// meta write queues anything for it.
     #[test]
     fn a_module_resource_is_never_written() {
         let rows = vec![module_row(
@@ -1013,9 +1084,8 @@ mod tests {
         );
     }
 
-    /// A scene dialog opens on the scene type, whatever the first type is, and
-    /// refuses to open at all when no scene type is registered - which is the
-    /// warning the person saw before the engine started registering its own.
+    /// A scene dialog opens on the scene type whatever the first type is, and
+    /// refuses to open when no scene type is registered.
     #[test]
     fn a_scene_dialog_needs_the_scene_type_and_chooses_it() {
         let assets = vec![listing("scenes", "folder", false, false)];
@@ -1058,7 +1128,7 @@ mod tests {
     }
 
     /// A scene create is one recorded step that clears the world and writes it,
-    /// and a save-as writes the world where the dialog said.
+    /// and a save-as writes the world to the path the dialog chose.
     #[test]
     fn submitting_a_scene_create_writes_the_chosen_path() {
         let mut dialog = Some(AssetDialog::Create {

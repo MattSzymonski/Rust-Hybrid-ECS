@@ -1,12 +1,14 @@
-//! The renderer contract a frontend drives once per frame.
+//! The renderer contract: the trait a frontend drives, what the renderer
+//! reports for each frame, and a stub for builds without a GPU.
 //!
 //! # Responsibilities
 //!
 //! - Define [`PillRenderer`], the trait a frontend drives: resize, viewport,
 //!   frame submission, surfaces, and asset invalidation.
-//! - Report each frame's result and cost through [`FrameOutcome`],
-//!   [`RenderCapabilities`] and [`RenderMetrics`], so frontends can display
-//!   statistics without knowing which backend produced them.
+//! - Report a frame's result ([`FrameOutcome`]) and the renderer's limits and
+//!   frame statistics ([`RenderCapabilities`], [`RenderMetrics`]), so a
+//!   frontend can display statistics without knowing which backend produced
+//!   them.
 //! - Name the future a renderer is built through ([`AttachFuture`]), so a
 //!   frontend can await it where it cannot block - in a browser.
 //! - Provide [`HeadlessRenderer`], the stub that keeps builds and tests
@@ -14,10 +16,10 @@
 //!
 //! # Design
 //!
-//! The host holds the renderer as a `Box<dyn PillRenderer>`, so this module
-//! stays free of wgpu types: a windowed build implements the trait on its wgpu
-//! `Renderer`, a headless one swaps in [`HeadlessRenderer`], and the frame
-//! loop cannot tell the difference.
+//! The host drives the renderer through a `Box<dyn PillRenderer>`, so this
+//! module names no graphics type: a windowed build implements the trait on its
+//! wgpu renderer, a headless build swaps in [`HeadlessRenderer`], and the
+//! frame loop cannot tell the two apart.
 
 // Standard library
 use std::future::Future;
@@ -29,118 +31,143 @@ use pill_engine::AssetManager;
 // Current crate
 use crate::{RawWindowData, RenderFrame, RenderViewport, RendererError, SurfaceId, SurfaceOptions};
 
+// =============================================================================
+// FrameOutcome
+// =============================================================================
+
 /// What one [`PillRenderer::render`] call did with the frame it was given.
 ///
-/// A skip is not a failure: the caller keeps running and simply presents
-/// nothing this frame.
+/// A skipped frame is not a failure. The caller keeps running and shows
+/// nothing new this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameOutcome {
     /// The frame was drawn and submitted to the surface.
     Presented,
-    /// Nothing was drawn: the surface is minimized, the frame carries no
-    /// camera, or the renderer is a stub with no GPU behind it.
+    /// Nothing was drawn: every surface was minimized, could not present yet,
+    /// or had no camera this frame - or the renderer is a stub with no GPU
+    /// behind it.
     Skipped,
 }
+
+// =============================================================================
+// RenderCapabilities
+// =============================================================================
 
 /// What the renderer can do: the limits of its device and the scene data it
 /// draws.
 ///
-/// Exposes what the device can accept, so callers that size transient
-/// resources - render targets, uploads - do not have to assume desktop
-/// maxima. A renderer with no GPU behind it reports the zero defaults.
+/// The limits are what the device accepts. A caller that sizes transient
+/// resources - render targets, uploads - reads them here instead of assuming
+/// what a desktop GPU allows. A renderer with no GPU behind it reports the
+/// zero defaults.
 ///
 /// Not `Copy`: `consumed_components` is an owned list, not a `&'static` slice.
-/// A renderer loaded as a module builds it inside its own image, so a static
-/// slice would point into that image after a reload unmaps it.
+/// A renderer loaded as a module builds the list inside its own image, so a
+/// static slice would point into that image after a reload unmaps it.
 #[derive(Debug, Clone, Default)]
 pub struct RenderCapabilities {
     /// Largest supported 2D texture dimension, in texels.
     pub max_texture_size: u32,
     /// Largest single GPU buffer the device accepts, in bytes.
     pub max_buffer_bytes: u64,
-    /// Whether the surface presents high-dynamic-range output. No renderer
-    /// reports `true`.
+    /// Whether the surface presents high-dynamic-range output (wider range of
+    /// brightness than a normal display shows). No renderer in this
+    /// repository reports `true`.
     pub hdr: bool,
-    /// Shared names of the components this renderer reads to build a frame.
+    /// Names of the components this renderer reads to build a frame, in the
+    /// shared form every DLL knows a component type by.
     ///
-    /// Lets the host warn when a project uses render data the active renderer
-    /// ignores (for example a component another renderer's data crate
-    /// declares). Empty for a renderer that reads nothing, like the headless
-    /// stub.
+    /// The host compares this list with the render components a project uses
+    /// and warns about any the renderer ignores - a component that only
+    /// another renderer's data crate draws, for example. The list is empty for
+    /// a renderer that reads nothing, like the headless stub.
     pub consumed_components: Vec<String>,
 }
 
-/// Frame statistics from the most recent [`PillRenderer::render`] call.
+// =============================================================================
+// RenderMetrics
+// =============================================================================
+
+/// Frame statistics from the most recent [`PillRenderer::render`] call that
+/// drew a frame.
 ///
-/// The windowed renderer fills these in as it works, and the host reads them
-/// to log the first presented frame; a renderer that has not drawn leaves
-/// every field at zero.
+/// The windowed renderer fills these in as it works. The host reads them to
+/// log the first presented frame and to notice when a pass stops drawing. A
+/// renderer that has not drawn leaves every field at zero.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderMetrics {
-    /// CPU time spent preparing the frame: syncing assets, rebuilding the
-    /// chain's objects if they moved, and building the draw queue, the
-    /// instance buffer and its upload.
+    /// CPU time spent preparing the frame: syncing the assets, building the
+    /// draw queue, and building and uploading the instance buffer.
     pub prepare_micros: u64,
-    /// CPU time spent submitting the recorded work to the GPU.
+    /// CPU time spent planning each extra surface's chain and submitting every
+    /// drawn surface to the GPU.
     pub submit_micros: u64,
-    /// Passes of the chain that were planned with at least one draw.
+    /// Passes of the frame's chain that had at least one draw.
     ///
-    /// A pass count, not a count of GPU draw commands: one pass draws every
-    /// instance run it was planned with, in as many commands as the runs it
-    /// found. Read it beside `passes` to see how much of the chain drew, and
-    /// not to judge batching.
+    /// This counts passes, not GPU draw commands. One pass draws all the
+    /// instance runs it was planned with, using as many commands as those runs
+    /// need. Compare it with `passes` to see how much of the chain drew; it
+    /// says nothing about batching.
     pub passes_with_draws: u32,
-    /// Passes the frame ran, whether or not they drew anything.
+    /// Passes of the frame's chain, whether or not they drew anything.
     pub passes: u32,
-    /// Instance bytes the frame's draw queue carried.
+    /// Bytes of instance data the frame's draw queue carried.
     pub instance_bytes: u64,
 }
 
-/// A renderer being built on a window: what a statically linked renderer's
-/// attach returns.
+// =============================================================================
+// AttachFuture
+// =============================================================================
+
+/// A renderer that is still being built for a window: what a statically
+/// linked renderer's attach returns.
 ///
-/// A future because creating a GPU device is asynchronous, and a browser only
-/// finishes it once control returns to its event loop: a native frontend
-/// blocks on it once, a web frontend awaits it. Not `Send` - a web GPU handle
-/// stays on the thread that made it.
+/// It is a future because creating a GPU device takes time, and a browser only
+/// finishes the work once control returns to its event loop. A native frontend
+/// blocks on it once; a web frontend awaits it. Not `Send`: a web GPU handle
+/// has to stay on the thread that created it.
 pub type AttachFuture = Pin<Box<dyn Future<Output = Result<Box<dyn PillRenderer>, RendererError>>>>;
 
-/// The renderer contract a frontend drives once per frame.
+// =============================================================================
+// PillRenderer
+// =============================================================================
+
+/// The contract a renderer implements and a frontend drives once per frame.
 ///
-/// Boxing it as `Box<dyn PillRenderer>` is what lets a frontend swap the wgpu
-/// backend for [`HeadlessRenderer`] without touching its frame loop.
+/// Boxing it as `Box<dyn PillRenderer>` lets a frontend swap the wgpu backend
+/// for [`HeadlessRenderer`] without touching its frame loop.
 ///
-/// A wrapper that implements this trait by delegating to another renderer -
-/// the host's module renderer does - must forward every method, the defaulted
-/// ones included: one it leaves out silently runs the default instead of the
-/// renderer it wraps.
+/// A wrapper that delegates to another renderer - the host's module renderer
+/// does - must forward every method, including the ones with defaults. A
+/// method it leaves out runs the trait's default instead of the wrapped
+/// renderer's, and nothing reports the omission.
 pub trait PillRenderer {
-    /// Reports the limits of the device the renderer draws on.
+    /// Returns the limits of the device the renderer draws on.
     ///
-    /// The default reports zeroed limits, which is all a renderer with no GPU
-    /// behind it has to say.
+    /// The default returns zeroed limits, which is all a renderer with no GPU
+    /// behind it can say.
     fn capabilities(&self) -> RenderCapabilities {
         RenderCapabilities::default()
     }
 
-    /// Returns the statistics of the most recent frame.
+    /// Returns the statistics of the most recent frame that drew.
     ///
-    /// The counts are only meaningful after a successful [`Self::render`];
-    /// before the first frame they stay at zero.
+    /// The counts describe the last [`Self::render`] call that drew a frame;
+    /// before the first such frame they are all zero.
     fn metrics(&self) -> RenderMetrics {
         RenderMetrics::default()
     }
 
     /// Tells the renderer that surface `id` now measures `width` by `height`
-    /// physical pixels; an id the renderer does not draw does nothing.
+    /// physical pixels. An id the renderer does not draw does nothing.
     ///
-    /// A zero dimension means the surface is minimized; frames skip it until a
-    /// usable size arrives. The primary surface is resized through its own id
-    /// ([`SurfaceId::PRIMARY`]) like any other.
+    /// A zero width or height means the surface is minimized, and frames skip
+    /// it until a usable size arrives. The primary surface is resized through
+    /// its own id ([`SurfaceId::PRIMARY`]) like any other.
     ///
-    /// Required rather than defaulted: a renderer that forgot to forward a
-    /// resize would keep drawing at the old size with nothing in the log to
-    /// say why.
+    /// This method has no default on purpose: a renderer that forgot to
+    /// forward a resize would keep drawing at the old size, with nothing in
+    /// the log to say why.
     fn resize_surface(&mut self, id: SurfaceId, width: u32, height: u32);
 
     /// Restricts drawing to a sub-region of surface `id`.
@@ -149,22 +176,23 @@ pub trait PillRenderer {
     /// [`Self::resize_surface`] is.
     fn set_surface_viewport(&mut self, id: SurfaceId, viewport: Option<RenderViewport>);
 
-    /// Draws one resolved frame from `assets` and presents it.
+    /// Draws one frame from `assets` and presents it.
     ///
-    /// Returns [`FrameOutcome::Skipped`] when there is nothing to present - a
-    /// minimized surface or a frame without a camera - which is a normal
-    /// outcome, not an error.
+    /// Returns [`FrameOutcome::Skipped`] when there is nothing to present: a
+    /// minimized surface, a surface that may not present yet, or a frame
+    /// without a camera. That is a normal outcome, not an error.
     ///
-    /// The store is read, not copied: the renderer diffs it against what it
-    /// last uploaded, and the borrow lasts the call.
+    /// The asset store is read, not copied. The renderer compares it with what
+    /// it last uploaded, and the borrow lasts for the call.
     ///
     /// # Errors
     ///
     /// Fails with [`RendererError`] when the GPU work itself fails: a lost or
     /// out-of-memory surface, a renderer resource the call referenced that is
-    /// not in storage, or a command buffer wgpu refuses at submission. An
-    /// asset that will not build is not an error - it is reported per pass and
-    /// skipped.
+    /// not in storage, or a command buffer that wgpu refuses at submission.
+    ///
+    /// An asset that will not build is not an error. The pass that needed it
+    /// is reported and skipped.
     fn render(
         &mut self,
         frame: &RenderFrame,
@@ -173,29 +201,30 @@ pub trait PillRenderer {
 
     /// Forces the next frame to rebuild every GPU object from the asset store.
     ///
-    /// The renderer normally rebuilds only what changed, tracked by content
-    /// versions; this clears that bookkeeping for callers that know the asset
-    /// set was replaced wholesale and the diff can no longer be trusted.
+    /// Normally the renderer rebuilds only what changed, tracked by content
+    /// versions. This clears that bookkeeping, for a caller that replaced the
+    /// whole asset set and cannot trust the recorded versions any more.
     fn invalidate_assets(&mut self);
 
     /// Starts drawing into another surface: a second window or canvas, sized
-    /// `width` by `height` physical pixels, drawn after the primary one through
-    /// the camera the frame resolved for it ([`RenderFrame::surface_views`]).
-    /// Attaching an id already attached replaces it.
+    /// `width` by `height` physical pixels. It is drawn after the primary
+    /// surface, through the camera the frame resolved for it
+    /// ([`RenderFrame::surface_views`]). Attaching an id that is already
+    /// attached replaces that surface.
     ///
-    /// The default refuses: a renderer that draws one surface only.
+    /// The default refuses, for a renderer that draws one surface only.
     ///
     /// # Errors
     ///
-    /// Returns [`RendererError::UnsupportedSurface`] when the renderer draws a
-    /// single surface or `id` is [`SurfaceId::PRIMARY`], and the creation
-    /// errors of the surface otherwise.
+    /// Returns [`RendererError::UnsupportedSurface`] if the renderer draws a
+    /// single surface or `id` is [`SurfaceId::PRIMARY`]. Any other failure is
+    /// one the surface creation itself reports.
     ///
     /// # Safety
     ///
-    /// `window` must name a live window that outlives the surface: the caller
-    /// keeps it alive until [`Self::detach_surface`] or until the renderer is
-    /// dropped, whichever comes first.
+    /// `window` must name a live window that outlives the surface. The caller
+    /// keeps it alive until [`Self::detach_surface`] is called or the renderer
+    /// is dropped, whichever comes first.
     unsafe fn attach_surface(
         &mut self,
         id: SurfaceId,
@@ -211,24 +240,26 @@ pub trait PillRenderer {
     }
 
     /// Stops drawing into a surface attached with [`Self::attach_surface`] and
-    /// releases it; an unknown id does nothing.
+    /// releases it. An id the renderer does not draw does nothing.
     fn detach_surface(&mut self, _id: SurfaceId) {}
 
     /// Tells the renderer whether `id` may present on the next
     /// [`Self::render`].
     ///
-    /// The frontend paces surfaces the window system paces itself - a Wayland
-    /// subsurface, by its frame callbacks - and a surface that may not present
-    /// is skipped rather than waited on. Every surface starts ready; this
-    /// applies to the primary surface too.
+    /// Some window systems pace a surface themselves - a Wayland subsurface,
+    /// through its frame callbacks - so the frontend passes that state on. A
+    /// surface that may not present is skipped instead of waited for. Every
+    /// surface starts ready, and the primary surface is paced the same way.
     fn set_surface_ready(&mut self, _id: SurfaceId, _ready: bool) {}
 
-    /// Takes the answers to every pick the GPU has finished since the last
+    /// Takes the answers to the picks the GPU has finished since the last
     /// call.
     ///
-    /// A pick is answered frames after it was asked, never by stalling the
-    /// frame that asked; the frontend writes what this returns into the
-    /// world's [`crate::PickResults`]. The default answers nothing: a renderer
+    /// A pick is answered a few frames after it was asked, when the GPU has
+    /// read the result back, and the frame that asked never waits for it. A
+    /// pick on a surface the frame did not draw is answered in the same frame,
+    /// with no hit. The frontend writes what this returns into the world's
+    /// [`crate::PickResults`]. The default answers nothing, for a renderer
     /// without a pick buffer.
     fn take_pick_results(&mut self) -> Vec<crate::PickResult> {
         Vec::new()
@@ -236,20 +267,27 @@ pub trait PillRenderer {
 
     /// Takes every preview the GPU has finished since the last call.
     ///
-    /// A preview is read back frames after it was asked, like a pick, and the
-    /// frontend writes what this returns into the world's
-    /// [`crate::PreviewResults`]. The default answers nothing: a renderer
-    /// without an off-screen preview target.
+    /// A preview is read back a few frames after it was asked, like a pick. A
+    /// request the renderer cannot draw is refused at once, so the caller does
+    /// not wait for an answer that will never come. The frontend writes what
+    /// this returns into the world's [`crate::PreviewResults`]. The default
+    /// answers nothing, for a renderer without an off-screen preview target.
     fn take_preview_results(&mut self) -> Vec<crate::PreviewImage> {
         Vec::new()
     }
 }
 
+// =============================================================================
+// HeadlessRenderer
+// =============================================================================
+
 /// Stub renderer for frontends that run without a GPU surface.
 ///
-/// Every call is accepted and forgotten: resize, viewport, and asset
-/// invalidation do nothing, and [`PillRenderer::render`] reports
-/// [`FrameOutcome::Skipped`] so a headless frame loop runs unchanged.
+/// Nothing reaches a GPU. Resize, viewport, surface readiness and asset
+/// invalidation do nothing, [`PillRenderer::render`] returns
+/// [`FrameOutcome::Skipped`], and the default methods answer with no picks and
+/// no previews. [`PillRenderer::attach_surface`] keeps its default, which
+/// refuses a second surface. A headless frame loop therefore runs unchanged.
 #[derive(Default)]
 pub struct HeadlessRenderer;
 

@@ -1,27 +1,29 @@
-//! The frame boundary: the pending-command drain, the undo/redo walk and the
-//! history prune a reload needs.
+//! The editor's frame boundary: applies the queued commands, walks the undo
+//! history, and prunes that history after a reload.
 //!
 //! # Responsibilities
 //!
 //! - Apply the batches the shell and the scripted channel queued
-//!   ([`apply_pending`]), following a moved or deleted asset in the shared
-//!   selection and recording one undo step per recorded batch.
-//! - Walk the history for `editor.undo`/`editor.redo` ([`step_history`]),
-//!   checking the command queue before a step is popped.
-//! - Drop history entries a reload's component registry can no longer
-//!   resolve ([`prune_history`]), once per registry change.
+//!   ([`apply_pending`]). A move or delete carries the shared selection with
+//!   it, and a recorded batch becomes one undo step.
+//! - Walk the history for `editor.undo` and `editor.redo`
+//!   ([`step_history`]). A step is only popped when a command queue exists.
+//! - Drop the history entries the current component registry can no longer
+//!   resolve ([`prune_history`]), at most once per registry change.
 //!
 //! # Design
 //!
-//! The drain touches only the engine's world resources, so nothing ties it to
-//! a runner: the native editor and the browser editor call the same functions
-//! at their own frame boundary, and one command-contract change lands once.
-//! The failure channels are the log lines the suites watch (`engine commands
-//! applied`, `command failed`, `history push`, `history undo`, `history
-//! remap`), so both postures report an edit the same way.
+//! The drain touches only the engine's world resources, so no runner owns it.
+//! The native editor and the browser editor call the same functions at their
+//! own frame boundary, so a change to the command contract is made once.
 //!
-//! Nothing here names egui: this module runs in a browser build with no
-//! window at all.
+//! Everything a caller can observe is a log line. The suites read `engine
+//! commands applied`, `command failed`, `history push` and `history undo`;
+//! the module also logs `history remap` and `history pruned`. Both editors
+//! therefore report an edit the same way.
+//!
+//! Nothing here names egui, so the module also works in the browser build,
+//! where there is no window at all.
 
 // Standard library
 use std::collections::HashSet;
@@ -45,22 +47,23 @@ use crate::history::{CommandHistory, HistoryEntry, HistoryEntryKind};
 pub struct DrainOutcome {
     /// How many batches ran.
     pub batches: usize,
-    /// Whether a batch touched files on disk, so the asset listing needs an
-    /// immediate walk.
+    /// Whether a batch changed files on disk, so the asset listing must be
+    /// refreshed right away.
     pub files_changed: bool,
-    /// Whether a batch wrote an asset's settings document, so the Inspector's
-    /// rows read it again.
+    /// Whether a batch wrote an asset's settings document, so the Inspector
+    /// must read it again.
     pub settings_changed: bool,
 }
 
-/// Apply every queued batch, then prune a history a reload invalidated.
+/// Applies every queued batch, then prunes a history a reload invalidated.
 ///
-/// A failed command never aborts the rest of its batch; a recorded batch that
-/// inverted in full lands in the history as one step; the shared selection
-/// follows a move and clears with a delete; and a batch that touched files
-/// reports `files_changed`, which the caller turns into an immediate listing
-/// walk.
+/// A failed command does not stop the rest of its batch. A recorded batch
+/// whose commands all succeeded and all have an inverse becomes one history
+/// step. The shared selection follows a move and clears with a delete. A
+/// batch that touched files reports `files_changed`, and the caller refreshes
+/// the asset listing at once.
 pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
+    // Step 1: Take every queued batch out of the world.
     let batches = {
         let world = engine.world_mut();
         world
@@ -68,39 +71,43 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
             .map(|pending| std::mem::take(&mut pending.batches))
             .unwrap_or_default()
     };
-    let mut outcome = DrainOutcome::default();
+    let mut drain_outcome = DrainOutcome::default();
+    // Step 2: Apply each batch in order, then act on what it changed.
     for batch in batches {
-        outcome.batches += 1;
-        let recorded = EditorCommand::apply_recorded(engine, &batch.commands);
-        let failed = recorded.failures.len();
+        drain_outcome.batches += 1;
+        let recorded_apply = EditorCommand::apply_recorded(engine, &batch.commands);
+        let failed_command_count = recorded_apply.failures.len();
         pill_core::info!(
             target: telemetry_target::ENGINE,
             count = batch.commands.len(),
-            failed,
+            failed = failed_command_count,
             "[editor] engine commands applied"
         );
-        // The selection follows what happened on disk, not what was asked for:
-        // a refused move or delete must leave the selection where the file
-        // still is, or the Inspector shows an asset that is not the one the
-        // failure left behind.
-        let refused: std::collections::HashSet<usize> =
-            recorded.failures.iter().map(|(index, _)| *index).collect();
-        follow_selection(engine, &batch.commands, &refused);
-        // A batch that moved files on disk brings the rows up to date at
-        // once: the Assets toolbar acts on what the rows say.
+        // The selection follows what happened on disk, not what was asked
+        // for. A refused move or delete must leave the selection on the file
+        // that is still there, or the Inspector shows an asset that does not
+        // match the disk.
+        let failed_command_indices: std::collections::HashSet<usize> = recorded_apply
+            .failures
+            .iter()
+            .map(|(index, _)| *index)
+            .collect();
+        follow_selection(engine, &batch.commands, &failed_command_indices);
+        // A batch that moved files refreshes the asset listing at once,
+        // because the Assets toolbar acts on what the listing says.
         if batch.commands.iter().any(command_touches_files) {
-            outcome.files_changed = true;
+            drain_outcome.files_changed = true;
         }
-        // A settings write leaves the listing's shape alone, but the document
-        // the Inspector's rows draw is now the old one.
+        // A settings write does not change the listing's shape, but the
+        // document the Inspector rows draw is now out of date.
         if batch
             .commands
             .iter()
             .any(|command| matches!(command, EditorCommand::SetAssetSettings { .. }))
         {
-            outcome.settings_changed = true;
+            drain_outcome.settings_changed = true;
         }
-        for (index, message) in recorded.failures {
+        for (index, message) in recorded_apply.failures {
             pill_core::warn!(
                 target: telemetry_target::ENGINE,
                 index,
@@ -108,15 +115,15 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
                 "[editor] command failed"
             );
         }
-        // A history step is popped before its commands run, so a replay that
-        // fails puts the cursor back: the step stays undoable instead of
-        // sitting in the opposite tail while the world still shows the edit.
-        // The `history undo` line is logged when the step is queued; this one
-        // reports the failure.
+        // A history step is popped before its commands run, so a failed
+        // replay must put the step back on the side it came from. Without
+        // that, the step would be offered in the wrong direction while the
+        // world still shows the edit. The `history undo` line was logged when
+        // the step was queued; this block reports the failure.
         if let Some(direction) = batch.replay {
             let world = engine.world_mut();
             if let Some(history) = world.get_resource_mut::<CommandHistory>() {
-                if failed > 0 {
+                if failed_command_count > 0 {
                     match direction {
                         HistoryDirection::Undo => history.undo_rollback(),
                         HistoryDirection::Redo => history.redo_rollback(),
@@ -132,10 +139,10 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
                 }
             }
         }
-        // A restore assigned fresh handles; the history follows them before
-        // anything else is recorded, so a later undo cannot target the dead
-        // handle.
-        for (previous, assigned) in &recorded.remaps {
+        // A restore gives its entity a fresh handle. The history follows the
+        // new handle before anything else is recorded, so a later undo cannot
+        // target the old one.
+        for (previous, assigned) in &recorded_apply.remaps {
             let world = engine.world_mut();
             let Some(history) = world.get_resource_mut::<CommandHistory>() else {
                 break;
@@ -149,13 +156,13 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
             );
         }
         // An edit batch becomes one undo step, unless it failed or could not
-        // be inverted in full - a step that could not be undone would be
-        // worse than no step.
-        if batch.record && recorded.fully_invertible && !batch.commands.is_empty() {
+        // be fully inverted. A step that cannot be undone would be worse than
+        // no step.
+        if batch.record && recorded_apply.fully_invertible && !batch.commands.is_empty() {
             let entry = HistoryEntry::engine(
                 batch.label.clone(),
                 batch.commands.clone(),
-                recorded.inverses.clone(),
+                recorded_apply.inverses.clone(),
             );
             let entry = match &batch.coalesce_key {
                 Some(key) => entry.coalescing(key.clone(), now_millis),
@@ -175,26 +182,24 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
             }
         }
     }
-    // The registry a reload rebuilt is the only thing that makes a recorded
-    // step unplayable, so the prune rides the same boundary as the drain and
-    // costs one hash while nothing changed.
+    // Step 3: Drop the history entries the rebuilt registry cannot resolve.
     prune_history(engine);
-    outcome
+    drain_outcome
 }
 
-/// Move the shared selection with the file a batch moved or deleted.
+/// Moves the shared selection with the file a batch moved or deleted.
 ///
-/// The selection is a view of the disk, not a step: it follows here, so undo
-/// never has to replay a selection change to keep the two agreeing. A command
-/// that did not apply is skipped - a move refused because its destination
+/// The selection follows the disk instead of being recorded as a step, so an
+/// undo never has to replay a selection change to keep the two in agreement.
+/// A command that failed is skipped: a move refused because its destination
 /// exists must not leave the selection on a file that is not there.
 fn follow_selection(
     engine: &mut Engine,
     commands: &[EditorCommand],
-    refused: &std::collections::HashSet<usize>,
+    failed_command_indices: &std::collections::HashSet<usize>,
 ) {
     for (index, command) in commands.iter().enumerate() {
-        if refused.contains(&index) {
+        if failed_command_indices.contains(&index) {
             continue;
         }
         let world = engine.world_mut();
@@ -245,17 +250,17 @@ fn command_touches_files(command: &EditorCommand) -> bool {
 // The history walk
 // =============================================================================
 
-/// Which way an undo walks.
+/// Which way a history walk goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryDirection {
-    /// Apply the newest step's inverse.
+    /// Applies the newest step's inverse.
     Undo,
-    /// Reapply the next step's forward batch.
+    /// Reapplies the next step's forward batch.
     Redo,
 }
 
 impl HistoryDirection {
-    /// The word the log lines use.
+    /// The word this direction is logged with.
     fn name(self) -> &'static str {
         match self {
             HistoryDirection::Undo => "undo",
@@ -276,16 +281,18 @@ pub enum HistoryOutcome {
     },
     /// Nothing was left in that direction.
     Empty,
-    /// The queue a step needs is absent, so nothing was popped.
+    /// The command queue or the history is absent, so nothing was popped.
     NoQueue,
 }
 
-/// Pop one history entry and queue its batch, applied but never recorded.
+/// Pops one history entry and queues its batch, which is applied but never
+/// recorded.
 ///
-/// The command queue is checked *before* the pop: a step popped without a
-/// queue would be lost while the log still said the undo ran.
+/// The command queue is checked before the pop. A step popped without a queue
+/// would be lost even though the log said the undo ran.
 pub fn step_history(engine: &mut Engine, direction: HistoryDirection) -> HistoryOutcome {
-    let name = direction.name();
+    // Step 1: Refuse the walk when no command queue exists.
+    let direction_name = direction.name();
     let queue_present = engine
         .world()
         .get_resource::<PendingEditorCommands>()
@@ -293,40 +300,43 @@ pub fn step_history(engine: &mut Engine, direction: HistoryDirection) -> History
     if !queue_present {
         pill_core::warn!(
             target: telemetry_target::ENGINE,
-            direction = name,
+            direction = direction_name,
             "[editor] history step without a command queue"
         );
         return HistoryOutcome::NoQueue;
     }
+    // Step 2: Pop the step in the walk's direction and read what it carries.
     let world = engine.world_mut();
     let Some(history) = world.get_resource_mut::<CommandHistory>() else {
         return HistoryOutcome::NoQueue;
     };
-    let entry = match direction {
+    let history_entry = match direction {
         HistoryDirection::Undo => history.pop_undo(),
         HistoryDirection::Redo => history.pop_redo(),
     };
-    let Some(entry) = entry else {
+    let Some(history_entry) = history_entry else {
         pill_core::info!(
             target: telemetry_target::ENGINE,
             "[editor] history {} empty",
-            name
+            direction_name
         );
         return HistoryOutcome::Empty;
     };
-    let label = entry.label.clone();
-    let remaining = match direction {
+    let label = history_entry.label.clone();
+    let remaining_step_count = match direction {
         HistoryDirection::Undo => history.undo_depth(),
         HistoryDirection::Redo => history.redo_depth(),
     };
-    let commands = match entry.entry {
+    let commands = match history_entry.entry {
         HistoryEntryKind::Engine { forward, inverse } => Some(match direction {
             HistoryDirection::Undo => inverse,
             HistoryDirection::Redo => forward,
         }),
-        // A selection-only step has no commands: its depth is logged below.
+        // A selection-only step carries no commands, so nothing is queued.
+        // The log line below still reports its depth.
         HistoryEntryKind::Selection { .. } => None,
     };
+    // Step 3: Queue the step's batch for the next drain, then log the walk.
     if let Some(commands) = commands {
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
             pending.push_replay(commands, direction);
@@ -335,47 +345,55 @@ pub fn step_history(engine: &mut Engine, direction: HistoryDirection) -> History
     pill_core::info!(
         target: telemetry_target::ENGINE,
         label = label.as_str(),
-        remaining,
+        remaining = remaining_step_count,
         "[editor] history {}",
-        name
+        direction_name
     );
-    HistoryOutcome::Queued { label, remaining }
+    HistoryOutcome::Queued {
+        label,
+        remaining: remaining_step_count,
+    }
 }
 
 // =============================================================================
 // The reload prune
 // =============================================================================
 
-/// Drop the history entries a reload's component registry cannot resolve.
+/// Drops the history entries the current component registry cannot resolve.
 ///
-/// Every entry remembers the component (and field) identifiers its commands
-/// touched. A project or module reload rebuilds the registry, and a reloaded
-/// module may no longer register a component or field an old step names;
-/// replaying that step would target storage that no longer exists. The
-/// registry is stamped, so the walk runs once per change and one hash per
-/// call otherwise. Returns how many entries went.
+/// Every entry remembers the component and field identifiers its commands
+/// touched. A project or module reload rebuilds the registry, and the
+/// reloaded module may no longer register a component or field that an old
+/// step names. Running that step would then target storage that no longer
+/// exists. Each call hashes the registry, but the entries are only walked
+/// when that hash changed.
+///
+/// Returns how many entries were dropped.
 pub fn prune_history(engine: &mut Engine) -> usize {
-    let stamp = registry_stamp(engine.world());
-    let live = live_identifiers(engine.world());
+    let current_registry_stamp = registry_stamp(engine.world());
+    let resolvable_identifiers = resolvable_identifiers(engine.world());
     let world = engine.world_mut();
     let Some(history) = world.get_resource_mut::<CommandHistory>() else {
         return 0;
     };
-    let steps = history.steps();
-    let dropped = history.drop_stale(|identifier| live.contains(identifier), stamp);
-    if dropped > 0 {
+    let step_count = history.steps();
+    let dropped_entry_count = history.drop_stale(
+        |identifier| resolvable_identifiers.contains(identifier),
+        current_registry_stamp,
+    );
+    if dropped_entry_count > 0 {
         pill_core::info!(
             target: telemetry_target::ENGINE,
-            dropped,
-            steps,
+            dropped = dropped_entry_count,
+            steps = step_count,
             "[editor] history pruned"
         );
     }
-    dropped
+    dropped_entry_count
 }
 
-/// A stamp of the world's component registry: its names and every field the
-/// layouts declare, so a removed field changes it too.
+/// A stamp of the world's component registry: the component names plus every
+/// field name their layouts declare. Removing a field changes it too.
 pub fn registry_stamp(world: &World) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for (name, id) in world.registered_components() {
@@ -389,19 +407,19 @@ pub fn registry_stamp(world: &World) -> u64 {
     hasher.finish()
 }
 
-/// Every identifier a history entry may name, as `component` and
+/// Returns every identifier a history entry may name, as `component` and
 /// `component.field`.
-fn live_identifiers(world: &World) -> HashSet<String> {
-    let mut live = HashSet::new();
+fn resolvable_identifiers(world: &World) -> HashSet<String> {
+    let mut resolvable_identifiers = HashSet::new();
     for (name, id) in world.registered_components() {
         if let Some(layout) = world.component_field_layout(id) {
             for descriptor in layout {
-                live.insert(format!("{name}.{}", descriptor.name));
+                resolvable_identifiers.insert(format!("{name}.{}", descriptor.name));
             }
         }
-        live.insert(name);
+        resolvable_identifiers.insert(name);
     }
-    live
+    resolvable_identifiers
 }
 
 // =============================================================================
@@ -428,8 +446,8 @@ mod tests {
     #[test]
     fn an_empty_drain_reports_nothing() {
         let mut engine = engine();
-        let outcome = apply_pending(&mut engine, 0);
-        assert_eq!(outcome, DrainOutcome::default());
+        let drain_outcome = apply_pending(&mut engine, 0);
+        assert_eq!(drain_outcome, DrainOutcome::default());
     }
 
     #[test]
@@ -462,26 +480,25 @@ mod tests {
     #[test]
     fn the_registry_stamp_changes_only_when_the_registry_does() {
         let engine = engine();
-        let first = registry_stamp(engine.world());
-        assert_eq!(first, registry_stamp(engine.world()));
+        let first_registry_stamp = registry_stamp(engine.world());
+        assert_eq!(first_registry_stamp, registry_stamp(engine.world()));
     }
 
-    /// The selection follows the files that moved and clears with the ones that
-    /// went, and it stays where it was when the command was refused: a move
-    /// whose destination already exists must not point the selection at that
-    /// other file.
+    /// The selection follows a move that applied, and stays where it was when
+    /// the move was refused. A move whose destination already exists must not
+    /// point the selection at that other file.
     #[test]
     fn the_selection_follows_the_moves_that_applied() {
         let _mount = crate::test_support::asset_mount_lock();
-        let root = std::env::temp_dir().join(format!(
+        let asset_directory = std::env::temp_dir().join(format!(
             "pill-editor-drain-selection-{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("from.material"), b"source").unwrap();
-        std::fs::write(root.join("taken.material"), b"taken").unwrap();
-        pill_engine::asset_store::mount_directory(&root);
+        let _ = std::fs::remove_dir_all(&asset_directory);
+        std::fs::create_dir_all(&asset_directory).unwrap();
+        std::fs::write(asset_directory.join("from.material"), b"source").unwrap();
+        std::fs::write(asset_directory.join("taken.material"), b"taken").unwrap();
+        pill_engine::asset_store::mount_directory(&asset_directory);
 
         let mut engine = engine();
         {
@@ -491,14 +508,14 @@ mod tests {
             world.insert_resource(selection);
             world.insert_resource(PendingEditorCommands::default());
         }
-        let queue = |engine: &mut Engine, commands: Vec<EditorCommand>| {
+        let queue_batch = |engine: &mut Engine, commands: Vec<EditorCommand>| {
             let world = engine.world_mut();
             let pending = world
                 .get_resource_mut::<PendingEditorCommands>()
                 .expect("the test engine carries the queue");
             pending.push(commands);
         };
-        let selected = |engine: &Engine| {
+        let selected_asset = |engine: &Engine| {
             engine
                 .world()
                 .get_resource::<EditorSelection>()
@@ -507,7 +524,7 @@ mod tests {
 
         // Refused: `taken.material` exists, so nothing moved and the selection
         // stays on the source.
-        queue(
+        queue_batch(
             &mut engine,
             vec![EditorCommand::MoveAssetFile {
                 from: "from.material".to_string(),
@@ -516,13 +533,13 @@ mod tests {
         );
         apply_pending(&mut engine, 0);
         assert_eq!(
-            selected(&engine).as_deref(),
+            selected_asset(&engine).as_deref(),
             Some("from.material"),
             "a refused move must leave the selection on the file that is still there"
         );
 
         // Applied: the file moved, so the selection follows it.
-        queue(
+        queue_batch(
             &mut engine,
             vec![EditorCommand::MoveAssetFile {
                 from: "from.material".to_string(),
@@ -531,22 +548,22 @@ mod tests {
         );
         apply_pending(&mut engine, 0);
         assert_eq!(
-            selected(&engine).as_deref(),
+            selected_asset(&engine).as_deref(),
             Some("moved.material"),
             "an applied move still carries the selection with it"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&asset_directory);
     }
 
     #[test]
     fn a_failed_undo_puts_the_step_back() {
-        // The step is popped before its commands run, so a failed inverse
-        // would leave the log saying the undo ran while the world still shows
-        // the edit and the step sits in the redo tail. A step that did not run
+        // The step is popped before its commands run. A failed inverse would
+        // then leave the log saying the undo ran, the world still showing the
+        // edit, and the step waiting to be redone. A step that did not run
         // must stay undoable, so the drain puts it back.
         let mut engine = engine();
-        let stale = HistoryEntry::engine(
+        let failing_entry = HistoryEntry::engine(
             "destroy an entity that is gone",
             vec![EditorCommand::DestroyEntity {
                 entity: pill_engine::Entity::default(),
@@ -559,7 +576,7 @@ mod tests {
         let Some(history) = world.get_resource_mut::<CommandHistory>() else {
             panic!("the test engine carries a history");
         };
-        history.push(stale, 0, CommandHistory::DEFAULT_COALESCE_WINDOW);
+        history.push(failing_entry, 0, CommandHistory::DEFAULT_COALESCE_WINDOW);
 
         assert!(matches!(
             step_history(&mut engine, HistoryDirection::Undo),
@@ -579,10 +596,10 @@ mod tests {
     fn a_prune_drops_entries_the_registry_cannot_resolve() {
         // The state a project or module reload leaves behind: a step naming a
         // component the arriving registry no longer has. Undoing it would
-        // target storage that is gone, so the first drain after the change
+        // target storage that is gone, so the first prune after the change
         // drops it - and only the first.
         let mut engine = engine();
-        let stale = HistoryEntry::engine(
+        let stale_entry = HistoryEntry::engine(
             "stale",
             vec![EditorCommand::SetField {
                 entity: pill_engine::Entity::default(),
@@ -596,7 +613,7 @@ mod tests {
         let Some(history) = world.get_resource_mut::<CommandHistory>() else {
             panic!("the test engine carries a history");
         };
-        history.push(stale, 0, CommandHistory::DEFAULT_COALESCE_WINDOW);
+        history.push(stale_entry, 0, CommandHistory::DEFAULT_COALESCE_WINDOW);
         assert_eq!(history.steps(), 1);
 
         assert_eq!(prune_history(&mut engine), 1);

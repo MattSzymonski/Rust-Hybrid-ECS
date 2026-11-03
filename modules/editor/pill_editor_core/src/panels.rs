@@ -3,7 +3,7 @@
 //! # Responsibilities
 //!
 //! - Hold the panels editor crates register: an id, a title, the crate that
-//!   drew it, the function that draws it and a liveness marker.
+//!   registered it, the function that draws it and a liveness marker.
 //! - Tell a live panel from one whose module has been unloaded, so the shell
 //!   can never call into an unloaded image.
 //! - Give each panel a stable slot, which is what a dock tab stores, and keep
@@ -13,31 +13,35 @@
 //!
 //! # Design
 //!
-//! A world resource the executable inserts and the shell reads each frame. A
-//! panel's draw function is a plain `fn` pointer into the registering module's
-//! image, handed out only while that source's marker is alive:
-//! `Arc::strong_count` answers "is that image still mapped".
+//! [`PanelRegistry`] is a world resource the executable inserts and the shell
+//! reads each frame. A panel's draw function is a plain `fn` pointer into the
+//! registering module's image. The registry hands that pointer out only while
+//! the source's marker is alive: the marker's strong count says whether the
+//! image is still mapped.
 //!
-//! Registering is per id, not per crate: a module that reloads registers the
-//! same id again, which replaces the entry in place (new function, new marker,
-//! new epoch) and keeps the slot. A module that unloads and never returns
-//! leaves its entry with a dead marker - the tab says so rather than vanishing.
+//! Registering is per id, not per crate. A module that reloads registers the
+//! same id again, and that replaces the entry in place (a new function, marker
+//! and epoch) while the slot stays. A module that unloads and never returns
+//! leaves its entry with a dead marker, and the tab says so instead of
+//! vanishing.
 
+// Standard library
 use std::sync::{Arc, Weak};
 
+// External crates
 use pill_engine::{Entity, Resource};
 
 /// The liveness marker of one registration source.
 ///
 /// The executable holds the one strong handle, per source, and drops it when
-/// that module unloads; the registry stores a [`Weak`] to it, so a strong
-/// count of zero is what marks every panel the source registered as dead. A
-/// unit struct on purpose - it carries no state, only a lifetime.
+/// that module unloads. The registry stores a [`Weak`] to it, so a strong
+/// count of zero means every panel the source registered is dead. A marker
+/// struct on purpose: it holds no data, and only its strong count matters.
 #[derive(Debug, Default)]
 pub struct ModuleLiveness(());
 
 impl ModuleLiveness {
-    /// A marker for one registering crate.
+    /// Creates a marker for one registering crate.
     pub fn new() -> Arc<ModuleLiveness> {
         Arc::new(ModuleLiveness(()))
     }
@@ -48,17 +52,17 @@ pub type PanelDrawFn = fn(&mut egui::Ui, &mut PanelContext<'_>);
 
 /// What a panel may ask the editor to do.
 ///
-/// Plain data, queued into [`PanelContext::commands`] and applied by the
-/// executable at the frame boundary, the same contract `EditorCommand`
-/// follows: a panel never mutates the world itself, so a panel from a module
-/// cannot leave the frame half-applied.
+/// A panel queues these into [`PanelContext::commands`] instead of changing
+/// the world itself. The editor applies them after the draw, the same contract
+/// `EditorCommand` follows, so a panel from a module cannot leave the frame
+/// half-applied.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PanelCommand {
     /// Make this entity the editor's selection.
     SelectEntity(Entity),
     /// Write one component field through the editor's recorded edit path, so
-    /// the change is one undo step. The value is text, parsed against the
-    /// field's current value exactly as the Inspector's own rows parse it.
+    /// the change is one undo step. The text is parsed against the field's
+    /// current value, the same way the Inspector's own rows parse it.
     SetField {
         /// The entity to edit.
         entity: Entity,
@@ -94,8 +98,8 @@ pub enum PanelCommand {
 /// One window a panel asks the shell for.
 ///
 /// The shell owns the window - its position, its lifetime and its closing on
-/// the module's unload - so a module's request is plain data and its content
-/// is drawn by the same panel that asked.
+/// the module's unload - so the request is plain data, and the same panel that
+/// asked draws the content.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PanelWindowRequest {
     /// The window's identity within its panel.
@@ -106,8 +110,8 @@ pub struct PanelWindowRequest {
     pub width: f32,
     /// The window's first height in logical points.
     pub height: f32,
-    /// Whether the window is modal: a modal takes the editor's input until it
-    /// is answered, and the shell answers it with Enter or Escape.
+    /// Whether the window is modal: a modal takes the editor's input until the
+    /// person answers it with Enter or Escape, or with its own buttons.
     pub modal: bool,
 }
 
@@ -118,8 +122,8 @@ pub struct PanelEntityRow {
     pub entity: Entity,
     /// The list label the Entities tab shows.
     pub display: String,
-    /// The joined component type names, which is how a panel finds the
-    /// entities it cares about without naming a crate's type.
+    /// The component type names joined into one string. A panel matches on
+    /// part of it instead of naming a type from another crate.
     pub archetype: String,
 }
 
@@ -154,13 +158,13 @@ pub struct PanelEntityDetail {
 ///
 /// Borrowed for the call only: a panel must not keep any of it past the frame,
 /// and none of it names a type from the panel's own crate, so nothing here can
-/// outlive the module that drew it.
+/// dangle when that module unloads.
 pub struct PanelContext<'a> {
     /// The editor's smoothed frame rate.
     pub frames_per_second: f32,
-    /// The selected entity, when one is.
+    /// The selected entity, when there is one.
     pub selected_entity: Option<Entity>,
-    /// The world's entities, when a panel asked for them.
+    /// The world's entity rows, copied for the pass that draws the panels.
     pub entities: &'a [PanelEntityRow],
     /// The selected entity's components, when there is a selection.
     pub detail: Option<&'a PanelEntityDetail>,
@@ -170,11 +174,11 @@ pub struct PanelContext<'a> {
     /// A window id the editor asked this panel to open - the scripted channel's
     /// stand-in for clicking the panel's own button.
     pub requested_window: Option<&'a str>,
-    /// The answer a modal window took, once: the panel acts on it and the
-    /// shell forgets it.
+    /// The answer a modal window took, for one draw: the panel acts on it and
+    /// the shell forgets it afterwards.
     pub answer: Option<&'a PanelAnswer>,
-    /// The commands this panel asks for; the executable applies them at the
-    /// frame boundary.
+    /// The commands this panel asks for. They are applied after the draw,
+    /// never from inside it.
     pub commands: &'a mut Vec<PanelCommand>,
 }
 
@@ -183,7 +187,8 @@ pub struct PanelContext<'a> {
 pub struct PanelAnswer {
     /// The window that was answered.
     pub window: String,
-    /// Whether the answer was Enter rather than Escape.
+    /// Whether the answer accepted the window: Enter or Apply yes, Escape or
+    /// Cancel no.
     pub accepted: bool,
 }
 
@@ -200,14 +205,16 @@ pub struct PanelRegistration {
     pub source: String,
     /// The function that draws the panel's body.
     pub draw: PanelDrawFn,
-    /// The module's liveness marker, dropped when its image unloads.
+    /// The marker of the module that registered it: it goes dead when that
+    /// module unloads.
     liveness: Weak<ModuleLiveness>,
-    /// Bumped every time this id is registered again.
+    /// The number this registration took: every registration takes the next
+    /// one, so a panel that registers again gets a new value.
     pub epoch: u64,
 }
 
 impl PanelRegistration {
-    /// Whether the module that registered this panel is still loaded.
+    /// Returns whether the module that registered this panel is still loaded.
     pub fn alive(&self) -> bool {
         self.liveness.strong_count() > 0
     }
@@ -228,12 +235,12 @@ impl std::fmt::Debug for PanelRegistration {
 
 /// One panel a module asks the editor to register.
 ///
-/// A module cannot register into the registry itself: the registry binds each
-/// entry to a liveness marker, and only the executable can own that marker's
-/// strong handle - a marker kept in the module's own world resource would
-/// outlive the module and make an unloaded draw function look alive. So a
-/// module queues requests here during its `register` and the executable binds
-/// them, which is also what makes a reload's stale entries go dead.
+/// A module cannot register into the registry itself. Each entry is bound to a
+/// liveness marker, and only the executable may hold that marker's strong
+/// handle: a marker kept in a world resource would outlive the module and make
+/// an unloaded draw function look alive. A module therefore queues its
+/// requests here during its `register`, and the executable binds them, so a
+/// reload's stale entries go dead with the marker they were bound to.
 #[derive(Clone, Copy, Debug)]
 pub struct PanelRequest {
     /// The panel's identity, stable across reloads.
@@ -248,68 +255,41 @@ pub struct PanelRequest {
 
 /// The panel requests queued since the executable last looked.
 ///
-/// Drained, never read twice: a request from a generation that has since
-/// unloaded must not be replayed into a live entry.
+/// A request is taken once and never read twice, so a request from a module
+/// that has since unloaded cannot reach a live entry.
 #[derive(Debug, Default)]
 pub struct PanelRegistrations {
     /// The requests, oldest first.
     pub pending: Vec<PanelRequest>,
 }
 
-impl Resource for PanelRegistrations {}
-
 impl PanelRegistrations {
-    /// Queue one request.
+    /// Queues one request.
     pub fn push(&mut self, request: PanelRequest) {
         self.pending.push(request);
     }
 
-    /// Take everything queued since the last sync.
+    /// Takes every queued request and leaves the queue empty.
     pub fn drain(&mut self) -> Vec<PanelRequest> {
         std::mem::take(&mut self.pending)
     }
 }
 
-/// Every panel the loaded modules registered.
+impl Resource for PanelRegistrations {}
+
+/// Every panel a module registered, live or not.
 #[derive(Debug, Default)]
 pub struct PanelRegistry {
-    entries: Vec<PanelRegistration>,
+    registrations: Vec<PanelRegistration>,
     next_epoch: u64,
 }
 
-impl Resource for PanelRegistry {}
-
-/// The commands this frame's panels asked for, drained by the executable at
-/// the frame boundary.
-///
-/// A resource rather than a queue the shell owns: the shell is replaced on
-/// every reload, and a command queued by a panel of the old generation must
-/// still be applied by the executable that survives it.
-#[derive(Debug, Default)]
-pub struct PanelCommands {
-    /// The commands, oldest first.
-    pub commands: Vec<PanelCommand>,
-}
-
-impl Resource for PanelCommands {}
-
-impl PanelCommands {
-    /// Take everything queued since the last frame.
-    pub fn drain(&mut self) -> Vec<PanelCommand> {
-        std::mem::take(&mut self.commands)
-    }
-
-    /// Queue one command, as a panel body does through its `PanelContext`.
-    pub fn push(&mut self, command: PanelCommand) {
-        self.commands.push(command);
-    }
-}
-
 impl PanelRegistry {
-    /// Register a panel, replacing the entry with the same id.
+    /// Registers a panel and returns its slot, replacing any entry with the
+    /// same id.
     ///
-    /// The slot - the index the dock tab names - stays the same across a
-    /// reload, because the entry is replaced in place rather than appended.
+    /// The slot is the index the dock tab names. It stays the same across a
+    /// reload because the entry is replaced in place, not appended.
     pub fn register(
         &mut self,
         id: &str,
@@ -329,33 +309,37 @@ impl PanelRegistry {
             epoch,
         };
         if let Some(slot) = self.slot(id) {
-            self.entries[slot as usize] = registration;
+            self.registrations[slot as usize] = registration;
             return slot;
         }
-        self.entries.push(registration);
-        (self.entries.len() - 1) as u16
+        self.registrations.push(registration);
+        (self.registrations.len() - 1) as u16
     }
 
-    /// The slot a panel id occupies, when it is registered.
+    /// Returns the slot a panel id occupies, if it is registered.
     pub fn slot(&self, id: &str) -> Option<u16> {
-        self.entries
+        self.registrations
             .iter()
             .position(|entry| entry.id == id)
             .map(|index| index as u16)
     }
 
-    /// The registration in one slot.
+    /// Returns the registration in one slot, if the slot exists.
     pub fn get(&self, slot: u16) -> Option<&PanelRegistration> {
-        self.entries.get(slot as usize)
+        self.registrations.get(slot as usize)
     }
 
-    /// The draw function of a live panel, `None` when its module unloaded.
+    /// Returns the draw function of a live panel, or `None` when its module
+    /// has unloaded.
     pub fn draw_of(&self, slot: u16) -> Option<PanelDrawFn> {
-        self.get(slot).filter(|entry| entry.alive()).map(|e| e.draw)
+        self.get(slot)
+            .filter(|entry| entry.alive())
+            .map(|registration| registration.draw)
     }
 
-    /// The title to show for a slot: the panel's own while it is alive, and
-    /// the "module not loaded" text once its module is gone.
+    /// Returns the title to show for a slot: the panel's own while it is
+    /// alive, its title with " (module not loaded)" added once its module is
+    /// gone, and "Module panel" for a slot the registry does not hold.
     pub fn tab_title(&self, slot: u16) -> String {
         match self.get(slot) {
             Some(entry) if entry.alive() => entry.title.clone(),
@@ -364,31 +348,60 @@ impl PanelRegistry {
         }
     }
 
-    /// Every registration, in slot order.
+    /// Returns every registration, in slot order.
     pub fn entries(&self) -> &[PanelRegistration] {
-        &self.entries
+        &self.registrations
     }
 
-    /// How many panels are registered, live or not.
+    /// Returns how many panels are registered, live or not.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.registrations.len()
     }
 
-    /// Whether no panel is registered.
+    /// Returns whether no panel is registered.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.registrations.is_empty()
     }
 
-    /// Whether the slot's module is still loaded.
+    /// Returns whether the slot's module is still loaded.
     pub fn alive(&self, slot: u16) -> bool {
         self.get(slot).is_some_and(|entry| entry.alive())
     }
 
-    /// Whether a live panel with this id is registered.
+    /// Returns whether a live panel with this id is registered.
     pub fn has_live(&self, id: &str) -> bool {
         self.slot(id).is_some_and(|slot| self.alive(slot))
     }
 }
+
+impl Resource for PanelRegistry {}
+
+/// The commands this frame's panels asked for, applied by the executable at
+/// the frame boundary.
+///
+/// This is a resource rather than a queue the shell owns. The shell is
+/// replaced on every reload, and a command queued by a panel of the old
+/// generation must still be applied by the executable, which survives the
+/// reload.
+#[derive(Debug, Default)]
+pub struct PanelCommands {
+    /// The commands, oldest first.
+    pub commands: Vec<PanelCommand>,
+}
+
+impl PanelCommands {
+    /// Takes every queued command and leaves the queue empty.
+    pub fn drain(&mut self) -> Vec<PanelCommand> {
+        std::mem::take(&mut self.commands)
+    }
+
+    /// Queues one command, as a panel body does through its `PanelContext`.
+    pub fn push(&mut self, command: PanelCommand) {
+        self.commands.push(command);
+    }
+}
+
+impl Resource for PanelCommands {}
 
 #[cfg(test)]
 mod tests {
@@ -410,14 +423,20 @@ mod tests {
     }
 
     #[test]
-    fn re_registering_replaces_in_place_and_bumps_the_epoch() {
+    fn re_registering_replaces_in_place_and_increases_the_epoch() {
         let mut registry = PanelRegistry::default();
-        let first = ModuleLiveness::new();
-        let slot = registry.register("a", "A", "shell", draw_panel, &first);
+        let first_registration_marker = ModuleLiveness::new();
+        let slot = registry.register("a", "A", "shell", draw_panel, &first_registration_marker);
         let epoch = registry.get(slot).map(|entry| entry.epoch).unwrap_or(0);
-        let second = ModuleLiveness::new();
+        let second_registration_marker = ModuleLiveness::new();
         assert_eq!(
-            registry.register("a", "A again", "shell", draw_panel, &second),
+            registry.register(
+                "a",
+                "A again",
+                "shell",
+                draw_panel,
+                &second_registration_marker
+            ),
             slot
         );
         assert_eq!(registry.len(), 1);

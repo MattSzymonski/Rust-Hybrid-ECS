@@ -1,13 +1,13 @@
-//! A scene: the entities of a world, their persistable components and their
-//! references, written as one standalone asset in `res`.
+//! A scene: the entities of a world, the components that can be saved and
+//! their references, written as one standalone asset in `res`.
 //!
 //! # Responsibilities
 //!
 //! - [`SceneDocument`]: what a `.scene` file holds - one entry per entity, its
 //!   stable [`EntityId`], and its components by registered type name, each a
 //!   map of field name to the value the field layer reads.
-//! - [`save_scene`]: a world's entities as that document, with every reference
-//!   in the saved form.
+//! - [`save_scene`]: a world's entities as that document, with references in
+//!   their saved form.
 //! - [`load_scene`]: the document back into a world - entities created under
 //!   the ids it carries, components re-attached by name, asset references
 //!   loaded on demand and entity references resolved once every entity exists.
@@ -16,24 +16,26 @@
 //!
 //! # Design
 //!
-//! The document is addressed by the field layer's names, not by the component
-//! types' own serde: a handle field then saves as its guid and an entity field
-//! as its stable id. A component whose own serde writes a handle as a slot pair
+//! The document uses the field layer's names, not the component types' own
+//! serde: a handle field is saved as its guid and an entity field as its
+//! stable id. A component whose own serde writes a handle as a slot pair
 //! cannot be written straight into a file meant for a later run, so the field
 //! layer - which knows what a reference *is* - is the writer.
 //!
-//! A field the field layer can only summarise (a `vec:` container, a `string`)
-//! is not written; [`SceneSave::skipped_fields`] names each one, so a lossy
-//! save says so rather than passing for a complete one. A field it can locate
-//! but not interpret (a `struct:` with no known layout) is written as its raw
-//! bytes, which write back verbatim into the same layout. A whole component it
-//! cannot reach - no layout, or a row it cannot read - is left out and named in
-//! [`SceneSave::skipped_components`], which is the caller's to report.
+//! A field the field layer can only summarise (a `vec:` or `dynbuf:`
+//! container, a `string`) is not written; [`SceneSave::skipped_fields`] names
+//! each one, so a save that loses data says so instead of looking complete. A
+//! field it can find but not interpret (a `struct:` with no known layout) is
+//! written as its raw bytes, which are written back unchanged into the same
+//! layout. A whole component it cannot reach - no layout, or a row it cannot
+//! read - is left out and named in [`SceneSave::skipped_components`], which
+//! the caller has to report.
 //!
-//! Loading is three passes: the components a reference lives in must exist
-//! before the field is written, and an entity reference may name an entity
-//! that comes later in the file. So: create every entity, attach every
-//! component, then write every field.
+//! Loading runs four passes in this order: create every entity, attach every
+//! component, write every field, then resolve the entity references. A
+//! component and its fields must exist before a reference is written into
+//! them, and an entity reference may name an entity that comes later in the
+//! file, so the last pass waits until every entity exists.
 
 // Standard library
 use std::collections::{BTreeMap, HashSet};
@@ -101,9 +103,10 @@ impl Scene {
 /// type under, and the type a `Handle<Scene>` field records.
 const SCENE_SHARED_NAME: &str = "pill_engine::scene::Scene";
 
-// Shared identity: a type two binaries each compile has one `TypeId` per
-// binary, so the pinned name is what makes them one asset column - and what a
-// saved `Handle<Scene>` field records. Keep it verbatim when moving the type.
+// Shared identity: when two binaries each compile this type, each gets its own
+// `TypeId` for it. The pinned name is what makes them one asset column, and
+// what a `Handle<Scene>` field records as its asset type. Keep it verbatim
+// when moving the type.
 impl Asset for Scene {
     fn shared_name() -> Option<&'static str> {
         Some(SCENE_SHARED_NAME)
@@ -141,21 +144,22 @@ pub struct SceneSave {
     /// `<entity>: <component>.<field>`.
     pub skipped_fields: Vec<String>,
     /// One entry per component the save left out, by `<entity>: <component>`
-    /// and the reason. A component is written through the field layer, so one
-    /// with no layout of its own has no fields to write - the document then
-    /// holds the entity without it, which is a loss the caller has to see.
+    /// and the reason. The save writes components through the field layer, so
+    /// a component with no layout of its own has no fields to write. The
+    /// document then holds the entity without that component, which is a loss
+    /// the caller has to see.
     pub skipped_components: Vec<String>,
-    /// How many components were written.
+    /// How many component entries the document holds.
     pub components: usize,
 }
 
-/// Write a world's entities into a scene document.
+/// Writes a world's entities into a scene document.
 ///
 /// `entities` names the entities to write; `None` writes every live entity.
-/// A component is written when the field layer can read it, which is the same
-/// condition that lets it be written back. Persistability is deliberately not
-/// the gate: that is a serde registration, and a component holding an `Entity`
-/// - the very thing a scene exists to carry - cannot have one.
+/// A component is written when the field layer can read it, which is also
+/// what a load needs to write it back. Persistability is deliberately not the
+/// gate: that is a serde registration, and a component holding an `Entity` -
+/// the very thing a scene exists to carry - cannot have one.
 pub fn save_scene(
     world: &World,
     assets: &AssetManager,
@@ -177,25 +181,26 @@ pub fn save_scene(
             continue;
         };
         let mut components = BTreeMap::new();
-        for name in world.entity_component_names(entity).unwrap_or_default() {
-            let Some(component_id) = world.resolve_entity_component_id(entity, &name) else {
+        for component_name in world.entity_component_names(entity).unwrap_or_default() {
+            let Some(component_id) = world.resolve_entity_component_id(entity, &component_name)
+            else {
                 report
                     .skipped_components
-                    .push(format!("{id}: {name} is not registered on this entity"));
+                    .push(format!("{id}: {component_name} is not registered on this entity"));
                 continue;
             };
             let Some(layout) = world.component_field_layout(component_id) else {
                 report
                     .skipped_components
-                    .push(format!("{id}: {name} has no field layout"));
+                    .push(format!("{id}: {component_name} has no field layout"));
                 continue;
             };
-            let values = match world.read_component_fields(entity, &name) {
+            let values = match world.read_component_fields(entity, &component_name) {
                 Ok(values) => values,
                 Err(_) => {
                     report
                         .skipped_components
-                        .push(format!("{id}: {name} cannot be read"));
+                        .push(format!("{id}: {component_name} cannot be read"));
                     continue;
                 }
             };
@@ -207,35 +212,35 @@ pub fn save_scene(
                     }
                     None => report
                         .skipped_fields
-                        .push(format!("{id}: {name}.{}", descriptor.name)),
+                        .push(format!("{id}: {component_name}.{}", descriptor.name)),
                 }
             }
             report.components += 1;
-            components.insert(name, fields);
+            components.insert(component_name, fields);
         }
         document.entities.push(SceneEntity { id, components });
     }
     (document, report)
 }
 
-/// One field value as a scene document holds it, or `None` for a value the
-/// field layer can only summarise (a heap container) or a float JSON has no
-/// number for.
+/// Returns one field value the way a scene document stores it, or `None` for
+/// a value the field layer can only summarise (a heap container) or a float
+/// that JSON cannot hold.
 ///
-/// `Text` is `None` for the same reason `List` is: a heap-backed field is not
-/// writable through the field layer, so a value written here could never be
-/// restored - and a document that carries one lies about what a load will do.
+/// `Text` is `None` for the same reason `List` is: the field layer cannot
+/// write a heap-backed field, so a value stored here would never reach a
+/// component on load.
 fn saved_field(
     world: &World,
     assets: &AssetManager,
     registry: &ImportRegistry,
-    value: &FieldValue,
+    field_value: &FieldValue,
 ) -> Option<serde_json::Value> {
-    /// A float JSON can represent; `None` for NaN and the infinities.
+    /// A JSON number holding `value`; `None` for NaN and the infinities.
     fn number(value: f64) -> Option<serde_json::Value> {
         serde_json::Number::from_f64(value).map(serde_json::Value::Number)
     }
-    match value {
+    match field_value {
         FieldValue::F32(value) => number(f64::from(*value)),
         FieldValue::F64(value) => number(*value),
         FieldValue::I8(value) => Some(serde_json::json!(value)),
@@ -265,35 +270,37 @@ fn saved_field(
             match saved_reference(world, assets, registry, value) {
                 Some(SavedReference::Asset(reference)) => serde_json::to_value(reference).ok(),
                 Some(SavedReference::Entity(id)) => Some(serde_json::json!(id.to_string())),
-                // An unset reference writes as `null`, which is how a cleared
-                // field reads back; a set one the writer cannot name (an asset
-                // without a guid) is a loss, and says so.
-                None if !is_set_reference(value) => Some(serde_json::Value::Null),
+                // An unset reference is written as `null`, and a load reads
+                // that back as the cleared value. A set reference the writer
+                // cannot name (an asset with no guid) is left out, and the
+                // caller reports the loss.
+                None if !is_set_reference(field_value) => Some(serde_json::Value::Null),
                 None => None,
             }
         }
     }
 }
 
-/// Whether `value` names something, for the two reference variants.
-fn is_set_reference(value: &FieldValue) -> bool {
-    match value {
+/// Whether `field_value` names something; only the two reference variants
+/// can.
+fn is_set_reference(field_value: &FieldValue) -> bool {
+    match field_value {
         FieldValue::Asset { .. } | FieldValue::Entity { .. } => !value.references_nothing(),
         _ => false,
     }
 }
 
-/// `bytes` as lowercase hex, the form an opaque payload is written in.
+/// Returns `bytes` as lowercase hex, the form an opaque payload is written in.
 fn hex_of(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        // Writing into the string cannot fail.
+        // Writing into a `String` cannot fail.
         let _ = write!(text, "{byte:02x}");
     }
     text
 }
 
-/// The bytes `text` spells as hex, or `None` for anything else.
+/// Returns the bytes `text` spells as hex, or `None` when it is not hex.
 fn bytes_of(text: &str) -> Option<Vec<u8>> {
     let digits = text.as_bytes();
     if !digits.len().is_multiple_of(2) {

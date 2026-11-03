@@ -5,142 +5,167 @@
 //! - Notice that one of the editor's state files changed without a writer to
 //!   hook: the editor's files are also written by hand and by other tools, so
 //!   the file's own metadata is the signal ([`FileStamp`]).
-//! - Read that file at most once per change, and keep its text so an unchanged
-//!   file costs nothing ([`StateFileWatch`]).
+//! - Read a file again only when that metadata moved or the regular re-read is
+//!   due, and keep its text so a file that did not change costs nothing
+//!   ([`StateFileWatch`]).
 //!
 //! # Design
 //!
-//! A watcher re-reads when the stamp moved or when the grace poll is due, so a
-//! coarse or unchanged timestamp still reaches the editor within a fraction of
-//! a second. The same rule was written out twice in the executable, with one
-//! extra flag between them; the flag's meaning is now the caller's decision:
-//! a caller whose apply can fail calls [`StateFileWatch::poll_now`] until it
-//! has applied once, instead of the watch carrying a "have I been applied"
-//! bit.
+//! A watch re-reads its file when the file's stamp (its modification time and
+//! length, see [`FileStamp`]) moved. It also re-reads every
+//! [`STATE_FILE_POLL_FRAMES`] frames whatever the stamp says, which catches an
+//! edit whose modification time is too coarse to show it. A caller whose apply
+//! can fail calls [`StateFileWatch::poll_now`] until it has applied once, so
+//! the watch does not need to remember whether the caller applied its last
+//! answer.
 //!
-//! The theme's layers keep their own stamps: they name a *selection* to
-//! re-resolve rather than a document to read, so a text cache would be dead
-//! weight there.
+//! The editor's theme watch keeps a stamp for each file it follows. It looks
+//! the theme up again instead of caching a document's text, so
+//! [`StateFileWatch`] is not used there.
 
 // Standard library
 use std::path::{Path, PathBuf};
 
-/// How often a state file is re-read even when its stamp did not move.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The number of frames after which a state file is re-read even when its
+/// stamp did not move.
 ///
-/// A filesystem may report a modification time coarser than the edits to the
-/// file, so the stamp alone can miss a change; this poll bounds the wait.
+/// A filesystem may report a modification time that changes less often than
+/// the file does, so the stamp alone can miss an edit. This regular re-read
+/// bounds how long the editor can miss it.
 pub const STATE_FILE_POLL_FRAMES: u64 = 30;
 
-/// A state file's metadata: what a frame compares to decide whether the file
-/// needs reading at all.
+// =============================================================================
+// Types
+// =============================================================================
+
+/// The metadata of a state file, which the editor compares from frame to frame
+/// to decide whether the file needs reading at all.
 ///
-/// A missing file stamps as the default, which differs from any file that
-/// exists, so creating one is noticed.
+/// A missing file stamps as the default. No file that exists has that stamp,
+/// so creating the file is noticed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FileStamp {
     /// The file's modification time, when the filesystem reports one.
-    modified: Option<std::time::SystemTime>,
-    /// Its length in bytes.
-    length: u64,
+    modification_time: Option<std::time::SystemTime>,
+    /// The file's length in bytes.
+    length_bytes: u64,
 }
 
 impl FileStamp {
-    /// The stamp of `path`, or the default when it cannot be read.
+    /// Returns the stamp of `path`, or the default stamp when the file cannot
+    /// be read.
     #[must_use]
     pub fn of(path: &Path) -> Self {
         std::fs::metadata(path)
             .map(|metadata| Self {
-                modified: metadata.modified().ok(),
-                length: metadata.len(),
+                modification_time: metadata.modified().ok(),
+                length_bytes: metadata.len(),
             })
             .unwrap_or_default()
     }
 }
 
-/// One state file the editor polls: where it is, the stamp its text was read
-/// at, and the text that read produced.
+/// One state file the editor polls.
+///
+/// It holds the file's path, the stamp seen when its text was last read, the
+/// text that read produced, and whether the file has been read at all.
 #[derive(Debug, Default)]
 pub struct StateFileWatch {
     path: PathBuf,
-    stamp: FileStamp,
+    last_read_stamp: FileStamp,
     text: Option<String>,
-    read_once: bool,
+    has_read_once: bool,
 }
 
 impl StateFileWatch {
-    /// A watch on `path` that has not read it yet.
+    /// Starts a watch on `path` that has not read the file yet.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            stamp: FileStamp::default(),
+            last_read_stamp: FileStamp::default(),
             text: None,
-            read_once: false,
+            has_read_once: false,
         }
     }
 
-    /// The path this watch polls.
+    /// Returns the path this watch polls.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// The text of the last read; `None` when the file was absent.
+    /// Returns the text of the most recent read. It is `None` before the first
+    /// read and when that read did not succeed.
     #[must_use]
     pub fn text(&self) -> Option<&str> {
         self.text.as_deref()
     }
 
-    /// Re-read the file when its stamp moved or the grace poll is due.
+    /// Re-reads the file when its stamp moved or when the regular re-read is
+    /// due.
     ///
-    /// `None` means the file is unchanged; `Some(None)` means it is gone;
-    /// `Some(Some(text))` is the new content. The first poll always reads,
-    /// because the default stamp of a file that has never been read differs
-    /// from the stamp of any file that exists.
+    /// `frame_index` is the editor's frame counter. It decides when the
+    /// regular re-read falls, once every [`STATE_FILE_POLL_FRAMES`] frames.
+    ///
+    /// Returns `None` when the file is unchanged, `Some(None)` when it is gone
+    /// or could not be read, and `Some(Some(text))` when the text is new. The
+    /// first poll always reads, whatever the stamp says.
     pub fn poll(&mut self, frame_index: u64) -> Option<Option<String>> {
-        let stamp = FileStamp::of(&self.path);
-        let due = frame_index.is_multiple_of(STATE_FILE_POLL_FRAMES);
-        if !due && self.read_once && stamp == self.stamp {
+        let current_stamp = FileStamp::of(&self.path);
+        let is_poll_due = frame_index.is_multiple_of(STATE_FILE_POLL_FRAMES);
+        if !is_poll_due && self.has_read_once && current_stamp == self.last_read_stamp {
             return None;
         }
-        self.stamp = stamp;
+        self.last_read_stamp = current_stamp;
         self.read()
     }
 
-    /// Re-read the file whatever its stamp says, answering only when the text
-    /// changed.
+    /// Re-reads the file whatever its stamp says, and returns it only when the
+    /// text changed.
     ///
-    /// A caller whose apply can fail polls this way until it has applied once,
-    /// so a file that could not be applied is retried instead of being
-    /// silently skipped as unchanged.
+    /// The answer has the same three shapes as [`poll`](Self::poll). A caller
+    /// whose apply can fail calls this until it has applied once, so a file
+    /// that could not be applied is retried instead of being skipped as
+    /// unchanged.
     pub fn poll_now(&mut self) -> Option<Option<String>> {
-        self.stamp = FileStamp::of(&self.path);
+        self.last_read_stamp = FileStamp::of(&self.path);
         self.read()
     }
 
-    /// Read the file and answer its text when it differs from the cached one,
-    /// or when this is its first read.
+    /// Reads the file and returns its text when that text differs from the
+    /// cached one, or when this is the first read.
+    ///
+    /// A file that cannot be read counts as an absent one.
     fn read(&mut self) -> Option<Option<String>> {
-        let text = std::fs::read_to_string(&self.path).ok();
-        let first = !self.read_once;
-        self.read_once = true;
-        if !first && text == self.text {
+        let current_text = std::fs::read_to_string(&self.path).ok();
+        let is_first_read = !self.has_read_once;
+        self.has_read_once = true;
+        if !is_first_read && current_text == self.text {
             return None;
         }
-        self.text = text;
+        self.text = current_text;
         Some(self.text.clone())
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A scratch directory of this test's own under the system temp directory,
-    /// named so parallel runs do not collide.
-    fn scratch_directory(label: &str) -> PathBuf {
+    /// Creates a scratch directory under the system temp directory, named so
+    /// that parallel test runs do not collide.
+    fn scratch_directory(test_label: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!(
-            "ecs-state-watch-{label}-{}-{}",
+            "ecs-state-watch-{test_label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -151,18 +176,18 @@ mod tests {
         directory
     }
 
-    /// The four states a watcher has to tell apart: absent, present, unchanged
-    /// and edited.
+    /// Checks the four states a watch has to tell apart: absent, present,
+    /// unchanged and edited.
     #[test]
     fn a_watch_follows_absent_present_unchanged_and_edited() {
         let directory = scratch_directory("follow");
         let path = directory.join("state.json");
         let mut watch = StateFileWatch::new(path.clone());
 
-        // Absent: the first poll reads and answers the absence.
+        // Absent: the first poll reads and reports the absence.
         assert_eq!(watch.poll(1), Some(None), "the first poll reads");
         assert_eq!(watch.text(), None);
-        // Still absent: unchanged.
+        // Still absent: the second poll reports no change.
         assert_eq!(watch.poll(2), None);
 
         // Present: the stamp moved, so the poll reads the file.
@@ -170,7 +195,7 @@ mod tests {
         assert_eq!(watch.poll(3), Some(Some("{\"a\": 1}".to_owned())));
         assert_eq!(watch.text(), Some("{\"a\": 1}"));
 
-        // Unchanged: no stamp move, no read.
+        // Unchanged: the stamp did not move, so nothing is read.
         assert_eq!(watch.poll(4), None);
 
         // Edited: the stamp moved again.
@@ -180,23 +205,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// The grace poll re-reads even when the stamp did not move, which is what
-    /// catches a filesystem with a coarse modification time.
+    /// Checks that the regular re-read still happens when the stamp did not
+    /// move, which is what catches an edit on a filesystem with a coarse
+    /// modification time.
     #[test]
-    fn the_grace_poll_reads_an_unchanged_stamp() {
+    fn an_unchanged_stamp_is_read_on_the_regular_reread() {
         let directory = scratch_directory("grace");
         let path = directory.join("state.json");
         std::fs::write(&path, "{\"a\": 1}").expect("the file");
         let mut watch = StateFileWatch::new(path.clone());
         assert_eq!(watch.poll(1), Some(Some("{\"a\": 1}".to_owned())));
-        // A poll at the grace frame re-reads even though the stamp compares
-        // equal; the text is the same, so it answers nothing.
+        // A poll on the regular re-read frame reads the file even though the
+        // stamp compares equal. The text is the same, so the poll reports
+        // nothing.
         assert_eq!(watch.poll(STATE_FILE_POLL_FRAMES), None);
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// A caller that cannot apply yet asks for a re-read regardless of the
-    /// stamp, and gets one only when the text really changed.
+    /// Checks that a caller that cannot apply yet can ask for a re-read
+    /// regardless of the stamp, and gets an answer only when the text really
+    /// changed.
     #[test]
     fn poll_now_reads_without_a_stamp_move() {
         let directory = scratch_directory("now");

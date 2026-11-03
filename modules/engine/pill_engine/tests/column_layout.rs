@@ -1,25 +1,27 @@
-//! Integration tests for the descriptor-component layout witness.
+//! Integration tests for the layout checks on a descriptor component column.
 //!
-//! A typeless descriptor component is stored as raw bytes: `ComponentColumn`
-//! copies rows with `ptr::copy`, frees them without running element
-//! destructors, and is `Send + Sync` on the strength of the `Blittability` its
-//! layout carries.
+//! A descriptor component is one whose type lives in another language, so the
+//! column stores its rows as raw bytes. `ComponentColumn` copies rows with
+//! `ptr::copy`, frees them without running element destructors, and is
+//! `Send + Sync` because the `Blittability` its layout carries is evidence
+//! that the rows are plain data.
 //!
 //! # Responsibilities
 //!
 //! - Pin the layout shapes the engine must refuse, as typed errors.
-//! - Keep the refusals at registration rather than at first growth.
+//! - Cover both places a layout is checked: when the column is built and when
+//!   it first grows.
 
 use pill_engine::archetype::{Blittability, ColumnLayout, ComponentColumn};
 use pill_engine::world::WorldError;
 
-/// A layout the constructor refuses is refused with the error that names the
-/// check; a layout built around the constructor is refused by the column.
+/// A layout that the constructor refuses comes back as the error naming the
+/// failed check, and a layout assembled without the constructor is refused by
+/// the column instead.
 #[test]
 fn degenerate_layouts_are_typed_errors() {
-    // SAFETY: every layout below would describe at most one row of a plain
-    // value type; only the size and alignment are degenerate, which is what
-    // the checks under test refuse.
+    // SAFETY: this test never builds a column from these layouts. Each is
+    // refused before one exists, so the plain-data claim is never relied on.
     let witness = unsafe { Blittability::assume() };
     assert!(matches!(
         ColumnLayout::new(0, 4, 1, witness),
@@ -64,8 +66,8 @@ fn degenerate_layouts_are_typed_errors() {
 /// is reported as a layout error rather than tripping an `expect`.
 #[test]
 fn an_unrepresentable_growth_is_a_layout_error() {
-    // One element of this size still describes a layout; four of them overflow
-    // `usize`, so the refusal happens in `reserve_one` before any allocation.
+    // One element of this size still describes a layout. Four of them overflow
+    // `usize`, so `grow_to` refuses the buffer size before it allocates.
     let unallocatable_growth = ColumnLayout {
         size: usize::MAX / 4 + 8,
         align: 8,

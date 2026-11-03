@@ -1,27 +1,34 @@
 //! Unit tests for the component field layer: the field value vocabulary, the
-//! tag helpers, the scalar and container codec, the row reads and writes, and
-//! the registration-time nested layout expansion.
+//! scalar codec, the heap-container reads, the field reads and writes, and the
+//! layout expansion done when a component registers.
 //!
 //! # Responsibilities
 //!
-//! - Cover every public entry point of the module through a registered test
-//!   component, so a change to the codec or the row layer fails here rather
+//! - Cover the field entry points of [`World`] through registered test
+//!   components, so a change to the codec or the row layer fails here rather
 //!   than in a caller.
-//! - Pin the layouts the tests declare: each probe type is `repr(C)` so the
-//!   hand-written `ComponentFieldLayout` beside it describes the offsets the
-//!   test expects, and a reordered struct fails instead of passing by accident.
+//! - Pin the layouts the tests declare: each probe type is `repr(C)`, and the
+//!   hand-written [`ComponentFieldDescriptor`] table beside it gives the same
+//!   offsets, so a reordered struct fails instead of passing by accident.
 //!
 //! # Design
 //!
-//! The tests reach the module's items through `use super::*`, as they did
-//! while they lived inside it; the type names they build as strings are names,
-//! not paths, and are untouched by the move.
+//! The tests reach the module's items through `use super::*`. A probe
+//! component that needs a field layout is registered with a hand-written
+//! descriptor table giving the same offsets as its `repr(C)` layout, so the
+//! tests check the reader against offsets they can see rather than against
+//! what the derive would generate.
 
+// Current crate
 use super::codec::{decode_scalar, encode_scalar, is_scalar_tag, scalar_size};
 use super::*;
 use crate::component::{Component, ComponentId};
 use crate::component_registry::ComponentFieldDescriptor;
 use crate::world::World;
+
+// =============================================================================
+// Probe components and their declared layouts
+// =============================================================================
 
 /// `repr(C)` pins the field offsets the hand-written layout below
 /// describes; a plain `repr(Rust)` struct may reorder fields.
@@ -35,8 +42,8 @@ struct SampleComponent {
 }
 impl Component for SampleComponent {}
 
-/// A second registered type the sample entity's archetype never carries,
-/// used to drive the write path into its storage-missing arms.
+/// A second registered type that the sample entity's archetype never carries,
+/// so the write path's storage-missing error can be reached.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq)]
 struct OtherComponent {
@@ -44,7 +51,8 @@ struct OtherComponent {
 }
 impl Component for OtherComponent {}
 
-/// Inner half of the nested-layout components below.
+/// The inner struct of [`NestedOuter`] below. It is registered as a component
+/// too, so the layout expansion can look its fields up.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct NestedInner {
@@ -53,10 +61,10 @@ struct NestedInner {
 }
 impl Component for NestedInner {}
 
-/// A value type whose layout reaches components through the installed
-/// value-type resolver rather than through a component registration of
-/// its own. The facade's `register_all_components` installs one over its
-/// DLL's `#[derive(PillMirror)]` registry; this test installs its own.
+/// A value type that is not registered as a component. Components reach its
+/// layout through the installed value-type resolver instead: the facade's
+/// `register_all_components` installs one over the registering DLL's
+/// `#[derive(PillMirror)]` types, and the tests install their own.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct ProbeVector {
@@ -87,8 +95,8 @@ static PROBE_VECTOR_FIELDS: &[ComponentFieldDescriptor] = &[
 ];
 
 /// The test's value-type resolver: knows `ProbeVector` only.
-fn probe_value_types(path: &str) -> Option<&'static [ComponentFieldDescriptor]> {
-    (path == "ProbeVector").then_some(PROBE_VECTOR_FIELDS)
+fn probe_value_types(type_path: &str) -> Option<&'static [ComponentFieldDescriptor]> {
+    (type_path == "ProbeVector").then_some(PROBE_VECTOR_FIELDS)
 }
 
 /// Carries one nested component field and one nested value-type field.
@@ -101,7 +109,7 @@ struct NestedOuter {
 }
 impl Component for NestedOuter {}
 
-// A hand-rolled registration mirroring what #[derive(PillComponent)] emits.
+// A hand-written field table, the same one `#[derive(PillComponent)]` emits.
 static SAMPLE_FIELDS: &[ComponentFieldDescriptor] = &[
     ComponentFieldDescriptor {
         name: "a_float",
@@ -149,7 +157,7 @@ fn test_world() -> World {
     world
 }
 
-fn sample_value() -> SampleComponent {
+fn sample_component() -> SampleComponent {
     SampleComponent {
         a_float: 1.5,
         an_int: 7,
@@ -209,8 +217,8 @@ static NESTED_OUTER_FIELDS: &[ComponentFieldDescriptor] = &[
     },
 ];
 
-/// A component carrying an array of value types: the shape a spline's
-/// control points have.
+/// A component holding an array of value types, the shape a spline's control
+/// points have.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct PointArray {
@@ -240,9 +248,13 @@ static POINT_ARRAY_FIELDS: &[ComponentFieldDescriptor] = &[
     },
 ];
 
-/// An `array:struct:` field expands into one dotted row per leaf per
-/// element, with the element stride composed from the array's own size, and
-/// a single element's leaf reads and writes like any scalar field.
+// =============================================================================
+// Field reads, writes and expanded layouts
+// =============================================================================
+
+/// An `array:struct:` field expands into one dotted row for every leaf of
+/// every element. The stride between elements comes from the array's own size,
+/// and each leaf reads and writes like a scalar field.
 #[test]
 fn struct_arrays_expand_into_editable_element_rows() {
     let mut world = World::new();
@@ -253,9 +265,9 @@ fn struct_arrays_expand_into_editable_element_rows() {
     let layout = world
         .component_field_layout(ComponentId::of::<PointArray>())
         .expect("PointArray registered with a layout");
-    let names: Vec<&str> = layout.iter().map(|field| field.name).collect();
+    let field_names: Vec<&str> = layout.iter().map(|field| field.name).collect();
     assert_eq!(
-        names,
+        field_names,
         [
             "lead",
             "points[0].x",
@@ -278,21 +290,21 @@ fn struct_arrays_expand_into_editable_element_rows() {
         })
         .build()
         .expect("entity builds");
-    let component = world
+    let component_name = world
         .entity_component_names(entity)
         .and_then(|names| names.into_iter().find(|name| name.ends_with("PointArray")))
         .expect("the entity carries PointArray");
-    let read = world
-        .read_component_field(entity, &component, "points[1].y")
+    let read_value = world
+        .read_component_field(entity, &component_name, "points[1].y")
         .expect("the element's leaf reads");
-    assert!(matches!(read, FieldValue::F32(value) if value == 5.0));
+    assert!(matches!(read_value, FieldValue::F32(value) if value == 5.0));
     world
-        .write_component_field(entity, &component, "points[0].x", FieldValue::F32(9.5))
+        .write_component_field(entity, &component_name, "points[0].x", FieldValue::F32(9.5))
         .expect("the element's leaf writes");
-    let read = world
-        .read_component_field(entity, &component, "points[0].x")
+    let read_value = world
+        .read_component_field(entity, &component_name, "points[0].x")
         .expect("the element's leaf reads back");
-    assert!(matches!(read, FieldValue::F32(value) if value == 9.5));
+    assert!(matches!(read_value, FieldValue::F32(value) if value == 9.5));
 }
 
 fn nested_world() -> World {
@@ -313,8 +325,8 @@ fn nested_fields_expand_into_editable_rows() {
     let layout = world
         .component_field_layout(ComponentId::of::<NestedOuter>())
         .expect("NestedOuter registered with a layout");
-    let names: Vec<&str> = layout.iter().map(|field| field.name).collect();
-    assert_eq!(names, ["lead", "inner.a", "inner.b", "probe.x", "probe.y"]);
+    let field_names: Vec<&str> = layout.iter().map(|field| field.name).collect();
+    assert_eq!(field_names, ["lead", "inner.a", "inner.b", "probe.x", "probe.y"]);
     assert_eq!(layout[1].offset, 4, "composed offsets for inner.a");
     assert_eq!(layout[2].offset, 8, "composed offsets for inner.b");
     assert_eq!(layout[3].offset, 12, "composed offsets for probe.x");
@@ -348,8 +360,10 @@ fn nested_fields_expand_into_editable_rows() {
     );
 }
 
-/// The declared view keeps the nesting the editor view flattens: a mirror
-/// is a struct declaration, and a leaf row names no field a struct has.
+/// The declared layout keeps nested fields whole, unlike the flattened layout
+/// [`World::component_field_layout`] returns. The C# mirror is generated from
+/// the declared form, because the editor's leaf rows name fields no struct
+/// declares.
 #[test]
 fn the_declared_layout_keeps_nested_fields_whole() {
     let mut world = nested_world();
@@ -360,19 +374,19 @@ fn the_declared_layout_keeps_nested_fields_whole() {
     let declared = world
         .component_declared_field_layout(ComponentId::of::<NestedOuter>())
         .expect("NestedOuter registered with a layout");
-    let names: Vec<&str> = declared.iter().map(|field| field.name).collect();
-    assert_eq!(names, ["lead", "inner", "probe"]);
+    let field_names: Vec<&str> = declared.iter().map(|field| field.name).collect();
+    assert_eq!(field_names, ["lead", "inner", "probe"]);
     assert_eq!(declared[1].type_tag, "struct:NestedInner");
     assert_eq!(declared[1].offset, 4);
     assert_eq!(declared[1].size, 8, "the whole nested struct, not a leaf");
 
-    // An array of structs stays one array field, so the mirror emits the
-    // elements it declares rather than one struct field per leaf.
+    // An array of structs stays one field in the declared layout, so the mirror
+    // declares the array it holds instead of one field per leaf.
     let declared = world
         .component_declared_field_layout(ComponentId::of::<PointArray>())
         .expect("PointArray registered with a layout");
-    let names: Vec<&str> = declared.iter().map(|field| field.name).collect();
-    assert_eq!(names, ["lead", "points"]);
+    let field_names: Vec<&str> = declared.iter().map(|field| field.name).collect();
+    assert_eq!(field_names, ["lead", "points"]);
     assert_eq!(declared[1].type_tag, "array:struct:ProbeVector");
     assert_eq!(declared[1].element_count, 2);
 }
@@ -408,9 +422,9 @@ fn unresolvable_struct_fields_stay_opaque() {
     assert_eq!(layout[0].type_tag, "struct:NoSuchTypeExists");
 }
 
-/// A captured opaque payload round-trips: read it off a live row, write it
-/// back through both generic paths (a field write and a whole image), and
-/// the bytes match; a payload that does not pin to the field is refused.
+/// A captured opaque payload round-trips. Read it from a live row, write it
+/// back through a field write or into a whole component image, and the bytes
+/// match. A payload whose tag or size does not match the field is refused.
 #[test]
 fn captured_opaque_payloads_round_trip_and_are_pinned_to_their_field() {
     static FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
@@ -452,7 +466,7 @@ fn captured_opaque_payloads_round_trip_and_are_pinned_to_their_field() {
     // native-endian convention rather than a fixed byte order.
     assert_eq!(bytes, 0xAAAA_BBBBu32.to_ne_bytes());
 
-    // A field write of the captured payload lands the same bytes back.
+    // A field write of the captured payload writes the same bytes back.
     world
         .write_component_field(entity, &name, "mystery", captured.clone())
         .expect("the captured payload writes back");
@@ -461,31 +475,32 @@ fn captured_opaque_payloads_round_trip_and_are_pinned_to_their_field() {
         Ok(captured.clone())
     );
 
-    // A whole captured image builds too, which is the restore path.
+    // The same payload also builds a whole component image, the path a scene
+    // load takes to attach a component.
     let image = world
         .build_component_image(&name, &[("mystery".to_string(), captured.clone())])
         .expect("the captured image builds");
     assert_eq!(image, 0xAAAA_BBBBu32.to_ne_bytes());
 
-    // A payload whose size or tag does not pin to the field is refused.
-    let short = FieldValue::Opaque {
+    // A payload whose size or tag does not match the field is refused.
+    let short_payload = FieldValue::Opaque {
         type_tag,
         bytes: vec![0, 1],
     };
     assert_eq!(
-        world.write_component_field(entity, &name, "mystery", short.clone()),
+        world.write_component_field(entity, &name, "mystery", short_payload.clone()),
         Err(ComponentFieldError::TypeMismatch {
             field: "mystery".to_string(),
             expected: "struct:NoSuchTypeExists",
             found: "opaque",
         })
     );
-    let mistagged = FieldValue::Opaque {
+    let mistagged_payload = FieldValue::Opaque {
         type_tag: "struct:SomethingElse",
         bytes: bytes.clone(),
     };
     assert_eq!(
-        world.build_component_image(&name, &[("mystery".to_string(), mistagged)]),
+        world.build_component_image(&name, &[("mystery".to_string(), mistagged_payload)]),
         Err(ComponentFieldError::TypeMismatch {
             field: "mystery".to_string(),
             expected: "struct:NoSuchTypeExists",
@@ -496,9 +511,10 @@ fn captured_opaque_payloads_round_trip_and_are_pinned_to_their_field() {
 
 /// An opaque payload cannot be written over a heap container's header.
 ///
-/// `dynbuf:` names a `DynamicBuffer` header, and an opaque payload whose
-/// tag and size pin to the field would copy its bytes straight over the
-/// live pointer. Every container tag takes the accessor-only path instead.
+/// A `dynbuf:` field is a `DynamicBuffer` header, so an opaque payload with
+/// the right tag and size would copy its bytes straight over the live pointer.
+/// Every container tag is refused by the generic write path instead and can
+/// only be edited through the field's accessors.
 #[test]
 fn an_opaque_payload_cannot_overwrite_a_container_handle() {
     static FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
@@ -530,8 +546,8 @@ fn an_opaque_payload_cannot_overwrite_a_container_handle() {
         .build()
         .expect("entity builds");
 
-    // A payload a hand-written document could carry: tagged and sized to
-    // pin exactly to this field, filled with bytes of its choosing.
+    // A payload a hand-written document could carry: the tag and size match
+    // the field exactly, and the bytes are the caller's own.
     let forged = FieldValue::Opaque {
         type_tag: "dynbuf:f32",
         bytes: 0xDEAD_BEEF_u64.to_ne_bytes().repeat(3),
@@ -556,9 +572,10 @@ fn an_opaque_payload_cannot_overwrite_a_container_handle() {
 
 /// A heap container field is read by following its real header.
 ///
-/// Neither a `String` nor a `Vec` puts its pointer in the first word of its
-/// header, so a decoder that assumes one either reports the length as a
-/// pointer - and dereferences it - or the capacity as an element count.
+/// The standard library does not fix the order of the three words in a
+/// `String` or `Vec` header, so the codec measures the pointer and length
+/// offsets at runtime. A guessed offset would read the length as an address
+/// and dereference it, or report the capacity as the element count.
 #[test]
 fn heap_container_fields_read_through_their_real_header() {
     static FIELDS: &[ComponentFieldDescriptor] = &[
@@ -584,11 +601,11 @@ fn heap_container_fields_read_through_their_real_header() {
 
     #[repr(C)]
     #[derive(Debug)]
-    struct Holder {
+    struct HeapContainerProbe {
         label: String,
         points: Vec<u32>,
     }
-    impl Component for Holder {}
+    impl Component for HeapContainerProbe {}
 
     // Three live elements in a sixteen-element allocation, so the count and
     // the capacity cannot be confused for one another.
@@ -596,11 +613,11 @@ fn heap_container_fields_read_through_their_real_header() {
     points.extend([10_u32, 20, 30]);
 
     let mut world = World::new();
-    world.register_component_with_layout::<Holder>(FIELDS);
-    let name = crate::component::ComponentRegistry::registered_name::<Holder>();
+    world.register_component_with_layout::<HeapContainerProbe>(FIELDS);
+    let name = crate::component::ComponentRegistry::registered_name::<HeapContainerProbe>();
     let entity = world
         .create_entity()
-        .with(Holder {
+        .with(HeapContainerProbe {
             label: "hello".to_string(),
             points,
         })
@@ -626,7 +643,7 @@ fn heap_container_fields_read_through_their_real_header() {
 /// scalar cannot be sized but not decoded, or decoded but named by nothing.
 #[test]
 fn every_scalar_tag_sizes_encodes_decodes_and_names_itself() {
-    let values = [
+    let field_values = [
         FieldValue::F32(1.5),
         FieldValue::F64(-2.25),
         FieldValue::I8(-3),
@@ -641,21 +658,21 @@ fn every_scalar_tag_sizes_encodes_decodes_and_names_itself() {
         FieldValue::Usize(12),
         FieldValue::Isize(-12),
     ];
-    for value in values {
-        let tag = value.variant_tag();
-        let size = scalar_size(tag).unwrap_or_else(|| panic!("`{tag}` is a scalar tag"));
-        assert!(is_scalar_tag(tag), "`{tag}` is a scalar tag");
+    for field_value in field_values {
+        let type_tag = field_value.variant_tag();
+        let size = scalar_size(type_tag).unwrap_or_else(|| panic!("`{type_tag}` is a scalar tag"));
+        assert!(is_scalar_tag(type_tag), "`{type_tag}` is a scalar tag");
 
         let mut bytes = Vec::new();
-        assert!(encode_scalar(tag, &value, &mut bytes), "`{tag}` encodes");
-        assert_eq!(bytes.len(), size, "`{tag}` encodes to its declared size");
+        assert!(encode_scalar(type_tag, &field_value, &mut bytes), "`{type_tag}` encodes");
+        assert_eq!(bytes.len(), size, "`{type_tag}` encodes to its declared size");
 
-        let decoded = decode_scalar(&bytes, 0, tag).expect("the encoded value decodes");
-        assert_eq!(decoded, value, "`{tag}` survives its own round trip");
+        let decoded = decode_scalar(&bytes, 0, type_tag).expect("the encoded value decodes");
+        assert_eq!(decoded, field_value, "`{type_tag}` survives its own round trip");
     }
 
-    // A tag nothing claims stays outside the vocabulary rather than
-    // half-known.
+    // A tag no helper knows, `u128` here, is refused by every one of them
+    // rather than by some.
     assert_eq!(scalar_size("u128"), None);
     assert!(!is_scalar_tag("u128"));
     assert!(!encode_scalar("u128", &FieldValue::U8(1), &mut Vec::new()));
@@ -667,7 +684,7 @@ fn round_trip_every_scalar_field() {
     let mut world = test_world();
     let entity = world
         .create_entity()
-        .with(sample_value())
+        .with(sample_component())
         .build()
         .expect("entity builds");
 
@@ -738,7 +755,7 @@ fn refusing_errors_leave_state_untouched() {
     let mut world = test_world();
     let entity = world
         .create_entity()
-        .with(sample_value())
+        .with(sample_component())
         .build()
         .expect("entity builds");
     let name = "pill_engine::component_field::tests::SampleComponent";
@@ -779,7 +796,7 @@ fn dead_entity_and_unknown_component_and_field() {
     let mut world = test_world();
     let entity = world
         .create_entity()
-        .with(sample_value())
+        .with(sample_component())
         .build()
         .expect("entity builds");
     let name = "pill_engine::component_field::tests::SampleComponent";
@@ -792,7 +809,7 @@ fn dead_entity_and_unknown_component_and_field() {
 
     let entity = world
         .create_entity()
-        .with(sample_value())
+        .with(sample_component())
         .build()
         .expect("entity builds");
     assert_eq!(
@@ -810,18 +827,18 @@ fn dead_entity_and_unknown_component_and_field() {
     );
 }
 
-/// Every single-field entry point misses the same way.
+/// The three single-field entry points miss the same way.
 ///
-/// They share one resolver, so a read and an array-element write have to
-/// report a dead entity, a missing component and a missing field with the
-/// same variant and payload; a new entry point that grows its own preamble
-/// fails here.
+/// A read, a write and an array-element write share one resolver, so each must
+/// report a dead entity, a missing component and a missing field with the same
+/// variant and payload. A new entry point has to join the probes below before
+/// it is covered.
 #[test]
 fn every_entry_point_reports_the_same_misses() {
     let mut world = test_world();
     let entity = world
         .create_entity()
-        .with(sample_value())
+        .with(sample_component())
         .build()
         .expect("entity builds");
     let name = "pill_engine::component_field::tests::SampleComponent";
@@ -869,10 +886,10 @@ fn every_entry_point_reports_the_same_misses() {
 
 /// A storage miss names the component instead of blaming the entity.
 ///
-/// The entry points resolve the component through a live entity, so a
-/// column or row that is missing after that point is a registration
-/// desync; `EntityNotFound` sent callers looking for a dead handle that is
-/// right there.
+/// The entry points resolve the component through a live entity, so a column
+/// or row that disappears after that point means the registration and the
+/// storage disagree. Reporting `EntityNotFound` would send callers looking for
+/// a dead handle that is right there.
 #[test]
 fn storage_missing_names_the_component() {
     // The summary names the component and cannot be read as a dead handle.
@@ -883,13 +900,13 @@ fn storage_missing_names_the_component() {
     assert!(summary.contains("demo::Settings"), "{summary}");
     assert!(!summary.contains("entity"), "{summary}");
 
-    // And the write path reports it: the entity lives, but its archetype
-    // holds no column for the registered component it does not carry.
+    // The write path reports it too. The entity lives, but its archetype holds
+    // no column for the registered component it does not carry.
     let mut world = test_world();
     world.register_component::<OtherComponent>();
     let entity = world
         .create_entity()
-        .with(sample_value())
+        .with(sample_component())
         .build()
         .expect("entity builds");
     let (archetype_id, row) = world.entity_row_location(entity).expect("entity is live");
@@ -916,7 +933,7 @@ fn reads_do_not_stamp_but_writes_do() {
     let mut world = test_world();
     let entity = world
         .create_entity()
-        .with(sample_value())
+        .with(sample_component())
         .build()
         .expect("entity builds");
     let name = "pill_engine::component_field::tests::SampleComponent";
@@ -954,7 +971,7 @@ fn changed_filter_observes_a_field_edit() {
     let mut world = test_world();
     let entity = world
         .create_entity()
-        .with(sample_value())
+        .with(sample_component())
         .build()
         .expect("entity builds");
     let name = "pill_engine::component_field::tests::SampleComponent";
@@ -962,7 +979,7 @@ fn changed_filter_observes_a_field_edit() {
     // Step 1: set the baseline so the creation-time `added` tick is past.
     world.set_system_last_run(world.change_tick());
 
-    // Step 2: edit one field through the generic API; this must stamp the
+    // Step 2: edit one field through the generic API. The write must stamp the
     // row's `changed` tick.
     world
         .write_component_field(entity, name, "an_int", FieldValue::U32(42))
@@ -973,6 +990,10 @@ fn changed_filter_observes_a_field_edit() {
     let hits: Vec<crate::entity::Entity> = query.iter_mut().map(|(e,)| e).collect();
     assert_eq!(hits, vec![entity]);
 }
+
+// =============================================================================
+// Asset handle fields
+// =============================================================================
 
 /// A component holding two asset handles, laid out like the derive lays
 /// out `MeshRendererComponent`.
@@ -1016,9 +1037,9 @@ static RENDERER_PROBE_FIELDS: &[ComponentFieldDescriptor] = &[
 fn renderer_probe_world() -> (World, crate::entity::Entity, String) {
     let mut world = World::new();
     world.register_component_with_layout::<RendererProbe>(RENDERER_PROBE_FIELDS);
-    let component = ComponentId::of::<RendererProbe>();
-    world.record_asset_field_type(component, "mesh", "probe::Mesh");
-    world.record_asset_field_type(component, "material", "probe::Material");
+    let component_id = ComponentId::of::<RendererProbe>();
+    world.record_asset_field_type(component_id, "mesh", "probe::Mesh");
+    world.record_asset_field_type(component_id, "material", "probe::Material");
     let entity = world
         .create_entity()
         .with(RendererProbe {
@@ -1054,22 +1075,22 @@ fn a_handle_field_reads_as_a_typed_asset_reference() {
     );
 }
 
-/// Another handle of the field's type writes, stamps the row changed, and
-/// reads back; the invalid handle clears the reference.
+/// Another handle of the field's type is written and reads back; the invalid
+/// handle clears the reference.
 #[test]
 fn a_handle_field_writes_another_handle_and_clears() {
     let (mut world, entity, name) = renderer_probe_world();
-    let other = FieldValue::Asset {
+    let another_mesh_handle = FieldValue::Asset {
         asset_type: Some("probe::Mesh".to_owned()),
         index: 7,
         generation: 2,
     };
     world
-        .write_component_field(entity, &name, "mesh", other.clone())
+        .write_component_field(entity, &name, "mesh", another_mesh_handle.clone())
         .expect("a mesh handle writes into the mesh field");
     assert_eq!(
         world.read_component_field(entity, &name, "mesh").unwrap(),
-        other
+        another_mesh_handle
     );
     assert_eq!(
         world.get_component::<RendererProbe>(entity).unwrap().mesh,
@@ -1091,16 +1112,16 @@ fn a_handle_field_writes_another_handle_and_clears() {
 }
 
 /// A handle of another asset type is refused with a typed error, and a
-/// non-asset value is refused as a type mismatch; neither writes.
+/// non-asset value is refused as a type mismatch. Neither writes.
 #[test]
 fn a_handle_of_another_asset_type_is_refused() {
     let (mut world, entity, name) = renderer_probe_world();
-    let material = FieldValue::Asset {
+    let material_reference = FieldValue::Asset {
         asset_type: Some("probe::Material".to_owned()),
         index: 3,
         generation: 0,
     };
-    let refused = world.write_component_field(entity, &name, "mesh", material);
+    let refused = world.write_component_field(entity, &name, "mesh", material_reference);
     assert!(
         matches!(
             &refused,
@@ -1109,10 +1130,10 @@ fn a_handle_of_another_asset_type_is_refused() {
         ),
         "{refused:?}"
     );
-    let scalar = world.write_component_field(entity, &name, "mesh", FieldValue::U32(5));
+    let scalar_write = world.write_component_field(entity, &name, "mesh", FieldValue::U32(5));
     assert!(
-        matches!(scalar, Err(ComponentFieldError::TypeMismatch { .. })),
-        "{scalar:?}"
+        matches!(scalar_write, Err(ComponentFieldError::TypeMismatch { .. })),
+        "{scalar_write:?}"
     );
     assert_eq!(
         world.get_component::<RendererProbe>(entity).unwrap().mesh,
@@ -1120,6 +1141,10 @@ fn a_handle_of_another_asset_type_is_refused() {
         "nothing was written"
     );
 }
+
+// =============================================================================
+// Entity reference fields
+// =============================================================================
 
 /// A component holding a reference to another entity, laid out like the
 /// derive lays out an `Entity` field.
@@ -1180,8 +1205,8 @@ fn an_entity_field_reads_as_an_entity_reference() {
     );
 }
 
-/// Writing another handle re-points the reference and stamps the row
-/// changed; the following scalar keeps its bytes.
+/// Writing another reference re-points the field and leaves the neighbouring
+/// scalar alone.
 #[test]
 fn an_entity_field_writes_another_reference() {
     let mut world = World::new();

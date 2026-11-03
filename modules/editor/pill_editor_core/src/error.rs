@@ -1,15 +1,20 @@
-//! The layout persistence failures.
+//! Failures of the persisted dock layout.
 //!
 //! # Responsibilities
 //!
-//! - Declare the dock-layout load and save failures
-//!   ([`LayoutPersistenceError`]) on the shared semantic error system.
+//! - Declare [`LayoutPersistenceError`] as a `#[engine_error]` enum, one
+//!   variant per way the dock layout can fail.
 //!
 //! # Design
 //!
-//! Loading failures are recovered by falling back to the default layout and
-//! saving failures leave the previous document untouched, so these errors are
-//! logged with their plain messages rather than ending anything.
+//! Every variant carries one `#[message(...)]` definition, and
+//! `#[engine_error]` turns it into the message text and the diagnostic code.
+//!
+//! A failed save leaves the previous document as it was, so
+//! [`crate::layout::save`] logs the plain message and the editor keeps
+//! running. Reading never reports here: [`crate::layout::load_or_default`]
+//! falls back to the default layout for a document this build cannot use, and
+//! logs one line.
 
 // Standard library
 use std::io;
@@ -24,13 +29,17 @@ use crate::layout::LayoutError;
 // LayoutPersistenceError
 // =============================================================================
 
-/// Failures while loading or saving the persisted dock layout.
+/// The failures of the persisted dock layout.
 ///
-/// Loading failures are recovered by falling back to the default layout;
-/// saving failures leave the installed document untouched.
+/// A save reports [`Self::Serialization`] and [`Self::Filesystem`]. The other
+/// two name the ways a saved document can be unusable: it does not parse, or
+/// the layout model rejects it.
+///
+/// A failed save leaves the previous document as it was.
 #[engine_error(namespace = editor::layout, runtime = ::pill_core::error)]
 pub enum LayoutPersistenceError {
-    /// The saved document is not valid JSON for the current layout schema.
+    /// The saved file does not parse as a document of the current layout
+    /// schema.
     #[message("failed to read the saved dock layout from ", name_style(path))]
     Invalid {
         path: String,
@@ -38,21 +47,23 @@ pub enum LayoutPersistenceError {
         source: serde_json::Error,
     },
 
-    /// The loaded model violates the editor's layout invariants.
+    /// The loaded model failed a check in [`LayoutError`], such as a schema
+    /// version this build does not know.
     #[message("the saved dock layout is invalid")]
     Validation {
         #[source]
         source: LayoutError,
     },
 
-    /// The model could not be serialized before writing.
+    /// The dock model could not be turned into JSON, so nothing was written.
     #[message("failed to serialize the dock layout")]
     Serialization {
         #[source]
         source: serde_json::Error,
     },
 
-    /// A filesystem operation failed while installing the layout document.
+    /// Writing the document failed: creating its folder, writing the temporary
+    /// file, or replacing the old file. `path` names the one that failed.
     #[message("failed to write the dock layout to ", name_style(path))]
     Filesystem {
         path: String,
@@ -72,7 +83,8 @@ mod tests {
     use pill_core::error::EngineMessage;
     use std::error::Error;
 
-    /// Plain rendering keeps dynamic paths verbatim with no semantic styling.
+    /// The plain message shows the path exactly as stored, with no styling
+    /// around it, and the I/O error stays reachable as the source.
     #[test]
     fn layout_persistence_messages_render_plain_paths() {
         let error = LayoutPersistenceError::Filesystem {
@@ -86,7 +98,8 @@ mod tests {
         assert!(error.source().is_some());
     }
 
-    /// Diagnostic codes derive from the namespace and variant name.
+    /// The namespace and the variant name build the diagnostic code, which is
+    /// `editor::layout::serialization` here.
     #[test]
     fn layout_persistence_codes_derive_from_namespace_and_variant() {
         let error = LayoutPersistenceError::Serialization {
@@ -96,9 +109,10 @@ mod tests {
         assert_eq!(code.to_string(), "editor::layout::serialization");
     }
 
-    /// Validation failures keep the underlying [`LayoutError`] in the chain.
+    /// The plain message stays the variant's own text, and the [`LayoutError`]
+    /// stays reachable as the source.
     #[test]
-    fn layout_validation_keeps_the_invariant_failure_in_the_chain() {
+    fn layout_validation_keeps_the_layout_error_in_the_chain() {
         let error = LayoutPersistenceError::Validation {
             source: LayoutError::UnsupportedVersion(99),
         };

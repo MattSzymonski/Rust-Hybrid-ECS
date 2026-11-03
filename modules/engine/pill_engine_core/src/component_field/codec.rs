@@ -2,21 +2,25 @@
 //!
 //! # Responsibilities
 //!
-//! - Turn a row's bytes into a [`FieldValue`](super::FieldValue) and back, for
-//!   every tag the derive emits: the scalar primitives, asset and entity
-//!   handles, whole fixed arrays, and the heap containers read through their
-//!   real header.
+//! - Read a row's bytes as a [`FieldValue`](super::FieldValue): a scalar, an
+//!   asset or entity reference, a whole fixed array, a heap container read
+//!   through its real header, or an opaque copy of bytes the engine cannot
+//!   interpret.
+//! - Encode a value back into row bytes for every field the generic write path
+//!   accepts: scalars, handles, entity references and fixed arrays of scalars.
+//!   Heap containers are read-only here and every write to one is refused.
 //! - Own the size facts a row is validated against - handle size, entity
 //!   reference size, the array element size - so the reads and the writes
 //!   agree on them.
 //!
 //! # Design
 //!
-//! A container field's bytes are a `Vec` or a `String`, whose layout std does
-//! not pin: the header offsets are measured once at runtime
-//! (`std_container_offsets`) and every read through them carries its `// SAFETY:`
-//! argument. Rows are native-endian by the module's stated convention, so the
-//! scalar paths are plain `from_ne_bytes`/`to_ne_bytes`.
+//! The standard library does not fix the field order of a `Vec` or a `String`
+//! header, so the code measures the offsets once at runtime
+//! (`std_container_offsets`) instead of assuming them. The two places that turn
+//! those words into a memory access explain in a `// SAFETY:` comment why the
+//! access is sound. Rows are native-endian, as the module's row byte convention
+//! states, so the scalar paths are plain `from_ne_bytes`/`to_ne_bytes`.
 
 // Standard library
 use std::sync::OnceLock;
@@ -27,6 +31,10 @@ use super::{is_container_tag, is_entity_tag, is_handle_tag, ComponentFieldError,
 use crate::component_registry::ComponentFieldDescriptor;
 use crate::entity::Entity;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// The byte size of a handle: its `u32` index and `u32` generation.
 const HANDLE_SIZE: usize = 8;
 
@@ -34,12 +42,16 @@ const HANDLE_SIZE: usize = 8;
 /// generation, and the padding `#[repr(C)]` puts after them.
 const ENTITY_REFERENCE_SIZE: usize = size_of::<Entity>();
 
+// =============================================================================
+// ScalarKind
+// =============================================================================
+
 /// The scalar primitives the field vocabulary names.
 ///
-/// One entry per tag, so the size table, both codecs and the derive's tag
-/// strings cannot drift apart: adding a scalar here is what makes it readable
-/// and writable, and the rest of this file asks the kind instead of repeating
-/// the tag strings.
+/// There is one entry per tag. The size table, the two codecs and the value
+/// labels all ask this type for the tag instead of repeating the strings, so a
+/// new scalar is added in one place. The derive emits its own tag text and must
+/// name the same tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScalarKind {
     /// A 32-bit float.
@@ -124,24 +136,40 @@ impl ScalarKind {
     }
 
     /// Append one value, reporting whether it is of this kind.
-    fn encode(self, value: &FieldValue, output: &mut Vec<u8>) -> bool {
-        match (self, value) {
-            (Self::F32, FieldValue::F32(value)) => output.extend_from_slice(&value.to_ne_bytes()),
-            (Self::F64, FieldValue::F64(value)) => output.extend_from_slice(&value.to_ne_bytes()),
-            (Self::I8, FieldValue::I8(value)) => output.push(*value as u8),
-            (Self::I16, FieldValue::I16(value)) => output.extend_from_slice(&value.to_ne_bytes()),
-            (Self::I32, FieldValue::I32(value)) => output.extend_from_slice(&value.to_ne_bytes()),
-            (Self::I64, FieldValue::I64(value)) => output.extend_from_slice(&value.to_ne_bytes()),
-            (Self::U8, FieldValue::U8(value)) => output.push(*value),
-            (Self::U16, FieldValue::U16(value)) => output.extend_from_slice(&value.to_ne_bytes()),
-            (Self::U32, FieldValue::U32(value)) => output.extend_from_slice(&value.to_ne_bytes()),
-            (Self::U64, FieldValue::U64(value)) => output.extend_from_slice(&value.to_ne_bytes()),
-            (Self::Bool, FieldValue::Bool(value)) => output.push(u8::from(*value)),
+    fn encode(self, field_value: &FieldValue, encoded_bytes: &mut Vec<u8>) -> bool {
+        match (self, field_value) {
+            (Self::F32, FieldValue::F32(value)) => {
+                encoded_bytes.extend_from_slice(&value.to_ne_bytes())
+            }
+            (Self::F64, FieldValue::F64(value)) => {
+                encoded_bytes.extend_from_slice(&value.to_ne_bytes())
+            }
+            (Self::I8, FieldValue::I8(value)) => encoded_bytes.push(*value as u8),
+            (Self::I16, FieldValue::I16(value)) => {
+                encoded_bytes.extend_from_slice(&value.to_ne_bytes())
+            }
+            (Self::I32, FieldValue::I32(value)) => {
+                encoded_bytes.extend_from_slice(&value.to_ne_bytes())
+            }
+            (Self::I64, FieldValue::I64(value)) => {
+                encoded_bytes.extend_from_slice(&value.to_ne_bytes())
+            }
+            (Self::U8, FieldValue::U8(value)) => encoded_bytes.push(*value),
+            (Self::U16, FieldValue::U16(value)) => {
+                encoded_bytes.extend_from_slice(&value.to_ne_bytes())
+            }
+            (Self::U32, FieldValue::U32(value)) => {
+                encoded_bytes.extend_from_slice(&value.to_ne_bytes())
+            }
+            (Self::U64, FieldValue::U64(value)) => {
+                encoded_bytes.extend_from_slice(&value.to_ne_bytes())
+            }
+            (Self::Bool, FieldValue::Bool(value)) => encoded_bytes.push(u8::from(*value)),
             (Self::Usize, FieldValue::Usize(value)) => {
-                output.extend_from_slice(&value.to_ne_bytes())
+                encoded_bytes.extend_from_slice(&value.to_ne_bytes())
             }
             (Self::Isize, FieldValue::Isize(value)) => {
-                output.extend_from_slice(&value.to_ne_bytes())
+                encoded_bytes.extend_from_slice(&value.to_ne_bytes())
             }
             _ => return false,
         }
@@ -150,30 +178,34 @@ impl ScalarKind {
 
     /// Decode one value at `offset`, or `None` when the buffer is too short.
     fn decode(self, bytes: &[u8], offset: usize) -> Option<FieldValue> {
-        fn read<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
+        fn read_bytes<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
             bytes.get(offset..offset + N)?.try_into().ok()
         }
         Some(match self {
-            Self::F32 => FieldValue::F32(f32::from_ne_bytes(read::<4>(bytes, offset)?)),
-            Self::F64 => FieldValue::F64(f64::from_ne_bytes(read::<8>(bytes, offset)?)),
+            Self::F32 => FieldValue::F32(f32::from_ne_bytes(read_bytes::<4>(bytes, offset)?)),
+            Self::F64 => FieldValue::F64(f64::from_ne_bytes(read_bytes::<8>(bytes, offset)?)),
             Self::I8 => FieldValue::I8(*bytes.get(offset)? as i8),
-            Self::I16 => FieldValue::I16(i16::from_ne_bytes(read::<2>(bytes, offset)?)),
-            Self::I32 => FieldValue::I32(i32::from_ne_bytes(read::<4>(bytes, offset)?)),
-            Self::I64 => FieldValue::I64(i64::from_ne_bytes(read::<8>(bytes, offset)?)),
+            Self::I16 => FieldValue::I16(i16::from_ne_bytes(read_bytes::<2>(bytes, offset)?)),
+            Self::I32 => FieldValue::I32(i32::from_ne_bytes(read_bytes::<4>(bytes, offset)?)),
+            Self::I64 => FieldValue::I64(i64::from_ne_bytes(read_bytes::<8>(bytes, offset)?)),
             Self::U8 => FieldValue::U8(*bytes.get(offset)?),
-            Self::U16 => FieldValue::U16(u16::from_ne_bytes(read::<2>(bytes, offset)?)),
-            Self::U32 => FieldValue::U32(u32::from_ne_bytes(read::<4>(bytes, offset)?)),
-            Self::U64 => FieldValue::U64(u64::from_ne_bytes(read::<8>(bytes, offset)?)),
+            Self::U16 => FieldValue::U16(u16::from_ne_bytes(read_bytes::<2>(bytes, offset)?)),
+            Self::U32 => FieldValue::U32(u32::from_ne_bytes(read_bytes::<4>(bytes, offset)?)),
+            Self::U64 => FieldValue::U64(u64::from_ne_bytes(read_bytes::<8>(bytes, offset)?)),
             Self::Bool => FieldValue::Bool(bytes.get(offset).copied()? != 0),
-            Self::Usize => FieldValue::Usize(usize::from_ne_bytes(read::<{ size_of::<usize>() }>(
-                bytes, offset,
-            )?)),
-            Self::Isize => FieldValue::Isize(isize::from_ne_bytes(read::<{ size_of::<isize>() }>(
-                bytes, offset,
-            )?)),
+            Self::Usize => FieldValue::Usize(usize::from_ne_bytes(
+                read_bytes::<{ size_of::<usize>() }>(bytes, offset)?,
+            )),
+            Self::Isize => FieldValue::Isize(isize::from_ne_bytes(
+                read_bytes::<{ size_of::<isize>() }>(bytes, offset)?,
+            )),
         })
     }
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// The size in bytes of one scalar whose tag is in the closed vocabulary.
 pub(super) fn scalar_size(tag: &str) -> Option<usize> {
@@ -185,18 +217,28 @@ pub(super) fn is_scalar_tag(tag: &str) -> bool {
     ScalarKind::from_tag(tag).is_some()
 }
 
-/// Encode one scalar value into `output`, returning whether the tag matched.
-pub(super) fn encode_scalar(tag: &str, value: &FieldValue, output: &mut Vec<u8>) -> bool {
-    ScalarKind::from_tag(tag).is_some_and(|kind| kind.encode(value, output))
+/// Encode one scalar value into `encoded_bytes`, returning whether the tag
+/// matched.
+pub(super) fn encode_scalar(
+    tag: &str,
+    field_value: &FieldValue,
+    encoded_bytes: &mut Vec<u8>,
+) -> bool {
+    ScalarKind::from_tag(tag).is_some_and(|kind| kind.encode(field_value, encoded_bytes))
 }
 
-/// Decode one scalar from a byte buffer at `offset`, or `None` when the tag is
-/// not a scalar.
+/// Decode one scalar from a byte buffer at `offset`.
+///
+/// Returns `None` when the tag is not a scalar, or when the buffer ends before
+/// the value does.
 pub(super) fn decode_scalar(bytes: &[u8], offset: usize, tag: &str) -> Option<FieldValue> {
     ScalarKind::from_tag(tag)?.decode(bytes, offset)
 }
 
 /// The number of bytes one fixed-array element occupies, from the descriptor.
+///
+/// Returns `None` when the descriptor declares no elements, so there is no
+/// count to divide by.
 fn array_element_size(descriptor: &ComponentFieldDescriptor) -> Option<usize> {
     if descriptor.element_count == 0 {
         return None;
@@ -205,24 +247,28 @@ fn array_element_size(descriptor: &ComponentFieldDescriptor) -> Option<usize> {
 }
 
 /// Read one machine word out of a row image.
-fn header_word(bytes: &[u8], at: usize) -> Option<usize> {
+///
+/// Returns `None` when the image ends before the whole word does.
+fn header_word(bytes: &[u8], byte_offset: usize) -> Option<usize> {
     Some(usize::from_ne_bytes(
-        bytes.get(at..at + size_of::<usize>())?.try_into().ok()?,
+        bytes.get(byte_offset..byte_offset + size_of::<usize>())?.try_into().ok()?,
     ))
 }
 
-/// Byte offsets of the pointer and the length inside a `Vec`/`String` header.
+/// The byte offsets of the pointer and the length inside a `Vec`/`String`
+/// header.
 ///
-/// The standard library gives `Vec` - and `String`, a `Vec<u8>` newtype - no
-/// `repr(C)`, so their field order is the compiler's to choose and it is not
-/// pointer-first on this build. The offsets are measured once from a live value
-/// rather than assumed: an assumed word is either the length, dereferenced as
-/// an address, or the capacity, read as a count.
+/// The standard library gives `Vec`, and `String` with it, no `repr(C)`, so the
+/// compiler chooses the field order and it is not pointer-first on this build.
+/// The offsets are measured once from a live value rather than assumed: a
+/// guessed offset would read the length as an address and dereference it, or
+/// read the capacity as the number of elements.
 fn std_container_offsets() -> (usize, usize) {
-    static OFFSETS: OnceLock<(usize, usize)> = OnceLock::new();
-    *OFFSETS.get_or_init(|| {
-        // Pointer, capacity and length all differ, so each word is
-        // recognisable: 12 bytes held in a 64-byte allocation.
+    static HEADER_OFFSETS: OnceLock<(usize, usize)> = OnceLock::new();
+    *HEADER_OFFSETS.get_or_init(|| {
+        // The pointer, the capacity and the length are all different values,
+        // so each word can be identified: the string holds 12 bytes in a
+        // 64-byte allocation.
         let mut text = String::with_capacity(64);
         text.push_str("header probe");
         let words = header_words_of(&text);
@@ -253,28 +299,29 @@ fn header_words_of(text: &String) -> [usize; 3] {
         3 * size_of::<usize>(),
         "a string header is three words; the field layer reads it as one"
     );
-    // SAFETY: the size was just checked, so three words cover the value
-    // exactly, and `transmute_copy` reads it without moving it.
+    // SAFETY: the assert above confirmed that a `String` is exactly three
+    // words, so three words cover the whole value. `transmute_copy` copies
+    // those bits out and leaves the string in place.
     unsafe { std::mem::transmute_copy(text) }
 }
 
 /// Read the `(pointer, length)` header of a std heap container field.
 ///
 /// `vec:` and `string` tags reach here, and only from a row copied out of a
-/// live column. Fixed-array fields keep going through
-/// `element_count`/`element_size` instead.
+/// live column. Fixed-array fields do not: their elements are read one by one,
+/// with the element size [`array_element_size`] computes from the descriptor.
 fn container_header(bytes: &[u8], offset: usize) -> Option<(*const u8, usize)> {
-    let (pointer_at, length_at) = std_container_offsets();
-    let pointer = header_word(bytes, offset + pointer_at)? as *const u8;
-    let length = header_word(bytes, offset + length_at)?;
+    let (pointer_offset, length_offset) = std_container_offsets();
+    let pointer = header_word(bytes, offset + pointer_offset)? as *const u8;
+    let length = header_word(bytes, offset + length_offset)?;
     Some((pointer, length))
 }
 
 /// Read the `(pointer, length)` header of an engine-owned native buffer field.
 ///
-/// `DynamicBuffer` pins that order with `repr(C)` - the C# mirror reads the same
-/// three words straight out of the row - so unlike [`container_header`] this one
-/// can name the offsets.
+/// `DynamicBuffer` fixes the word order with `repr(C)`, and the C# mirror reads
+/// the same three words straight out of the row. Unlike [`container_header`],
+/// this function can name the offsets.
 fn native_buffer_header(bytes: &[u8], offset: usize) -> Option<(*const u8, usize)> {
     let pointer = header_word(bytes, offset)? as *const u8;
     let length = header_word(bytes, offset + size_of::<usize>())?;
@@ -284,13 +331,14 @@ fn native_buffer_header(bytes: &[u8], offset: usize) -> Option<(*const u8, usize
 /// Decode one field (scalar, whole array, heap container, or opaque) from a
 /// row image.
 pub(super) fn decode_field(bytes: &[u8], descriptor: &ComponentFieldDescriptor) -> FieldValue {
-    // Heap-owning containers are summarized rather than materialized. Both are
-    // read-only through this path; writes go through the field's generated
-    // accessors, which reach the live buffer in place.
+    // Heap-owning containers are reported, not copied out: a `vec:` or
+    // `dynbuf:` field becomes its element count, and a `string` field becomes
+    // its text. All three are read-only here; a write goes through the field's
+    // generated accessors, which edit the live buffer in place.
     //
-    // The two kinds read their count from different headers: a `vec:` field is
-    // a std `Vec`, whose word order the compiler chooses (see
-    // [`std_container_offsets`]), and a `dynbuf:` field is a `DynamicBuffer`,
+    // A `vec:` field and a `dynbuf:` field store their length at different
+    // offsets: `vec:` is a std `Vec`, whose word order the compiler chooses
+    // (see [`std_container_offsets`]), and `dynbuf:` is a `DynamicBuffer`,
     // whose `repr(C)` order the engine owns.
     if let Some(element_tag) = descriptor.type_tag.strip_prefix("vec:") {
         let element_count = container_header(bytes, descriptor.offset)
@@ -312,12 +360,15 @@ pub(super) fn decode_field(bytes: &[u8], descriptor: &ComponentFieldDescriptor) 
     }
     if descriptor.type_tag == "string" {
         let text = match container_header(bytes, descriptor.offset) {
-            // A zero-length string may carry the dangling-but-aligned pointer
-            // `String` uses for its empty state; reading nothing from it is
-            // fine, and the null check keeps that explicit.
+            // An empty `String` keeps a dangling but aligned pointer, so a
+            // slice built over it reads zero bytes. A null pointer, which no
+            // live `String` holds, is refused here because `from_raw_parts`
+            // requires a non-null pointer.
             Some((pointer, length)) if !pointer.is_null() => {
-                // SAFETY: the header was copied out of a live component row,
-                // so the buffer it describes is live for this call too.
+                // SAFETY: the header came from a `String` in a row copied out
+                // of a live component column, so the buffer it points at is
+                // allocated, holds this many initialized bytes, and is not
+                // mutated during this shared borrow.
                 let slice = unsafe { std::slice::from_raw_parts(pointer, length) };
                 String::from_utf8_lossy(slice).into_owned()
             }
@@ -351,19 +402,28 @@ pub(super) fn decode_field(bytes: &[u8], descriptor: &ComponentFieldDescriptor) 
     FieldValue::Array(elements)
 }
 
-/// Decode one tag-sized value: a scalar when the tag is scalar, otherwise an
-/// opaque byte copy of `size` bytes.
+/// Decode one value of a tag from a row image.
 ///
-/// `tag` is `'static` because every tag an `Opaque` value can carry comes from
-/// a registered field layout (compile-time static data or a `Box::leak`ed
+/// A scalar tag decodes its scalar. A handle tag of [`HANDLE_SIZE`] bytes
+/// decodes an asset reference, and an entity tag of [`ENTITY_REFERENCE_SIZE`]
+/// bytes decodes an entity reference. Any other tag is copied as an opaque
+/// payload of `field_size` bytes.
+///
+/// `type_tag` is `'static` because every tag an `Opaque` value can carry comes
+/// from a registered field layout (compile-time static data or a `Box::leak`ed
 /// runtime string).
-fn decode_tagged(bytes: &[u8], offset: usize, tag: &'static str, size: usize) -> FieldValue {
-    if let Some(value) = decode_scalar(bytes, offset, tag) {
+fn decode_tagged(
+    bytes: &[u8],
+    offset: usize,
+    type_tag: &'static str,
+    field_size: usize,
+) -> FieldValue {
+    if let Some(value) = decode_scalar(bytes, offset, type_tag) {
         return value;
     }
-    // A handle is two `u32`s; the asset type is the world's record of the
-    // field, filled in by the caller that knows the component.
-    if is_handle_tag(tag) && size == HANDLE_SIZE {
+    // A handle is two `u32`s. The asset type comes from the world's record of
+    // the field, which the caller that knows the component fills in.
+    if is_handle_tag(type_tag) && field_size == HANDLE_SIZE {
         let index = decode_scalar(bytes, offset, "u32");
         let generation = decode_scalar(bytes, offset + 4, "u32");
         if let (Some(FieldValue::U32(index)), Some(FieldValue::U32(generation))) =
@@ -376,154 +436,163 @@ fn decode_tagged(bytes: &[u8], offset: usize, tag: &'static str, size: usize) ->
             };
         }
     }
-    // An entity reference is a slot id and a generation, in the handle's
-    // `#[repr(C)]` order; the trailing padding is not read.
-    if is_entity_tag(tag) && size == ENTITY_REFERENCE_SIZE {
+    // An entity reference is a slot id and then a generation, in the handle's
+    // `#[repr(C)]` order. The trailing padding is not read.
+    if is_entity_tag(type_tag) && field_size == ENTITY_REFERENCE_SIZE {
         let id = decode_scalar(bytes, offset, "u64");
         let generation = decode_scalar(bytes, offset + 8, "u32");
         if let (Some(FieldValue::U64(id)), Some(FieldValue::U32(generation))) = (id, generation) {
             return FieldValue::Entity { id, generation };
         }
     }
-    let mut raw = vec![0u8; size];
-    if let Some(source) = bytes.get(offset..offset + size) {
-        raw.copy_from_slice(source);
+    let mut raw_bytes = vec![0u8; field_size];
+    if let Some(source) = bytes.get(offset..offset + field_size) {
+        raw_bytes.copy_from_slice(source);
     }
     FieldValue::Opaque {
-        type_tag: tag,
-        bytes: raw,
+        type_tag,
+        bytes: raw_bytes,
     }
 }
 
-/// Encode a validated whole-field write for a descriptor.
+/// Encode one field value into the bytes a row write should carry.
+///
+/// # Errors
+///
+/// Returns [`ComponentFieldError::UnsupportedField`] for a heap-backed
+/// container, for a tag outside the editable vocabulary, or for a fixed array
+/// whose elements are not scalars. Returns
+/// [`ComponentFieldError::TypeMismatch`] when the value does not match the
+/// field's tag, and [`ComponentFieldError::ArrayLengthMismatch`] when an array
+/// value has a different number of elements than the descriptor declares.
 pub(super) fn encode_field_write(
     descriptor: &ComponentFieldDescriptor,
-    field: &str,
-    value: &FieldValue,
+    field_name: &str,
+    field_value: &FieldValue,
 ) -> Result<FieldWrite, ComponentFieldError> {
-    let tag = descriptor.type_tag;
-    // A heap-backed container is never writable through the generic path: its
+    let type_tag = descriptor.type_tag;
+    // A heap-backed container is never writable through the generic path. Its
     // buffer is reached through the field's accessors, which edit the live
-    // container in place rather than replacing it, so an editor that showed a
-    // stale image cannot overwrite the real one here. The predicate is the
-    // crate's one spelling of "heap-backed", so a container tag added there
-    // cannot leave a writable raw handle behind in a document.
-    if is_container_tag(tag) {
+    // container in place instead of replacing it, so an editor holding a stale
+    // image cannot overwrite the real value here. `is_container_tag` is the
+    // crate's only test for a heap-backed field, so a container tag added there
+    // is refused here too.
+    if is_container_tag(type_tag) {
         return Err(ComponentFieldError::UnsupportedField {
-            field: field.to_string(),
+            field: field_name.to_string(),
             reason: "heap-backed fields are read-only here; edit them through the field accessors",
         });
     }
-    // A captured payload writes back byte-faithfully: the bytes came out of
-    // this exact field's column, and the value's tag plus its exact size pin
-    // them to it. This is the route a restore takes (an editor re-creating a
-    // destroyed entity, or re-attaching a removed component); a value of any
-    // other kind still walks the editable rules below.
-    if let FieldValue::Opaque { type_tag, bytes } = value {
-        if *type_tag == descriptor.type_tag && bytes.len() == descriptor.size {
+    // A captured payload is written back byte for byte when its tag and its
+    // size still match the field. A restore relies on this: the editor
+    // re-creating a destroyed entity, or re-attaching a removed component,
+    // hands back the bytes an earlier read produced. Any other value goes
+    // through the editable rules below.
+    if let FieldValue::Opaque { type_tag: captured_type_tag, bytes } = field_value {
+        if *captured_type_tag == type_tag && bytes.len() == descriptor.size {
             return Ok(FieldWrite {
                 row_offset: descriptor.offset,
                 bytes: bytes.clone(),
             });
         }
         return Err(ComponentFieldError::TypeMismatch {
-            field: field.to_string(),
-            expected: tag,
-            found: value.variant_tag(),
+            field: field_name.to_string(),
+            expected: type_tag,
+            found: field_value.variant_tag(),
         });
     }
-    // A handle field takes an asset value: its index and generation, encoded
-    // like every other `u32` in a row (see the module's row byte convention).
-    // The asset type is checked by the caller, which knows the field's record
-    // (`World::write_component_field`).
+    // A handle field takes an asset value, written as its index and then its
+    // generation in the row's native byte order (see the module's row byte
+    // convention). The asset type itself is checked by the caller, which knows
+    // the field's record (`World::write_component_field`).
     if let FieldValue::Asset {
         index, generation, ..
-    } = value
+    } = field_value
     {
-        if !is_handle_tag(tag) || descriptor.size != HANDLE_SIZE {
+        if !is_handle_tag(type_tag) || descriptor.size != HANDLE_SIZE {
             return Err(ComponentFieldError::TypeMismatch {
-                field: field.to_string(),
-                expected: tag,
-                found: value.variant_tag(),
+                field: field_name.to_string(),
+                expected: type_tag,
+                found: field_value.variant_tag(),
             });
         }
-        let mut bytes = Vec::with_capacity(HANDLE_SIZE);
-        encode_scalar("u32", &FieldValue::U32(*index), &mut bytes);
-        encode_scalar("u32", &FieldValue::U32(*generation), &mut bytes);
+        let mut encoded_bytes = Vec::with_capacity(HANDLE_SIZE);
+        encode_scalar("u32", &FieldValue::U32(*index), &mut encoded_bytes);
+        encode_scalar("u32", &FieldValue::U32(*generation), &mut encoded_bytes);
         return Ok(FieldWrite {
             row_offset: descriptor.offset,
-            bytes,
+            bytes: encoded_bytes,
         });
     }
     // A handle field is editable, but only by an asset value.
-    if is_handle_tag(tag) {
+    if is_handle_tag(type_tag) {
         return Err(ComponentFieldError::TypeMismatch {
-            field: field.to_string(),
-            expected: tag,
-            found: value.variant_tag(),
+            field: field_name.to_string(),
+            expected: type_tag,
+            found: field_value.variant_tag(),
         });
     }
-    // An entity reference takes an entity value: the slot id and generation,
-    // then the padding a `#[repr(C)]` handle leaves after them, written as
-    // zero so a row byte never carries a stale value.
-    if is_entity_tag(tag) {
-        let FieldValue::Entity { id, generation } = value else {
+    // An entity reference takes an entity value. The row gets the slot id, then
+    // the generation, then zeros for the padding a `#[repr(C)]` handle leaves
+    // after them, so no row byte carries a stale value.
+    if is_entity_tag(type_tag) {
+        let FieldValue::Entity { id, generation } = field_value else {
             return Err(ComponentFieldError::TypeMismatch {
-                field: field.to_string(),
-                expected: tag,
-                found: value.variant_tag(),
+                field: field_name.to_string(),
+                expected: type_tag,
+                found: field_value.variant_tag(),
             });
         };
         if descriptor.size != ENTITY_REFERENCE_SIZE {
             return Err(ComponentFieldError::TypeMismatch {
-                field: field.to_string(),
-                expected: tag,
-                found: value.variant_tag(),
+                field: field_name.to_string(),
+                expected: type_tag,
+                found: field_value.variant_tag(),
             });
         }
-        let mut bytes = Vec::with_capacity(ENTITY_REFERENCE_SIZE);
-        bytes.extend_from_slice(&id.to_ne_bytes());
-        bytes.extend_from_slice(&generation.to_ne_bytes());
-        bytes.resize(ENTITY_REFERENCE_SIZE, 0);
+        let mut encoded_bytes = Vec::with_capacity(ENTITY_REFERENCE_SIZE);
+        encoded_bytes.extend_from_slice(&id.to_ne_bytes());
+        encoded_bytes.extend_from_slice(&generation.to_ne_bytes());
+        encoded_bytes.resize(ENTITY_REFERENCE_SIZE, 0);
         return Ok(FieldWrite {
             row_offset: descriptor.offset,
-            bytes,
+            bytes: encoded_bytes,
         });
     }
-    // A `struct:` field, or any other tag the engine cannot interpret, is
-    // never writable through the generic path.
-    if !is_scalar_tag(tag) && !tag.starts_with("array:") {
+    // A `struct:` field, or any other tag the engine cannot interpret, is never
+    // writable through the generic path.
+    if !is_scalar_tag(type_tag) && !type_tag.starts_with("array:") {
         return Err(ComponentFieldError::UnsupportedField {
-            field: field.to_string(),
+            field: field_name.to_string(),
             reason: "the field's type is outside the editable vocabulary",
         });
     }
-    if let Some(inner_tag) = tag.strip_prefix("array:") {
-        let FieldValue::Array(values) = value else {
+    if let Some(inner_tag) = type_tag.strip_prefix("array:") {
+        let FieldValue::Array(values) = field_value else {
             return Err(ComponentFieldError::TypeMismatch {
-                field: field.to_string(),
-                expected: tag,
-                found: value.variant_tag(),
+                field: field_name.to_string(),
+                expected: type_tag,
+                found: field_value.variant_tag(),
             });
         };
         if !is_scalar_tag(inner_tag) {
             return Err(ComponentFieldError::UnsupportedField {
-                field: field.to_string(),
+                field: field_name.to_string(),
                 reason: "array elements are not scalar primitives",
             });
         }
         if values.len() != descriptor.element_count {
             return Err(ComponentFieldError::ArrayLengthMismatch {
-                field: field.to_string(),
+                field: field_name.to_string(),
                 expected: descriptor.element_count,
                 found: values.len(),
             });
         }
-        let mut bytes = Vec::with_capacity(descriptor.size);
+        let mut encoded_bytes = Vec::with_capacity(descriptor.size);
         for element in values {
-            if !encode_scalar(inner_tag, element, &mut bytes) {
+            if !encode_scalar(inner_tag, element, &mut encoded_bytes) {
                 return Err(ComponentFieldError::TypeMismatch {
-                    field: field.to_string(),
+                    field: field_name.to_string(),
                     expected: inner_tag,
                     found: element.variant_tag(),
                 });
@@ -531,22 +600,22 @@ pub(super) fn encode_field_write(
         }
         return Ok(FieldWrite {
             row_offset: descriptor.offset,
-            bytes,
+            bytes: encoded_bytes,
         });
     }
 
     // A scalar field: the value must carry the exact scalar tag.
-    let mut bytes = Vec::new();
-    if encode_scalar(tag, value, &mut bytes) {
+    let mut encoded_bytes = Vec::new();
+    if encode_scalar(type_tag, field_value, &mut encoded_bytes) {
         Ok(FieldWrite {
             row_offset: descriptor.offset,
-            bytes,
+            bytes: encoded_bytes,
         })
     } else {
         Err(ComponentFieldError::TypeMismatch {
-            field: field.to_string(),
-            expected: tag,
-            found: value.variant_tag(),
+            field: field_name.to_string(),
+            expected: type_tag,
+            found: field_value.variant_tag(),
         })
     }
 }

@@ -7,13 +7,15 @@
 //!
 //! # Design
 //!
-//! The ring is bounded by line count; the oldest lines drop first. Every
-//! line carries a monotonically increasing sequence number, so a reader
-//! fetches only what is new ([`LogBuffer::since`]) and never holds a lock
-//! while formatting. Lines are owned strings: nothing borrowed from a
-//! module's image ever enters the ring, which is what lets the editor shell
-//! (a reloadable module itself) read lines emitted by other modules that may
-//! have unloaded since.
+//! The ring is bounded by line count: once it is full, the oldest lines are
+//! dropped first. Every line carries a sequence number that only goes up, so
+//! a reader asks for just the lines it has not seen yet
+//! ([`LogBuffer::since`]). An event is formatted before it reaches the ring,
+//! so no caller ever holds the lock while it formats text.
+//!
+//! Every line holds owned strings, never anything borrowed from a loaded
+//! module. That is what lets the editor shell - itself a reloadable module -
+//! read lines that another module logged before it unloaded.
 
 // Standard library
 use std::collections::VecDeque;
@@ -28,44 +30,44 @@ use tracing_subscriber::layer::{Context, Layer};
 // Current crate
 use super::StyledFieldVisitor;
 
-/// Lines a capture ring holds when nothing else is asked for.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The number of lines a ring keeps when the caller does not choose a size.
 pub const DEFAULT_CAPTURE_CAPACITY: usize = 4096;
 
-/// One captured line, owned.
+// =============================================================================
+// Types
+// =============================================================================
+
+/// One captured log line, with its own copy of every string.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogLine {
-    /// Monotonic sequence number, unique within the buffer.
+    /// Sequence number that only goes up: it starts at 1 and no two lines
+    /// share one.
     pub seq: u64,
-    /// Severity, low to high: 1 trace, 2 debug, 3 info, 4 warn, 5 error.
+    /// How serious the line is, low to high: 1 trace, 2 debug, 3 info,
+    /// 4 warn, 5 error.
     pub level: u8,
-    /// The tracing target (the crate or module path).
+    /// The tracing target the line came from (the crate or module path).
     pub target: String,
-    /// The formatted message, structured fields appended as `name=value`.
+    /// The message text, with the event's structured fields appended as
+    /// `name=value`.
     pub message: String,
 }
 
-/// The severity ordering [`LogLine::level`] uses.
-pub fn level_value(level: Level) -> u8 {
-    match level {
-        Level::TRACE => 1,
-        Level::DEBUG => 2,
-        Level::INFO => 3,
-        Level::WARN => 4,
-        Level::ERROR => 5,
-    }
-}
-
-/// The ring itself, behind the shared handle.
+/// The ring's contents, guarded by the mutex inside the shared handle.
 struct Ring {
     capacity: usize,
-    next_seq: u64,
+    next_sequence_number: u64,
     lines: VecDeque<LogLine>,
 }
 
 /// A clonable handle to a bounded ring of captured log lines.
 #[derive(Clone)]
 pub struct LogBuffer {
-    inner: Arc<Mutex<Ring>>,
+    shared_ring: Arc<Mutex<Ring>>,
 }
 
 impl Default for LogBuffer {
@@ -75,34 +77,36 @@ impl Default for LogBuffer {
 }
 
 impl LogBuffer {
-    /// A buffer that keeps at most `capacity` lines (at least one).
+    /// Creates a buffer that keeps at most `capacity` lines; a capacity of 0
+    /// is treated as 1.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Ring {
+            shared_ring: Arc::new(Mutex::new(Ring {
                 capacity: capacity.max(1),
-                next_seq: 1,
+                next_sequence_number: 1,
                 lines: VecDeque::new(),
             })),
         }
     }
 
-    /// Take the ring, recovering it from a poison.
+    /// Locks the ring and returns the guard, even if the lock was poisoned.
     ///
-    /// A poisoned ring still holds every line written before the panic, and the
-    /// console is the surface that has to show what went wrong - so a panic
-    /// must not turn the panel permanently blank. Every accessor recovers the
-    /// same way, which is also what the crate's other locks do.
-    fn ring(&self) -> std::sync::MutexGuard<'_, Ring> {
-        self.inner
+    /// A poisoned lock still holds every line written before the panic. The
+    /// console exists to show what went wrong, so a panic in another thread
+    /// must not leave the panel empty for the rest of the session. Every
+    /// accessor here recovers the same way, as the locks in `metrics` and
+    /// `native_buffer` do.
+    fn lock_ring(&self) -> std::sync::MutexGuard<'_, Ring> {
+        self.shared_ring
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Append one line, dropping the oldest beyond the capacity.
+    /// Appends one line and drops the oldest line once the ring is full.
     pub fn push(&self, level: u8, target: &str, message: String) {
-        let mut ring = self.ring();
-        let seq = ring.next_seq;
-        ring.next_seq += 1;
+        let mut ring = self.lock_ring();
+        let seq = ring.next_sequence_number;
+        ring.next_sequence_number += 1;
         ring.lines.push_back(LogLine {
             seq,
             level,
@@ -114,24 +118,25 @@ impl LogBuffer {
         }
     }
 
-    /// Every line with a sequence number greater than `after`, oldest first.
-    pub fn since(&self, after: u64) -> Vec<LogLine> {
-        let ring = self.ring();
+    /// Returns every line with a sequence number greater than
+    /// `after_sequence_number`, oldest first.
+    pub fn since(&self, after_sequence_number: u64) -> Vec<LogLine> {
+        let ring = self.lock_ring();
         ring.lines
             .iter()
-            .filter(|line| line.seq > after)
+            .filter(|line| line.seq > after_sequence_number)
             .cloned()
             .collect()
     }
 
     /// The sequence number of the newest line (0 while empty).
     pub fn latest_seq(&self) -> u64 {
-        self.ring().next_seq - 1
+        self.lock_ring().next_sequence_number - 1
     }
 
-    /// Lines currently held.
+    /// The number of lines the ring holds now.
     pub fn len(&self) -> usize {
-        self.ring().lines.len()
+        self.lock_ring().lines.len()
     }
 
     /// Whether the ring holds no lines.
@@ -139,9 +144,10 @@ impl LogBuffer {
         self.len() == 0
     }
 
-    /// Lines the ring can hold before dropping the oldest.
+    /// The number of lines the ring holds before it starts dropping the
+    /// oldest ones.
     pub fn capacity(&self) -> usize {
-        self.ring().capacity
+        self.lock_ring().capacity
     }
 }
 
@@ -162,7 +168,8 @@ pub struct CaptureLayer {
 }
 
 impl CaptureLayer {
-    /// A layer capturing events at or above `minimum_level`.
+    /// Creates a layer that copies events at or above `minimum_level` into
+    /// `buffer`.
     pub fn new(buffer: LogBuffer, minimum_level: Level) -> Self {
         Self {
             buffer,
@@ -185,15 +192,36 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
     }
 }
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns the number [`LogLine::level`] stores for a logging level: 1 trace
+/// through 5 error.
+pub fn level_value(level: Level) -> u8 {
+    match level {
+        Level::TRACE => 1,
+        Level::DEBUG => 2,
+        Level::INFO => 3,
+        Level::WARN => 4,
+        Level::ERROR => 5,
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A captured line is the formatter's line: same fields, same value
-    /// spelling, bridged `log.*` fields dropped.
+    /// A captured line has the same shape as the line the terminal formatter
+    /// writes: the same fields, the same spelling for each value, and the
+    /// bridged `log.*` fields left out.
     ///
-    /// The two lanes share one visitor, so this pins the shape they inherit
-    /// rather than a second renderer's idea of it.
+    /// Both paths use the same visitor, so this test pins the shape they
+    /// share instead of one renderer's separate idea of it.
     #[test]
     fn a_captured_line_matches_the_formatter_line_shape() {
         use tracing_subscriber::layer::SubscriberExt;
@@ -217,23 +245,26 @@ mod tests {
         );
     }
 
-    /// A poisoned ring still serves the lines written before the panic.
+    /// A poisoned ring still returns the lines written before the panic.
     ///
-    /// The console is the surface built to show what went wrong, so a panic
-    /// elsewhere must not blank it for the rest of the session.
+    /// The console is there to show what went wrong, so a panic in another
+    /// thread must not leave it empty for the rest of the session.
     #[test]
     fn a_poisoned_ring_still_returns_its_lines() {
         let buffer = LogBuffer::with_capacity(8);
         buffer.push(3, "test", "before the panic".to_string());
 
-        // Poison the ring: a thread panics while holding the guard.
+        // Poison the ring: this thread panics while it holds the lock.
         let poisoned = buffer.clone();
         let _ = std::thread::spawn(move || {
-            let _guard = poisoned.inner.lock().expect("the ring is unpoisoned here");
+            let _guard = poisoned
+                .shared_ring
+                .lock()
+                .expect("the ring is unpoisoned here");
             panic!("a writer panicked while holding the guard");
         })
         .join();
-        assert!(buffer.inner.is_poisoned(), "the ring is poisoned");
+        assert!(buffer.shared_ring.is_poisoned(), "the ring is poisoned");
 
         assert_eq!(buffer.len(), 1);
         assert_eq!(buffer.latest_seq(), 1);
@@ -255,21 +286,21 @@ mod tests {
         assert_eq!(lines[2].message, "line 4");
         assert_eq!(buffer.latest_seq(), 5);
 
-        let new = buffer.since(3);
-        assert_eq!(new.len(), 2);
-        assert_eq!(new[0].message, "line 3");
+        let newer_lines = buffer.since(3);
+        assert_eq!(newer_lines.len(), 2);
+        assert_eq!(newer_lines[0].message, "line 3");
     }
 
     #[test]
     fn since_returns_only_newer_lines() {
         let buffer = LogBuffer::with_capacity(8);
         buffer.push(4, "engine::ecs", "first".to_string());
-        let watermark = buffer.latest_seq();
+        let latest_sequence_number = buffer.latest_seq();
         buffer.push(5, "project", "second".to_string());
-        let new = buffer.since(watermark);
-        assert_eq!(new.len(), 1);
-        assert_eq!(new[0].target, "project");
-        assert_eq!(new[0].level, 5);
+        let newer_lines = buffer.since(latest_sequence_number);
+        assert_eq!(newer_lines.len(), 1);
+        assert_eq!(newer_lines[0].target, "project");
+        assert_eq!(newer_lines[0].level, 5);
     }
 
     #[test]

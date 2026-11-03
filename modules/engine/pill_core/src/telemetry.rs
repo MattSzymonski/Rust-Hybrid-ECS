@@ -1,30 +1,34 @@
-//! Structured telemetry foundation: one `tracing` system with three lanes.
+//! One `tracing` system for the engine: three lanes of log targets feeding
+//! configurable output layers.
 //!
 //! # Responsibilities
 //!
-//! - Define the static tracing targets of the `engine::dev`, `engine::*` and
-//!   `profile::*` lanes.
-//! - Build strict [`LoggingConfig`] → `EnvFilter` filters, with reload handles
-//!   for live changes.
-//! - Own the [`EngineTerminalFormatter`], and with it every terminal appearance
-//!   decision (severity, target, fields, timestamp, source location), which it
-//!   draws through the `colored` crate.
+//! - Define the static tracing targets: developer logs (`engine::dev`), engine
+//!   logs (`engine::*`) and the profiling lanes (`profile::*`).
+//! - Turn a [`LoggingConfig`] into a strict `EnvFilter`, and hand out reload
+//!   handles so a filter can be replaced while the host runs.
+//! - Own the [`EngineTerminalFormatter`], which decides how a line looks:
+//!   level, target, message, fields, timestamp and source location.
 //! - Hold the process-wide [`TimestampFormat`] and the source-location switch
-//!   ([`set_show_source_location`]), so every DLL's lines agree.
-//! - Assemble the subscriber stack (terminal, optional file, optional capture,
-//!   optional Tracy) with independent per-layer filters through
-//!   [`TelemetryBuilder`].
+//!   ([`set_show_source_location`]), so every DLL writes lines the same way.
+//! - Assemble the subscriber stack (terminal, optional file, optional capture
+//!   ring, optional Tracy) through [`TelemetryBuilder`], each layer filtered on
+//!   its own.
 //!
 //! # Design
 //!
-//! The engine emits structured meaning through `tracing`; the output layers
-//! decide where it goes and how it looks. The three lanes stay apart:
+//! The engine logs through `tracing`; each output layer decides where a line
+//! goes and how it looks. A lane is a group of targets, and the three lanes
+//! stay apart:
 //!
 //! - `engine::dev` - scratch developer logs from `log!`/`dev_warn!`/`dev_error!`,
 //!   feature-gated behind `dev-logs`.
 //! - `engine::*` - permanent structured engine logs.
-//! - `profile::*` - the profiling lane: a `TracyZone` asks the Tracy layer's
+//! - `profile::*` - profiling spans. A `TracyZone` asks the Tracy layer's
 //!   filter whether its target is enabled, independently of terminal verbosity.
+
+/// Bounded in-process log capture for the editor console.
+pub mod capture;
 
 // Standard library
 use std::fmt;
@@ -48,9 +52,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::{EnvFilter, Registry};
 
-/// Bounded in-process log capture for the editor console.
-pub mod capture;
-
 // Current crate
 use crate::platform::log_output::{self, FileGuard, FileWriter, TerminalWriter};
 
@@ -63,15 +64,15 @@ pub const DEV_LOG_TARGET: &str = "engine::dev";
 
 /// Static `tracing` targets used by instrumentation callsites.
 ///
-/// Targets are chosen once at the callsite and never parsed at runtime.
-/// Filtering is expressed over these stable strings.
+/// A callsite names one of these constants. The strings never change, so a log
+/// filter can select a target by its name.
 pub mod telemetry_target {
     /// The main engine lifecycle.
     pub const ENGINE: &str = "engine::engine";
     /// Hot-reload coordination.
     pub const HOT_RELOAD: &str = "engine::hot_reload";
-    /// Statically linked project and module startup: what a shipped build has
-    /// where the dev host has reloads.
+    /// Startup of the statically linked project and its modules, which a
+    /// shipped build has in place of the dev host's reloads.
     pub const LINK: &str = "engine::link";
     /// Input handling.
     pub const INPUT: &str = "engine::input";
@@ -81,12 +82,12 @@ pub mod telemetry_target {
     pub const SYSTEM: &str = "engine::system";
     /// Renderer activity.
     pub const RENDERING: &str = "engine::rendering";
-    /// The in-game UI layer: texture mirroring and the draw lists it publishes.
+    /// The in-game UI, which mirrors textures and publishes draw lists.
     pub const UI: &str = "engine::ui";
     /// Resource loading and storage.
     pub const RESOURCES: &str = "engine::resources";
 
-    /// The coarse profiling lane: frame, system and pass zones.
+    /// The coarse profiling lane, for frame, system and pass zones.
     pub const PROFILE_COARSE: &str = "profile::coarse";
     /// The fine profiling lane, for temporary deep investigation.
     pub const PROFILE_FINE: &str = "profile::fine";
@@ -103,9 +104,10 @@ pub const PROFILE_FINE_TARGET: &str = telemetry_target::PROFILE_FINE;
 
 /// Per-target logging levels expressed as strict `EnvFilter` directives.
 ///
-/// The builder composes a baseline level with per-target overrides and
-/// parses every directive strictly: an invalid directive is a configuration
-/// error, never a silent fallback to `INFO`.
+/// A configuration holds one baseline level and a list of per-target
+/// overrides. [`LoggingConfig::build_env_filter`] parses both strictly: an
+/// invalid directive is a configuration error, never a silent fallback to
+/// `INFO`.
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
     /// Baseline level applied before any target-specific directive.
@@ -141,10 +143,12 @@ impl LoggingConfig {
         self
     }
 
-    /// A sensible default for the embedded host: permanent engine logs at
-    /// `INFO` (rendering included; its per-shader and per-material detail is
-    /// `DEBUG`), developer scratch logs visible when the `dev-logs` feature is
-    /// enabled, and dependency noise reduced.
+    /// The default configuration for a game host.
+    ///
+    /// Engine logs are `INFO`, except resource loading, which is off. The
+    /// renderer's per-shader and per-material detail stays at `DEBUG`.
+    /// Developer scratch logs are enabled when the `dev-logs` feature is on,
+    /// and `wgpu` and `naga` are reduced to warnings.
     pub fn default_engine() -> Self {
         use tracing::level_filters::LevelFilter;
         Self::new()
@@ -164,8 +168,9 @@ impl LoggingConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`TelemetryError::InvalidDirective`] when any configured
-    /// directive fails to parse.
+    /// Returns [`TelemetryError::InvalidFilter`] when the baseline level
+    /// cannot form a filter, and [`TelemetryError::InvalidDirective`] when any
+    /// configured directive fails to parse.
     ///
     /// # Examples
     ///
@@ -173,9 +178,9 @@ impl LoggingConfig {
     /// use pill_core::telemetry::LoggingConfig;
     /// use pill_core::tracing::level_filters::LevelFilter;
     ///
-    /// let config = LoggingConfig::new()
+    /// let logging_config = LoggingConfig::new()
     ///     .with_directive("engine::ecs", LevelFilter::DEBUG);
-    /// let filter = config.build_env_filter().expect("directive must parse");
+    /// let filter = logging_config.build_env_filter().expect("directive must parse");
     /// ```
     pub fn build_env_filter(&self) -> Result<EnvFilter, TelemetryError> {
         let mut filter = EnvFilter::try_new(self.baseline.to_string()).map_err(|source| {
@@ -270,11 +275,11 @@ static TIMESTAMP_FORMAT: AtomicU8 = AtomicU8::new(TimestampFormat::Time as u8);
 
 /// Decodes a stored discriminant; `None` for a byte no variant wrote.
 ///
-/// An exhaustive match is the point: a new format adds a stored value, and
-/// this is the one place that has to learn to read it back. A `!= DateTime`
-/// test would silently report the default instead.
-const fn timestamp_format_from_discriminant(value: u8) -> Option<TimestampFormat> {
-    match value {
+/// The match is exhaustive on purpose: adding a format adds a stored value, and
+/// this is the only place that must learn to read it. A `!= DateTime` test
+/// would quietly report the default instead.
+const fn timestamp_format_from_discriminant(discriminant: u8) -> Option<TimestampFormat> {
+    match discriminant {
         0 => Some(TimestampFormat::Time),
         1 => Some(TimestampFormat::DateTime),
         _ => None,
@@ -309,18 +314,20 @@ pub fn show_source_location() -> bool {
 // Terminal Formatter
 // =============================================================================
 
-/// Terminal formatting layer for `tracing` events.
+/// Line formatting layer for `tracing` events, used by the terminal and file
+/// layers.
 ///
-/// Owns every terminal appearance decision: severity colors, target styling,
-/// timestamps, file/line, and the message plus its structured fields.
-/// Callsites never embed styling; this layer applies it.
+/// Owns the line's appearance: severity colors, target styling, timestamps,
+/// file/line, and the message plus its structured fields. It adds that styling
+/// itself, so callsites write plain text. A message that carries its own colors
+/// (see [`log_block_colored`]) keeps them only on a color-capable layer.
 #[derive(Debug, Clone, Copy)]
 pub struct EngineTerminalFormatter {
-    show_timestamps: bool,
+    timestamps_enabled: bool,
 }
 
 impl EngineTerminalFormatter {
-    /// Create a formatter; timestamps are included by default.
+    /// Create a formatter with the timestamp prefix enabled.
     ///
     /// # Examples
     ///
@@ -331,7 +338,7 @@ impl EngineTerminalFormatter {
     /// ```
     pub fn new() -> Self {
         Self {
-            show_timestamps: true,
+            timestamps_enabled: true,
         }
     }
 
@@ -345,7 +352,7 @@ impl EngineTerminalFormatter {
     /// let formatter = EngineTerminalFormatter::new().without_timestamps();
     /// ```
     pub fn without_timestamps(mut self) -> Self {
-        self.show_timestamps = false;
+        self.timestamps_enabled = false;
         self
     }
 }
@@ -367,60 +374,64 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
-        // A record bridged from the `log` crate arrives with the target `log`
-        // and its real target, file and line as `log.*` fields; normalizing
-        // shows it like any other event.
+        // A record bridged from the `log` crate arrives with the target `log`,
+        // and its real target, file and line sit in `log.*` fields. Normalizing
+        // it shows the record like any other event.
         let normalized = event.normalized_metadata();
         let metadata = normalized.as_ref().unwrap_or_else(|| event.metadata());
-        // The file lane is built without ANSI, so styling follows the writer
+        // The file layer is built without ANSI, so styling follows the writer
         // rather than whether a terminal happens to be attached.
-        let ansi = writer.has_ansi_escapes();
-        if self.show_timestamps {
+        let accepts_ansi = writer.has_ansi_escapes();
+        if self.timestamps_enabled {
             let pattern = timestamp_format().pattern();
-            let now = format!("[{}]", chrono::Local::now().format(pattern));
-            write!(writer, "{} ", paint(ansi, &now, |text| text.dimmed()))?;
+            let timestamp = format!("[{}]", chrono::Local::now().format(pattern));
+            write!(
+                writer,
+                "{} ",
+                paint(accepts_ansi, &timestamp, |text| text.dimmed())
+            )?;
         }
 
-        write!(writer, "{} ", styled_level(metadata.level(), ansi))?;
-        write!(writer, "{}", styled_target(metadata.target(), ansi))?;
+        write!(writer, "{} ", styled_level(metadata.level(), accepts_ansi))?;
+        write!(writer, "{}", styled_target(metadata.target(), accepts_ansi))?;
 
         // Message first, then its fields after a two-space gap, so the text
         // never runs into the first field name.
         let mut visitor = StyledFieldVisitor {
-            ansi,
+            accepts_ansi,
             skip_log_fields: event.is_log(),
             message: String::new(),
             fields: String::new(),
         };
         event.record(&mut visitor);
         // A message may carry color codes (see `log_block_colored`). They reach
-        // only a lane that shows colors - an interactive terminal - and are
-        // stripped for the file lane and for piped output, which the suites read.
-        if !(ansi && colored::control::SHOULD_COLORIZE.should_colorize()) {
+        // only a layer that shows colors - an interactive terminal - and are
+        // stripped for the file layer and for piped output, which the suites read.
+        if !(accepts_ansi && colored::control::SHOULD_COLORIZE.should_colorize()) {
             visitor.message = strip_color_codes(&visitor.message);
         }
-        // A multi-line message is a block (see `log_block`): the prefix line
-        // carries only the time, level, target and fields, and the message
-        // follows below it from the left edge, so wide tables and trees keep
+        // A message with a line break is a block (see `log_block`): the prefix
+        // line keeps the time, level, target and fields, and the message starts
+        // on the next line at the left edge. Wide tables and trees then keep
         // their full width.
-        let block = visitor.message.contains('\n');
-        if !block {
+        let is_block = visitor.message.contains('\n');
+        if !is_block {
             write!(writer, "  {}", visitor.message)?;
         }
         if !visitor.fields.is_empty() {
             write!(writer, "  {}", visitor.fields)?;
         }
 
-        // The source location is opt-in and trails the line in dark gray:
-        // useful for navigation, but not what a reader scans for.
+        // The source location is opt-in. It trails the line in dark gray, which
+        // helps navigation without distracting a reader.
         if show_source_location() {
             if let (Some(file), Some(line)) = (metadata.file(), metadata.line()) {
                 let location = format!("{file}:{line}");
-                let location = paint(ansi, &location, |text| text.bright_black());
+                let location = paint(accepts_ansi, &location, |text| text.bright_black());
                 write!(writer, "  {location}")?;
             }
         }
-        if block {
+        if is_block {
             write!(writer, "\n{}", visitor.message)?;
         }
         writeln!(writer)?;
@@ -429,15 +440,15 @@ where
 }
 
 /// `tracing` visitor that collects the message and the structured fields
-/// separately, so a lane can lay them out in a fixed order whatever order the
-/// callsite declared them in.
+/// separately, so every layer can put the message first and the fields after
+/// it, whatever order the callsite declared them in.
 ///
-/// Both renderers use it: the terminal and file lanes write the two parts into
-/// their line, and the capture lane joins them for the editor console. Sharing
-/// it is what keeps the console from showing a different line than the log file
-/// for the same event - which fields appear, and how a value reads.
+/// The terminal and file layers write the two parts into their line, and the
+/// capture layer joins them for the editor console. Sharing the visitor is what
+/// keeps the console from showing a different line than the log file for the
+/// same event: the same fields appear, and a value reads the same way.
 pub(crate) struct StyledFieldVisitor {
-    ansi: bool,
+    accepts_ansi: bool,
     /// Drop the `log.*` fields of a bridged `log` record; the normalized
     /// metadata already carries what they hold.
     skip_log_fields: bool,
@@ -450,7 +461,7 @@ impl StyledFieldVisitor {
     /// `log.*` fields when the record came through `log`.
     pub(crate) fn plain(skip_log_fields: bool) -> Self {
         Self {
-            ansi: false,
+            accepts_ansi: false,
             skip_log_fields,
             message: String::new(),
             fields: String::new(),
@@ -488,16 +499,16 @@ impl Visit for StyledFieldVisitor {
         if !self.fields.is_empty() {
             self.fields.push(' ');
         }
-        // Values keep their `Debug` form (strings quoted, options as
-        // `Some(..)`): the end-to-end suites match on that exact text.
-        let name = paint(self.ansi, field.name(), |text| text.dimmed());
+        // Values keep their `Debug` form, with strings quoted and options shown
+        // as `Some(..)`. The end-to-end suites match on that exact text.
+        let field_name = paint(self.accepts_ansi, field.name(), |text| text.dimmed());
         let value = format!("{value:?}");
         let value = if MODULE_FIELD_NAMES.contains(&field.name()) {
-            paint(self.ansi, &value, |text| text.cyan().bold())
+            paint(self.accepts_ansi, &value, |text| text.cyan().bold())
         } else {
             value
         };
-        let _ = write!(self.fields, "{name}={value}");
+        let _ = write!(self.fields, "{field_name}={value}");
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
@@ -548,27 +559,29 @@ type FileLayer = tracing_subscriber::filter::Filtered<
     TerminalStack,
 >;
 
-/// The three artifacts produced when installing the optional file lane:
-/// the layer itself, the file writer's guard, and the reload handle.
-type FileLaneArtifacts = (
+/// The three values the optional file layer produces: its layer, the file
+/// writer's guard, and the reload handle.
+type FileLayerArtifacts = (
     Option<FileLayer>,
     Option<Arc<FileGuard>>,
     Option<reload::Handle<EnvFilter, TerminalStack>>,
 );
 
-/// Build and install the engine telemetry subscriber stack.
+/// Configures and installs the engine's telemetry subscriber stack.
 ///
-/// The terminal and file lanes are filtered independently and both are
-/// live-reloadable through [`TelemetryHandles::reload_logging_config`] and
-/// [`TelemetryHandles::reload_file_config`]. The Tracy lane only ever sees
+/// Set up the layers with the `with_*` methods, then call
+/// [`TelemetryBuilder::init`] once per process. The terminal and file layers
+/// are filtered independently and both are live-reloadable through
+/// [`TelemetryHandles::reload_logging_config`] and
+/// [`TelemetryHandles::reload_file_config`]. The Tracy layer only ever sees
 /// `profile::*` targets.
 #[derive(Debug, Clone, Default)]
 pub struct TelemetryBuilder {
     logging: LoggingConfig,
     file_logging: Option<(LoggingConfig, PathBuf)>,
     capture: Option<capture::LogBuffer>,
-    tracy: bool,
-    fine_profiling: bool,
+    tracy_enabled: bool,
+    fine_profiling_enabled: bool,
 }
 
 impl TelemetryBuilder {
@@ -586,28 +599,28 @@ impl TelemetryBuilder {
             logging: LoggingConfig::default_engine(),
             file_logging: None,
             capture: None,
-            tracy: false,
-            fine_profiling: false,
+            tracy_enabled: false,
+            fine_profiling_enabled: false,
         }
     }
 
     /// Capture `info` and above into a bounded in-process ring.
     ///
-    /// The editor's console panel reads the ring; the terminal and file
-    /// lanes are unaffected, and the ring never borrows from the emitting
-    /// crate - lines are owned strings.
+    /// The editor's console panel reads the ring; the terminal and file layers
+    /// are unaffected. Every line in the ring is an owned copy, so the ring
+    /// never holds a pointer into the module that logged it.
     pub fn with_capture(mut self, buffer: capture::LogBuffer) -> Self {
         self.capture = Some(buffer);
         self
     }
 
     /// Replace the terminal logging configuration.
-    pub fn with_logging_config(mut self, config: LoggingConfig) -> Self {
-        self.logging = config;
+    pub fn with_logging_config(mut self, logging_config: LoggingConfig) -> Self {
+        self.logging = logging_config;
         self
     }
 
-    /// Add a rolling file lane with its own independent filter.
+    /// Add a file logging layer with its own filter. The file rotates daily.
     ///
     /// # Examples
     ///
@@ -621,24 +634,25 @@ impl TelemetryBuilder {
     /// ```
     pub fn with_file_output(
         mut self,
-        config: LoggingConfig,
+        file_logging_config: LoggingConfig,
         directory: impl Into<PathBuf>,
     ) -> Self {
-        self.file_logging = Some((config, directory.into()));
+        self.file_logging = Some((file_logging_config, directory.into()));
         self
     }
 
-    /// Install the Tracy lane: `TracyLayer` filtered to the `profile::*`
-    /// targets, which is also the filter a `TracyZone` reads to decide whether
-    /// the profiler wants its zone.
+    /// Turn the Tracy layer on or off. It carries only the `profile::*`
+    /// targets, and a `TracyZone` asks this filter whether the profiler wants
+    /// its zone.
     pub fn with_tracy(mut self, enabled: bool) -> Self {
-        self.tracy = enabled;
+        self.tracy_enabled = enabled;
         self
     }
 
-    /// Also enable `profile::fine` spans in the Tracy lane (investigative).
+    /// Also send `profile::fine` spans to the Tracy layer, for temporary deep
+    /// investigation.
     pub fn with_fine_profiling(mut self, enabled: bool) -> Self {
-        self.fine_profiling = enabled;
+        self.fine_profiling_enabled = enabled;
         self
     }
 
@@ -650,8 +664,11 @@ impl TelemetryBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`TelemetryError`] when any configured filter directive is
-    /// invalid or the file appender cannot be created.
+    /// Returns [`TelemetryError::InvalidFilter`] or
+    /// [`TelemetryError::InvalidDirective`] when a configured filter cannot be
+    /// parsed, and [`TelemetryError::FileOutput`] when the log file cannot be
+    /// opened. A call made after a failed install returns
+    /// [`TelemetryError::InstallFailed`], which repeats the first failure.
     ///
     /// # Examples
     ///
@@ -663,12 +680,10 @@ impl TelemetryBuilder {
     ///     .expect("default configuration installs cleanly");
     /// ```
     pub fn init(self) -> Result<TelemetryHandles, TelemetryError> {
-        // Exactly-once install. `OnceLock::get_or_init` runs the installer at
-        // most once process-wide and blocks concurrent callers until it
-        // completes, which is the whole of the serialization this needs: a
-        // second `Mutex` around check-and-install would only repeat it. The
-        // stored value is the install's `Result` flattened to a message, since
-        // `TelemetryError` is not `Clone` (it boxes its sources).
+        // Install once per process. `OnceLock::get_or_init` runs the installer
+        // at most once and makes other callers wait for it, so no separate
+        // mutex is needed. The result is stored as a message because
+        // `TelemetryError` boxes its sources and cannot be cloned.
         static INSTALLED: OnceLock<Result<TelemetryHandles, String>> = OnceLock::new();
         match INSTALLED.get_or_init(|| Self::install(self).map_err(|error| error.to_string())) {
             Ok(handles) => Ok(handles.clone()),
@@ -679,12 +694,19 @@ impl TelemetryBuilder {
     }
 
     /// Build the full subscriber stack (terminal, optional file, optional
-    /// Tracy) and install it as the process-wide default subscriber.
+    /// capture ring, optional Tracy) and install it as the process-wide default
+    /// subscriber.
     ///
     /// Invoked exactly once per process by [`Self::init`], through its
     /// `OnceLock`.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`LoggingConfig::build_env_filter`] reports for an invalid
+    /// filter, and [`TelemetryError::FileOutput`] when the log file cannot be
+    /// opened.
     fn install(self) -> Result<TelemetryHandles, TelemetryError> {
-        // Step 1: Build the terminal lane with its own reloadable filter.
+        // Step 1: Build the terminal layer with its own reloadable filter.
         let terminal_filter = self.logging.build_env_filter()?;
         let (terminal_reload, terminal_handle) = reload::Layer::new(terminal_filter);
         let terminal_layer: TerminalLayer = tracing_subscriber::fmt::layer()
@@ -693,30 +715,31 @@ impl TelemetryBuilder {
             .event_format(EngineTerminalFormatter::new())
             .with_filter(terminal_reload);
 
-        // Step 2: Build the optional file lane. `Option<L>` implements
-        // `Layer`, so a missing file lane is simply a no-op layer in the
+        // Step 2: Build the optional file layer. `Option<L>` implements
+        // `Layer`, so a missing file layer is simply a no-op layer in the
         // same position.
-        let (file_layer, file_guard, file_handle): FileLaneArtifacts = match self.file_logging {
-            Some((file_config, directory)) => {
-                let file_filter = file_config.build_env_filter()?;
+        let (file_layer, file_guard, file_handle): FileLayerArtifacts = match self.file_logging {
+            Some((file_logging_config, directory)) => {
+                let file_filter = file_logging_config.build_env_filter()?;
                 let (file_reload, file_handle) =
                     reload::Layer::<EnvFilter, TerminalStack>::new(file_filter);
-                let (writer, guard) = log_output::open_file_output(&directory, "engine.log")
-                    .map_err(|message| TelemetryError::FileOutput { message })?;
+                let (writer, file_guard) =
+                    log_output::open_file_output(&directory, "engine.log")
+                        .map_err(|message| TelemetryError::FileOutput { message })?;
                 let layer: FileLayer = tracing_subscriber::fmt::layer::<TerminalStack>()
                     .with_writer(writer)
                     .with_ansi(false)
                     .event_format(EngineTerminalFormatter::new())
                     .with_filter(file_reload);
-                (Some(layer), Some(Arc::new(guard)), Some(file_handle))
+                (Some(layer), Some(Arc::new(file_guard)), Some(file_handle))
             }
             None => (None, None, None),
         };
 
-        // Step 3: Build the optional Tracy lane, restricted to `profile::*`
+        // Step 3: Build the optional Tracy layer, restricted to `profile::*`
         // targets and controlled independently of terminal verbosity.
         #[cfg(feature = "tracy")]
-        let tracy_layer = if self.tracy {
+        let tracy_layer = if self.tracy_enabled {
             let mut tracy_filter = EnvFilter::default();
             tracy_filter = tracy_filter.add_directive(
                 format!("{PROFILE_COARSE_TARGET}=trace")
@@ -726,7 +749,7 @@ impl TelemetryBuilder {
                         source: Box::new(source),
                     })?,
             );
-            if self.fine_profiling {
+            if self.fine_profiling_enabled {
                 tracy_filter = tracy_filter.add_directive(
                     format!("{PROFILE_FINE_TARGET}=trace")
                         .parse()
@@ -744,12 +767,13 @@ impl TelemetryBuilder {
         #[cfg(not(feature = "tracy"))]
         let tracy_layer: Option<tracing_subscriber::layer::Identity> = None;
 
-        // Step 3b: the optional capture lane, feeding the editor console.
+        // Step 4: Build the optional capture layer, which feeds the editor
+        // console.
         let capture_layer = self
             .capture
             .map(|buffer| capture::CaptureLayer::new(buffer, tracing::Level::INFO));
 
-        // Step 4: Assemble the layers and install the stack as the
+        // Step 5: Assemble the layers and install the stack as the
         // process-wide default subscriber.
         let registry = tracing_subscriber::registry()
             .with(terminal_layer)
@@ -758,15 +782,15 @@ impl TelemetryBuilder {
             .with(tracy_layer);
         registry.init();
 
-        // Step 5: Bridge the legacy `log` crate into tracing so dependencies
-        // that still emit through `log` (winit, wgpu, notify, ...) reach the
-        // same lanes. Bridged records carry the target `log`, so the
-        // EnvFilter directives above cannot select them by crate. The bridge
-        // filters them itself instead: only warnings and errors pass (a
-        // dependency's info and debug chatter, such as symphonia's format
-        // probing, is not engine news), and the targets in IGNORED_LOG_TARGETS
-        // are dropped entirely. The bridge is process-wide and installs once;
-        // a second attempt only reports that it is already active.
+        // Step 6: Bridge the `log` crate into tracing, so a dependency that
+        // still logs through `log` (winit, wgpu, notify, ...) reaches the same
+        // layers. A bridged record has the target `log`, so the filters above
+        // cannot select it by crate name. The bridge filters instead: only
+        // warnings and errors pass, because a dependency's info and debug
+        // chatter (such as symphonia's format probing) is not output the engine
+        // wants, and the targets listed in IGNORED_LOG_TARGETS are dropped. The
+        // bridge is process-wide and installs once; a second attempt only
+        // reports that it is already active.
         let _ = tracing_log::LogTracer::builder()
             .with_max_level(tracing_log::log::LevelFilter::Warn)
             .ignore_all(IGNORED_LOG_TARGETS.iter().copied())
@@ -782,13 +806,13 @@ impl TelemetryBuilder {
 
 /// Handles returned by [`TelemetryBuilder::init`] for live configuration.
 ///
-/// Holds the reload handles for the terminal and file lanes plus the guard
+/// Holds the reload handles for the terminal and file layers plus the guard
 /// that keeps the non-blocking file writer alive for the process lifetime.
 #[derive(Debug, Clone)]
 pub struct TelemetryHandles {
     /// Reload handle for the terminal logging filter.
     logging_filter: reload::Handle<EnvFilter, Registry>,
-    /// Reload handle for the file logging filter, when a file lane exists.
+    /// Reload handle for the file logging filter, when a file layer exists.
     file_filter: Option<reload::Handle<EnvFilter, TerminalStack>>,
     /// Keeps the file writer alive for the app lifetime.
     _file_guard: Option<Arc<FileGuard>>,
@@ -799,40 +823,32 @@ impl TelemetryHandles {
     ///
     /// # Errors
     ///
-    /// Returns [`TelemetryError::InvalidDirective`] when a directive of the
-    /// configuration cannot be parsed, or [`TelemetryError::Reload`] when the
-    /// reload itself fails; the previous filter stays active either way.
-    pub fn reload_logging_config(&self, config: &LoggingConfig) -> Result<(), TelemetryError> {
-        reload_filter(&self.logging_filter, config.build_env_filter()?)
+    /// Returns [`TelemetryError::InvalidFilter`] when the baseline level cannot
+    /// form a filter, [`TelemetryError::InvalidDirective`] when a directive of
+    /// the configuration cannot be parsed, or [`TelemetryError::Reload`] when
+    /// the reload itself fails. The previous filter stays active either way.
+    pub fn reload_logging_config(
+        &self,
+        logging_config: &LoggingConfig,
+    ) -> Result<(), TelemetryError> {
+        reload_filter(&self.logging_filter, logging_config.build_env_filter()?)
     }
 
     /// Reload the file logging filter from a [`LoggingConfig`]. Does nothing
-    /// when no file lane is installed.
+    /// when no file layer is installed.
     ///
     /// # Errors
     ///
     /// As [`Self::reload_logging_config`].
-    pub fn reload_file_config(&self, config: &LoggingConfig) -> Result<(), TelemetryError> {
+    pub fn reload_file_config(
+        &self,
+        file_logging_config: &LoggingConfig,
+    ) -> Result<(), TelemetryError> {
         let Some(handle) = &self.file_filter else {
             return Ok(());
         };
-        reload_filter(handle, config.build_env_filter()?)
+        reload_filter(handle, file_logging_config.build_env_filter()?)
     }
-}
-
-/// Replace one lane's live filter, reporting a refused reload.
-///
-/// Both lanes reload the same way, so the error mapping is written once here
-/// rather than once per lane.
-fn reload_filter<S>(
-    handle: &reload::Handle<EnvFilter, S>,
-    filter: EnvFilter,
-) -> Result<(), TelemetryError> {
-    handle
-        .reload(filter)
-        .map_err(|error| TelemetryError::Reload {
-            error: error.to_string(),
-        })
 }
 
 // =============================================================================
@@ -841,8 +857,8 @@ fn reload_filter<S>(
 
 /// Configuration or installation failures of the telemetry stack.
 ///
-/// Every variant carries the offending input and the underlying parse or
-/// reload error so callers can render precise diagnostics.
+/// Each variant carries the input that failed, or a rendered description of
+/// the failure, so a caller can show a precise message.
 #[derive(Debug, thiserror::Error)]
 pub enum TelemetryError {
     /// A complete `RUST_LOG`-style filter string could not be parsed.
@@ -872,7 +888,7 @@ pub enum TelemetryError {
         error: String,
     },
 
-    /// The file lane could not be opened.
+    /// The file layer could not be opened.
     #[error("failed to open the log file: {message}")]
     FileOutput {
         /// Rendered description of the failure.
@@ -897,10 +913,10 @@ pub enum TelemetryError {
 
 /// Join a heading and its lines into one multi-line log message.
 ///
-/// The terminal formatter prints any message with a line break as a block: the
-/// time, level and target alone on the first line, then the message from the
-/// left edge. The block ends with a line break, so an empty line separates it
-/// from the next log entry:
+/// The formatter prints a message that contains a line break as a block: the
+/// time, level, target and fields stay on the first line, and the message
+/// starts on the next line at the left edge. The block ends with a line break,
+/// so an empty line separates it from the next entry:
 ///
 /// ```text
 /// [21:51:45:003] INFO  engine::hot_reload
@@ -936,10 +952,10 @@ where
 /// Join a heading and its lines into one multi-line log message, where any
 /// part may carry color.
 ///
-/// The same as [`log_block`] for parts that display their own styling - plain
+/// This works like [`log_block`] for parts that style themselves: plain
 /// strings, or text styled with [`Colorize`] (re-exported here) or
-/// [`PillStyle`](crate::PillStyle). The formatter strips the colors for the
-/// file log and for piped output.
+/// [`PillStyle`](crate::PillStyle). The formatter strips the colors from the
+/// file log and from piped output.
 ///
 /// # Examples
 ///
@@ -967,8 +983,8 @@ where
     )
 }
 
-/// `text` without its ANSI escape sequences (`ESC [ ... letter`): what a lane
-/// that does not show colors receives from colored text.
+/// `text` without its ANSI escape sequences (`ESC [ ... letter`). A layer that
+/// does not show colors therefore receives plain text.
 ///
 /// # Examples
 ///
@@ -1003,24 +1019,24 @@ pub fn strip_color_codes(text: &str) -> String {
 const LEVEL_WIDTH: usize = 5;
 
 /// Severity color mapping owned by the terminal formatter.
-fn styled_level(level: &Level, ansi: bool) -> String {
+fn styled_level(level: &Level, accepts_ansi: bool) -> String {
     // Padded to the widest level so the targets line up in a column.
-    let text = format!("{:<LEVEL_WIDTH$}", level.as_str());
+    let padded_level = format!("{:<LEVEL_WIDTH$}", level.as_str());
     match *level {
-        Level::TRACE => paint(ansi, &text, |text| text.magenta()),
-        Level::DEBUG => paint(ansi, &text, |text| text.blue().bold()),
-        Level::INFO => paint(ansi, &text, |text| text.green()),
-        Level::WARN => paint(ansi, &text, |text| text.yellow().bold()),
-        Level::ERROR => paint(ansi, &text, |text| text.red().bold()),
+        Level::TRACE => paint(accepts_ansi, &padded_level, |text| text.magenta()),
+        Level::DEBUG => paint(accepts_ansi, &padded_level, |text| text.blue().bold()),
+        Level::INFO => paint(accepts_ansi, &padded_level, |text| text.green()),
+        Level::WARN => paint(accepts_ansi, &padded_level, |text| text.yellow().bold()),
+        Level::ERROR => paint(accepts_ansi, &padded_level, |text| text.red().bold()),
     }
 }
 
 /// Target styling owned by the terminal formatter.
-fn styled_target(target: &str, ansi: bool) -> String {
-    paint(ansi, target, |text| text.cyan())
+fn styled_target(target: &str, accepts_ansi: bool) -> String {
+    paint(accepts_ansi, target, |text| text.cyan())
 }
 
-/// Field names whose value names a module; their value is highlighted so the
+/// Field names whose value names a module. Such a value is highlighted so the
 /// module a lifecycle line is about stands out.
 const MODULE_FIELD_NAMES: &[&str] = &["module", "extension"];
 
@@ -1034,12 +1050,36 @@ const IGNORED_LOG_TARGETS: &[&str] = &["wgpu_hal::vulkan::conv"];
 
 /// Applies `style` to `text` when the writer accepts ANSI escapes, and returns
 /// the text unchanged otherwise.
-fn paint(ansi: bool, text: &str, style: impl FnOnce(&str) -> colored::ColoredString) -> String {
-    if ansi {
+fn paint(
+    accepts_ansi: bool,
+    text: &str,
+    style: impl FnOnce(&str) -> colored::ColoredString,
+) -> String {
+    if accepts_ansi {
         style(text).to_string()
     } else {
         text.to_string()
     }
+}
+
+/// Replace one layer's live filter, reporting a refused reload.
+///
+/// Both layers reload the same way, so the error mapping is written once here
+/// rather than once per layer.
+///
+/// # Errors
+///
+/// Returns [`TelemetryError::Reload`] when the subscriber refuses the new
+/// filter; the old filter stays active.
+fn reload_filter<S>(
+    handle: &reload::Handle<EnvFilter, S>,
+    filter: EnvFilter,
+) -> Result<(), TelemetryError> {
+    handle
+        .reload(filter)
+        .map_err(|error| TelemetryError::Reload {
+            error: error.to_string(),
+        })
 }
 
 // =============================================================================
@@ -1067,8 +1107,8 @@ mod tests {
     fn invalid_directives_are_rejected() {
         use tracing::level_filters::LevelFilter;
         // A target containing a second `=` cannot form a directive.
-        let config = LoggingConfig::new().with_directive("a=b=c", LevelFilter::INFO);
-        assert!(config.build_env_filter().is_err());
+        let logging_config = LoggingConfig::new().with_directive("a=b=c", LevelFilter::INFO);
+        assert!(logging_config.build_env_filter().is_err());
     }
 
     /// The terminal formatter renders level, target, and message text.
@@ -1134,10 +1174,10 @@ mod tests {
         assert_eq!(timestamp_format_from_discriminant(2), None);
     }
 
-    /// Color codes in a message reach no lane that cannot show them: a plain
-    /// lane gets the text alone.
+    /// Color codes in a message reach no layer that cannot show them: a plain
+    /// layer gets the text alone.
     #[test]
-    fn color_codes_are_stripped_for_a_plain_lane() {
+    fn color_codes_are_stripped_for_a_plain_layer() {
         use std::sync::{Arc, Mutex};
 
         assert_eq!(
@@ -1210,7 +1250,7 @@ mod tests {
     }
 
     /// The message is separated from its fields, the source location appears
-    /// only when enabled and then trails the line, and a lane without ANSI
+    /// only when enabled and then trails the line, and a layer without ANSI
     /// gets no escape codes even for highlighted fields.
     ///
     /// The only test that changes the source location setting, so the toggle
@@ -1259,7 +1299,7 @@ mod tests {
         );
     }
 
-    /// A shared capture buffer used by [`MakeWriter`].
+    /// A capture buffer that `tracing_subscriber`'s `MakeWriter` writes into.
     struct CapturingMakeWriter(Arc<std::sync::Mutex<String>>);
 
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingMakeWriter {
@@ -1302,10 +1342,10 @@ mod tests {
     #[test]
     fn logging_config_round_trips_through_env_filter() {
         use tracing::level_filters::LevelFilter;
-        let config = LoggingConfig::new()
+        let logging_config = LoggingConfig::new()
             .with_directive("engine::rendering", LevelFilter::DEBUG)
             .with_directive("wgpu", LevelFilter::WARN);
-        let filter = config.build_env_filter().unwrap();
+        let filter = logging_config.build_env_filter().unwrap();
         let rendered = format!("{filter}");
         assert!(rendered.contains("engine::rendering"));
         assert!(rendered.contains("wgpu"));
@@ -1359,12 +1399,13 @@ mod tests {
     }
 
     /// The reload handles reject invalid filters strictly and, with a file
-    /// lane installed, reload the file filter too.
+    /// layer installed, reload the file filter too.
     ///
-    /// A single test installs the process-wide subscriber once so it does not
-    /// collide with other telemetry tests running in parallel.
+    /// This test and the concurrency test both install the process-wide
+    /// subscriber, so both use a file layer and either may be the one that
+    /// installs it.
     #[test]
-    fn reload_handles_work_for_terminal_and_file_lanes() {
+    fn reload_handles_work_for_terminal_and_file_layers() {
         let directory = std::env::temp_dir().join(format!(
             "ecs-telemetry-reload-{}-{}",
             std::process::id(),
@@ -1380,7 +1421,7 @@ mod tests {
             .expect("telemetry install should succeed");
         assert!(handles.file_filter.is_some());
 
-        // A valid configuration reloads both lanes; an unparsable directive is
+        // A valid configuration reloads both layers; an unparsable directive is
         // refused and leaves the live filters alone.
         assert!(handles.reload_logging_config(&LoggingConfig::new()).is_ok());
         assert!(handles.reload_file_config(&LoggingConfig::new()).is_ok());
@@ -1394,8 +1435,8 @@ mod tests {
     /// Concurrent `init` calls install the subscriber exactly once, and every
     /// caller receives the same installed handle set.
     ///
-    /// The single `OnceLock` is what provides this. Uses a file lane like
-    /// `reload_handles_work_for_terminal_and_file_lanes` so the two tests
+    /// The single `OnceLock` is what provides this. Uses a file layer like
+    /// `reload_handles_work_for_terminal_and_file_layers` so the two tests
     /// agree on what "installed" means whichever one wins the process-wide race.
     #[test]
     fn concurrent_init_installs_exactly_once() {
@@ -1424,20 +1465,20 @@ mod tests {
                 .collect()
         });
 
-        // Every caller holds the same install: the worker guards are literally
-        // the same `Arc`, which is only possible if the OnceLock ran the
-        // installer exactly once and every other caller read the result.
-        let first_guard = handles[0]
+        // Every caller holds the same install: the file writer guards are the
+        // same `Arc`, which is only possible if the `OnceLock` ran the installer
+        // once and every other caller read that result.
+        let first_file_guard = handles[0]
             ._file_guard
             .as_ref()
             .expect("the shared install must carry a file lane");
         for handle in &handles[1..] {
-            let guard = handle
+            let file_guard = handle
                 ._file_guard
                 .as_ref()
                 .expect("every caller must see the same install");
             assert!(
-                std::sync::Arc::ptr_eq(first_guard, guard),
+                std::sync::Arc::ptr_eq(first_file_guard, file_guard),
                 "concurrent callers must share one install, not each get their own"
             );
         }
@@ -1445,7 +1486,7 @@ mod tests {
     }
 
     /// Legacy `log`-crate records are bridged into the tracing subscriber on
-    /// their own target, so dependency diagnostics reach the same lanes.
+    /// their own target, so dependency diagnostics reach the same layers.
     #[test]
     fn log_records_are_bridged_into_tracing() {
         use std::sync::{Arc, Mutex};

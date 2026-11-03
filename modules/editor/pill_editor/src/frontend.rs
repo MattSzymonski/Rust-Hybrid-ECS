@@ -2,15 +2,15 @@
 //!
 //! # Responsibilities
 //!
-//! - Declares [`EditorError`], what an editor run can end with: event-loop
-//!   and window creation, the editor's own GPU device, or a fatal frame.
+//! - Declares [`EditorError`], what an editor run can end with: event-loop,
+//!   window and GPU device creation, host setup, or a frame through the
+//!   project's renderer.
 //!
 //! # Design
 //!
 //! The error lives in the crate that owns the event loop, like
-//! `pill_standalone`'s. Every leaf carries its `wgpu` or `winit` source
-//! unchanged, so the styled report at the reporting boundary shows the
-//! driver's own message.
+//! `pill_standalone`'s. The `wgpu` and `winit` errors are carried unchanged,
+//! so the report printed when the run ends shows the driver's own message.
 
 // External crates
 use pill_core_macros::engine_error;
@@ -47,7 +47,7 @@ pub enum EditorError {
         source: winit::error::OsError,
     },
 
-    /// No GPU adapter could drive the editor's surface.
+    /// No GPU adapter could be found for the editor.
     #[message("failed to find a GPU adapter for the editor")]
     AdapterRequest {
         #[source]
@@ -63,8 +63,8 @@ pub enum EditorError {
 }
 
 impl From<pill_player::RenderingError> for EditorError {
-    /// The runtime's composition is this one without the frontend arms, so
-    /// each of its arms maps onto the matching arm here.
+    /// `pill_player::RenderingError` is this enum without the frontend arms,
+    /// so each of its two arms maps onto the one of the same name here.
     fn from(error: pill_player::RenderingError) -> Self {
         match error {
             pill_player::RenderingError::Host(error) => Self::Host(error),

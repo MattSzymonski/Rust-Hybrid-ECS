@@ -2,21 +2,20 @@
 //!
 //! # Responsibilities
 //!
-//! - Makes `crate::profiling::*` resolve to [`pill_core::profiling`] so the
-//!   engine keeps a single namespace for both its own code and downstream
-//!   users.
+//! - Makes `crate::profiling::*` resolve to [`pill_core::profiling`], so
+//!   engine code and downstream users name the profiling API in one place.
 //!
 //! # Design
 //!
-//! The implementation, feature gating, and all `#[macro_export]` profiling
-//! macros live in `pill_core::profiling`. This module is a pure re-export
-//! shim; the engine's own root re-exports (`pub use pill_core::{profile_scope,
-//! ...}`) additionally surface the macros at `crate::` scope for the many
-//! internal call sites.
+//! The implementation, the feature gating and every `#[macro_export]`
+//! profiling macro are defined in `pill_core::profiling`. This module only
+//! re-exports them. The crate root also re-exports those macros, so the many
+//! internal call sites can write `crate::profile_scope!` and the other
+//! `crate::profile_*` macros.
 
 // External crates
 
-/// Re-exports the entire [`pill_core::profiling`] namespace at
-/// `crate::profiling`, giving engine code and downstream users a single
-/// profiling entry point.
+/// Re-exports every public item of [`pill_core::profiling`] at
+/// `crate::profiling`, so engine code and downstream users use one profiling
+/// module.
 pub use pill_core::profiling::*;

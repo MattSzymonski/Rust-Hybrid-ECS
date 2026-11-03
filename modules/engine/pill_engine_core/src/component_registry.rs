@@ -2,32 +2,37 @@
 //!
 //! # Responsibilities
 //!
-//! - Declare [`ComponentFieldDescriptor`], the field layout the derive macros
-//!   emit and the world stores for the editor and the C# mirror codegen.
+//! - Declare [`ComponentFieldDescriptor`], the description of one component or
+//!   value-type field. The derive macros emit it, the world keeps it for the
+//!   editor, and the host reads it to generate the C# mirror.
 //! - Declare [`FieldDecorator`], the presentation metadata a field declares
 //!   for the editor's Inspector.
 //! - Declare the [`ComponentLayout`] trait the derives implement, and
-//!   [`ValueTypeLayoutResolver`], through which the world finds the layout of
-//!   a value type a component field nests.
+//!   [`ValueTypeLayoutResolver`], the function the world calls to find the
+//!   layout of a value type that a component field nests.
 //!
 //! # Design
 //!
 //! The registries the derives submit into (`PillComponentDescriptor` and the
 //! other descriptor types) live in `pill_engine`, the facade crate every
 //! project and extension depends on, not here. The facade is compiled into
-//! every DLL, so each DLL's registries hold exactly what that DLL declared;
-//! this crate holds only what is the same for all of them.
+//! every DLL, so each DLL's registry holds exactly what that DLL declared.
+//! This crate holds only the definitions that are the same for all of them.
 
 // Standard library
 use std::borrow::Cow;
 
-/// Presentation metadata one field declares for the editor's Inspector.
+// =============================================================================
+// FieldDecorator
+// =============================================================================
+
+/// Presentation metadata a field declares for the editor's Inspector.
 ///
-/// The vocabulary is Unity's; a decorator never reaches storage, persistence,
-/// the schema fingerprint or the C# mirror - it only changes what the
-/// Inspector draws and how it draws it. Text payloads are [`Cow`] so a
-/// deriving artifact can borrow its literals while the C# manifest lane owns
-/// what it parsed.
+/// The vocabulary is Unity's. A decorator changes only what the Inspector
+/// draws and how it draws it. It never reaches storage, persistence, the
+/// schema fingerprint or the C# mirror. Text payloads are [`Cow`] so a
+/// deriving artifact can borrow its literals, while the C# manifest lane owns
+/// the text it parsed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FieldDecorator {
     /// Unity's `[HideInInspector]`: the field is not drawn. It is still stored,
@@ -50,50 +55,61 @@ pub enum FieldDecorator {
         max: f32,
     },
     /// Unity's `[TextArea]` / `[TextArea(minLines, maxLines)]`: a text field is
-    /// drawn as a multi-line box of that many rows.
+    /// drawn as a multi-line box.
     TextArea {
-        /// Rows the box starts with.
+        /// Row count the Inspector asks the box to show.
         min_lines: usize,
-        /// Rows the box grows to before it scrolls.
+        /// Declared upper row count; the Inspector sizes the box from
+        /// `min_lines` alone.
         max_lines: usize,
     },
-    /// Unity's `[Multiline(lines)]`: a text field is drawn as a fixed-height
-    /// multi-line box.
+    /// Unity's `[Multiline(lines)]`: a text field is drawn as a multi-line box
+    /// that asks for that many rows.
     Multiline(usize),
     /// Unity's `[Min(value)]`: a numeric field's drag value never goes below
     /// the minimum.
     Min(f32),
-    /// The field is a colour. An array of three or four numbers draws as one
-    /// colour row with a popup picker, and consecutive scalar leaves sharing a
-    /// dotted prefix (a nested `Color`, say) collapse into one.
+    /// The field draws as one colour row with a popup picker. That covers an
+    /// array of three or four numbers and the leaves of a nested colour struct
+    /// (`fill.r`, `fill.g`, ...), which the world flattens at registration.
     Color,
     /// Consecutive scalar leaves sharing a dotted prefix draw as one vector
-    /// row - X/Y/Z/W side by side - instead of one row each.
+    /// row, X/Y/Z/W side by side, instead of one row each.
     Vector,
 }
 
-/// One named field of a `#[derive(PillComponent)]` component or a
-/// `#[derive(PillMirror)]` value type, captured at compile time so the host
-/// can emit a typed C# mirror instead of an opaque ABI blob.
+// =============================================================================
+// ComponentFieldDescriptor
+// =============================================================================
+
+/// One named field of a component or a value type: its name, its type tag and
+/// where it sits in the row.
 ///
-/// Every value is const-constructible (`offset_of!`/`size_of!`/`align_of!`),
-/// so a descriptor array can live in a static inside the declaring artifact.
+/// The derive macros build these at compile time and the C# back end builds
+/// them at runtime from a managed declaration. The host reads them to emit a
+/// typed C# mirror instead of an opaque ABI blob, and the world keeps them so
+/// the editor can show and edit the field.
+///
+/// Every value can be written in a `const` (`offset_of!`, `size_of!`,
+/// `align_of!`), so a descriptor list can live in a `static` inside the
+/// declaring artifact.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComponentFieldDescriptor {
     /// Rust field name (snake_case); the C# codegen maps it to PascalCase.
     pub name: &'static str,
-    /// Type tag from a closed vocabulary — `f32`, `u32`, `bool`, ...
+    /// The field's type tag, from a closed set: `f32`, `u32`, `bool`, ...,
     /// `array:<inner>`, `struct:<path>`, `vec:<element>`, `dynbuf:<element>`,
-    /// `string` — that the C# codegen maps to a concrete C# type. See
-    /// `pill_development_host/src/csharp/codegen.rs`.
+    /// `string`. The C# codegen maps each tag to a C# type; see
+    /// `modules/hosting/pill_development_host/src/csharp/codegen.rs`.
     ///
-    /// `vec:<element>` and `string` describe Rust-owned heap fields, which
-    /// carry no C# field of their own: managed code reaches them through the
+    /// A `vec:<element>` or `string` field is a heap value that Rust owns, so
+    /// it has no C# field of its own. Managed code reaches it through the
     /// accessor members the codegen emits, whose trampolines are declared with
     /// `pill_engine::component_registry::PillFieldAccessorDescriptor`.
-    /// `dynbuf:<element>` describes an engine-owned native buffer, whose
-    /// `(ptr, len, cap)` handle is mirrorable as plain words — managed code
-    /// reads it in place, and only resizing goes through an accessor.
+    ///
+    /// A `dynbuf:<element>` field is a native buffer the engine owns. Its
+    /// `(ptr, len, cap)` handle is mirrorable as plain words, so managed code
+    /// reads the buffer in place and only resizing goes through an accessor.
     pub type_tag: &'static str,
     /// Byte offset of the field within the type (`core::mem::offset_of!`).
     pub offset: usize,
@@ -101,25 +117,31 @@ pub struct ComponentFieldDescriptor {
     pub size: usize,
     /// Byte alignment of the field's type.
     pub align: usize,
-    /// Number of elements for an `array:` field; zero for non-array fields.
-    /// Computed from the array length expression at compile time, so const
-    /// and literal lengths alike resolve here.
+    /// Number of elements for an `array:` field; zero for a field that is not
+    /// an array. The derive computes it from the length expression, so a
+    /// literal length and a `const` both work.
     pub element_count: usize,
     /// The presentation decorators the field declared, in declaration order.
+    /// Empty when it declares none.
     ///
-    /// Borrowed from the declaring artifact's static data for a Rust type, and
-    /// owned by the world for a layout described at runtime (the C# manifest
-    /// lane). Empty when the field declares none.
+    /// A Rust type's own list is borrowed from the declaring artifact's static
+    /// data. A list the world builds is owned instead: the leaves of a
+    /// flattened struct that inherit a colour or vector grouping, and a layout
+    /// a managed declaration describes at runtime.
     pub decorators: Cow<'static, [FieldDecorator]>,
 }
 
+// =============================================================================
+// ComponentLayout
+// =============================================================================
+
 /// The compile-time field layout of a type, as the derive macros emit it.
 ///
-/// Implemented by `#[derive(PillLayout)]`, `#[derive(PillComponent)]` and
-/// `#[derive(PillMirror)]`; lets a layout reach
+/// The `#[derive(PillLayout)]`, `#[derive(PillComponent)]` and
+/// `#[derive(PillMirror)]` macros all implement it. It lets a layout reach
 /// [`World::register_component_with_layout`] without restating the
-/// descriptors. The shorthand for the same list is the type's inherent
-/// `FIELD_LAYOUT` const.
+/// descriptors. The same list is also the type's inherent `FIELD_LAYOUT`
+/// const.
 ///
 /// [`World::register_component_with_layout`]: crate::World::register_component_with_layout
 pub trait ComponentLayout {
@@ -127,25 +149,34 @@ pub trait ComponentLayout {
     const FIELDS: &'static [ComponentFieldDescriptor];
 }
 
-/// Finds the field layout of a `#[derive(PillMirror)]` value type by the path
-/// a `struct:<path>` field tag names: an exact type name first, then a unique
-/// suffix match.
+// =============================================================================
+// ValueTypeLayoutResolver
+// =============================================================================
+
+/// A function that finds the field layout of a `#[derive(PillMirror)]` value
+/// type. It takes the path a `struct:<path>` field tag names and tries an
+/// exact type name first, then a unique suffix match.
 ///
-/// The value types are a per-DLL registry, which this crate cannot read. The
-/// facade's `register_all_components` installs its own DLL's resolver into the
-/// world for the duration of its registration loop
+/// The value types live in a per-DLL registry, which this crate cannot read.
+/// The facade's `register_all_components` lends its own DLL's resolver to the
+/// world for the length of its registration loop
 /// ([`World::replace_value_type_layout_resolver`]), so a component's nested
 /// value-type fields expand against the value types its own DLL declares.
 ///
 /// [`World::replace_value_type_layout_resolver`]: crate::World::replace_value_type_layout_resolver
 pub type ValueTypeLayoutResolver = fn(&str) -> Option<&'static [ComponentFieldDescriptor]>;
 
-/// The candidate name a `struct:<path>` field tag refers to.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns the candidate name a `struct:<path>` field tag refers to.
 ///
-/// The tag is the path as written at the field site, which is usually an
-/// imported short name (`Color`), so an exact match is tried first and a unique
-/// `::<path>` suffix second. An ambiguous suffix resolves to `None`: an opaque
-/// field is readable, a wrong one is not.
+/// The tag is the path as written at the field site, usually an imported short
+/// name (`Color`). An exact match is tried first, then a unique `::<path>`
+/// suffix. `None` means no single candidate matches and the field shows as
+/// opaque. That is better than picking a wrong type, which would show the field
+/// as another type's value.
 ///
 /// Both candidate sources - the world's registered component names and the
 /// facade's value-type names - answer through this one rule, so the two can
@@ -155,23 +186,27 @@ pub fn resolve_unique_name<'a>(
     candidates: impl Iterator<Item = &'a str>,
 ) -> Option<&'a str> {
     let suffix = format!("::{path}");
-    let mut suffix_hit = None;
-    let mut suffix_matches = 0usize;
+    let mut suffix_match = None;
+    let mut suffix_match_count = 0usize;
     for name in candidates {
         if name == path {
             return Some(name);
         }
         if name.ends_with(&suffix) {
-            suffix_matches += 1;
-            suffix_hit = Some(name);
+            suffix_match_count += 1;
+            suffix_match = Some(name);
         }
     }
-    if suffix_matches == 1 {
-        suffix_hit
+    if suffix_match_count == 1 {
+        suffix_match
     } else {
         None
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -188,21 +223,20 @@ mod tests {
     struct TestPlainComponent;
     impl Component for TestPlainComponent {}
 
-    /// The name rule both candidate sources use: exact first, then a unique
-    /// suffix, and nothing when the suffix is ambiguous.
+    /// Checks the rule both candidate sources use. An exact match wins, a
+    /// unique suffix is accepted, and an ambiguous suffix resolves to nothing.
     ///
-    /// An ambiguous tag must resolve to nothing rather than to one of the
-    /// candidates: a wrong layout renders a field the reader will edit as if it
-    /// were another type's.
+    /// Resolving an ambiguous tag to one of its candidates would show the
+    /// reader another type's fields to edit, so the test insists on `None`.
     #[test]
     fn a_path_resolves_by_exact_name_then_a_unique_suffix() {
-        let names = [
+        let candidate_names = [
             "project::Color",
             "project::paint::Color",
             "project::Mesh",
             "project::Grid",
         ];
-        let resolve = |path: &str| resolve_unique_name(path, names.iter().copied());
+        let resolve = |path: &str| resolve_unique_name(path, candidate_names.iter().copied());
 
         assert_eq!(resolve("project::Mesh"), Some("project::Mesh"));
         assert_eq!(resolve("Grid"), Some("project::Grid"), "a unique suffix");

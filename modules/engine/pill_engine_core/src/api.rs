@@ -1,27 +1,27 @@
-//! The module entry-point contract: the table a loaded artifact receives.
+//! The table the host hands to every loaded artifact at its entry point.
 //!
 //! # Responsibilities
 //!
 //! - Defines [`EngineApi`], the `#[repr(C)]` struct every project and module
 //!   DLL receives through its `pill_module_init` export.
-//! - Constructs one for a live engine via [`EngineApi::new`].
+//! - Builds one for a live engine with [`EngineApi::new`].
 //!
 //! # Design
 //!
-//! **The module ABI is Rust-to-Rust by design.** The host owns the
-//! [`Engine`](crate::Engine) and hands each loaded artifact a pointer to it;
-//! the artifact casts `engine_handle` back to `&mut Engine` and calls the full
-//! typed API. A language-neutral ABI would need a function-pointer vocabulary
-//! for every engine operation, and the engine's surface is generic Rust
-//! (`register_component::<T>`, typed queries) that such a vocabulary cannot
-//! express without a parallel implementation of the whole API.
+//! **Both sides of the module ABI are Rust.** The host owns the
+//! [`Engine`](crate::Engine) and hands each loaded artifact a pointer to it.
+//! The artifact casts `engine_handle` back to `&mut Engine` and calls the full
+//! typed API. A language-neutral ABI would need one function pointer per
+//! engine operation. The engine's surface is generic Rust
+//! (`register_component::<T>`, typed queries), and such a table cannot express
+//! it without a second implementation of the whole API.
 //!
-//! A `#[repr(C)]` struct rather than a bare pointer is what crosses the DLL
-//! boundary, and it leaves room to add a field without changing every entry
-//! point's signature. Adding or removing a field still changes a layout every
-//! module compiles against, so it forces a lockstep rebuild of every module
-//! and project - which development does automatically, since the host builds
-//! them all from source at startup.
+//! What crosses the DLL boundary is a `#[repr(C)]` struct, not a bare pointer.
+//! It leaves room to add a field without changing the signature of every
+//! entry point. Adding or removing a field still changes the struct layout
+//! every module is compiled against, so every module and project must be
+//! rebuilt together. Development does that automatically, because the host
+//! builds them all from source at startup.
 
 // Standard library
 use std::ffi::c_void;
@@ -33,13 +33,13 @@ use crate::engine::Engine;
 // EngineApi
 // =============================================================================
 
-/// The table a project or module DLL receives at its entry point.
+/// The engine table a project or module DLL receives at its entry point.
 ///
 /// # Safety
 ///
 /// `engine_handle` is only valid while the host's [`Engine`](crate::Engine)
-/// lives and while the artifact is loaded. The artifact must not store it
-/// beyond the duration of the `pill_module_init` call.
+/// lives and while the artifact is loaded. The artifact must not keep the
+/// `&mut Engine` it builds from the handle once `pill_module_init` returns.
 ///
 /// # Examples
 ///
@@ -48,7 +48,7 @@ use crate::engine::Engine;
 /// pub unsafe extern "C" fn pill_module_init(api: *const EngineApi) -> u32 {
 ///     let api = unsafe { &*api };
 ///     let engine: &mut Engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
-///     engine.register_component::<Position>();
+///     engine.world_mut().register_component::<Position>();
 ///     engine.register_system("movement", movement_system);
 ///     0
 /// }
@@ -65,12 +65,12 @@ pub struct EngineApi {
 }
 
 impl EngineApi {
-    /// Build the table that addresses the given engine.
+    /// Builds the table that points at the given engine.
     ///
-    /// The engine must outlive every artifact that receives the result, which
-    /// is why the host boxes its engine before constructing this: the handle is
-    /// a raw pointer into that allocation and moving the host would invalidate
-    /// it.
+    /// The engine must outlive every artifact that receives the result. The
+    /// host therefore boxes its engine before it builds this table: the handle
+    /// points into that box, so moving the host does not move the engine and
+    /// the pointer stays valid.
     pub fn new(engine: &mut Engine) -> Self {
         Self {
             engine_handle: engine as *mut Engine as *mut c_void,
@@ -88,23 +88,23 @@ mod tests {
 
     /// The handle addresses the engine it was built from.
     ///
-    /// This is the whole contract the generated entry points rely on: every
-    /// `pill_module_init` casts this field back and expects the host's engine.
+    /// Every generated entry point relies on this contract: `pill_module_init`
+    /// casts the field back and expects the host's engine.
     #[test]
     fn the_handle_casts_back_to_the_engine_it_was_built_from() {
         let mut engine = Engine::new();
         let expected = &mut engine as *mut Engine;
-        let api = EngineApi::new(&mut engine);
+        let engine_api = EngineApi::new(&mut engine);
 
         assert_eq!(
-            api.engine_handle as *mut Engine, expected,
+            engine_api.engine_handle as *mut Engine, expected,
             "the handle must address the engine it was built from"
         );
 
         // SAFETY: the handle was just built from `engine`, which is still alive
         // and not otherwise borrowed, so this is the same unique reference the
         // generated entry points reconstruct.
-        let restored: &mut Engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
+        let restored: &mut Engine = unsafe { &mut *(engine_api.engine_handle as *mut Engine) };
         assert_eq!(
             restored.world().entity_count(),
             0,
@@ -112,9 +112,9 @@ mod tests {
         );
     }
 
-    /// The table's layout is what every module DLL compiles against, so a
-    /// change to it has to be a deliberate one: this pins the shape that
-    /// forces a lockstep rebuild.
+    /// Every module DLL is compiled against this layout, so changing it means
+    /// rebuilding every module at the same time. This test pins the layout, so
+    /// such a change cannot happen by accident.
     #[test]
     fn the_table_is_one_pointer_wide() {
         assert_eq!(

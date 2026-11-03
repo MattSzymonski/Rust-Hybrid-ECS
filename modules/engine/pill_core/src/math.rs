@@ -1,16 +1,17 @@
-//! Math type aliases over `glam` plus the direction vocabulary.
+//! Type aliases for `glam`'s vector and matrix types, a color alias, and an
+//! enum that names directions.
 //!
 //! # Responsibilities
 //!
-//! - Provide short, engine-facing aliases for `glam` vectors, matrices, and
-//!   colors.
-//! - Define the `Direction` vocabulary reserved for transform and input code.
+//! - Give engine code one set of names for `glam`'s vector and matrix types,
+//!   and for an RGB color.
+//! - Define [`Direction`], named axes for transform and input code.
 //!
 //! # Design
 //!
-//! Pure type aliases and one unit enum; `glam` is the only dependency. The
-//! [`Direction`] enum carries no data and exists purely as vocabulary so
-//! callers can name axes without depending on `glam`'s own terms.
+//! The file holds type aliases and one enum with no data, and `glam` is its
+//! only dependency. The enum lets calling code name an axis in words instead
+//! of passing a `glam` vector.
 
 // External crates
 use glam::{IVec2, Mat3, Mat3A, Mat4, Vec2, Vec3, Vec4};
@@ -19,38 +20,39 @@ use glam::{IVec2, Mat3, Mat3A, Mat4, Vec2, Vec3, Vec4};
 // Vector, matrix, and color aliases
 // =============================================================================
 
-/// 2D integer vector.
+/// A 2D vector of `i32` components.
 pub type Vector2i = IVec2;
 
-/// 2D float vector.
+/// A 2D vector of `f32` components.
 pub type Vector2f = Vec2;
-/// 3D float vector.
+/// A 3D vector of `f32` components.
 pub type Vector3f = Vec3;
-/// 4D float vector.
+/// A 4D vector of `f32` components.
 pub type Vector4f = Vec4;
 
-/// RGB color stored as a 3D float vector.
+/// An RGB color with no alpha channel, stored as a [`Vector3f`].
 pub type Color = Vec3;
 
-/// 3x3 float matrix: three `Vec3` columns, indexed `matrix[column][row]`.
+/// A 3x3 matrix of `f32` values, stored as three `Vec3` columns. `col` and
+/// `row` read one column or row.
 pub type Matrix3f = Mat3;
-/// 3x3 float matrix whose columns are `Vec3A`: the same maths as
-/// [`Matrix3f`], 16-byte aligned and 48 bytes wide, so its layout is not
-/// interchangeable with `Matrix3f`'s.
+/// A 3x3 matrix of `f32` values whose columns are `Vec3A` values. It does the
+/// same maths as [`Matrix3f`], but it is 16-byte aligned and 48 bytes wide,
+/// so the two memory layouts are not interchangeable.
 pub type Matrix3fA = Mat3A;
 
-/// 4x4 float matrix.
+/// A 4x4 matrix of `f32` values.
 pub type Matrix4f = Mat4;
 
 // =============================================================================
-// Direction vocabulary
+// Directions
 // =============================================================================
 
-/// Axis-aligned direction vocabulary.
+/// A direction along one of the coordinate axes.
 ///
-/// Names a cardinal axis in either the local or world frame, so a caller can
-/// express movement and facing without depending on `glam`'s vector constants.
-/// No code in the workspace uses it yet: it is reserved vocabulary.
+/// Variants without `World` name a direction on the object's own axes. The
+/// `World` variants name a direction on the scene's axes. Nothing in the
+/// workspace uses the enum yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Local forward.

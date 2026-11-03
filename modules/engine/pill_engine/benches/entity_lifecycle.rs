@@ -1,7 +1,8 @@
-//! Entity creation and destruction benchmarks.
+//! Benchmarks for creating and destroying entities.
 //!
-//! Every spawned enemy, bullet or particle pays these costs, and they sit
-//! outside the hot query loop, so this target isolates the allocation paths.
+//! A game pays these costs every time it spawns an enemy, a bullet or a
+//! particle. They happen outside the hot query loop, so this target measures
+//! the allocation work on its own.
 //!
 //! # Responsibilities
 //!
@@ -13,11 +14,11 @@
 //!
 //! # Design
 //!
-//! Each benchmark registers the components it uses on a fresh [`World`], so
-//! every measurement starts from an empty state. The destroy and reuse-cycle
-//! benchmarks use Criterion's `iter_batched` harness to keep setup outside the
-//! measured section; the create benchmarks spawn inside the measurement,
-//! because spawning is the workload.
+//! Every benchmark registers its components on a fresh [`World`], so each
+//! measurement starts from an empty world. The destroy and reuse-cycle
+//! benchmarks use Criterion's `iter_batched` harness to keep their setup
+//! outside the measured section. The create benchmarks build the world and
+//! spawn inside the measurement, because spawning is what they measure.
 
 #![allow(dead_code)]
 
@@ -33,20 +34,20 @@ use pill_engine::*;
 
 /// Position of an entity in 3D space.
 ///
-/// Shared by the create, destroy, and reuse-cycle benchmarks as a
-/// representative spatial component.
+/// Every benchmark uses it as the spatial component a real entity would
+/// carry.
 #[derive(Debug, Clone)]
-struct Transform {
+struct Position {
     x: f32,
     y: f32,
     z: f32,
 }
-impl Component for Transform {}
+impl Component for Position {}
 
 /// Linear velocity of an entity in 3D space.
 ///
-/// Used alongside [`Transform`] so the benchmarks exercise multi-component
-/// entity construction.
+/// Added next to [`Position`] so the spawning benchmarks build entities from
+/// more than one component.
 #[derive(Debug, Clone)]
 struct Velocity {
     x: f32,
@@ -55,10 +56,10 @@ struct Velocity {
 }
 impl Component for Velocity {}
 
-/// Flat hit-point value carried by spawned entities.
+/// Hit points of a spawned entity, as a single flat number.
 ///
-/// Tuple-style component that complements the struct-style [`Transform`] and
-/// [`Velocity`] layouts.
+/// A tuple struct, unlike the struct-shaped [`Position`] and [`Velocity`], so
+/// the benchmarks cover both component layouts.
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
@@ -67,15 +68,20 @@ impl Component for Health {}
 // Benchmarks
 // =============================================================================
 
-/// Spawns `count` entities with three components each into the given `world`.
+/// Spawns `entity_count` entities with three components each into `world`.
 ///
-/// Shared helper for the create benches so every measurement exercises the
-/// same entity-building path.
-fn create_entities(world: &mut World, count: usize) {
-    for _ in 0..count {
+/// `bench_create` and `bench_create_reserved` share this helper, so both
+/// measure the same entity-building path.
+///
+/// # Panics
+///
+/// Panics if `world` has not registered `Position`, `Velocity` and `Health`,
+/// because `build` then returns an error that the helper unwraps.
+fn create_entities(world: &mut World, entity_count: usize) {
+    for _ in 0..entity_count {
         world
             .create_entity()
-            .with(Transform {
+            .with(Position {
                 x: 1.0,
                 y: 2.0,
                 z: 3.0,
@@ -91,21 +97,26 @@ fn create_entities(world: &mut World, count: usize) {
     }
 }
 
-/// Creates `count` entities with 3 components each in a fresh `World`.
-/// Measures allocation overhead, HashMap insertion, and Vec growth during bulk spawning.
+/// Spawns a batch of entities with three components each into a new world,
+/// and measures the cost of the spawn.
+///
+/// The measured section also builds the world and registers the three
+/// components, so every result includes that fixed cost. What grows with the
+/// batch is the insert into the map that records where each entity lives,
+/// plus the archetype and its component columns.
 fn bench_create(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("entity_create");
-    for &count in &[100, 1_000, 10_000] {
+    for &entity_count in &[100, 1_000, 10_000] {
         group.bench_with_input(
-            BenchmarkId::from_parameter(count),
-            &count,
-            |benchmark, &count| {
+            BenchmarkId::from_parameter(entity_count),
+            &entity_count,
+            |benchmark, &entity_count| {
                 benchmark.iter(|| {
                     let mut world = World::new();
-                    world.register_component::<Transform>();
+                    world.register_component::<Position>();
                     world.register_component::<Velocity>();
                     world.register_component::<Health>();
-                    create_entities(&mut world, count);
+                    create_entities(&mut world, entity_count);
                     black_box(world.entity_count());
                 });
             },
@@ -114,22 +125,26 @@ fn bench_create(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// Same as `bench_create` but calls `world.reserve_entities(count)` first.
-/// Measures how much pre-allocation reduces reallocation overhead vs the non-reserved path.
+/// Same as `bench_create`, but calls `world.reserve_entities(entity_count)`
+/// before spawning the batch.
+///
+/// Compare its results with `bench_create` to see what pre-allocation saves.
+/// `reserve_entities` reserves only the freed-id list and the entity location
+/// map; the archetype and its component columns still grow during the spawn.
 fn bench_create_reserved(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("entity_create_reserved");
-    for &count in &[1_000, 10_000, 100_000] {
+    for &entity_count in &[1_000, 10_000, 100_000] {
         group.bench_with_input(
-            BenchmarkId::from_parameter(count),
-            &count,
-            |benchmark, &count| {
+            BenchmarkId::from_parameter(entity_count),
+            &entity_count,
+            |benchmark, &entity_count| {
                 benchmark.iter(|| {
                     let mut world = World::new();
-                    world.register_component::<Transform>();
+                    world.register_component::<Position>();
                     world.register_component::<Velocity>();
                     world.register_component::<Health>();
-                    world.reserve_entities(count);
-                    create_entities(&mut world, count);
+                    world.reserve_entities(entity_count);
+                    create_entities(&mut world, entity_count);
                     black_box(world.entity_count());
                 });
             },
@@ -138,25 +153,29 @@ fn bench_create_reserved(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// Destroys `count` single-component entities one by one.
-/// Measures HashMap removal cost, free-list push overhead, and archetype cleanup.
+/// Destroys a batch of single-component entities one at a time.
+///
+/// The setup closure spawns the batch outside the measured section. Inside it,
+/// every destroy removes the entity from the location map and pushes its id
+/// onto the freed-id list. The last one also removes the archetype, which is
+/// empty by then.
 fn bench_destroy(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("entity_destroy");
-    for &count in &[100, 1_000, 10_000] {
+    for &entity_count in &[100, 1_000, 10_000] {
         group.bench_with_input(
-            BenchmarkId::from_parameter(count),
-            &count,
-            |benchmark, &count| {
+            BenchmarkId::from_parameter(entity_count),
+            &entity_count,
+            |benchmark, &entity_count| {
                 benchmark.iter_batched(
                     || {
                         let mut world = World::new();
-                        world.register_component::<Transform>();
-                        let mut handles = Vec::with_capacity(count);
-                        for i in 0..count {
-                            handles.push(
+                        world.register_component::<Position>();
+                        let mut entity_handles = Vec::with_capacity(entity_count);
+                        for i in 0..entity_count {
+                            entity_handles.push(
                                 world
                                     .create_entity()
-                                    .with(Transform {
+                                    .with(Position {
                                         x: i as f32,
                                         y: 0.0,
                                         z: 0.0,
@@ -165,10 +184,10 @@ fn bench_destroy(criterion: &mut Criterion) {
                                     .unwrap(),
                             );
                         }
-                        (world, handles)
+                        (world, entity_handles)
                     },
-                    |(mut world, handles)| {
-                        for entity in handles {
+                    |(mut world, entity_handles)| {
+                        for entity in entity_handles {
                             black_box(world.destroy_entity(entity));
                         }
                     },
@@ -180,30 +199,35 @@ fn bench_destroy(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// Creates entities, destroys all of them, then immediately creates the same number again.
-/// Exercises the free-list ID recycling path to measure reuse vs fresh-allocation overhead.
+/// Creates a batch of entities, destroys all of them, then creates the same
+/// number again, all inside one measured iteration.
+///
+/// The second create takes back the ids the destroys returned, so comparing
+/// this benchmark with `bench_create` shows what a recycled id costs against a
+/// fresh one.
 fn bench_reuse_cycle(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("entity_reuse_cycle");
-    for &cycle_count in &[100, 1_000, 10_000] {
+    for &entity_count in &[100, 1_000, 10_000] {
         group.bench_with_input(
-            BenchmarkId::from_parameter(cycle_count),
-            &cycle_count,
-            |benchmark, &cycle_count| {
+            BenchmarkId::from_parameter(entity_count),
+            &entity_count,
+            |benchmark, &entity_count| {
                 benchmark.iter_batched(
                     || {
                         let mut world = World::new();
-                        world.register_component::<Transform>();
+                        world.register_component::<Position>();
                         world.register_component::<Velocity>();
                         world
                     },
                     |mut world| {
-                        // Step 1: Create `cycle_count` entities, retaining their handles.
-                        let mut handles = Vec::with_capacity(cycle_count);
-                        for i in 0..cycle_count {
-                            handles.push(
+                        // Step 1: Create `entity_count` entities and keep their
+                        // entity handles.
+                        let mut entity_handles = Vec::with_capacity(entity_count);
+                        for i in 0..entity_count {
+                            entity_handles.push(
                                 world
                                     .create_entity()
-                                    .with(Transform {
+                                    .with(Position {
                                         x: i as f32,
                                         y: 0.0,
                                         z: 0.0,
@@ -217,16 +241,18 @@ fn bench_reuse_cycle(criterion: &mut Criterion) {
                                     .unwrap(),
                             );
                         }
-                        // Step 2: Destroy every entity, pushing their freed IDs onto the free list.
-                        for &entity in &handles {
+                        // Step 2: Destroy every entity, which pushes each freed id
+                        // onto the free list.
+                        for &entity in &entity_handles {
                             let _ = world.destroy_entity(entity);
                         }
-                        // Step 3: Re-create the same count, reusing freed IDs via the free list.
-                        for i in 0..cycle_count {
+                        // Step 3: Create the same number again, taking the freed
+                        // ids back off the free list.
+                        for i in 0..entity_count {
                             black_box(
                                 world
                                     .create_entity()
-                                    .with(Transform {
+                                    .with(Position {
                                         x: i as f32,
                                         y: 0.0,
                                         z: 0.0,
@@ -249,8 +275,12 @@ fn bench_reuse_cycle(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// Creates entities with 6 components each, forming a single wide archetype.
-/// Measures the cost of building large-archetype entities vs the 3-component baseline.
+/// Spawns a batch of entities with six components each, so all of them share
+/// one wide archetype.
+///
+/// Measures what building entities in a wide archetype costs. Compare the
+/// result with `bench_create`, which spawns the same way with three
+/// components, to see what the extra columns add.
 fn bench_create_many_components(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("entity_create_many_components");
 
@@ -265,23 +295,23 @@ fn bench_create_many_components(criterion: &mut Criterion) {
     struct Stamina(f32);
     impl Component for Stamina {}
 
-    for &count in &[100, 1_000, 10_000] {
+    for &entity_count in &[100, 1_000, 10_000] {
         group.bench_with_input(
-            BenchmarkId::from_parameter(count),
-            &count,
-            |benchmark, &count| {
+            BenchmarkId::from_parameter(entity_count),
+            &entity_count,
+            |benchmark, &entity_count| {
                 benchmark.iter(|| {
                     let mut world = World::new();
-                    world.register_component::<Transform>();
+                    world.register_component::<Position>();
                     world.register_component::<Velocity>();
                     world.register_component::<Health>();
                     world.register_component::<Armor>();
                     world.register_component::<Mana>();
                     world.register_component::<Stamina>();
-                    for i in 0..count {
+                    for i in 0..entity_count {
                         world
                             .create_entity()
-                            .with(Transform {
+                            .with(Position {
                                 x: i as f32,
                                 y: 0.0,
                                 z: 0.0,

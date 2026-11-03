@@ -1,4 +1,5 @@
-//! Registration bookkeeping: manifests, sequence markers, and forget paths.
+//! Registration bookkeeping: what each generation registers, and how a type
+//! that no generation registers any more is dropped and forgotten.
 //!
 //! # Responsibilities
 //!
@@ -12,11 +13,12 @@
 //!
 //! # Design
 //!
-//! The registry accumulates one entry per generation, each with its own
-//! `TypeId` for the same name, so the forget paths sweep by name and retire
-//! every id they find. Retiring is careful to release a bit only when no
-//! archetype still maps it: the mask is the archetype id, so releasing a bit
-//! with live rows behind it would alias two component sets onto one column.
+//! After several reloads the registry can hold one entry per generation for
+//! the same type name, each with its own `TypeId`, so the forget paths find
+//! entries by name and retire every id they find. A bit is released only when
+//! no archetype still maps it: an archetype's mask is also its id, so a bit
+//! reused while live rows still reference it would make two component sets
+//! share one column.
 
 use super::*;
 
@@ -25,26 +27,29 @@ use super::*;
 // =============================================================================
 
 impl World {
-    /// Look up the single [`ComponentId`] a component type name resolves to.
+    /// Returns the single [`ComponentId`] that a persistable component type
+    /// name resolves to.
     ///
-    /// After multiple hot-reloads the component registry can hold one entry
-    /// per reload, each with a different `TypeId` but the same type name.
-    /// What reduces those to one candidate is **eviction**: registering a new
-    /// generation purges every same-name entry from `persist_inserters`
-    /// (see [`Self::register_persistable_component`]), so the
-    /// `persist_inserters` filter below leaves exactly one.
+    /// After several hot reloads the component registry can hold one entry per
+    /// reload for the same type name, each with a different `TypeId`.
+    /// Registering a new generation removes every same-name entry from
+    /// `persist_inserters` (see [`Self::register_persistable_component`]), so
+    /// the filter below normally leaves exactly one candidate.
     ///
-    /// The bit index is deliberately *not* used as a tiebreak. It is not a
-    /// recency ordering: `ComponentRegistry::allocate_bit` hands out bits
-    /// reclaimed by `remove` before advancing `next_bit`, so a later
-    /// registration can receive a lower bit than an earlier one. Since
-    /// eviction already guarantees uniqueness, more than one surviving
-    /// candidate is a bug rather than something to break a tie on, and it is
-    /// reported as [`WorldError::ComponentNameAmbiguous`].
+    /// The bit index is deliberately not used to break a tie, because it does
+    /// not order registrations in time: `ComponentRegistry::allocate_bit`
+    /// hands out bits reclaimed by `remove` before it advances `next_bit`, so
+    /// a later registration can receive a lower bit than an earlier one. More
+    /// than one surviving candidate therefore means eviction did not do its
+    /// job, which is a bug rather than something to break a tie on.
     ///
     /// [`persist_registration_sequence`](Self::persist_registration_sequence)
-    /// is the true chronological ordering, if a recency tiebreak is ever
-    /// genuinely wanted.
+    /// is the real chronological ordering, should one ever be needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::ComponentNameAmbiguous`] when more than one
+    /// registration survives for the name.
     pub(super) fn resolve_component_id_by_name(
         &self,
         type_name: &str,
@@ -59,26 +64,26 @@ impl World {
         let Some(first) = candidates.next() else {
             return Ok(None);
         };
-        // Any second candidate means eviction did not collapse the set, so
-        // picking either one would silently bind half the rows to the wrong
-        // column.
-        let extra = candidates.count();
-        if extra > 0 {
+        // A second candidate means eviction did not collapse the set. Picking
+        // either one would bind half the rows to the wrong column without any
+        // error.
+        let extra_candidate_count = candidates.count();
+        if extra_candidate_count > 0 {
             return Err(WorldError::ComponentNameAmbiguous {
                 type_name: type_name.to_string(),
-                count: extra + 1,
+                count: extra_candidate_count + 1,
             });
         }
         Ok(Some(first))
     }
 
     /// [`Self::resolve_component_id_by_name`] for callers that cannot return
-    /// an error, degrading an ambiguous name to "unresolved".
+    /// an error, treating an ambiguous name as unresolved.
     ///
-    /// Every such caller already has a safe answer for an unresolved name -
-    /// skip the row, omit the manifest entry, drop nothing - so reporting the
-    /// ambiguity and taking that path is strictly better than a tiebreak that
-    /// silently picks one candidate and binds rows to the wrong column.
+    /// The manifest builder is the only caller: it leaves an unresolved type
+    /// out of the manifest. Reporting the ambiguity and taking that path is
+    /// better than a tiebreak that silently picks one candidate and binds rows
+    /// to the wrong column.
     pub(super) fn resolve_component_id_by_name_logged(
         &self,
         type_name: &str,
@@ -97,16 +102,22 @@ impl World {
         }
     }
 
-    /// The schema hash currently recorded for one persistable component name.
+    /// Returns the schema hash currently recorded for one persistable
+    /// component name.
     ///
-    /// The host keeps the hash each subject registered and compares it with
-    /// this one, so a subject built against a layout another subject has since
-    /// replaced is found without asking the stale binary anything.
+    /// The host stores the hash each subject registered and compares it with
+    /// this one later. If another subject's reload replaced the type's layout
+    /// in between, the comparison identifies the binaries still built against
+    /// the old layout, without asking them anything.
     pub fn persist_schema_hash(&self, type_name: &str) -> Option<u64> {
         self.persist_schema_hashes.get(type_name).copied()
     }
 
-    /// Return current persistable component manifest.
+    /// Returns one entry per persistable component that still resolves to a
+    /// registered id, sorted by type name.
+    ///
+    /// A type whose name resolves to no id, or to more than one, is left out
+    /// of the manifest.
     pub fn persist_type_manifest(&self) -> Vec<PersistTypeManifestEntry> {
         let mut entries: Vec<PersistTypeManifestEntry> = self
             .persist_schema_hashes
@@ -125,22 +136,25 @@ impl World {
         entries
     }
 
-    /// Sequence marker to capture before a module's `init` so the exact set of
-    /// persistable types that `init` registers can be enumerated afterwards.
+    /// Returns the counter that a module's persistable registrations are
+    /// recorded against.
+    ///
+    /// The host reads it before a module's `init`, so afterwards it can list
+    /// exactly the persistable types that `init` registered.
     pub fn persist_registration_sequence(&self) -> u64 {
         self.persist_registration_sequence
     }
 
-    /// Names of persistable components registered after `sequence`.
+    /// Returns the persistable component names registered at or after
+    /// `sequence`.
     ///
-    /// Used by the host to compare what a module's new generation registered
-    /// against what the previous generation registered, so a component type
-    /// that was accidentally dropped from the module is detected instead of
-    /// silently orphaned.
+    /// The host compares this list with the one the previous generation
+    /// registered, so a component type that was accidentally dropped from the
+    /// module is reported instead of silently orphaned.
     ///
-    /// The comparison is `>=`: a registration reads the current sequence value
-    /// and then increments it, so a registration that happened immediately
-    /// after the capture carries exactly the captured value.
+    /// The test is `>=`, not `>`: a registration stores the current counter
+    /// value and then adds one, so a type registered right after the capture
+    /// carries exactly the captured value.
     pub fn persist_type_names_registered_since(&self, sequence: u64) -> Vec<String> {
         self.persist_registration_log
             .iter()
@@ -149,19 +163,22 @@ impl World {
             .collect()
     }
 
-    /// Sequence marker to capture before a module's `init` so the exact set of
-    /// component types (plain or persistable) that `init` registers can be
-    /// enumerated afterwards.
+    /// Returns the counter that every component registration is recorded
+    /// against, plain or persistable.
+    ///
+    /// The host reads it before a module's `init`, so afterwards it can list
+    /// exactly the component types that `init` registered.
     pub fn component_registration_sequence(&self) -> u64 {
         self.component_registration_sequence
     }
 
-    /// Names of all component types registered after `sequence`.
+    /// Returns the names of all component types registered at or after
+    /// `sequence`, plain and persistable alike.
     ///
     /// Unlike [`Self::persist_type_names_registered_since`], this covers plain
-    /// components too, so the host can tell a type a reloaded module dropped
-    /// entirely apart from one merely downgraded from persistable to plain
-    /// (whose data is still live).
+    /// components too. That lets the host tell a type a reloaded module
+    /// dropped entirely apart from one that was only downgraded from
+    /// persistable to plain, whose data is still live.
     pub fn registered_component_names_since(&self, sequence: u64) -> Vec<String> {
         self.component_registration_log
             .iter()
@@ -170,12 +187,13 @@ impl World {
             .collect()
     }
 
-    /// Ids of all component types registered after `sequence`.
+    /// Returns the ids of all component types registered at or after
+    /// `sequence`.
     ///
-    /// The id-level twin of [`Self::registered_component_names_since`]: a
-    /// rebuilt image gets a fresh `TypeId` for every name it declares, so a
-    /// failed generation's entries can be told apart from a rollback
-    /// generation's re-registration of the same names only by id.
+    /// The id-level twin of [`Self::registered_component_names_since`]. A
+    /// rebuilt image gives every name it declares a fresh `TypeId`, so only
+    /// the id tells a failed generation's entries apart from a rollback
+    /// generation's re-registration of the same names.
     pub fn registered_component_ids_since(&self, sequence: u64) -> Vec<ComponentId> {
         self.component_registration_log
             .iter()
@@ -184,28 +202,29 @@ impl World {
             .collect()
     }
 
-    /// Drop every column belonging to component types that no module or
-    /// project generation registers anymore.
+    /// Removes the component from every entity for each type that no module
+    /// or project generation registers any more, then forgets the type.
+    /// Returns the number of entities whose data was removed.
     ///
-    /// Called by the host right after a reloaded module/project stopped
-    /// registering a persistable type entirely (it is not even registered as a
-    /// plain component, so its data is truly orphaned). Removing the component
-    /// from every entity frees its columns now, while the generation that last
-    /// registered the type is still mapped, so the drop can never call into an
-    /// evicted DLL. Returns the number of entities whose data was removed.
+    /// The host calls this after a reloaded module or project stopped
+    /// registering a persistable type entirely, so the type is not even a
+    /// plain component and its data is truly orphaned. Removing the rows now,
+    /// while the generation that last registered the type is still loaded,
+    /// means the drop never calls into an unloaded DLL.
     ///
-    /// Every native id sharing the name loses its rows, not just the one a
-    /// name resolver returns: an ambiguous name resolves to nothing at all, and
-    /// a superseded generation's rows would otherwise outlive the registration
-    /// purge that `forget_component_type` then performs for all of them.
+    /// Every native id sharing the name loses its rows, not only the one a
+    /// name resolver would return. An ambiguous name resolves to nothing, and
+    /// a superseded generation's rows would otherwise survive the registration
+    /// purge that `forget_component_type` runs for all of them.
     pub fn drop_forgotten_components(&mut self, type_names: &[String]) -> usize {
         let mut dropped_entities = 0;
         for type_name in type_names {
-            // Native columns only; type-erased foreign-language columns are
-            // not part of the native forgotten-type path. Shared components
-            // are native, so they are covered here. A name none of whose ids
-            // is native is left alone entirely, including its name-keyed
-            // entries: it belongs to a live peer, not to a forgotten type.
+            // Step 1: Keep the native registrations of this name. A managed
+            // (foreign-language) component has a type-erased column, which
+            // this path does not cover, while a shared component is native
+            // and is covered. If no id is native, the name belongs to a live
+            // peer rather than to a forgotten type, and the whole name is
+            // skipped, name-keyed entries included.
             let native_ids: Vec<ComponentId> = self
                 .component_registry
                 .registered_components()
@@ -218,8 +237,10 @@ impl World {
             }
 
             for component_id in native_ids {
-                // Collect the entities carrying this component up front so the
-                // mutable borrows during removal never overlap the iteration.
+                // Step 2: Remove the component from every entity that carries
+                // it. The entities are collected first, because removing one
+                // needs a mutable world while the search holds shared
+                // borrows.
                 let entities: Vec<Entity> = self
                     .entity_locations
                     .iter()
@@ -240,43 +261,44 @@ impl World {
                 }
             }
 
+            // Step 3: Forget the name: retire every registration under it and
+            // drop its name-keyed entries.
             self.forget_component_type(type_name);
         }
         dropped_entities
     }
 
-    /// Retire the storage of the given component ids.
+    /// Removes the given components from every entity that carries them and
+    /// retires their registrations. Returns how many entities lost data.
     ///
-    /// The id-keyed sweep, used by the host when a failed generation's
-    /// registrations have to go: the ids are the only handle that separates
-    /// them from a rollback generation's re-registration of the same names.
-    /// Every entity carrying an id loses that one component through
-    /// `remove_component_by_id` - so a type the failed generation's `init`
-    /// managed to give rows to does not leak them into an image that is about
-    /// to be retired - the registration is retired (its bit released when no
-    /// archetype with live rows still references it, the rule
-    /// [`Self::retire_registration`] documents), and a name-keyed entry
-    /// (deserializer, schema hash) goes only when no surviving registration
-    /// still claims the name.
+    /// This sweep works by id, for the host to use when a failed generation's
+    /// registrations have to go: the ids are the only handle that tells those
+    /// registrations apart from a rollback generation's re-registration of the
+    /// same names. For each id, every entity carrying it loses that one
+    /// component, so rows the failed generation created do not leak into the
+    /// image that is about to be retired. The registration is then retired
+    /// through [`Self::retire_registration`], and the name-keyed entries
+    /// (deserializer and schema hash) are dropped only when no surviving
+    /// registration still claims the name.
     ///
-    /// Covers the descriptor lane, unlike the name-based
-    /// [`Self::drop_forgotten_components`]: a managed component has no Rust
-    /// type to name it by, so the host reaches it through the id its binding
-    /// held. That is also what the host uses when a reloaded manifest stopped
-    /// naming a managed component.
-    ///
-    /// Returns how many entities lost data.
+    /// Unlike the name-based [`Self::drop_forgotten_components`], this covers
+    /// managed components: one has no Rust type to name it by, so the host
+    /// reaches it through the id its binding held. The host also uses this
+    /// when a reloaded manifest stops naming a managed component.
     pub fn retire_component_storage(&mut self, component_ids: &[ComponentId]) -> usize {
         let mut dropped_entities = 0;
         for &component_id in component_ids {
+            // Step 1: Find the name the id was registered under, if it is
+            // still registered.
             let type_name = self
                 .component_registry
                 .registered_components()
                 .find(|(id, _, _)| *id == component_id)
                 .map(|(_, _, name)| name.to_string());
 
-            // Collect the entities carrying this component up front so the
-            // mutable borrows during removal never overlap the iteration.
+            // Step 2: Remove the component from every entity that carries it.
+            // The entities are collected first, because removing one needs a
+            // mutable world while the search holds shared borrows.
             let entities: Vec<Entity> = self
                 .entity_locations
                 .iter()
@@ -294,6 +316,8 @@ impl World {
                 }
             }
 
+            // Step 3: Retire the registration, then drop the name-keyed
+            // entries once no registration still claims the name.
             self.retire_registration(component_id);
             if let Some(name) = type_name {
                 let still_claimed = self
@@ -309,18 +333,18 @@ impl World {
         dropped_entities
     }
 
-    /// Retire one registration, releasing its bit only when no archetype still
-    /// maps a mask carrying it.
+    /// Retires one registration, releasing its bit only when no archetype that
+    /// still holds rows maps that bit.
     ///
-    /// The mask *is* the archetype id, so a bit that returns to the pool while
-    /// an archetype references it aliases two component sets onto one id: the
-    /// next registration that reuses the bit would reach the stale archetype
-    /// through `get_or_create_archetype` and be served its columns. The sweeps
-    /// that precede both callers rehome every entity holding the type, so the
-    /// archetypes carrying the bit are empty and are dropped here. A non-empty
-    /// one means rows still reference the bit, and then the registration is
-    /// removed *without* releasing the bit - a leaked bit is recoverable, an
-    /// aliased archetype is not.
+    /// An archetype's mask is also its id, so a bit that returned to the pool
+    /// while an archetype still referenced it would make two component sets
+    /// share one id. The next registration that reused the bit would then
+    /// reach the stale archetype through `get_or_create_archetype` and be served
+    /// its columns. Every caller removes the entities holding the type first,
+    /// so the archetypes carrying the bit are empty and are dropped here. If
+    /// one still holds rows, the registration is removed without releasing the
+    /// bit, because a leaked bit is recoverable while a shared archetype is
+    /// not.
     pub(crate) fn retire_registration(&mut self, component_id: ComponentId) {
         let bit = self.component_registry.get_bit(&component_id);
         let rows_still_reference_bit = bit.is_some_and(|bit| {
@@ -345,11 +369,12 @@ impl World {
         self.persist_inserters.remove(&component_id);
     }
 
-    /// Remove every registration artifact for one forgotten component type so
-    /// it stops appearing in the persistable manifest and registry.
+    /// Removes every registration and name-keyed persist entry of one
+    /// forgotten component type, so the type stops appearing in the manifest
+    /// and in the registry.
     pub(super) fn forget_component_type(&mut self, type_name: &str) {
-        // The registry accumulates one entry per generation (each with a
-        // distinct `TypeId`); purge every entry that shares this type name.
+        // The registry can hold one entry per generation for the same name,
+        // each with its own `TypeId`, so every entry sharing the name goes.
         let stale_ids: Vec<ComponentId> = self
             .component_registry
             .registered_components()
@@ -363,7 +388,12 @@ impl World {
         self.persist_schema_hashes.remove(type_name);
     }
 
-    /// Capture old persistable component metadata before hot-reload.
+    /// Returns the serializer and schema hash of every persistable component
+    /// currently registered, keyed by type name.
+    ///
+    /// The host captures this before a reload replaces the registrations.
+    /// Migration then reads the retiring generation's rows through these
+    /// serializers, the only code that understands the old layout.
     pub fn capture_persist_type_metadata(&self) -> HashMap<String, PersistTypeMetadata> {
         let mut metadata_by_name: HashMap<String, PersistTypeMetadata> = HashMap::new();
 
@@ -383,12 +413,12 @@ impl World {
         metadata_by_name
     }
 
-    /// Snapshot every live entity id.
+    /// Returns the id of every entity that is currently alive.
     ///
     /// Migration runs after the incoming generation's `init`, so archetypes
-    /// may already hold entities whose components were written with the
-    /// current schema. This set lets the migration tell those apart from the
-    /// entities that need converting - see
+    /// may already hold entities that `init` spawned, written with the current
+    /// schema. This set lets the migration tell those entities apart from the
+    /// ones that need converting. See
     /// [`Self::migrate_changed_persistable_components`].
     pub fn capture_live_entities(&self) -> HashSet<Entity> {
         let mut entities: HashSet<Entity> = HashSet::new();
@@ -403,67 +433,69 @@ impl World {
 // Function Pointer Type Aliases
 // =============================================================================
 
-/// Serializes the component at `index` in the given storage map into a
-/// JSON-encoded byte vector, or `None` when the type's `Serialize`
-/// implementation refuses the value.
+/// Serializes the component at `index` in the given storage map into JSON
+/// bytes, or `None` when the value cannot be serialized.
 ///
-/// Infallible by signature would be a lie: `serde_json::to_vec` can fail on a
-/// user type, and the migration that reads through this pointer must report
-/// that as a skipped type rather than abort the reload.
+/// The signature could not be infallible: `serde_json::to_vec` can fail for a
+/// user type. Migration reports such a failure as a skipped type instead of
+/// aborting the reload.
 pub(crate) type SerializeComponentFn =
     fn(storage: &ComponentColumns, index: usize) -> Option<Vec<u8>>;
 
-/// Deserializes JSON bytes back into a heap-allocated component.
+/// Rebuilds a heap-allocated component from JSON bytes.
 ///
-/// Returns `None` if the schema changed incompatibly (e.g. a field type
-/// changed from `f32` to `String`).  Simple additions/removals are handled
-/// by serde's `default` / `ignore` behaviour.
+/// Returns `None` when the schema changed incompatibly, for example when a
+/// field's type changed from `f32` to `String`. A field that was added takes
+/// its default value, and a field that was removed is ignored: serde matches
+/// fields by name.
 pub(crate) type DeserializeComponentFn = fn(bytes: &[u8]) -> Option<Box<dyn Component>>;
 
-/// Downcasts a `Box<dyn Component>` to its concrete type and pushes it into
-/// the appropriate [`ComponentColumn`](crate::archetype::ComponentColumn)
-/// inside the storage map.
+/// Downcasts a `Box<dyn Component>` to its concrete type and pushes the value
+/// into that type's [`ComponentColumn`](crate::archetype::ComponentColumn) in
+/// the storage map.
 pub(crate) type InsertComponentFn =
     fn(storage: &mut ComponentColumns, component: Box<dyn Component>);
 
 /// Serializes one registered resource out of the world into JSON bytes.
 ///
-/// `None` when the world holds no value for it, which is different from an
-/// empty value: a resource that was never inserted has nothing to record.
-/// Takes the whole world rather than a value because a resource is found by
-/// its id, and the id is what monomorphizing this for `T` supplies.
+/// Returns `None` when the world holds no value for the resource, which is
+/// different from an empty value: a resource that was never inserted has
+/// nothing to record. The function takes the whole world rather than a value
+/// because a resource is found by its id, and the `T` it is monomorphized for
+/// supplies that id.
 pub type SerializeResourceFn = fn(world: &World) -> Option<Vec<u8>>;
 
 /// Rebuilds one resource from snapshot bytes and inserts it into the world.
 ///
 /// Returns whether the payload could be read. A value that no longer parses
-/// under the current shape is reported and skipped rather than inserted
-/// half-formed, matching how an unreadable component row is handled.
+/// under the current shape is logged and skipped instead of being inserted
+/// half-formed, the same way an unreadable component row is handled.
 pub type RestoreResourceFn = fn(world: &mut World, bytes: &[u8]) -> bool;
 
 // =============================================================================
-// Per-Type Monomorphized Functions
+// Schema Shape and Hash Helpers
 // =============================================================================
 
-/// Deep-merge two JSON values: `base` provides defaults, `override_json`
-/// provides the actual data.  Fields present in `override_json` take
-/// precedence; fields only in `base` are kept as defaults.
+/// Deep-merges two JSON values: `base_json` provides the defaults and
+/// `override_json` the stored data. Fields present in `override_json` win;
+/// fields only in `base_json` keep their default value.
 pub(super) fn merge_json(
-    mut base: serde_json::Value,
+    mut base_json: serde_json::Value,
     override_json: serde_json::Value,
 ) -> serde_json::Value {
-    match (&mut base, override_json) {
+    match (&mut base_json, override_json) {
         (serde_json::Value::Object(base_map), serde_json::Value::Object(override_map)) => {
             for (key, value) in override_map {
                 match base_map.get_mut(&key) {
-                    Some(base_val) => {
+                    Some(base_value) => {
                         // Recursively merge nested objects.
-                        let merged = merge_json(base_val.clone(), value);
-                        *base_val = merged;
+                        let merged = merge_json(base_value.clone(), value);
+                        *base_value = merged;
                     }
                     None => {
-                        // Field in snapshot but not in default — keep it
-                        // (handles fields that were removed from the struct).
+                        // The snapshot has a field the default does not: the
+                        // struct no longer declares it. Keep it; serde ignores
+                        // unknown fields while deserializing.
                         base_map.insert(key, value);
                     }
                 }
@@ -471,12 +503,15 @@ pub(super) fn merge_json(
             serde_json::Value::Object(base_map.clone())
         }
         // For non-object values (primitives, arrays), override wins.
-        (_, ov) => ov,
+        (_, override_value) => override_value,
     }
 }
 
-/// Build a normalized schema-shape JSON tree where values are replaced by
-/// stable kind markers. This avoids false negatives from default value changes.
+/// Builds a copy of a JSON tree in which every value is replaced by a marker
+/// for its kind, such as `"number"` or `"string"`.
+///
+/// Hashing this copy instead of the original means that changing a default
+/// value does not change the schema hash, while changing a field's kind does.
 pub(super) fn normalize_schema_shape(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Null => serde_json::Value::String("null".to_string()),
@@ -504,38 +539,38 @@ pub(super) fn normalize_schema_shape(value: &serde_json::Value) -> serde_json::V
     }
 }
 
-/// Compute schema hash for one persistable component type.
+/// Computes the schema hash of one persistable component type.
 ///
-/// `fields` is the declared field layout when the type was registered through
-/// the derive, and empty for hand-registered types. Including it matters:
-/// normalized default values describe a `Vec<f32>` and a `Vec<String>` alike
-/// as an empty array, so without the tags a reload could take the
-/// unchanged-schema fast path and then interpret one as the other.
+/// `fields` is the declared field layout when the derive registered the type,
+/// and empty for a hand-registered one. The layout must be part of the hash:
+/// the normalized default value of a `Vec<f32>` and of a `Vec<String>` are
+/// both an empty array, so without the field tags a reload could decide the
+/// schema was unchanged and then read one as the other.
 pub(super) fn calculate_schema_hash<T>(
     fields: &[crate::component_registry::ComponentFieldDescriptor],
 ) -> u64
 where
     T: Component + Serialize + Default + 'static,
 {
-    // Step 1: Serialize a default instance and normalize it to stable kind
-    // markers so default-value changes do not alter the schema hash.
+    // Step 1: Serialize a default instance and keep only the kind of each
+    // value, so changing a default value does not change the hash.
     let default_value = T::default();
     let default_json = serde_json::to_value(default_value).unwrap_or(serde_json::Value::Null);
     let normalized_schema = normalize_schema_shape(&default_json);
     let normalized_schema_string = serde_json::to_string(&normalized_schema)
         .unwrap_or_else(|_| "<schema-serialization-failed>".to_string());
 
-    // Step 2: Combine the type name, size, and normalized schema into a
-    // stable 64-bit hash for comparing schemas across reloads.
+    // Step 2: Hash the type name, the type's size and the normalized schema
+    // into one value that can be compared across reloads.
     let mut hasher = DefaultHasher::new();
     crate::type_names::stable_type_name::<T>().hash(&mut hasher);
     std::mem::size_of::<T>().hash(&mut hasher);
     normalized_schema_string.hash(&mut hasher);
 
-    // Step 3: Fold in the declared field layout. Tags carry the container
-    // kinds (`vec:f32`, `string`), offsets distinguish a reordered or padded
-    // shape, and the element count separates a fixed array from a resized one.
-    // A layout-less registration contributes nothing here.
+    // Step 3: Add the declared field layout. The type tag says which container
+    // a field holds (`vec:f32`, `string`), the offset catches a reordered or
+    // padded shape, and the element count separates a fixed array from a
+    // resized one. A registration without a layout adds nothing here.
     for field in fields {
         field.name.hash(&mut hasher);
         field.type_tag.hash(&mut hasher);

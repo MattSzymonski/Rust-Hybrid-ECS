@@ -1,5 +1,5 @@
 //! Typed error system shared by every Pill workspace crate, generated from
-//! one semantic message definition per variant.
+//! one semantic message definition per leaf variant.
 //!
 //! # Responsibilities
 //!
@@ -13,14 +13,15 @@
 //!
 //! # Design
 //!
-//! Every error variant carries a single `#[message(...)]` definition. The
-//! `#[engine_error]` macro generates the plain `Display` message, a stable
+//! Every leaf variant carries one `#[message(...)]` definition; [`HostError`]
+//! wraps whole subsystem errors and adds no text of its own. The
+//! `#[engine_error]` macro generates the plain `Display` text, a stable
 //! `namespace::variant` diagnostic code, and an [`EngineMessage`]
 //! implementation that renders the same definition with semantic roles.
 //! Subsystem errors compose into [`HostError`] through transparent
-//! `#[from]` wrappers, so `?` works across boundaries while the leaf error
-//! and its source chain survive. Styling lives only in the renderers; error
-//! definitions never import a styling crate.
+//! `#[from]` wrappers, so `?` works across boundaries and the leaf error
+//! keeps its source chain. Error definitions never import a styling crate;
+//! only the renderer turns a role into styled text.
 
 // Standard library
 use std::fmt;
@@ -31,6 +32,9 @@ use pill_core_macros::engine_error;
 // Current crate
 use crate::style::PillStyle;
 
+// The submodules bring all of this in through `use super::*;`, so a line
+// removed here breaks them even where this file never names it.
+
 // =============================================================================
 // Module Layout
 // =============================================================================
@@ -39,10 +43,9 @@ mod host;
 mod render;
 mod report;
 
-// Every item keeps the path it had when this was one file: the submodules above
-// are private and their contents are re-exported here, so
-// `pill_core::error::BuildError` and `pill_core::error::MessageRenderer` resolve
-// unchanged.
+// The submodules are private and everything they define is re-exported here,
+// so `pill_core::error::BuildError` and `pill_core::error::MessageRenderer`
+// keep working whatever file the item lives in.
 pub use host::*;
 pub use render::*;
 pub use report::*;
@@ -53,12 +56,16 @@ pub use report::*;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use miette::Diagnostic as _;
+
     /// A boxed source still reports its cause through the chain.
     ///
-    /// The variants that name the watcher's and the loader's own error box it
-    /// instead, because this crate is the shared dylib every posture links and
-    /// may not depend on either. `format_error_chain` builds the
-    /// host's one-line reports, so the cause it walks to is what has to stay.
+    /// The watcher and loader variants store their error boxed instead of
+    /// naming it, because this crate is the shared dylib every posture links
+    /// and may not depend on `notify` or `libloading`. The host builds its
+    /// one-line reports with `format_error_chain`, so the cause it walks to
+    /// has to survive.
     #[test]
     fn a_boxed_source_still_reports_its_cause() {
         let error = WatcherError::CreationFailed {
@@ -74,8 +81,8 @@ mod tests {
     /// The engine-dylib mismatch names both dylibs and both ways out.
     ///
     /// Windows reports the same failure as `os error 127`, which names neither
-    /// the dylib nor the feature that moved, so the parts a reader has to act
-    /// on are worth pinning.
+    /// the dylib nor the feature that moved. That is why the parts a reader
+    /// has to act on are worth pinning.
     #[test]
     fn engine_dylib_mismatch_names_both_dylibs_and_the_remedy() {
         let error = LibraryError::EngineDylibMismatch {
@@ -101,10 +108,7 @@ mod tests {
         );
     }
 
-    use super::*;
-    use miette::Diagnostic as _;
-
-    /// One rendered semantic fragment, recorded for verification.
+    /// One piece of a rendered message, kept so a test can compare it.
     #[derive(Debug, PartialEq, Eq)]
     enum RecordedPart {
         Text(String),
@@ -157,9 +161,10 @@ mod tests {
         );
     }
 
-    /// Semantic rendering exposes the declared roles to the renderer.
+    /// The renderer receives the text and values in the order the definition
+    /// names them.
     #[test]
-    fn recording_renderer_sees_the_semantic_roles() {
+    fn recording_renderer_receives_text_and_values_in_order() {
         let error = CSharpError::InteropVersionMismatch {
             expected: 2,
             actual: 3,
@@ -179,9 +184,9 @@ mod tests {
         );
     }
 
-    /// Styled static tokens carry their role into the renderer.
+    /// A styled field reaches the renderer with its role.
     #[test]
-    fn styled_static_tokens_carry_their_role() {
+    fn styled_field_carries_its_role_into_the_renderer() {
         let error = BuildError::OutputMissing {
             path: "target/debug/project.dll".to_string(),
         };
@@ -237,16 +242,16 @@ mod tests {
         );
     }
 
-    /// The terminal renderer applies name styling, visible even without
-    /// ANSI assertions, through the quoting convention.
+    /// The terminal renderer quotes a name token, which a test can check
+    /// without matching ANSI codes.
     #[test]
     fn terminal_renderer_quotes_name_tokens() {
         let error = WatcherError::WatchDirectoryMissing {
             path: "project_rs/src".to_string(),
         };
-        let mut output = String::new();
-        let mut renderer = TerminalMessageRenderer::new(&mut output);
+        let mut rendered_message = String::new();
+        let mut renderer = TerminalMessageRenderer::new(&mut rendered_message);
         error.render_message(&mut renderer).unwrap();
-        assert!(output.contains("\"project_rs/src\""));
+        assert!(rendered_message.contains("\"project_rs/src\""));
     }
 }

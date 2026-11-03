@@ -2,13 +2,13 @@
 //!
 //! # Responsibilities
 //!
-//! - Provide a fixed, visually distinct palette for coloring entities.
-//! - Generate evenly spaced HSL-derived palettes.
+//! - Provide a fixed palette of visually distinct colors.
+//! - Generate a palette of 100 colors from evenly spaced hues.
 //!
 //! # Design
 //!
-//! Pure functions returning `(f32, f32, f32)` RGB tuples in the 0.0-1.0
-//! range. No engine state or external dependencies.
+//! Every color is an `(r, g, b)` triple of `f32` values in the 0.0-1.0
+//! range. The module keeps no state and has no dependencies.
 
 // ============================================================================
 // Constants
@@ -41,13 +41,13 @@ pub const DISTINCT_COLOR_PALETTE: &[(f32, f32, f32)] = &[
 ];
 
 // ============================================================================
-// Free functions
+// Free Functions
 // ============================================================================
 
-/// Generates 100 evenly spaced HSL-derived colors.
+/// Generates 100 colors from evenly spaced hues.
 ///
-/// The saturation and lightness are fixed while the hue advances uniformly
-/// across the full circle, producing a palette that spreads colors evenly.
+/// The saturation and lightness stay fixed while the hue advances in 100
+/// equal steps around the circle, so the colors spread evenly.
 pub fn generate_color_palette() -> Vec<(f32, f32, f32)> {
     (0..100)
         .map(|i| {
@@ -57,10 +57,10 @@ pub fn generate_color_palette() -> Vec<(f32, f32, f32)> {
         .collect()
 }
 
-/// Converts a hue/saturation/lightness triple (HLS) to an RGB triple.
+/// Converts a hue, saturation and lightness triple (HSL) to an RGB triple.
 ///
-/// `h` is expected in the 0.0-1.0 range; all channels come back in the
-/// 0.0-1.0 range.
+/// `hue`, `saturation` and `lightness` are expected in the 0.0-1.0 range, and
+/// every returned channel is in the same range.
 ///
 /// # Examples
 ///
@@ -72,13 +72,15 @@ pub fn generate_color_palette() -> Vec<(f32, f32, f32)> {
 /// assert!(color.1 >= 0.0 && color.1 <= 1.0);
 /// assert!(color.2 >= 0.0 && color.2 <= 1.0);
 /// ```
-pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
-    // Standard HSL to RGB conversion: `a` is the chroma scaled by lightness,
-    // and `f` projects a hue offset onto the red/green/blue channel axes.
-    let a = s * l.min(1.0 - l);
-    let f = |n: f32| {
-        let k = (n + h * 12.0) % 12.0;
-        l - a * (-((k - 3.0).abs() - 1.0).clamp(-1.0, 1.0))
+pub fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (f32, f32, f32) {
+    // `channel_amplitude` is how far a channel can move away from
+    // `lightness`: zero for gray and larger the more saturated the color is.
+    // `channel_value` returns one channel from its hue offset; the calls
+    // below pass the offsets for red, green and blue.
+    let channel_amplitude = saturation * lightness.min(1.0 - lightness);
+    let channel_value = |channel_offset: f32| {
+        let hue_position = (channel_offset + hue * 12.0) % 12.0;
+        lightness - channel_amplitude * (-((hue_position - 3.0).abs() - 1.0)).clamp(-1.0, 1.0)
     };
-    (f(0.0), f(8.0), f(4.0))
+    (channel_value(0.0), channel_value(8.0), channel_value(4.0))
 }

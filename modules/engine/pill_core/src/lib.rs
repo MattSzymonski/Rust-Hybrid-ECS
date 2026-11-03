@@ -2,31 +2,36 @@
 //!
 //! # Responsibilities
 //!
-//! - Own the semantic error system used by every workspace crate.
-//! - Own the telemetry foundation: static targets, developer log macros, the
-//!   terminal formatter, the subscriber builder and the metrics recorder.
-//! - Own the platform layer ([`platform`]): clock, log output and futures, the
-//!   only code that differs between native and the web.
-//! - Own the Tracy profiling API (`profile_scope!` and friends) with its
-//!   feature gating and no-op fallbacks.
-//! - Own the state that must exist once per process: the Rayon pool, the
-//!   native buffer allocation service and the per-thread run ticks.
-//! - Provide the plain-data and helper types the artifacts share: inline
-//!   strings, native-backed buffers, slot maps, `PillStyle`, colour palettes,
-//!   math aliases and small utilities.
-//! - Re-export the `tracing` and `metrics` macros, so every telemetry entry
-//!   point imports from a single flat namespace: `pill_core`.
+//! - Own the error types every workspace crate uses, built from one semantic
+//!   message definition per leaf variant and rendered as plain or styled text.
+//! - Own the telemetry foundation: the static log targets, the developer log
+//!   macros, the terminal line formatter, the log subscriber builder and the
+//!   metrics recorder.
+//! - Own the platform layer ([`platform`]): clock, log output, futures and
+//!   terminal styling, the only code that differs between native and the web.
+//! - Own the Tracy profiling API (`profile_scope!` and the other `profile_*`
+//!   macros), with its feature gates and no-op fallbacks.
+//! - Own the state that must have one copy per process: the Rayon thread
+//!   pool, the native buffer allocation service and the per-thread change
+//!   ticks (counters that record when each system last ran).
+//! - Provide the plain-data and helper types the DLLs share: inline strings,
+//!   native-backed buffers, slot maps, `PillStyle`, color palettes, math
+//!   aliases and small utilities.
+//! - Re-export the `tracing` and `metrics` macros, so a caller imports every
+//!   telemetry entry point from `pill_core` alone.
 //!
 //! # Design
 //!
-//! The crate is both a `dylib` and an `rlib`: every DLL links the one shared
-//! copy, so process-global state has a single instance across the boundary,
-//! while a monolithic release-profile build can still embed it.
+//! The crate builds both as a `dylib` and as an `rlib`. Every DLL links the
+//! one shared copy, so process-global state has a single instance across the
+//! DLL boundary. A monolithic release-profile build can link everything
+//! statically instead.
 //!
-//! The error system lives in [`error`]: subsystem enums declared with
-//! `#[engine_error]` compose transparently into [`error::HostError`], and the
-//! renderers turn one semantic message definition into plain or styled output.
-//! The telemetry system lives in [`telemetry`] and [`metrics`].
+//! The error system lives in [`error`]. A subsystem declares its errors with
+//! `#[engine_error]`, and they combine into [`error::HostError`] without
+//! adding text of their own. A renderer turns one semantic message definition
+//! into plain or styled output. The telemetry system lives in [`telemetry`]
+//! and [`metrics`].
 
 // =============================================================================
 // Modules
@@ -34,7 +39,7 @@
 
 /// Color palettes for debug visualization.
 pub mod color;
-/// Growable runs of plain elements in engine-owned native memory.
+/// A growable run of plain (`Copy`) elements in engine-owned native memory.
 pub mod dynamic_buffer;
 /// Semantic error system shared by every workspace crate.
 pub mod error;
@@ -45,9 +50,10 @@ pub mod math;
 /// Metrics recording foundation, gated on the `metrics` feature.
 #[cfg(feature = "metrics")]
 pub mod metrics;
-/// Engine-owned native buffer allocation, shared by every loaded artifact.
+/// Engine-owned native buffer allocation, shared by every loaded DLL.
 pub mod native_buffer;
-/// The platform layer: clock, log output and futures on native and the web.
+/// The platform layer: clock, log output, futures and terminal styling on
+/// native and on the web.
 pub mod platform;
 /// Tracy profiling API with feature gating and no-op fallbacks.
 pub mod profiling;
@@ -55,46 +61,51 @@ pub mod profiling;
 pub mod slot_map;
 /// `PillStyle` string-styling vocabulary for terminal output.
 pub mod style;
-/// Per-thread change ticks of the running system, shared by every artifact.
+/// Per-thread change ticks of the system running on the current thread, shared
+/// by every loaded DLL.
 pub mod system_ticks;
-/// Telemetry foundation: static targets, formatter, and subscriber builder.
+/// Telemetry foundation: the log targets, the log filter, the line formatter
+/// and the subscriber builder.
 pub mod telemetry;
 /// Small general-purpose helpers shared by Pill crates.
 pub mod utils;
 
 // =============================================================================
-// Flat Re-exports: tracing, metrics, and tracy-client
+// Flat Re-exports: engine types and shared crates
 // =============================================================================
 
-/// The engine-owned dynamic buffer, re-exported at the crate root.
+/// The engine-owned dynamic buffer: a growable run of plain elements in
+/// native memory.
 pub use dynamic_buffer::DynamicBuffer;
-/// Inline fixed-capacity strings, re-exported at the crate root.
+/// `FixedString64` and `FIXED_STRING_64_CAPACITY`: an inline string type and
+/// the capacity it allows.
 pub use fixed_string::{FixedString64, FIXED_STRING_64_CAPACITY};
-/// The `PillStyle` string-styling vocabulary, re-exported at the crate root.
+/// The `PillStyle` trait, which styles text for terminal output.
 pub use style::PillStyle;
 /// The `tracing` crate, re-exported so downstream crates import telemetry
 /// macros from `pill_core` alone.
 pub use tracing;
 
 /// The `rayon` crate, re-exported so every DLL runs parallel work on the one
-/// global thread pool inside `pill_core.dll`, which no reload unmaps. Use
-/// it through this path. A module must not build a pool of its own
-/// (`ThreadPoolBuilder::build`): its threads would park in the module's
-/// code, which a reload unmaps.
+/// global thread pool inside `pill_core.dll`, which never unloads. Use
+/// `rayon` through this path. A module must not build a pool of its own
+/// (`ThreadPoolBuilder::build`): its threads would keep running in the
+/// module's code, and a reload unloads that code.
 pub use rayon;
 
-// Permanent logging macros. `error` coexists with the `pub mod error` module:
-// Rust keeps the macro and module namespaces separate, so both resolve.
+// Permanent logging macros. `error` has the same name as the `pub mod error`
+// module; Rust keeps macros and modules in separate namespaces, so both
+// resolve.
 pub use tracing::{debug, error, info, span, trace, trace_span, warn};
 
-// Metrics macros (gated on the `metrics` feature). The leading `::` forces
-// the external `metrics` crate rather than the local `pub mod metrics`.
+// Metrics macros, gated on the `metrics` feature. The leading `::` selects
+// the external `metrics` crate instead of the local `pub mod metrics`.
 #[cfg(feature = "metrics")]
 pub use ::metrics::{counter, gauge, histogram};
 
-// `tracy_client` is re-exported so the `profile_*` macros can reach it via
-// `$crate::tracy_client::...` from any downstream crate without that crate
-// declaring a direct dependency.
+// The `tracy_client` crate, re-exported so the `profile_*` macros can call it
+// through `$crate::tracy_client::...` in any crate, without that crate
+// declaring a dependency on it.
 #[cfg(any(
     feature = "profiling",
     feature = "profiling-minimal",
@@ -106,11 +117,12 @@ pub use tracy_client;
 // Simple Developer Logging Macros
 // =============================================================================
 
-/// Simple developer scratch log at `DEBUG` level on the [`DEV_LOG_TARGET`]
-/// lane (`engine::dev`).
+/// Writes a temporary developer log at `DEBUG` level on the `engine::dev`
+/// lane ([`DEV_LOG_TARGET`]).
 ///
-/// Feature-gated behind `dev-logs`; compiles away when disabled. These macros
-/// are for temporary developer diagnostics, never permanent telemetry.
+/// Only available with the `dev-logs` feature. Without it the macro expands
+/// to nothing. Use these macros for diagnostics while developing, never for
+/// permanent telemetry.
 ///
 /// [`DEV_LOG_TARGET`]: telemetry::DEV_LOG_TARGET
 #[cfg(feature = "dev-logs")]
@@ -121,15 +133,16 @@ macro_rules! log {
     };
 }
 
-/// Compile-time no-op of [`log!`] when the `dev-logs` feature is disabled.
+/// The version of [`log!`] used when the `dev-logs` feature is off. It
+/// expands to nothing.
 #[cfg(not(feature = "dev-logs"))]
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {};
 }
 
-/// Simple developer scratch warning at `WARN` level on the `engine::dev`
-/// lane. Feature-gated behind `dev-logs`.
+/// Writes a temporary developer warning at `WARN` level on the `engine::dev`
+/// lane. Only available with the `dev-logs` feature.
 #[cfg(feature = "dev-logs")]
 #[macro_export]
 macro_rules! dev_warn {
@@ -138,15 +151,16 @@ macro_rules! dev_warn {
     };
 }
 
-/// Compile-time no-op of [`dev_warn!`] when the `dev-logs` feature is disabled.
+/// The version of [`dev_warn!`] used when the `dev-logs` feature is off. It
+/// expands to nothing.
 #[cfg(not(feature = "dev-logs"))]
 #[macro_export]
 macro_rules! dev_warn {
     ($($arg:tt)*) => {};
 }
 
-/// Simple developer scratch error at `ERROR` level on the `engine::dev`
-/// lane. Feature-gated behind `dev-logs`.
+/// Writes a temporary developer error at `ERROR` level on the `engine::dev`
+/// lane. Only available with the `dev-logs` feature.
 #[cfg(feature = "dev-logs")]
 #[macro_export]
 macro_rules! dev_error {
@@ -155,7 +169,8 @@ macro_rules! dev_error {
     };
 }
 
-/// Compile-time no-op of [`dev_error!`] when the `dev-logs` feature is disabled.
+/// The version of [`dev_error!`] used when the `dev-logs` feature is off. It
+/// expands to nothing.
 #[cfg(not(feature = "dev-logs"))]
 #[macro_export]
 macro_rules! dev_error {

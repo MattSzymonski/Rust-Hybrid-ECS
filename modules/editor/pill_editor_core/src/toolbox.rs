@@ -1,27 +1,33 @@
-//! The floating viewport toolbox: its rows, geometry and the
-//! commands a click on a row queues.
+//! The floating viewport toolbox: its rows, its geometry and the commands a
+//! click on a row queues.
 //!
 //! # Responsibilities
 //!
 //! - Name the toolbox's rows ([`ToolboxItem`]: the three gizmo tools, the
 //!   space toggle, the snapping toggle and the scene grid's switch) and the
 //!   order the panel stacks them in ([`TOOLBOX_ITEMS`]).
-//! - The vocabulary the rows share with the rest of the editor: the label a
-//!   row shows for the current state ([`ToolboxItem::label`]), its icon
-//!   ([`ToolboxItem::icon`]), whether it reads as active
-//!   ([`ToolboxItem::active`]), its name in the log, and the command a click
-//!   queues ([`ToolboxItem::command`]).
-//! - The panel's geometry: where it defaults to inside a viewport
-//!   ([`default_origin`]), how a drag is clamped inside it
-//!   ([`clamped_origin`]), and the rectangles of the panel, its drag handle
-//!   and each row ([`panel_rect`], [`handle_rect`], [`item_rect`]).
+//! - The row lists the other surfaces share with the panel: the three tools
+//!   ([`TOOL_ROWS`]) and the two spaces with their labels and icons
+//!   ([`SPACE_ROWS`], [`SpaceRow`]), plus the edit builders for one tool and
+//!   one space ([`mode_command`], [`space_command`]).
+//! - The vocabulary a row reads: the label it shows for the current state
+//!   ([`ToolboxItem::label`]), its icon ([`ToolboxItem::icon`]), whether it
+//!   looks active ([`ToolboxItem::active`]), its name in the log
+//!   ([`ToolboxItem::name`]) and the command a click queues
+//!   ([`ToolboxItem::command`]).
+//! - The panel's geometry: where it starts inside a viewport
+//!   ([`default_origin`]), how a drag is kept inside the viewport
+//!   ([`clamped_origin`]), and the rectangles of the panel, its drag handle and
+//!   each row ([`panel_rect`], [`handle_rect`], [`item_rect`]).
 //!
 //! # Design
 //!
-//! Pure functions and plain constants over egui's geometry types: a click's
-//! target, the region a press must not become a scene pick and the drag's
-//! clamp all read the numbers the shell draws. A row queues the same
-//! `SetGizmoTool` edit the shortcuts, the viewport menu and Preferences do.
+//! The file is plain constants and pure functions over egui's geometry types.
+//! Their numbers are the ones the shell draws with, so a row's click target,
+//! the region that must never become a scene pick and the drag's limit all
+//! come from here. A row queues the same edit the shortcuts, the viewport menu
+//! and the Preferences tab queue: `SetGizmoTool` for the tools, the space and
+//! the snapping, and `SetGrid` for the grid.
 
 // External crates
 use egui::{Pos2, Rect, Vec2};
@@ -35,54 +41,63 @@ use crate::icons::Icon;
 // Geometry
 // =============================================================================
 
-/// The panel's width, in logical points: one button across the panel, wide
-/// enough for the longest row's label and the button padding.
+/// The panel's width, in points. It leaves room for one button across the
+/// panel, wide enough for the longest label plus the button's padding.
 pub const TOOLBOX_WIDTH: f32 = 128.0;
 
-/// The gap between the panel and the viewport's edges: the default anchor
-/// and the clamp both keep it, so a dragged toolbox never touches the edge.
+/// The gap between the panel and the viewport's edges, in points. The starting
+/// position sits one margin inside the viewport, and on a viewport big enough
+/// to hold the panel the clamp keeps its far sides that same margin in.
 pub const TOOLBOX_MARGIN: f32 = 10.0;
 
-/// The drag handle's height: the panel's full-width top strip.
+/// The height of the drag handle, in points: the full-width strip along the
+/// panel's top edge.
 pub const TOOLBOX_HANDLE_HEIGHT: f32 = 18.0;
 
-/// The gap between the handle and the first row, and between two rows.
+/// The gap, in points, between the handle and the first row, and between two
+/// rows.
 pub const TOOLBOX_ITEM_GAP: f32 = 3.0;
 
-/// One row's height: a stock button's height, so the rows read as one column
-/// of ordinary buttons.
+/// The height of one row, in points. Each row is an ordinary button drawn at
+/// exactly this height, so the rows read as one column of buttons.
 pub const TOOLBOX_ITEM_HEIGHT: f32 = 24.0;
 
-/// The inset between a row and the panel's sides, and below the last row.
+/// The inset, in points, between a row and the panel's sides, and between the
+/// last row and the panel's bottom edge.
 pub const TOOLBOX_PADDING: f32 = 6.0;
 
-/// The panel's size: the handle, then every row, with the bottom padding.
+/// Returns the panel's size in points: the handle, the gap below it, one row
+/// per item with a gap between rows, and the bottom inset.
 pub fn panel_size() -> Vec2 {
-    let rows = TOOLBOX_ITEMS.len() as f32;
+    let row_count = TOOLBOX_ITEMS.len() as f32;
     Vec2::new(
         TOOLBOX_WIDTH,
         TOOLBOX_HANDLE_HEIGHT
             + TOOLBOX_ITEM_GAP
-            + rows * TOOLBOX_ITEM_HEIGHT
-            + (rows - 1.0) * TOOLBOX_ITEM_GAP
+            + row_count * TOOLBOX_ITEM_HEIGHT
+            + (row_count - 1.0) * TOOLBOX_ITEM_GAP
             + TOOLBOX_PADDING,
     )
 }
 
-/// The panel's rectangle for one top-left origin.
+/// Returns the panel's rectangle when its top-left corner sits at `origin`.
 pub fn panel_rect(origin: Pos2) -> Rect {
     Rect::from_min_size(origin, panel_size())
 }
 
-/// The drag handle's rectangle: the panel's top strip, the one part of the
-/// panel a press drags instead of clicking.
+/// Returns the drag handle's rectangle: the panel's top strip. It is the one
+/// part of the panel where a press starts a drag instead of a click.
 pub fn handle_rect(origin: Pos2) -> Rect {
     Rect::from_min_size(origin, Vec2::new(TOOLBOX_WIDTH, TOOLBOX_HANDLE_HEIGHT))
 }
 
-/// One row's rectangle inside the panel.
+/// Returns one row's rectangle inside the panel.
+///
+/// A row that [`TOOLBOX_ITEMS`] does not list takes the first row's place.
+/// Every [`ToolboxItem`] variant is listed, so that only keeps the function
+/// total.
 pub fn item_rect(item: ToolboxItem, origin: Pos2) -> Rect {
-    let index = TOOLBOX_ITEMS
+    let row_index = TOOLBOX_ITEMS
         .iter()
         .position(|candidate| *candidate == item)
         .unwrap_or(0) as f32;
@@ -92,14 +107,14 @@ pub fn item_rect(item: ToolboxItem, origin: Pos2) -> Rect {
             origin.y
                 + TOOLBOX_HANDLE_HEIGHT
                 + TOOLBOX_ITEM_GAP
-                + index * (TOOLBOX_ITEM_HEIGHT + TOOLBOX_ITEM_GAP),
+                + row_index * (TOOLBOX_ITEM_HEIGHT + TOOLBOX_ITEM_GAP),
         ),
         Vec2::new(TOOLBOX_WIDTH - 2.0 * TOOLBOX_PADDING, TOOLBOX_ITEM_HEIGHT),
     )
 }
 
-/// Where a toolbox parks before it is dragged: the viewport's top-left
-/// corner, one margin in.
+/// Returns where the panel starts before it is dragged: one margin in from the
+/// viewport's top-left corner.
 pub fn default_origin(viewport: Rect) -> Pos2 {
     Pos2::new(
         viewport.left() + TOOLBOX_MARGIN,
@@ -107,21 +122,22 @@ pub fn default_origin(viewport: Rect) -> Pos2 {
     )
 }
 
-/// A drag's result: the requested origin pulled back inside the viewport.
+/// Returns the origin a drag may use: `requested_origin` moved back inside
+/// `viewport`, one margin clear of its edges.
 ///
-/// A viewport smaller than the panel cannot hold it; the clamp then keeps
-/// the panel's top-left corner on screen - the rest may overshoot, which
-/// still leaves the handle and the first rows reachable.
-pub fn clamped_origin(origin: Pos2, viewport: Rect) -> Pos2 {
-    let size = panel_size();
-    let minimum = default_origin(viewport);
-    let maximum = Pos2::new(
-        (viewport.right() - size.x - TOOLBOX_MARGIN).max(minimum.x),
-        (viewport.bottom() - size.y - TOOLBOX_MARGIN).max(minimum.y),
+/// A viewport smaller than the panel cannot hold it. The clamp then pins the
+/// panel's top-left corner at its starting position, so the right or bottom
+/// part may stick out; the handle and the first rows stay reachable.
+pub fn clamped_origin(requested_origin: Pos2, viewport: Rect) -> Pos2 {
+    let panel_dimensions = panel_size();
+    let minimum_origin = default_origin(viewport);
+    let maximum_origin = Pos2::new(
+        (viewport.right() - panel_dimensions.x - TOOLBOX_MARGIN).max(minimum_origin.x),
+        (viewport.bottom() - panel_dimensions.y - TOOLBOX_MARGIN).max(minimum_origin.y),
     );
     Pos2::new(
-        origin.x.clamp(minimum.x, maximum.x),
-        origin.y.clamp(minimum.y, maximum.y),
+        requested_origin.x.clamp(minimum_origin.x, maximum_origin.x),
+        requested_origin.y.clamp(minimum_origin.y, maximum_origin.y),
     )
 }
 
@@ -129,8 +145,9 @@ pub fn clamped_origin(origin: Pos2, viewport: Rect) -> Pos2 {
 // Rows
 // =============================================================================
 
-/// The state the toolbox's rows read and write through their commands: the
-/// gizmo's settings and the scene grid's switch.
+/// What the toolbox's rows show: the gizmo's settings and the scene grid's
+/// switch. A row reads this, and the command a click queues changes it for the
+/// next frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ToolboxState {
     /// The gizmo's mode, space and snapping.
@@ -142,18 +159,18 @@ pub struct ToolboxState {
 /// One row of the floating toolbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolboxItem {
-    /// Select the translate tool.
+    /// The translate tool's row.
     Translate,
-    /// Select the rotate tool.
+    /// The rotate tool's row.
     Rotate,
-    /// Select the scale tool.
+    /// The scale tool's row.
     Scale,
-    /// Toggle the gizmo's space between world and local; the label carries
-    /// the space it is currently in.
+    /// The space toggle's row: switches the gizmo between world and local
+    /// space. The label names the space the gizmo is in.
     Space,
-    /// Toggle the gizmo's snapping.
+    /// The snapping toggle's row.
     Snap,
-    /// Toggle the scene grid under the viewport.
+    /// The scene grid's switch row.
     Grid,
 }
 
@@ -167,33 +184,34 @@ pub const TOOLBOX_ITEMS: [ToolboxItem; 6] = [
     ToolboxItem::Grid,
 ];
 
-/// The three tools, in the order every surface lists them: the viewport menu
-/// and the Preferences row draw these rows, so a new tool is one row here.
+/// The three tools in the order the viewport menu and the Preferences tab
+/// list them. Both surfaces draw their rows from this list, so a new tool is
+/// one row here.
 pub const TOOL_ROWS: [ToolboxItem; 3] = [
     ToolboxItem::Translate,
     ToolboxItem::Rotate,
     ToolboxItem::Scale,
 ];
 
-/// One gizmo space as the surfaces that list both spaces draw it: the value,
-/// the longer label the viewport menu shows, the short one the Preferences row
-/// shows, and the icon both carry.
+/// One gizmo space as the viewport menu and the Preferences tab draw it: the
+/// value it selects, the long label the menu shows, the short one the
+/// Preferences row shows, and the icon both use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpaceRow {
     /// The space this row selects.
     pub space: GizmoSpace,
-    /// The label the viewport menu shows.
+    /// The long label the viewport menu shows.
     pub menu: &'static str,
-    /// The label a narrow row shows.
+    /// The short label the Preferences tab shows.
     pub short: &'static str,
     /// The row's icon.
     pub icon: Icon,
 }
 
-/// Both spaces, in the order every surface lists them. The toolbox's own space
-/// row toggles between the two and takes its label and icon from
-/// [`ToolboxItem::label`] and [`ToolboxItem::icon`], which read the same two
-/// values.
+/// Both spaces, in the order the viewport menu and the Preferences tab list
+/// them. The panel's own space row switches between the two spaces, and its
+/// label and icon come from [`ToolboxItem::label`] and [`ToolboxItem::icon`],
+/// which repeat the short labels and icons below.
 pub const SPACE_ROWS: [SpaceRow; 2] = [
     SpaceRow {
         space: GizmoSpace::World,
@@ -210,7 +228,8 @@ pub const SPACE_ROWS: [SpaceRow; 2] = [
 ];
 
 impl ToolboxItem {
-    /// The row's name in the log and the scripted channel's assertions.
+    /// Returns the row's name in the log: the shell writes it with each row
+    /// (`item="translate"`), and the editor's test suite finds a row by it.
     pub fn name(self) -> &'static str {
         match self {
             ToolboxItem::Translate => "translate",
@@ -222,9 +241,8 @@ impl ToolboxItem {
         }
     }
 
-    /// The row's icon: the tools' own marks, the globe or the map pin for
-    /// the space the gizmo is in, and the magnet and grid marks for the
-    /// toggles.
+    /// Returns the row's icon: the tool's own mark, a globe or a map pin for
+    /// the space the gizmo is in, and a magnet or a grid for the two toggles.
     pub fn icon(self, state: &ToolboxState) -> Icon {
         match self {
             ToolboxItem::Translate => Icon::ArrowsOutCardinal,
@@ -239,9 +257,9 @@ impl ToolboxItem {
         }
     }
 
-    /// The row's label for the current state: the tools and the two plain
-    /// toggles carry a fixed label, while the space row names the space the
-    /// gizmo is in.
+    /// Returns the label the row shows for the current state: a fixed word for
+    /// the tools and the two toggles, and the space the gizmo is in for the
+    /// space row.
     pub fn label(self, state: &ToolboxState) -> &'static str {
         match self {
             ToolboxItem::Translate => "Translate",
@@ -256,8 +274,8 @@ impl ToolboxItem {
         }
     }
 
-    /// Whether the row reads as active: the selected tool, and each toggle
-    /// in its non-default state (local space, snapping on, grid on).
+    /// Returns whether the row looks active: the selected tool, and each
+    /// toggle in its non-default state (local space, snapping on, grid on).
     pub fn active(self, state: &ToolboxState) -> bool {
         match self {
             ToolboxItem::Translate => state.gizmo.mode == GizmoMode::Translate,
@@ -269,9 +287,10 @@ impl ToolboxItem {
         }
     }
 
-    /// The longer label the viewport menu shows. The tools and the two toggles
-    /// read as a menu item; the space row's menu lists the two spaces instead
-    /// of this toggle, so it answers the toggle's own name.
+    /// Returns the label the scene viewport's menu shows: "Snapping" where the
+    /// panel says "Snap", and the panel's word for the other rows. The menu
+    /// lists the two spaces as rows of their own, so the space toggle only
+    /// needs its own name here.
     pub fn menu_label(self) -> &'static str {
         match self {
             ToolboxItem::Translate => "Translate",
@@ -283,8 +302,9 @@ impl ToolboxItem {
         }
     }
 
-    /// The command a click queues: the tool rows select, the toggles flip
-    /// the state they show.
+    /// Returns the command a click queues: a tool row selects that tool, the
+    /// space row switches to the other space, and the snapping and grid rows
+    /// flip their switch.
     pub fn command(self, state: &ToolboxState) -> EditorCommand {
         match self {
             ToolboxItem::Translate => EditorCommand::SetGizmoTool {
@@ -322,8 +342,12 @@ impl ToolboxItem {
     }
 }
 
-/// The edit that selects one tool: the command the toolbox's row, the viewport
-/// menu's row and the Preferences row all queue.
+// =============================================================================
+// Commands
+// =============================================================================
+
+/// Builds the edit that selects one tool: `SetGizmoTool` with the mode set and
+/// the space and snapping left unchanged. The tool rows queue the same edit.
 pub fn mode_command(mode: GizmoMode) -> EditorCommand {
     EditorCommand::SetGizmoTool {
         mode: Some(mode),
@@ -332,7 +356,8 @@ pub fn mode_command(mode: GizmoMode) -> EditorCommand {
     }
 }
 
-/// The edit that switches the gizmo to one space.
+/// Builds the edit that switches the gizmo to one space: `SetGizmoTool` with
+/// the space set and the mode and snapping left unchanged.
 pub fn space_command(space: GizmoSpace) -> EditorCommand {
     EditorCommand::SetGizmoTool {
         mode: None,
@@ -350,8 +375,8 @@ mod tests {
     use super::*;
     use egui::vec2;
 
-    /// A viewport away from the screen's corner, so a clamp bug that falls
-    /// back to zero shows.
+    /// A viewport that does not start at the screen's corner, so a clamp that
+    /// fell back to zero would fail the tests below.
     fn viewport() -> Rect {
         Rect::from_min_size(Pos2::new(100.0, 50.0), vec2(800.0, 600.0))
     }
@@ -373,7 +398,7 @@ mod tests {
             assert_eq!(rect.width(), TOOLBOX_WIDTH - 2.0 * TOOLBOX_PADDING);
             previous_bottom = rect.bottom() + TOOLBOX_ITEM_GAP;
         }
-        // The rows end exactly where the panel's bottom padding begins.
+        // The last row ends exactly where the bottom inset begins.
         let last = item_rect(ToolboxItem::Grid, origin);
         assert_eq!(panel.bottom(), last.bottom() + TOOLBOX_PADDING);
     }
@@ -385,21 +410,21 @@ mod tests {
 
     #[test]
     fn a_drag_clamps_inside_the_viewport() {
-        let view = viewport();
-        let size = panel_size();
-        let far = clamped_origin(Pos2::new(5000.0, 5000.0), view);
+        let viewport_rect = viewport();
+        let panel_dimensions = panel_size();
+        let far_origin = clamped_origin(Pos2::new(5000.0, 5000.0), viewport_rect);
         assert_eq!(
-            far,
+            far_origin,
             Pos2::new(
-                view.right() - size.x - TOOLBOX_MARGIN,
-                view.bottom() - size.y - TOOLBOX_MARGIN
+                viewport_rect.right() - panel_dimensions.x - TOOLBOX_MARGIN,
+                viewport_rect.bottom() - panel_dimensions.y - TOOLBOX_MARGIN
             )
         );
-        let negative = clamped_origin(Pos2::new(-200.0, -200.0), view);
-        assert_eq!(negative, default_origin(view));
+        let negative_origin = clamped_origin(Pos2::new(-200.0, -200.0), viewport_rect);
+        assert_eq!(negative_origin, default_origin(viewport_rect));
         // A point already inside the bounds is left alone.
         let inside = Pos2::new(300.0, 200.0);
-        assert_eq!(clamped_origin(inside, view), inside);
+        assert_eq!(clamped_origin(inside, viewport_rect), inside);
     }
 
     #[test]
@@ -420,7 +445,7 @@ mod tests {
         assert_eq!(ToolboxItem::Grid.label(&state), "Grid");
     }
 
-    /// Each row names its own icon; the space row's follows the space the
+    /// Every row has its own icon; the space row's follows the space the
     /// gizmo is in.
     #[test]
     fn icons_belong_to_their_rows() {
@@ -437,7 +462,7 @@ mod tests {
 
     #[test]
     fn active_follows_the_settings() {
-        let mut settings = ToolboxState {
+        let mut state = ToolboxState {
             gizmo: GizmoSettings {
                 mode: GizmoMode::Scale,
                 space: GizmoSpace::Local,
@@ -446,25 +471,25 @@ mod tests {
             },
             grid: true,
         };
-        assert!(ToolboxItem::Scale.active(&settings));
-        assert!(ToolboxItem::Space.active(&settings));
-        assert!(ToolboxItem::Snap.active(&settings));
-        assert!(ToolboxItem::Grid.active(&settings));
-        assert!(!ToolboxItem::Translate.active(&settings));
-        settings.grid = false;
-        settings.gizmo = GizmoSettings::default();
-        assert!(ToolboxItem::Translate.active(&settings));
-        assert!(!ToolboxItem::Rotate.active(&settings));
-        assert!(!ToolboxItem::Space.active(&settings));
-        assert!(!ToolboxItem::Snap.active(&settings));
-        assert!(!ToolboxItem::Grid.active(&settings));
+        assert!(ToolboxItem::Scale.active(&state));
+        assert!(ToolboxItem::Space.active(&state));
+        assert!(ToolboxItem::Snap.active(&state));
+        assert!(ToolboxItem::Grid.active(&state));
+        assert!(!ToolboxItem::Translate.active(&state));
+        state.grid = false;
+        state.gizmo = GizmoSettings::default();
+        assert!(ToolboxItem::Translate.active(&state));
+        assert!(!ToolboxItem::Rotate.active(&state));
+        assert!(!ToolboxItem::Space.active(&state));
+        assert!(!ToolboxItem::Snap.active(&state));
+        assert!(!ToolboxItem::Grid.active(&state));
     }
 
     #[test]
     fn a_click_queues_the_edit_that_belongs_to_the_row() {
-        let settings = ToolboxState::default();
+        let state = ToolboxState::default();
         assert_eq!(
-            ToolboxItem::Rotate.command(&settings),
+            ToolboxItem::Rotate.command(&state),
             EditorCommand::SetGizmoTool {
                 mode: Some(GizmoMode::Rotate),
                 space: None,
@@ -472,7 +497,7 @@ mod tests {
             }
         );
         assert_eq!(
-            ToolboxItem::Space.command(&settings),
+            ToolboxItem::Space.command(&state),
             EditorCommand::SetGizmoTool {
                 mode: None,
                 space: Some(GizmoSpace::Local),
@@ -480,7 +505,7 @@ mod tests {
             }
         );
         assert_eq!(
-            ToolboxItem::Snap.command(&settings),
+            ToolboxItem::Snap.command(&state),
             EditorCommand::SetGizmoTool {
                 mode: None,
                 space: None,
@@ -488,15 +513,15 @@ mod tests {
             }
         );
         assert_eq!(
-            ToolboxItem::Grid.command(&settings),
+            ToolboxItem::Grid.command(&state),
             EditorCommand::SetGrid { enabled: true }
         );
-        // The toggles flip from the state they show.
+        // Each toggle queues the opposite of the state it shows.
         let flipped = ToolboxState {
             gizmo: GizmoSettings {
                 space: GizmoSpace::Local,
                 snap: true,
-                ..settings.gizmo
+                ..state.gizmo
             },
             grid: true,
         };
@@ -522,9 +547,10 @@ mod tests {
         );
     }
 
-    /// The rows the menu and the Preferences tab draw are the panel's own rows,
-    /// in the panel's order, and the spaces they list are the ones the panel's
-    /// toggle names: one vocabulary, not three that agree by hand.
+    /// The viewport menu and the Preferences tab draw the panel's own rows, in
+    /// the panel's order, and the spaces they list are the ones the panel's
+    /// space toggle names. One list per thing serves all three surfaces, and
+    /// this test keeps them from drifting apart.
     #[test]
     fn the_menu_rows_are_the_panels_rows() {
         assert_eq!(TOOL_ROWS.as_slice(), &TOOLBOX_ITEMS[..3]);

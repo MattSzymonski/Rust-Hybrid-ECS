@@ -1,21 +1,35 @@
-//! Build diagnostics: the problems the Problems panel shows.
+//! Build diagnostics: the problem rows the editor's Problems tab shows.
 //!
 //! # Responsibilities
 //!
-//! - Parse a build's output text into structured problems: severity, message
-//!   and the first `file:line:column` a compiler printed for it.
-//! - Keep the parser dependency-free and total: malformed or unfamiliar output
-//!   yields fewer problems, never an error.
+//! - Turn a build's output text into structured problems: the severity, the
+//!   message and the first `file:line:column` the compiler printed for it.
+//! - Stay dependency-free and total: malformed or unfamiliar output gives
+//!   fewer problems, never an error.
 //!
 //! # Contract
 //!
-//! The input is rustc's human-readable output, one diagnostic per block: both
+//! The input is rustc's human-readable output, one diagnostic per block. Both
 //! one-line (`error: message`) and code-carrying (`error[E0425]: message`)
-//! headers are recognised, at any leading indentation, and the location is the
-//! first `-->` span line within the following [`SPAN_LOOKAHEAD`] lines. A
-//! coloured header matches nothing, so coloured output yields no problems.
-//! Lines like `error: could not compile \`crate\`` are summaries of problems
-//! reported above them, so they are dropped.
+//! headers are recognised, at any indentation.
+//!
+//! The location is the first `-->` span line within the next
+//! [`SPAN_LOOKAHEAD`] lines, and a blank line ends the search. A coloured
+//! header matches nothing, so coloured output gives no problems. Lines like
+//! `error: could not compile \`crate\`` summarise the problems above them, so
+//! they are dropped.
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// How many lines after a header the parser looks for the span line that
+/// gives the location.
+const SPAN_LOOKAHEAD: usize = 6;
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// How serious one problem is.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,12 +38,13 @@ pub enum Severity {
     Error,
     /// A compiler warning: the build finished anyway.
     Warning,
-    /// A note attached to a problem (rare in the top-level form).
+    /// A note the compiler printed as its own `note:` line.
     Note,
 }
 
 impl Severity {
-    /// The wire name the panel's rows and the suites use.
+    /// The name the problems rows show, and the `severity=` value of the
+    /// `[test] problem row` lines.
     pub fn name(self) -> &'static str {
         match self {
             Severity::Error => "error",
@@ -54,18 +69,20 @@ pub struct Problem {
     pub column: Option<u32>,
 }
 
-/// How many lines after a header the span line may sit.
-const SPAN_LOOKAHEAD: usize = 6;
+// =============================================================================
+// Free Functions
+// =============================================================================
 
-/// Parse `output` into problems, in the order the compiler reported them.
+/// Parses `output` into problems, in the order the compiler reported them.
 ///
-/// A header whose first span line cannot be found (or is malformed) still
-/// yields a problem, with no location: the panel can show the message even
-/// when the link has nowhere to go.
+/// A header whose first span line cannot be found, or is malformed, still
+/// gives a problem, with no location. The row can still show the message;
+/// clicking it just cannot open a file.
 pub fn parse_build_output(output: &str) -> Vec<Problem> {
     let lines: Vec<&str> = output.lines().collect();
     let mut problems = Vec::new();
     let mut index = 0;
+    // Step 1: Take one problem per header line, in the order they appear.
     while index < lines.len() {
         let Some((severity, message)) = parse_header(lines[index]) else {
             index += 1;
@@ -83,13 +100,13 @@ pub fn parse_build_output(output: &str) -> Vec<Problem> {
             line: None,
             column: None,
         };
-        // Step 1: the first span within the lookahead window names the
-        // location; anything past a blank line belongs to the next entry.
-        for span in lines.iter().skip(index + 1).take(SPAN_LOOKAHEAD) {
-            if span.trim().is_empty() {
+        // Step 2: The first span line within the lookahead window names the
+        // location. A blank line means the next diagnostic has started.
+        for span_line in lines.iter().skip(index + 1).take(SPAN_LOOKAHEAD) {
+            if span_line.trim().is_empty() {
                 break;
             }
-            if let Some((file, line, column)) = parse_span(span) {
+            if let Some((file, line, column)) = parse_span(span_line) {
                 problem.file = Some(file);
                 problem.line = Some(line);
                 problem.column = Some(column);
@@ -102,9 +119,10 @@ pub fn parse_build_output(output: &str) -> Vec<Problem> {
     problems
 }
 
-/// The severity and message of a rustc header line, when it is one.
+/// Returns the severity and the message of a rustc header line, or `None`
+/// when the line is not one.
 ///
-/// Cargo's status lines (`Compiling ...`, `Finished ...`) do not start with a
+/// Cargo's status lines (`Compiling ...`, `Finished ...`) do not begin with a
 /// severity word, so they never match.
 fn parse_header(line: &str) -> Option<(Severity, String)> {
     let text = line.trim_start();
@@ -117,19 +135,19 @@ fn parse_header(line: &str) -> Option<(Severity, String)> {
     } else {
         return None;
     };
-    // `error[E0425]: msg` carries a bracketed code before the colon;
-    // `error: msg` is the bare form. Anything else (`error_span`, `errors`) is
-    // not a header.
+    // `error[E0425]: msg` carries a bracketed code before the colon, and
+    // `error: msg` carries none. A tail that fits neither form
+    // (`error_span`, `errors`) is not a header.
     let rest = if let Some(rest) = rest.strip_prefix('[') {
-        let code_end = rest.find(']')?;
-        let code = &rest[..code_end];
+        let code_end_index = rest.find(']')?;
+        let code = &rest[..code_end_index];
         if code.is_empty() || !code.chars().next()?.is_ascii_uppercase() {
             return None;
         }
-        if !rest[code_end + 1..].starts_with(':') {
+        if !rest[code_end_index + 1..].starts_with(':') {
             return None;
         }
-        &rest[code_end + 1..]
+        &rest[code_end_index + 1..]
     } else {
         rest
     };
@@ -140,18 +158,19 @@ fn parse_header(line: &str) -> Option<(Severity, String)> {
     Some((severity, message.to_string()))
 }
 
-/// The `file`, `line` and `column` of a rustc span line (`  --> src/x.rs:12:5`).
+/// Returns the `file`, `line` and `column` of a rustc span line
+/// (`  --> src/x.rs:12:5`), or `None` when the line is not one.
 fn parse_span(line: &str) -> Option<(String, u32, u32)> {
     let text = line.trim_start();
-    let rest = text.strip_prefix("-->")?.trim();
-    // The path may contain colons (a Windows drive), so split from the right:
-    // the location is the last two `:`-separated numeric fields.
-    let (path, rest) = rest.rsplit_once(':')?;
-    let (path, line) = path.rsplit_once(':')?;
-    let line: u32 = line.trim().parse().ok()?;
-    // A span often trails `column` with decoration (`:5` or `:5:6`); the
-    // column is the leading number.
-    let column: u32 = rest
+    let location = text.strip_prefix("-->")?.trim();
+    // A path may contain colons (a Windows drive), so split from the right:
+    // the last two fields are the line number and the column.
+    let (path_and_line, column_text) = location.rsplit_once(':')?;
+    let (path, line_text) = path_and_line.rsplit_once(':')?;
+    let line: u32 = line_text.trim().parse().ok()?;
+    // The last field is the column. Only its leading digits are read, so any
+    // text after them is ignored.
+    let column: u32 = column_text
         .trim()
         .split(|c: char| !c.is_ascii_digit())
         .next()?
@@ -162,6 +181,10 @@ fn parse_span(line: &str) -> Option<(String, u32, u32)> {
     }
     Some((path.to_string(), line, column))
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

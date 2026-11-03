@@ -1,4 +1,4 @@
-//! Versioned dock-layout loading and recoverable writes.
+//! Loading and saving the dock layout, with a schema version.
 //!
 //! # Responsibilities
 //!
@@ -6,6 +6,15 @@
 //!   build cannot read.
 //! - Write without destroying the previous file when a save goes wrong.
 //! - Own [`layout_directory`], where the editor's state files live.
+//!
+//! # Design
+//!
+//! The document is the whole [`EditorDock`] with a schema version field.
+//! Loading upgrades a document the migration list has an entry for and
+//! replaces every other one with the default layout, so a stale or unreadable
+//! file never stops the editor from opening. Writes go through
+//! [`crate::editor_files::write_bytes`], which stages a temporary file and
+//! renames it over the target.
 
 // Standard library
 use std::io;
@@ -19,16 +28,21 @@ use thiserror::Error;
 use super::EditorDock;
 use crate::error::LayoutPersistenceError;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// The schema of the dock-layout document this build writes and accepts.
 ///
-/// Any change to the tab set, or to what the document carries beside the dock
-/// tree, bumps it: `EditorTab` is serialized into the document, and the tab
-/// payloads plus the panel-id and pop-out lists are what a reader has to
-/// understand.
+/// Raise it whenever the tab set changes, or whenever the document carries
+/// something new beside the dock tree: `EditorTab` is written into the
+/// document, so a reader has to understand the tab values, the `panel_ids`
+/// list and the `popouts` list.
 ///
-/// A document `migrate` has a rule for is upgraded in place and stamped; any
-/// other - older than the oldest rule, or newer than this build - is replaced
-/// by the default layout with one log line.
+/// A document that `migrate` has a rule for is upgraded in place and written
+/// back with this version. Any other one - older than the oldest rule, or
+/// newer than this build - is replaced by the default layout, with one log
+/// line.
 pub const LAYOUT_SCHEMA_VERSION: u32 = 13;
 
 /// The application directory inside the per-user state directory.
@@ -37,16 +51,25 @@ const APPLICATION_DIRECTORY: &str = "RustHybridEcs";
 /// The dock document's file name in the layout directory.
 const LAYOUT_FILE: &str = "editor_egui_layout.json";
 
-/// Failures the dock model reports.
+// =============================================================================
+// Types
+// =============================================================================
+
+/// A saved dock document the layout model refuses.
 ///
-/// [`LayoutPersistenceError`] carries this type as its validation source; it
-/// stays here because the shared error surface names it (`editor::layout`).
+/// [`LayoutPersistenceError`] keeps this type as the source of its `Validation`
+/// variant, and that error's namespace is `editor::layout`, so the type lives
+/// here with the layout code.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LayoutError {
-    /// The saved document was written by a newer layout schema.
+    /// The document carries a schema version this build does not write.
     #[error("invalid dock layout: UnsupportedVersion({0})")]
     UnsupportedVersion(u32),
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Load the saved dock, falling back to the default on any invalid document.
 pub fn load_or_default() -> EditorDock {
@@ -56,12 +79,14 @@ pub fn load_or_default() -> EditorDock {
 /// Load the dock document at `path`, falling back to the default on any
 /// document this build cannot read.
 ///
-/// An older document [`migrate`] has a rule for is upgraded and written back
-/// first. The default is the answer for every remaining reason - a missing
-/// file, an unreadable schema, a document that does not parse - so the editor
-/// always opens. A reset is logged once, at info, as `[editor] layout reset`:
-/// a suite tells a reset from a restored layout without reading the reason,
-/// and a person reads the reason.
+/// An older document that [`migrate`] has a rule for is upgraded and written
+/// back before it is returned. Any other document this build cannot use - a
+/// schema it does not know, a file that does not parse - is replaced by the
+/// default layout, so the editor always opens.
+///
+/// A replacement is logged once, at info, as `[editor] layout reset`, with the
+/// reason in its own field: the message is the stable token a suite can match,
+/// and the reason is what a person reads.
 fn load_from_path(path: &Path) -> EditorDock {
     // A missing file is the normal first-run state and stays silent.
     let Ok(contents) = std::fs::read_to_string(path) else {
@@ -70,14 +95,14 @@ fn load_from_path(path: &Path) -> EditorDock {
     match serde_json::from_str::<EditorDock>(&contents) {
         Ok(dock) if dock.is_current() => dock,
         Ok(mut dock) => match migrate(&mut dock) {
-            Some(previous) => {
+            Some(previous_schema_version) => {
                 // A document this build can upgrade in place: keep the layout
-                // the user arranged and write the stamped version back.
+                // the user arranged and write it back with the current version.
                 save(&dock);
                 pill_core::info!(
                     target: pill_core::telemetry::telemetry_target::ENGINE,
                     path = %path.display(),
-                    from = previous,
+                    from = previous_schema_version,
                     to = LAYOUT_SCHEMA_VERSION,
                     "[editor] layout migrated"
                 );
@@ -105,39 +130,40 @@ fn load_from_path(path: &Path) -> EditorDock {
 /// Upgrade an older document in place, returning the version it came from;
 /// `None` when this build has no rule for that version.
 ///
-/// Each chain entry names the newest schema that still lacks a tab, the anchor
-/// it is appended beside and the tab itself. A document several versions old
-/// gets every missing tab in one pass, chained in strip order, and nothing the
-/// user arranged moves.
+/// Each entry in `TAB_ADDITIONS` names the newest schema that still lacks a
+/// tab, the tab the new one is placed beside, and the tab itself. A document
+/// several versions old gets every missing tab in one pass, in tab-strip
+/// order, and no tab the user arranged moves.
 fn migrate(dock: &mut EditorDock) -> Option<u32> {
-    const CHAIN: [(u32, super::EditorTab, super::EditorTab); 3] = [
+    const TAB_ADDITIONS: [(u32, super::EditorTab, super::EditorTab); 3] = [
         (7, super::EditorTab::Assets, super::EditorTab::Console),
         (8, super::EditorTab::Console, super::EditorTab::Problems),
         (9, super::EditorTab::Problems, super::EditorTab::Statistics),
     ];
-    let previous = dock.schema_version();
-    if !(7..LAYOUT_SCHEMA_VERSION).contains(&previous) {
+    let previous_schema_version = dock.schema_version();
+    if !(7..LAYOUT_SCHEMA_VERSION).contains(&previous_schema_version) {
         return None;
     }
-    for (version, anchor, tab) in CHAIN {
-        if previous <= version && !dock.contains(tab) {
+    for (version, anchor, tab) in TAB_ADDITIONS {
+        if previous_schema_version <= version && !dock.contains(tab) {
             append_beside(dock, anchor, tab);
         }
     }
     dock.set_schema_version(LAYOUT_SCHEMA_VERSION);
-    Some(previous)
+    Some(previous_schema_version)
 }
 
-/// Append `tab` to the leaf that holds `anchor`, or to the focused leaf when
-/// the anchor is not docked - an unusual layout keeps the rest of itself.
+/// Append `tab` to the leaf that holds `anchor` (the tab group it is docked
+/// in), or to the focused leaf when the anchor is not docked, so an unusual
+/// layout keeps the rest of its tabs.
 fn append_beside(dock: &mut EditorDock, anchor: super::EditorTab, tab: super::EditorTab) {
-    let leaf = dock
+    let leaf_path = dock
         .state_mut()
         .find_tab(&anchor)
-        .map(|path| path.node_path());
-    match leaf {
-        Some(path) => {
-            if let Ok(node) = dock.state_mut().leaf_mut(path) {
+        .map(|tab_path| tab_path.node_path());
+    match leaf_path {
+        Some(leaf_path) => {
+            if let Ok(node) = dock.state_mut().leaf_mut(leaf_path) {
                 node.append_tab(tab);
             }
         }
@@ -145,7 +171,7 @@ fn append_beside(dock: &mut EditorDock, anchor: super::EditorTab, tab: super::Ed
     }
 }
 
-/// Log one replaced dock document.
+/// Log that the document at `path` was replaced, and the reason it was.
 fn reset_layout(path: &Path, reason: &str) {
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
@@ -155,7 +181,10 @@ fn reset_layout(path: &Path, reason: &str) {
     );
 }
 
-/// Persist `dock`; a failure leaves the previous document untouched.
+/// Save `dock` to the layout directory.
+///
+/// A failed write leaves the previous document untouched and is logged as a
+/// warning, since the caller has nothing to do about it.
 pub fn save(dock: &EditorDock) {
     let path = layout_directory().join(LAYOUT_FILE);
     if let Err(error) = save_to_path(dock, path) {
@@ -167,35 +196,48 @@ pub fn save(dock: &EditorDock) {
     }
 }
 
-/// Serialize and install `dock` at `path`.
+/// Write `dock` as a JSON document at `path`, replacing the file there.
+///
+/// The document is written from [`EditorDock::settled`], which replaces the
+/// infinite placeholder rectangles of a dock that was never laid out with
+/// zeros, since JSON cannot hold them and the next show recomputes them.
+///
+/// # Errors
+///
+/// [`LayoutPersistenceError::Serialization`] when the dock cannot be turned
+/// into JSON, and [`LayoutPersistenceError::Filesystem`] when the directory,
+/// the temporary file or the target cannot be written.
 fn save_to_path(dock: &EditorDock, path: PathBuf) -> Result<(), LayoutPersistenceError> {
-    let document = serde_json::to_vec_pretty(&dock.settled())
+    let document_bytes = serde_json::to_vec_pretty(&dock.settled())
         .map_err(|source| LayoutPersistenceError::Serialization { source })?;
-    crate::editor_files::write_bytes(&path, &document).map_err(|error| match error {
+    crate::editor_files::write_bytes(&path, &document_bytes).map_err(|error| match error {
         crate::editor_files::FileError::Write { path, source } => {
             LayoutPersistenceError::Filesystem { path, source }
         }
-        other => LayoutPersistenceError::Filesystem {
+        other_file_error => LayoutPersistenceError::Filesystem {
             path: path.display().to_string(),
-            source: io::Error::other(other.message()),
+            source: io::Error::other(other_file_error.message()),
         },
     })
 }
 
-/// The directory the editor's layout files live in.
+/// The directory the editor keeps its state files in: the dock layout, the
+/// preferences (which also hold the gizmo settings), the keybindings and the
+/// recovery snapshot.
 pub fn layout_directory() -> PathBuf {
     editor_state_directory().join(APPLICATION_DIRECTORY)
 }
 
-/// The per-user directory editor state belongs in.
+/// The per-user directory that editor state belongs in.
 ///
-/// Windows: `%LOCALAPPDATA%`. Elsewhere: `$XDG_STATE_HOME`, or
-/// `~/.local/state` when it is unset, as the XDG base directory spec says.
-/// The temp directory is the last resort for an environment with neither.
+/// Windows: `%LOCALAPPDATA%`, or the temp directory when it is not set.
+/// Elsewhere: `$XDG_STATE_HOME`, then `~/.local/state` when that is unset (as
+/// the XDG base directory spec says), then the temp directory when `$HOME` is
+/// unset too.
 ///
-/// A browser has no environment and no filesystem; `std::env` panics there,
-/// so the web posture answers a fixed relative directory and every load fails
-/// into the default dock.
+/// A browser has no environment and no filesystem, so this function is
+/// compiled out there. The web posture answers a fixed relative directory, and
+/// every load fails into the default dock.
 #[cfg(not(target_arch = "wasm32"))]
 fn editor_state_directory() -> PathBuf {
     if cfg!(windows) {
@@ -220,27 +262,32 @@ fn editor_state_directory() -> PathBuf {
     PathBuf::from("editor-state")
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::layout::EditorTab;
 
-    /// A layout document in `egui_dock` 0.17's node model: a real v6
-    /// document, not a hand-written sketch.
+    /// A dock-layout document saved by `egui_dock` 0.17, whose node model
+    /// differs from this build's: a real saved file, not a hand-written
+    /// sketch. Its schema is 6, older than the oldest upgrade rule.
     const V6_LAYOUT: &str = include_str!("fixtures/layout_v6.json");
 
     /// A directory of this test's own under the temp directory.
-    fn scratch_directory(name: &str) -> PathBuf {
-        let directory = std::env::temp_dir().join(format!("pill_layout_test_{name}"));
+    fn scratch_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("pill_layout_test_{label}"));
         std::fs::create_dir_all(&directory).expect("the temp directory is writable");
         directory
     }
 
     #[test]
     fn a_stored_v6_document_is_replaced_by_the_default_layout() {
-        // The node models differ. Whether the document cannot be read at all
-        // or parses and then fails the schema check, it must never be mistaken
-        // for this build's own file.
+        // The two node models differ, so the document may fail to parse, or
+        // may parse and then fail the schema check. Either way it must never
+        // be taken for this build's own file.
         if let Ok(dock) = serde_json::from_str::<EditorDock>(V6_LAYOUT) {
             assert_eq!(dock.schema_version(), 6);
             assert!(!dock.is_current());
@@ -278,17 +325,17 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
-    /// Saving twice replaces the document: the rename the shared state-file
-    /// rule relies on is a replace on this platform too, so the writer no
-    /// longer keeps a `.bak` fallback for the opposite belief.
+    /// Saving twice replaces the first document: the shared state-file writer
+    /// renames its temporary file over the target, so no `.bak` file is left
+    /// beside the layout.
     #[test]
     fn a_second_save_replaces_the_first_layout() {
         let directory = scratch_directory("second_save");
         let path = directory.join(LAYOUT_FILE);
         save_to_path(&EditorDock::new(), path.clone()).expect("the first save");
-        let mut moved = EditorDock::new();
-        moved.pop_out(EditorTab::Console);
-        save_to_path(&moved, path.clone()).expect("the second save");
+        let mut popped_out_dock = EditorDock::new();
+        popped_out_dock.pop_out(EditorTab::Console);
+        save_to_path(&popped_out_dock, path.clone()).expect("the second save");
 
         let loaded = load_from_path(&path);
 

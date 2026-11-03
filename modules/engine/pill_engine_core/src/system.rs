@@ -2,39 +2,40 @@
 //!
 //! # Responsibilities
 //!
-//! - Defines the [`SystemParam`] trait that lets function parameters extract
-//!   themselves from the [`World`] (e.g., `Query<T>`, `Commands`, `Res<T>`).
-//! - Provides [`IntoSystem`] to convert plain functions into boxed [`System`]
-//!   trait objects.
-//! - Implements the [`System`] trait for registered functions, enabling the
-//!   engine to call them generically.
+//! - Defines the [`SystemParam`] trait that lets a function's parameters take
+//!   themselves out of the [`World`] (`Query<T>`, `Commands`, `Res<T>`).
+//! - Provides [`IntoSystem`] to turn a plain function into a boxed [`System`].
+//! - Implements [`System`] for the closure each adapted function is boxed
+//!   into, so the engine can call every system the same way.
 //!
 //! # Design
 //!
-//! Four cooperating traits: [`SystemParam`] extracts a system's arguments from
-//! the [`World`] and the [`CommandQueue`] and reports its access pattern to the
-//! scheduler; [`SystemParamFunction`] adapts a `FnMut` taking those parameters
-//! into a runnable form; [`IntoSystem`] boxes that function into a [`System`]
-//! the engine stores and invokes generically; and [`SystemOutput`] normalizes
-//! the return value (`()` or `Result<(), SystemError>`).
+//! Four traits work together. [`SystemParam`] takes a system's arguments out of
+//! the [`World`] and the [`CommandQueue`], and reports what they access to the
+//! scheduler. [`SystemParamFunction`] adapts a `FnMut` that takes those
+//! arguments into something callable. [`IntoSystem`] boxes that function into a
+//! [`System`] the engine can store and call. [`SystemOutput`] turns the
+//! function's return value (`()` or `Result<(), SystemError>`) into one shared
+//! result type.
 //!
 //! # Safety
 //!
-//! [`SystemParam::fetch`] returns a value that is `'static` to the compiler
-//! while it borrows from the world and the command queue. Rust cannot express
-//! "this reference lives exactly as long as this call" without GATs, so the
-//! transmutation is deliberate; it is sound only while the parameter does not
+//! [`SystemParam::fetch`] returns a value the compiler treats as `'static`,
+//! even though it borrows from the world and the command queue. A system's
+//! parameter type is fixed when the system is registered, so it cannot name the
+//! lifetime of the borrow it gets when it is called. The transmutation that
+//! hides this is deliberate, and it is sound only while the parameter does not
 //! outlive the system call:
 //!
-//! 1. A system parameter must not be stored - no static or global state, and
+//! 1. A system parameter must not be stored: no static or global state, and
 //!    nothing the system call outlives.
 //! 2. It must not escape through a closure that outlives the system: a
 //!    background thread, an async task, a callback registered for later.
 //! 3. It must not be returned.
 //!
 //! The engine's runner (`IntoSystem::into_system` / `into_hot_system`) is the
-//! one audited caller; a safe call from anywhere else is what the signature
-//! refuses. Violating these invariants is undefined behavior.
+//! one audited caller, and the signature refuses a safe call from anywhere
+//! else. Breaking these rules is undefined behavior.
 //!
 //! ```no_run
 //! # use pill_engine::*;
@@ -61,27 +62,49 @@ use crate::world::World;
 // System
 // =============================================================================
 
-/// Trait for systems the engine can execute.
+/// A function the engine can run as a system.
 ///
-/// Systems are functions that operate on World data. They are executed
-/// every frame and can read/write components, create entities, etc.
+/// A system works on `World` data. It runs every frame and can read and write
+/// components, create entities, and more.
 ///
-/// A system reports its own failure through [`Result::Err`]; the engine
-/// records it and continues with the remaining systems.
+/// A system reports a failure through [`Result::Err`]. The engine records the
+/// failure and carries on with the other systems.
 ///
-/// Must be Send to support parallel execution.
+/// Systems must be `Send`, so the scheduler can run them on several threads.
 pub trait System: Send {
-    /// Executes one system invocation, returning its failure when it aborted.
+    /// Runs the system once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`SystemError`] that ended the call: the one the system
+    /// returned, or the one the engine built from a panic in a patched body.
     fn run(&mut self, world: &mut World, queue: &mut CommandQueue) -> Result<(), SystemError>;
 }
 
-/// Accepted return types of a system function.
+/// Implements [`System`] for any `FnMut` closure with the right signature.
 ///
-/// Systems may return `()` when they cannot fail or `Result<(), SystemError>`
-/// when they can. The engine converts both into the uniform result type used
-/// by the execution loops.
+/// This is the form a registered system takes: the engine's registration
+/// entry stores the boxed closure and calls it like any other [`System`].
+impl<F, Output> System for F
+where
+    F: FnMut(&mut World, &mut CommandQueue) -> Output + Send,
+    Output: SystemOutput,
+{
+    fn run(&mut self, world: &mut World, queue: &mut CommandQueue) -> Result<(), SystemError> {
+        self(world, queue).into_system_result()
+    }
+}
+
+// =============================================================================
+// SystemOutput
+// =============================================================================
+
+/// A value a system function can return.
+///
+/// A system returns `()` when it cannot fail, or `Result<(), SystemError>` when
+/// it can. The engine turns either one into the same result type.
 pub trait SystemOutput: 'static {
-    /// Converts one system return value into the uniform result type.
+    /// Turns this return value into the result type the engine runs on.
     fn into_system_result(self) -> Result<(), SystemError>;
 }
 
@@ -97,50 +120,36 @@ impl SystemOutput for Result<(), SystemError> {
     }
 }
 
-/// Implements [`System`] for any `FnMut` closure with the right signature.
-///
-/// This is what lets a registered system be stored as one `RegisteredSystem`
-/// in the engine's registration vector.
-impl<F, Output> System for F
-where
-    F: FnMut(&mut World, &mut CommandQueue) -> Output + Send,
-    Output: SystemOutput,
-{
-    fn run(&mut self, world: &mut World, queue: &mut CommandQueue) -> Result<(), SystemError> {
-        self(world, queue).into_system_result()
-    }
-}
-
 // =============================================================================
 // SystemParam
 // =============================================================================
 
-/// SystemParam trait - any type that can be extracted as a system parameter
+/// A type that can be used as a parameter of a system function.
 ///
-/// This is the core of the flexible system architecture. Types that implement
-/// SystemParam can be used as function parameters in systems.
+/// This trait is what makes system signatures flexible: any type that
+/// implements it can appear in the parameter list of a system.
 ///
 /// # Safety
 ///
-/// Implementations use lifetime transmutation internally. See the module-level
-/// docs for the invariants that must hold.
+/// Implementations change lifetimes with a transmutation. The module-level
+/// docs list the rules that keep this sound.
 ///
-/// The returned parameter must not escape the system function scope.
+/// A parameter must not escape the system function that received it.
 pub trait SystemParam: Sized {
-    /// Fetches the parameter from world state.
+    /// Takes this parameter out of the world and the command queue.
     ///
     /// # Safety
     ///
-    /// The returned value has a `'static` lifetime marker but actually borrows
-    /// from `world` and `queue`. Callers must ensure:
+    /// The returned value is marked `'static`, but it really borrows from
+    /// `world` and `queue`. The caller must make sure that:
     ///
-    /// 1. The returned value is dropped before the system function returns
-    /// 2. The returned value is not stored in static/global state
-    /// 3. The returned value is not moved into background threads or async tasks
+    /// 1. the value is dropped before the system function returns,
+    /// 2. it is never stored in static or global state, and
+    /// 3. it is never moved onto a background thread or into an async task.
     ///
-    /// Violating these invariants is undefined behavior. The engine's runner
-    /// (`IntoSystem::into_system` / `into_hot_system`) is the one audited
-    /// caller; a safe call from anywhere else is what this signature refuses:
+    /// Breaking these rules is undefined behavior. The engine's runner
+    /// (`IntoSystem::into_system` / `into_hot_system`) is the one caller that
+    /// upholds them, and the signature refuses a safe call from anywhere else:
     ///
     /// ```compile_fail
     /// use pill_engine::system::SystemParam;
@@ -154,59 +163,62 @@ pub trait SystemParam: Sized {
     /// ```
     unsafe fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self;
 
-    /// Reports the component access pattern for dependency analysis.
+    /// Records which components and resources this parameter reads and writes.
     ///
-    /// Called during system registration to build the execution graph. The
-    /// default implementation reports no access (for things like `State`).
+    /// The engine calls this while registering a system, to build the graph
+    /// that decides which systems may run at the same time. The default
+    /// implementation records nothing, which suits a parameter that touches
+    /// neither components nor resources.
     fn report_access(_access: &mut SystemAccess) {
-        // Default: no component access
+        // The default records no access.
     }
 }
 
-/// Commands is a SystemParam - provides deferred entity operations
+/// Lets a system queue entity changes that apply after it returns.
 impl SystemParam for Commands<'static> {
     unsafe fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self {
-        // CRITICAL RISK
-        // SAFETY: Lifetime transmutation from actual borrow to 'static.
+        // SAFETY: The lifetime of the borrow is transmuted to `'static`.
         //
-        // This is sound IFF the caller upholds the SystemParam safety contract:
-        // - The Commands<'static> must not escape the system function
-        // - The Commands<'static> must not be stored in global/static state
-        // - The Commands<'static> must be dropped before system returns
+        // This is sound only if the caller keeps the SystemParam contract:
+        // - the `Commands<'static>` must not escape the system function,
+        // - it must not be stored in global or static state, and
+        // - it must be dropped before the system returns.
         //
-        // The Engine's system execution infrastructure ensures these invariants
-        // by calling systems as opaque functions that cannot return the parameter.
+        // The engine's system runner calls systems as opaque functions that
+        // cannot return their parameters, so it keeps these rules.
         //
-        // Undefined behavior if Commands escapes (e.g., stored in static variable,
-        // moved to another thread, or captured in an escaping closure).
+        // It is undefined behavior if `Commands` escapes: stored in a static,
+        // moved to another thread, or captured by a closure that outlives the
+        // call.
         unsafe { std::mem::transmute(Commands::new(queue, world)) }
     }
 
     fn report_access(access: &mut SystemAccess) {
-        // Commands can create/destroy entities and add/remove components
-        // This requires exclusive World access
+        // Commands can create and destroy entities and add or remove
+        // components, so the system needs exclusive access to the world.
         access.set_uses_commands(true);
     }
 }
 
-/// Generic Query is a SystemParam - works for ANY WorldQuery type
+/// Lets a system take any query as a parameter.
 ///
-/// This implementation allows any query pattern to be used as a system parameter
-/// without needing separate implementations for each query type.
+/// One implementation covers every query pattern, so a new query type needs no
+/// separate implementation of this trait.
 impl<Q: QueryTarget + 'static, F: QueryFilter + 'static> SystemParam for Query<'static, Q, F> {
     unsafe fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
-        // SAFETY: Lifetime transmutation from actual borrow to 'static.
+        // SAFETY: The lifetime of the borrow is transmuted to `'static`.
         //
-        // This is sound IFF the caller upholds the SystemParam safety contract:
-        // - The Query<'static, Q, F> must not escape the system function
-        // - The Query<'static, Q, F> must not be stored in global/static state
-        // - The Query<'static, Q, F> must be dropped before system returns
+        // This is sound only if the caller keeps the SystemParam contract:
+        // - the `Query<'static, Q, F>` must not escape the system function,
+        // - it must not be stored in global or static state, and
+        // - it must be dropped before the system returns.
         //
-        // The Engine's system execution infrastructure ensures these invariants
-        // by calling systems as opaque functions that cannot return the parameter.
+        // The engine's system runner calls systems as opaque functions that
+        // cannot return their parameters, so it keeps these rules.
         //
-        // UNDEFINED BEHAVIOR if Query escapes (e.g., stored in static variable,
-        // moved to another thread, or captured in an escaping closure).
+        // It is undefined behavior if `Query` escapes: stored in a static,
+        // moved to another thread, or captured by a closure that outlives the
+        // call.
         unsafe {
             let query: Query<Q, F> = Query::new(world);
             std::mem::transmute(query)
@@ -215,38 +227,38 @@ impl<Q: QueryTarget + 'static, F: QueryFilter + 'static> SystemParam for Query<'
 
     fn report_access(access: &mut SystemAccess) {
         let (reads, writes) = Q::report_component_access();
-        for comp_id in reads {
-            access.add_read(comp_id);
+        for component_id in reads {
+            access.add_read(component_id);
         }
-        for comp_id in writes {
-            access.add_write(comp_id);
+        for component_id in writes {
+            access.add_write(component_id);
         }
-        // Filters that gate on a component (e.g. Changed<T>, With<T>) need
-        // read access to that component's storage so they don't conflict
-        // with concurrent writers of the same component in another system.
-        for comp_id in F::included_component_ids() {
-            access.add_read(comp_id);
+        // A filter can require a component to be present or to have changed
+        // (`With<T>`, `Changed<T>`). Such a filter needs read access to that
+        // component, or the scheduler could run a writer of it in parallel.
+        for component_id in F::included_component_ids() {
+            access.add_read(component_id);
         }
     }
 }
 
-/// Res<T> is a SystemParam - provides immutable access to a Resource
+/// Gives a system shared access to a resource.
 ///
-/// The scheduler tracks this as a resource read, allowing multiple systems
-/// to read the same resource in parallel.
+/// The scheduler records this as a resource read, so several systems may read
+/// the same resource at the same time.
 impl<T: Resource> SystemParam for Res<'static, T> {
     unsafe fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
-        // SAFETY: Lifetime transmutation from actual borrow to 'static.
+        // SAFETY: The lifetime of the borrow is transmuted to `'static`.
         //
-        // This is sound IFF the caller upholds the SystemParam safety contract:
-        // - The Res<'static, T> must not escape the system function
-        // - The Res<'static, T> must not be stored in global/static state
-        // - The Res<'static, T> must be dropped before system returns
+        // This is sound only if the caller keeps the SystemParam contract:
+        // - the `Res<'static, T>` must not escape the system function,
+        // - it must not be stored in global or static state, and
+        // - it must be dropped before the system returns.
         //
-        // UNDEFINED BEHAVIOR if Res escapes.
+        // It is undefined behavior if `Res` escapes.
         unsafe {
-            let res: Res<T> = Res::new(&*world);
-            std::mem::transmute(res)
+            let resource: Res<T> = Res::new(&*world);
+            std::mem::transmute(resource)
         }
     }
 
@@ -255,23 +267,23 @@ impl<T: Resource> SystemParam for Res<'static, T> {
     }
 }
 
-/// ResMut<T> is a SystemParam - provides mutable access to a Resource
+/// Gives a system exclusive access to a resource.
 ///
-/// The scheduler tracks this as a resource write, preventing other systems
-/// from accessing the same resource in parallel.
+/// The scheduler records this as a resource write, so no other system touches
+/// the same resource at the same time.
 impl<T: Resource> SystemParam for ResMut<'static, T> {
     unsafe fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
-        // SAFETY: Lifetime transmutation from actual borrow to 'static.
+        // SAFETY: The lifetime of the borrow is transmuted to `'static`.
         //
-        // This is sound IFF the caller upholds the SystemParam safety contract:
-        // - The ResMut<'static, T> must not escape the system function
-        // - The ResMut<'static, T> must not be stored in global/static state
-        // - The ResMut<'static, T> must be dropped before system returns
+        // This is sound only if the caller keeps the SystemParam contract:
+        // - the `ResMut<'static, T>` must not escape the system function,
+        // - it must not be stored in global or static state, and
+        // - it must be dropped before the system returns.
         //
-        // UNDEFINED BEHAVIOR if ResMut escapes.
+        // It is undefined behavior if `ResMut` escapes.
         unsafe {
-            let res: ResMut<T> = ResMut::new(world);
-            std::mem::transmute(res)
+            let resource: ResMut<T> = ResMut::new(world);
+            std::mem::transmute(resource)
         }
     }
 
@@ -284,19 +296,19 @@ impl<T: Resource> SystemParam for ResMut<'static, T> {
 // SystemParam Tuple Implementations
 // =============================================================================
 
-/// Macro to implement SystemParam for tuples
+/// Implements [`SystemParam`] for tuples, so a system can take more than one
+/// parameter.
 ///
-/// This allows systems to take multiple parameters. Each parameter is
-/// fetched independently and combined into a tuple.
+/// Each element is fetched on its own and put into the tuple.
 macro_rules! impl_system_param_tuple {
     ($($T:ident),*) => {
         #[allow(non_snake_case)]
         impl<$($T: SystemParam),*> SystemParam for ($($T,)*) {
             unsafe fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self {
-                // SAFETY: every element is fetched and immediately moved into
-                // the tuple this function returns, so the caller's
-                // drop-before-return obligation covers the elements exactly as
-                // it covers a single parameter.
+                // SAFETY: Each element is fetched and moved straight into the
+                // tuple this function returns. The caller's promise to drop the
+                // value before it returns therefore covers every element, just
+                // as it covers a single parameter.
                 unsafe { ($($T::fetch(world, queue),)*) }
             }
 
@@ -307,12 +319,13 @@ macro_rules! impl_system_param_tuple {
     };
 }
 
-// Implement for tuples of different sizes (0 to 7 parameters)
+// Tuples take 0 to 7 parameters. The empty tuple is written out here; the
+// macro below covers the rest.
 impl SystemParam for () {
     unsafe fn fetch(_world: &mut World, _queue: &mut CommandQueue) -> Self {}
 
     fn report_access(_access: &mut SystemAccess) {
-        // Empty tuple has no access
+        // An empty parameter list reports no access.
     }
 }
 
@@ -328,26 +341,29 @@ impl_system_param_tuple!(A, B, C, D, E, F, G);
 // SystemParamFunction
 // =============================================================================
 
-/// SystemParamFunction trait - functions that can be converted to systems
+/// A function that can become a system.
 ///
-/// This trait is implemented for functions with different numbers of
-/// SystemParam parameters. It provides the bridge between user-written
-/// functions and the System trait. The associated [`Output`] is the
-/// function's return type, either `()` or `Result<(), SystemError>`.
+/// The trait is implemented for functions with one to seven [`SystemParam`]
+/// parameters, plus the case with none. It is the bridge between a function a
+/// project writes and the [`System`] the engine runs. The associated
+/// [`Output`] is the function's return type, `()` or
+/// `Result<(), SystemError>`.
 ///
 /// [`Output`]: SystemParamFunction::Output
 pub trait SystemParamFunction<Input: SystemParam>: 'static {
     /// The function's return value, `()` or `Result<(), SystemError>`.
     type Output: SystemOutput;
 
-    /// Runs the wrapped function with the resolved parameters.
+    /// Calls the wrapped function with the parameters it was given.
     ///
-    /// The `input` tuple carries the parameters fetched from the [`World`] and
-    /// [`CommandQueue`]; the return value is normalized by [`SystemOutput`].
+    /// `input` is the tuple fetched from the [`World`] and the
+    /// [`CommandQueue`]. The return value goes through [`SystemOutput`] to
+    /// become a result.
     fn run(&mut self, input: Input) -> Self::Output;
 }
 
-/// Macro to implement SystemParamFunction for functions with different arities
+/// Implements [`SystemParamFunction`] for functions with one to seven
+/// parameters.
 macro_rules! impl_system_param_function {
     ($($T:ident),*) => {
         #[allow(non_snake_case)]
@@ -392,26 +408,26 @@ impl_system_param_function!(A, B, C, D, E, F, G);
 // IntoSystem
 // =============================================================================
 
-/// Trait for converting functions into Systems
+/// Converts a function into a [`System`] the engine can run.
 ///
-/// This uses the SystemParam infrastructure to automatically resolve parameters.
-/// When you call engine.register_system(name, function), this trait handles
-/// the conversion from a plain function to a boxed System trait object.
+/// It uses the [`SystemParam`] machinery to fetch the function's parameters.
+/// `engine.register_system(name, function)` relies on this trait to turn a
+/// plain function into a boxed `System`.
 pub trait IntoSystem<Input: SystemParam> {
     /// Boxes this function into a [`System`] trait object the engine can store
     /// and invoke generically.
     fn into_system(self) -> Box<dyn System>;
 
-    /// Boxes this function so its implementation can be replaced at runtime.
+    /// Boxes this function so its body can be replaced while the game runs.
     ///
-    /// Identical to [`Self::into_system`] except that the call to the user's
-    /// function goes through `slot`. Replacing the implementation is then a
-    /// single atomic store: the returned box, its vtable, the scheduler graph
-    /// and the system's metadata all stay put, and the `World` is untouched.
+    /// It works like [`Self::into_system`], except that the call to the user's
+    /// function goes through `slot`. Replacing the body is then a single atomic
+    /// store: the returned box, its vtable, the scheduler graph and the
+    /// system's metadata stay where they are, and the `World` is left alone.
     ///
-    /// The slot is initialized here because this is the only place the concrete
-    /// `F` and `Input` are known; `name` is the identity a panicking patched
-    /// body is attributed to, so its host can roll that function back.
+    /// The slot is set up here because this is the only place that knows the
+    /// concrete `F` and `Input`. `name` is the identity a panicking patched body
+    /// is reported under, which lets the host roll that function back.
     #[cfg(feature = "hot_patch")]
     fn into_hot_system(
         self,
@@ -420,13 +436,14 @@ pub trait IntoSystem<Input: SystemParam> {
     ) -> Box<dyn System>;
 }
 
-/// Implement IntoSystem for any function that implements SystemParamFunction
+/// Implements [`IntoSystem`] for any function that implements
+/// [`SystemParamFunction`].
 ///
-/// This is the magic that makes everything work together:
-/// 1. Function has parameters that implement SystemParam
-/// 2. Those parameters are extracted via SystemParam::fetch
-/// 3. The function is called with those parameters
-/// 4. All wrapped in a System trait object for storage in the Engine
+/// This is where the pieces meet:
+/// 1. the function's parameters implement [`SystemParam`],
+/// 2. [`SystemParam::fetch`] takes those parameters out of the world,
+/// 3. the function is called with them, and
+/// 4. the whole thing is boxed as a [`System`] for the engine to store.
 impl<F, Input> IntoSystem<Input> for F
 where
     F: SystemParamFunction<Input> + Send + 'static,
@@ -434,15 +451,16 @@ where
 {
     fn into_system(mut self) -> Box<dyn System> {
         Box::new(move |world: &mut World, queue: &mut CommandQueue| {
-            // Resolve the system's parameters from the world and queue.
+            // Step 1: Fetch the system's parameters from the world and queue.
             //
-            // SAFETY: `input` is dropped at the end of this closure call,
-            // before `world` and `queue` - borrowed from the caller's frame -
-            // go out of scope, and the closure returns only the system's own
-            // result, so the parameter cannot escape. That is exactly the
-            // drop-before-return invariant `fetch`'s `'static` marker assumes.
+            // SAFETY: `input` is dropped when this closure call ends, before
+            // `world` and `queue` - borrowed from the caller's frame - go out
+            // of scope, and the closure returns only the system's own result,
+            // so the parameter cannot escape. That is exactly the
+            // drop-before-return rule the `'static` marker on `fetch` assumes.
             let input = unsafe { Input::fetch(world, queue) };
-            // Invoke the wrapped function and normalize its return value.
+            // Step 2: Call the wrapped function and turn its return value into
+            // a system result.
             self.run(input).into_system_result()
         })
     }
@@ -453,57 +471,59 @@ where
         slot: std::sync::Arc<crate::hot_patch::HotSlot>,
         name: String,
     ) -> Box<dyn System> {
-        // The baseline implementation and the signature to gate replacements
-        // against. This is the only place the concrete `F` and `Input` exist.
+        // Record the baseline implementation and the signature a replacement
+        // has to match. This is the only place that knows the concrete `F` and
+        // `Input`.
         slot.initialize(
             <F as SystemParamFunction<Input>>::run as *const () as usize,
             crate::hot_patch::signature_hash::<F, Input>(),
         );
 
         Box::new(move |world: &mut World, queue: &mut CommandQueue| {
-            // Resolve the system's parameters exactly as the non-patchable path
-            // does, so a hot system and a plain one behave identically.
+            // Step 1: Fetch the parameters exactly as the plain path does, so
+            // a hot system and a plain one behave the same.
             //
-            // SAFETY: as in `into_system` - `input` is dropped before this
+            // SAFETY: As in `into_system`, `input` is dropped before this
             // closure returns, so the `'static` marker never outlives the
             // borrows it stands for. A panicking callee unwinds through the
-            // call, which drops `input` on the way out, before the `Err` arm
+            // call and drops `input` on the way out, before the `Err` arm
             // below is reached.
             let input = unsafe { Input::fetch(world, queue) };
 
-            // One acquire load from a hot cache line, then an indirect call.
-            // Measured at under 0.2 ns/call against a direct call, which is
-            // below the noise floor of ABI and register-allocation accidents.
+            // Step 2: Read the implementation to call. This costs one acquire
+            // load and an indirect call; measured at under 0.2 ns/call against
+            // a direct call, which is below the noise floor of ABI and
+            // register-allocation accidents.
             let address = slot.current();
 
-            // SAFETY: `address` is either the baseline written by `initialize`
-            // above - `<F as SystemParamFunction<Input>>::run`, exactly this
-            // type - or a replacement accepted by `HotSlot::install`, which
-            // refuses any address whose signature hash differs from this
+            // SAFETY: `address` is one of two things. It is the baseline
+            // written by `initialize` above -
+            // `<F as SystemParamFunction<Input>>::run`, exactly this function
+            // type. Or it is a replacement that `HotSlot::install` accepted,
+            // which refuses any address whose signature hash differs from this
             // monomorphization's. A replacement lives in a patch library the
-            // host never unloads, so the address stays executable for the
-            // process lifetime. The acquire load pairs with install's release
-            // store, so the replacement's code is visible before it is called.
+            // host never unloads, so the address stays executable for the whole
+            // process. The acquire load pairs with the release store in
+            // `install`, so the replacement's code is visible before the call.
             let run: fn(&mut F, Input) -> F::Output =
                 unsafe { std::mem::transmute::<usize, fn(&mut F, Input) -> F::Output>(address) };
 
-            // A patched body can panic: the panic is caught here, where the
-            // failing function is still nameable, and turned into the system
-            // failure the engine already knows how to record and survive.
-            // `panic_into_failure` also counts the streak that makes the host
-            // roll the patch back after three invocations.
+            // Step 3: Call the implementation and catch a panic from a patched
+            // body. Here the failing function still has a name, so the panic
+            // becomes the system failure the engine already records and
+            // survives. `panic_into_failure` also counts the streak; when it
+            // reaches three panics in a row, the host rolls the patch back.
             //
-            // `AssertUnwindSafe`: the world and the function are lent to the
-            // call and nothing observably inconsistent survives it - the
-            // engine treats the invocation as failed and resumes at the next
-            // frame boundary, exactly as it does for a system that returned
-            // an error.
+            // `AssertUnwindSafe` is fine: the world and the function are only
+            // lent to the call, and nothing inconsistent survives it. The
+            // engine treats the run as failed and carries on at the next frame
+            // boundary, just as it does for a system that returned an error.
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut self, input))) {
                 Ok(output) => {
                     crate::hot_patch::record_success(&name);
                     output.into_system_result()
                 }
-                Err(payload) => Err(crate::hot_patch::panic_into_failure(&name, payload)),
+                Err(panic_payload) => Err(crate::hot_patch::panic_into_failure(&name, panic_payload)),
             }
         })
     }

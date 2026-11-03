@@ -2,18 +2,17 @@
 //!
 //! # Responsibilities
 //!
-//! - Present the layout vocabulary the shell and persistence share: the tab
-//!   set ([`dock`]), the on-disk document ([`persistence`]) and the recovery
-//!   document ([`recovery`]), re-exported here for the shell and the
-//!   executable.
+//! - Re-export the layout pieces the shell and the executable share: the tab
+//!   set ([`dock`]), the saved layout document ([`persistence`]) and the
+//!   recovery document ([`recovery`]).
 //!
 //! # Design
 //!
 //! `egui_dock` owns the splits, tab geometry and drag behavior, so this
 //! module only defines the editor's tabs, the default layout and where the
-//! documents live. The dock value itself lives in the shell's session
-//! resource; this crate only defines types and persistence, so it stays
-//! UI-thin.
+//! documents live. The dock value itself is a field of the shell's session
+//! resource, [`crate::session::EguiShellState`], so nothing here is drawn or
+//! kept alive between frames.
 
 mod dock;
 mod persistence;

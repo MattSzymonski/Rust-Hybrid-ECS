@@ -1,24 +1,26 @@
-//! Centralised configuration constants and the parallel-execution report.
+//! Configuration constants for the engine, and the startup report of the
+//! parallel-iteration settings.
 //!
 //! # Responsibilities
 //!
-//! - Defines all tunable constants (slice sizes, work-group counts, profiling
-//!   knobs).
-//! - Provides `default_entities_per_slice()` for adaptive parallel work sizing.
-//! - Reports the parallel-execution configuration at engine startup.
+//! - Defines the tunable constants for parallel iteration, entity builders,
+//!   queries and allocation profiling.
+//! - Provides `default_entities_per_slice` to size parallel work slices.
+//! - Reports the parallel-execution configuration when the engine starts.
 //!
 //! # Design
 //!
-//! All magic numbers live here so they can be adjusted without hunting through
-//! source files. The [`ParallelProcessingConfig`] struct groups related knobs;
-//! free functions handle slice-size computation and the startup report.
+//! Keeping the tuning numbers in one file means changing one does not require
+//! hunting through the source. The [`ParallelProcessingConfig`] struct groups
+//! the parallel settings; free functions compute the slice size and write the
+//! startup report.
 //!
-//! The startup report (`print_parallel_config`) emits through the tracing
-//! stack under `telemetry_target::SYSTEM`, so it can be filtered, redirected to
-//! the file lane, or silenced like any other engine output. It is one
+//! The startup report ([`print_parallel_config`]) goes through the tracing
+//! stack under `telemetry_target::SYSTEM`, so it can be filtered, redirected
+//! to the file lane or silenced like any other engine output. It is one
 //! multi-line event (`log_block`), which the terminal formatter prints as a
-//! block below its time, level and target. The system hardware report lives in
-//! `pill_player` (its `system_specs` module), so `sysinfo` stays out of the
+//! block below its time, level and target. The hardware report lives in
+//! `pill_player` (its `system_specs` module), which keeps `sysinfo` out of the
 //! shared engine dylib.
 
 // External crates
@@ -30,11 +32,14 @@ use pill_core::telemetry::log_block;
 // Profiling
 // =============================================================================
 
-/// Sampling rate for `tracy_client::ProfiledAllocator`.
+/// Callstack depth recorded for each allocation by
+/// `tracy_client::ProfiledAllocator`.
 ///
-/// `1` = track every allocation (complete picture, higher overhead).
-/// `10` = track 1 in 10 allocations (good balance).
-/// `100` = track 1 in 100 allocations (minimal overhead, statistical).
+/// `0` records no callstack. A non-zero value records up to that many call
+/// frames, which is what shows where an allocation came from in Tracy's
+/// memory view; deeper stacks cost more, and Windows keeps at most 62 frames.
+/// Every allocation is recorded either way - this value decides only how much
+/// of the callstack is kept.
 pub const PROFILING_MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY: u16 = 10;
 
 // =============================================================================
@@ -49,7 +54,7 @@ pub const PROFILING_MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY: u16 = 10;
 //           │
 //           └─ par_iter_mut().for_each()
 //                │
-//                ├─ iterator_slices (4096 entities each)  ← DEFAULT_ITERATOR_SLICE_SIZE
+//                ├─ iterator_slices (up to 4096 entities each)  ← DEFAULT_ITERATOR_SLICE_SIZE
 //                │   iterator_slice 0: entities 0..4096
 //                │   iterator_slice 1: entities 4096..8192
 //                │   ...
@@ -58,48 +63,49 @@ pub const PROFILING_MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY: u16 = 10;
 //                    iterator_work_group 0: iterator_slices [0,1,2,3]  → rayon task 0
 //                    iterator_work_group 1: iterator_slices [4,5,6,7]  → rayon task 1
 
-/// Zero-sized struct grouping configuration constants for the parallel iterator.
+/// Zero-sized struct grouping the parallel-iterator constants.
 ///
-/// Access via `crate::config::ParallelProcessingConfig::<CONSTANT>`.
+/// Read a constant as `crate::config::ParallelProcessingConfig::<CONSTANT>`.
 pub struct ParallelProcessingConfig;
 
 impl ParallelProcessingConfig {
-    /// Smoothing factor for the exponential moving average of system
-    /// execution time.  `1/32 ≈ 0.031` gives a ~32-frame averaging window,
-    /// damping frame-to-frame jitter.
+    /// Smoothing factor for the moving average of how long a system run or an
+    /// iterator loop takes. Each new sample moves the average by `1/32 ≈ 0.031`
+    /// of the difference, so the value follows roughly the last 32 samples
+    /// instead of copying one slow run.
     pub const SPLITTING_HINT_WINDOW: i64 = 32;
 
-    /// Target wall-clock duration per parallel group (nanoseconds).
+    /// Target wall-clock duration of one parallel work group, in nanoseconds.
     ///
-    /// The timing-feedback loop divides the system's average execution time
-    /// by this value to determine how many Rayon tasks to spawn.  Larger
-    /// values mean fewer, bigger groups - less wake-up scatter but also
-    /// less parallelism.  50 µs is a sweet spot where OS thread wake-up
-    /// latency (~10 µs) doesn't dominate.
+    /// The iterator chooses its task count by dividing the system's measured
+    /// run time by this value, so each task gets roughly this much work. A
+    /// larger value means fewer, larger tasks: threads wake up less often, but
+    /// the work is split less finely. 50 µs works well because a sleeping
+    /// thread needs about 10 µs to wake, so the wake-up cost stays small
+    /// beside the work.
     pub const TARGET_ITERATOR_WORK_GROUP_DURATION: u64 = 50_000;
 
-    /// Most parallel work groups per pool thread.
+    /// Most parallel work groups one pool thread gets.
     ///
-    /// More groups than threads lets a long loop balance itself when the
-    /// threads do not run equally fast (efficiency cores on a hybrid CPU, two
-    /// hyperthreads on one core): the faster threads take the groups the
-    /// slower ones have not reached yet.
+    /// Giving a long loop more groups than threads keeps it balanced when
+    /// threads do not run equally fast (efficiency cores on a hybrid CPU, or
+    /// two hyperthreads sharing one core): the faster threads take the groups
+    /// the slower ones have not reached yet.
     pub const WORK_GROUPS_PER_THREAD: usize = 4;
 
-    /// Default entities per parallel work slice.
+    /// Default number of entities in one parallel work slice.
     ///
-    /// A starting point chosen for streaming access rather than fine-tuned by
-    /// measurement: the access pattern and hardware prefetching make the exact
-    /// number non-critical. The clamped formula (see
-    /// [`default_entities_per_slice`]) scales it down per query for unusually
-    /// large components.
+    /// A starting value chosen for sequential (streaming) access, not tuned
+    /// by measurement: the access pattern and the CPU's prefetching make the
+    /// exact number matter little. [`default_entities_per_slice`] scales it
+    /// down for a query whose components have unusually large rows.
     pub const DEFAULT_ITERATOR_SLICE_SIZE: usize = 4096;
 
-    /// Minimum entities per thread before parallel execution kicks in.
+    /// Minimum entities per thread for a query to run in parallel.
     ///
-    /// Below `num_threads × MINIMUM_SLICE_SIZE` total entities, the
-    /// iterator falls back to a sequential loop - Rayon task-spawning
-    /// overhead would dominate the actual work.
+    /// When the total is below `pool threads × MINIMUM_SLICE_SIZE` entities,
+    /// the iterator runs the rows on the calling thread, because spawning
+    /// Rayon tasks would cost more than the work itself.
     pub const MINIMUM_SLICE_SIZE: usize = 256;
 }
 
@@ -107,15 +113,15 @@ impl ParallelProcessingConfig {
 // EntityBuilderConfig
 // =============================================================================
 
-/// Zero-sized struct grouping configuration constants for entity builders.
+/// Zero-sized struct grouping the entity-builder constants.
 pub struct EntityBuilderConfig;
 
 impl EntityBuilderConfig {
-    /// Initial `Vec::with_capacity` for the component list in
-    /// `EntityBuilder` and `DeferredEntityBuilder`.
+    /// Starting capacity of the component list in `EntityBuilder` and
+    /// `DeferredEntityBuilder`.
     ///
-    /// Most entities carry 3–8 components.  Pre-allocating avoids
-    /// reallocation during chained `.with()` calls.
+    /// Most entities carry 3 to 8 components, so pre-allocating 8 avoids a
+    /// reallocation while components are added one by one with `.with()`.
     pub const DEFAULT_COMPONENTS_CAPACITY: usize = 8;
 }
 
@@ -123,19 +129,19 @@ impl EntityBuilderConfig {
 // QueryConfig
 // =============================================================================
 
-/// Zero-sized struct grouping configuration constants for query internals.
+/// Zero-sized struct grouping the query constants.
 pub struct QueryConfig;
 
 impl QueryConfig {
-    /// Initial `Vec::with_capacity` for component-ID and filter-pair
-    /// collections inside query-target and filter-tuple macros.
+    /// Starting capacity for the component-id and filter-pair lists that the
+    /// query-target and filter-tuple macros build.
     ///
-    /// Typical queries use 1–4 components/filters, so 4 avoids
-    /// reallocation for the common case.
+    /// A typical query names 1 to 4 components or filters, so 4 avoids a
+    /// reallocation in the common case.
     pub const DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY: usize = 4;
 
-    /// Initial `Vec::with_capacity` for filter-pair combinations in
-    /// `Or` filter expansions.
+    /// Starting capacity for the filter-pair list built when an `Or` filter is
+    /// expanded.
     pub const DEFAULT_FILTER_PAIRS_CAPACITY: usize = 4;
 }
 
@@ -143,13 +149,15 @@ impl QueryConfig {
 // Free Functions
 // =============================================================================
 
-/// Default number of entities per parallel work slice, clamped by component size.
+/// Returns the number of entities in one parallel work slice, scaled down for
+/// components with large rows.
 ///
-/// Without an override it lands between
+/// Without an override the result is between
 /// `ParallelProcessingConfig::MINIMUM_SLICE_SIZE` (256) and
-/// `ParallelProcessingConfig::DEFAULT_ITERATOR_SLICE_SIZE` (4096), scaled
-/// inversely with the bytes per entity so per-slice overhead stays bounded.
-/// A positive `ECS_SLICE_SIZE` environment variable overrides that.
+/// `ParallelProcessingConfig::DEFAULT_ITERATOR_SLICE_SIZE` (4096), and it
+/// falls as `bytes_per_entity` grows, which keeps the per-slice overhead
+/// small. A positive `ECS_SLICE_SIZE` environment variable overrides the
+/// computed value.
 ///
 /// # Examples
 ///
@@ -162,36 +170,39 @@ impl QueryConfig {
 /// assert!(large_components <= small_components);
 /// ```
 pub fn default_entities_per_slice(bytes_per_entity: usize) -> usize {
-    // Step 1: Honour a runtime override from the `ECS_SLICE_SIZE` environment variable.
-    if let Ok(val) = std::env::var("ECS_SLICE_SIZE") {
-        if let Ok(n) = val.parse::<usize>() {
-            if n > 0 {
-                return n;
+    // Step 1: Use the `ECS_SLICE_SIZE` override when it is set to a positive
+    // number.
+    if let Ok(slice_size_override_text) = std::env::var("ECS_SLICE_SIZE") {
+        if let Ok(override_slice_entity_count) = slice_size_override_text.parse::<usize>() {
+            if override_slice_entity_count > 0 {
+                return override_slice_entity_count;
             }
         }
     }
 
-    // Step 2: Fall back to the size-scaled default, clamped to the configured range.
-    let default = ParallelProcessingConfig::DEFAULT_ITERATOR_SLICE_SIZE;
-    let min = ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
-    // Scale: keep total data per slice constant (~32 KiB for an 8 B baseline).
-    // The query path clamps bytes_per_entity to at least 8, so this cannot
-    // divide by zero.
-    (default * 8 / bytes_per_entity).clamp(min, default)
+    // Step 2: Otherwise scale the default by the bytes per entity and clamp it
+    // to the configured range.
+    let default_slice_entity_count = ParallelProcessingConfig::DEFAULT_ITERATOR_SLICE_SIZE;
+    let minimum_slice_entity_count = ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
+    // Keep the data per slice roughly constant: 4096 entities of 8 bytes is
+    // 32 KiB. The query path clamps bytes_per_entity to at least 8, so this
+    // cannot divide by zero.
+    (default_slice_entity_count * 8 / bytes_per_entity)
+        .clamp(minimum_slice_entity_count, default_slice_entity_count)
 }
 
-/// Report the active parallel-iterator configuration through the telemetry stack.
+/// Reports the active parallel-iterator settings through the telemetry stack.
 ///
-/// Shows the Rayon thread-pool size and the knobs the report lists - the
-/// work-group duration target, the averaging window, the default slice size
-/// and the minimum - under the same `telemetry_target::SYSTEM` target as the
-/// runtime's system-specs report.
+/// The report lists the Rayon pool size, the work-group duration target, the
+/// averaging window, the default slice size and the minimum slice size. It
+/// goes to the `telemetry_target::SYSTEM` target, the same one the runtime's
+/// hardware report uses.
 ///
 /// Called during [`Engine::new`](crate::Engine::new).
 pub fn print_parallel_config() {
-    let threads = rayon::current_num_threads();
+    let rayon_thread_count = rayon::current_num_threads();
     let lines = [
-        format!("├─ Rayon threads: {threads}"),
+        format!("├─ Rayon threads: {rayon_thread_count}"),
         format!(
             "├─ Target work-group duration: {} µs",
             ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION / 1000

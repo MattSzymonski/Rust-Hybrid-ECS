@@ -6,19 +6,21 @@
 //!   the `std::time::Instant` API the engine uses.
 //! - Provide [`unix_time`], the wall-clock time since the Unix epoch.
 //!
-//! On native both come from `std::time`. On `wasm32-unknown-unknown` the
-//! `std` versions panic, so both come from `web-time`, which reads
+//! On native both come from `std::time`. The `std` versions panic on
+//! `wasm32-unknown-unknown`, so there both come from `web-time`, which reads
 //! `performance.now()` and `Date.now()`.
 //!
-//! [`Instant`] is a newtype rather than a re-export: a re-export would still be
-//! `std::time::Instant` to the `disallowed-types` lint, and every use through
-//! it would be reported.
+//! [`Instant`] is a newtype, not a re-export. Clippy's `disallowed-types` lint
+//! matches the type behind a name, so a re-export would still be
+//! `std::time::Instant` and every use through it would be reported.
 
 // Standard library
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::time::Duration;
 
-// The platform's monotonic clock: the only place `std::time::Instant` is named.
+// The engine's monotonic clock type: `std` on native, `web-time` on the web.
+// Code elsewhere uses `Instant` rather than naming `std::time::Instant`, which
+// the workspace lint bans.
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::disallowed_types)]
 type PlatformInstant = std::time::Instant;
@@ -27,13 +29,14 @@ type PlatformInstant = web_time::Instant;
 
 /// A monotonic timestamp that works on native and on the web.
 ///
-/// Use it wherever `std::time::Instant` would be used; the API is the same
-/// subset (`now`, `elapsed`, `duration_since`, arithmetic with [`Duration`]).
+/// Use it wherever `std::time::Instant` would be used. It offers the part of
+/// that API the engine uses: `now`, `elapsed`, the `duration_since` methods,
+/// and arithmetic with [`Duration`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Instant(PlatformInstant);
 
 impl Instant {
-    /// The current time.
+    /// The current instant.
     pub fn now() -> Self {
         Self(PlatformInstant::now())
     }
@@ -45,9 +48,9 @@ impl Instant {
 
     /// The time from `earlier` to this instant, zero if `earlier` is later.
     ///
-    /// Saturating, like [`std::time::Instant::duration_since`] on current
-    /// Rust: it never panics on a reversed pair. [`saturating_duration_since`]
-    /// is the same operation under its standard name; prefer this one in new
+    /// It saturates: a reversed pair gives zero instead of a panic, the same
+    /// as [`std::time::Instant::duration_since`]. This and
+    /// [`saturating_duration_since`] do the same thing; prefer this one in new
     /// code.
     ///
     /// [`saturating_duration_since`]: Instant::saturating_duration_since
@@ -57,7 +60,8 @@ impl Instant {
 
     /// The time from `earlier` to this instant, zero if `earlier` is later.
     ///
-    /// The standard spelling of [`duration_since`](Instant::duration_since).
+    /// The same operation as [`duration_since`](Instant::duration_since), under
+    /// the name the standard library uses.
     pub fn saturating_duration_since(&self, earlier: Instant) -> Duration {
         self.0.saturating_duration_since(earlier.0)
     }
@@ -116,13 +120,14 @@ impl Sub<Instant> for Instant {
 
 /// The wall-clock time since the Unix epoch, zero if the clock is set before it.
 ///
-/// For timestamps a person reads (log lines); use [`Instant`] to measure time.
+/// Use it for a time a person reads, such as a calendar date; use [`Instant`]
+/// to measure elapsed time.
 pub fn unix_time() -> Duration {
     #[cfg(not(target_arch = "wasm32"))]
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    let elapsed_since_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
     #[cfg(target_arch = "wasm32")]
-    let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH);
-    now.unwrap_or_default()
+    let elapsed_since_epoch = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH);
+    elapsed_since_epoch.unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
-//! Typed error system for the ECS engine, generated from one semantic
-//! message definition per variant.
+//! Typed error system for the ECS engine, with one semantic message
+//! definition per variant.
 //!
 //! # Responsibilities
 //!
@@ -16,8 +16,9 @@
 //!
 //! # Design
 //!
-//! Each error variant states its wording once, as a `#[message(...)]`
-//! definition rendered through the `pill_core` diagnostics runtime. Error enums
+//! Each variant that has its own message states its wording once, as a
+//! `#[message(...)]` definition rendered through the `pill_core` diagnostics
+//! runtime. Error enums
 //! never import a styling crate and never convert sources to text; the ones
 //! that compose do so with `?` through transparent `#[from]` wrappers. A
 //! frontend's frame boundary does not receive an [`EngineError`]:
@@ -102,7 +103,7 @@ pub enum WorldError {
     #[message("a descriptor entity cannot contain duplicate components")]
     DescriptorDuplicateComponent,
 
-    /// The component ID was never registered as descriptor storage.
+    /// The component ID was never registered with this world.
     #[message("descriptor component ", debug_value(id), " is not registered")]
     DescriptorComponentNotRegistered { id: ComponentId },
 
@@ -118,11 +119,11 @@ pub enum WorldError {
     #[message("entity not found")]
     EntityNotFound,
 
-    /// The entity already carries the descriptor component being added.
+    /// The entity already carries the component being added.
     #[message("entity already contains the descriptor component")]
     DescriptorComponentAlreadyPresent,
 
-    /// The entity does not carry the descriptor component being removed or set.
+    /// The entity does not carry the component being removed or set.
     #[message("entity does not contain the descriptor component")]
     DescriptorComponentMissing,
 
@@ -303,8 +304,9 @@ pub enum WorldError {
     ///
     /// The id of a shared resource is a 128-bit hash of its name, and a hash
     /// collision would make one slot answer to two names - each declaration
-    /// silently joining the other's resource. The recorded string is the
-    /// evidence the id cannot carry, so it is compared on every claim.
+    /// silently joining the other's resource. The id cannot carry the evidence,
+    /// so each claim also stores its name and compares it with the recorded
+    /// one.
     #[message(
         "shared resource names ",
         name_style(shared_name),
@@ -345,12 +347,12 @@ pub enum WorldError {
     /// Two live registrations claim the same component type name under
     /// different [`ComponentId`]s.
     ///
-    /// The persistable-registration path evicts a same-name entry from the
-    /// persist maps, assuming it is a superseded hot-reload generation - which
-    /// has no live rows left. When the older column still holds entities the
-    /// two registrations are concurrent peers (two binaries that each linked
-    /// the type and got their own `TypeId`), and evicting one would silently
-    /// drop its rows at the next reload.
+    /// The persistable-registration path replaces a same-name entry in the
+    /// persist maps once the host announced that generation as superseded.
+    /// When the older column still holds entities and no announcement covers
+    /// it, the two registrations are concurrent peers (two binaries that each
+    /// linked the type and got their own `TypeId`), and replacing one would
+    /// silently drop its rows at the next reload.
     ///
     /// Give the type a shared identity with `#[pill(shared)]`, which makes
     /// both binaries resolve to one column instead of two.
@@ -382,9 +384,9 @@ pub enum WorldError {
     /// The migration rebuilds the old column after reading the rows the
     /// incoming generation spawned into it through the incoming type, in
     /// slots spaced for the old layout. A wider alignment - or a stride that
-    /// is not a multiple of it - makes those reads misaligned, which aborts
-    /// debug hosts and is undefined behaviour in release, so the registration
-    /// is refused and the host rolls the reload back instead.
+    /// is not a multiple of it - makes those reads misaligned, which is
+    /// undefined behaviour, so the registration is refused and the host rolls
+    /// the reload back instead.
     ///
     /// A size change that keeps the alignment is accepted: the add-a-field
     /// reloads depend on that shape migrating.
@@ -444,10 +446,10 @@ pub enum WorldError {
 
     /// One shared resource name, two different memory layouts.
     ///
-    /// A shared resource is reached from every artifact through one slot, and
-    /// the only thing establishing that they agree about its contents is this
-    /// check - the box's own identity check compares layout, so a mismatch
-    /// would misread the value rather than refuse it.
+    /// Every artifact reaches the resource through one slot, and this check is
+    /// the only thing establishing that they agree about its shape. Binding the
+    /// second registration anyway would leave the two artifacts reading one
+    /// slot with different layouts, so it is refused instead.
     #[message(
         "shared resource ",
         name_style(shared_name),
@@ -482,10 +484,11 @@ pub enum WorldError {
     /// succeed and silently return another component's data.
     ///
     /// One type compiled into two binaries must not be rejected - that is what
-    /// shared identity is for - and the two are told apart by their Rust path:
-    /// the same type compiled twice reports the same [`std::any::type_name`].
-    /// Overriding the name with `#[pill(shared = "...")]` is the only way to
-    /// reach this; the default is already distinct per module path.
+    /// shared identity is for - and the two are told apart by their type names:
+    /// the same type compiled twice reports the same short name, even when the
+    /// module paths differ. Overriding the name with `#[pill(shared = "...")]`
+    /// is the only way to reach this; the default is already distinct per
+    /// module path.
     #[message(
         "shared component name ",
         name_style(shared_name),
@@ -498,20 +501,20 @@ pub enum WorldError {
     SharedComponentNameConflict {
         /// The shared name both types declared.
         shared_name: String,
-        /// Rust path of the type that registered the name first.
+        /// Short Rust name of the type that registered the name first.
         existing_type: String,
-        /// Rust path of the type claiming it now.
+        /// Short Rust name of the type claiming it now.
         incoming_type: String,
     },
 
     /// Two binaries registered the same shared component with different
     /// memory layouts.
     ///
-    /// A shared component is reached from every binary that links it through
-    /// one column, and the only thing establishing that they agree about what
-    /// a row contains is this check. Binding the second registration anyway
-    /// would let one binary read another's rows through the wrong field
-    /// offsets, so the registration is refused instead.
+    /// Every binary that links the component reaches it through one column, and
+    /// this check is the only thing establishing that they agree about what a
+    /// row contains. Binding the second registration anyway would leave the two
+    /// binaries reading and writing one column with different field offsets, so
+    /// the registration is refused instead.
     ///
     /// Because identity is resolved at load time rather than by the compiler,
     /// a field reorder or type change compiles cleanly in both binaries and
@@ -613,10 +616,10 @@ pub enum WorldError {
 /// The refusal logged when two live registrations claim one component type
 /// name.
 ///
-/// One source of truth for the sentence the host prints: the
-/// [`WorldError::ComponentNameCollision`] record and the log line beside it
-/// both point at this constant, so a second guard site cannot drift into its
-/// own wording - or its own source-wrap spaces.
+/// One source of truth for the sentence the host prints: the log line that
+/// reports a [`WorldError::ComponentNameCollision`] uses this constant, so a
+/// second guard site cannot drift into its own wording - or its own
+/// source-wrap spaces.
 pub(crate) const COMPONENT_NAME_COLLISION_REFUSAL: &str =
     "two live registrations claim one component type name; refusing to evict the peer's persist entries";
 
@@ -624,9 +627,8 @@ pub(crate) const COMPONENT_NAME_COLLISION_REFUSAL: &str =
 /// component with a layout the previous generation's column cannot host.
 ///
 /// One source of truth for the sentence the host prints and the tests assert
-/// on, following [`COMPONENT_NAME_COLLISION_REFUSAL`]: the
-/// [`WorldError::ComponentLayoutChanged`] record and the log line beside it
-/// both point here.
+/// on, following [`COMPONENT_NAME_COLLISION_REFUSAL`]: the log line that
+/// reports a [`WorldError::ComponentLayoutChanged`] uses this constant.
 pub(crate) const COMPONENT_LAYOUT_CHANGED_REFUSAL: &str =
     "was re-registered with a different size or alignment; keeping the running generation";
 
@@ -636,9 +638,9 @@ pub(crate) const COMPONENT_LAYOUT_CHANGED_REFUSAL: &str =
 
 /// Error returned when a deferred command cannot be executed.
 ///
-/// Command errors are non-fatal by default — the engine logs them and
-/// continues. Call `Engine::set_should_exit_on_error(true)` for strict mode
-/// where any command failure stops the frame immediately.
+/// Command errors are non-fatal by default: the engine logs them and
+/// continues. Call `Engine::set_should_exit_on_error(true)` to have
+/// `Engine::process_frame` return every failure to its caller instead.
 #[engine_error(namespace = engine::commands, runtime = ::pill_core::error)]
 pub enum CommandError {
     /// The target entity no longer exists in the world.
@@ -648,7 +650,7 @@ pub enum CommandError {
         operation: &'static str,
     },
 
-    /// A queued entity creation could not write one of its components.
+    /// A queued command could not write one of its components.
     ///
     /// The component was validated when the command was queued, but the world
     /// can change before the queue is flushed - a hot reload that retires a
@@ -714,12 +716,12 @@ pub enum CommandError {
         component_id: ComponentId,
     },
 
-    /// A queued command's archetype migration failed partway through.
+    /// A queued structural edit failed inside the world for a reason the flush
+    /// has no more specific command error for.
     ///
-    /// The entity's recorded location referenced an archetype that no longer
-    /// exists, or a descriptor component named by an archetype had no storage
-    /// column. Those inconsistencies are exactly what a partially applied hot
-    /// reload can leave behind, so they are collected like any other command
+    /// A storage column missing from an archetype, or a column whose layout no
+    /// longer matches the manifest, is exactly what a partially applied hot
+    /// reload can leave behind. Those are collected like any other command
     /// failure rather than panicking inside the flush - which for a managed
     /// project would unwind across the C ABI.
     #[message("entity ", debug_value(entity), " migration failed: ", value(reason))]
@@ -775,11 +777,13 @@ pub enum RemoveComponentError {
     ComponentNotFound,
 }
 
-/// Error type for `EntityBuilder::build` when a component was not registered.
+/// Error type for `EntityBuilder::build`.
 ///
-/// Returned when the builder writes a component type the world has never
-/// seen; each offending type must first be registered with
-/// `world.register_component::<T>()`.
+/// Returned when the builder writes a component type the world has never seen
+/// (each offending type must first be registered with
+/// `world.register_component::<T>()`), when the same component type is handed
+/// to it twice, or when the requested entity id already belongs to a live
+/// entity.
 #[engine_error(namespace = engine::world, runtime = ::pill_core::error)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BuildError {
@@ -958,8 +962,8 @@ pub enum SystemError {
 /// One failed system execution recorded during a frame.
 ///
 /// Wraps the failing system's name with its [`SystemError`] and renders the
-/// pair through the shared semantic protocol, so the host boundary can log
-/// `system "name" failed: <error>` with role-aware styling.
+/// pair through the shared semantic protocol, so a reporter can log
+/// `system <name> failed: <error>` in plain or styled form.
 #[derive(Debug)]
 pub struct SystemFailure {
     /// Registered name of the system that failed.
@@ -1011,8 +1015,8 @@ impl fmt::Display for SystemFailure {
 // Engine Error Composition
 // =============================================================================
 
-/// Transparent composition of every engine subsystem error plus the shared
-/// host errors from `pill_core`.
+/// Transparent composition of the engine errors that cross a subsystem
+/// boundary, plus the shared host errors from `pill_core`.
 ///
 /// Subsystem functions return their narrowest meaningful error;
 /// [`EngineError`] exists as the composition boundary where `?` crosses

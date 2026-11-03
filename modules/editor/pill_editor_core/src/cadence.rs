@@ -1,57 +1,69 @@
-//! Redraw cadence: when the editor owes a frame.
+//! Redraw cadence: how the editor decides when to draw the next frame.
 //!
 //! # Responsibilities
 //!
-//! - Name every reason a frame is owed: input, a scripted command, a changed
-//!   snapshot, a resize, something moving, or egui's own repaint request.
+//! - Name every reason a frame is asked for: input, a scripted command, a
+//!   changed snapshot, a resize, something moving, or egui's own repaint
+//!   request.
 //! - Decide whether the loop draws at once or sleeps for the idle poll.
-//! - Count the frames it drew, how many of them were demanded, and how often
+//! - Count the frames it drew, how many of them were asked for, and how often
 //!   it waited.
+//! - Read `PILL_EDITOR_CONTINUOUS_REDRAW`, the switch a profile or a suite
+//!   sets so that every frame is drawn.
 //!
 //! # Rules
 //!
-//! A frame is drawn at once when input, a scripted command, a changed
-//! snapshot or a resize owes one, when egui asked for a repaint, or while
-//! something is moving. Only a settled editor sleeps for [`IDLE_POLL`], so a
-//! running project draws at the display rate and an idle one stops drawing.
-//! - Read `PILL_EDITOR_CONTINUOUS_REDRAW`, the switch that restores the
-//!   always-draw posture a profile or a suite wants.
+//! A frame is drawn at once when something asks for it - input arrived, a
+//! scripted command arrived, the snapshot changed, the window resized, egui
+//! asked for a repaint - or while something is moving, which keeps a running
+//! project at the display rate. Only a settled editor sleeps for
+//! [`IDLE_POLL`], so an idle one stops drawing.
 //!
 //! # Design
 //!
-//! The decision is plain data so it can be tested without an event loop: the
-//! frontend gathers this frame's [`FrameDemand`] and asks a [`Cadence`] what
+//! The decision is plain data, so it can be tested without an event loop. The
+//! frontend collects this frame's [`FrameDemand`] and asks a [`Cadence`] what
 //! to do next. Nothing here touches a window, a clock or the world.
 
+// Standard library
 use std::time::Duration;
 
-/// The environment variable that forces every frame.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The environment variable that makes the loop draw every frame.
 pub const CONTINUOUS_REDRAW_ENV: &str = "PILL_EDITOR_CONTINUOUS_REDRAW";
 
-/// How long an idle editor sleeps before it looks at the world again.
+/// How long an idle editor sleeps between frames.
 ///
-/// Nothing wakes a waiting loop when the *host* changes something - a notice,
-/// a build finishing, a console line - because those arrive on the host's own
-/// threads, so the idle state polls at this pace instead of sleeping until
-/// input arrives. It is the Console tab's worst-case latency.
+/// A change the host makes on one of its own threads - a notice, a build
+/// finishing, a console line - cannot wake the waiting loop the way a window
+/// event does. The loop wakes on this timer instead and draws the change, so
+/// this value is the Console tab's worst-case delay. Input still wakes the
+/// loop sooner.
 pub const IDLE_POLL: Duration = Duration::from_millis(250);
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// What asks for the next frame.
 ///
-/// Each flag is set by whoever knows about it - the event handler for input, a
-/// resize and scripted commands, the frame itself for the snapshot it
-/// published and for egui's repaint request - and cleared once the frame that
-/// honoured it has run.
+/// Each flag is set by whoever knows about it: the event handler sets `input`
+/// and `resized`, the scripted channel sets `scripted`, and the frame itself
+/// sets `snapshot`, `animating` and `repaint_requested`. The whole demand is
+/// cleared at the end of the frame that honoured it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameDemand {
-    /// A window event that is not a redraw arrived (pointer, keys, focus,
-    /// wheel, a drop of files).
+    /// Input arrived from a window - a pointer move or button, a key or text,
+    /// the wheel - or a drag out of the editor finished.
     pub input: bool,
     /// A scripted command arrived from the test channel.
     pub scripted: bool,
     /// The snapshot this frame published differs from the last one.
     pub snapshot: bool,
-    /// The window's size or scale changed.
+    /// The window's size or its scale factor changed.
     pub resized: bool,
     /// Something is moving: the engine is not paused, or a camera navigation
     /// or scripted drag is in flight.
@@ -71,7 +83,11 @@ impl FrameDemand {
             || self.repaint_requested
     }
 
-    /// Whether the frame must be drawn again with no delay.
+    /// Whether input, a scripted command, a changed snapshot or a resize asked
+    /// for the frame.
+    ///
+    /// The other two reasons - something moving and egui's repaint request -
+    /// are checked separately by [`Cadence::decide`].
     pub fn urgent(&self) -> bool {
         self.input || self.scripted || self.snapshot || self.resized
     }
@@ -86,20 +102,22 @@ pub enum FrameWake {
     After(Duration),
 }
 
-/// The editor's redraw counters and its mode.
+/// The editor's redraw counters, and the mode that sets when it draws next.
 #[derive(Clone, Debug)]
 pub struct Cadence {
     continuous: bool,
     /// Frames drawn since startup.
     frames: u64,
-    /// Frames drawn because something asked for them.
+    /// Frames drawn because something asked for one; the continuous mode
+    /// counts every frame.
     demanded: u64,
     /// Times the loop went to sleep instead of drawing.
     waits: u64,
 }
 
 impl Cadence {
-    /// A cadence with an explicit mode.
+    /// A cadence with an explicit mode: `continuous` draws every frame,
+    /// whatever the demand is.
     pub fn new(continuous: bool) -> Self {
         Self {
             continuous,
@@ -109,11 +127,12 @@ impl Cadence {
         }
     }
 
-    /// A cadence the environment chose: continuous when the variable is set
-    /// to anything but an empty string or `0`.
+    /// A cadence chosen from the environment: continuous when
+    /// [`CONTINUOUS_REDRAW_ENV`] is set to anything except an empty string or
+    /// `0`.
     pub fn from_environment() -> Self {
         let continuous = std::env::var(CONTINUOUS_REDRAW_ENV)
-            .map(|value| !value.is_empty() && value != "0")
+            .map(|variable_value| !variable_value.is_empty() && variable_value != "0")
             .unwrap_or(false);
         Self::new(continuous)
     }
@@ -128,7 +147,8 @@ impl Cadence {
         self.frames
     }
 
-    /// Frames drawn because something demanded one.
+    /// Frames drawn because something asked for one; the continuous mode
+    /// counts every frame.
     pub fn demanded(&self) -> u64 {
         self.demanded
     }
@@ -153,10 +173,9 @@ impl Cadence {
 
     /// Decide when to draw next.
     ///
-    /// A continuous cadence always draws at once. Otherwise the frame's own
-    /// evidence decides: an urgent reason, egui's own repaint request, or
-    /// something still moving draws now, and a settled frame sleeps for
-    /// [`IDLE_POLL`].
+    /// The loop draws at once when the cadence is continuous, when
+    /// [`FrameDemand::urgent`] is set, while something is moving, or when egui
+    /// asked for a repaint. Otherwise the frame sleeps for [`IDLE_POLL`].
     pub fn decide(&self, demand: FrameDemand) -> FrameWake {
         if self.continuous || demand.urgent() || demand.animating || demand.repaint_requested {
             FrameWake::Immediate
@@ -171,6 +190,10 @@ impl Default for Cadence {
         Self::new(false)
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

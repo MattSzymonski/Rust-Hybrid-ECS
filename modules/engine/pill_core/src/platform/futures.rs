@@ -4,29 +4,43 @@
 //!
 //! - Run a future to completion on the calling thread on native
 //!   ([`block_on`]).
-//! - Start a future whose result nobody waits for ([`spawn`]): blocks on
-//!   native, hands it to the browser's event loop on the web.
+//! - Start a future that returns nothing ([`spawn`]): it blocks until the
+//!   future finishes on native, and runs on the browser's event loop on the
+//!   web.
 //!
-//! A browser only resolves a future after control returns to its event loop,
-//! so blocking on one there spins forever. That is why [`block_on`] exists
-//! only on native: code that needs a future's value on the web must `.await`
-//! it instead.
+//! # Design
+//!
+//! On the web, a future that waits for something from the browser (a timer,
+//! a network fetch) only finishes after the browser's event loop gets control
+//! back. Blocking on such a future stops that loop, so it would never finish;
+//! that is why [`block_on`] exists only on native. Code that needs a future's
+//! value on the web must `.await` it instead.
 
 // Standard library
 use std::future::Future;
 
-/// Run `future` to completion on the calling thread and return its output.
+/// Runs `future` to completion on the calling thread and returns its output.
 ///
-/// Native only; on the web a future has to be awaited or [`spawn`]ed.
+/// This function exists only on native. On the web, a future has to be awaited
+/// or passed to [`spawn`].
+///
+/// # Panics
+///
+/// Panics if `future` panics.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn block_on<F: Future>(future: F) -> F::Output {
     pollster::block_on(future)
 }
 
-/// Start `future` without waiting for its result.
+/// Starts `future` and returns nothing.
 ///
 /// On native it runs to completion before this returns; on the web it runs on
 /// the browser's event loop after the current task yields.
+///
+/// # Panics
+///
+/// On native, panics if `future` panics. On the web, the browser reports the
+/// panic as an uncaught error instead.
 pub fn spawn<F: Future<Output = ()> + 'static>(future: F) {
     #[cfg(not(target_arch = "wasm32"))]
     pollster::block_on(future);
@@ -45,9 +59,9 @@ mod tests {
 
     #[test]
     fn spawn_runs_the_future_on_native() {
-        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
-        let flag = ran.clone();
-        spawn(async move { flag.set(true) });
-        assert!(ran.get());
+        let did_run = std::rc::Rc::new(std::cell::Cell::new(false));
+        let did_run_in_future = did_run.clone();
+        spawn(async move { did_run_in_future.set(true) });
+        assert!(did_run.get());
     }
 }

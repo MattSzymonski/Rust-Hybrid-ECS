@@ -2,21 +2,25 @@
 //!
 //! # Responsibilities
 //!
-//! - Own the ordered undo entries, the apply cursor, and the redo tail.
-//! - Merge continuous edits (a slider drag) into one entry by coalescing.
-//! - Enforce the step cap and the memory budget from the preferences,
-//!   dropping the oldest entries first and saying which limit did it.
-//! - Drop entries addressing component types or fields that a reload removed.
+//! - Own the undo entries, the cursor that says which of them are applied,
+//!   and the redo tail (the entries past the cursor).
+//! - Merge continuous edits of one control, such as a slider drag, into a
+//!   single step while they keep arriving close together.
+//! - Keep the history within the step cap and the memory budget the
+//!   preferences set, dropping the oldest entries first and reporting which
+//!   limit caused the drop.
+//! - Drop entries that name a component type or field a reload removed.
 //!
 //! # Design
 //!
 //! The history is a world resource, so it survives reloads of the editor
-//! modules that write into it. An entry holds engine batches in both
-//! directions; undo pops an entry and queues its inverse batch through the
-//! same frame-boundary application every edit uses, so undo can never mutate
-//! differently from the edit it reverses. A restore of a destroyed entity
-//! assigns a fresh handle; the queue's caller remaps the remaining entries
-//! with [`CommandHistory::remap_entity`].
+//! modules that write into it. An engine entry keeps two batches: the
+//! commands that made the edit and the commands that reverse it. Undo pops an
+//! entry and queues its inverse batch through the same frame-boundary
+//! application every edit uses, so an undo reaches the world the same way the
+//! edit did. A restore of a destroyed entity assigns a fresh handle; after it
+//! runs, the remaining entries are moved to that handle with
+//! [`CommandHistory::remap_entity`].
 
 // Standard library
 use std::time::Duration;
@@ -27,16 +31,22 @@ use pill_engine::{Entity, FieldValue};
 // Current crate
 use crate::editor_state::EditorCommand;
 
+// =============================================================================
+// Types
+// =============================================================================
+
 /// One undoable step.
 #[derive(Clone, Debug)]
 pub struct HistoryEntry {
-    /// Human label shown in menus and logs ("set PhysicsState.position_x").
+    /// What the step is called in the history's log lines
+    /// ("set PhysicsState.position_x").
     pub label: String,
     /// What undoing and redoing this step does.
     pub entry: HistoryEntryKind,
     /// Component and field identifiers the entry addresses.
     pub touched: Vec<String>,
-    /// Approximate retained size, counting asset pre-images where they exist.
+    /// Approximate size the entry keeps alive, including the bytes of a file
+    /// a restore has to write back.
     pub memory_bytes: usize,
     /// Continuous edits sharing a key merge while they arrive back to back.
     pub coalesce_key: Option<String>,
@@ -47,15 +57,17 @@ pub struct HistoryEntry {
 /// The two kinds of undoable step.
 #[derive(Clone, Debug)]
 pub enum HistoryEntryKind {
-    /// An engine batch and its inverse, in undo order.
+    /// An engine batch and the batch that reverses it.
     Engine {
         /// The commands the edit applied.
         forward: Vec<EditorCommand>,
         /// The commands that reverse it, in undo order.
         inverse: Vec<EditorCommand>,
     },
-    /// A selection change carrying one entity on each side; undo restores
-    /// `before`, redo applies `after`.
+    /// A selection change, carrying the selection on each side of it.
+    ///
+    /// A history walk queues no commands for this kind, so a step of this
+    /// kind only moves the step counts.
     Selection {
         /// The selection before the change.
         before: Option<Entity>,
@@ -65,7 +77,8 @@ pub enum HistoryEntryKind {
 }
 
 impl HistoryEntry {
-    /// An engine-batch entry.
+    /// Builds an entry from the commands an edit applied and the commands that
+    /// reverse it.
     pub fn engine(
         label: impl Into<String>,
         forward: Vec<EditorCommand>,
@@ -85,7 +98,8 @@ impl HistoryEntry {
         }
     }
 
-    /// A selection-change entry.
+    /// Builds an entry for a selection change from the selection before and
+    /// after it.
     pub fn selection(before: Option<Entity>, after: Option<Entity>) -> Self {
         Self {
             label: "select".to_string(),
@@ -97,14 +111,19 @@ impl HistoryEntry {
         }
     }
 
-    /// Mark this entry as part of a continuous edit sequence.
-    pub fn coalescing(mut self, key: impl Into<String>, at_millis: u64) -> Self {
-        self.coalesce_key = Some(key.into());
-        self.coalesced_at_millis = at_millis;
+    /// Marks the entry as one of a continuous edit sequence.
+    ///
+    /// `coalesce_key` names the control being edited and `coalesced_at_millis`
+    /// is when the edit arrived. A later push with the same key merges into
+    /// this entry while it arrives within the coalesce window.
+    pub fn coalescing(mut self, coalesce_key: impl Into<String>, coalesced_at_millis: u64) -> Self {
+        self.coalesce_key = Some(coalesce_key.into());
+        self.coalesced_at_millis = coalesced_at_millis;
         self
     }
 
-    /// Replace every named handle with `assigned`.
+    /// Replaces `previous` with `assigned` wherever this entry names an
+    /// entity.
     pub fn remap_entity(&mut self, previous: Entity, assigned: Entity) {
         match &mut self.entry {
             HistoryEntryKind::Engine { forward, inverse } => {
@@ -124,16 +143,328 @@ impl HistoryEntry {
     }
 }
 
-/// Approximate the retained size of a batch.
+/// Why the history dropped its oldest entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimReason {
+    /// The step cap was reached.
+    Steps,
+    /// The memory budget was reached.
+    Memory,
+}
+
+/// What a push or a limit change did to the history.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PushOutcome {
+    /// Entries still in the history afterwards.
+    pub steps: usize,
+    /// How many of the oldest entries the change dropped.
+    pub trimmed: usize,
+    /// The limit that caused the drop, when one did.
+    pub trim_reason: Option<TrimReason>,
+    /// True when a push merged into the entry before it.
+    pub coalesced: bool,
+}
+
+/// The editor's undo stack.
+#[derive(Debug)]
+pub struct CommandHistory {
+    /// Oldest first; `entries[cursor]` is the next redo.
+    entries: Vec<HistoryEntry>,
+    /// Number of entries currently applied.
+    cursor: usize,
+    /// Maximum number of entries.
+    step_cap: usize,
+    /// Maximum retained bytes.
+    memory_budget_bytes: usize,
+    /// Sum of the entries' `memory_bytes`.
+    memory_used_bytes: usize,
+    /// The registry stamp (a hash of the registered components and their
+    /// fields) that the last prune ran against. It starts at zero, so the first
+    /// prune that gets a real stamp does the walk.
+    registry_stamp: u64,
+}
+
+impl CommandHistory {
+    /// Steps kept when the preferences do not say otherwise.
+    pub const DEFAULT_STEP_CAP: usize = 500;
+    /// Bytes kept when the preferences do not say otherwise.
+    pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+    /// Continuous edits within this window merge into one step.
+    pub const DEFAULT_COALESCE_WINDOW: Duration = Duration::from_millis(400);
+
+    /// Creates a history that enforces `step_cap` entries and
+    /// `memory_budget_bytes` bytes.
+    pub fn new(step_cap: usize, memory_budget_bytes: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            cursor: 0,
+            step_cap,
+            memory_budget_bytes,
+            memory_used_bytes: 0,
+            registry_stamp: 0,
+        }
+    }
+
+    /// Registers the history resource, inserting a default only when the world
+    /// has none, so a reload keeps the live history.
+    pub fn ensure(world: &mut pill_engine::World) {
+        world.register_resource::<CommandHistory>();
+        if world.get_resource::<CommandHistory>().is_none() {
+            world.insert_resource(Self::default());
+        }
+    }
+
+    /// Drops every recorded step but keeps the configured limits.
+    ///
+    /// Starting a new scene or opening a file clears the history this way. The
+    /// entries name entities the previous document owned, and undoing one
+    /// would edit a world those entities never belonged to.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.cursor = 0;
+        self.memory_used_bytes = 0;
+    }
+
+    /// Applies the limits the preferences set and trims while the history is
+    /// over either of them.
+    ///
+    /// The returned outcome says how many entries that dropped and which limit
+    /// caused it, so the caller can log it.
+    pub fn set_limits(&mut self, step_cap: usize, memory_budget_bytes: usize) -> PushOutcome {
+        self.step_cap = step_cap.max(1);
+        self.memory_budget_bytes = memory_budget_bytes;
+        let (dropped_step_count, trim_reason) = self.trim();
+        PushOutcome {
+            steps: self.entries.len(),
+            trimmed: dropped_step_count,
+            trim_reason,
+            coalesced: false,
+        }
+    }
+
+    /// Pushes one step, merging it into the entry before it when the two
+    /// coalesce.
+    ///
+    /// `now_millis` is when the step arrived, and `coalesce_window` is how
+    /// close two coalescing edits must be to merge. A push after an undo drops
+    /// the redo tail, because the user has started a new branch.
+    pub fn push(
+        &mut self,
+        mut incoming_entry: HistoryEntry,
+        now_millis: u64,
+        coalesce_window: Duration,
+    ) -> PushOutcome {
+        let mut outcome = PushOutcome::default();
+        // Step 1: Decide whether this step merges into the newest applied
+        // entry. Only a push at the end of the applied list merges; anything
+        // after an undo starts a new branch.
+        let merge_index = if self.cursor > 0 && self.cursor == self.entries.len() {
+            Some(self.cursor - 1)
+        } else {
+            None
+        };
+        if let (Some(index), Some(key)) = (merge_index, incoming_entry.coalesce_key.as_deref()) {
+            let newest_entry = &mut self.entries[index];
+            let is_within_window = now_millis.saturating_sub(newest_entry.coalesced_at_millis)
+                <= coalesce_window.as_millis() as u64;
+            if newest_entry.coalesce_key.as_deref() == Some(key) && is_within_window {
+                if let (
+                    HistoryEntryKind::Engine { forward, .. },
+                    HistoryEntryKind::Engine {
+                        forward: new_forward,
+                        inverse: new_inverse,
+                    },
+                ) = (&mut newest_entry.entry, &mut incoming_entry.entry)
+                {
+                    // Keep the original inverse, which restores the value the
+                    // drag started from, and take the newest forward commands.
+                    let merged_bytes = estimate_bytes(new_forward) + estimate_bytes(new_inverse);
+                    self.memory_used_bytes = self
+                        .memory_used_bytes
+                        .saturating_sub(newest_entry.memory_bytes)
+                        .saturating_add(merged_bytes);
+                    newest_entry.memory_bytes = merged_bytes;
+                    *forward = std::mem::take(new_forward);
+                    for identifier in &incoming_entry.touched {
+                        if !newest_entry.touched.contains(identifier) {
+                            newest_entry.touched.push(identifier.clone());
+                        }
+                    }
+                    newest_entry.coalesced_at_millis = now_millis;
+                    outcome.coalesced = true;
+                    outcome.steps = self.entries.len();
+                    return outcome;
+                }
+            }
+        }
+        // Step 2: A new edit discards the redo tail the last undo left behind.
+        if self.cursor < self.entries.len() {
+            let dropped_entries: Vec<HistoryEntry> = self.entries.split_off(self.cursor);
+            for entry in &dropped_entries {
+                self.memory_used_bytes = self.memory_used_bytes.saturating_sub(entry.memory_bytes);
+            }
+        }
+        // Step 3: Record the step, then enforce the limits, dropping the oldest
+        // entries first.
+        self.memory_used_bytes = self
+            .memory_used_bytes
+            .saturating_add(incoming_entry.memory_bytes);
+        self.entries.push(incoming_entry);
+        self.cursor = self.entries.len();
+        let (dropped_step_count, trim_reason) = self.trim();
+        outcome.trimmed = dropped_step_count;
+        outcome.trim_reason = trim_reason;
+        outcome.steps = self.entries.len();
+        outcome
+    }
+
+    /// Drops the oldest entries until both limits hold.
+    fn trim(&mut self) -> (usize, Option<TrimReason>) {
+        let mut dropped_step_count = 0;
+        let mut trim_reason = None;
+        while self.entries.len() > self.step_cap
+            || self.memory_used_bytes > self.memory_budget_bytes
+        {
+            let entry = self.entries.remove(0);
+            self.memory_used_bytes = self.memory_used_bytes.saturating_sub(entry.memory_bytes);
+            self.cursor = self.cursor.saturating_sub(1);
+            dropped_step_count += 1;
+            // Name the step cap first while both limits are still broken:
+            // dropping for the count is the common case, so it must not be
+            // reported as a memory trim.
+            if self.entries.len() >= self.step_cap {
+                trim_reason = Some(TrimReason::Steps);
+            } else if trim_reason.is_none() {
+                trim_reason = Some(TrimReason::Memory);
+            }
+        }
+        (dropped_step_count, trim_reason)
+    }
+
+    /// Pops the newest applied step for undoing.
+    pub fn pop_undo(&mut self) -> Option<HistoryEntry> {
+        if self.cursor == 0 {
+            return None;
+        }
+        self.cursor -= 1;
+        Some(self.entries[self.cursor].clone())
+    }
+
+    /// Pops the next unapplied step for redoing.
+    pub fn pop_redo(&mut self) -> Option<HistoryEntry> {
+        if self.cursor >= self.entries.len() {
+            return None;
+        }
+        let entry = self.entries[self.cursor].clone();
+        self.cursor += 1;
+        Some(entry)
+    }
+
+    /// Puts the cursor back after an undo whose commands failed.
+    ///
+    /// The step is popped before its commands run. When one of them fails, the
+    /// world still shows the edit, so the step must be undoable again rather
+    /// than offered as redoable.
+    pub fn undo_rollback(&mut self) {
+        if self.cursor < self.entries.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// Puts the cursor back after a redo whose commands failed.
+    pub fn redo_rollback(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+
+    /// Entries currently held (applied plus redoable).
+    pub fn steps(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Steps available to undo.
+    pub fn undo_depth(&self) -> usize {
+        self.cursor
+    }
+
+    /// Steps available to redo.
+    pub fn redo_depth(&self) -> usize {
+        self.entries.len() - self.cursor
+    }
+
+    /// Retained size in bytes.
+    pub fn memory_bytes(&self) -> usize {
+        self.memory_used_bytes
+    }
+
+    /// Follows an entity to the fresh handle a restore assigned it.
+    pub fn remap_entity(&mut self, previous: Entity, assigned: Entity) {
+        for entry in &mut self.entries {
+            entry.remap_entity(previous, assigned);
+        }
+    }
+
+    /// Drops every entry that names an identifier `is_valid` rejects.
+    ///
+    /// `is_valid` is asked about `"component"` and `"component.field"`
+    /// strings. One rejected identifier is enough to drop the whole entry,
+    /// because undoing it would target storage that no longer exists.
+    ///
+    /// `registry_stamp` identifies the registry the check runs against: the
+    /// caller hashes the registered component names and their fields. An
+    /// unchanged stamp returns without walking the entries, so a caller can
+    /// ask again on every frame.
+    ///
+    /// Returns how many entries were dropped.
+    pub fn drop_stale(&mut self, is_valid: impl Fn(&str) -> bool, registry_stamp: u64) -> usize {
+        if self.registry_stamp == registry_stamp {
+            return 0;
+        }
+        self.registry_stamp = registry_stamp;
+        let applied_count_before = self.cursor;
+        let mut dropped_entry_count = 0;
+        let mut kept_entries: Vec<HistoryEntry> = Vec::with_capacity(self.entries.len());
+        let mut applied_count_kept = 0;
+        for (index, entry) in std::mem::take(&mut self.entries).into_iter().enumerate() {
+            if entry.touched.iter().any(|identifier| !is_valid(identifier)) {
+                dropped_entry_count += 1;
+                self.memory_used_bytes = self.memory_used_bytes.saturating_sub(entry.memory_bytes);
+                continue;
+            }
+            if index < applied_count_before {
+                applied_count_kept += 1;
+            }
+            kept_entries.push(entry);
+        }
+        self.entries = kept_entries;
+        self.cursor = applied_count_kept;
+        dropped_entry_count
+    }
+}
+
+impl Default for CommandHistory {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_STEP_CAP, Self::DEFAULT_MEMORY_BUDGET_BYTES)
+    }
+}
+
+impl pill_engine::Resource for CommandHistory {}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Estimates how many bytes a batch keeps alive.
 ///
-/// The estimate only gates the memory budget, so exactness is not required:
-/// a fixed per-command cost plus the owned strings and array payloads gets
-/// the budget's behavior (old entries drop under pressure) right.
+/// The number only decides when the memory budget drops the oldest entries,
+/// so it does not have to be exact: a fixed cost per command plus the bytes
+/// its strings and arrays hold is close enough for that decision.
 pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
-    const PER_COMMAND: usize = 96;
-    let mut bytes = commands.len() * PER_COMMAND;
+    const PER_COMMAND_BYTES: usize = 96;
+    let mut bytes = commands.len() * PER_COMMAND_BYTES;
     for command in commands {
-        let strings = match command {
+        let payload_bytes = match command {
             EditorCommand::SetField {
                 component,
                 field,
@@ -196,8 +527,9 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
                     + sources.iter().map(String::len).sum::<usize>()
                     + destination.len()
             }
-            // The asset commands: the restore carries the deleted file's whole
-            // pre-image, which is what the budget counts.
+            // Asset commands cost what their paths and names hold, except
+            // the restore, which carries the deleted file's old content: that
+            // copy is the bulk of what the memory budget counts.
             EditorCommand::CreateStandaloneAsset {
                 type_name,
                 folder,
@@ -234,317 +566,29 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
                     + asset.as_ref().map(String::len).unwrap_or(0)
                     + resource.as_ref().map(String::len).unwrap_or(0)
             }
-            // Document commands are never recorded, so their cost is zero -
-            // but the estimate still has to name them.
+            // Opening and saving a scene is never recorded, so it costs
+            // nothing; this arm exists only to cover the commands.
             EditorCommand::SceneNew | EditorCommand::SceneSave => 0,
             EditorCommand::SceneOpen { path } | EditorCommand::SceneSaveAs { path } => path.len(),
         };
-        bytes += strings;
+        bytes += payload_bytes;
     }
     bytes
 }
 
-/// Byte size of one field value payload (strings and arrays dominate).
-fn field_value_bytes(value: &FieldValue) -> usize {
-    match value {
+/// Returns the bytes one field value holds: a string's length, an array's
+/// elements added up, or a fixed eight for a plain number.
+fn field_value_bytes(field_value: &FieldValue) -> usize {
+    match field_value {
         FieldValue::Text(text) => text.len(),
         FieldValue::Array(elements) => elements.iter().map(field_value_bytes).sum(),
         _ => 8,
     }
 }
 
-/// Why the history dropped its oldest entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrimReason {
-    /// The step cap was reached.
-    Steps,
-    /// The memory budget was reached.
-    Memory,
-}
-
-/// What [`CommandHistory::push`] did to the history.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PushOutcome {
-    /// Entries still in the history after the push.
-    pub steps: usize,
-    /// How many oldest entries this push dropped.
-    pub trimmed: usize,
-    /// The limit that caused the drop, when one did.
-    pub trim_reason: Option<TrimReason>,
-    /// True when this push merged into the previous entry.
-    pub coalesced: bool,
-}
-
-/// The editor's undo stack.
-#[derive(Debug)]
-pub struct CommandHistory {
-    /// Oldest first; `entries[cursor]` is the next redo.
-    entries: Vec<HistoryEntry>,
-    /// Number of entries currently applied.
-    cursor: usize,
-    /// Maximum number of entries.
-    step_cap: usize,
-    /// Maximum retained bytes.
-    memory_budget_bytes: usize,
-    /// Sum of the entries' `memory_bytes`.
-    memory_used_bytes: usize,
-    /// The component-registry stamp `drop_stale` last pruned against; zero
-    /// before the first prune, so the first call always runs.
-    registry_stamp: u64,
-}
-
-impl Default for CommandHistory {
-    fn default() -> Self {
-        Self::new(Self::DEFAULT_STEP_CAP, Self::DEFAULT_MEMORY_BUDGET_BYTES)
-    }
-}
-
-impl CommandHistory {
-    /// Steps kept when the preferences do not say otherwise.
-    pub const DEFAULT_STEP_CAP: usize = 500;
-    /// Bytes kept when the preferences do not say otherwise.
-    pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-    /// Continuous edits within this window merge into one step.
-    pub const DEFAULT_COALESCE_WINDOW: Duration = Duration::from_millis(400);
-
-    /// A history enforcing the given limits.
-    pub fn new(step_cap: usize, memory_budget_bytes: usize) -> Self {
-        Self {
-            entries: Vec::new(),
-            cursor: 0,
-            step_cap,
-            memory_budget_bytes,
-            memory_used_bytes: 0,
-            registry_stamp: 0,
-        }
-    }
-
-    /// Re-claim the resource across a reload, keeping the live history.
-    pub fn ensure(world: &mut pill_engine::World) {
-        world.register_resource::<CommandHistory>();
-        if world.get_resource::<CommandHistory>().is_none() {
-            world.insert_resource(Self::default());
-        }
-    }
-
-    /// Drop every recorded step, keeping the configured limits.
-    ///
-    /// What opening or starting a scene does: its entries name entities the
-    /// previous document owned, and undoing into those would edit a world they
-    /// never belonged to.
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.cursor = 0;
-        self.memory_used_bytes = 0;
-    }
-
-    /// Apply the preferences' limits, trimming if they shrank.
-    ///
-    /// Returns the trim that resulted, for the caller to log.
-    pub fn set_limits(&mut self, step_cap: usize, memory_budget_bytes: usize) -> PushOutcome {
-        self.step_cap = step_cap.max(1);
-        self.memory_budget_bytes = memory_budget_bytes;
-        let (trimmed, trim_reason) = self.trim();
-        PushOutcome {
-            steps: self.entries.len(),
-            trimmed,
-            trim_reason,
-            coalesced: false,
-        }
-    }
-
-    /// Push one step, merging it into the previous one when they coalesce.
-    ///
-    /// Pushing after an undo drops the redo tail: the branch the user left is
-    /// gone, which is what every editor does.
-    pub fn push(
-        &mut self,
-        mut entry: HistoryEntry,
-        now_millis: u64,
-        coalesce_window: Duration,
-    ) -> PushOutcome {
-        let mut outcome = PushOutcome::default();
-        // Step 1: decide whether this merges into the newest applied entry.
-        // Only a push at the tip merges; anything after an undo starts fresh.
-        let merge_index = if self.cursor > 0 && self.cursor == self.entries.len() {
-            Some(self.cursor - 1)
-        } else {
-            None
-        };
-        if let (Some(index), Some(key)) = (merge_index, entry.coalesce_key.as_deref()) {
-            let last = &mut self.entries[index];
-            let within_window = now_millis.saturating_sub(last.coalesced_at_millis)
-                <= coalesce_window.as_millis() as u64;
-            if last.coalesce_key.as_deref() == Some(key) && within_window {
-                if let (
-                    HistoryEntryKind::Engine { forward, .. },
-                    HistoryEntryKind::Engine {
-                        forward: new_forward,
-                        inverse: new_inverse,
-                    },
-                ) = (&mut last.entry, &mut entry.entry)
-                {
-                    // Keep the original inverse (it restores the drag's start)
-                    // and adopt the newest forward values.
-                    let merged_bytes = estimate_bytes(new_forward) + estimate_bytes(new_inverse);
-                    self.memory_used_bytes = self
-                        .memory_used_bytes
-                        .saturating_sub(last.memory_bytes)
-                        .saturating_add(merged_bytes);
-                    last.memory_bytes = merged_bytes;
-                    *forward = std::mem::take(new_forward);
-                    for identifier in &entry.touched {
-                        if !last.touched.contains(identifier) {
-                            last.touched.push(identifier.clone());
-                        }
-                    }
-                    last.coalesced_at_millis = now_millis;
-                    outcome.coalesced = true;
-                    outcome.steps = self.entries.len();
-                    return outcome;
-                }
-            }
-        }
-        // Step 2: a fresh push discards the abandoned redo tail.
-        if self.cursor < self.entries.len() {
-            let dropped: Vec<HistoryEntry> = self.entries.split_off(self.cursor);
-            for entry in &dropped {
-                self.memory_used_bytes = self.memory_used_bytes.saturating_sub(entry.memory_bytes);
-            }
-        }
-        // Step 3: record, then enforce the limits oldest-first.
-        self.memory_used_bytes = self.memory_used_bytes.saturating_add(entry.memory_bytes);
-        self.entries.push(entry);
-        self.cursor = self.entries.len();
-        let (trimmed, trim_reason) = self.trim();
-        outcome.trimmed = trimmed;
-        outcome.trim_reason = trim_reason;
-        outcome.steps = self.entries.len();
-        outcome
-    }
-
-    /// Drop oldest entries until both limits hold.
-    fn trim(&mut self) -> (usize, Option<TrimReason>) {
-        let mut trimmed = 0;
-        let mut reason = None;
-        while self.entries.len() > self.step_cap
-            || self.memory_used_bytes > self.memory_budget_bytes
-        {
-            let entry = self.entries.remove(0);
-            self.memory_used_bytes = self.memory_used_bytes.saturating_sub(entry.memory_bytes);
-            self.cursor = self.cursor.saturating_sub(1);
-            trimmed += 1;
-            // Report the limit that would still be violated first: a step
-            // cap stop is the common case and must not hide behind memory.
-            if self.entries.len() >= self.step_cap {
-                reason = Some(TrimReason::Steps);
-            } else if reason.is_none() {
-                reason = Some(TrimReason::Memory);
-            }
-        }
-        (trimmed, reason)
-    }
-
-    /// Pop the newest applied step for undoing.
-    pub fn pop_undo(&mut self) -> Option<HistoryEntry> {
-        if self.cursor == 0 {
-            return None;
-        }
-        self.cursor -= 1;
-        Some(self.entries[self.cursor].clone())
-    }
-
-    /// Pop the next unapplied step for redoing.
-    pub fn pop_redo(&mut self) -> Option<HistoryEntry> {
-        if self.cursor >= self.entries.len() {
-            return None;
-        }
-        let entry = self.entries[self.cursor].clone();
-        self.cursor += 1;
-        Some(entry)
-    }
-
-    /// Put the cursor back where a failed undo left it.
-    ///
-    /// The step was popped before its inverse ran, so an inverse that failed
-    /// leaves the world showing the edit while the cursor offers the step as
-    /// redoable. Moving it back makes the step undoable again and drops it from
-    /// the redo tail, so neither direction claims a step that did not run.
-    pub fn undo_rollback(&mut self) {
-        if self.cursor < self.entries.len() {
-            self.cursor += 1;
-        }
-    }
-
-    /// Put the cursor back where a failed redo left it.
-    pub fn redo_rollback(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-        }
-    }
-
-    /// Entries currently held (applied plus redoable).
-    pub fn steps(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Steps available to undo.
-    pub fn undo_depth(&self) -> usize {
-        self.cursor
-    }
-
-    /// Steps available to redo.
-    pub fn redo_depth(&self) -> usize {
-        self.entries.len() - self.cursor
-    }
-
-    /// Retained size in bytes.
-    pub fn memory_bytes(&self) -> usize {
-        self.memory_used_bytes
-    }
-
-    /// Follow an entity to the fresh handle a restore assigned it.
-    pub fn remap_entity(&mut self, previous: Entity, assigned: Entity) {
-        for entry in &mut self.entries {
-            entry.remap_entity(previous, assigned);
-        }
-    }
-
-    /// Drop entries whose identifiers a reload invalidated.
-    ///
-    /// `is_valid` receives `"component"` and `"component.field"` identifiers;
-    /// an entry with any invalid identifier goes, because undoing it would
-    /// target storage that no longer exists. `stamp` identifies the registry
-    /// the check ran against: an unchanged stamp skips the walk, so a caller
-    /// may ask on every frame for one hash and no allocation. Returns how
-    /// many were dropped.
-    pub fn drop_stale(&mut self, is_valid: impl Fn(&str) -> bool, stamp: u64) -> usize {
-        if self.registry_stamp == stamp {
-            return 0;
-        }
-        self.registry_stamp = stamp;
-        let applied_before = self.cursor;
-        let mut dropped = 0;
-        let mut kept: Vec<HistoryEntry> = Vec::with_capacity(self.entries.len());
-        let mut applied_kept = 0;
-        for (index, entry) in std::mem::take(&mut self.entries).into_iter().enumerate() {
-            if entry.touched.iter().any(|identifier| !is_valid(identifier)) {
-                dropped += 1;
-                self.memory_used_bytes = self.memory_used_bytes.saturating_sub(entry.memory_bytes);
-                continue;
-            }
-            if index < applied_before {
-                applied_kept += 1;
-            }
-            kept.push(entry);
-        }
-        self.entries = kept;
-        self.cursor = applied_kept;
-        dropped
-    }
-}
-
-impl pill_engine::Resource for CommandHistory {}
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -552,42 +596,42 @@ mod tests {
     use crate::editor_state::EditorCommand;
 
     /// A field edit entry over a named component, for history-only tests.
-    fn field_entry(label: &str, value: f32) -> HistoryEntry {
+    fn field_entry(label: &str, field_value: f32) -> HistoryEntry {
         let command = EditorCommand::SetField {
             entity: Entity::default(),
             component: "Demo".to_string(),
             field: "strength".to_string(),
-            value: FieldValue::F32(value),
+            value: FieldValue::F32(field_value),
         };
         HistoryEntry::engine(label, vec![command.clone()], vec![command])
     }
 
-    /// The window tests coalesce against, in milliseconds.
-    const WINDOW: Duration = Duration::from_millis(400);
+    /// The coalesce window these tests use, in milliseconds.
+    const COALESCE_WINDOW: Duration = Duration::from_millis(400);
 
     #[test]
     fn the_memory_budget_counts_asset_pre_images() {
-        // The undo of an asset delete carries the whole file as its
-        // pre-image; that is the memory the budget must count.
-        let pre_image = vec![0u8; 64 * 1024];
+        // Undoing an asset delete needs the whole file back, so that copy
+        // is the memory the budget must count.
+        let deleted_file_bytes = vec![0u8; 64 * 1024];
         let forward = EditorCommand::DeleteAssetFile {
             path: "textures/helmet.png".to_string(),
         };
         let inverse = EditorCommand::RestoreAssetFile {
             path: "textures/helmet.png".to_string(),
-            bytes: pre_image.clone(),
+            bytes: deleted_file_bytes.clone(),
             meta: Some(b"{\"guid\":\"abc\"}".to_vec()),
         };
         let entry = HistoryEntry::engine("delete asset", vec![forward], vec![inverse]);
         assert!(
-            entry.memory_bytes >= pre_image.len(),
+            entry.memory_bytes >= deleted_file_bytes.len(),
             "the pre-image must land in memory_bytes ({} < {})",
             entry.memory_bytes,
-            pre_image.len()
+            deleted_file_bytes.len()
         );
 
         let mut history = CommandHistory::new(10, 32 * 1024);
-        history.push(entry.clone(), 0, WINDOW);
+        history.push(entry.clone(), 0, COALESCE_WINDOW);
         assert_eq!(
             history.steps(),
             0,
@@ -595,17 +639,17 @@ mod tests {
         );
         // The same entry fits a larger budget: the drop above was the byte
         // count, not the recording.
-        let mut roomy = CommandHistory::new(10, usize::MAX);
-        roomy.push(entry, 0, WINDOW);
-        assert_eq!(roomy.steps(), 1);
-        assert!(roomy.memory_bytes() >= pre_image.len());
+        let mut roomy_history = CommandHistory::new(10, usize::MAX);
+        roomy_history.push(entry, 0, COALESCE_WINDOW);
+        assert_eq!(roomy_history.steps(), 1);
+        assert!(roomy_history.memory_bytes() >= deleted_file_bytes.len());
     }
 
     #[test]
     fn push_undo_redo_round_trip() {
         let mut history = CommandHistory::new(10, usize::MAX);
-        history.push(field_entry("one", 1.0), 0, WINDOW);
-        history.push(field_entry("two", 2.0), 1000, WINDOW);
+        history.push(field_entry("one", 1.0), 0, COALESCE_WINDOW);
+        history.push(field_entry("two", 2.0), 1000, COALESCE_WINDOW);
         assert_eq!(history.steps(), 2);
         assert_eq!(history.undo_depth(), 2);
 
@@ -623,10 +667,10 @@ mod tests {
     #[test]
     fn push_after_undo_drops_the_redo_tail() {
         let mut history = CommandHistory::new(10, usize::MAX);
-        history.push(field_entry("one", 1.0), 0, WINDOW);
-        history.push(field_entry("two", 2.0), 1000, WINDOW);
+        history.push(field_entry("one", 1.0), 0, COALESCE_WINDOW);
+        history.push(field_entry("two", 2.0), 1000, COALESCE_WINDOW);
         history.pop_undo();
-        history.push(field_entry("three", 3.0), 2000, WINDOW);
+        history.push(field_entry("three", 3.0), 2000, COALESCE_WINDOW);
         assert_eq!(history.steps(), 2);
         assert_eq!(history.redo_depth(), 0);
         assert_eq!(history.undo_depth(), 2);
@@ -636,9 +680,10 @@ mod tests {
     fn continuous_edits_coalesce_into_one_step() {
         let mut history = CommandHistory::new(10, usize::MAX);
         // A slider drag: same key, edits close together in time.
-        for step in 0..5 {
-            let entry = field_entry("drag", step as f32).coalescing("slider", step * 50);
-            history.push(entry, step * 50, WINDOW);
+        for step_index in 0..5 {
+            let entry =
+                field_entry("drag", step_index as f32).coalescing("slider", step_index * 50);
+            history.push(entry, step_index * 50, COALESCE_WINDOW);
         }
         // One step; the inverse still restores the drag's starting value.
         assert_eq!(history.steps(), 1);
@@ -669,7 +714,7 @@ mod tests {
         history.push(
             field_entry("drag", 9.0).coalescing("slider", 5000),
             5000,
-            WINDOW,
+            COALESCE_WINDOW,
         );
         assert_eq!(history.steps(), 1);
     }
@@ -677,11 +722,15 @@ mod tests {
     #[test]
     fn step_cap_trims_oldest_first() {
         let mut history = CommandHistory::new(3, usize::MAX);
-        for step in 0..5 {
-            history.push(field_entry("step", step as f32), step as u64 * 1000, WINDOW);
+        for step_index in 0..5 {
+            history.push(
+                field_entry("step", step_index as f32),
+                step_index as u64 * 1000,
+                COALESCE_WINDOW,
+            );
         }
         assert_eq!(history.steps(), 3);
-        let outcome = history.push(field_entry("more", 9.0), 6000, WINDOW);
+        let outcome = history.push(field_entry("more", 9.0), 6000, COALESCE_WINDOW);
         assert_eq!(outcome.trimmed, 1);
         assert_eq!(outcome.trim_reason, Some(TrimReason::Steps));
     }
@@ -689,7 +738,7 @@ mod tests {
     #[test]
     fn memory_budget_trims_with_its_own_reason() {
         let mut history = CommandHistory::new(100, 2048);
-        for step in 0..8 {
+        for step_index in 0..8 {
             let command = EditorCommand::SetField {
                 entity: Entity::default(),
                 component: "Demo".to_string(),
@@ -697,7 +746,7 @@ mod tests {
                 value: FieldValue::Text("x".repeat(400)),
             };
             let entry = HistoryEntry::engine("big", vec![command.clone()], vec![command]);
-            history.push(entry, step as u64 * 1000, WINDOW);
+            history.push(entry, step_index as u64 * 1000, COALESCE_WINDOW);
         }
         assert!(history.memory_bytes() <= 2048);
         assert!(history.steps() < 8);
@@ -706,7 +755,7 @@ mod tests {
     #[test]
     fn drop_stale_removes_invalid_entries_and_keeps_the_cursor() {
         let mut history = CommandHistory::new(10, usize::MAX);
-        history.push(field_entry("keep one", 1.0), 0, WINDOW);
+        history.push(field_entry("keep one", 1.0), 0, COALESCE_WINDOW);
         history.push(
             HistoryEntry::engine(
                 "stale",
@@ -719,46 +768,46 @@ mod tests {
                 Vec::new(),
             ),
             1000,
-            WINDOW,
+            COALESCE_WINDOW,
         );
-        history.push(field_entry("keep two", 3.0), 2000, WINDOW);
+        history.push(field_entry("keep two", 3.0), 2000, COALESCE_WINDOW);
         history.pop_undo(); // "keep two" is now unapplied.
         let dropped = history.drop_stale(|identifier| !identifier.starts_with("Gone"), 1);
         assert_eq!(dropped, 1);
         assert_eq!(history.steps(), 2);
         assert_eq!(history.undo_depth(), 1);
         assert_eq!(history.redo_depth(), 1);
-        // The same registry stamp reports nothing the second time: the prune
-        // rides one registry change, not one call.
+        // The same registry stamp reports nothing the second time, so the
+        // prune runs once per registry change rather than once per call.
         assert_eq!(history.drop_stale(|_| false, 1), 0);
         assert_eq!(history.drop_stale(|_| false, 2), 2);
     }
 
     #[test]
     fn remap_follows_a_restored_entity() {
-        let old = Entity::default();
-        let fresh = Entity::default();
+        let previous_entity = Entity::default();
+        let assigned_entity = Entity::default();
         let mut history = CommandHistory::new(10, usize::MAX);
         history.push(
             HistoryEntry::engine(
                 "on the restored entity",
                 vec![EditorCommand::SetField {
-                    entity: old,
+                    entity: previous_entity,
                     component: "Demo".to_string(),
                     field: "strength".to_string(),
                     value: FieldValue::F32(1.0),
                 }],
                 vec![EditorCommand::SetField {
-                    entity: old,
+                    entity: previous_entity,
                     component: "Demo".to_string(),
                     field: "strength".to_string(),
                     value: FieldValue::F32(0.0),
                 }],
             ),
             0,
-            WINDOW,
+            COALESCE_WINDOW,
         );
-        history.remap_entity(old, fresh);
+        history.remap_entity(previous_entity, assigned_entity);
         let entry = history.pop_undo().expect("entry");
         let HistoryEntryKind::Engine { forward, inverse } = entry.entry else {
             panic!("engine entry expected");
@@ -767,7 +816,7 @@ mod tests {
             let EditorCommand::SetField { entity, .. } = command else {
                 panic!("set field expected");
             };
-            assert_eq!(*entity, fresh);
+            assert_eq!(*entity, assigned_entity);
         }
     }
 
@@ -779,16 +828,16 @@ mod tests {
         history.push(
             HistoryEntry::selection(Some(before), Some(after)),
             0,
-            WINDOW,
+            COALESCE_WINDOW,
         );
         let entry = history.pop_undo().expect("selection step");
         match entry.entry {
             HistoryEntryKind::Selection {
-                before: b,
-                after: a,
+                before: carried_before,
+                after: carried_after,
             } => {
-                assert_eq!(b, Some(before));
-                assert_eq!(a, Some(after));
+                assert_eq!(carried_before, Some(before));
+                assert_eq!(carried_after, Some(after));
             }
             HistoryEntryKind::Engine { .. } => panic!("selection entry expected"),
         }
@@ -797,8 +846,12 @@ mod tests {
     #[test]
     fn limits_shrink_trims_existing_entries() {
         let mut history = CommandHistory::new(10, usize::MAX);
-        for step in 0..6 {
-            history.push(field_entry("step", step as f32), step as u64 * 1000, WINDOW);
+        for step_index in 0..6 {
+            history.push(
+                field_entry("step", step_index as f32),
+                step_index as u64 * 1000,
+                COALESCE_WINDOW,
+            );
         }
         let outcome = history.set_limits(2, usize::MAX);
         assert_eq!(history.steps(), 2);

@@ -1,26 +1,37 @@
-//! The Preferences tab's shared vocabulary: the preferences
-//! file's editable keys, value parsing and the document helpers.
+//! The Preferences tab's shared vocabulary: the preferences file's editable
+//! keys, the rules that turn row text into JSON, and the helpers that read and
+//! write the document.
 //!
 //! # Responsibilities
 //!
-//! - [`PREFERENCE_FIELDS`]: the editable rows (file key, label, blank-file
-//!   fallback) the Preferences tab draws, in row order.
-//! - [`PreferencesView`]: the file's current values as display strings,
-//!   plus the project key and its remembered gizmo entry - the snapshot
-//!   tier the tab seeds its buffers from.
-//! - [`parse_value`], [`set_key`], [`read_document`], [`write_document`]:
-//!   the text-to-JSON rule and the dotted-key document access the
-//!   `SetPreferences` command applies.
+//! - [`PREFERENCE_FIELDS`]: the editable rows the Preferences tab draws, in row
+//!   order. Each row names its key in the file, the label it shows, and the
+//!   text a file without that key shows.
+//! - [`PreferencesView`]: the file's values as display strings, plus the parsed
+//!   icon size and the project's remembered gizmo entry. The tab seeds its
+//!   buffers from this view.
+//! - [`parse_value`], [`set_key`], [`read_document`], [`write_document`]: the
+//!   text-to-JSON rule and the dotted-key document access the `SetPreferences`
+//!   command applies.
+//! - [`keymap_preset`]: the navigation preset the file selects, or Blender
+//!   when the file says nothing usable.
+//! - [`gizmo_hit_radius`], [`gizmo_icon_size`]: one clamped number each, with
+//!   the default a missing key falls back to.
+//! - [`update`]: reads, edits and writes the document in one step, for a caller
+//!   that updates only the keys it owns.
 //!
 //! # Design
 //!
-//! The preferences file is a plain JSON document the editor does not own
-//! alone: every write is a read-modify-write, so keys other writers leave
-//! behind - the executable's per-project gizmo entry - survive a save. Rows
-//! carry the text the user typed; [`parse_value`] turns a row's text into
-//! JSON - bare JSON first, so a number or a boolean round-trips, anything
-//! else the string it looks like. A blank row writes nothing, so blank keeps
-//! whatever the consumer's own default is.
+//! The preferences file is plain JSON, and the editor does not own it alone.
+//! The tab's save writes the editor-wide rows, and the executable writes the
+//! per-project gizmo entry. Every write therefore reads the document first and
+//! changes only the keys its owner owns, so a key the other writer left behind
+//! survives the save.
+//!
+//! A row holds the text the user typed. [`parse_value`] tries that text as
+//! bare JSON first, so a number or a boolean round-trips, and stores it as a
+//! string otherwise. A blank row writes nothing, so a key that was never set
+//! stays absent and its reader keeps its own default.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -32,18 +43,43 @@ use serde_json::{Map, Value};
 // Current crate
 use crate::commands::{GizmoProjectPreferences, KeymapPreset, PREFERENCES_FILE};
 
-/// The tab's unsaved field buffers: one text per editable key.
-pub type PreferencesDraft = BTreeMap<String, String>;
+// =============================================================================
+// Constants
+// =============================================================================
 
-/// One editable preference: the document key and the row's label.
-pub struct PreferenceField {
-    /// The file's key; a dot nests into an object.
-    pub key: &'static str,
-    /// The label the row shows.
-    pub label: &'static str,
-    /// The text a file without the key shows - the consumer's own default.
-    pub fallback: &'static str,
-}
+/// The preference key the editor's user theme layer is named under.
+///
+/// The value is a `.theme` or `.json` file, either absolute or relative to the
+/// editor's state directory.
+pub const THEME_PREFERENCE_KEY: &str = "theme";
+
+/// The preference key the keymap preset lives under.
+pub const KEYMAP_PRESET_KEY: &str = "keymap_preset";
+
+/// The preference key the gizmo's hit radius lives under.
+pub const GIZMO_HIT_RADIUS_KEY: &str = "editor.gizmo_hit_radius";
+
+/// The hit radius used when the file says nothing: about the width the overlay
+/// draws a gizmo line with.
+pub const GIZMO_HIT_RADIUS_DEFAULT: f32 = 0.07;
+
+/// The range a file's hit radius is clamped into, as a multiplier on the
+/// handle length: tight enough to still mean a handle, wide enough to grab
+/// from.
+pub const GIZMO_HIT_RADIUS_RANGE: (f32, f32) = (0.01, 0.35);
+
+/// The preference key the scene badges' icon size lives under.
+pub const GIZMO_ICON_SIZE_KEY: &str = "editor.gizmo_icon_size";
+
+/// The icon size used when the file says nothing, in points.
+///
+/// It matches the Preferences row's fallback text, so a file without the key
+/// shows the size the badges are drawn with.
+pub const GIZMO_ICON_SIZE_DEFAULT: f32 = 20.0;
+
+/// The range a file's icon size is clamped into, in points: small enough to
+/// stay a mark over the scene, large enough to keep it clickable.
+pub const GIZMO_ICON_SIZE_RANGE: (f32, f32) = (8.0, 64.0);
 
 /// The editable rows, in the order the tab draws them.
 pub const PREFERENCE_FIELDS: [PreferenceField; 12] = [
@@ -65,8 +101,8 @@ pub const PREFERENCE_FIELDS: [PreferenceField; 12] = [
     PreferenceField {
         key: GIZMO_ICON_SIZE_KEY,
         label: "gizmo icon size",
-        // Two steps up from the fixed 10-point mark the badges carried
-        // before the row existed, so the default reads clearly larger.
+        // The fallback repeats `GIZMO_ICON_SIZE_DEFAULT`, so a file without the
+        // key shows the size the badges are drawn with.
         fallback: "20",
     },
     PreferenceField {
@@ -111,104 +147,41 @@ pub const PREFERENCE_FIELDS: [PreferenceField; 12] = [
     },
 ];
 
-/// The preference key the editor's user theme layer is named under: a
-/// `.theme`/`.json` file, absolute or relative to the editor's state
-/// directory.
-pub const THEME_PREFERENCE_KEY: &str = "theme";
+// =============================================================================
+// Types
+// =============================================================================
 
-/// The preference key the keymap preset lives under.
-pub const KEYMAP_PRESET_KEY: &str = "keymap_preset";
+/// The tab's unsaved field buffers: one text per editable key.
+pub type PreferencesDraft = BTreeMap<String, String>;
 
-/// The keymap preset the file selects, or the default (Blender) when the
-/// key is absent, blank or unknown - the preset the viewport navigation
-/// table reads.
-pub fn keymap_preset(document: &Map<String, Value>) -> KeymapPreset {
-    let Some(Value::String(name)) = lookup(document, KEYMAP_PRESET_KEY) else {
-        return KeymapPreset::default();
-    };
-    match name.trim().to_ascii_lowercase().as_str() {
-        "blender" => KeymapPreset::Blender,
-        "unity" => KeymapPreset::Unity,
-        "godot" => KeymapPreset::Godot,
-        "unreal" => KeymapPreset::Unreal,
-        _ => KeymapPreset::default(),
-    }
+/// One editable preference: the document key, the row's label and the text a
+/// file without the key shows.
+pub struct PreferenceField {
+    /// The file's key; a dot nests into an object.
+    pub key: &'static str,
+    /// The label the row shows.
+    pub label: &'static str,
+    /// The text the row shows when the file has no value for the key, which is
+    /// the value the key's reader falls back to.
+    pub fallback: &'static str,
 }
 
-/// The gizmo handle's hit radius the file asks for, as a multiplier on the
-/// handle length.
+/// The file's values as the tab shows them.
 ///
-/// The hover test and the press both read this one number, so a handle that
-/// highlights under the pointer is a handle a press grabs. A missing, blank
-/// or unparsable value keeps the default, and a value outside
-/// [`GIZMO_HIT_RADIUS_RANGE`] is clamped rather than trusted: a zero radius
-/// would make the gizmo ungrabbable.
-pub fn gizmo_hit_radius(document: &Map<String, Value>) -> f32 {
-    let value = match lookup(document, GIZMO_HIT_RADIUS_KEY) {
-        Some(Value::Number(number)) => number.as_f64().map(|number| number as f32),
-        Some(Value::String(text)) => text.trim().parse::<f32>().ok(),
-        _ => None,
-    };
-    value
-        .filter(|radius| radius.is_finite())
-        .unwrap_or(GIZMO_HIT_RADIUS_DEFAULT)
-        .clamp(GIZMO_HIT_RADIUS_RANGE.0, GIZMO_HIT_RADIUS_RANGE.1)
-}
-
-/// The preference key the gizmo's hit radius lives under.
-pub const GIZMO_HIT_RADIUS_KEY: &str = "editor.gizmo_hit_radius";
-
-/// The hit radius used when the file says nothing: about the width the
-/// overlay draws a handle's line with.
-pub const GIZMO_HIT_RADIUS_DEFAULT: f32 = 0.07;
-
-/// The range a file's hit radius is clamped into, as multipliers on the
-/// handle length: tight enough to still mean a handle, wide enough to grab
-/// from.
-pub const GIZMO_HIT_RADIUS_RANGE: (f32, f32) = (0.01, 0.35);
-
-/// The preference key the scene badges' icon size lives under.
-pub const GIZMO_ICON_SIZE_KEY: &str = "editor.gizmo_icon_size";
-
-/// The icon size used when the file says nothing, in points: twice the fixed
-/// 10-point mark the badges drew before the preference existed.
-pub const GIZMO_ICON_SIZE_DEFAULT: f32 = 20.0;
-
-/// The range a file's icon size is clamped into, in points: small enough to
-/// stay a mark over the scene, large enough to keep it clickable.
-pub const GIZMO_ICON_SIZE_RANGE: (f32, f32) = (8.0, 64.0);
-
-/// The scene badges' icon size the file asks for, in points.
-///
-/// The mark and the rectangle that picks it both scale with this one number.
-/// A missing, blank or unparsable value keeps the default, and a value outside
-/// [`GIZMO_ICON_SIZE_RANGE`] is clamped rather than trusted: a zero or
-/// negative size would draw nothing to click on.
-pub fn gizmo_icon_size(document: &Map<String, Value>) -> f32 {
-    let value = match lookup(document, GIZMO_ICON_SIZE_KEY) {
-        Some(Value::Number(number)) => number.as_f64().map(|number| number as f32),
-        Some(Value::String(text)) => text.trim().parse::<f32>().ok(),
-        _ => None,
-    };
-    value
-        .filter(|size| size.is_finite())
-        .unwrap_or(GIZMO_ICON_SIZE_DEFAULT)
-        .clamp(GIZMO_ICON_SIZE_RANGE.0, GIZMO_ICON_SIZE_RANGE.1)
-}
-
-/// The file's current values as the tab shows them.
+/// It holds one display string per editable key, the parsed icon size the
+/// badges are drawn with, and the project's remembered gizmo entry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreferencesView {
     /// One display string per editable field, keyed like the fields.
     pub values: BTreeMap<String, String>,
-    /// The scene badges' icon size, in points: the shell's drawing needs the
-    /// number, not the row's text, so it is parsed here from the same
-    /// document the rows show.
+    /// The scene badges' icon size, in points. The shell draws with the number
+    /// rather than with the row's text, so the view parses it from the same
+    /// document the rows come from.
     pub gizmo_icon_size: f32,
     /// The project key the per-project entry is remembered under.
     pub project: Option<String>,
-    /// The project's remembered gizmo entry, as the file holds it (the
-    /// defaults when the file has none).
+    /// The project's remembered gizmo entry, as the file holds it. A file with
+    /// no entry for this project leaves it at the defaults.
     pub project_gizmo: GizmoProjectPreferences,
     /// Whether the file carries the project's entry at all.
     pub project_remembered: bool,
@@ -227,9 +200,15 @@ impl Default for PreferencesView {
 }
 
 impl PreferencesView {
-    /// Build the view from one parsed document.
+    /// Builds the view from one parsed document.
+    ///
+    /// `project` names the per-project entry to read from `gizmo.projects`. A
+    /// name the file does not hold leaves `project_gizmo` at its defaults and
+    /// `project_remembered` false.
     pub fn from_document(document: &Map<String, Value>, project: Option<&str>) -> Self {
-        let values = PREFERENCE_FIELDS
+        // Step 1: build one display text per editable row, or use the row's
+        // fallback.
+        let row_text_by_key = PREFERENCE_FIELDS
             .iter()
             .map(|field| {
                 let text = lookup(document, field.key)
@@ -238,6 +217,7 @@ impl PreferencesView {
                 (field.key.to_string(), text)
             })
             .collect();
+        // Step 2: the project's own entry, when the file holds one.
         let project_entry = project.and_then(|name| {
             let projects = lookup(document, "gizmo.projects")?.as_object()?;
             projects.get(name)
@@ -246,7 +226,7 @@ impl PreferencesView {
             .and_then(|entry| serde_json::from_value(entry.clone()).ok())
             .unwrap_or_default();
         Self {
-            values,
+            values: row_text_by_key,
             gizmo_icon_size: gizmo_icon_size(document),
             project: project.map(str::to_string),
             project_gizmo,
@@ -254,42 +234,109 @@ impl PreferencesView {
         }
     }
 
-    /// A copy of the rows the tab's buffers start from.
+    /// Returns a copy of the rows the tab's draft buffers start from.
     pub fn seed_buffers(&self) -> BTreeMap<String, String> {
         self.values.clone()
     }
 
-    /// One row's display text.
+    /// Returns one row's display text, or an empty string when the table has
+    /// no such row.
     pub fn text(&self, key: &str) -> &str {
         self.values.get(key).map(String::as_str).unwrap_or("")
     }
 }
 
-/// Follow a dotted key through the document; `None` when any hop is absent
-/// or not an object.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns the keymap preset the file selects.
+///
+/// A key that is absent, blank or unknown selects the default, Blender. The
+/// viewport navigation chords are resolved from the result.
+pub fn keymap_preset(document: &Map<String, Value>) -> KeymapPreset {
+    let Some(Value::String(name)) = lookup(document, KEYMAP_PRESET_KEY) else {
+        return KeymapPreset::default();
+    };
+    match name.trim().to_ascii_lowercase().as_str() {
+        "blender" => KeymapPreset::Blender,
+        "unity" => KeymapPreset::Unity,
+        "godot" => KeymapPreset::Godot,
+        "unreal" => KeymapPreset::Unreal,
+        _ => KeymapPreset::default(),
+    }
+}
+
+/// Returns the gizmo handle's hit radius the file asks for, as a multiplier on
+/// the handle length.
+///
+/// The hover test and the press both read this one number, so a handle that
+/// highlights under the pointer is a handle a press grabs. A missing, blank or
+/// unparsable value keeps the default, and a value outside
+/// [`GIZMO_HIT_RADIUS_RANGE`] is clamped: a zero radius would make the gizmo
+/// ungrabbable.
+pub fn gizmo_hit_radius(document: &Map<String, Value>) -> f32 {
+    let parsed_radius = match lookup(document, GIZMO_HIT_RADIUS_KEY) {
+        Some(Value::Number(number)) => number.as_f64().map(|number| number as f32),
+        Some(Value::String(text)) => text.trim().parse::<f32>().ok(),
+        _ => None,
+    };
+    parsed_radius
+        .filter(|radius| radius.is_finite())
+        .unwrap_or(GIZMO_HIT_RADIUS_DEFAULT)
+        .clamp(GIZMO_HIT_RADIUS_RANGE.0, GIZMO_HIT_RADIUS_RANGE.1)
+}
+
+/// Returns the scene badges' icon size the file asks for, in points.
+///
+/// The mark and the rectangle that picks it both scale with this one number.
+/// A missing, blank or unparsable value keeps the default, and a value outside
+/// [`GIZMO_ICON_SIZE_RANGE`] is clamped: a zero or negative size would draw
+/// nothing to click on.
+pub fn gizmo_icon_size(document: &Map<String, Value>) -> f32 {
+    let parsed_size = match lookup(document, GIZMO_ICON_SIZE_KEY) {
+        Some(Value::Number(number)) => number.as_f64().map(|number| number as f32),
+        Some(Value::String(text)) => text.trim().parse::<f32>().ok(),
+        _ => None,
+    };
+    parsed_size
+        .filter(|size| size.is_finite())
+        .unwrap_or(GIZMO_ICON_SIZE_DEFAULT)
+        .clamp(GIZMO_ICON_SIZE_RANGE.0, GIZMO_ICON_SIZE_RANGE.1)
+}
+
+/// Follows a dotted key through the document.
+///
+/// Returns `None` when a segment is absent, or when a segment before the last
+/// one holds something other than a JSON object.
 pub fn lookup<'a>(document: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
     let mut segments = key.split('.').peekable();
-    let mut current = document;
+    let mut current_object = document;
     while let Some(segment) = segments.next() {
-        let value = current.get(segment)?;
+        let segment_value = current_object.get(segment)?;
         if segments.peek().is_none() {
-            return Some(value);
+            return Some(segment_value);
         }
-        current = value.as_object()?;
+        current_object = segment_value.as_object()?;
     }
     None
 }
 
-/// One JSON value as the tab's text: strings verbatim, the rest compact.
-fn display_value(value: &Value) -> String {
-    match value {
+/// Returns one JSON value as the tab's text: a string verbatim, and anything
+/// else as compact JSON.
+fn display_value(json_value: &Value) -> String {
+    match json_value {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
 }
 
-/// Parse one row's text into JSON: bare JSON first (numbers, booleans,
-/// arrays), anything else the string it looks like.
+/// Parses one row's text into JSON.
+///
+/// The trimmed text is tried as bare JSON first, so a number, a boolean or an
+/// array round-trips. When that fails, the text is quoted and parsed as a JSON
+/// string. Text that still does not parse (it holds an unescaped quote, for
+/// example) is returned as plain text.
 pub fn parse_value(text: &str) -> Value {
     let trimmed = text.trim();
     serde_json::from_str::<Value>(trimmed)
@@ -297,13 +344,14 @@ pub fn parse_value(text: &str) -> Value {
         .unwrap_or_else(|_| Value::String(trimmed.to_string()))
 }
 
-/// Set one dotted key, creating intermediate objects on the way.
+/// Sets one dotted key, creating intermediate objects on the way.
 ///
 /// # Errors
 ///
-/// A message when a segment on the way is present but not an object, or the
-/// key is empty.
+/// Returns a message when the key is empty, or when a segment on the way is
+/// present and holds something other than an object.
 pub fn set_key(document: &mut Map<String, Value>, key: &str, value: Value) -> Result<(), String> {
+    // Step 1: refuse a key with nothing in it.
     if key.is_empty() {
         return Err(format!("`{key}` is empty"));
     }
@@ -311,30 +359,32 @@ pub fn set_key(document: &mut Map<String, Value>, key: &str, value: Value) -> Re
     let Some((last, parents)) = segments.split_last() else {
         return Err(format!("`{key}` is empty"));
     };
+    // Step 2: walk the parent segments, creating each object that is missing.
     let mut current = document;
     for segment in parents {
-        let entry = current
+        let intermediate_object = current
             .entry(segment.to_string())
             .or_insert_with(|| Value::Object(Map::new()));
-        current = entry
+        current = intermediate_object
             .as_object_mut()
             .ok_or_else(|| format!("`{segment}` in `{key}` is not an object"))?;
     }
+    // Step 3: write the value under the last segment.
     current.insert(last.to_string(), value);
     Ok(())
 }
 
-/// Read the preferences document a write will modify.
+/// Reads the preferences document a write will modify.
 ///
-/// A missing file is an empty document - the first save creates it - but a file
-/// that exists and cannot be read or parsed is an error. Folding it into an
-/// empty document would let the next save write a file holding only the keys it
-/// set, erasing every unrelated preference.
+/// A missing file is an empty document, so the first save creates it. A file
+/// that exists and cannot be read or parsed is an error instead. Reading it as
+/// empty would let the next save write a file holding only the keys it set,
+/// erasing every unrelated preference.
 ///
 /// # Errors
 ///
-/// A message naming the file when it cannot be read, is not JSON, or is not a
-/// JSON object.
+/// Returns a message naming the file when it cannot be read, is not JSON, or is
+/// not a JSON object.
 pub fn read_document(directory: &Path) -> Result<Map<String, Value>, String> {
     let path = directory.join(PREFERENCES_FILE);
     match crate::editor_files::read_json::<Value>(&path) {
@@ -345,11 +395,12 @@ pub fn read_document(directory: &Path) -> Result<Map<String, Value>, String> {
     }
 }
 
-/// Parse a preferences file's text into its document.
+/// Parses a preferences file's text into its document.
 ///
 /// # Errors
 ///
-/// A message naming the file when the text is not JSON or is not a JSON object.
+/// Returns a message naming the file when the text is not JSON or is not a JSON
+/// object.
 pub fn parse_document(text: &str) -> Result<Map<String, Value>, String> {
     let value: Value = serde_json::from_str(text)
         .map_err(|error| format!("{PREFERENCES_FILE} is not valid JSON: {error}"))?;
@@ -359,29 +410,30 @@ pub fn parse_document(text: &str) -> Result<Map<String, Value>, String> {
     }
 }
 
-/// Write the document through the shared state-file rule: a temporary file
-/// and a rename, creating the directory when the profile never saved a layout.
+/// Writes the document the way the editor writes its state files. The text
+/// goes into a temporary file beside the target, and a rename replaces the
+/// target with it. A missing directory is created first.
 ///
 /// # Errors
 ///
-/// A message when the document cannot be serialized or the file cannot be
-/// replaced.
+/// Returns a message when the document cannot be serialized or the file cannot
+/// be written.
 pub fn write_document(directory: &Path, document: &Map<String, Value>) -> Result<(), String> {
     let path = directory.join(PREFERENCES_FILE);
     crate::editor_files::write_json(&path, &Value::Object(document.clone()))
         .map_err(|error| error.message())
 }
 
-/// Read, edit and write the preferences document in one step.
+/// Reads the preferences document, applies the edit and writes it back.
 ///
-/// This is the only way a part of the editor updates its own keys: a caller
-/// says what it owns and leaves the rest of the document alone, and a document
-/// that cannot be read stops the edit instead of being replaced by one holding
-/// only the caller's keys.
+/// Use this when a caller updates only the keys it owns. The rest of the
+/// document is left alone. A document that cannot be read stops the edit
+/// instead of being replaced by one holding only the caller's keys.
 ///
 /// # Errors
 ///
-/// The read's or the write's message; the edit's own error when it refuses.
+/// Returns the read's or the write's message, or the edit's own error when it
+/// refuses.
 pub fn update(
     directory: &Path,
     edit: impl FnOnce(&mut Map<String, Value>) -> Result<(), String>,
@@ -391,11 +443,15 @@ pub fn update(
     write_document(directory, &document)
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A scratch directory of this test's own under the system temp
+    /// Creates a scratch directory of this test's own under the system temp
     /// directory, named so parallel runs do not collide.
     fn scratch_directory(label: &str) -> std::path::PathBuf {
         let directory = std::env::temp_dir().join(format!(
@@ -411,9 +467,9 @@ mod tests {
     }
 
     /// Every editable row's key is one the document helpers can write and read
-    /// back: the table, the dotted-key path and the reader agree by
-    /// construction, so a duplicated or malformed key fails here rather than as
-    /// a row that saves a value nothing reads.
+    /// back. The table, the dotted-key path and the reader therefore agree, so
+    /// a duplicated or malformed key fails here instead of becoming a row whose
+    /// saved value nothing reads.
     #[test]
     fn every_preference_field_round_trips_through_its_key() {
         for field in &PREFERENCE_FIELDS {
@@ -443,9 +499,9 @@ mod tests {
     #[test]
     fn the_gizmo_hit_radius_reads_numbers_strings_and_clamps() {
         let mut document = Map::new();
-        // Absent: the default.
+        // With no key, the default is used.
         assert_eq!(gizmo_hit_radius(&document), GIZMO_HIT_RADIUS_DEFAULT);
-        // A number and a numeric string both read.
+        // Both a number and a numeric string are read.
         set_key(&mut document, GIZMO_HIT_RADIUS_KEY, serde_json::json!(0.12)).unwrap();
         assert_eq!(gizmo_hit_radius(&document), 0.12);
         set_key(
@@ -455,7 +511,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gizmo_hit_radius(&document), 0.2);
-        // A value outside the range is clamped, and junk keeps the default.
+        // A value outside the range is clamped, and text that is not a number
+        // keeps the default.
         set_key(&mut document, GIZMO_HIT_RADIUS_KEY, serde_json::json!(40.0)).unwrap();
         assert_eq!(gizmo_hit_radius(&document), GIZMO_HIT_RADIUS_RANGE.1);
         set_key(
@@ -468,17 +525,17 @@ mod tests {
     }
 
     #[test]
-    fn the_gizmo_icon_size_defaults_doubles_and_clamps() {
+    fn the_gizmo_icon_size_defaults_and_clamps() {
         let mut document = Map::new();
-        // Absent: the default, twice the 10-point mark the badges drew before
-        // the row existed.
+        // With no key, the default is used.
         assert_eq!(gizmo_icon_size(&document), GIZMO_ICON_SIZE_DEFAULT);
-        // A number and a numeric string both read.
+        // Both a number and a numeric string are read.
         set_key(&mut document, GIZMO_ICON_SIZE_KEY, serde_json::json!(28)).unwrap();
         assert_eq!(gizmo_icon_size(&document), 28.0);
         set_key(&mut document, GIZMO_ICON_SIZE_KEY, serde_json::json!("36")).unwrap();
         assert_eq!(gizmo_icon_size(&document), 36.0);
-        // A value outside the range is clamped, and junk keeps the default.
+        // A value outside the range is clamped, and text that is not a number
+        // keeps the default.
         set_key(&mut document, GIZMO_ICON_SIZE_KEY, serde_json::json!(0)).unwrap();
         assert_eq!(gizmo_icon_size(&document), GIZMO_ICON_SIZE_RANGE.0);
         set_key(&mut document, GIZMO_ICON_SIZE_KEY, serde_json::json!(900)).unwrap();
@@ -544,7 +601,7 @@ mod tests {
         let view = PreferencesView::from_document(&document, Some("italian_brainrot"));
         assert_eq!(view.text("keymap_preset"), "preset");
         assert_eq!(view.text("snapping_steps.translation"), "0.25");
-        // Absent keys show the consumer's own fallbacks.
+        // Keys the file does not have show the row's fallback text.
         assert_eq!(view.text("snapping_steps.rotation_degrees"), "15");
         assert_eq!(view.text("history_step_cap"), "");
         assert_eq!(view.text("code_editor_command"), "");
@@ -554,10 +611,10 @@ mod tests {
             Some(crate::gizmo::GizmoMode::Rotate)
         );
         // A project the file never saw reads as unremembered defaults.
-        let other = PreferencesView::from_document(&document, Some("project_rs"));
-        assert!(!other.project_remembered);
-        assert_eq!(other.project_gizmo.mode, None);
-        assert_eq!(other.project.as_deref(), Some("project_rs"));
+        let other_project_view = PreferencesView::from_document(&document, Some("project_rs"));
+        assert!(!other_project_view.project_remembered);
+        assert_eq!(other_project_view.project_gizmo.mode, None);
+        assert_eq!(other_project_view.project.as_deref(), Some("project_rs"));
     }
 
     #[test]
@@ -582,14 +639,13 @@ mod tests {
 
     #[test]
     fn a_corrupt_document_is_refused_rather_than_read_as_empty() {
-        // Folding "not JSON" into an empty document would let the next save
-        // erase every key the file held, including the ones this write never
-        // touched.
+        // Reading "not JSON" as an empty document would let the next save erase
+        // every key the file held, including the ones this write never touched.
         let directory = scratch_directory("corrupt");
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join(PREFERENCES_FILE);
-        let corrupt = "{\"theme\": \"dark\",}";
-        std::fs::write(&path, corrupt).unwrap();
+        let corrupt_text = "{\"theme\": \"dark\",}";
+        std::fs::write(&path, corrupt_text).unwrap();
 
         let error = read_document(&directory).expect_err("a trailing comma is not a document");
         assert!(
@@ -598,11 +654,12 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            corrupt,
+            corrupt_text,
             "the file is left exactly as it was"
         );
 
-        // A missing file is still an empty document: the first save creates it.
+        // A missing file is still an empty document, so the first save creates
+        // it.
         std::fs::remove_file(&path).unwrap();
         assert!(read_document(&directory)
             .expect("missing reads empty")
@@ -624,19 +681,21 @@ mod tests {
             .contains_key("theme"));
     }
 
-    /// Two saves in a row land: the second replaces the first, which is the
-    /// fact the layout writer's removed `.bak` fallback doubted.
+    /// Two saves in a row land: the second document replaces the first.
     #[test]
     fn a_second_save_replaces_the_first_document() {
         let directory = scratch_directory("second-save");
-        let mut first = Map::new();
-        first.insert("theme".to_owned(), Value::String("dark".to_owned()));
-        write_document(&directory, &first).expect("the first save");
-        let mut second = Map::new();
-        second.insert("theme".to_owned(), Value::String("light".to_owned()));
-        write_document(&directory, &second).expect("the second save");
-        let read = read_document(&directory).expect("the read");
-        assert_eq!(lookup(&read, THEME_PREFERENCE_KEY), second.get("theme"));
+        let mut first_document = Map::new();
+        first_document.insert("theme".to_owned(), Value::String("dark".to_owned()));
+        write_document(&directory, &first_document).expect("the first save");
+        let mut second_document = Map::new();
+        second_document.insert("theme".to_owned(), Value::String("light".to_owned()));
+        write_document(&directory, &second_document).expect("the second save");
+        let stored_document = read_document(&directory).expect("the read");
+        assert_eq!(
+            lookup(&stored_document, THEME_PREFERENCE_KEY),
+            second_document.get("theme")
+        );
         assert!(!directory
             .join(PREFERENCES_FILE)
             .with_extension("tmp")
@@ -644,8 +703,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// An update owns its own key and leaves every other one alone, which is
-    /// what the gizmo's save used to fail to do.
+    /// An update writes its own key and leaves every other key alone.
     #[test]
     fn an_update_keeps_the_keys_it_does_not_own() {
         let directory = scratch_directory("update");
@@ -659,21 +717,24 @@ mod tests {
             Ok(())
         })
         .expect("the update");
-        let read = read_document(&directory).expect("the read");
-        assert!(read.contains_key("gizmo"));
-        assert!(read.contains_key("theme"), "the update erased `theme`");
-        assert!(read.contains_key("editor.history_step_cap"));
+        let stored_document = read_document(&directory).expect("the read");
+        assert!(stored_document.contains_key("gizmo"));
+        assert!(
+            stored_document.contains_key("theme"),
+            "the update erased `theme`"
+        );
+        assert!(stored_document.contains_key("editor.history_step_cap"));
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// A document that cannot be parsed stops the update: the file still holds
+    /// A document that cannot be parsed stops the update. The file still holds
     /// the caller's own text, and no partial document replaces it.
     #[test]
     fn an_update_refuses_a_document_it_cannot_read() {
         let directory = scratch_directory("update-corrupt");
         let path = directory.join(PREFERENCES_FILE);
-        let broken = "{ \"theme\": \"dark\", }";
-        std::fs::write(&path, broken).expect("the broken document");
+        let broken_text = "{ \"theme\": \"dark\", }";
+        std::fs::write(&path, broken_text).expect("the broken document");
         let error = update(&directory, |document| {
             document.insert("gizmo".to_owned(), Value::String("written".to_owned()));
             Ok(())
@@ -685,7 +746,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&path).expect("the document"),
-            broken,
+            broken_text,
             "the failed update rewrote the document"
         );
         let _ = std::fs::remove_dir_all(&directory);

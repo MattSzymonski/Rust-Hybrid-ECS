@@ -1,25 +1,28 @@
-//! Scheduler benchmarks for the engine's parallel batch scheduler.
+//! Benchmarks for the engine's scheduler: building the dependency graph and
+//! running frames of systems through it.
 //!
-//! The scheduler analyzes component read/write access across the registered
-//! systems to build a dependency graph, then groups independent systems into
-//! parallel batches. These benchmarks measure both halves of that pipeline.
+//! The scheduler compares what each pair of systems reads and writes, then
+//! puts systems that do not conflict into the same parallel batch. One
+//! benchmark measures building that graph, the other measures running frames
+//! on it.
 //!
 //! # Responsibilities
 //!
-//! - `scheduler_graph_build`: measures the O(n²) pairwise conflict analysis
-//!   over 10-200 systems, with a 1/3-write conflict pattern across 20 distinct
-//!   component types.
-//! - `scheduler_batch_execution`: measures end-to-end frame dispatch with 100
-//!   entities carrying 20 components, isolating scheduler overhead from system
-//!   compute time.
+//! - `scheduler_graph_build` measures the pairwise conflict comparison and the
+//!   batch assignment for 10, 50, 100 and 200 systems. One system in three
+//!   writes its component and the other two only read theirs. The systems
+//!   cycle through 20 type ids, so some pairs conflict and most do not.
+//! - `scheduler_batch_execution` measures whole frames with the same system
+//!   counts over 100 entities. Each system does almost no work, so the frame
+//!   time is mostly scheduler overhead rather than system compute.
 //!
 //! # Design
 //!
-//! The two benchmarks are deliberately decoupled. Graph build involves no real
-//! components or entities - just [`TypeId`] values. Batch execution runs a full
-//! frame dispatch where each system does trivial per-entity work, so what is
-//! measured is the graph walk, batch dispatch and thread wake-up rather than
-//! system compute.
+//! The two benchmarks share nothing but the idea of a set of systems. Graph
+//! build needs no components and no entities: its access patterns are built
+//! from [`TypeId`] values alone. Batch execution builds a real engine with
+//! real systems, then measures `process_frame`, which is where the scheduler
+//! consults the graph and dispatches the batches.
 
 // Standard library
 use std::any::TypeId;
@@ -32,7 +35,8 @@ use pill_engine::*;
 // Constants
 // =============================================================================
 
-/// 20 distinct `TypeId` values for the graph-build benchmark (no real components needed).
+/// Twenty distinct component type ids, taken from Rust's own types so the
+/// graph-build benchmark needs no component registrations.
 static DISTINCT_TYPE_IDS: [TypeId; 20] = [
     TypeId::of::<u8>(),
     TypeId::of::<u16>(),
@@ -60,10 +64,11 @@ static DISTINCT_TYPE_IDS: [TypeId; 20] = [
 // Types
 // =============================================================================
 
-/// Defines the 20 concrete component structs (`C0`..`C19`) used by the
+/// Declares the twenty component structs (`C0`..`C19`) used by the
 /// batch-execution benchmark.
 ///
-/// Each generated struct wraps a single `f32` and implements `Component`.
+/// The macro takes the struct names. Each generated struct holds one `f32`
+/// and implements [`Component`].
 macro_rules! define_components {
     ($($name:ident),* $(,)?) => {
         $(
@@ -78,19 +83,24 @@ define_components!(
     C0, C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11, C12, C13, C14, C15, C16, C17, C18, C19,
 );
 
-/// Registers `system_count` systems into `engine`, cycling through the 20
-/// component types.
+// =============================================================================
+// Macros
+// =============================================================================
+
+/// Registers `system_count` systems into `engine`, each writing one of the
+/// twenty component types.
 ///
-/// System `i` writes component `C(i % 20)`, so every 20th system contends for
-/// the same component (write-write conflict → sequential) while the rest are
-/// independent (no conflict → parallel batches).
+/// System `i` writes component `C(i % 20)`, so the component type repeats
+/// every twenty systems, and two systems twenty apart never share a batch.
+/// The `index => type` arms give the struct for each remainder from 0 to 19;
+/// a missing arm panics.
 macro_rules! register_batch_systems {
     ($engine:expr, $system_count:expr, $($index:literal => $component_type:ty),* $(,)?) => {
         for i in 0..$system_count {
-            let _name = Box::leak(format!("sys_{}", i).into_boxed_str());
+            let system_name = Box::leak(format!("sys_{}", i).into_boxed_str());
             match i % 20 {
                 $($index => {
-                    $engine.register_system(_name, |mut query: Query<&mut $component_type>| {
+                    $engine.register_system(system_name, |mut query: Query<&mut $component_type>| {
                         for mut component in query.iter_mut() { black_box(component.0 += 0.001); }
                     });
                 })*
@@ -104,16 +114,17 @@ macro_rules! register_batch_systems {
 // Helper Functions
 // =============================================================================
 
-/// Builds the access patterns of `system_count` systems.
+/// Builds the access patterns the graph-build benchmark schedules.
 ///
-/// Every third system writes a component while the others read it, producing
-/// a realistic 1/3-write conflict mix for the graph-build benchmark.
+/// Each system touches exactly one component: system `i` uses the type id at
+/// `i % 20`, so systems twenty apart share a component. One system in three
+/// writes its component and the other two only read theirs, so some of those
+/// shared pairs conflict and some do not.
 fn build_accesses(system_count: usize) -> Vec<SystemAccess> {
     let mut accesses = Vec::with_capacity(system_count);
     for i in 0..system_count {
         let mut access = SystemAccess::new();
         let type_id = DISTINCT_TYPE_IDS[i % DISTINCT_TYPE_IDS.len()];
-        // Every third system writes; others read - realistic conflict mix.
         if i % 3 == 0 {
             access.add_write(ComponentId::native(type_id));
         } else {
@@ -124,15 +135,14 @@ fn build_accesses(system_count: usize) -> Vec<SystemAccess> {
     accesses
 }
 
-/// Builds an `Engine` with `system_count` registered systems and 100
-/// fully-populated entities.
+/// Builds an engine with `system_count` systems and 100 fully-populated
+/// entities for the batch-execution benchmark.
 ///
-/// Registers all 20 component types, spawns 100 entities carrying every
-/// component, then registers `system_count` systems that each write one
-/// component type, so the batch-execution benchmark has realistic work to
-/// dispatch.
+/// Every entity carries all twenty components, so every system's query finds
+/// all 100 of them. The engine is built once per system count, before the
+/// timed runs start.
 fn build_engine_for_batch_execution(system_count: usize) -> Engine {
-    // Step 1: Create an engine with parallel batch execution enabled.
+    // Step 1: Create an engine and enable parallel batch execution.
     let mut engine = Engine::new();
     engine.set_parallel_execution(true);
 
@@ -187,7 +197,7 @@ fn build_engine_for_batch_execution(system_count: usize) -> Engine {
             .unwrap();
     }
 
-    // Step 4: Register `system_count` systems, one per component type.
+    // Step 4: Register `system_count` systems; system `i` writes component `C(i % 20)`.
     register_batch_systems!(engine, system_count,
         0 => C0,  1 => C1,  2 => C2,  3 => C3,  4 => C4,
         5 => C5,  6 => C6,  7 => C7,  8 => C8,  9 => C9,
@@ -202,11 +212,12 @@ fn build_engine_for_batch_execution(system_count: usize) -> Engine {
 // Benchmarks
 // =============================================================================
 
-/// Builds the execution graph for `system_count` systems with a realistic
-/// read/write conflict mix.
+/// Measures building the execution graph from ready-made access patterns.
 ///
-/// Measures the O(n²) pairwise conflict analysis and batch-formation cost as
-/// system count grows.
+/// The patterns are built before each timed run, so the measurement starts
+/// from an empty scheduler and covers the scheduler's own work: the pairwise
+/// conflict comparison and the batch assignment. Sizes run from 10 to 200
+/// systems.
 fn bench_graph_build(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("scheduler_graph_build");
     for &system_count in &[10, 50, 100, 200] {
@@ -229,11 +240,13 @@ fn bench_graph_build(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// Runs a full `engine.process_frame()` with `system_count` registered systems
-/// and 100 entities.
+/// Measures whole frames on an engine with `system_count` systems and 100
+/// entities.
 ///
-/// Measures end-to-end scheduler dispatch overhead - graph walk + parallel
-/// batch execution + system invocation.
+/// The engine is built before the timed runs, so every iteration is one call
+/// to `process_frame`. Most of that time is the scheduler: checking that its
+/// graph is current, walking the batches, and calling every system, each of
+/// which does almost no work.
 fn bench_batch_execution(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("scheduler_batch_execution");
     for &system_count in &[10, 50, 100, 200] {

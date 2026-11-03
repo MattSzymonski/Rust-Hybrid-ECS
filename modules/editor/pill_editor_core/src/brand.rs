@@ -1,4 +1,5 @@
-//! The editor's brand mark: the pill logotype, baked from its SVG source.
+//! The editor's brand mark: the pill logotype, computed from its SVG source
+//! and stored here as data.
 //!
 //! # Responsibilities
 //!
@@ -7,23 +8,30 @@
 //! - Holds no drawing code: the shell decides where the mark sits and what
 //!   colour it takes.
 //!
-//! The source is `modules/editor/pill_editor_core/assets/pill_mark.svg` (500x500, one
-//! white path of three subpaths). egui has no SVG renderer in this crate
-//! graph, so the path was flattened and rasterised offline - even-odd fill,
-//! 8x8 supersampling per texel, the path's bounding box
-//! centred in the square with a 6% margin - and the resulting
-//! coverage shipped as [`MARK_ALPHA`]. Regenerate it with
-//! `local/temp/bake_pill_mark.py` when the SVG changes; the constant's shape
-//! is pinned by this module's tests.
+//! The source is `modules/editor/pill_editor_core/assets/pill_mark.svg`
+//! (500x500, one white path made of three subpaths). egui has no SVG
+//! renderer in this crate graph, so the path was rendered ahead of time into
+//! a square bitmap: filled with the even-odd rule, 8x8 samples per texel,
+//! with the path's bounding box centred in the square and a 6% margin
+//! around it. The result is the coverage stored in [`MARK_ALPHA`]. Render it
+//! again with the same settings when the SVG changes; this module's tests
+//! pin the constant's shape.
 
 // External crates
 use egui;
 
-/// The mark's resolution, in texels: square, one byte of coverage each.
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// The mark's width and height in texels. The image is square, and every
+/// texel takes one byte of coverage.
 pub const MARK_SIDE: usize = 48;
 
-/// The mark's coverage per texel, row-major, `MARK_SIDE * MARK_SIDE` bytes:
-/// 255 where the path covers the texel, 0 where it does not.
+/// The mark's coverage per texel, stored row by row. The array holds
+/// `MARK_SIDE * MARK_SIDE` bytes: a texel the path covers fully reads 255,
+/// one it misses reads 0, and a texel on an edge reads the covered share of
+/// its area, scaled to the same range.
 pub const MARK_ALPHA: [u8; MARK_SIDE * MARK_SIDE] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -116,8 +124,13 @@ pub const MARK_ALPHA: [u8; MARK_SIDE * MARK_SIDE] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
-/// The mark as a white image whose alpha is the baked coverage: the shell
-/// uploads it once and tints it with the theme's text colour.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns the mark as a white image whose alpha channel is the stored
+/// coverage. The shell uploads it once per session and tints it with the
+/// theme's text colour.
 pub fn mark_color_image() -> egui::ColorImage {
     let pixels = MARK_ALPHA
         .iter()
@@ -130,13 +143,20 @@ pub fn mark_color_image() -> egui::ColorImage {
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn the_mark_covers_a_sensible_share_of_its_box() {
-        let ink = MARK_ALPHA.iter().map(|value| *value as u64).sum::<u64>();
+        let ink = MARK_ALPHA
+            .iter()
+            .map(|coverage| *coverage as u64)
+            .sum::<u64>();
         let share = ink as f32 / (MARK_ALPHA.len() * 255) as f32;
         assert!(
             (0.15..0.85).contains(&share),
@@ -156,8 +176,9 @@ mod tests {
 
     #[test]
     fn the_mark_carries_ink_in_both_halves() {
-        // One pill half is an outline, the other is solid: both quadrants along
-        // the box's diagonal must carry ink, or the path was clipped.
+        // One pill half is an outline and the other is solid, so the two
+        // quadrants on opposite corners of the box must both carry ink. If one
+        // of them is empty, the path was clipped when it was rendered.
         let half = MARK_SIDE / 2;
         let mut top_right = 0u64;
         let mut bottom_left = 0u64;
@@ -184,7 +205,8 @@ mod tests {
         assert_eq!(image.pixels.len(), MARK_SIDE * MARK_SIDE);
         for (pixel, coverage) in image.pixels.iter().zip(MARK_ALPHA.iter()) {
             assert_eq!(pixel.a(), *coverage);
-            // `from_white_alpha` premultiplies: the channels follow the alpha.
+            // `from_white_alpha` multiplies the white channels by the alpha,
+            // so red, green and blue all equal the alpha here.
             assert_eq!(pixel.r(), *coverage);
             assert_eq!(pixel.g(), *coverage);
             assert_eq!(pixel.b(), *coverage);

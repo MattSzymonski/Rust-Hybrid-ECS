@@ -6,22 +6,26 @@
 //! - Model a command ([`CommandSpec`]) and the registry that owns every
 //!   registration ([`CommandRegistry`]), grouped by the registering module.
 //! - Resolve effective shortcuts from the active keymap preset plus the
-//!   keybindings file's overrides, and report conflicts by command name.
-//! - Parse and format a chord as the `ctrl+shift+p` text both files use
-//!   ([`Chord`], [`KeyName`]).
-//! - Read the keybindings and preferences files ([`KeybindingsFile`],
-//!   [`EditorPreferences`]) and hand back problems to report once.
+//!   keybindings file's overrides, and report every chord that two commands
+//!   answer to.
+//! - Parse and format a chord as the `ctrl+shift+p` text the keybindings file
+//!   uses ([`Chord`], [`KeyName`]).
+//! - Model the keybindings and preferences files ([`KeybindingsFile`],
+//!   [`EditorPreferences`]) and read and write the gizmo settings a project
+//!   starts with ([`read_gizmo_settings`], [`write_gizmo_preferences`]).
 //!
 //! # Design
 //!
-//! The registry is plain data in a world resource, because three DLLs write
-//! and read it: the executable (applies the batch the shell queued), the
-//! reloadable shell (dispatches and paints menus) and every editor crate
-//! (registers its own commands from `register`). A module re-registering its
-//! owner replaces the previous generation's set, so a reload never strands
-//! duplicate commands. Chords are this crate's own serde types rather than
-//! the engine's input types, so the files stay stable when the engine's key
-//! vocabulary changes; the one conversion lives here.
+//! The registry lives in a world resource as plain data, because the
+//! executable, the reloadable shell and any editor crate all read or write it.
+//! The executable resolves a chord and applies the batches the shell queued;
+//! the shell paints the menus and queues commands; an editor crate adds its
+//! own commands with [`CommandRegistry::register`]. A module that re-registers
+//! its owner replaces that owner's previous set, so a reload never leaves
+//! duplicate commands behind. Chords are this crate's own serde types rather
+//! than the engine's input types, so the files stay stable when the engine's
+//! key vocabulary changes. The conversions to and from
+//! [`pill_engine::KeyCode`] live in [`KeyName`].
 
 // Standard library
 use std::collections::BTreeMap;
@@ -41,9 +45,9 @@ use crate::layout::EditorTab;
 
 /// The key vocabulary command bindings use.
 ///
-/// Deliberately small: every key a preset or a user binding names, converted
-/// to the engine's [`pill_engine::KeyCode`] in one place so the two lists
-/// cannot drift silently.
+/// Deliberately small: it holds only the keys a preset or a user binding can
+/// name. The conversion to and from the engine's [`pill_engine::KeyCode`] sits
+/// in the impl below, so the two lists cannot fall out of step quietly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyName {
@@ -91,7 +95,8 @@ pub enum KeyName {
 }
 
 impl KeyName {
-    /// The engine key this name denotes, when the engine knows it.
+    /// Returns the engine key this name stands for. Every name has one, so
+    /// the result is always `Some`.
     pub fn engine_key(self) -> Option<pill_engine::KeyCode> {
         use pill_engine::KeyCode as K;
         Some(match self {
@@ -139,7 +144,8 @@ impl KeyName {
         })
     }
 
-    /// The name of the engine key, for building chords from input.
+    /// Returns this vocabulary's name for an engine key, or `None` when it
+    /// names no such key. Input events are turned into chords through this.
     pub fn from_engine(key: pill_engine::KeyCode) -> Option<Self> {
         use pill_engine::KeyCode as K;
         Some(match key {
@@ -192,18 +198,18 @@ impl KeyName {
 /// One shortcut: a key plus the modifiers that must be held with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Chord {
-    /// Whether control was held.
+    /// Whether the control key is part of the chord.
     pub ctrl: bool,
-    /// Whether shift was held.
+    /// Whether the shift key is part of the chord.
     pub shift: bool,
-    /// Whether alt was held.
+    /// Whether the alt key is part of the chord.
     pub alt: bool,
     /// The key itself.
     pub key: KeyName,
 }
 
 impl Chord {
-    /// A chord without modifiers.
+    /// Builds a chord with no modifiers.
     pub fn plain(key: KeyName) -> Self {
         Self {
             ctrl: false,
@@ -213,7 +219,7 @@ impl Chord {
         }
     }
 
-    /// A chord with modifiers.
+    /// Builds a chord from a key and the modifiers held with it.
     pub fn with(key: KeyName, ctrl: bool, shift: bool, alt: bool) -> Self {
         Self {
             ctrl,
@@ -223,7 +229,7 @@ impl Chord {
         }
     }
 
-    /// Whether this chord fires for a key event with the given modifiers.
+    /// Returns whether this chord matches a key press with these modifiers.
     pub fn matches(&self, key: pill_engine::KeyCode, modifiers: pill_engine::Modifiers) -> bool {
         KeyName::from_engine(key) == Some(self.key)
             && self.ctrl == modifiers.control
@@ -233,14 +239,16 @@ impl Chord {
 }
 
 impl std::fmt::Display for KeyName {
-    /// The lowercase name the files use (`space`, `f10`, `numpad1`).
+    /// Writes the lowercase key name the files use (`space`, `f10`,
+    /// `numpad1`).
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", format!("{self:?}").to_lowercase())
     }
 }
 
 impl std::fmt::Display for Chord {
-    /// The `ctrl+shift+p` form both files use.
+    /// Writes the `ctrl+shift+p` form: the syntax the keybindings file uses,
+    /// and what the conflict log prints.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.ctrl {
             write!(formatter, "ctrl+")?;
@@ -255,11 +263,12 @@ impl std::fmt::Display for Chord {
     }
 }
 
-/// Why a chord text could not be parsed.
+/// The reason a chord or key name could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChordParseError(pub String);
 
 impl std::fmt::Display for ChordParseError {
+    /// Writes the reason the parse failed.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.0)
     }
@@ -268,7 +277,8 @@ impl std::fmt::Display for ChordParseError {
 impl FromStr for Chord {
     type Err = ChordParseError;
 
-    /// Parses `[ctrl+][shift+][alt+]key`, case-insensitively.
+    /// Parses `[ctrl+][shift+][alt+]key`, ignoring case. `control` is
+    /// accepted for `ctrl`.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let mut chord = Chord::plain(KeyName::Escape);
         let mut key_seen = false;
@@ -296,10 +306,11 @@ impl FromStr for Chord {
 impl FromStr for KeyName {
     type Err = ChordParseError;
 
-    /// Parses a key name case-insensitively; `esc`/`del` are aliases.
+    /// Parses a key name, ignoring case. `esc` and `del` are aliases, and
+    /// `return` stands for enter.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let lower = text.to_ascii_lowercase();
-        let named = match lower.as_str() {
+        let named_key = match lower.as_str() {
             "space" => Some(Self::Space),
             "escape" | "esc" => Some(Self::Escape),
             "enter" | "return" => Some(Self::Enter),
@@ -325,11 +336,12 @@ impl FromStr for KeyName {
                 }
             }
         };
-        named.ok_or_else(|| ChordParseError(format!("unknown key `{text}`")))
+        named_key.ok_or_else(|| ChordParseError(format!("unknown key `{text}`")))
     }
 }
 
-/// The letters, in order, for the single-letter key parse.
+/// The letter keys in alphabetical order. A single letter parses by its index
+/// here.
 const LETTERS: [KeyName; 26] = [
     KeyName::A,
     KeyName::B,
@@ -367,18 +379,20 @@ const LETTERS: [KeyName; 26] = [
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeymapPreset {
-    /// The default: Blender-like.
+    /// The default preset: Blender-like.
     #[default]
     Blender,
-    /// Unity-like.
+    /// Unity-like shortcuts.
     Unity,
-    /// Godot-like.
+    /// Godot-like shortcuts.
     Godot,
-    /// Unreal-Engine-like.
+    /// Unreal-Engine-like shortcuts.
     Unreal,
 }
 
 impl std::fmt::Display for KeymapPreset {
+    /// Writes the preset's name as the files spell it (`blender`, `unity`,
+    /// `godot`, `unreal`).
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
             Self::Blender => "blender",
@@ -401,13 +415,14 @@ pub struct CommandSpec {
     pub id: String,
     /// The title menus and the palette show.
     pub title: String,
-    /// Menu path (`["View", "Pause Simulation"]`); empty means palette-only.
+    /// Menu path (`["Edit", "Undo"]`); an empty path means no menu bar row.
     pub menu_path: Vec<String>,
     /// The default binding per preset; a preset that is absent leaves the
     /// command unbound in it.
     pub shortcuts: BTreeMap<KeymapPreset, Vec<Chord>>,
-    /// Whether the shortcut wins while a text field has focus (a global
-    /// binding); everything else yields to the focused field.
+    /// Whether the shortcut is a global binding. A global binding is meant to
+    /// fire even while a text field has focus, where every other shortcut
+    /// yields to the field.
     pub global: bool,
     /// Whether a menu draws a rule above this command's row, grouping it
     /// with the rows after it.
@@ -415,7 +430,7 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
-    /// A command with a title and no menu or bindings yet.
+    /// Builds a command with a title and no menu or bindings yet.
     pub fn new(id: &str, title: &str) -> Self {
         Self {
             id: id.to_string(),
@@ -433,29 +448,37 @@ impl CommandSpec {
         self
     }
 
-    /// Draws a rule above this command's menu row.
+    /// Marks that a rule is drawn above this command's menu row.
     pub fn separator(mut self) -> Self {
         self.separator_before = true;
         self
     }
 
-    /// Adds a binding for one preset.
-    pub fn bind(mut self, preset: KeymapPreset, chord: &str) -> Self {
-        let chord = chord
+    /// Adds one default chord for a preset.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `chord_text` is not valid chord text. Every caller is in
+    /// this file (the built-in table and its tests), so a bad string is a
+    /// mistake here rather than input to handle.
+    pub fn bind(mut self, preset: KeymapPreset, chord_text: &str) -> Self {
+        let chord = chord_text
             .parse::<Chord>()
-            .unwrap_or_else(|error| panic!("built-in chord `{chord}` is invalid: {error}"));
+            .unwrap_or_else(|error| panic!("built-in chord `{chord_text}` is invalid: {error}"));
         self.shortcuts.entry(preset).or_default().push(chord);
         self
     }
 
-    /// Marks the shortcut as global (it wins over a focused text field).
+    /// Makes the shortcut global: it is meant to fire even while a text field
+    /// has focus.
     pub fn global(mut self) -> Self {
         self.global = true;
         self
     }
 }
 
-/// Every command every owner registered, plus the resolved keybindings.
+/// Every command every owner registered, plus the preset and the file
+/// overrides that decide each command's chords.
 ///
 /// A world resource (inserted by [`CommandRegistry::ensure`]); owners are
 /// keyed by the module that registered them so a re-registration replaces
@@ -468,7 +491,8 @@ pub struct CommandRegistry {
 }
 
 impl CommandRegistry {
-    /// The registry holding the built-in commands, under owner `editor`.
+    /// Builds a registry holding only the built-in commands, under owner
+    /// `editor`.
     pub fn with_builtins() -> Self {
         let mut registry = Self {
             owners: BTreeMap::new(),
@@ -479,7 +503,8 @@ impl CommandRegistry {
         registry
     }
 
-    /// The world's registry, created with the built-ins when absent.
+    /// Registers the registry resource in `world` and inserts the built-ins
+    /// when it is absent.
     pub fn ensure(world: &mut pill_engine::World) {
         world.register_resource::<CommandRegistry>();
         if world.get_resource::<CommandRegistry>().is_none() {
@@ -492,30 +517,31 @@ impl CommandRegistry {
         self.owners.insert(owner.to_string(), commands);
     }
 
-    /// Every command, owners in key order; the built-ins ride under owner
-    /// `editor`.
+    /// Iterates every command, owners in key order; the built-in commands
+    /// belong to owner `editor`.
     pub fn commands(&self) -> impl Iterator<Item = &CommandSpec> {
         self.owners.values().flatten()
     }
 
-    /// One command by id, across every owner.
+    /// Returns the command with this id, whichever owner registered it.
     pub fn command(&self, id: &str) -> Option<&CommandSpec> {
         self.commands().find(|spec| spec.id == id)
     }
 
-    /// The active preset.
+    /// Returns the active preset.
     pub fn preset(&self) -> KeymapPreset {
         self.preset
     }
 
-    /// The number of resolved overrides (for the status log).
+    /// Returns how many commands the keybindings file's overrides name; the
+    /// `[editor] keybindings applied` log line prints it.
     pub fn override_count(&self) -> usize {
         self.overrides.len()
     }
 
-    /// The chords a command currently answers to: the overrides when the
-    /// file names any (an empty list means unbound), else the preset's
-    /// defaults.
+    /// Returns the chords a command currently answers to: the file's override
+    /// when it names this command (an empty list means unbound), or the
+    /// preset's defaults otherwise.
     pub fn effective_chords(&self, id: &str) -> Vec<Chord> {
         if let Some(chords) = self.overrides.get(id) {
             return chords.clone();
@@ -525,22 +551,28 @@ impl CommandRegistry {
             .unwrap_or_default()
     }
 
-    /// Applies a keybindings file: its preset (when named), its overrides,
-    /// and the problems a caller reports once.
+    /// Applies a keybindings file: switches to its preset when it names one,
+    /// replaces the overrides with its own, and returns every problem found
+    /// for the caller to report.
+    ///
+    /// An override for a command nothing has registered is kept, so it starts
+    /// working once that id exists.
     pub fn apply_file(&mut self, file: &KeybindingsFile) -> Vec<String> {
         let mut problems = Vec::new();
+        // Step 1: switch to the file's preset when it names one.
         if let Some(preset) = file.preset {
             self.preset = preset;
         }
+        // Step 2: replace every override with the file's own list.
         self.overrides.clear();
-        for (id, texts) in &file.overrides {
+        for (id, chord_texts) in &file.overrides {
             if self.command(id).is_none() {
                 problems.push(format!(
                     "keybindings: override for unknown command `{id}` (kept; it binds once that id exists)"
                 ));
             }
             let mut chords = Vec::new();
-            for text in texts {
+            for text in chord_texts {
                 match text.parse::<Chord>() {
                     Ok(chord) => chords.push(chord),
                     Err(error) => problems.push(format!("keybindings: {error}")),
@@ -551,10 +583,11 @@ impl CommandRegistry {
         problems
     }
 
-    /// Whether a chord fires for `key` with `modifiers`, and which command.
+    /// Returns the command a key press runs, or `None` when no command is
+    /// bound to it.
     ///
     /// The first command in the registry's order wins when two share a chord;
-    /// [`Self::conflicts`] is what reports the collision.
+    /// [`Self::conflicts`] reports the collision.
     pub fn resolve(
         &self,
         key: pill_engine::KeyCode,
@@ -567,7 +600,8 @@ impl CommandRegistry {
         })
     }
 
-    /// Every chord bound to more than one command, with the ids involved.
+    /// Returns every chord bound to more than one command, with the ids
+    /// involved.
     pub fn conflicts(&self) -> Vec<(Chord, Vec<String>)> {
         let mut by_chord: BTreeMap<Chord, Vec<String>> = BTreeMap::new();
         for spec in self.commands() {
@@ -581,9 +615,9 @@ impl CommandRegistry {
             .collect()
     }
 
-    /// The commands as plain data, in the registry's order: what the frame's
-    /// snapshot carries so the menus and the palette build rows without
-    /// touching the world.
+    /// Returns the commands as plain data, in the registry's order. The
+    /// frame's snapshot carries these rows, so the menus and the palette build
+    /// themselves without touching the world.
     pub fn views(&self) -> Vec<CommandView> {
         self.commands()
             .map(|spec| CommandView {
@@ -598,16 +632,16 @@ impl CommandRegistry {
 
 /// One registered command as the UI sees it.
 ///
-/// A copy, not a borrow: menus are built from the frame's snapshot, which
-/// outlives no world access, and a row's label and presence must come from
-/// the registry that produced it.
+/// It is a copy, not a borrow. The frame's snapshot keeps these rows after the
+/// world borrow ends, and a row's label and presence must come from the
+/// registry that produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandView {
     /// Stable identifier (`editor.pause_toggle`).
     pub id: String,
     /// The title a menu row shows.
     pub title: String,
-    /// The menu path; an empty path means palette-only.
+    /// The menu path; an empty path means no menu row.
     pub menu_path: Vec<String>,
     /// Whether a rule is drawn above the row.
     pub separator_before: bool,
@@ -615,32 +649,32 @@ pub struct CommandView {
 
 impl pill_engine::Resource for CommandRegistry {}
 
-/// The registry's commands grouped by their top-level menu, in command
-/// order; the paths the menu bar paints.
+/// Groups the registry's commands by their top-level menu, in command order.
+/// Commands with no menu path are left out.
 pub fn menu_tree(registry: &CommandRegistry) -> BTreeMap<String, Vec<&CommandSpec>> {
     let mut menus: BTreeMap<String, Vec<&CommandSpec>> = BTreeMap::new();
     for spec in registry.commands() {
-        let Some(top) = spec.menu_path.first() else {
+        let Some(top_menu) = spec.menu_path.first() else {
             continue;
         };
-        menus.entry(top.clone()).or_default().push(spec);
+        menus.entry(top_menu.clone()).or_default().push(spec);
     }
     menus
 }
 
 /// The built-in commands every editor has (owner `editor`).
 ///
-/// This table is what the menu bar draws: a row exists because a command
-/// registers a menu path, its label is the command's title, and the rules
-/// between groups are the specs marked [`CommandSpec::separator`]. Removing
-/// a spec here removes its row.
+/// This table is what the menu bar draws. A row exists because a command
+/// registers a menu path. Its label is the command's title, except for the
+/// gizmo's space row, which shows the space the gizmo is in. A line between
+/// two groups is drawn for the spec marked [`CommandSpec::separator`].
+/// Removing a spec here removes its row.
 fn builtin_commands() -> Vec<CommandSpec> {
     use KeymapPreset::{Blender, Godot, Unity, Unreal};
     let mut commands = vec![
-        // The layout commands: chord-only until the bar grows a Layout menu.
-        // A menu path here would name a menu `Menu::ALL` does not carry, so the
-        // row could never be drawn and the registry would describe a bar that
-        // does not exist.
+        // The layout commands carry no menu row: `Menu::ALL` has no Layout
+        // menu, so a menu path here would describe a row the bar can never
+        // draw.
         CommandSpec::new("editor.save_layout", "Save Layout")
             .bind(Blender, "ctrl+alt+s")
             .bind(Unity, "ctrl+shift+l")
@@ -651,9 +685,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Unity, "alt+r")
             .bind(Godot, "ctrl+alt+r")
             .bind(Unreal, "alt+r"),
-        // The pop-out pair: the tab in the active tabset moves into its own
-        // window, and every floating tab comes home. Both live in the tab's
-        // own context menu, which is the surface that knows which tab.
+        // The pop-out pair: Pop Out moves a tab into its own window, and
+        // Redock takes every tab of that window back into the main dock. The
+        // tab's own context menu is the only surface that knows which tab, so
+        // neither command takes a menu path or a chord; the shell draws that
+        // menu itself.
         CommandSpec::new("editor.popout_tab", "Pop Out Panel"),
         CommandSpec::new("editor.redock_tab", "Redock Popped Panels"),
         CommandSpec::new("editor.command_palette", "Command Palette")
@@ -676,7 +712,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Godot, "ctrl+shift+z")
             .bind(Unreal, "ctrl+y")
             .global(),
-        // The clipboard commands stay un-global on purpose: while a widget
+        // The clipboard commands are not global on purpose: while a widget
         // holds the focus (a text field), ctrl+c/x/v belong to the field's
         // own Edit handling.
         CommandSpec::new("editor.copy", "Copy")
@@ -699,8 +735,8 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Unreal, "ctrl+v"),
         // The transform tools: the chords are the ones Unity and
         // Unreal already use, and Blender's own grab/rotate/scale keys. The
-        // titles are the toolbox's row labels - the View menu, the panel and
-        // the palette show one name per command.
+        // titles are the toolbox's row labels, so the View menu, the panel and
+        // the palette show the same word for a tool.
         CommandSpec::new("editor.tool_translate", "Translate")
             .menu(&["View", "Translate"])
             .bind(Blender, "g")
@@ -719,10 +755,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Unity, "r")
             .bind(Godot, "r")
             .bind(Unreal, "r"),
-        // Unbound on purpose: the space toggle is a menu, palette and
-        // toolbar command, and the presets have no free chord that would
-        // mean "local" anywhere else either. The row's label carries the
-        // space it would leave the gizmo in, so the shell overrides it.
+        // Unbound on purpose: the space toggle appears in the View menu, the
+        // palette and the toolbox, and no preset has a free chord that would
+        // also mean "local". The title names both spaces; the menu row shows
+        // the space the gizmo is in now, so the menu model replaces the title
+        // with that label.
         CommandSpec::new("editor.tool_space_toggle", "Local / World Space")
             .menu(&["View", "Local / World Space"])
             .separator(),
@@ -749,17 +786,16 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Unity, "f10")
             .bind(Godot, "f6")
             .bind(Unreal, "f10"),
-        // The Hierarchy's entity actions: creation makes one empty entity,
-        // deletion clears the selection in the same step. No chords: the
-        // menu, the palette and the panel's toolbar carry them.
+        // The Entities tab's actions: creation makes one empty entity, and
+        // deletion clears the selection in the same step. No chords: the menu,
+        // the palette and the tab's context menu carry them.
         CommandSpec::new("editor.entity_create", "New Entity").menu(&["Create", "New Entity"]),
         CommandSpec::new("editor.entity_delete", "Delete Entity")
             .menu(&["Edit", "Delete Entity"])
             .separator(),
-        // The scene document's rows: what the editor opens and writes. Save As
-        // carries no chord for the same reason the other rows do not - the menu
-        // and the palette carry it - and Open acts on the scene selected in the
-        // Assets tab.
+        // The rows that open and write the scene document. Open acts on the
+        // scene selected in the Assets tab. Save As carries no chord, like the
+        // other chordless rows, because the menu and the palette reach it.
         CommandSpec::new("editor.scene_new", "Create Scene")
             .menu(&["Create", "Create Scene"])
             .bind(Blender, "ctrl+n")
@@ -776,11 +812,9 @@ fn builtin_commands() -> Vec<CommandSpec> {
         CommandSpec::new("editor.scene_save_as", "Save Scene As")
             .menu(&["File", "Save Scene As"])
             .separator(),
-        // The Assets dialogs' buttons. They are registered like
-        // any other command - the button row runs them by id - and Create keeps
-        // its menu row beside the entity and scene creates. Rename has no menu
-        // row: it answers through the dialog it was pressed on, and invoked
-        // without one it warns and does nothing.
+        // The Assets dialogs' buttons. Create keeps its menu row beside the
+        // entity and scene creates; Rename has none, because it acts on the file
+        // whose dialog opened it.
         CommandSpec::new("editor.asset.create", "Create Asset...")
             .menu(&["Create", "Create Asset..."]),
         CommandSpec::new("editor.asset.rename", "Rename Asset"),
@@ -802,8 +836,9 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .menu(&["Window", "New Scene View"])
             .separator(),
     ];
-    // Window: one row per dock tab, in strip order; the shell turns each back
-    // into the tab it activates. A scene view's title is its number.
+    // Window: one row per built-in tab, in `EditorTab::ALL` order, and the id
+    // names the tab it activates. A scene view's title carries its number
+    // (`Scene`, `Scene 2`, ...), and a module panel has no row.
     for tab in EditorTab::ALL {
         let title = tab.title();
         commands.push(
@@ -818,7 +853,8 @@ fn builtin_commands() -> Vec<CommandSpec> {
 // Files
 // =============================================================================
 
-/// The keybindings file: the active preset and single-binding overrides.
+/// The keybindings file: the active preset and the per-command chord
+/// overrides.
 ///
 /// Shape: `{ "preset": "unity", "overrides": { "editor.pause_toggle": ["space"] } }`.
 /// A command missing from `overrides` keeps its preset binding; a command
@@ -833,11 +869,12 @@ pub struct KeybindingsFile {
     pub overrides: BTreeMap<String, Vec<String>>,
 }
 
-/// The preferences file: everything the editor lets a user persist that is
-/// not the layout or the bindings.
+/// The typed view of the preferences file. It holds the keys the executable
+/// reads as values, which are the theme layer, the gizmo entry, the snapping
+/// steps, the code editor command and the history limits.
 ///
-/// The keymap preset lives in the keybindings file instead; this file holds
-/// the rest, parsed here so one reader owns it.
+/// The Preferences tab reads and writes the same document key by key through
+/// [`crate::preferences`]; the two owners only ever change their own keys.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EditorPreferences {
     /// The user theme layer's file, absolute or relative to the state
@@ -884,9 +921,9 @@ fn default_scale_step() -> f32 {
 
 /// The gizmo tool's persisted state.
 ///
-/// The top-level fields are the defaults; `projects` remembers a choice per
-/// project, keyed by the project directory's name, so moving between
-/// projects brings each one's tool back.
+/// The top-level fields hold the last-used values; `projects` remembers a
+/// choice per project, keyed by the project directory's name, so moving
+/// between projects brings each one's tool back.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GizmoPreferences {
     /// The last active mode, when one was chosen.
@@ -920,27 +957,29 @@ pub struct GizmoProjectPreferences {
 /// The preferences file's name, next to the layout file.
 ///
 /// Declared here rather than in an editor frontend: the executable reads the
-/// file at startup and the shell writes it, and both link this crate.
+/// file and applies the shell's save commands to it, and both sides link this
+/// crate.
 pub const PREFERENCES_FILE: &str = "preferences.json";
 
 /// The keybindings file's name, next to the layout file.
 ///
 /// The executable watches it and applies every change through
 /// [`CommandRegistry::apply_file`]; the preset and the overrides it holds
-/// are what menus, shortcuts and the palette dispatch from.
+/// decide what each shortcut does.
 pub const KEYBINDINGS_FILE: &str = "keybindings.json";
 
-/// The gizmo settings a project starts a session with.
+/// Reads the gizmo settings a project starts a session with.
 ///
-/// Resolution order: the project's own remembered entry, then the file's
-/// last-used values, then the defaults; the snapping steps are the file's,
-/// one set for every project. A missing or unreadable file is the
-/// defaults, never an error: the tool has to work before anyone edits
-/// preferences.
+/// The file's last-used values are applied first, then the project's own
+/// remembered entry, then the defaults for anything neither sets. The snapping
+/// steps come from the file alone, one set for every project. A missing or
+/// unreadable file gives the defaults and never an error. The tool has to work
+/// before anyone edits preferences.
 pub fn read_gizmo_settings(
     directory: &std::path::Path,
     project: &str,
 ) -> crate::gizmo::GizmoSettings {
+    // Step 1: read the file, treating a missing or unreadable one as empty.
     let preferences: EditorPreferences = std::fs::read_to_string(directory.join(PREFERENCES_FILE))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
@@ -954,6 +993,7 @@ pub fn read_gizmo_settings(
     let Some(gizmo) = &preferences.gizmo else {
         return settings;
     };
+    // Step 2: take the file's last-used values.
     if let Some(mode) = gizmo.mode {
         settings.mode = mode;
     }
@@ -963,40 +1003,42 @@ pub fn read_gizmo_settings(
     if let Some(snap) = gizmo.snap {
         settings.snap = snap;
     }
-    if let Some(project) = gizmo.projects.get(project) {
-        if let Some(mode) = project.mode {
+    // Step 3: let this project's own entry win.
+    if let Some(project_entry) = gizmo.projects.get(project) {
+        if let Some(mode) = project_entry.mode {
             settings.mode = mode;
         }
-        if let Some(space) = project.space {
+        if let Some(space) = project_entry.space {
             settings.space = space;
         }
-        if let Some(snap) = project.snap {
+        if let Some(snap) = project_entry.snap {
             settings.snap = snap;
         }
     }
     settings
 }
 
-/// Remember one project's gizmo choices in the preferences file.
+/// Writes one project's gizmo choices into the preferences file.
 ///
-/// Read-modify-write, so every other key survives; the top-level fields are
-/// the last-used values a shell toggles against, and the per-project entry
-/// is what the next session on this project starts with. Written through a
-/// temporary file and a rename, so the live reload reader never observes a
-/// half-written document.
+/// This reads the document, changes only the gizmo keys and writes it back,
+/// so every other key survives. The top-level fields hold the values written
+/// last, which a project without an entry of its own starts from; the
+/// project's own entry is what its next session starts with. The write goes
+/// through a temporary file and a rename, so the live reload reader never sees
+/// a half-written document.
 ///
 /// # Errors
 ///
-/// A message when the file cannot be read as JSON, serialized, or replaced.
+/// Returns a message when the file cannot be read, is not a JSON object, or
+/// cannot be written back.
 pub fn write_gizmo_preferences(
     directory: &std::path::Path,
     project: &str,
     settings: &crate::gizmo::GizmoSettings,
 ) -> Result<(), String> {
-    // The preferences document has one owner: this is an edit of it, not a
-    // second reader. A document that cannot be read stops the save instead of
-    // being replaced by one holding only `gizmo`, which used to erase every
-    // other key.
+    // Edit the document rather than writing a new one. A document that cannot
+    // be read stops the save; overwriting it with one holding only `gizmo`
+    // would erase every other key.
     crate::preferences::update(directory, |document| {
         let mut gizmo = document
             .get("gizmo")
@@ -1023,12 +1065,12 @@ pub fn write_gizmo_preferences(
     })
 }
 
-/// The world resource carrying commands executed this frame to their owners.
+/// The world resource that carries a frame's executed command ids to the
+/// modules that own them.
 ///
-/// The shell pushes every executed command id here after dispatch; a module
-/// owns the ids it registered and drains them in a system (the shell cannot
-/// call into a module's code, and a reloadable owner must not hand function
-/// pointers across the boundary).
+/// A module reads its own ids in a system of its own. The shell cannot call
+/// into a module's code, and a reloadable module must not hand function
+/// pointers across the reload boundary.
 #[derive(Clone, Debug, Default)]
 pub struct CommandInbox {
     /// Command ids executed this frame, in execution order.
@@ -1037,22 +1079,23 @@ pub struct CommandInbox {
 
 impl pill_engine::Resource for CommandInbox {}
 
-/// The world resource carrying engine mutations queued by command handlers.
+/// The world resource holding the engine mutations queued by command
+/// handlers.
 ///
-/// The shell has no `Engine`, so its handlers queue [`EditorCommand`]s; the
-/// executable applies the batch at the frame boundary
-/// ([`EditorCommand::apply`]).
+/// The shell has no `Engine`, so its handlers queue [`EditorCommand`]s
+/// instead; the executable applies each batch at the frame boundary through
+/// [`crate::drain::apply_pending`].
 #[derive(Clone, Debug, Default)]
 pub struct PendingEditorCommands {
     /// The queued batches, drained by the executable.
     pub batches: Vec<PendingCommandBatch>,
-    /// Asset paths the shell asked the executable to show in the platform's
+    /// Asset keys the shell asked the executable to show in the platform's
     /// file manager, in request order.
     ///
-    /// Not commands: showing a file changes nothing in the world and has
-    /// nothing to undo, and the shell cannot reach the asset root - only the
-    /// executable knows where the project lives and which file manager the OS
-    /// has.
+    /// They are not commands: showing a file changes nothing in the world, so
+    /// there is nothing to undo. The shell also cannot reach the asset root;
+    /// only the executable knows where the project lives and which file
+    /// manager the OS has.
     pub reveals: Vec<String>,
     /// Keys the shell asked the editor to show in the Assets panel, in request
     /// order. Not commands either: moving a selection changes nothing in the
@@ -1061,8 +1104,8 @@ pub struct PendingEditorCommands {
 }
 
 impl PendingEditorCommands {
-    /// Queue a batch that engine controls issue (pause, step, undo replays):
-    /// it is applied, never recorded as a new undo step.
+    /// Queues a batch that is applied but never recorded as an undo step
+    /// (pause, step, a scripted command that is not an edit).
     pub fn push(&mut self, commands: Vec<EditorCommand>) {
         self.batches.push(PendingCommandBatch {
             commands,
@@ -1073,11 +1116,12 @@ impl PendingEditorCommands {
         });
     }
 
-    /// Queue the batch a history walk replays.
+    /// Queues the batch that replays one step of the undo history.
     ///
-    /// Marked with the walk's direction, because the step is popped before its
-    /// commands run: a replay that fails puts the cursor back rather than
-    /// leaving the log claiming a step that never happened.
+    /// The batch keeps `direction` because the step is popped before its
+    /// commands run. When a replay fails, the executable puts the step back on
+    /// the side it came from; without that, the history would claim an edit
+    /// that never happened.
     pub fn push_replay(&mut self, commands: Vec<EditorCommand>, direction: HistoryDirection) {
         self.batches.push(PendingCommandBatch {
             commands,
@@ -1088,29 +1132,30 @@ impl PendingEditorCommands {
         });
     }
 
-    /// Ask the executable to show `path` (project-relative, below `res`) in
-    /// the platform's file manager.
+    /// Asks the executable to show `path` in the platform's file manager.
+    /// `path` is an asset key, relative to the asset root that holds it (the
+    /// project's `res` or a module's resources).
     pub fn reveal(&mut self, path: impl Into<String>) {
         self.reveals.push(path.into());
     }
 
-    /// Take the reveal requests waiting for the executable's OS half.
+    /// Takes the reveal requests that are waiting for the executable.
     pub fn take_reveals(&mut self) -> Vec<String> {
         std::mem::take(&mut self.reveals)
     }
 
-    /// Ask the editor to show `key` in the Assets panel: the selection moves to
-    /// the asset and the panel opens the folder that holds it.
+    /// Asks the editor to show `key` in the Assets panel: the selection moves
+    /// to the asset and the panel opens the folder that holds it.
     pub fn focus_asset(&mut self, key: impl Into<String>) {
         self.focuses.push(key.into());
     }
 
-    /// Take the focus requests waiting for the executable.
+    /// Takes the focus requests that are waiting for the executable.
     pub fn take_focuses(&mut self) -> Vec<String> {
         std::mem::take(&mut self.focuses)
     }
 
-    /// Queue an edit the history should record as one undo step.
+    /// Queues an edit the history should record as one undo step.
     ///
     /// `coalesce_key` merges continuous edits (a slider drag) that arrive
     /// back to back under the same key into the previous step.
@@ -1142,14 +1187,14 @@ pub struct PendingCommandBatch {
     pub label: String,
     /// Continuous-edit key, when recorded.
     pub coalesce_key: Option<String>,
-    /// The history walk this batch replays, when it is one.
+    /// The history move this batch replays, when it is one.
     pub replay: Option<HistoryDirection>,
 }
 
 impl pill_engine::Resource for PendingEditorCommands {}
 
-/// Inserts every command resource the editor relies on, keeping existing
-/// values (the reload protocol's re-claim rule).
+/// Inserts every command resource the editor relies on, keeping the values a
+/// previous generation set.
 pub fn ensure_command_resources(world: &mut pill_engine::World) {
     CommandRegistry::ensure(world);
     world.register_resource::<CommandInbox>();
@@ -1205,13 +1250,13 @@ mod tests {
         };
         write_gizmo_preferences(&directory, "italian_brainrot", &settings).unwrap();
         // A second project's write keeps the first project's entry.
-        let other = crate::gizmo::GizmoSettings {
+        let second_project_settings = crate::gizmo::GizmoSettings {
             mode: crate::gizmo::GizmoMode::Scale,
             ..crate::gizmo::GizmoSettings::default()
         };
-        write_gizmo_preferences(&directory, "project_rs", &other).unwrap();
-        let text = std::fs::read_to_string(directory.join(PREFERENCES_FILE)).unwrap();
-        let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+        write_gizmo_preferences(&directory, "project_rs", &second_project_settings).unwrap();
+        let preferences_text = std::fs::read_to_string(directory.join(PREFERENCES_FILE)).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&preferences_text).unwrap();
         assert_eq!(document["theme"], "dark");
         assert_eq!(document["history_step_cap"], 42);
         assert_eq!(
@@ -1220,23 +1265,26 @@ mod tests {
         );
         assert_eq!(document["gizmo"]["projects"]["project_rs"]["mode"], "scale");
 
-        let read_back = read_gizmo_settings(&directory, "italian_brainrot");
-        assert_eq!(read_back.mode, crate::gizmo::GizmoMode::Rotate);
-        assert_eq!(read_back.space, crate::gizmo::GizmoSpace::Local);
-        assert!(read_back.snap);
+        let read_back_settings = read_gizmo_settings(&directory, "italian_brainrot");
+        assert_eq!(read_back_settings.mode, crate::gizmo::GizmoMode::Rotate);
+        assert_eq!(read_back_settings.space, crate::gizmo::GizmoSpace::Local);
+        assert!(read_back_settings.snap);
         // A project the file never saw keeps the last-used values.
-        let unknown = read_gizmo_settings(&directory, "circus_demo");
-        assert_eq!(unknown.mode, crate::gizmo::GizmoMode::Scale);
+        let unknown_project_settings = read_gizmo_settings(&directory, "circus_demo");
+        assert_eq!(
+            unknown_project_settings.mode,
+            crate::gizmo::GizmoMode::Scale
+        );
         // And no file at all is the defaults.
-        let empty = std::env::temp_dir().join("ecs-gizmo-nonexistent-dir");
-        let defaults = read_gizmo_settings(&empty, "anything");
-        assert_eq!(defaults, crate::gizmo::GizmoSettings::default());
+        let empty_directory = std::env::temp_dir().join("ecs-gizmo-nonexistent-dir");
+        let default_settings = read_gizmo_settings(&empty_directory, "anything");
+        assert_eq!(default_settings, crate::gizmo::GizmoSettings::default());
         // A profile whose layout was never saved has no directory yet: the
         // write creates it instead of failing.
-        let fresh = directory.join("unsaved-profile");
-        write_gizmo_preferences(&fresh, "italian_brainrot", &settings).unwrap();
+        let fresh_directory = directory.join("unsaved-profile");
+        write_gizmo_preferences(&fresh_directory, "italian_brainrot", &settings).unwrap();
         assert_eq!(
-            read_gizmo_settings(&fresh, "italian_brainrot").mode,
+            read_gizmo_settings(&fresh_directory, "italian_brainrot").mode,
             crate::gizmo::GizmoMode::Rotate
         );
         let _ = std::fs::remove_dir_all(&directory);
@@ -1248,8 +1296,8 @@ mod tests {
         assert!(chord.ctrl && chord.shift && !chord.alt);
         assert_eq!(chord.key, KeyName::P);
         assert_eq!(chord.to_string(), "ctrl+shift+p");
-        let plain: Chord = "space".parse().unwrap();
-        assert_eq!(plain, Chord::plain(KeyName::Space));
+        let plain_chord: Chord = "space".parse().unwrap();
+        assert_eq!(plain_chord, Chord::plain(KeyName::Space));
         assert!("ctrl+".parse::<Chord>().is_err());
         assert!("ctrl+bogus".parse::<Chord>().is_err());
         assert!("hyper+x".parse::<Chord>().is_err());
@@ -1258,52 +1306,54 @@ mod tests {
     #[test]
     fn presets_rebind_builtins_and_overrides_win() {
         let mut registry = CommandRegistry::with_builtins();
-        let pause = "editor.pause_toggle";
+        let pause_command_id = "editor.pause_toggle";
         // Blender is the default: Space pauses.
         assert_eq!(
-            registry.effective_chords(pause),
+            registry.effective_chords(pause_command_id),
             vec![Chord::plain(KeyName::Space)]
         );
         // Switching the preset rebinds without touching any command.
-        let file: KeybindingsFile = serde_json::from_str(r#"{ "preset": "unity" }"#).unwrap();
-        assert!(registry.apply_file(&file).is_empty());
+        let keybindings: KeybindingsFile =
+            serde_json::from_str(r#"{ "preset": "unity" }"#).unwrap();
+        assert!(registry.apply_file(&keybindings).is_empty());
         assert_eq!(
-            registry.effective_chords(pause),
+            registry.effective_chords(pause_command_id),
             vec![Chord::with(KeyName::P, true, false, false)]
         );
         // A single override wins on top of the preset.
-        let file: KeybindingsFile = serde_json::from_str(
+        let keybindings: KeybindingsFile = serde_json::from_str(
             r#"{ "preset": "unity", "overrides": { "editor.pause_toggle": ["ctrl+j"] } }"#,
         )
         .unwrap();
-        assert!(registry.apply_file(&file).is_empty());
+        assert!(registry.apply_file(&keybindings).is_empty());
         assert_eq!(
-            registry.effective_chords(pause),
+            registry.effective_chords(pause_command_id),
             vec![Chord::with(KeyName::J, true, false, false)]
         );
         // An empty list unbinds it.
-        let file: KeybindingsFile =
+        let keybindings: KeybindingsFile =
             serde_json::from_str(r#"{ "overrides": { "editor.pause_toggle": [] } }"#).unwrap();
-        registry.apply_file(&file);
-        assert!(registry.effective_chords(pause).is_empty());
+        registry.apply_file(&keybindings);
+        assert!(registry.effective_chords(pause_command_id).is_empty());
     }
 
     #[test]
     fn conflicts_and_unknown_overrides_are_reported() {
         let mut registry = CommandRegistry::with_builtins();
-        let file: KeybindingsFile = serde_json::from_str(
+        let keybindings: KeybindingsFile = serde_json::from_str(
             r#"{ "overrides": { "editor.pause_toggle": ["f10"], "editor.nope": ["x"] } }"#,
         )
         .unwrap();
-        let problems = registry.apply_file(&file);
+        let problems = registry.apply_file(&keybindings);
         assert!(problems
             .iter()
             .any(|problem| problem.contains("editor.nope")));
-        // f10 now binds pause and step (step's unity default, but the
-        // preset is still blender: use blender's right for a real clash).
-        let file: KeybindingsFile =
+        // The second file replaces the first one's overrides. Step now takes
+        // space, which the Blender preset still gives to pause, so both
+        // commands answer to one chord.
+        let keybindings: KeybindingsFile =
             serde_json::from_str(r#"{ "overrides": { "editor.step": ["space"] } }"#).unwrap();
-        assert!(registry.apply_file(&file).is_empty());
+        assert!(registry.apply_file(&keybindings).is_empty());
         let conflicts = registry.conflicts();
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].0, Chord::plain(KeyName::Space));
@@ -1350,9 +1400,9 @@ mod tests {
     fn resolve_finds_the_first_matching_command() {
         let registry = CommandRegistry::with_builtins();
         let modifiers = pill_engine::Modifiers::default();
-        let resolved = registry.resolve(pill_engine::KeyCode::Space, modifiers);
+        let resolved_command = registry.resolve(pill_engine::KeyCode::Space, modifiers);
         assert_eq!(
-            resolved.map(|spec| spec.id.as_str()),
+            resolved_command.map(|spec| spec.id.as_str()),
             Some("editor.pause_toggle")
         );
         assert!(registry
