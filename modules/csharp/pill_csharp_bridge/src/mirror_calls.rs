@@ -1,26 +1,28 @@
-//! The native calls the managed side of the mirror ABI needs beside the
-//! trampolines themselves.
+//! The native calls the managed side of the mirror ABI uses in addition to the
+//! generated trampolines.
 //!
 //! # Responsibilities
 //!
-//! - Drain the two text channels `pill_engine::mirror` keeps per thread - the
-//!   last error and the returned string - into managed strings.
-//! - Hand a mirrored call the address of a Rust-owned resource
+//! - Take the text out of the two per-thread channels `pill_engine::mirror`
+//!   keeps (the last error and the returned string) and give managed code a
+//!   pointer to it.
+//! - Give a mirrored call the address of a Rust-owned resource
 //!   (`ResMut<AssetManager>`), under the running invocation's declared access.
 //! - Read a file through the engine's asset store for `AssetLoader.Load()`.
-//! - Build the mirror-method table of a statically linked binary from its own
-//!   inventory, for the shipping posture.
+//! - Build the mirror-method table of a binary that links its modules
+//!   statically, from its own inventory, for the shipping posture.
 //!
 //! # Design
 //!
-//! None of this names a renderer or audio type: every extension's C# surface
-//! is generated from its own mirror attributes and reaches its own trampolines
-//! by address. What lives here is engine-wide - the world's resources, the
+//! Nothing here names a renderer or audio type. Each extension's C# surface is
+//! generated from its own mirror attributes and reaches its own trampolines by
+//! address. This file holds only engine-wide pieces: the world's resources, the
 //! asset store, and the channels every trampoline writes to.
 //!
-//! A string or byte run handed out here stays valid until the next call of the
-//! same kind on the same thread: it is parked in a thread-local, and managed
-//! code copies it before it does anything else.
+//! Text and bytes handed out here stay valid on this thread until the next
+//! call of the same kind hands new ones out. This file keeps them in a
+//! thread-local (one value per thread), and managed code copies them before it
+//! does anything else.
 
 // Standard library
 use std::cell::RefCell;
@@ -43,8 +45,8 @@ use super::ResolvedMirrorMethod;
 
 /// The call succeeded.
 const STATUS_OK: u8 = 0;
-/// The thing asked for does not exist: no text in the channel, or no value of
-/// the resource in the world.
+/// The call asked for something that does not exist: no text in the channel,
+/// or no value under the resource's name in the world.
 const STATUS_MISSING: u8 = 1;
 /// The running system did not declare this access.
 const STATUS_ACCESS_NOT_DECLARED: u8 = 2;
@@ -52,7 +54,7 @@ const STATUS_ACCESS_NOT_DECLARED: u8 = 2;
 const STATUS_NO_ACTIVE_SCOPE: u8 = 3;
 /// A panic was caught inside the call.
 const STATUS_PANICKED: u8 = 4;
-/// The caller passed no output buffer.
+/// One of the output locations the call writes was null.
 const STATUS_NULL_OUTPUT: u8 = 5;
 
 /// `ffi_take_mirror_text` kind for the last error.
@@ -61,32 +63,47 @@ const TEXT_LAST_ERROR: u8 = 0;
 const TEXT_RETURN_STRING: u8 = 1;
 
 thread_local! {
-    /// The text handed out by the last `ffi_take_mirror_text` on this thread.
-    static HELD_TEXT: RefCell<String> = const { RefCell::new(String::new()) };
-    /// The bytes handed out by the last `ffi_asset_loader_read` on this thread.
-    static HELD_BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// The text the last `ffi_take_mirror_text` on this thread handed out.
+    static HELD_MIRROR_TEXT: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The bytes the last `ffi_asset_loader_read` on this thread handed out.
+    static HELD_ASSET_BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 // =============================================================================
 // Text Channels
 // =============================================================================
 
-/// Take the last error (`kind` 0) or the returned string (`kind` 1) of the
-/// mirrored call that just ran on this thread.
+/// Takes the last error or the returned string of the mirrored call that just
+/// ran on this thread.
 ///
-/// Writes a pointer and a length the managed side copies before its next
-/// call; status `0` handed text out, `1` the channel was empty, `5` an output
-/// was null.
+/// `text_kind` is `TEXT_LAST_ERROR` (`0`) for the last error or
+/// `TEXT_RETURN_STRING` (`1`) for the returned string; any other value takes
+/// nothing. On success the text stays valid on this thread until the next call
+/// that hands text out, and both outputs point at it.
+///
+/// # Safety
+///
+/// Both outputs must be null or point at a writable value of their type, which
+/// the caller keeps for the duration of the call.
+///
+/// # Errors
+///
+/// Returns `STATUS_NULL_OUTPUT` (`5`) when either output is null,
+/// `STATUS_MISSING` (`1`) when the requested channel holds no text, and
+/// `STATUS_PANICKED` (`4`) when the call panicked. It returns `STATUS_OK`
+/// (`0`) after writing both outputs.
 pub(super) extern "C" fn ffi_take_mirror_text(
-    kind: u8,
+    text_kind: u8,
     out_data: *mut *const u8,
     out_length: *mut u32,
 ) -> u8 {
+    // Step 1: refuse a call with nowhere to write the answer.
     if out_data.is_null() || out_length.is_null() {
         return STATUS_NULL_OUTPUT;
     }
     guard_managed_callback("take_mirror_text", STATUS_PANICKED, || {
-        let text = match kind {
+        // Step 2: take the requested text out of its channel.
+        let text = match text_kind {
             TEXT_LAST_ERROR => pill_engine::mirror::take_last_error(),
             TEXT_RETURN_STRING => pill_engine::mirror::take_return_string(),
             _ => None,
@@ -94,7 +111,8 @@ pub(super) extern "C" fn ffi_take_mirror_text(
         let Some(text) = text else {
             return STATUS_MISSING;
         };
-        HELD_TEXT.with(|held| {
+        // Step 3: keep the text on this thread and write out its address.
+        HELD_MIRROR_TEXT.with(|held| {
             let mut held = held.borrow_mut();
             *held = text;
             // SAFETY: both outputs were checked non-null above, and the
@@ -112,30 +130,45 @@ pub(super) extern "C" fn ffi_take_mirror_text(
 // Native Resources
 // =============================================================================
 
-/// Write the address of the Rust-owned resource whose shared name hashes to
-/// `low`/`high`, for a mirrored call that takes it as `&T` (`mode` 0) or
-/// `&mut T` (`mode` 1).
+/// Writes the address of the Rust-owned resource registered under the shared
+/// name whose 128-bit hash is `stable_id_low` and `stable_id_high`.
 ///
-/// Status `0` wrote it, `1` the world holds no Rust value under that name,
-/// `2` the running system did not declare the access, `3` no invocation is
-/// running, `5` the output was null. A startup holds the world exclusively
-/// and is always authorized.
+/// `mode` is `0` for a shared borrow (`&T`) and `1` for a mutable one
+/// (`&mut T`). A startup holds the world exclusively, so it is always
+/// authorized.
+///
+/// # Safety
+///
+/// `output` must be null or point at a writable pointer the caller keeps for
+/// the duration of the call.
+///
+/// # Errors
+///
+/// Returns `STATUS_NULL_OUTPUT` (`5`) when the output is null,
+/// `STATUS_NO_ACTIVE_SCOPE` (`3`) when no managed invocation is running,
+/// `STATUS_ACCESS_NOT_DECLARED` (`2`) when the running system did not declare
+/// this access, `STATUS_MISSING` (`1`) when the world holds no Rust-owned value
+/// under that name, and `STATUS_PANICKED` (`4`) when the call panicked. It
+/// returns `STATUS_OK` (`0`) after writing the address.
 pub(super) extern "C" fn ffi_get_native_resource(
-    low: u64,
-    high: u64,
+    stable_id_low: u64,
+    stable_id_high: u64,
     mode: u8,
     output: *mut *mut c_void,
 ) -> u8 {
+    // Step 1: refuse a call with nowhere to write the address.
     if output.is_null() {
         return STATUS_NULL_OUTPUT;
     }
     guard_managed_callback("get_native_resource", STATUS_PANICKED, || {
-        let key = StableComponentId::from_halves(low, high);
+        let key = StableComponentId::from_halves(stable_id_low, stable_id_high);
+        // Step 2: check that the running system declared this access.
         match native_resource_access_is_authorized(key, mode) {
             None => return STATUS_NO_ACTIVE_SCOPE,
             Some(false) => return STATUS_ACCESS_NOT_DECLARED,
             Some(true) => {}
         }
+        // Step 3: find the value in the active world and write its address.
         let pointer = with_active_world(|world| {
             world.native_resource_pointer(ResourceId::Shared(key.0), mode == 1)
         });
@@ -156,22 +189,39 @@ pub(super) extern "C" fn ffi_get_native_resource(
 // Asset Store
 // =============================================================================
 
-/// Read the file at `path` (relative to `res`, through the mounted packs) for
-/// `AssetLoader.Load()`.
+/// Reads the file at `path` for `AssetLoader.Load()`.
 ///
-/// Writes a pointer and a length the managed side copies before its next
-/// call; status `0` read it, `1` the read failed with its message in the
-/// last-error channel, `5` an output was null.
+/// A relative path is looked up in the mounted packs first, then below the
+/// project's asset directory and the module roots; an absolute path is read
+/// from the filesystem as it is. A shipped build reads only the packs, the
+/// mounted directories and the module roots. On success both outputs point at
+/// the bytes, which stay valid on this thread until the next call that hands
+/// bytes out.
+///
+/// # Safety
+///
+/// `path` must be null or point at `path_length` readable bytes. Both outputs
+/// must be null or point at a writable value of their type, which the caller
+/// keeps for the duration of the call.
+///
+/// # Errors
+///
+/// Returns `STATUS_NULL_OUTPUT` (`5`) when either output is null,
+/// `STATUS_MISSING` (`1`) when the read failed, with its message in the
+/// last-error channel, and `STATUS_PANICKED` (`4`) when the call panicked. It
+/// returns `STATUS_OK` (`0`) after writing both outputs.
 pub(super) extern "C" fn ffi_asset_loader_read(
     path: *const u8,
     path_length: u32,
     out_data: *mut *const u8,
     out_length: *mut u32,
 ) -> u8 {
+    // Step 1: refuse a call with nowhere to write the bytes.
     if out_data.is_null() || out_length.is_null() {
         return STATUS_NULL_OUTPUT;
     }
     guard_managed_callback("asset_loader_read", STATUS_PANICKED, || {
+        // Step 2: copy the path the managed side passed.
         let path = if path_length == 0 || path.is_null() {
             String::new()
         } else {
@@ -179,9 +229,10 @@ pub(super) extern "C" fn ffi_asset_loader_read(
             let bytes = unsafe { std::slice::from_raw_parts(path, path_length as usize) };
             String::from_utf8_lossy(bytes).into_owned()
         };
+        // Step 3: load the file through the asset store.
         match AssetLoader::Path(path.into()).load() {
             Ok(bytes) => {
-                HELD_BYTES.with(|held| {
+                HELD_ASSET_BYTES.with(|held| {
                     let mut held = held.borrow_mut();
                     *held = bytes;
                     // SAFETY: both outputs were checked non-null above.
@@ -204,13 +255,14 @@ pub(super) extern "C" fn ffi_asset_loader_read(
 // Static Mirror Table
 // =============================================================================
 
-/// The mirror-method table of this binary, from its own inventory.
+/// Builds the mirror-method table of this binary from its own inventory.
 ///
-/// A shipping build links every extension into one image, so the descriptors
-/// they submitted are this artifact's and carry their trampolines' addresses;
-/// no module has to be loaded to read them. The development host builds the
-/// same rows from each loaded module's copy instead.
-pub(super) fn static_mirror_methods() -> Vec<ResolvedMirrorMethod> {
+/// A shipping build links every extension into one image. The method
+/// descriptors those extensions registered therefore belong to this artifact
+/// and carry their trampolines' addresses, so no module has to be loaded to
+/// read them. The development host instead builds the same rows from each
+/// loaded module's copy.
+pub(super) fn statically_linked_mirror_methods() -> Vec<ResolvedMirrorMethod> {
     mirror_method_descriptors()
         .into_iter()
         .map(|descriptor| ResolvedMirrorMethod {
@@ -236,11 +288,12 @@ pub(super) fn static_mirror_methods() -> Vec<ResolvedMirrorMethod> {
         .collect()
 }
 
-/// Whether a resolved row is one managed code can call.
+/// Reports whether managed code can call a resolved row.
 ///
-/// An enum's or a resource's type row (`__type`) describes the type and has
-/// no trampoline; an object's type row is its drop and does. Only rows with an
-/// address go into the table managed code calls through.
-pub(super) fn is_callable(row: &ResolvedMirrorMethod) -> bool {
+/// An enum's or a resource's `__type` row only describes the type, so it has
+/// no trampoline and its address is zero. An object's `__type` row is its drop
+/// function and does have one. Only rows with an address go into the table
+/// managed code calls through.
+pub(super) fn is_callable_by_managed_code(row: &ResolvedMirrorMethod) -> bool {
     row.address != 0
 }

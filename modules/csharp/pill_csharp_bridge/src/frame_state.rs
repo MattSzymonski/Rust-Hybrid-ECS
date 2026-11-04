@@ -10,15 +10,16 @@
 //!
 //! # Design
 //!
-//! Every function runs inside an active managed invocation, whose world the
-//! host owns, and reports the values the frame's systems see - so a managed
-//! system and a native one agree about the frame they process. Outside an
-//! invocation the answers are "nothing held" and zero: these are reads of
-//! per-frame state, so there is no cached copy that could go stale.
+//! Each function reads the world of the active managed invocation, which the
+//! host owns. It returns the same values the frame's systems see, so a managed
+//! system and a native one agree about the frame they process. With no
+//! invocation active, the answers are "nothing held" and zero. Nothing is
+//! cached between calls, so an answer cannot go stale.
 //!
-//! Keys and mouse buttons cross as `u8` discriminants: [`KeyCode::ALL`] is
-//! the wire order, and the managed mirror lists the same keys in the same
-//! order. An unknown discriminant reports "not held".
+//! The managed runtime passes keys and mouse buttons as `u8` numbers. Each
+//! number is an index into [`KeyCode::ALL`] or [`MouseButton::ALL`], and the
+//! C# mirror lists the same items in the same order. A number that names no
+//! entry reports "not held".
 
 // External crates
 use pill_core::math::Vector2f;
@@ -27,79 +28,91 @@ use pill_engine::{Input, KeyCode, MouseButton, Time};
 // Current crate
 use crate::context::with_active_world;
 
-/// Whether the key with discriminant `key` is held this frame.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Reports whether the key with discriminant `key_discriminant` is held this
+/// frame.
 ///
-/// `1` while held, `0` otherwise - outside an active invocation included, and
-/// for a discriminant no [`KeyCode`] has.
-pub(super) extern "C" fn ffi_input_key_held(key: u8) -> u8 {
-    let Some(key) = KeyCode::ALL.get(key as usize).copied() else {
+/// Returns `1` while the key is held and `0` otherwise, including outside an
+/// active invocation and for a number no [`KeyCode`] has.
+pub(super) extern "C" fn ffi_input_key_held(key_discriminant: u8) -> u8 {
+    let Some(key_code) = KeyCode::ALL.get(key_discriminant as usize).copied() else {
         return 0;
     };
     let held = with_active_world(|world| {
         world
             .get_resource::<Input>()
-            .is_some_and(|input| input.key_held(key))
+            .is_some_and(|input| input.key_held(key_code))
     })
     .unwrap_or(false);
     u8::from(held)
 }
 
-/// Whether the mouse button with discriminant `button` is held this frame;
-/// shaped like [`ffi_input_key_held`].
-pub(super) extern "C" fn ffi_input_mouse_button_held(button: u8) -> u8 {
-    let Some(button) = MouseButton::ALL.get(button as usize).copied() else {
+/// Reports whether the mouse button with discriminant
+/// `button_discriminant` is held this frame. Works the same way as
+/// [`ffi_input_key_held`].
+pub(super) extern "C" fn ffi_input_mouse_button_held(button_discriminant: u8) -> u8 {
+    let Some(mouse_button) = MouseButton::ALL.get(button_discriminant as usize).copied() else {
         return 0;
     };
     let held = with_active_world(|world| {
         world
             .get_resource::<Input>()
-            .is_some_and(|input| input.mouse_button_held(button))
+            .is_some_and(|input| input.mouse_button_held(mouse_button))
     })
     .unwrap_or(false);
     u8::from(held)
 }
 
-/// Writes the mouse motion since the previous frame, in physical pixels, to
-/// `out_x`/`out_y`, and returns `1`.
+/// Writes the mouse movement since the previous frame to `out_x` and `out_y`
+/// and returns `1`.
 ///
-/// Returns `0` without writing when either output is null. Outside an active
-/// invocation the written delta is zero.
+/// The values are raw device motion with no pixel unit: the platform reports
+/// them in its own units and does not scale them. Outside an active invocation
+/// the values written are zero. Returns `0` and writes nothing when either
+/// output is null.
 ///
 /// # Safety
 ///
-/// `out_x` and `out_y` must be null or point at writable `f32` values for the
-/// call's duration.
+/// `out_x` and `out_y` must each be null or point at a writable `f32` for the
+/// whole call.
 pub(super) extern "C" fn ffi_input_mouse_delta(out_x: *mut f32, out_y: *mut f32) -> u8 {
     if out_x.is_null() || out_y.is_null() {
         return 0;
     }
-    let delta = with_active_world(|world| {
+    let mouse_delta = with_active_world(|world| {
         world
             .get_resource::<Input>()
             .map_or(Vector2f::ZERO, |input| input.mouse_delta())
     })
     .unwrap_or(Vector2f::ZERO);
-    // SAFETY: checked non-null above; the caller's contract makes both
-    // writable.
+    // SAFETY: both pointers were checked non-null above, and the caller's
+    // contract makes them point at writable `f32` values.
     unsafe {
-        *out_x = delta.x;
-        *out_y = delta.y;
+        *out_x = mouse_delta.x;
+        *out_y = mouse_delta.y;
     }
     1
 }
 
-/// The frame's clamped delta in seconds, or `0.0` with no active clock.
+/// Returns the frame's time step in seconds, capped at the engine's maximum,
+/// or `0.0` with no active invocation.
 ///
-/// This is the value gameplay integrates with, not wall clock, so a stalled
-/// frame cannot teleport a managed simulation either.
+/// Gameplay advances by this value instead of by wall-clock time, and the cap
+/// keeps a stalled frame from moving a managed simulation too far.
 pub(super) extern "C" fn ffi_time_delta_seconds() -> f32 {
     with_active_world(|world| world.get_resource::<Time>().map(Time::delta_seconds))
         .flatten()
         .unwrap_or(0.0)
 }
 
-/// Seconds since the engine started, or `0.0` with no active clock:
-/// wall-clock time, for animation that must not tick with the delta.
+/// Returns the seconds since the project started, or `0.0` with no active
+/// invocation.
+///
+/// This is wall-clock time, for animation that must not advance with the
+/// frame delta.
 pub(super) extern "C" fn ffi_time_elapsed_seconds() -> f32 {
     with_active_world(|world| world.get_resource::<Time>().map(Time::elapsed_seconds))
         .flatten()

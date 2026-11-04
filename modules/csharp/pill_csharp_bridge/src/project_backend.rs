@@ -23,7 +23,7 @@ use pill_engine::Engine;
 use pill_player::ProjectBackend;
 
 // Current crate
-use crate::mirror_calls::static_mirror_methods;
+use crate::mirror_calls::statically_linked_mirror_methods;
 use crate::{exposed_components_from_names, CSharpModuleConfig, CSharpRuntime};
 
 // =============================================================================
@@ -33,34 +33,35 @@ use crate::{exposed_components_from_names, CSharpModuleConfig, CSharpRuntime};
 /// How the managed project is hosted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Posture {
-    /// CoreCLR booted through hostfxr, loading the runtime and project
-    /// assemblies (framework-dependent).
+    /// CoreCLR started through hostfxr, which loads the runtime and project
+    /// assemblies. The .NET runtime must be installed on the machine.
     CoreClr,
-    /// A NativeAOT library with a trimmed runtime embedded; no .NET install
-    /// and no JIT.
+    /// A NativeAOT library with a trimmed runtime inside it. It needs no .NET
+    /// install and runs no JIT.
     NativeAot,
 }
 
 /// A shipped C# project: where its assemblies are, and how to host them.
 ///
-/// There is no static equivalent of a .NET assembly - the runtime loads it
-/// either way - so a shipped project differs from a developed one only in what
-/// is not done: nothing is compiled, no C# mirror sources are generated, and
-/// the assembly is not watched for replacement.
+/// A .NET assembly has no static form that could be linked in; it is always
+/// loaded at run time. So this backend only loads it. Nothing is compiled, no
+/// C# mirror sources are generated, and the assembly is not watched for
+/// replacement.
 #[derive(Clone, Debug)]
 pub struct CSharpBackend {
     /// CoreCLR or NativeAOT.
     posture: Posture,
-    /// Assembly names and output directories, exactly as a reloading build
-    /// describes them. In the NativeAOT posture only the project side is used,
-    /// and it points at the `dotnet publish` output directory.
-    config: CSharpModuleConfig,
-    /// Directory the subdirectories in `config` are resolved against.
+    /// Assembly names and output directories, in the same form a reloading
+    /// build gives them. A NativeAOT build uses only the project side, whose
+    /// output directory is the `dotnet publish` output.
+    module_config: CSharpModuleConfig,
+    /// Directory the output subdirectories in `module_config` are resolved
+    /// against.
     ///
-    /// A distributed build carries its assemblies beside the executable, which
-    /// the backend prefers; this root is the fallback, the workspace the
-    /// binary was built in.
-    root: PathBuf,
+    /// A shipped bundle copies its assemblies beside the executable, and the
+    /// backend looks there first. This directory is the fallback, the
+    /// workspace the binary was built in.
+    workspace_root: PathBuf,
 }
 
 // =============================================================================
@@ -69,53 +70,69 @@ pub struct CSharpBackend {
 
 impl CSharpBackend {
     /// A project hosted by CoreCLR through hostfxr.
-    pub fn coreclr(config: CSharpModuleConfig, root: PathBuf) -> Self {
+    pub fn coreclr(module_config: CSharpModuleConfig, workspace_root: PathBuf) -> Self {
         Self {
             posture: Posture::CoreClr,
-            config,
-            root,
+            module_config,
+            workspace_root,
         }
     }
 
     /// A project published with NativeAOT and loaded as a native library.
-    pub fn native_aot(config: CSharpModuleConfig, root: PathBuf) -> Self {
+    pub fn native_aot(module_config: CSharpModuleConfig, workspace_root: PathBuf) -> Self {
         Self {
             posture: Posture::NativeAot,
-            config,
-            root,
+            module_config,
+            workspace_root,
         }
     }
 }
 
 impl ProjectBackend for CSharpBackend {
-    /// Start .NET (or load the AOT library) and register the project.
+    /// Starts .NET (or loads the AOT library) and registers the project.
     ///
-    /// Managed code is given byte-level bindings for every component the
-    /// extensions registered. The mirrored Rust functions are this binary's
-    /// own: every extension is linked in, so the descriptors they submitted
-    /// carry the trampolines' addresses with no module to load.
+    /// Managed code gets byte-level bindings for every component the
+    /// extensions registered. The mirrored Rust functions come from this
+    /// binary's own inventory: every extension is linked in, so the
+    /// descriptors they submitted already carry their trampolines' addresses,
+    /// and no module has to be loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::CSharp`] when the project cannot start: .NET or
+    /// the AOT library could not be started, a managed export is missing, the
+    /// component manifest could not be registered, a managed startup method
+    /// failed, or a reflected system access names a component that is not
+    /// registered.
     fn start(
         &self,
         engine: &mut Engine,
         exposed_component_names: &[String],
     ) -> Result<Box<dyn Any>, HostError> {
-        let exposed = exposed_components_from_names(engine.world(), exposed_component_names);
-        let mirror_methods = static_mirror_methods();
+        // Step 1: Resolve the byte layouts of the components the extensions
+        // registered, and this binary's mirror table of its own linked
+        // extensions.
+        let exposed_components =
+            exposed_components_from_names(engine.world(), exposed_component_names);
+        let mirror_methods = statically_linked_mirror_methods();
+        // Step 2: Start the runtime the posture's way. Both postures then
+        // register the project through the same code.
         let runtime = match self.posture {
-            // Nothing to load beside a shipped project.
+            // A shipped build loads no extra assemblies into the runtime, so
+            // the hook does nothing.
             Posture::CoreClr => CSharpRuntime::start(
                 engine,
-                &self.root,
-                &self.config,
-                &exposed,
+                &self.workspace_root,
+                &self.module_config,
+                &exposed_components,
                 &mirror_methods,
                 &mut |_| {},
             )?,
             Posture::NativeAot => CSharpRuntime::start_aot(
                 engine,
-                &self.root,
-                &self.config,
-                &exposed,
+                &self.workspace_root,
+                &self.module_config,
+                &exposed_components,
                 &mirror_methods,
             )?,
         };
@@ -131,21 +148,23 @@ impl ProjectBackend for CSharpBackend {
 mod tests {
     use super::*;
 
-    /// Each constructor selects its posture and keeps what it was given.
+    /// Each constructor records its posture and keeps the configuration it was
+    /// given.
     #[test]
     fn constructors_select_the_posture() {
-        let config = CSharpModuleConfig::new("csharp_runtime", "runtime", "project_cs", "project");
-        let coreclr = CSharpBackend::coreclr(config.clone(), PathBuf::from("."));
-        let aot = CSharpBackend::native_aot(config, PathBuf::from("."));
+        let module_config =
+            CSharpModuleConfig::new("csharp_runtime", "runtime", "project_cs", "project");
+        let coreclr = CSharpBackend::coreclr(module_config.clone(), PathBuf::from("."));
+        let aot = CSharpBackend::native_aot(module_config, PathBuf::from("."));
         assert_eq!(coreclr.posture, Posture::CoreClr);
         assert_eq!(aot.posture, Posture::NativeAot);
-        assert_eq!(aot.config.project_assembly_name, "project_cs");
+        assert_eq!(aot.module_config.project_assembly_name, "project_cs");
     }
 
-    /// A name the world does not know resolves to no binding rather than a
-    /// guessed one; the C#-facing name is the Rust path with `.` separators.
+    /// A component name the world does not know resolves to no binding, never
+    /// to a guessed one.
     #[test]
-    fn unknown_exposed_names_are_skipped() {
+    fn unknown_exposed_component_names_are_skipped() {
         let engine = Engine::new();
         let bindings =
             exposed_components_from_names(engine.world(), &["pill_spline::Spline".to_string()]);

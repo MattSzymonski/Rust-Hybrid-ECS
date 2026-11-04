@@ -554,7 +554,32 @@ impl ReloadTransaction<'_> {
         // it.
         self.drop_resources_whose_layout_changed(engine);
         self.begin_registration(engine);
-        let status = new_library.call_init(engine_api);
+        // Step 4c: A later generation re-registers and does not re-initialize.
+        // The artifact's registration half re-registers the systems and
+        // resources whose code moved with the new image; its one-time `init`
+        // ran on the first load and must not seed this world twice. An artifact
+        // built before the split exports no registration half, so it keeps the
+        // one entry point it always had - said on every such reload, because a
+        // reload that re-initializes silently is the thing this stage exists to
+        // end.
+        let status = match new_library.call_register(engine_api) {
+            Some(status) => {
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = self.subject,
+                    "this artifact exports a registration entry point; its one-time init does not run again"
+                );
+                status
+            }
+            None => {
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = self.subject,
+                    "this artifact has no registration entry point; its one-time init runs again on this reload"
+                );
+                new_library.call_init(engine_api)
+            }
+        };
         self.end_registration(engine);
         engine.world_mut().clear_superseded_persist_registrations();
         analytics::record_init(self.subject, init_started.elapsed().as_secs_f64() * 1000.0);

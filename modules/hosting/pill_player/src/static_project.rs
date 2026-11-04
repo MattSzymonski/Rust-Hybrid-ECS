@@ -446,6 +446,9 @@ pub(crate) fn run_linked_entry_point(
                 apply_project_startup_scene(engine, path);
             }
         },
+        // A statically linked project is loaded once and never reloaded, so
+        // there is no later generation for a registration half to serve.
+        pill_engine::component_registry::no_registration,
         |engine| register_module(engine, scope, init),
     );
 

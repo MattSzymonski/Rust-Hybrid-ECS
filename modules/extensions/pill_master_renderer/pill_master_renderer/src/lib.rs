@@ -117,25 +117,35 @@ pub use resources::RenderingManager;
 // Free Functions
 // =============================================================================
 
-/// The module's entry point: adds the post-update `rendering` system that
-/// fills the frame, once, and returns zero.
+/// The registration half: adds the post-update `rendering` system that fills
+/// the frame, once, and returns zero.
 ///
-/// The system belongs to whatever scope the caller opened. A host loading this
-/// module gives it the module's own owner, so a reload removes exactly this
-/// system and the next generation registers its own. The generated
-/// `host_module_*` wrapper carries this as `pill_module_init` by expanding
-/// `__pill_module_entry_points!`.
+/// This is the half a reload repeats. The system belongs to whatever scope the
+/// caller opened. A host loading this module gives it the module's own owner,
+/// so a reload removes exactly this system and the next generation registers
+/// its own.
 ///
 /// Registers no data: `pill_master_renderer_data`'s own `register` declares the
 /// components, asset types, resources and default pipeline before this module
 /// loads, and doing it here would point the asset types' tables at this image,
 /// which reloads most often.
-#[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     if !engine.is_registered("rendering") {
         engine.register_post_update_system("rendering", rendering_system);
     }
     0
+}
+
+/// The artifact's one-time entry point: nothing is one-time here.
+///
+/// Everything the module owns is registration that [`register`] repeats on
+/// every generation. This function exists because a host that links the crate
+/// statically loads it once and calls this entry point alone, and because the
+/// generated `host_module_*` wrapper carries it as `pill_module_init` by
+/// expanding `__pill_module_entry_points!`.
+#[pill_module(register = register)]
+pub fn init(engine: &mut Engine) -> u32 {
+    register(engine)
 }
 
 /// Starts building a renderer backend on a window, for a host that links this

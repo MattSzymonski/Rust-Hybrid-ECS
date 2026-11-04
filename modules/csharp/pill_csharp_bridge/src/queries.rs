@@ -8,17 +8,18 @@
 //!
 //! # Design
 //!
-//! Each `ffi_*` function is an `extern "C"` entry point invoked across the
-//! host/managed boundary by C# query iterators and scheduled systems. Access
-//! validation is delegated to [`access_is_authorized`], and world/binding
-//! lookups run through [`with_active_context`] and [`with_active_world`], so
-//! every callback fails closed with status code `3` when no managed system is
-//! active. Pointers returned in [`ComponentChunk`] remain owned by the active
-//! world's archetype and are only valid for the duration of the managed
-//! invocation. Entity rows arrive in `ComponentChunk::entities`, a const slot,
-//! and the archetype-scoped path serves them only for an archetype a validated
-//! term already reached in the same invocation - that path cannot be used to
-//! probe arbitrary archetypes.
+//! Each `ffi_*` function is an `extern "C"` entry point that C# query iterators
+//! and scheduled systems call across the host/managed boundary. Access checks
+//! go through [`access_is_authorized`], and world and binding lookups go
+//! through [`with_active_context`] and [`with_active_world`]. When no managed
+//! system is active, every callback answers status code `3` instead of serving
+//! data.
+//!
+//! Pointers returned in [`ComponentChunk`] stay owned by the active world's
+//! archetype and are valid only while the managed invocation runs. Entity rows
+//! arrive in `ComponentChunk::entities`, a const slot. The archetype-scoped
+//! path serves them only for an archetype this invocation has already received
+//! a chunk for, so it cannot be used to probe arbitrary archetypes.
 
 // External crates
 use pill_core::telemetry::telemetry_target;
@@ -39,16 +40,16 @@ use super::context::{
 
 /// Record the archetype of a chunk a validated term just served.
 ///
-/// The entity path answers only for archetypes recorded here, so the recording
-/// happens exactly where a chunk is returned - a status other than success
-/// served nothing and records nothing.
-fn record_served_archetype(status: u8, output: *mut ComponentChunk) {
+/// The entity path answers only for archetypes this invocation has already
+/// served a chunk for. Recording happens exactly where a chunk is returned, so
+/// a status that served nothing records nothing.
+fn record_served_archetype(status: u8, chunk_output: *mut ComponentChunk) {
     if status != 1 {
         return;
     }
-    // SAFETY: a status of `1` means the arm that produced it wrote a complete
-    // chunk into the output buffer, which was checked non-null at entry.
-    let chunk = unsafe { &*output };
+    // SAFETY: status `1` is returned only after the producing arm wrote a
+    // complete chunk into `chunk_output`, which was checked non-null on entry.
+    let chunk = unsafe { &*chunk_output };
     record_observed_archetype(ArchetypeId(
         ((chunk.archetype_high as u128) << 64) | chunk.archetype_low as u128,
     ));
@@ -56,33 +57,33 @@ fn record_served_archetype(status: u8, output: *mut ComponentChunk) {
 
 /// Write one component column chunk into the managed caller's output buffer.
 ///
-/// `data` and `ticks` stay owned by the active world's archetype and are only
-/// valid for the managed invocation that requested the chunk, exactly as
-/// [`ComponentChunk`] documents.
-// Eight fields of one ABI struct rather than an implicit grouping: a wrapper
-// struct over them would exist only to satisfy the lint.
+/// `column_rows` and `ticks` stay owned by the active world's archetype and
+/// are valid only during the managed invocation that requested the chunk,
+/// exactly as [`ComponentChunk`] documents.
+// The eight fields belong to one ABI struct, so they stay separate arguments:
+// a wrapper struct would exist only to satisfy the lint.
 #[allow(clippy::too_many_arguments)]
 fn write_component_chunk(
-    output: *mut ComponentChunk,
+    chunk_output: *mut ComponentChunk,
     archetype: ArchetypeId,
-    data: *mut u8,
-    len: usize,
+    column_rows: *mut u8,
+    row_count: usize,
     element_size: usize,
     ticks: *mut ComponentTicks,
     change_tick: u32,
     scope_token: u32,
 ) {
-    let bits = archetype.0;
-    // SAFETY: `output` is non-null, checked by the caller, and points at a
-    // caller-owned slot; `data` and `ticks` point into a live column of the
-    // active world and stay valid for the duration of the managed invocation.
+    let archetype_bits = archetype.0;
+    // SAFETY: `chunk_output` is non-null, checked by the caller, and points at
+    // a caller-owned slot. `column_rows` and `ticks` point into a live column
+    // of the active world and stay valid while the managed invocation runs.
     unsafe {
-        output.write(ComponentChunk {
-            archetype_low: bits as u64,
-            archetype_high: (bits >> 64) as u64,
-            data: data.cast(),
+        chunk_output.write(ComponentChunk {
+            archetype_low: archetype_bits as u64,
+            archetype_high: (archetype_bits >> 64) as u64,
+            data: column_rows.cast(),
             entities: std::ptr::null(),
-            len: len as u32,
+            len: row_count as u32,
             element_size: element_size as u32,
             ticks,
             change_tick,
@@ -94,24 +95,24 @@ fn write_component_chunk(
 /// Write one archetype's entity column chunk into the managed caller's output
 /// buffer.
 ///
-/// Entity rows arrive through the const `entities` slot with null `data` and
-/// `ticks`, the read-only contract the ABI documents, so a managed write
-/// through an entity column cannot be expressed.
+/// Entity rows arrive through the const `entities` slot, with `data` and
+/// `ticks` null. That is the read-only contract the ABI documents, so managed
+/// code has no way to express a write through an entity column.
 fn write_entity_chunk(
-    output: *mut ComponentChunk,
+    chunk_output: *mut ComponentChunk,
     archetype: ArchetypeId,
     entities: &[Entity],
     change_tick: u32,
     scope_token: u32,
 ) {
-    let bits = archetype.0;
-    // SAFETY: `output` is non-null, checked by the caller, and points at a
-    // caller-owned slot; the entity slice stays borrowed from the active world
-    // for the duration of the managed invocation.
+    let archetype_bits = archetype.0;
+    // SAFETY: `chunk_output` is non-null, checked by the caller, and points at
+    // a caller-owned slot. The entity slice stays borrowed from the active
+    // world while the managed invocation runs.
     unsafe {
-        output.write(ComponentChunk {
-            archetype_low: bits as u64,
-            archetype_high: (bits >> 64) as u64,
+        chunk_output.write(ComponentChunk {
+            archetype_low: archetype_bits as u64,
+            archetype_high: (archetype_bits >> 64) as u64,
             data: std::ptr::null_mut(),
             entities: entities.as_ptr().cast(),
             len: entities.len() as u32,
@@ -125,72 +126,79 @@ fn write_entity_chunk(
 
 /// Whether a module's native binding still matches the live column's layout.
 ///
-/// The binding was built from a layout the live column no longer matches - the
+/// A binding can describe an older layout than the column it points at: the
 /// module reloaded with a new schema, or a mirror arrived against a stale one.
-/// A wrong-size chunk would be read as the managed mirror's fields, so the
-/// request fails closed here and the mismatch is logged.
+/// A chunk of the wrong size would be read as the managed mirror's fields, so
+/// the caller refuses the request and this check logs the mismatch.
 fn module_binding_matches_live_column(
     component_id: ComponentId,
-    binding_size: usize,
-    column_size: usize,
+    binding_element_size: usize,
+    column_element_size: usize,
 ) -> bool {
-    if column_size == binding_size {
+    if column_element_size == binding_element_size {
         return true;
     }
     pill_core::error!(
         target: telemetry_target::ECS,
         component_id = ?component_id,
-        binding_size = binding_size,
-        column_size = column_size,
+        binding_size = binding_element_size,
+        column_size = column_element_size,
         "module native binding size disagrees with the live column"
     );
     false
 }
 
-/// Return a component chunk to managed code after validating scheduler access.
+/// Return a component chunk to managed code after checking the system's
+/// declared access.
 ///
-/// Status codes are interpreted by `Engine.TryGetChunk`: `0` ends iteration,
-/// `1` returns a chunk, `2` is unknown component, `3` is out-of-scope access,
-/// `4` is an undeclared access mode, and `5` reports a caller bug - the output
-/// buffer is null, which the managed side maps to an `ArgumentException`.
+/// `Engine.TryGetChunk` on the managed side reads these status codes:
+///
+/// - `0`: nothing to serve, so iteration ends.
+/// - `1`: the output holds a complete chunk.
+/// - `2`: the component is unknown, or a module binding no longer matches the
+///   live column's element size.
+/// - `3`: no managed system is running on this thread.
+/// - `4`: the running system did not declare the requested access.
+/// - `5`: the caller passed no output buffer. Managed code maps this to an
+///   `ArgumentException`, because its own call sites always pass a real one.
 fn ffi_get_component_chunk_guarded(
-    key_low: u64,
-    key_high: u64,
-    mode: u8,
+    stable_id_low: u64,
+    stable_id_high: u64,
+    request_mode: u8,
     chunk_index: u32,
-    output: *mut ComponentChunk,
+    chunk_output: *mut ComponentChunk,
 ) -> u8 {
-    // Step 1: Reject a null output buffer - the caller-bug status, not the
-    // end-of-iteration code - and validate the declared access mode.
-    if output.is_null() {
+    // Step 1: Reject a null output buffer with the caller-bug status, not the
+    // end-of-iteration code. Then check the requested access.
+    if chunk_output.is_null() {
         return 5;
     }
-    let stable_id = StableComponentId::from_halves(key_low, key_high);
-    match access_is_authorized(stable_id, mode) {
+    let stable_id = StableComponentId::from_halves(stable_id_low, stable_id_high);
+    match access_is_authorized(stable_id, request_mode) {
         None => return 3,
         Some(false) => return 4,
         Some(true) => {}
     }
 
-    // Step 2: Resolve the component binding and write the requested chunk
-    // into the managed caller's output buffer.
+    // Step 2: Look up the component binding and write the requested chunk into
+    // the managed caller's output buffer.
     let status = with_active_context(|world, bindings| match bindings.get(&stable_id).copied() {
         Some(ComponentBinding::Managed { component_id, .. }) => {
             let change_tick = world.change_tick().get();
             let scope_token = active_scope_token();
-            // The stride comes from the live column inside the accessor, never
-            // from the binding's copy of the layout: `data` points into that
-            // column, and only the column describes what is stored there. A
-            // binding that drifted must not be able to make managed row
-            // arithmetic walk off the column; a missing column fails closed
-            // like an unknown component.
+            // The row stride comes from the live column inside the accessor,
+            // never from the binding's copy of the layout. The chunk written
+            // here points into that column, and only the column describes what
+            // is stored there, so a stale binding cannot make managed row
+            // arithmetic read past the column. An index that finds no column
+            // serves nothing, the same as an index past the end.
             let Some(chunk) =
                 world.descriptor_component_chunk_mut(component_id, chunk_index as usize)
             else {
                 return 0;
             };
             write_component_chunk(
-                output,
+                chunk_output,
                 chunk.archetype,
                 chunk.data,
                 chunk.len,
@@ -206,8 +214,9 @@ fn ffi_get_component_chunk_guarded(
         }) => {
             let change_tick = world.change_tick().get();
             let scope_token = active_scope_token();
-            // The native twin of the descriptor path: serve the module's native
-            // column as raw bytes so managed code and Rust share one storage.
+            // The native twin of the descriptor path: serve the module's own
+            // column as raw bytes, so managed code and Rust use the same
+            // storage.
             let Some(chunk) = world.native_component_chunk_mut(component_id, chunk_index as usize)
             else {
                 return 0;
@@ -216,7 +225,7 @@ fn ffi_get_component_chunk_guarded(
                 return 2;
             }
             write_component_chunk(
-                output,
+                chunk_output,
                 chunk.archetype,
                 chunk.data,
                 chunk.len,
@@ -230,59 +239,75 @@ fn ffi_get_component_chunk_guarded(
         None => 2,
     })
     .unwrap_or(3);
-    record_served_archetype(status, output);
+    record_served_archetype(status, chunk_output);
     status
 }
 
 /// Panic-guarded entry point for [`ffi_get_component_chunk_guarded`].
 ///
-/// A panic crossing the `extern "C"` boundary would abort the process; it is
-/// logged and reported as `5` instead, so the frame's error path names the
-/// system and the host keeps running.
+/// A panic that crosses the `extern "C"` boundary aborts the process. This
+/// wrapper logs the panic and answers `5` instead, so the failure is recorded
+/// against the running system and the host keeps running.
 pub(super) extern "C" fn ffi_get_component_chunk(
-    key_low: u64,
-    key_high: u64,
-    mode: u8,
+    stable_id_low: u64,
+    stable_id_high: u64,
+    request_mode: u8,
     chunk_index: u32,
-    output: *mut ComponentChunk,
+    chunk_output: *mut ComponentChunk,
 ) -> u8 {
     super::context::guard_managed_callback("ffi_get_component_chunk", 5, || {
-        ffi_get_component_chunk_guarded(key_low, key_high, mode, chunk_index, output)
+        ffi_get_component_chunk_guarded(
+            stable_id_low,
+            stable_id_high,
+            request_mode,
+            chunk_index,
+            chunk_output,
+        )
     })
 }
 
 /// Return one component chunk of an archetype the managed enumerator already
 /// identified through its driver chunk.
 ///
-/// Managed query iterators resolve every non-driver term with this call once
-/// per archetype, instead of scanning chunk indices until the archetypes
-/// match. Status codes match [`ffi_get_component_chunk`]: `0` means the
-/// archetype does not carry the component (an optional term is absent), `1`
-/// returns a chunk, `2` is unknown component, `3` is out-of-scope access,
-/// `4` is an undeclared access mode, and `5` reports a null output buffer. A
-/// `mode` of `2` requests the archetype's entity column instead, which carries
-/// no component access to validate.
+/// Managed query iterators call this once per archetype for each non-driver
+/// term, instead of scanning chunk indices until the archetypes match.
+///
+/// `Engine.TryGetArchetypeChunk` on the managed side reads these status codes:
+///
+/// - `0`: nothing to serve. For a component term, the archetype does not carry
+///   the component, so an optional term is absent.
+/// - `1`: the output holds a complete chunk.
+/// - `2`: the component is unknown, or a module binding no longer matches the
+///   live column's element size.
+/// - `3`: no managed system is running on this thread.
+/// - `4`: the running system did not declare the requested access, or this
+///   invocation has not served the archetype yet.
+/// - `5`: the caller passed no output buffer.
+///
+/// A `request_mode` of `2` asks for the archetype's entity column instead of a
+/// component. That column belongs to no component, so there is no access
+/// declaration to check.
 fn ffi_get_archetype_chunk_guarded(
     archetype_low: u64,
     archetype_high: u64,
-    key_low: u64,
-    key_high: u64,
-    mode: u8,
-    output: *mut ComponentChunk,
+    stable_id_low: u64,
+    stable_id_high: u64,
+    request_mode: u8,
+    chunk_output: *mut ComponentChunk,
 ) -> u8 {
-    // Step 1: Reject a null output buffer before reconstructing the identity;
-    // the caller-bug status, not end-of-iteration.
-    if output.is_null() {
+    // Step 1: Reject a null output buffer before rebuilding the identity. The
+    // status reports the caller's bug; it does not end iteration.
+    if chunk_output.is_null() {
         return 5;
     }
     let archetype_id = ArchetypeId(((archetype_high as u128) << 64) | archetype_low as u128);
 
-    // Step 2: Entity terms resolve against the archetype's entity column and
-    // carry no component access, matching the dedicated entity callback. The
-    // archetype must already have been served through a validated term in this
-    // same invocation: without that precondition any id could be probed, which
-    // is a component-set oracle no query declared.
-    if mode == 2 {
+    // Step 2: An entity term reads the archetype's entity column, which needs
+    // no component access check - the same rule as the dedicated entity
+    // callback. The archetype must already have been served in this
+    // invocation: otherwise managed code could ask about any archetype id and
+    // learn which components it holds without declaring access to them.
+    if request_mode == 2 {
         match archetype_was_observed(archetype_id) {
             None => return 3,
             Some(false) => return 4,
@@ -293,7 +318,7 @@ fn ffi_get_archetype_chunk_guarded(
                 return 0;
             };
             write_entity_chunk(
-                output,
+                chunk_output,
                 archetype,
                 entities,
                 world.change_tick().get(),
@@ -302,25 +327,26 @@ fn ffi_get_archetype_chunk_guarded(
             1
         })
         .unwrap_or(3);
-        record_served_archetype(status, output);
+        record_served_archetype(status, chunk_output);
         return status;
     }
 
-    // Step 3: Component terms validate the declared access exactly like the
-    // index-based lookup, so both entry points fail the same way.
-    let stable_id = StableComponentId::from_halves(key_low, key_high);
-    match access_is_authorized(stable_id, mode) {
+    // Step 3: A component term checks the declared access exactly like the
+    // index-based lookup, so both entry points answer the same status.
+    let stable_id = StableComponentId::from_halves(stable_id_low, stable_id_high);
+    match access_is_authorized(stable_id, request_mode) {
         None => return 3,
         Some(false) => return 4,
         Some(true) => {}
     }
 
-    // Step 4: Resolve the binding and write the column from that one
-    // archetype; the remaining chunks of the world are never touched.
+    // Step 4: Look up the binding and write the column from that one
+    // archetype. No other chunk of the world is touched.
     let status = with_active_context(|world, bindings| match bindings.get(&stable_id).copied() {
         Some(ComponentBinding::Managed { component_id, .. }) => {
-            // As in the index-based callback: the stride is the live column's,
-            // so a drifted binding cannot mislead managed row arithmetic.
+            // As in the index-based callback, the row stride is the live
+            // column's, so a stale binding cannot mislead managed row
+            // arithmetic.
             let change_tick = world.change_tick().get();
             let scope_token = active_scope_token();
             let Some(chunk) =
@@ -329,7 +355,7 @@ fn ffi_get_archetype_chunk_guarded(
                 return 0;
             };
             write_component_chunk(
-                output,
+                chunk_output,
                 chunk.archetype,
                 chunk.data,
                 chunk.len,
@@ -353,7 +379,7 @@ fn ffi_get_archetype_chunk_guarded(
                 return 2;
             }
             write_component_chunk(
-                output,
+                chunk_output,
                 chunk.archetype,
                 chunk.data,
                 chunk.len,
@@ -367,53 +393,53 @@ fn ffi_get_archetype_chunk_guarded(
         None => 2,
     })
     .unwrap_or(3);
-    record_served_archetype(status, output);
+    record_served_archetype(status, chunk_output);
     status
 }
 
 /// Panic-guarded entry point for [`ffi_get_archetype_chunk_guarded`].
 ///
-/// A panic crossing the `extern "C"` boundary would abort the process; it is
-/// logged and reported as `5` instead, so the frame's error path names the
-/// system and the host keeps running.
+/// A panic that crosses the `extern "C"` boundary aborts the process. This
+/// wrapper logs the panic and answers `5` instead, so the failure is recorded
+/// against the running system and the host keeps running.
 pub(super) extern "C" fn ffi_get_archetype_chunk(
     archetype_low: u64,
     archetype_high: u64,
-    key_low: u64,
-    key_high: u64,
-    mode: u8,
-    output: *mut ComponentChunk,
+    stable_id_low: u64,
+    stable_id_high: u64,
+    request_mode: u8,
+    chunk_output: *mut ComponentChunk,
 ) -> u8 {
     super::context::guard_managed_callback("ffi_get_archetype_chunk", 5, || {
         ffi_get_archetype_chunk_guarded(
             archetype_low,
             archetype_high,
-            key_low,
-            key_high,
-            mode,
-            output,
+            stable_id_low,
+            stable_id_high,
+            request_mode,
+            chunk_output,
         )
     })
 }
 
-/// Return the `chunk_index`th archetype entity column.
+/// Return the entity column of the archetype at `chunk_index`.
 ///
-/// The slice written to `output` contains `Entity` values for one archetype
-/// and is only valid while the managed system that triggered the callback is
-/// active; callers must not retain it beyond the invocation.
-fn ffi_get_entity_chunk_guarded(chunk_index: u32, output: *mut ComponentChunk) -> u8 {
-    // Step 1: Reject a null output buffer before touching the world; the
-    // caller-bug status, not end-of-iteration.
-    if output.is_null() {
+/// The slice written to `chunk_output` holds the `Entity` values of one
+/// archetype. It is valid only while the managed system that made the call is
+/// running, so the caller must not keep it after the call returns.
+fn ffi_get_entity_chunk_guarded(chunk_index: u32, chunk_output: *mut ComponentChunk) -> u8 {
+    // Step 1: Reject a null output buffer before touching the world. Status
+    // `5` reports the caller's bug; it does not end iteration.
+    if chunk_output.is_null() {
         return 5;
     }
-    // Step 2: Resolve the entity column and write it into the output buffer.
+    // Step 2: Find the entity column and write it into the output buffer.
     with_active_world(|world| {
         let Some((archetype, entities)) = world.entity_chunk(chunk_index as usize) else {
             return 0;
         };
         write_entity_chunk(
-            output,
+            chunk_output,
             archetype,
             entities,
             world.change_tick().get(),
@@ -427,75 +453,91 @@ fn ffi_get_entity_chunk_guarded(chunk_index: u32, output: *mut ComponentChunk) -
 
 /// Panic-guarded entry point for [`ffi_get_entity_chunk_guarded`].
 ///
-/// A panic crossing the `extern "C"` boundary would abort the process; it is
-/// logged and reported as `5` instead, so the frame's error path names the
-/// system and the host keeps running.
-pub(super) extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut ComponentChunk) -> u8 {
+/// A panic that crosses the `extern "C"` boundary aborts the process. This
+/// wrapper logs the panic and answers `5` instead, so the failure is recorded
+/// against the running system and the host keeps running.
+pub(super) extern "C" fn ffi_get_entity_chunk(
+    chunk_index: u32,
+    chunk_output: *mut ComponentChunk,
+) -> u8 {
     super::context::guard_managed_callback("ffi_get_entity_chunk", 5, || {
-        ffi_get_entity_chunk_guarded(chunk_index, output)
+        ffi_get_entity_chunk_guarded(chunk_index, chunk_output)
     })
 }
 
 /// Write the current entity count while a managed system is active.
 ///
-/// Status codes: `0` wrote the count, `3` no managed system is scheduled (a
-/// caller cannot tell that from an empty world through the count alone, so it
-/// gets a status the managed wrapper turns into an exception), and `5` the
-/// caller passed no output buffer.
+/// Status codes:
 ///
-/// The count is `u32` by ABI design; worlds above ~4.29 billion entities are
-/// unsupported (see the `ComponentChunk` layout-limits documentation).
-fn ffi_entity_count_guarded(output: *mut u32) -> u8 {
-    if output.is_null() {
+/// - `0`: the count was written.
+/// - `3`: no managed system is scheduled. The count alone could not show the
+///   difference from an empty world, so it gets its own status, which the
+///   managed wrapper turns into an exception.
+/// - `5`: the caller passed no output buffer.
+///
+/// The count is `u32` by ABI design, so worlds above ~4.29 billion entities
+/// are unsupported. See the `ComponentChunk` layout-limits documentation.
+fn ffi_entity_count_guarded(count_output: *mut u32) -> u8 {
+    if count_output.is_null() {
         return 5;
     }
     let Some(count) = with_active_world(|world| world.entity_count() as u32) else {
         return 3;
     };
-    // SAFETY: `output` was checked non-null above and points at a caller-owned
-    // `u32` for the duration of this call.
-    unsafe { output.write(count) };
+    // SAFETY: `count_output` was checked non-null above and points at a
+    // caller-owned `u32` for the duration of this call.
+    unsafe { count_output.write(count) };
     0
 }
 
 /// Panic-guarded entry point for [`ffi_entity_count_guarded`].
 ///
-/// A panic crossing the `extern "C"` boundary would abort the process; it is
-/// logged and reported as `5` instead, so the frame's error path names the
-/// system and the host keeps running.
-pub(super) extern "C" fn ffi_entity_count(output: *mut u32) -> u8 {
+/// A panic that crosses the `extern "C"` boundary aborts the process. This
+/// wrapper logs the panic and answers `5` instead, so the failure is recorded
+/// against the running system and the host keeps running.
+pub(super) extern "C" fn ffi_entity_count(count_output: *mut u32) -> u8 {
     super::context::guard_managed_callback("ffi_entity_count", 5, || {
-        ffi_entity_count_guarded(output)
+        ffi_entity_count_guarded(count_output)
     })
 }
 
 /// Write a live entity's stable id, split into two `u64` halves.
 ///
-/// Status codes: `0` wrote the id, `1` the entity is not live (it was
-/// destroyed, or the handle belongs to another world), `3` no managed system is
-/// scheduled, and `5` a half was missing or the call could not be served.
+/// Status codes:
 ///
-/// Two halves rather than a `u128`: no C ABI in the table carries one, and the
-/// managed side re-assembles the pair into the hex form saved data uses.
-fn ffi_entity_stable_id_guarded(entity: *const Entity, low: *mut u64, high: *mut u64) -> u8 {
-    if entity.is_null() || low.is_null() || high.is_null() {
+/// - `0`: the id was written.
+/// - `1`: the entity is not live. It was destroyed, or the handle belongs to
+///   another world.
+/// - `3`: no managed system is scheduled.
+/// - `5`: the entity handle or one of the two output halves was null.
+///
+/// Two `u64` halves stand in for one `u128`, because no C ABI in the engine
+/// table carries one. The managed side joins the pair back into the 32-digit
+/// hex form that saved data records.
+fn ffi_entity_stable_id_guarded(
+    entity: *const Entity,
+    low_half_output: *mut u64,
+    high_half_output: *mut u64,
+) -> u8 {
+    if entity.is_null() || low_half_output.is_null() || high_half_output.is_null() {
         return 5;
     }
     // SAFETY: `entity` was checked non-null above and points at a caller-owned
     // handle for the duration of this call.
     let entity = unsafe { entity.read() };
-    let Some(id) = with_active_world(|world| world.entity_id(entity)) else {
+    let Some(entity_id) = with_active_world(|world| world.entity_id(entity)) else {
         return 3;
     };
-    let Some(id) = id else {
+    let Some(entity_id) = entity_id else {
         return 1;
     };
-    let value = id.value();
-    // SAFETY: both halves were checked non-null above and point at
-    // caller-owned `u64`s for the duration of this call.
+    let stable_id_value = entity_id.value();
+    // SAFETY: `low_half_output` and `high_half_output` were checked non-null
+    // above, and both point at caller-owned `u64`s for the duration of this
+    // call.
     unsafe {
-        low.write(value as u64);
-        high.write((value >> 64) as u64);
+        low_half_output.write(stable_id_value as u64);
+        high_half_output.write((stable_id_value >> 64) as u64);
     }
     0
 }
@@ -503,10 +545,10 @@ fn ffi_entity_stable_id_guarded(entity: *const Entity, low: *mut u64, high: *mut
 /// Panic-guarded entry point for [`ffi_entity_stable_id_guarded`].
 pub(super) extern "C" fn ffi_entity_stable_id(
     entity: *const Entity,
-    low: *mut u64,
-    high: *mut u64,
+    low_half_output: *mut u64,
+    high_half_output: *mut u64,
 ) -> u8 {
     super::context::guard_managed_callback("ffi_entity_stable_id", 5, || {
-        ffi_entity_stable_id_guarded(entity, low, high)
+        ffi_entity_stable_id_guarded(entity, low_half_output, high_half_output)
     })
 }

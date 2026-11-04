@@ -250,8 +250,8 @@ if host_will_build "$@"; then
             echo "error: the shipping posture (\`shipping\`) needs \`--no-default-features\`, otherwise the default \`dev\` feature stays on and the binary ships the development host." >&2
             exit 1
         fi
-        if features_selected "dev,hot_patch" "$@"; then
-            echo "error: a shipping build cannot combine \`shipping\` with \`dev\`/\`hot_patch\`." >&2
+        if features_selected "dev" "$@"; then
+            echo "error: a shipping build cannot combine \`shipping\` with \`dev\`." >&2
             exit 1
         fi
         # Regenerate the shipping bundle from the project's settings file so

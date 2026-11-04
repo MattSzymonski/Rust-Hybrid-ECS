@@ -21,7 +21,7 @@ use std::path::Path;
 
 // External crates
 use pill_engine::asset_store::mount_directory;
-use pill_engine::component_registry::{register_all_components, run_project_init};
+use pill_engine::component_registry::{no_registration, register_all_components, run_project_init};
 use pill_engine::{
     queue_startup_scene, render_standalone, save_scene, AssetManager, Engine, EntityId,
     ImportRegistry, PillComponent, Scene,
@@ -134,7 +134,7 @@ fn the_startup_scene_is_in_the_world_before_init_runs() {
     let mut engine = Engine::new();
     engine.world_mut().register_standalone_asset::<Scene>();
     queue_startup_scene(engine.world_mut(), "scenes/start.scene");
-    let init_status = run_project_init(&mut engine, recording_init);
+    let init_status = run_project_init(&mut engine, no_registration, recording_init);
     assert_eq!(init_status, 0, "the project initializes");
 
     // Step 3: check that `init` saw the scene's one entity and nothing else.
@@ -166,7 +166,7 @@ fn the_startup_scene_is_in_the_world_before_init_runs() {
 #[test]
 fn a_project_without_a_startup_scene_is_untouched() {
     let mut engine = Engine::new();
-    let init_status = run_project_init(&mut engine, recording_init);
+    let init_status = run_project_init(&mut engine, no_registration, recording_init);
     assert_eq!(init_status, 0);
     let (entity_count, beacon_count) = recorded_counts_at_init();
     assert_eq!(entity_count, 0, "an empty project seeds no entity");

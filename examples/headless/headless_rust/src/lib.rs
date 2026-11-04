@@ -116,34 +116,3 @@ fn tick_system(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn initialization_fills_the_world_once() {
-        let mut engine = Engine::new();
-
-        assert_eq!(init(&mut engine), 0);
-
-        let tickers = Query::<&TickCounter>::new(engine.world_mut())
-            .iter_mut()
-            .count();
-        assert_eq!(tickers, TICKER_COUNT);
-    }
-
-    /// A hot reload runs `init` again. It must not duplicate the world.
-    #[test]
-    fn initializing_again_keeps_one_world() {
-        let mut engine = Engine::new();
-        assert_eq!(init(&mut engine), 0);
-
-        assert_eq!(init(&mut engine), 0);
-
-        let tickers = Query::<&TickCounter>::new(engine.world_mut())
-            .iter_mut()
-            .count();
-        assert_eq!(tickers, TICKER_COUNT);
-    }
-}

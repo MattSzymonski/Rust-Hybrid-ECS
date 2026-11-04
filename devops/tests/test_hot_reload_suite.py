@@ -165,6 +165,12 @@ PROBE_MIDPOINT_PATTERN = re.compile(r"midpoint \((-?[0-9.]+), (-?[0-9.]+)\)")
 # this id is what must not change across a reload.
 PROBE_ID_PATTERN = re.compile(r"entityid ([0-9a-f]{32})")
 
+# Printed by the fixture project's one-time `init`, and by nothing else. A
+# process must reach that entry point exactly once: a reload repeats the
+# artifact's registration half and never its seeding, so a second occurrence
+# means the world was seeded twice.
+PROJECT_INIT_MARKER = "[project] init ran"
+
 
 def last_probe_entity_id(output: str) -> str:
     """Returns the stable id the newest probe report names."""
@@ -210,10 +216,10 @@ def launch_host(project_path: str):
 # --- pill_spline module edits (all applied from the original source) ---------
 
 SPLINE_REGISTER_ORIGINAL = """\
-#[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     // Fill up to the target count rather than spawning a new path on every
-    // rebuild, because hot reload preserves the entities already created.
+    // rebuild, because a reload keeps the entities already created - and fills
+    // back up when a dropped column took them with it.
     let existing_spline_count = {
         let mut query = Query::<&Spline>::new(engine.world_mut());
         query.iter_mut().count()
@@ -282,14 +288,12 @@ impl ::pill_engine::component::Component for Spline {
 pub struct Spline {"""
 
 SPLINE_REGISTER_STUB_NO_REGISTRATION = """\
-// Suite stub: the module loads WITHOUT registering `Spline`. The attribute
-// stays - the wrapper crate expands its `__pill_module_entry_points!` macro
-// and init still runs `register_all_components` - so what removes the
-// registration is the derive edit that goes with this stub
+// Suite stub: the module loads WITHOUT registering `Spline`. `init` still
+// calls this function and still runs `register_all_components`, so what
+// removes the registration is the derive edit that goes with this stub
 // (`SPLINE_DERIVE_STUB_NO_REGISTRATION`): this artifact's inventory then holds
 // nothing for `Spline`. `DEMO_SPLINE_COUNT`/`demo_spline` stay referenced only
 // to keep the dead-code lint quiet in this stub build.
-#[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     let _ = engine;
     let _ = (DEMO_SPLINE_COUNT, demo_spline());
@@ -301,12 +305,10 @@ pub fn register(engine: &mut Engine) -> u32 {
 }"""
 
 SPLINE_REGISTER_STUB_INIT_FAILURE = """\
-// Suite stub: deliberately fail init so the host rolls back to the previous
-// generation. The attribute stays - the wrapper crate expands its
-// `__pill_module_entry_points!` macro and init auto-registration runs as usual
-// - so the stub only changes the body. `DEMO_SPLINE_COUNT`/`demo_spline` stay
-// referenced to keep the dead-code lint quiet in this stub build.
-#[pill_module]
+// Suite stub: deliberately fail registration so the host rolls back to the
+// previous generation. `init` still calls this function, so the stub only
+// changes the body. `DEMO_SPLINE_COUNT`/`demo_spline` stay referenced to keep
+// the dead-code lint quiet in this stub build.
 pub fn register(engine: &mut Engine) -> u32 {
     let _ = engine;
     let _ = (DEMO_SPLINE_COUNT, demo_spline());
@@ -729,6 +731,25 @@ def session_a_scenarios(_monitor: OutputMonitor) -> Sequence[Scenario]:
     return SESSION_A_SCENARIOS
 
 
+def validate_project_init_ran_once(output: str) -> bool:
+    """The fixture's project `init` must run once per process, not per reload.
+
+    The marker is printed by that one-time entry point itself, not by a system,
+    so it counts how often the host reached the entry point: a reload repeats
+    the artifact's registration half and must never seed the world again.
+    """
+    count = output.count(PROJECT_INIT_MARKER)
+    if count != 1:
+        print(
+            f"  [FAIL] The project's init ran {count} time(s) in one process; "
+            "a reload must not run it again."
+        )
+        print(f"  Output tail:\n{output[-1600:]}")
+        return False
+    print("  [OK] The project's init ran exactly once, across every reload.")
+    return True
+
+
 def verify_clean_restart(
     project_root: Path, project_path: str, settings_content: str
 ) -> bool:
@@ -817,6 +838,12 @@ def run_session(
             if not run_scenario(scenario, monitor, session_runner()):
                 session_passed = False
                 break
+
+        if session_passed:
+            # The scenarios reloaded the project and both modules; the fixture's
+            # one-time entry point must still have run exactly once.
+            if not validate_project_init_ran_once(monitor.output_since(0)):
+                session_passed = False
 
         if session_passed:
             # I3: verify a clean restart on the same (fully built) project.

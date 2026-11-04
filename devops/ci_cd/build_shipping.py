@@ -924,9 +924,9 @@ def resolve_build_request(argv: List[str]) -> BuildRequest:
                 "otherwise the default `dev` feature stays on and the binary "
                 "ships the development host."
             )
-        if requested_features & {"dev", "hot_patch"}:
+        if requested_features & {"dev"}:
             raise BuildRequestError(
-                "a shipping build cannot combine `shipping` with `dev`/`hot_patch`."
+                "a shipping build cannot combine `shipping` with `dev`."
             )
         if not project_path:
             raise BuildRequestError(

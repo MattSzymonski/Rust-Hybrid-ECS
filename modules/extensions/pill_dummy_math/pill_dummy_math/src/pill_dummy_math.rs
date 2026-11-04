@@ -54,17 +54,22 @@ pub fn double(number_to_double: i32) -> i32 {
 // Registration
 // =============================================================================
 
-/// Registers the module against the host engine. Returns zero on success.
+/// Registers the module against the host engine and returns zero.
 ///
-/// The host calls it once each time it loads a new build of the module. If it
-/// reports a non-zero status, the host goes back to the library that was
-/// running before and calls that one's `register` again, so a second run must
-/// restore what the first one set up.
-///
-/// It is public because a statically linked build calls it directly, and
-/// because the generated `host_module_pill_dummy_math` wrapper calls it
-/// through the `pill_module_init` entry point that wrapper exports.
-#[pill_module]
+/// This is the half a reload repeats. The module adds nothing to the engine, so
+/// the call does nothing; it exists so every in-repo artifact answers the same
+/// contract. A second run must leave the engine as the first one found it.
 pub fn register(_engine: &mut Engine) -> u32 {
     0
+}
+
+/// The artifact's one-time entry point.
+///
+/// The module keeps nothing that has to run once, so this function defers to
+/// [`register`]. It exists because a statically linked build calls it directly
+/// and because the generated `host_module_pill_dummy_math` wrapper carries it
+/// as `pill_module_init`.
+#[pill_module(register = register)]
+pub fn init(engine: &mut Engine) -> u32 {
+    register(engine)
 }

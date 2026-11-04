@@ -955,6 +955,9 @@ mod tests {
     /// `.meta` sidecars and dot-files.
     #[test]
     fn the_tree_lists_folders_first_and_hides_metadata() {
+        // The listing appends every mounted module root after the project's own
+        // tree, so a test that mounts one has to be finished before this runs.
+        let _mounted = mount_lock();
         let root = std::env::temp_dir().join(format!("pill-asset-browser-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("textures/nested")).unwrap();

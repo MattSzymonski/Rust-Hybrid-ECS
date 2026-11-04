@@ -1,27 +1,29 @@
-//! The two-call protocol every managed payload crosses the boundary through.
+//! The two-call handshake that copies a managed payload across the boundary.
 //!
 //! # Responsibilities
 //!
-//! - Runs the ask-the-length, allocate, ask-for-a-copy handshake once, for
-//!   every payload kind: manifests, system names, failure messages, compiler
-//!   diagnostics.
-//! - Bounds the length managed code reports and reserves fallibly, so neither
-//!   a buggy nor a hostile assembly can drive the host into an abort.
+//! - Runs the same handshake for every kind of payload: ask the length,
+//!   allocate, ask for a copy. Manifests, system names, failure messages and
+//!   compiler diagnostics all use it.
+//! - Checks the length the managed side reports against a limit, and reserves
+//!   memory in a way that can fail. Neither a buggy nor a hostile assembly can
+//!   make the host abort.
 //!
 //! # Design
 //!
 //! Managed code cannot hand the host an owned buffer, so every payload crosses
 //! in two calls: one reports how many bytes there are, the host allocates, and
-//! the second fills what the host allocated. That protocol is a property of the
-//! boundary rather than of any one payload, so each caller supplies only the
-//! pair of exported functions and the upper bound its kind accepts.
+//! the second call fills the buffer the host allocated. The protocol belongs to
+//! the boundary, not to any one payload, so each caller supplies only the two
+//! exported functions and the upper bound for its kind.
 //!
-//! The length is checked against a bound **before** anything is allocated, so a
-//! corrupt length is a reported error rather than a multi-gigabyte request, and
-//! the reservation is fallible: `Vec::try_reserve_exact` returns an error where
-//! `vec![0; n]` aborts the process. Failure is returned rather than reported
-//! because the callers disagree about what it means - a typed reload error, a
-//! logged refusal, a neutral string - and that disagreement is legitimate.
+//! The length is checked against the limit **before** anything is allocated, so
+//! a corrupt length becomes a reported error instead of a multi-gigabyte
+//! request. The reservation is fallible too: `Vec::try_reserve_exact` returns
+//! an error where `vec![0; n]` would abort the process. A failure is returned
+//! instead of logged because callers treat it differently - one returns a typed
+//! load error, one logs the failure, one substitutes plain text - and that
+//! difference is legitimate.
 
 // External crates
 use pill_core::error::CSharpError;
@@ -32,9 +34,9 @@ use pill_core::error::CSharpError;
 
 /// Why one managed payload could not be fetched.
 ///
-/// Carries the numbers the caller needs to report, so a caller that logs and a
-/// caller that returns a typed error both have what they need without asking
-/// the managed side again.
+/// The variants that report a length carry it, so a caller that logs the
+/// failure and one that returns a typed error both have what they need without
+/// asking the managed side again.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedBufferError {
@@ -58,23 +60,23 @@ pub enum ManagedBufferError {
 // Free Functions
 // =============================================================================
 
-/// Fetch one managed payload through the two-call protocol.
+/// Fetches one managed payload through the two-call protocol.
 ///
-/// `length` and `copy` are the pair of exported functions for this payload
-/// kind, already bound to whatever index or receiver they need; `limit` is the
-/// largest length this kind accepts. The returned buffer is exactly `length`
-/// bytes, all of them written by managed code.
+/// `length` and `copy` are the two exported functions for this payload kind,
+/// already bound to the index or receiver they need. `limit` is the largest
+/// length this kind accepts. The returned buffer is exactly `length` bytes, and
+/// the managed contract says a successful copy fills all of them.
 ///
-/// Closures rather than function pointers, because the exports are
-/// `extern "system"` and that ABI does not implement the `Fn` traits - and
-/// because several payload kinds are addressed by an index the caller has to
-/// close over anyway.
+/// The arguments are closures rather than function pointers for two reasons.
+/// The exports are `extern "system"`, and that ABI does not implement the `Fn`
+/// traits. Several payload kinds are also addressed by an index, which the
+/// caller has to close over anyway.
 ///
 /// # Errors
 ///
 /// Returns [`ManagedBufferError::LengthOutOfRange`] when the reported length is
-/// zero or above `limit`, [`ManagedBufferError::AllocationFailed`] when a
-/// buffer that long cannot be reserved, and
+/// zero, or above `limit`. Returns [`ManagedBufferError::AllocationFailed`]
+/// when a buffer that long cannot be reserved. Returns
 /// [`ManagedBufferError::CopyFailed`] when managed code declines to fill it.
 /// Nothing is allocated in the first case, and the partially filled buffer is
 /// discarded in the last.
@@ -84,36 +86,37 @@ pub fn fetch_managed_buffer(
     copy: impl FnOnce(*mut u8, u32) -> u8,
     limit: u32,
 ) -> Result<Vec<u8>, ManagedBufferError> {
-    // Step 1: Bound the length before anything is allocated from it. Zero is
-    // rejected with the oversized values: a payload the managed side says is
-    // empty is the absence of a payload, not a payload of no bytes, and every
-    // caller that can meet one answers it differently from a failed fetch.
+    // Step 1: Check the length before anything is allocated from it. Zero is
+    // refused along with lengths above the limit: a zero length means the
+    // managed side has no payload for this kind, and the host does not treat
+    // that as an empty payload.
     let length = length();
     if length == 0 || length > limit {
         return Err(ManagedBufferError::LengthOutOfRange { length, limit });
     }
 
-    // Step 2: Reserve explicitly so an allocation failure surfaces as a regular
-    // error instead of aborting the host process.
+    // Step 2: Reserve the memory explicitly. A failed reservation then comes
+    // back as a normal error instead of aborting the host process.
     let mut buffer = Vec::new();
     buffer
         .try_reserve_exact(length as usize)
         .map_err(|_| ManagedBufferError::AllocationFailed { length })?;
     buffer.resize(length as usize, 0);
 
-    // Step 3: Hand the buffer over. The managed contract rejects any caller
-    // buffer smaller than the payload, so a successful copy guarantees a
-    // complete one; a refusal leaves the zeroed buffer to be dropped.
+    // Step 3: Hand the buffer to the managed copy function. The managed
+    // contract refuses any buffer smaller than the payload, so a successful
+    // copy means the whole payload was written. A refusal is an error, and the
+    // buffer is dropped.
     if copy(buffer.as_mut_ptr(), length) == 0 {
         return Err(ManagedBufferError::CopyFailed);
     }
     Ok(buffer)
 }
 
-/// Report a failed manifest fetch in the vocabulary the reload path uses.
+/// Reports a failed manifest fetch as the typed error the load fails with.
 ///
 /// The startup and AOT paths both fail the whole load on any of these, so they
-/// share one mapping rather than each inventing its own.
+/// share one mapping instead of each defining its own.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(super) fn manifest_fetch_error(error: ManagedBufferError) -> CSharpError {
     match error {
@@ -140,9 +143,9 @@ mod tests {
         let fetched = fetch_managed_buffer(
             || payload.len() as u32,
             |pointer, length| {
-                // SAFETY: the helper allocated `length` bytes at `pointer` and
-                // reports exactly the length the closure above returned, which
-                // is this payload's length.
+                // SAFETY: the helper allocated `length` bytes at `pointer`, and
+                // `length` is the value the length closure returned, which is
+                // `payload.len()`.
                 unsafe {
                     std::ptr::copy_nonoverlapping(payload.as_ptr(), pointer, length as usize)
                 };
@@ -156,8 +159,8 @@ mod tests {
 
     /// A length above the bound is refused before anything is allocated.
     ///
-    /// An unbounded length would reach `Vec` as an allocation request, and an
-    /// allocation request that large aborts the host.
+    /// Without the check, a corrupt length would become a huge allocation
+    /// attempt instead of an immediate error.
     #[test]
     fn an_oversized_length_is_refused_without_allocating() {
         let error = fetch_managed_buffer(
@@ -201,7 +204,7 @@ mod tests {
         assert_eq!(error, ManagedBufferError::CopyFailed);
     }
 
-    /// Each failure maps to the manifest error the reload path reports.
+    /// Each failure maps to the manifest error the load reports.
     #[test]
     fn manifest_failures_map_to_their_typed_errors() {
         assert!(matches!(

@@ -1,17 +1,21 @@
-//! Thread-local access scope installed around one scheduled C# system.
+//! Thread-local access scope installed around one scheduled C# system or one
+//! startup method.
 //!
 //! # Responsibilities
 //!
-//! - Publish the active world, queue, and bindings for managed callbacks.
+//! - Publish the active world, command queue, and component bindings for
+//!   managed callbacks.
 //! - Reject nested or out-of-scope managed invocation.
 //! - Clear the complete thread-local scope when the invocation ends.
 //!
 //! # Design
 //!
-//! All invocation state is bundled into one [`ActiveScopeData`] value held in
-//! a single thread-local [`Cell`]. Installation and teardown are each one
-//! assignment, which makes the scope panic-atomic by construction: a panic
-//! can never leave a half-installed set of raw pointers behind.
+//! The raw pointers (world, command queue, access list, bindings) are kept in
+//! one [`ActiveScopeData`] value inside a single thread-local [`Cell`]. The
+//! reserved entities, the observed archetypes, and the invocation counter are
+//! separate thread-locals. Installing the scope and clearing it are each one
+//! assignment, so a panic can never leave half of the pointers installed: the
+//! value is either fully there or not there at all.
 
 // Standard library
 use std::cell::{Cell, RefCell};
@@ -31,44 +35,43 @@ use super::components::{ComponentBindings, StableComponentId};
 // Constants
 // =============================================================================
 
-/// Access-list discriminator for a component key.
+/// Marks an access entry that names a component.
 pub(super) const ACCESS_KIND_COMPONENT: u8 = 0;
 
-/// Access-list discriminator for a resource key.
+/// Marks an access entry that names a resource from the managed manifest.
 pub(super) const ACCESS_KIND_RESOURCE: u8 = 1;
 
-/// Access-list discriminator for a Rust-owned resource reached by its shared
-/// name (`ResMut<AssetManager>`), whose bytes managed code never sees.
+/// Marks an access entry that names a Rust-owned resource by its shared name
+/// (`ResMut<AssetManager>`). Managed code never sees this resource's bytes.
 ///
-/// Separate from [`ACCESS_KIND_RESOURCE`] because the two resolve through
-/// different tables: a managed resource through the manifest's bindings, a
-/// native one straight to `ResourceId::Shared` of its name.
+/// This kind is separate from [`ACCESS_KIND_RESOURCE`] because the two are
+/// looked up in different tables: a managed resource through the manifest's
+/// resource bindings, a native one straight to `ResourceId::Shared` of its
+/// name.
 pub(super) const ACCESS_KIND_NATIVE_RESOURCE: u8 = 2;
 
-// =============================================================================
-// Constants
-// =============================================================================
-
 thread_local! {
-    /// Complete managed invocation scope for the current thread.
+    /// The complete managed invocation scope for the current thread.
     ///
-    /// `None` means no C# system is executing on this thread.
+    /// `None` means no managed code is running on this thread, whether a
+    /// system or a startup method.
     static ACTIVE_SCOPE: Cell<Option<ActiveScopeData>> = const { Cell::new(None) };
-    /// Handles reserved during this invocation and not yet consumed by create.
-    static ACTIVE_RESERVED: RefCell<HashSet<Entity>> = RefCell::new(HashSet::new());
-    /// Archetype ids served to managed code during this invocation.
+    /// Entity handles reserved during this invocation and not yet used by a
+    /// create.
+    static RESERVED_ENTITIES: RefCell<HashSet<Entity>> = RefCell::new(HashSet::new());
+    /// Archetypes this invocation has already served to managed code.
     ///
-    /// The entity path (`mode == 2` of the archetype chunk callback) answers
-    /// only for these: a managed term reaches an archetype through validated
-    /// component or entity access first, and without that precondition the
-    /// entity path would enumerate any component set the world holds.
+    /// Only these are answered by the entity path (`mode == 2` of the
+    /// archetype chunk callback). Managed code reaches an archetype through a
+    /// validated component or entity lookup first; without that requirement,
+    /// the entity path could enumerate the component sets of the whole world.
     static OBSERVED_ARCHETYPES: RefCell<HashSet<ArchetypeId>> = RefCell::new(HashSet::new());
-    /// Monotonic per-thread invocation counter stamped into every chunk.
+    /// Counter of managed invocations on this thread, copied into every chunk.
     ///
-    /// Zero means "no managed system is running on this thread", so it doubles
-    /// as the out-of-scope answer. The counter only moves forward, which is
-    /// what makes a token from an earlier invocation compare unequal to the
-    /// current one without anything having to be cleared on the way out.
+    /// Zero means no managed code is running on this thread, so it also gives
+    /// the out-of-scope answer. The counter only moves forward and skips zero
+    /// when it wraps, so a token from an earlier invocation never equals the
+    /// current one and nothing has to be cleared when the invocation ends.
     static SCOPE_TOKEN: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -78,85 +81,87 @@ thread_local! {
 
 /// One complete managed invocation scope.
 ///
-/// Bundling every pointer into a single value keeps installation and teardown
-/// to one [`Cell::set`] call each, so no panic can ever strand a partially
+/// Keeping every pointer in one value means installing the scope and clearing
+/// it are one [`Cell::set`] call each, so a panic can never leave a partially
 /// installed scope on this thread.
 #[derive(Clone, Copy)]
 struct ActiveScopeData {
     world: *mut World,
     queue: *mut CommandQueue,
-    access: (*const NativeSystemAccess, usize),
+    accesses: (*const NativeSystemAccess, usize),
     bindings: *const ComponentBindings,
     uses_commands: bool,
-    /// Whether the invocation holds the whole world, as a startup method
-    /// does: every resource access is authorized without a declaration,
-    /// because nothing else can be running.
+    /// Whether the invocation holds the whole world, as a startup method does.
+    /// Every resource access is then allowed without a declaration, because
+    /// nothing else can be running.
     exclusive: bool,
-    /// Token stamped into every chunk issued during this invocation.
+    /// Invocation token copied into every chunk issued during this invocation.
     scope_token: u32,
 }
 
-/// Guards the thread-local invocation scope for exactly one scheduled managed
-/// system.
+/// Keeps the thread-local invocation scope installed for exactly one managed
+/// invocation.
 ///
-/// Created by the scope installers and dropped at the end of the managed
-/// invocation, this guard clears every raw pointer from the thread-local scope
-/// even when managed execution unwinds through a panic.
-pub(super) struct ActiveSystemGuard;
+/// The scope installers create it, and it is dropped when the invocation ends.
+/// Its drop clears every raw pointer from the thread-local scope, including
+/// when managed execution unwinds through a panic.
+pub(super) struct ActiveScopeGuard;
 
-impl ActiveSystemGuard {
-    /// Installs a query-only invocation scope used by native bridge tests.
+impl ActiveScopeGuard {
+    /// Installs a query-only invocation scope for native bridge tests.
     ///
-    /// Production systems use [`Self::set_with_commands`] because the scheduler
-    /// always supplies a queue even when the managed signature omits Commands.
+    /// Production systems use [`Self::set_with_commands`] instead, because the
+    /// scheduler always supplies a queue even when the managed signature takes
+    /// no Commands parameter.
     #[cfg(test)]
-    pub(super) fn set(
+    pub(super) fn install_query_scope(
         world: &mut World,
         access: &[NativeSystemAccess],
         bindings: &ComponentBindings,
     ) -> Option<Self> {
-        Self::set_inner(world, std::ptr::null_mut(), access, bindings, false, false)
+        Self::install_scope(world, std::ptr::null_mut(), access, bindings, false, false)
     }
 
-    /// Publishes one scheduled system's world, command queue, bindings, and
-    /// reflected access declaration for synchronous managed callbacks.
-    pub(super) fn set_with_commands(
+    /// Publishes one scheduled system's world, command queue, component
+    /// bindings, and declared access list for its synchronous managed
+    /// callbacks.
+    pub(super) fn install_scope_with_commands(
         world: &mut World,
         queue: &mut CommandQueue,
         access: &[NativeSystemAccess],
         bindings: &ComponentBindings,
         uses_commands: bool,
     ) -> Option<Self> {
-        Self::set_inner(world, queue, access, bindings, uses_commands, false)
+        Self::install_scope(world, queue, access, bindings, uses_commands, false)
     }
 
-    /// Publishes one startup method's scope: the whole world, a command queue
-    /// and the bindings, with every resource reachable.
+    /// Publishes a startup method's scope. It holds the whole world, a command
+    /// queue, and the component bindings, and every resource is reachable.
     ///
-    /// Startups run one at a time before the scheduler starts, so the scope
-    /// holds the world exclusively and needs no access list; that is what
-    /// lets a startup take `Res<T>` / `ResMut<T>` parameters it never
+    /// Startup methods run one at a time before the scheduler starts, so the
+    /// scope holds the world exclusively and needs no access list. That is why
+    /// a startup method can take `Res<T>` / `ResMut<T>` parameters it never
     /// declared to a scheduler.
-    pub(super) fn set_exclusive(
+    pub(super) fn install_exclusive_scope(
         world: &mut World,
         queue: &mut CommandQueue,
         bindings: &ComponentBindings,
     ) -> Option<Self> {
-        Self::set_inner(world, queue, &[], bindings, true, true)
+        Self::install_scope(world, queue, &[], bindings, true, true)
     }
 
-    /// Installs the complete scope in one assignment after rejecting nested
-    /// invocation, which would overwrite active raw pointers.
+    /// Installs the complete scope in one assignment, after rejecting a nested
+    /// invocation that would overwrite the raw pointers already stored.
     ///
-    /// Returns `None` when a scope is already installed on this thread. That is
-    /// a managed-side programming error - a C# system re-entering the host -
-    /// and it must not panic: unwinding through the .NET frames that called in
-    /// is undefined behaviour at the FFI boundary, so the condition is reported
-    /// instead of raised.
+    /// Returns `None` when a scope is already installed on this thread. That
+    /// means a C# system re-entered the host while it was running, which is a
+    /// mistake in the managed code. It must not panic: unwinding through the
+    /// .NET frames that called in is undefined behaviour at the FFI boundary,
+    /// so the condition is reported instead of raised.
     ///
     /// The nested-invocation check is the only fallible step and it runs before
-    /// any mutation, so a rejection leaves no stale state behind.
-    fn set_inner(
+    /// anything is changed, so a rejection leaves no stale state behind.
+    fn install_scope(
         world: &mut World,
         queue: *mut CommandQueue,
         access: &[NativeSystemAccess],
@@ -165,7 +170,7 @@ impl ActiveSystemGuard {
         exclusive: bool,
     ) -> Option<Self> {
         // Step 1: Reject nested invocation before touching any thread-local.
-        let already_active = ACTIVE_SCOPE.with(|slot| slot.get().is_some());
+        let already_active = ACTIVE_SCOPE.with(|scope_slot| scope_slot.get().is_some());
         if already_active {
             error!(
                 target: pill_core::telemetry::telemetry_target::ECS,
@@ -174,41 +179,43 @@ impl ActiveSystemGuard {
             return None;
         }
 
-        // Step 2: Clear reservations from the previous invocation without
-        // panicking. A reservation borrow can only exist while a scope is
-        // active, which Step 1 has already rejected, so this is belt-and-braces.
-        ACTIVE_RESERVED.with(|slot| {
-            if let Ok(mut reserved) = slot.try_borrow_mut() {
+        // Step 2: Clear the reservations left by the previous invocation,
+        // without panicking. A reservation borrow can only exist while a scope
+        // is active, and Step 1 has already rejected that case, so this is only
+        // a second safeguard.
+        RESERVED_ENTITIES.with(|reserved_slot| {
+            if let Ok(mut reserved) = reserved_slot.try_borrow_mut() {
                 reserved.clear();
             }
         });
-        // Every invocation starts with no archetype observed: the entity path
-        // answers for what THIS system reached through a validated term.
-        OBSERVED_ARCHETYPES.with(|slot| {
-            if let Ok(mut observed) = slot.try_borrow_mut() {
+        // Every invocation starts with no archetype observed. The entity path
+        // answers only for what this invocation reached through a validated
+        // lookup.
+        OBSERVED_ARCHETYPES.with(|observed_slot| {
+            if let Ok(mut observed) = observed_slot.try_borrow_mut() {
                 observed.clear();
             }
         });
 
-        // Step 3: Commit the whole scope in one assignment. Cell::set cannot
-        // panic, so from this point on the guard's Drop owns the teardown.
-        // Take this invocation's token before committing the scope. Wrapping
-        // skips zero, which is reserved for "no scope", so a wrapped counter
-        // can never make an out-of-scope chunk look current.
-        let scope_token = SCOPE_TOKEN.with(|slot| {
-            let next = match slot.get().wrapping_add(1) {
+        // Step 3: Store the whole scope with one assignment. `Cell::set` cannot
+        // panic, so from here on the guard's `Drop` does the clearing. The
+        // invocation token is taken first. The counter skips zero when it
+        // wraps, and zero means "no scope", so an old chunk can never look
+        // current after the wrap.
+        let scope_token = SCOPE_TOKEN.with(|token_slot| {
+            let next_token = match token_slot.get().wrapping_add(1) {
                 0 => 1,
-                value => value,
+                incremented => incremented,
             };
-            slot.set(next);
-            next
+            token_slot.set(next_token);
+            next_token
         });
 
-        ACTIVE_SCOPE.with(|slot| {
-            slot.set(Some(ActiveScopeData {
+        ACTIVE_SCOPE.with(|scope_slot| {
+            scope_slot.set(Some(ActiveScopeData {
                 world: world as *mut World,
                 queue,
-                access: (access.as_ptr(), access.len()),
+                accesses: (access.as_ptr(), access.len()),
                 bindings: bindings as *const ComponentBindings,
                 uses_commands,
                 exclusive,
@@ -219,58 +226,68 @@ impl ActiveSystemGuard {
     }
 }
 
-impl Drop for ActiveSystemGuard {
-    /// Returns unconsumed reservations to the entity allocator and clears the
-    /// complete scope before the scheduler's native borrows expire.
+impl Drop for ActiveScopeGuard {
+    /// Returns unused reservations to the entity allocator and clears the
+    /// complete scope before the borrowed world and queue are released.
     fn drop(&mut self) {
         ACTIVE_SCOPE.with(|scope_slot| {
             let world_pointer = scope_slot.get().map(|scope| scope.world);
-            ACTIVE_RESERVED.with(|reserved_slot| {
+            // Step 1: Give back reserved handles that no create used.
+            RESERVED_ENTITIES.with(|reserved_slot| {
                 if let Ok(mut reserved) = reserved_slot.try_borrow_mut() {
-                    // Reserved handles never consumed by a create are returned
-                    // to the allocator, so speculative managed allocations
-                    // cannot leak entity generation slots.
-                    if let Some(world) = world_pointer.filter(|pointer| !pointer.is_null()) {
-                        // SAFETY: the scope is still installed for the
-                        // duration of this drop, so the world pointer remains
-                        // valid until the scope is cleared below.
-                        let world = unsafe { &mut *world };
+                    // Handles reserved but never used by a create go back to
+                    // the allocator, so a managed allocation that is only
+                    // planned cannot leak an entity id and generation pair.
+                    if let Some(world_pointer) = world_pointer.filter(|pointer| !pointer.is_null())
+                    {
+                        // SAFETY: the scope stays installed for the whole of
+                        // this drop, so the world pointer is still valid here;
+                        // it is cleared only at the end of this closure.
+                        let world = unsafe { &mut *world_pointer };
                         for entity in reserved.drain() {
                             world.release_entity(entity);
                         }
                     }
                 }
             });
+            // Step 2: Forget the archetypes this invocation observed.
             OBSERVED_ARCHETYPES.with(|observed_slot| {
                 if let Ok(mut observed) = observed_slot.try_borrow_mut() {
                     observed.clear();
                 }
             });
-            // A managed system that opened a profiling zone and never ended it
-            // - or threw between the two - leaves a Tracy zone open across the
-            // boundary. Closing it here is what the zone vector's own doc
-            // promised: the guard list cannot grow per frame, and the timeline
-            // records the zone against the invocation that opened it.
+            // Step 3: Close profiling zones the managed code left open.
+            // A managed system that opened a profiling zone and never ended it,
+            // or threw between the two calls, would leave a Tracy zone open
+            // past the invocation. Closing it here keeps the zone list from
+            // growing by one entry per frame, and keeps the zone on the
+            // timeline of the invocation that opened it.
             super::abi::end_unfinished_zones();
+            // Step 4: Clear the scope last, so the pointers above stay valid.
             scope_slot.set(None);
         });
     }
 }
 
-/// Run one managed FFI callback, turning a panic into its failure status.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Runs one managed FFI callback and turns a panic into its failure status.
 ///
-/// Since Rust 1.81 a panic crossing an `extern "C"` boundary aborts the process
-/// rather than being undefined, so this converts a loud process kill into the
-/// refusal the callback can report, and the managed side then fails the running
-/// system through its per-system error channel. The payload is logged here
-/// because the status code alone cannot carry it.
+/// Since Rust 1.81 a panic that crosses an `extern "C"` boundary aborts the
+/// process instead of being undefined. This function reports the failure status
+/// instead, so the process keeps running, and the managed side then fails the
+/// running system through its per-system error channel. The panic payload is
+/// logged here because a status code cannot carry it.
 ///
 /// `AssertUnwindSafe` is required because these callbacks take raw pointers,
 /// which are never `UnwindSafe`. The assertion is sound because a failed
-/// callback leaves the frame's work incomplete, and the deferred command queue
-/// and the invocation scope are both torn down when the system reports failure.
+/// callback leaves the frame's work incomplete, and both the deferred command
+/// queue and the invocation scope are torn down when the system reports
+/// failure.
 pub(super) fn guard_managed_callback(
-    callback: &'static str,
+    callback_name: &'static str,
     failure_status: u8,
     body: impl FnOnce() -> u8,
 ) -> u8 {
@@ -284,7 +301,7 @@ pub(super) fn guard_managed_callback(
                 .unwrap_or_else(|| "a non-string panic payload".to_string());
             error!(
                 target: pill_core::telemetry::telemetry_target::ECS,
-                callback,
+                callback = callback_name,
                 detail = detail.as_str(),
                 "a managed callback panicked; reporting failure to the calling system instead of aborting"
             );
@@ -293,14 +310,11 @@ pub(super) fn guard_managed_callback(
     }
 }
 
-// =============================================================================
-// Free Functions
-// =============================================================================
-
-/// Runs a callback with the active world, deferred queue, component bindings,
-/// and reservation set only when the system declared a Commands parameter.
+/// Runs a callback with the active world, deferred command queue, component
+/// bindings, and reserved-entity set, but only when the system declared a
+/// Commands parameter.
 pub(super) fn with_active_command_context<R>(
-    f: impl FnOnce(&mut World, &mut CommandQueue, &ComponentBindings, &mut HashSet<Entity>) -> R,
+    body: impl FnOnce(&mut World, &mut CommandQueue, &ComponentBindings, &mut HashSet<Entity>) -> R,
 ) -> Option<R> {
     ACTIVE_SCOPE.with(|scope_slot| {
         let scope = scope_slot.get()?;
@@ -313,92 +327,95 @@ pub(super) fn with_active_command_context<R>(
         if world.is_null() || queue.is_null() || bindings.is_null() {
             return None;
         }
-        ACTIVE_RESERVED.with(|reserved| {
-            // SAFETY: ActiveSystemGuard installs the scope for one scheduled
-            // invocation and clears it before its native borrows expire.
+        RESERVED_ENTITIES.with(|reserved_slot| {
+            // SAFETY: the guard installs the scope for exactly one managed
+            // invocation and clears it before the world, queue, and bindings
+            // borrows it was built from end.
             Some(unsafe {
-                f(
+                body(
                     &mut *world,
                     &mut *queue,
                     &*bindings,
-                    &mut reserved.borrow_mut(),
+                    &mut reserved_slot.borrow_mut(),
                 )
             })
         })
     })
 }
 
-/// Runs a callback with the world belonging to the active managed invocation,
-/// returning `None` when called outside scheduler-controlled execution.
-pub(super) fn with_active_world<R>(f: impl FnOnce(&mut World) -> R) -> Option<R> {
-    ACTIVE_SCOPE.with(|slot| {
-        let pointer = slot.get().map(|scope| scope.world)?;
-        // SAFETY: ActiveSystemGuard installs this pointer immediately before
-        // managed invocation and clears it before the borrowed world expires.
-        (!pointer.is_null()).then(|| unsafe { f(&mut *pointer) })
+/// Runs a callback with the world of the active managed invocation, returning
+/// `None` when no managed invocation is running on this thread.
+pub(super) fn with_active_world<R>(body: impl FnOnce(&mut World) -> R) -> Option<R> {
+    ACTIVE_SCOPE.with(|scope_slot| {
+        let world_pointer = scope_slot.get().map(|scope| scope.world)?;
+        // SAFETY: the guard installs this pointer just before the managed
+        // invocation and clears it before the world borrow it came from ends.
+        (!world_pointer.is_null()).then(|| unsafe { body(&mut *world_pointer) })
     })
 }
 
-/// Token of the invocation active on this thread, or zero when none is.
+/// Returns the token of the invocation active on this thread, or zero when
+/// there is none.
 ///
-/// Every chunk carries the value current when it was issued, so managed code
-/// can tell a chunk belonging to the call it is inside from one kept since an
-/// earlier invocation.
+/// Every chunk carries the token that was current when it was issued, so
+/// managed code can tell a chunk from the call it is inside apart from one
+/// kept since an earlier invocation.
 pub(super) fn active_scope_token() -> u32 {
-    ACTIVE_SCOPE.with(|slot| slot.get().map_or(0, |scope| scope.scope_token))
+    ACTIVE_SCOPE.with(|scope_slot| scope_slot.get().map_or(0, |scope| scope.scope_token))
 }
 
-/// FFI view of [`active_scope_token`], published in the engine API table.
+/// Returns [`active_scope_token`] to managed code through the engine API table.
 pub(super) extern "C" fn ffi_current_scope_token() -> u32 {
     active_scope_token()
 }
 
-/// Reports whether a managed system scope exists without dereferencing its world.
+/// Reports whether a managed scope exists, without dereferencing its world
+/// pointer.
 pub(super) fn active_world_exists() -> bool {
-    ACTIVE_SCOPE.with(|slot| slot.get().is_some_and(|scope| !scope.world.is_null()))
+    ACTIVE_SCOPE.with(|scope_slot| scope_slot.get().is_some_and(|scope| !scope.world.is_null()))
 }
 
-/// Runs a callback with both the active world and its stable component binding
-/// table, which must always be installed and cleared as one guard scope.
+/// Runs a callback with the active world and its stable component binding
+/// table, which the same guard always installs and clears together.
 pub(super) fn with_active_context<R>(
-    f: impl FnOnce(&mut World, &ComponentBindings) -> R,
+    body: impl FnOnce(&mut World, &ComponentBindings) -> R,
 ) -> Option<R> {
-    ACTIVE_SCOPE.with(|slot| {
-        let scope = slot.get()?;
+    ACTIVE_SCOPE.with(|scope_slot| {
+        let scope = scope_slot.get()?;
         if scope.world.is_null() || scope.bindings.is_null() {
             return None;
         }
-        // SAFETY: ActiveSystemGuard installs and clears the complete scope
-        // for exactly the managed invocation.
-        Some(unsafe { f(&mut *scope.world, &*scope.bindings) })
+        // SAFETY: the guard installs the complete scope for exactly one
+        // managed invocation and clears it when that invocation ends.
+        Some(unsafe { body(&mut *scope.world, &*scope.bindings) })
     })
 }
 
-/// Record that an archetype was served to managed code through a validated
-/// term during the active invocation.
+/// Records that a validated term served an archetype to managed code during
+/// the active invocation.
 ///
-/// Called by the chunk callbacks on every successful component or entity
-/// lookup; the entity path then serves this archetype's entity column later in
-/// the same invocation.
+/// The chunk callbacks call this after every successful component or entity
+/// lookup. The entity path may then serve this archetype's entity column later
+/// in the same invocation.
 pub(super) fn record_observed_archetype(archetype: ArchetypeId) {
-    OBSERVED_ARCHETYPES.with(|slot| {
-        if let Ok(mut observed) = slot.try_borrow_mut() {
+    OBSERVED_ARCHETYPES.with(|observed_slot| {
+        if let Ok(mut observed) = observed_slot.try_borrow_mut() {
             observed.insert(archetype);
         }
     });
 }
 
-/// Whether a validated term has already served this archetype in the active
-/// invocation.
+/// Returns whether a validated term has already served this archetype in the
+/// active invocation.
 ///
-/// `None` means no managed system is active on this thread, matching
-/// [`access_is_authorized`]'s answer for the same condition.
+/// `None` means no managed invocation is active on this thread, which is the
+/// same answer [`access_is_authorized`] gives in that state.
 pub(super) fn archetype_was_observed(archetype: ArchetypeId) -> Option<bool> {
-    ACTIVE_SCOPE.with(|slot| {
-        slot.get()?;
-        OBSERVED_ARCHETYPES.with(|observed| {
+    ACTIVE_SCOPE.with(|scope_slot| {
+        scope_slot.get()?;
+        OBSERVED_ARCHETYPES.with(|observed_slot| {
             Some(
-                observed
+                observed_slot
                     .try_borrow()
                     .is_ok_and(|observed| observed.contains(&archetype)),
             )
@@ -408,53 +425,59 @@ pub(super) fn archetype_was_observed(archetype: ArchetypeId) -> Option<bool> {
 
 /// Checks whether the active system declared the requested component mode.
 ///
-/// A write declaration also permits reads; a read declaration never permits
-/// writes. `None` means no managed system is currently active on this thread.
+/// A write declaration also allows reads. A read declaration never allows
+/// writes. `None` means no managed invocation is active on this thread.
 pub(super) fn access_is_authorized(key: StableComponentId, requested_mode: u8) -> Option<bool> {
-    declared_access(ACCESS_KIND_COMPONENT, key, requested_mode)
+    declared_access_allows(ACCESS_KIND_COMPONENT, key, requested_mode)
 }
 
 /// The resource counterpart of [`access_is_authorized`].
 ///
-/// Separate rather than a flag on the component check because the two answer
-/// about different declarations that happen to share a key space: a resource
-/// and a component may be named alike, and a component entry must never
-/// authorize a reach into resource storage.
+/// This is a separate function instead of a flag on the component check
+/// because the two look at different declarations that happen to share one key
+/// space. A resource and a component can have the same key, and a component
+/// entry must never give access to resource storage.
 pub(super) fn resource_access_is_authorized(
     key: StableComponentId,
     requested_mode: u8,
 ) -> Option<bool> {
-    declared_access(ACCESS_KIND_RESOURCE, key, requested_mode)
+    declared_access_allows(ACCESS_KIND_RESOURCE, key, requested_mode)
 }
 
 /// The counterpart of [`resource_access_is_authorized`] for a Rust-owned
-/// resource reached by its shared name.
+/// resource that is reached by its shared name.
 pub(super) fn native_resource_access_is_authorized(
     key: StableComponentId,
     requested_mode: u8,
 ) -> Option<bool> {
-    declared_access(ACCESS_KIND_NATIVE_RESOURCE, key, requested_mode)
+    declared_access_allows(ACCESS_KIND_NATIVE_RESOURCE, key, requested_mode)
 }
 
-/// Scan the active system's reflected access list for one declaration.
+/// Returns whether the active system's declared access list allows one request.
 ///
-/// An exclusive scope - a startup method - authorizes every resource access,
-/// and no component access: a startup has no queries to have declared one.
-fn declared_access(kind: u8, key: StableComponentId, requested_mode: u8) -> Option<bool> {
-    ACTIVE_SCOPE.with(|slot| {
-        let scope = slot.get()?;
-        if scope.exclusive && kind != ACCESS_KIND_COMPONENT {
+/// An exclusive scope (a startup method) allows every resource access and no
+/// component access, because a startup has no queries that could have declared
+/// one.
+fn declared_access_allows(
+    access_kind: u8,
+    key: StableComponentId,
+    requested_mode: u8,
+) -> Option<bool> {
+    ACTIVE_SCOPE.with(|scope_slot| {
+        let scope = scope_slot.get()?;
+        if scope.exclusive && access_kind != ACCESS_KIND_COMPONENT {
             return Some(true);
         }
-        let (pointer, len) = scope.access;
+        let (pointer, len) = scope.accesses;
         if pointer.is_null() {
             return None;
         }
-        // SAFETY: ActiveSystemGuard stores a slice owned by the registered
-        // system closure and clears the scope before that invocation returns.
+        // SAFETY: `ActiveSystemGuard` stores a slice owned by the registered
+        // system closure, and it clears the scope before that invocation
+        // returns, so the pointer and length stay valid for this read.
         let accesses = unsafe { std::slice::from_raw_parts(pointer, len) };
         Some(accesses.iter().any(|access| {
-            access.kind == kind
+            access.kind == access_kind
                 && StableComponentId::from_halves(access.component_key, access.component_key_high)
                     == key
                 && (requested_mode == 0 || access.mode == requested_mode)

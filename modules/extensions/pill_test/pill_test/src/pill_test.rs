@@ -91,29 +91,24 @@ fn module_test_processor(mut query: Query<&mut ModuleTest>) -> Result<(), System
 // Registration
 // =============================================================================
 
-/// Registers the module's system and its seed entities, and returns 0 on
-/// success.
+/// Registers the module's system and fills the world up to its entity count.
 ///
-/// Component registration happens automatically from the `PillComponent`
-/// derive before this runs. Must be idempotent: the host calls it once per
-/// loaded generation, on a fresh load and again if it has to roll back. Public
-/// so a statically linked build can call it directly, and so the generated
-/// `host_module_pill_test` wrapper can export it as `pill_module_init` for the
-/// host to find in a loaded DLL.
+/// This is the half a reload repeats: the systems, resources and entities whose
+/// code moved with the arriving image. It must be idempotent, because a first
+/// load reaches it too, immediately before [`init`], and a failed generation
+/// rolls back by calling it again on the older image.
 ///
 /// # Errors
 ///
 /// Returns 1 when an entity cannot be created. The host reads any non-zero
-/// status as a failed generation and rolls back to the previous library, which
-/// calls this function again on the older generation.
-#[pill_module]
+/// status as a failed generation and rolls back to the previous library.
 pub fn register(engine: &mut Engine) -> u32 {
     // Step 1: Register the system that advances the component.
     engine.register_system("module_test_processor", module_test_processor);
 
     // Step 2: Fill the world up to the target count instead of spawning a
-    // fresh batch, because hot reload keeps the entities the previous
-    // generation created.
+    // fresh batch, because a reload keeps the entities the previous generation
+    // created - and fills back up when a dropped column took them with it.
     let existing_entity_count = {
         let mut query = Query::<&ModuleTest>::new(engine.world_mut());
         query.iter_mut().count()
@@ -139,4 +134,19 @@ pub fn register(engine: &mut Engine) -> u32 {
         "pill_test module registered"
     );
     0
+}
+
+/// The artifact's one-time entry point.
+///
+/// The module keeps nothing that has to run once: everything it owns is
+/// registration, and [`register`] re-runs all of it on every generation. This
+/// function exists because a statically linked build loads the module once and
+/// calls this entry point alone, so it defers to [`register`].
+///
+/// Component registration happens automatically from the `PillComponent`
+/// derive before either entry point runs. Public so the generated
+/// `host_module_pill_test` wrapper can export it as `pill_module_init`.
+#[pill_module(register = register)]
+pub fn init(engine: &mut Engine) -> u32 {
+    register(engine)
 }

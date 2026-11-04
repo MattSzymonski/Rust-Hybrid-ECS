@@ -419,21 +419,23 @@ fn demo_spline() -> Spline {
 // Registration
 // =============================================================================
 
-/// Registers the module's components against the host engine.
+/// Registers the module's components against the host engine and fills the
+/// world up to its spline count.
 ///
-/// Returns zero on success. Must be idempotent: the host calls it once per
-/// loaded generation and rolls back to the previous library when it reports a
-/// non-zero status, which re-runs this function on the older generation.
+/// This is the half a reload repeats. It must be idempotent, because a first
+/// load reaches it too, immediately before [`init`], and a failed generation
+/// rolls back by calling it again on the older image.
 ///
 /// The module registers no system: it contributes a component type and the math
 /// to sample it, leaving movement along a path to whoever owns that behaviour.
-/// Public so a statically linked build can call it directly, and so the
-/// generated `host_module_pill_spline` wrapper can carry it as
-/// `pill_module_init` for the host to find in a loaded DLL.
-#[pill_module]
+///
+/// # Errors
+///
+/// Returns 1 when an entity cannot be created.
 pub fn register(engine: &mut Engine) -> u32 {
     // Fill up to the target count rather than spawning a new path on every
-    // rebuild, because hot reload preserves the entities already created.
+    // rebuild, because a reload keeps the entities already created - and fills
+    // back up when a dropped column took them with it.
     let existing_spline_count = {
         let mut query = Query::<&Spline>::new(engine.world_mut());
         query.iter_mut().count()
@@ -467,6 +469,20 @@ pub fn register(engine: &mut Engine) -> u32 {
         "pill_spline module registered"
     );
     0
+}
+
+/// The artifact's one-time entry point.
+///
+/// The module keeps nothing that has to run once: everything it owns is
+/// registration, and [`register`] re-runs all of it on every generation. This
+/// function exists because a statically linked build loads the module once and
+/// calls this entry point alone, so it defers to [`register`].
+///
+/// Public so the generated `host_module_pill_spline` wrapper can carry it as
+/// `pill_module_init` for the host to find in a loaded DLL.
+#[pill_module(register = register)]
+pub fn init(engine: &mut Engine) -> u32 {
+    register(engine)
 }
 
 // =============================================================================

@@ -451,10 +451,12 @@ impl Drop for ValueTypeLayoutScope {
 /// 3. `before_init` runs - a project loads the startup scene it queued here,
 ///    because the component types exist and the project has not yet seeded its
 ///    own entities over them;
-/// 4. the user's `init` runs;
-/// 5. the registration-error slot is read once more, because `before_init` or
-///    the user's `init` can record an error after the drain in step 2 already
-///    looked at it.
+/// 4. the artifact's `register` runs - the half a later generation repeats, so
+///    the systems it registers belong to the image that is running;
+/// 5. the user's one-time `init` runs;
+/// 6. the registration-error slot is read once more, because `before_init`, the
+///    registration or the user's `init` can record an error after the drain in
+///    step 2 already looked at it.
 ///
 /// The resolver is held for the whole entry point - a `struct:`-tagged field (a
 /// value type, or an array of one) only expands into editable rows while one is
@@ -463,17 +465,21 @@ impl Drop for ValueTypeLayoutScope {
 pub fn run_artifact_entry(
     engine: &mut Engine,
     before_init: impl FnOnce(&mut Engine),
+    register: fn(&mut Engine) -> u32,
     init: impl FnOnce(&mut Engine) -> u32,
 ) -> u32 {
     // Step 1: install this artifact's value types as the world's layout
     // resolver.
     let scope = ValueTypeLayoutScope::install(engine);
-    // Steps 2-4: register the components, load what `before_init` queued, then
-    // run the user's `init`.
+    // Steps 2-4: register the components, load what `before_init` queued, run
+    // the artifact's registration, then its one-time `init`.
     let mut status = match register_all_components(engine.world_mut()) {
         Ok(()) => {
             before_init(engine);
-            init(engine)
+            match register(engine) {
+                0 => init(engine),
+                registration_status => registration_status,
+            }
         }
         // The failure was logged; a half-registered artifact must not run.
         Err(_error) => u32::MAX,
@@ -488,8 +494,44 @@ pub fn run_artifact_entry(
 
 /// [`run_artifact_entry`] for a module or a project that loads no startup
 /// document.
-pub fn run_artifact_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u32 {
-    run_artifact_entry(engine, |_engine| {}, init)
+pub fn run_artifact_init(
+    engine: &mut Engine,
+    register: fn(&mut Engine) -> u32,
+    init: fn(&mut Engine) -> u32,
+) -> u32 {
+    run_artifact_entry(engine, |_engine| {}, register, init)
+}
+
+/// Runs one artifact's registration, and nothing else.
+///
+/// This is the half a later generation repeats: [the value types and the
+/// components](run_artifact_entry) come back with the new image, and the
+/// artifact's `register` re-registers the systems and resources whose code
+/// moved with it. The one-time work - `before_init`, the user's `init` - is
+/// deliberately absent, so a reload cannot seed a world twice.
+///
+/// Returns zero on success, exactly like the entry points it serves.
+pub fn run_artifact_registration(engine: &mut Engine, register: fn(&mut Engine) -> u32) -> u32 {
+    let scope = ValueTypeLayoutScope::install(engine);
+    let mut status = match register_all_components(engine.world_mut()) {
+        Ok(()) => register(engine),
+        // The failure was logged; a half-registered artifact must not run.
+        Err(_error) => u32::MAX,
+    };
+    if status != u32::MAX && engine.world_mut().take_registration_error().is_some() {
+        status = u32::MAX;
+    }
+    drop(scope);
+    status
+}
+
+/// The registration function of an artifact that declares none.
+///
+/// A project that keeps everything in its `init` still loads and still
+/// registers its components through the entry point; this is what the host's
+/// registration-only call finds in its place.
+pub fn no_registration(_engine: &mut Engine) -> u32 {
+    0
 }
 
 /// [`run_artifact_entry`] for a project, which also loads the startup scene the
@@ -498,7 +540,11 @@ pub fn run_artifact_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u
 /// The load runs after registration and before the user's `init`: a scene
 /// loaded earlier would find no component types to attach, and one loaded later
 /// would double every entity the project seeds.
-pub fn run_project_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u32 {
+pub fn run_project_init(
+    engine: &mut Engine,
+    register: fn(&mut Engine) -> u32,
+    init: fn(&mut Engine) -> u32,
+) -> u32 {
     run_artifact_entry(
         engine,
         |engine| {
@@ -510,6 +556,7 @@ pub fn run_project_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u3
                 );
             }
         },
+        register,
         init,
     )
 }

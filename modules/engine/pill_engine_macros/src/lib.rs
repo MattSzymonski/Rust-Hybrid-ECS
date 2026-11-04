@@ -2672,20 +2672,15 @@ fn hot_patch_resolver_export(
 /// `gate` is empty in both emissions: a project is always built as its own
 /// artifact, and a module's entry points are emitted by the wrapper macro, where
 /// `init_fn` is the path `$crate::` plus the annotated function's name.
-fn module_init_export(
-    gate: &proc_macro2::TokenStream,
-    init_fn: &proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    module_init_export_with(gate, init_fn, &quote! { run_artifact_init })
-}
-
-/// [`module_init_export`] with the registration entry point chosen by the
-/// caller: a project uses `run_project_init`, which also loads the startup
-/// scene between registration and the user's `init`.
+///
+/// `register_fn` is the artifact's registration half, or `no_registration` when
+/// it declares none: the entry point runs the components, then that function,
+/// then the one-time `init`.
 fn module_init_export_with(
     gate: &proc_macro2::TokenStream,
     init_fn: &proc_macro2::TokenStream,
     registration_runner: &proc_macro2::TokenStream,
+    register_fn: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     quote! {
         /// Registers this artifact against the host engine; returns zero on
@@ -2716,7 +2711,52 @@ fn module_init_export_with(
                 // value types installed for the whole entry point, so a
                 // `struct:`-tagged field expands into editable rows even when
                 // the artifact registers components itself.
-                ::pill_engine::component_registry::#registration_runner(engine, #init_fn)
+                ::pill_engine::component_registry::#registration_runner(engine, #register_fn, #init_fn)
+            }));
+            result.unwrap_or(u32::MAX)
+        }
+    }
+}
+
+/// Emit the registration-only entry point of an artifact that declares one.
+///
+/// The host calls this instead of `pill_module_init` on every generation after
+/// the first: the artifact's components come back with the new image, its
+/// `register` function re-registers the systems and resources whose code moved
+/// with it, and its one-time `init` is not run again. An artifact without a
+/// registration function emits nothing here, and the host keeps calling
+/// `pill_module_init`.
+fn module_register_export(
+    gate: &proc_macro2::TokenStream,
+    register_fn: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    quote! {
+        /// Re-registers this artifact against the host engine for one more
+        /// generation; returns zero on success.
+        ///
+        /// # Safety
+        ///
+        /// `api` must be a valid [`EngineApi`] pointer owned by the host and
+        /// kept alive for the whole duration of this call.
+        ///
+        /// [`EngineApi`]: ::pill_engine::EngineApi
+        #gate
+        #[no_mangle]
+        pub unsafe extern "C" fn pill_module_register(
+            api: *const ::pill_engine::EngineApi,
+        ) -> u32 {
+            // A panic must never unwind across the C ABI boundary, so it
+            // becomes a non-zero status and the host keeps the previous
+            // generation.
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                // SAFETY: The host guarantees `api` points at a live `EngineApi`
+                // whose `engine_handle` addresses the single engine instance,
+                // and that both outlive this call. The engine is not otherwise
+                // borrowed while an artifact registers, so the reconstructed
+                // `&mut Engine` is unique.
+                let api = unsafe { &*api };
+                let engine = unsafe { &mut *(api.engine_handle as *mut ::pill_engine::Engine) };
+                ::pill_engine::component_registry::run_artifact_registration(engine, #register_fn)
             }));
             result.unwrap_or(u32::MAX)
         }
@@ -2725,8 +2765,8 @@ fn module_init_export_with(
 
 /// Emit the ABI revision export the host reads before it calls anything else.
 ///
-/// Shared for the same reason [`module_init_export`] is: the revision belongs
-/// to the one loadable-artifact contract, not to one kind of artifact.
+/// Shared for the same reason [`module_init_export_with`] is: the revision
+/// belongs to the one loadable-artifact contract, not to one kind of artifact.
 fn module_abi_version_export(gate: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
     quote! {
         /// Loadable-artifact ABI revision this crate was built against.
@@ -2746,9 +2786,15 @@ fn module_abi_version_export(gate: &proc_macro2::TokenStream) -> proc_macro2::To
 // #[pill_module]
 // =============================================================================
 
-/// Wraps an extension's `register` function and generates the `pill_module_*`
+/// Wraps an extension's `init` function and generates the `pill_module_*`
 /// C-ABI exports. The annotated function must have the signature
 /// `fn(engine: &mut Engine) -> u32`.
+///
+/// `#[pill_module(register = path)]` also names the artifact's registration
+/// half: the repeatable work the host calls on every generation after the
+/// first, so the one-time `init` does not run against a world that already has
+/// its entities. Without the argument the artifact exports `pill_module_init`
+/// alone, which is what every module built before the split does.
 ///
 /// Before calling it, the macro registers every component that
 /// `#[derive(PillComponent)]` declared in this artifact. It also derives the
@@ -2765,9 +2811,25 @@ fn module_abi_version_export(gate: &proc_macro2::TokenStream) -> proc_macro2::To
 /// a symbol more than once. The wrapped function itself is always compiled,
 /// because a statically linked build calls it directly.
 #[proc_macro_attribute]
-pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
+pub fn pill_module(attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
     let fn_ident = &item_fn.sig.ident;
+
+    // `#[pill_module(register = path)]` names the extension's registration
+    // half: the repeatable part of its body, which the host calls on every
+    // generation after the first. Without it the module keeps the single entry
+    // point it always had.
+    let mut register_path: Option<syn::Path> = None;
+    if !attribute.is_empty() {
+        let parse_register = syn::meta::parser(|meta| {
+            if meta.path.is_ident("register") {
+                register_path = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            Err(meta.error("unknown `#[pill_module]` argument; expected `register = path`"))
+        });
+        parse_macro_input!(attribute with parse_register);
+    }
 
     // The entry points are written once, as the body of the macro below: the
     // loadable artifact is always a generated wrapper crate, which compiles
@@ -2776,6 +2838,8 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     // one more than once.
     fn entry_points(
         init_fn: &proc_macro2::TokenStream,
+        register_fn: &proc_macro2::TokenStream,
+        register_export: &proc_macro2::TokenStream,
         name_bytes: &proc_macro2::TokenStream,
     ) -> proc_macro2::TokenStream {
         // The resolver stays behind `debug_assertions`: hot patching is a
@@ -2786,7 +2850,12 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
             &quote! { #[cfg(debug_assertions)] },
         );
         let abi_version_export = module_abi_version_export(&quote! {});
-        let init_export = module_init_export(&quote! {}, init_fn);
+        let init_export = module_init_export_with(
+            &quote! {},
+            init_fn,
+            &quote! { run_artifact_init },
+            register_fn,
+        );
 
         quote! {
             #hot_patch_resolver
@@ -2901,11 +2970,29 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
         }
 
             #init_export
+
+            #register_export
         }
     }
 
+    let (register_fn, register_export) = match &register_path {
+        Some(path) => (
+            quote! { $crate::#path },
+            module_register_export(&quote! {}, &quote! { $crate::#path }),
+        ),
+        None => (
+            // Fully qualified: the entry points expand inside the generated
+            // `host_module_<name>` wrapper crate, where nothing of this crate
+            // is in scope.
+            quote! { ::pill_engine::component_registry::no_registration },
+            quote! {},
+        ),
+    };
+
     let entry_point_items = entry_points(
         &quote! { $crate::#fn_ident },
+        &register_fn,
+        &register_export,
         &quote! { $crate::PILL_MODULE_NAME_BYTES },
     );
 
@@ -2962,9 +3049,24 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
 /// `#[cfg]` gate. A project is always built as its own artifact, so there is no
 /// second definition to collide with.
 #[proc_macro_attribute]
-pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
+pub fn pill_project(attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
     let fn_ident = &item_fn.sig.ident;
+
+    // `#[pill_project(register = path)]` names the project's registration
+    // function: the half a reload repeats once `init` has run for the last
+    // time. Without it the project keeps the one entry point it always had.
+    let mut register_path: Option<syn::Path> = None;
+    if !attribute.is_empty() {
+        let parse_register = syn::meta::parser(|meta| {
+            if meta.path.is_ident("register") {
+                register_path = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            Err(meta.error("unknown `#[pill_project]` argument; expected `register = path`"))
+        });
+        parse_macro_input!(attribute with parse_register);
+    }
 
     // Debug-only: a released project keeps no hot-patching surface.
     let hot_patch_resolver = hot_patch_resolver_export(
@@ -2976,10 +3078,21 @@ pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     // collide with.
     let ungated = quote! {};
     let abi_version_export = module_abi_version_export(&ungated);
+    let (register_fn, register_export) = match &register_path {
+        Some(path) => (
+            quote! { #path },
+            module_register_export(&ungated, &quote! { #path }),
+        ),
+        None => (
+            quote! { ::pill_engine::component_registry::no_registration },
+            quote! {},
+        ),
+    };
     let init_export = module_init_export_with(
         &ungated,
         &quote! { #fn_ident },
         &quote! { run_project_init },
+        &register_fn,
     );
 
     let expanded = quote! {
@@ -2990,6 +3103,8 @@ pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
         #abi_version_export
 
         #init_export
+
+        #register_export
 
         /// Aggregate schema fingerprint of every persistable component,
         /// computed from the compile-time registry.

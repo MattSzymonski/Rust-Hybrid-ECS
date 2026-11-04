@@ -128,7 +128,9 @@ const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 /// mirrored to C# - are policy, and live in the config and the reload
 /// transaction rather than in the loader.
 const MODULE_INIT_SYMBOL: &[u8] = b"pill_module_init";
-
+/// Optional: an artifact's registration-only entry point, called instead of
+/// `pill_module_init` on every generation after the first.
+const MODULE_REGISTER_SYMBOL: &[u8] = b"pill_module_register";
 /// Optional ABI revision export, read at load time when present.
 const MODULE_ABI_VERSION_SYMBOL: &[u8] = b"pill_module_abi_version";
 
@@ -607,6 +609,11 @@ pub(crate) struct NativeLibrary {
     library: Option<Library>,
     /// Required registration entry point, resolved once at load time.
     module_init: ModuleInitFn,
+    /// Optional registration-only entry point, resolved once at load time.
+    ///
+    /// `None` means the artifact predates the split and must be called through
+    /// `pill_module_init` on every generation.
+    module_register: Option<ModuleInitFn>,
     /// ABI revision the module reports, when it exports one.
     abi_version: Option<u32>,
     /// Optional value-type manifest exports (`#[derive(PillMirror)]`), used by
@@ -1175,6 +1182,19 @@ impl NativeLibrary {
                 })?
         };
 
+        // Step 2b: Resolve the optional `pill_module_register` export. Its
+        // presence is what lets a later generation re-register without running
+        // the artifact's one-time `init`; an artifact without it keeps the one
+        // entry point it always had.
+        // SAFETY: the same contract as `pill_module_init` - the signature is
+        // the module ABI's, and the handle keeps the image mapped.
+        let module_register = unsafe {
+            library
+                .get::<ModuleInitFn>(MODULE_REGISTER_SYMBOL)
+                .ok()
+                .map(|symbol| *symbol)
+        };
+
         // Step 3: Read the optional ABI revision before anything else calls
         // into the module, so a caller can reject an incompatible module
         // without ever handing it a pointer into engine memory.
@@ -1247,6 +1267,7 @@ impl NativeLibrary {
         Ok(Self {
             library: Some(library),
             module_init: module_init_pointer,
+            module_register,
             abi_version,
             value_type_count,
             copy_value_types,
@@ -1256,6 +1277,21 @@ impl NativeLibrary {
             copy_field_accessors,
             temporary_path,
         })
+    }
+
+    /// Calls the registration-only entry point, when the artifact exports one.
+    ///
+    /// Returns `None` when it does not: the caller then has to use
+    /// [`Self::call_init`] and accept that the artifact's one-time work runs
+    /// again.
+    pub(crate) fn call_register(&self, api: &EngineApi) -> Option<u32> {
+        let module_register = self.module_register?;
+        // SAFETY: the export was found at load time and is held with this C ABI
+        // signature, which is the signature the module ABI contract defines for
+        // it. The `library` field keeps the module mapped for as long as this
+        // `NativeLibrary` lives, and `api` is only borrowed for the duration of
+        // the call.
+        Some(unsafe { module_register(api as *const EngineApi) })
     }
 
     /// Calls the module's registration entry point.

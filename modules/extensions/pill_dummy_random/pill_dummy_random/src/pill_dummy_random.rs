@@ -65,13 +65,20 @@ pub fn seed_from_u32(seed: u32) -> LcgRandom {
 
 /// Registers the module against the host engine. Returns zero on success.
 ///
-/// The call must be idempotent, so a second call leaves the engine in the same
-/// state. The host calls it once for every generation it loads, and a non-zero
-/// status makes it keep the previous library.
-/// It is public so a statically linked build can call it directly, and so the
-/// generated `host_module_pill_dummy_random` wrapper can expose it to the host
-/// as `pill_module_init`.
-#[pill_module]
+/// This is the half a reload repeats. The module adds nothing to the engine, so
+/// the call does nothing; it exists so every in-repo artifact answers the same
+/// contract. A second call must leave the engine in the same state.
 pub fn register(_engine: &mut Engine) -> u32 {
     0
+}
+
+/// The artifact's one-time entry point.
+///
+/// The module keeps nothing that has to run once, so this function defers to
+/// [`register`]. It exists because a statically linked build calls it directly
+/// and because the generated `host_module_pill_dummy_random` wrapper carries it
+/// as `pill_module_init`.
+#[pill_module(register = register)]
+pub fn init(engine: &mut Engine) -> u32 {
+    register(engine)
 }

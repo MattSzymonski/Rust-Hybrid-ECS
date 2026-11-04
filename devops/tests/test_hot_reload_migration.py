@@ -91,8 +91,8 @@ DESERIALIZE_FAILED_TOKEN = "[persistence] Failed to deserialize"
 # migration that silently reset every field to its default would still pass.
 WITNESS_POSITION_2 = "[project] witness SpatialPosition(10.00,20.00)"
 WITNESS_POSITION_3_A = "[project] witness SpatialPosition(10.00,20.00,0.00)"
-WITNESS_POSITION_3_B = "[project] witness SpatialPosition(1.00,2.00,1.00)"
-WITNESS_POSITION_3_C = "[project] witness SpatialPosition(-5.00,8.00,2.00)"
+WITNESS_POSITION_3_B = "[project] witness SpatialPosition(1.00,2.00,0.00)"
+WITNESS_POSITION_3_C = "[project] witness SpatialPosition(-5.00,8.00,0.00)"
 WITNESS_TRAIL_ALPHA = (
     '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50)'
 )
@@ -577,7 +577,7 @@ def build_scenarios() -> List[Scenario]:
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("native::FrameCounter", 6)],
+            expected_migration_entity_counts=[("native::FrameCounter", 3)],
             expected_witness_tokens=[WITNESS_POSITION_2, WITNESS_TRAIL_ALPHA],
         ),
         migration_scenario(
@@ -597,7 +597,7 @@ def build_scenarios() -> List[Scenario]:
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("native::FrameCounter", 9)],
+            expected_migration_entity_counts=[("native::FrameCounter", 3)],
             expected_witness_tokens=[WITNESS_POSITION_2, WITNESS_TRAIL_ALPHA],
         ),
         migration_scenario(
@@ -618,7 +618,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("native::SpatialPosition", 12)],
+            expected_migration_entity_counts=[("native::SpatialPosition", 3)],
             # The added field defaults to zero on migrated entities while every
             # pre-existing value survives: the witness pins exactly that.
             expected_witness_tokens=[
@@ -643,7 +643,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("native::LinearVelocity", 10)],
+            expected_migration_entity_counts=[("native::LinearVelocity", 2)],
             expected_witness_tokens=[
                 WITNESS_POSITION_3_A,
                 WITNESS_POSITION_3_B,
@@ -680,7 +680,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("native::SpatialPosition", 21)],
+            expected_migration_entity_counts=[("native::SpatialPosition", 3)],
             expected_witness_tokens=[
                 WITNESS_POSITION_3_A,
                 WITNESS_POSITION_3_B,
@@ -704,13 +704,13 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("native::MarkerTrail", 16)],
-            # Heap payloads must survive the schema change; the new vector must
-            # arrive empty on migrated rows (stamps=0) and seeded on new ones.
+            expected_migration_entity_counts=[("native::MarkerTrail", 2)],
+            # Heap payloads must survive the schema change; the new vector
+            # arrives empty on every row, because the seeded ones were the only
+            # rows and they are migrated rather than spawned again.
             expected_witness_tokens=[
                 '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50,stamps=0)',
                 '[project] witness MarkerTrail(points=2,sum=9.00,label="beta",samples=1,last=2.50,stamps=0)',
-                '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50,stamps=2)',
             ],
         ),
         migration_scenario(
@@ -735,13 +735,10 @@ def build_scenarios() -> List[Scenario]:
                 "MarkerTrail(points=3,sum=1.88",
                 "MarkerTrail(points=2,sum=2.25",
             ],
-            expected_migration_entity_counts=[("native::MarkerTrail", 20)],
+            expected_migration_entity_counts=[("native::MarkerTrail", 2)],
             expected_witness_tokens=[
                 '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50,stamps=0)',
-                '[project] witness MarkerTrail(points=2,sum=9.00,label="beta",samples=1,last=2.50,stamps=1)',
-                # This generation's own spawn, carried across the rebuilt
-                # column without reinterpretation.
-                '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50,stamps=2)',
+                '[project] witness MarkerTrail(points=2,sum=9.00,label="beta",samples=1,last=2.50,stamps=0)',
             ],
         ),
         migration_scenario(
@@ -761,12 +758,12 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("native::MarkerTrail", 20)],
+            expected_migration_entity_counts=[("native::MarkerTrail", 2)],
             expected_witness_tokens=[
                 # A renamed field has no source value: it resets to Default
-                # while its neighbours keep their data.
-                '[project] witness MarkerTrail(points=3,sum=6.00,name="",samples=2,last=1.50,stamps=2)',
-                '[project] witness MarkerTrail(points=3,sum=6.00,name="alpha",samples=2,last=1.50,stamps=2)',
+                # while its neighbours keep their data. Both rows are migrations
+                # of the seeded entities, so both lose their name.
+                '[project] witness MarkerTrail(points=3,sum=6.00,name="",samples=2,last=1.50,stamps=0)',
             ],
         ),
         migration_scenario(
@@ -787,7 +784,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("native::MarkerTrail", 24)],
+            expected_migration_entity_counts=[("native::MarkerTrail", 2)],
             # The stored floats cannot become u32, so the snapshot fails to
             # parse and the fallback resets the WHOLE component on migrated
             # rows (name reverts too, visible as the empty string) while the
@@ -796,7 +793,6 @@ def build_scenarios() -> List[Scenario]:
             # negative zero, hence the `-0.00`.
             expected_witness_tokens=[
                 '[project] witness MarkerTrail(points=0,sum=-0.00,name="",samples=0,last=0.00,stamps=0)',
-                '[project] witness MarkerTrail(points=3,sum=6.00,name="alpha",samples=2,last=1.50,stamps=2)',
             ],
         ),
         migration_scenario(

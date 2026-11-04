@@ -83,22 +83,18 @@ const CSHARP_CONFIGURATIONS: [&str; 2] = ["Release", "Debug"];
 /// is large and does not work well with NativeAOT, so the compiler is built
 /// and loaded only when the host enables hot reload, and never reaches a
 /// shipping bundle.
-#[cfg(feature = "hot_reload")]
 pub(crate) const CSHARP_COMPILER_MANIFEST: &str =
     "csharp/pill_csharp_compiler/pill_csharp_compiler.csproj";
 
 /// Assembly name of the in-process C# compiler.
-#[cfg(feature = "hot_reload")]
 pub(crate) const CSHARP_COMPILER_ASSEMBLY_NAME: &str = "pill_csharp_compiler";
 
 /// Workspace-relative output directory of the in-process C# compiler.
-#[cfg(feature = "hot_reload")]
 pub(crate) const CSHARP_COMPILER_OUTPUT_SUBDIRECTORY: &str =
     "csharp/pill_csharp_compiler/bin/Release/net8.0";
 
 /// Workspace-relative MSBuild file that captures a project's compiler command
 /// line, injected into a managed project's build.
-#[cfg(feature = "hot_reload")]
 pub(crate) const CSHARP_COMPILER_ARGUMENTS_TARGETS: &str =
     "csharp/pill_csharp_compiler/build/PillCaptureCompilerArgs.targets";
 
@@ -107,7 +103,6 @@ pub(crate) const CSHARP_COMPILER_ARGUMENTS_TARGETS: &str =
 /// This name is the whole contract between the host and the targets file.
 /// MSBuild derives the directory from the project it builds, and the host
 /// derives the same path from the project's output directory.
-#[cfg(feature = "hot_reload")]
 pub(crate) const CSHARP_COMPILER_ARGUMENTS_FILE: &str = "pill_compiler_args.rsp";
 
 /// Workspace-relative directory holding one folder per extension.
@@ -256,6 +251,7 @@ pub(crate) const RENDERER_DATA_SUFFIX: &str = "_data";
 ///
 /// The crate's build script and the shader reload code must name the same
 /// directory, or an edited shader changes a file that nothing rebuilds.
+#[cfg(feature = "rendering")]
 pub(crate) const RENDERER_SHADER_SOURCES_DIRECTORY: &str = "shader_sources";
 
 /// Dependency tables whose entries link code into the build.
@@ -1499,7 +1495,6 @@ pub(crate) fn spawned_build_environment() -> Vec<(String, String)> {
 /// dylibs it maps where its own profile put them rather than always in
 /// `target/debug`. A host built with `--target` (the dioxus CLI) lives under
 /// `target/<triple>/<profile>`; a native one under `target/<profile>`.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(crate) fn host_target_directory() -> String {
     match host_target_triple() {
         Some(triple) => format!("target/{triple}/{HOST_PROFILE_DIRECTORY}"),
@@ -1568,10 +1563,8 @@ pub(crate) fn host_cargo_command(packages: &[String]) -> Vec<String> {
     if cargo_timings_enabled() {
         command.push("--timings".to_string());
     }
-    if cfg!(feature = "hot_patch") {
-        command.push("--features".to_string());
-        command.push("pill_engine/hot_patch".to_string());
-    }
+    command.push("--features".to_string());
+    command.push("pill_engine/hot_patch".to_string());
     command
 }
 
@@ -1670,7 +1663,6 @@ fn manifest_string_value(manifest: &str, section: &str, key: &str) -> Option<Str
         .map(str::to_string)
 }
 
-#[cfg(feature = "hot_reload")]
 /// Whether the project manifest declares a direct dependency on `crate_name`.
 ///
 /// Reads the project's manifest again at runtime because the decision depends
@@ -1701,7 +1693,6 @@ pub(crate) fn project_depends_on_crate(
 /// Reads the document rather than scanning lines: a dependency may be an
 /// inline table, a sub-table, renamed through `package = "..."`, or declared
 /// under a target-specific table.
-#[cfg(feature = "hot_reload")]
 fn manifest_depends_on_crate(manifest: &str, crate_name: &str) -> bool {
     let Ok(document) = manifest.parse::<DocumentMut>() else {
         return false;
@@ -1713,7 +1704,6 @@ fn manifest_depends_on_crate(manifest: &str, crate_name: &str) -> bool {
 
 /// Every dependency table in `document`: the three linking tables at the top
 /// level, and the same three under each `[target.<cfg>]` table.
-#[cfg(feature = "hot_reload")]
 fn linking_dependency_tables(document: &DocumentMut) -> Vec<&Table> {
     let mut tables = Vec::new();
     for section in LINKING_DEPENDENCY_TABLES {
@@ -1738,7 +1728,6 @@ fn linking_dependency_tables(document: &DocumentMut) -> Vec<&Table> {
 
 /// Whether one dependency table declares `crate_name`, directly or as the
 /// `package` of a renamed entry.
-#[cfg(feature = "hot_reload")]
 fn declares_dependency(table: &Table, crate_name: &str) -> bool {
     table.iter().any(|(key, item)| {
         if key == crate_name {
@@ -2027,7 +2016,6 @@ fn materialize_host_project_member(
         // rebuild, and nobody should pay that for a development feature they
         // have not enabled. A `[lib]` without a `crate-type` list builds an
         // rlib by default.
-        #[cfg(feature = "hot_patch")]
         if let Some(crate_types) = library_table
             .get_mut("crate-type")
             .and_then(Item::as_array_mut)
@@ -2380,7 +2368,6 @@ mod tests {
     use super::*;
 
     /// A native project manifest that links the extension directly.
-    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     const DEPENDENT_MANIFEST: &str = r#"
 [package]
 name = "project"
@@ -2391,7 +2378,6 @@ pill_spline = { path = "../../modules/extensions/pill_spline" }
 "#;
 
     /// A native project manifest with no extension dependency.
-    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     const INDEPENDENT_MANIFEST: &str = r#"
 [package]
 name = "project"
@@ -2402,7 +2388,6 @@ serde = { version = "1", features = ["derive"] }
 "#;
 
     /// A native `ProjectModuleConfig` for dependency-check tests.
-    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     fn native_config(manifest_path: Option<&str>) -> ProjectModuleConfig {
         ProjectModuleConfig {
             name: "project".to_string(),
@@ -2418,7 +2403,6 @@ serde = { version = "1", features = ["derive"] }
     }
 
     /// A managed `ProjectModuleConfig`; it carries no Rust manifest path.
-    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     fn csharp_config() -> ProjectModuleConfig {
         ProjectModuleConfig {
             name: "project_cs".to_string(),
@@ -2446,7 +2430,6 @@ serde = { version = "1", features = ["derive"] }
     /// Each call starts from a clean subdirectory and tests remove only their
     /// own subdirectory when done, so parallel tests never delete a manifest
     /// another test is still reading.
-    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     fn write_manifest(subdirectory: &str, contents: &str) -> PathBuf {
         let directory = temp_root().join(subdirectory);
         let _ = std::fs::remove_dir_all(&directory);
@@ -3057,14 +3040,11 @@ serde = { version = "1", features = ["derive"] }
             cargo_timings_enabled(),
             "the timings flag follows the same gate the analytics collector reads"
         );
-        #[cfg(feature = "hot_patch")]
         assert_eq!(
             &command[command.len() - 2..],
             ["--features", "pill_engine/hot_patch"],
             "the hot-patch feature is package-qualified onto the engine and comes last"
         );
-        #[cfg(not(feature = "hot_patch"))]
-        assert!(!command.contains(&"--features".to_string()));
     }
 
     // =========================================================================
@@ -3072,14 +3052,12 @@ serde = { version = "1", features = ["derive"] }
     // =========================================================================
 
     /// A direct dependency declared as an inline table is detected.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn direct_dependency_is_detected() {
         assert!(manifest_depends_on_crate(DEPENDENT_MANIFEST, "pill_spline"));
     }
 
     /// A dependency renamed through `package = "..."` is detected.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn renamed_dependency_is_detected() {
         let manifest = r#"
@@ -3091,7 +3069,6 @@ spline_path = { package = "pill_spline", path = "../../modules/extensions/pill_s
 
     /// A dependency with a quoted key (renamed to a non-identifier) is detected
     /// through its `package` value.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn quoted_key_rename_is_detected() {
         let manifest = r#"
@@ -3102,7 +3079,6 @@ spline_path = { package = "pill_spline", path = "../../modules/extensions/pill_s
     }
 
     /// Dev and build dependencies also link the crate into the build.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn dev_and_build_dependencies_are_detected() {
         let manifest = r#"
@@ -3116,7 +3092,6 @@ pill_spline = { path = "../../modules/extensions/pill_spline" }
     }
 
     /// A target-specific dependency table is detected.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn target_specific_dependency_is_detected() {
         let manifest = r#"
@@ -3127,7 +3102,6 @@ pill_spline = { path = "../../modules/extensions/pill_spline" }
     }
 
     /// A dependency written as its own sub-table is detected.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn sub_table_dependency_is_detected() {
         let manifest = r#"
@@ -3138,7 +3112,6 @@ path = "../../modules/extensions/pill_spline"
     }
 
     /// A manifest that never mentions the crate reports no dependency.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn missing_dependency_is_not_detected() {
         assert!(!manifest_depends_on_crate(
@@ -3149,7 +3122,6 @@ path = "../../modules/extensions/pill_spline"
 
     /// A crate listed only under `[workspace.dependencies]` is shared
     /// infrastructure, not something this project links directly.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn workspace_shared_dependency_is_not_a_project_dependency() {
         let manifest = r#"
@@ -3163,7 +3135,6 @@ pill_engine = { path = "../../modules/engine/pill_engine" }
     }
 
     /// A crate name appearing outside any dependency section is not a link.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn same_name_outside_dependency_sections_is_ignored() {
         let manifest = r#"
@@ -3180,7 +3151,6 @@ pill_engine = { path = "../../modules/engine/pill_engine" }
     }
 
     /// A longer crate name sharing the prefix must not match.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn shared_prefix_does_not_match() {
         let manifest = r#"
@@ -3195,7 +3165,6 @@ pill_spline_extra = { path = "../../modules/extensions/pill_spline_extra" }
     // =========================================================================
 
     /// The project manifest is read from disk and a direct dependency found.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn reads_the_project_manifest() {
         let manifest = write_manifest("dependent", DEPENDENT_MANIFEST);
@@ -3209,7 +3178,6 @@ pill_spline_extra = { path = "../../modules/extensions/pill_spline_extra" }
     }
 
     /// A project that does not depend on the module is not triggered.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn independent_manifest_is_not_triggered() {
         let manifest = write_manifest("independent", INDEPENDENT_MANIFEST);
@@ -3224,7 +3192,6 @@ pill_spline_extra = { path = "../../modules/extensions/pill_spline_extra" }
 
     /// A managed project is never triggered, even with a manifest path set,
     /// because it cannot link a Rust extension crate.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn managed_project_is_never_triggered() {
         let manifest = write_manifest("managed", "# csproj contents\n");
@@ -3239,7 +3206,6 @@ pill_spline_extra = { path = "../../modules/extensions/pill_spline_extra" }
     }
 
     /// A missing manifest counts as "no dependency" rather than an error.
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn missing_manifest_file_is_not_an_error() {
         let project = native_config(Some("does/not/exist/Cargo.toml"));
@@ -3251,7 +3217,6 @@ pill_spline_extra = { path = "../../modules/extensions/pill_spline_extra" }
     }
 
     /// A config without a manifest path counts as "no dependency".
-    #[cfg(feature = "hot_reload")]
     #[test]
     fn missing_manifest_path_is_not_an_error() {
         let project = native_config(None);
@@ -3579,7 +3544,7 @@ name = \"x\"
     }
 }
 
-#[cfg(all(test, feature = "hot_patch"))]
+#[cfg(test)]
 mod hot_patch_manifest_tests {
     use super::{
         materialize_host_project_member, HOST_PROJECT_MEMBER_PREFIX, PROJECT_MEMBER_DIRECTORY,

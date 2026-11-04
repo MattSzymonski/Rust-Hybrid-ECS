@@ -16,8 +16,9 @@
 //! backend selection out of executable crates. Running the game is
 //! `pill_player`'s job: the engine, the frame, the statically linked project
 //! and the renderer's window. A shipping build links that crate without this
-//! one. The reload path compiles only with `hot_reload`; without that feature
-//! this crate is mostly its configuration types.
+//! one. Everything this crate does is development work, so nothing here is
+//! behind a feature: what a run watches is decided at startup by the switches
+//! in [`switches`].
 
 // =============================================================================
 // Module Declarations

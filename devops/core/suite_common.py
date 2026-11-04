@@ -849,10 +849,12 @@ class HostPosture:
         return " ".join(self.build_command)
 
 
-# The postures in use. `--features rendering` on the defaults is the same graph
-# as the `--features pill_development_host/hot_patch,rendering` the hot-patch suites used to
-# spell out: `hot_patch` is a default feature and it is what forwards
-# `pill_development_host/hot_patch`.
+# The postures in use. `hot_patch` is no longer a feature of the host - it pins
+# `pill_engine/hot_patch` in its manifest, and `PILL_FUNCTION_HOT_PATCHING`
+# decides at startup whether the fast path runs - so `HOST_DEV_HOT_PATCH` and
+# `HOST_DEV` are two names for one graph, as are the two rendering postures. The
+# old names stay because a suite's posture is also its log line and its
+# `--skip-build` identity.
 HOST_DEV_HOT_PATCH = HostPosture("development+hot_patch")
 HOST_DEV = HostPosture("development", ("--no-default-features", "--features", "development"))
 HOST_DEV_HOT_PATCH_RENDERING = HostPosture("development+hot_patch+rendering", ("--features", "rendering"))

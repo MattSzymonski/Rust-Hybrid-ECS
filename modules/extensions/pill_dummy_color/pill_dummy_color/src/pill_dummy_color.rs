@@ -128,14 +128,26 @@ pub fn get_color_a() -> f32 {
 
 /// Registers the module with the host engine and returns zero on success.
 ///
-/// It must be idempotent: the host calls it once for each loaded generation,
-/// and when it returns a non-zero status the host keeps the previous library.
-/// It is public so a statically linked build can call it directly, and so the
-/// generated `host_module_pill_dummy_color` wrapper can expose it as
-/// `pill_module_init`, the symbol the host looks up in a loaded DLL.
-#[pill_module]
+/// This is the half a reload repeats. The module adds nothing to the engine -
+/// its Mirrored declarations are compile-time registries - so the call does
+/// nothing, and it exists so every in-repo artifact answers the same contract.
+///
+/// It must be idempotent: the host calls it on every generation, and when it
+/// returns a non-zero status the host keeps the previous library.
 pub fn register(_engine: &mut Engine) -> u32 {
     0
+}
+
+/// The artifact's one-time entry point.
+///
+/// The module keeps nothing that has to run once, so this function defers to
+/// [`register`]. It exists because a statically linked build loads the module
+/// once and calls this entry point alone, and because the generated
+/// `host_module_pill_dummy_color` wrapper exposes it as `pill_module_init`, the
+/// symbol the host looks up in a loaded DLL.
+#[pill_module(register = register)]
+pub fn init(engine: &mut Engine) -> u32 {
+    register(engine)
 }
 
 // =============================================================================

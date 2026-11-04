@@ -33,17 +33,15 @@ pill_shipping_bundle = { path = "../../../build/pill_shipping_bundle", optional 
 
 [features]
 # Exactly one of `development` and `shipping`; `main.rs` refuses neither or both.
-# `hot_patch` is in the defaults; drop it for the pure reload path with
-# `--no-default-features --features development`.
-default = ["development", "hot_patch"]
-# Development mode: the host builds, loads, watches and reloads modules.
-development = ["dep:pill_development_host", "pill_development_host/hot_reload"]
+default = ["development"]
+# Development mode: the host builds, loads, watches and reloads modules. Which
+# watchers a run starts is a startup switch (`PILL_HOT_RELOADING` and friends),
+# not a feature.
+development = ["dep:pill_development_host"]
 # Shipping mode: the bundle's project runs statically. Build with
 # `--package pill_standalone`, never `--workspace`, which would union the
 # editor's host dependency back in and re-enable `development`.
 shipping = ["dep:pill_shipping_bundle"]
-# Per-function patching, forwarded to the host. Implies `development`.
-hot_patch = ["development", "pill_development_host/hot_patch"]
 # Windowed runs: the loop and input here, the renderer attach in the runtime.
 rendering = [
     "dep:winit",

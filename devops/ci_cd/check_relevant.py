@@ -312,10 +312,11 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # development postures end to end.
     if has("modules/hosting/pill_development_host/**", "modules/hosting/pill_hot_scan/**"):
         selected.append(cargo_check("test pill_development_host",
-                                    ("test", "-p", "pill_development_host", "--features", "hot_patch", "--offline"),
+                                    ("test", "-p", "pill_development_host", "--offline"),
                                     "host changed"))
         selected.append(suite_check("test_hot_reload_suite.py", "host reload path changed"))
         selected.append(suite_check("test_hot_patch_coverage.py", "host patch path changed"))
+        selected.append(suite_check("test_host_switches.py", "host switches changed"))
         selected.append(suite_check("test_shader_recompile.py", "host shader reload path changed"))
         selected.append(suite_check("test_resource_layout_fingerprint.py", "host reload path changed"))
         selected.append(suite_check("test_manager_settings.py", "host settings path changed"))

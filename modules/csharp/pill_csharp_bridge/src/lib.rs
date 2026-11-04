@@ -12,21 +12,21 @@
 //! # Design
 //!
 //! `pill_csharp_runtime` is the managed half of this boundary, and the two
-//! change together: [`INTEROP_CONTRACT_VERSION`] is checked from both sides
+//! change together. [`INTEROP_CONTRACT_VERSION`] is checked from both sides
 //! when the runtime starts. [`csharp_runtime`] owns the low-level .NET hosting
-//! boundary; the remaining modules split ABI layout, registration, invocation
-//! scope, queries, commands and backend lifecycle; [`CSharpRuntime`] is the
+//! boundary. The remaining modules split ABI layout, registration, invocation
+//! scope, queries, commands and backend lifecycle. [`CSharpRuntime`] is the
 //! entry point.
 //!
-//! Development tooling - mirror generation and the in-process Roslyn
-//! compiler - lives in `pill_development_host`. This crate reads no project settings,
-//! builds nothing and watches nothing. A shipped C# project reaches the
-//! runtime as a [`CSharpBackend`] implementing `pill_player::ProjectBackend`:
-//! the bridge depends on the runtime, never the other way round.
+//! Mirror generation and the in-process Roslyn compiler live in
+//! `pill_development_host`. This crate reads no project settings, builds
+//! nothing and watches no files. A shipped C# project reaches `pill_player`
+//! as a [`CSharpBackend`] implementing `pill_player::ProjectBackend`; the
+//! bridge depends on `pill_player`, never the other way round.
 
 /// C-compatible data structures and callback table shared with the managed runtime.
 mod abi;
-/// NativeAOT library loader used by the C# project backend's AOT posture.
+/// Loads the native library of a C# project published with NativeAOT.
 mod aot_runtime;
 /// High-level C# project startup, discovery, and scheduler registration.
 mod backend;
@@ -42,16 +42,16 @@ mod context;
 mod csharp_runtime;
 /// Read-only frame state for managed code: input and time.
 mod frame_state;
-/// The two-call protocol every managed payload crosses the boundary through.
+/// The two-call protocol that carries every managed payload across the boundary.
 mod managed_buffer;
 /// C# component manifest schema, field validation, and engine type mapping.
 mod manifest;
-/// The one apply pipeline every manifest kind runs through.
+/// The single pipeline that applies every kind of manifest.
 mod manifest_apply;
-/// The native calls the mirror ABI needs beside the trampolines: text
+/// The native calls the mirror ABI needs besides its trampolines: text
 /// channels, Rust-owned resources, and the asset store.
 mod mirror_calls;
-/// The rules that name a generated mirror's fields, for generation and binding checks.
+/// The naming rules a generated C# mirror's fields follow.
 mod mirror_naming;
 /// Parallel dispatch of managed callbacks onto the shared Rayon pool.
 mod parallel;
@@ -66,34 +66,39 @@ mod resources;
 // Types + Impls
 // =============================================================================
 
-// The full type documentation lives in the `backend` module.
+/// Rebuilds the mirror-method table the managed runtime copies, after an
+/// extension reload changes its trampoline addresses or method set.
+pub use abi::publish_mirror_methods;
+/// The full type documentation lives in the `backend` module.
 pub use backend::{CSharpRuntime, INTEROP_CONTRACT_VERSION};
 /// The reload poll's status codes.
 #[cfg(feature = "hot_reload")]
 pub use backend::{POLL_MANIFEST_PENDING, POLL_NO_CHANGE, POLL_REJECTED, POLL_RELOADED};
+/// Assembly names and output directories of a managed project, as the
+/// backend needs them to start it.
 pub use config::CSharpModuleConfig;
 /// The booted CoreCLR runtime, which development tooling (the in-process
 /// compiler) loads its own assemblies into.
 pub use csharp_runtime::DotnetRuntimeContext;
-/// The two-call protocol every managed payload crosses the boundary through.
+/// The two-call protocol for managed payloads, with its error type.
 pub use managed_buffer::{fetch_managed_buffer, ManagedBufferError};
-/// The naming rules a generated mirror follows, shared by the generator in
-/// `pill_development_host` and the binding check here.
+/// The naming rules a generated mirror follows. The generator in
+/// `pill_development_host` and the binding check here both use them.
 pub use mirror_naming::{
     is_heap_owned_tag, is_opaque_container_tag, snake_to_pascal, split_array_tag,
 };
 /// A shipped C# project, started through `pill_player`'s external backend.
 pub use project_backend::CSharpBackend;
 
-/// Resolve registered component names into the layouts managed code binds.
+/// Resolves registered component names into the layouts managed code binds.
 pub use components::exposed_components_from_names;
 /// Aggregate of the native components exposed to managed code.
 pub use components::ModuleExposedComponent;
 
-/// One mirrored Rust method resolved to a callable address, shared by the
-/// host's module loader and the C# backend. Defined here (not in the host's
-/// `hot_reload`-gated module loader) because the C# backend is compiled in
-/// every configuration.
+/// One mirrored Rust method, resolved to a callable address, shared by the
+/// host's module loader and the C# backend. It lives here rather than in the
+/// host's `hot_reload`-gated module loader because the C# backend is
+/// compiled in every configuration.
 #[derive(Clone, Debug)]
 pub struct ResolvedMirrorMethod {
     /// Fully-qualified Rust type name the method belongs to - or, for a free
@@ -111,21 +116,22 @@ pub struct ResolvedMirrorMethod {
     pub arg_names: Vec<String>,
     /// Address of the C-ABI trampoline; zero for a type row with none.
     pub address: usize,
-    /// Whether the declaration is a `#[pill_mirror_fn]` free function; the
+    /// Whether the declaration is a `#[pill_mirror_fn]` free function. The
     /// codegen then emits a static method on a static class named after the
-    /// declaring module instead of an instance method on a struct mirror.
+    /// declaring module, instead of an instance method on a struct mirror.
     pub is_free_function: bool,
     /// The package that declared the method, from `env!("CARGO_PKG_NAME")` at
     /// the macro's expansion site. The host keeps only the entries whose
-    /// `crate_name` matches the module being generated or published, so one
-    /// artifact linking another crate's code cannot claim its declarations.
+    /// `crate_name` matches the module being generated or published, so an
+    /// artifact cannot claim declarations from a crate it only links.
     pub crate_name: String,
-    /// How the function takes its owner: `""`, `"ref"`, `"mut"` or `"value"`.
+    /// How the method takes the value it is called on: empty for none, or
+    /// `"ref"`, `"mut"` or `"value"`.
     pub receiver: String,
     /// What the owning type is, when the declaring attribute knew it: `"value"`
     /// for a `#[derive(PillMirror)]` value type or a component row, `"object"`,
-    /// `"enum"`, `"resource"`, `"module"` for a free function, or empty for a
-    /// method whose type the codegen resolves from the type rows.
+    /// `"enum"`, `"resource"`, or `"module"` for a free function. Empty when
+    /// the codegen has to resolve the type from the type rows.
     pub owner_kind: String,
 }
 
@@ -141,11 +147,11 @@ pub struct ResolvedFieldAccessor {
     pub field_name: String,
     /// Container kind: `"vec"`, `"dynbuf"`, `"string"`, or `"vecstring"`.
     pub kind: String,
-    /// Element type tag of a `vec` field; `string` for a `vecstring` field;
-    /// empty for a `string` field.
+    /// Element type tag of a `vec` field. It is `string` for a `vecstring`
+    /// field, and empty for a `string` field.
     pub element_tag: String,
-    /// Address of the view trampoline; `None` for a `vecstring` field, whose
-    /// elements are individually allocated and cannot be viewed as one run.
+    /// Address of the view trampoline. `None` for a `vecstring` field, whose
+    /// elements are allocated separately and cannot be viewed as one run.
     pub view_address: Option<usize>,
     /// Address of the resize trampoline for a `vec`, `dynbuf` or `vecstring`
     /// field.
@@ -160,20 +166,23 @@ pub struct ResolvedFieldAccessor {
     pub push_address: Option<usize>,
 }
 
-/// The operation name a generated `MirrorMethods.Resolve` call and the host's
-/// accessor rows agree on for one operation of a heap field.
-///
-/// Defined once so the codegen (which writes the name into C#) and the table
-/// builder (which registers it) can never drift; `operation` is `view`,
-/// `resize`, `set`, `item`, `set_item`, or `push`.
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns the name a generated `MirrorMethods.Resolve` call and the host's
+/// accessor rows both use for one operation on a heap field. Writing it in
+/// one place keeps the codegen (which writes it into C#) and the row builder
+/// (which turns it into a table row) from drifting apart. `operation` is
+/// `view`, `resize`, `set`, `item`, `set_item`, or `push`.
 #[cfg(feature = "hot_reload")]
 pub fn accessor_operation_name(field_name: &str, operation: &str) -> String {
     format!("{field_name}_{operation}")
 }
 
-/// Convert heap-field accessors into mirror-method rows, so the managed
-/// runtime resolves them through the same table — and the same per-reload
-/// refresh — as mirrored value-type methods.
+/// Converts heap-field accessors into mirror-method rows. The managed
+/// runtime then resolves them through the same table as mirrored value-type
+/// methods, and refreshes that table the same way on each reload.
 #[cfg(feature = "hot_reload")]
 pub fn accessor_rows(accessors: &[ResolvedFieldAccessor]) -> Vec<ResolvedMirrorMethod> {
     let mut rows = Vec::with_capacity(accessors.len() * 6);
@@ -204,10 +213,6 @@ pub fn accessor_rows(accessors: &[ResolvedFieldAccessor]) -> Vec<ResolvedMirrorM
     rows
 }
 
-/// Rebuild the mirror-method table the managed runtime reads, after an
-/// extension reload changes its trampoline addresses or method set.
-pub use abi::publish_mirror_methods;
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -216,7 +221,7 @@ pub use abi::publish_mirror_methods;
 ///
 /// The fixtures are the shared-ABI components the managed side mirrors
 /// (`TransformComponent`, `MeshRendererComponent`). They come from `pill_engine`
-/// and the renderer data crate (a dev-dependency), so these run in every
-/// build, headless included.
+/// and the renderer data crate (a dev-dependency), so the suite builds in
+/// every configuration, headless included.
 #[cfg(test)]
 mod tests;

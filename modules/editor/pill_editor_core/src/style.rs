@@ -685,7 +685,7 @@ fn to_egui_color(theme_color: Rgba) -> Color32 {
 ///
 /// The executable merges the layers and the shell installs the result, passing
 /// the layers and the generation the theme came from. A context created later
-/// - a pop-out window, the no-shell fallback - calls [`apply`] to install the
+/// (a pop-out window, the no-shell fallback) calls [`apply`] to install the
 /// recorded theme. The install goes through the UI kit with `append_fonts` as
 /// its callback: a font a theme layer names leads each UI family, the editor's
 /// own fonts follow it, and each icon family leads with its Phosphor face.

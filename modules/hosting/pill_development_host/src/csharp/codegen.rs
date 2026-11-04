@@ -2965,7 +2965,7 @@ mod tests {
     ///
     /// A mutator on the value type would reallocate through whatever struct
     /// the caller holds - `var copy = row.Write<Trail>(); copy.ResizePoints(8);`
-    /// - and leave the live row pointing at the freed block. `Bind` takes a
+    /// and leave the live row pointing at the freed block. `Bind` takes a
     /// `ref`, so the compiler refuses a copy, and copying the handle copies
     /// only a pointer.
     #[test]

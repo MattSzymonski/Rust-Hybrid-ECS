@@ -113,7 +113,7 @@ FRONTENDS = {
     ),
     "headless reload-only": (
         ["--package", "pill_standalone", "--no-default-features", "--features", "development"],
-        [],
+        ["pill_engine/hot_patch"],
         None,
         ALL_DYLIBS,
     ),

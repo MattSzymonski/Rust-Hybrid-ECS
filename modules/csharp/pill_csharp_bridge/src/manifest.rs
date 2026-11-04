@@ -6,18 +6,18 @@
 //!   resources, with their identities, sizes and field trees.
 //! - Validate field trees against the blittable vocabulary the byte-level
 //!   column storage requires.
-//! - Map managed field types onto the engine's field descriptors, interning
+//! - Map managed field types onto the engine's field descriptors, and intern
 //!   the strings a manifest-declared component has no static to borrow from.
 //!
 //! # Design
 //!
-//! A manifest is the managed side's only description of a component - identity,
-//! layout and fields - transferred as JSON bytes in the pending-manifest
+//! A manifest is the managed side's only description of a component: its
+//! identity, layout and fields, sent as JSON bytes in the pending-manifest
 //! payload. The storage it feeds is a raw byte buffer, so the validation here
-//! is the enforcement behind that storage's `Send`/`Sync` claim: every field
-//! must be a blittable value with no ownership and nothing to release.
+//! is what makes that storage's `Send`/`Sync` claim true: every field must be
+//! a blittable value with no ownership and nothing to release.
 //!
-//! The types stay `Deserialize`-only: the host parses a manifest and never
+//! The types stay `Deserialize`-only. The host parses a manifest and never
 //! writes one, so there is no serializer to keep in step with.
 
 // Standard library
@@ -34,28 +34,47 @@ use serde::Deserialize;
 use super::components::{stable_component_id, StableComponentId};
 use super::resources::{ManagedResourceDeclaration, ResourceFieldLayout};
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 /// Maximum nesting depth accepted in a managed component field tree.
 ///
-/// Real component layouts never exceed a handful of levels. The budget stays
-/// below `serde_json`'s own parser recursion limit so this validation, not an
-/// opaque parser error, rejects pathological manifests.
+/// Real component layouts never exceed a handful of levels. The limit stays
+/// below `serde_json`'s own parser recursion limit, so this check, not a vague
+/// parser error, refuses a pathological manifest.
 const MAX_FIELD_NESTING_DEPTH: usize = 32;
 
-/// One accepted leaf type's whole meaning to the host.
+/// The nested-struct marker. Validation descends into a nested struct's
+/// fields instead of treating it as a leaf.
+const STRUCT_TYPE: &str = "struct";
+
+/// The prefix of a `Handle<T>` field's type. What follows is the Rust type
+/// path of `T`, as the C# mirror of `T` carries it.
+const HANDLE_PREFIX: &str = "handle:";
+
+/// A handle's size and alignment: two `u32`s, `index` then `generation`.
+const HANDLE_SIZE: usize = 8;
+const HANDLE_ALIGNMENT: usize = 4;
+
+// =============================================================================
+// Blittable Vocabulary
+// =============================================================================
+
+/// What one accepted leaf type means to the host.
 ///
-/// The manifest vocabulary is read by four separate checks - blittability,
-/// natural alignment, the engine type tag and default-literal parsing - and all
-/// four read their answer from this table: a type is accepted exactly when it
-/// has a row here, so the checks cannot disagree about what a type means.
+/// Four checks read this table: blittability, natural alignment, the engine
+/// type tag and default-literal parsing. A type is accepted exactly when it has
+/// a row here, so the checks cannot disagree about what a type means.
 struct BlittableLeaf {
     /// Canonical managed type name as the manifest writes it.
     type_name: &'static str,
-    /// Natural alignment the managed side places the field at.
+    /// Alignment the managed side gives the field in its own layout.
     alignment: usize,
-    /// Engine type tag, or `None` for a type the engine cannot decode: the
+    /// Engine type tag, or `None` for a type the engine cannot decode. Such a
     /// field keeps its bytes in storage but is left out of the registered
     /// editor layout.
-    tag: Option<&'static str>,
+    type_tag: Option<&'static str>,
     /// How a `default:` literal for this type parses.
     default_literal: DefaultLiteral,
 }
@@ -76,132 +95,122 @@ enum DefaultLiteral {
     Unsigned64,
     Float32,
     Float64,
-    /// No supported literal form. The pointer-width types land here, so a
-    /// manifest declaring such a default is refused by name.
+    /// No supported literal form. The pointer-width types and `Entity` use
+    /// this, so a manifest that declares a default for one of them is refused
+    /// by name.
     Unsupported,
 }
 
 /// The managed blittable field vocabulary: one row per accepted leaf type.
 ///
-/// This is the enforcement behind `ComponentColumn`'s `unsafe impl Send`/`Sync`
-/// and its lack of drop glue. That storage is a raw byte buffer: rows are moved
-/// with `ptr::copy` and the buffer is freed without running any destructor, so
-/// every field must be a blittable value with no ownership, no interior
-/// pointer, and nothing to release.
+/// This table is what makes `ComponentColumn`'s `unsafe impl Send`/`Sync`
+/// sound and what lets its rows be freed without drop glue. The column is a raw
+/// byte buffer: rows are moved with `ptr::copy` and the buffer is freed without
+/// running any destructor. Every field must therefore be a blittable value with
+/// no ownership, no interior pointer, and nothing to release.
 ///
-/// A nested value type is a shape, not a leaf: it has no row here, and
-/// validation recurses into its own fields instead of looking it up.
+/// A nested value type is a shape, not a leaf: it has no row here. Validation
+/// recurses into its own fields instead of looking it up.
 const BLITTABLE_LEAVES: &[BlittableLeaf] = &[
     BlittableLeaf {
         type_name: "System.Byte",
         alignment: 1,
-        tag: Some("u8"),
+        type_tag: Some("u8"),
         default_literal: DefaultLiteral::Unsigned8,
     },
     BlittableLeaf {
         type_name: "System.SByte",
         alignment: 1,
-        tag: Some("i8"),
+        type_tag: Some("i8"),
         default_literal: DefaultLiteral::Signed8,
     },
     BlittableLeaf {
         type_name: "System.Int16",
         alignment: 2,
-        tag: Some("i16"),
+        type_tag: Some("i16"),
         default_literal: DefaultLiteral::Signed16,
     },
     BlittableLeaf {
         type_name: "System.UInt16",
         alignment: 2,
-        tag: Some("u16"),
+        type_tag: Some("u16"),
         default_literal: DefaultLiteral::Unsigned16,
     },
     BlittableLeaf {
         type_name: "System.Int32",
         alignment: 4,
-        tag: Some("i32"),
+        type_tag: Some("i32"),
         default_literal: DefaultLiteral::Signed32,
     },
     BlittableLeaf {
         type_name: "System.UInt32",
         alignment: 4,
-        tag: Some("u32"),
+        type_tag: Some("u32"),
         default_literal: DefaultLiteral::Unsigned32,
     },
     BlittableLeaf {
         type_name: "System.Int64",
         alignment: 8,
-        tag: Some("i64"),
+        type_tag: Some("i64"),
         default_literal: DefaultLiteral::Signed64,
     },
     BlittableLeaf {
         type_name: "System.UInt64",
         alignment: 8,
-        tag: Some("u64"),
+        type_tag: Some("u64"),
         default_literal: DefaultLiteral::Unsigned64,
     },
-    // Pointer-width on the host, which is what the managed side marshals them
-    // as; the engine only ever stores their bytes.
+    // Pointer-width on the host, which is how the managed side marshals them.
+    // The engine only ever stores their bytes.
     BlittableLeaf {
         type_name: "System.IntPtr",
         alignment: std::mem::size_of::<usize>(),
-        tag: None,
+        type_tag: None,
         default_literal: DefaultLiteral::Unsupported,
     },
     BlittableLeaf {
         type_name: "System.UIntPtr",
         alignment: std::mem::size_of::<usize>(),
-        tag: None,
+        type_tag: None,
         default_literal: DefaultLiteral::Unsupported,
     },
     BlittableLeaf {
         type_name: "System.Single",
         alignment: 4,
-        tag: Some("f32"),
+        type_tag: Some("f32"),
         default_literal: DefaultLiteral::Float32,
     },
     BlittableLeaf {
         type_name: "System.Double",
         alignment: 8,
-        tag: Some("f64"),
+        type_tag: Some("f64"),
         default_literal: DefaultLiteral::Float64,
     },
     BlittableLeaf {
         type_name: "System.Boolean",
         alignment: 1,
-        tag: Some("bool"),
+        type_tag: Some("bool"),
         default_literal: DefaultLiteral::Boolean,
     },
-    // A blittable UTF-16 code unit with the same size as the engine's `u16`;
-    // exposing it that way keeps the field editable.
+    // A blittable UTF-16 code unit, the same size as the engine's `u16`.
+    // Exposing it as `u16` keeps the field editable.
     BlittableLeaf {
         type_name: "System.Char",
         alignment: 2,
-        tag: Some("u16"),
+        type_tag: Some("u16"),
         default_literal: DefaultLiteral::Unsigned16,
     },
-    // A reference to another entity: the runtime's `Entity`
-    // handle, which is the Rust handle's mirror - a `u64` slot id and a `u32`
-    // generation. Eight-byte aligned because of the `u64`, and with no
-    // default: an unset reference is the world's null handle.
+    // A reference to another entity, mirrored from the runtime's `Entity`
+    // handle: a `u64` slot id and a `u32` generation. It is eight-byte aligned
+    // because of the `u64`, and it has no default: an unset reference is the
+    // world's null handle.
     BlittableLeaf {
         type_name: "Entity",
         alignment: 8,
-        tag: Some("entity"),
+        type_tag: Some("entity"),
         default_literal: DefaultLiteral::Unsupported,
     },
 ];
-
-/// The nested-struct marker: a shape validation descends into, not a leaf.
-const STRUCT_TYPE: &str = "struct";
-
-/// The prefix of a `Handle<T>` field's type: `handle:` and the Rust type path
-/// of `T`, as the C# mirror of `T` carries it.
-const HANDLE_PREFIX: &str = "handle:";
-
-/// A handle's size and alignment: two `u32`s, `index` then `generation`.
-const HANDLE_SIZE: usize = 8;
-const HANDLE_ALIGNMENT: usize = 4;
 
 /// The Rust type path of a handle field's asset type, when the field is one.
 pub(super) fn handle_asset_path(primitive_type: &str) -> Option<&str> {
@@ -210,8 +219,9 @@ pub(super) fn handle_asset_path(primitive_type: &str) -> Option<&str> {
         .filter(|path| !path.is_empty())
 }
 
-/// The engine tag a handle field is recorded under: `struct:Handle<Mesh>`,
-/// the last segment of the asset type's path, as the derive writes it.
+/// The engine tag a handle field is recorded under, such as
+/// `struct:Handle<Mesh>`. It uses the last segment of the asset type's path,
+/// as the derive writes it.
 fn handle_tag(asset_path: &str) -> &'static str {
     let short = asset_path.rsplit("::").next().unwrap_or(asset_path);
     intern(&format!("struct:Handle<{short}>"))
@@ -224,18 +234,22 @@ fn blittable_leaf(primitive_type: &str) -> Option<&'static BlittableLeaf> {
         .find(|leaf| leaf.type_name == primitive_type)
 }
 
-/// Whether a manifest may declare a field of this type: an accepted leaf, or
-/// a nested value struct whose own fields are validated recursively against
-/// this same vocabulary.
+/// Whether a manifest may declare a field of this type. That is an accepted
+/// leaf, or a nested value struct, whose own fields are validated against this
+/// same vocabulary.
 fn is_blittable(primitive_type: &str) -> bool {
     primitive_type == STRUCT_TYPE
         || blittable_leaf(primitive_type).is_some()
         || handle_asset_path(primitive_type).is_some()
 }
 
-/// Deserialized entry from the managed component manifest.
+// =============================================================================
+// Manifest Schema
+// =============================================================================
+
+/// One entry deserialized from the manifest a managed assembly submits.
 #[derive(Deserialize)]
-pub(super) struct ManagedComponentManifest {
+pub(super) struct ManagedManifestEntry {
     /// Low 64 bits of the stable component identity.
     pub(super) stable_id_low: u64,
     /// High 64 bits of the stable component identity.
@@ -253,17 +267,16 @@ pub(super) struct ManagedComponentManifest {
     /// What the entry declares: a component, or a resource.
     ///
     /// Defaulted so a payload that omits the tag parses as a list of
-    /// components: an older generation's manifest stays readable during a
-    /// reload that straddles the change.
+    /// components, which keeps the manifest of an older generation readable
+    /// during a reload.
     #[serde(default)]
     pub(super) kind: ManifestEntryKind,
     /// The names of live registrations this entry renames onto itself.
     ///
-    /// A rename is expressed here rather than as a new entry: the host resolves
-    /// each alias to the registration that answered to it and moves that
-    /// registration's rows onto this entry, so the rename reads as a
-    /// migration instead of a retirement plus an add. Defaulted for the same
-    /// reason `kind` is.
+    /// A rename is declared here, not as a new entry: the host finds the
+    /// registration that answered to each alias and moves its rows onto this
+    /// entry, so a rename keeps its data, where a removal plus an add would
+    /// lose it. Defaulted for the same reason `kind` is.
     #[serde(default)]
     pub(super) aliases: Vec<String>,
     /// Top-level field descriptions of the component layout.
@@ -273,9 +286,8 @@ pub(super) struct ManagedComponentManifest {
 /// What one managed manifest entry declares.
 ///
 /// Resources ride in the same array as components rather than a second
-/// document, so one transfer and one registration transaction cover a whole
-/// generation's declaration - a resource that registered while its project's
-/// components were refused would be a half-applied manifest.
+/// document, so one transfer covers a whole generation's declaration and a
+/// manifest that fails validation registers nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ManifestEntryKind {
@@ -295,7 +307,9 @@ pub(super) struct ManagedFieldManifest {
     pub(super) offset: usize,
     /// Byte size of the field.
     pub(super) size: usize,
-    /// Canonical managed type name of the field.
+    /// Managed type name of the field: a leaf type name as the manifest writes
+    /// it, `struct` for a nested value type, or `handle:` plus the asset
+    /// type's Rust path.
     pub(super) primitive_type: String,
     /// Literal a newly added or reset field starts from, instead of zero.
     #[serde(default)]
@@ -313,8 +327,8 @@ pub(super) struct ManagedFieldManifest {
 ///
 /// Mirrors the editor's [`FieldDecorator`](pill_engine::component_registry::FieldDecorator)
 /// vocabulary. The managed side writes one flat record for the whole
-/// vocabulary, so unused payload members arrive as `null` and a variant reads
-/// only the members its kind carries. [`validate_decorations`] refuses a
+/// vocabulary, so unused payload members arrive as `null` and each variant
+/// reads only the members its kind carries. [`validate_decorations`] refuses a
 /// payload that cannot mean what it says; nothing here affects storage.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -345,9 +359,10 @@ pub(super) enum ManagedFieldDecorator {
     },
     /// A multi-line text box.
     TextArea {
-        /// Rows the box starts with.
+        /// Rows the Inspector asks the box to show.
         min_lines: usize,
-        /// Rows the box grows to before it scrolls.
+        /// Declared upper row count; the Inspector sizes the box from
+        /// `min_lines` alone.
         max_lines: usize,
     },
     /// A fixed-height multi-line text box.
@@ -362,10 +377,14 @@ pub(super) enum ManagedFieldDecorator {
     },
 }
 
+// =============================================================================
+// Validation
+// =============================================================================
+
 /// Reject sibling fields that share any byte range.
 ///
-/// Conflicting interpretations of the same storage would corrupt data
-/// silently, so overlaps and duplicated offsets are invalid layouts.
+/// Two fields that share bytes would overwrite each other's values with no
+/// error, so an overlap and a duplicated offset are both invalid layouts.
 ///
 /// # Errors
 ///
@@ -389,20 +408,23 @@ pub(super) fn validate_sibling_non_overlap(
     Ok(())
 }
 
-/// Verify that a field and every nested field fit within the byte range of
-/// the struct that directly contains it, and that sibling fields never
-/// overlap.
+/// Check that one field and all of its nested fields fit inside the struct
+/// that contains them, and that sibling fields never overlap.
 ///
-/// The field tree is walked with an explicit worklist so deeply nested input
-/// consumes heap rather than stack, and the depth budget rejects pathological
-/// manifests before they cost real work.
+/// The field tree is walked with an explicit worklist, so deeply nested input
+/// uses heap memory instead of the stack. The depth limit refuses a
+/// pathological manifest before it costs any real work.
 ///
 /// # Errors
 ///
 /// Returns an error when a field overflows its containing struct, names an
-/// empty field or type, declares a type outside the [`BLITTABLE_LEAVES`]
-/// vocabulary, sits at an offset that is not a multiple of its natural
-/// alignment, or exceeds the maximum nesting depth.
+/// empty field or type, or declares a type outside the [`BLITTABLE_LEAVES`]
+/// vocabulary. It also fails when a leaf sits at an offset that is not a
+/// multiple of its natural alignment, when a handle is not exactly
+/// [`HANDLE_SIZE`] bytes at a [`HANDLE_ALIGNMENT`]-byte boundary or declares a
+/// default, when a default does not parse or does not fill the field exactly,
+/// when a decorator is out of range, when sibling fields overlap, or when the
+/// nesting limit is exceeded.
 pub(super) fn validate_field_manifest(
     field: &ManagedFieldManifest,
     parent_size: usize,
@@ -420,9 +442,9 @@ pub(super) fn validate_field_manifest(
         }
         // Reject anything that is not a blittable value type. `ComponentColumn`
         // copies rows as raw bytes and frees its buffer without running drop
-        // glue, so a field owning a resource would be duplicated on move and
-        // leaked on free - and sharing such a column across threads, which the
-        // engine does, would be unsound.
+        // glue. A field that owned a resource would therefore be copied on
+        // move and leaked on free, and sharing such a column across threads,
+        // which the engine does, would be unsound.
         if !is_blittable(&field.primitive_type) {
             return Err(format!(
                 "managed field {} has non-blittable type {}; descriptor components must contain only unmanaged value types",
@@ -436,12 +458,14 @@ pub(super) fn validate_field_manifest(
         // boundary - a project built without the analyzer reference reaches the
         // host with nothing in between.
         //
-        // The offset is relative to the containing struct, and a struct's own
-        // offset is checked against its parent by the same rule, so a field is
-        // correctly aligned within the component exactly when every step of
-        // that chain is.
-        // A handle is exactly the engine's `Handle<T>`: two `u32`s, aligned to
-        // four, with no default (an unset reference is the invalid handle).
+        // Each field offset is measured from the struct that directly contains
+        // it, so a nested leaf is checked against its own struct. A struct
+        // field declares no alignment of its own, so where that struct starts
+        // inside the component is not checked here.
+
+        // A handle must be exactly the engine's `Handle<T>`: two `u32`s,
+        // aligned to four, with no default (an unset reference is the invalid
+        // handle).
         if handle_asset_path(&field.primitive_type).is_some()
             && (field.size != HANDLE_SIZE
                 || field.offset % HANDLE_ALIGNMENT != 0
@@ -460,10 +484,10 @@ pub(super) fn validate_field_manifest(
                 ));
             }
         }
-        // A default is for the leaves: a struct has no literal form, and a
+        // Defaults are for leaves only. A struct has no literal form, and a
         // nested default would be a second layout language to validate. The
         // literal is checked against the field's own type here, so a mismatch
-        // is a named refusal rather than a marshalling surprise later.
+        // is a named refusal instead of a surprise at marshalling time.
         if let Some(literal) = &field.default {
             if !field.fields.is_empty() {
                 return Err(format!(
@@ -500,10 +524,10 @@ pub(super) fn validate_field_manifest(
 
 /// Reject a presentation decorator that cannot mean what it says.
 ///
-/// Presentation only, but a slider whose minimum is above its maximum, or a
-/// text box with zero lines, is a declaration mistake the managed side cannot
-/// see - Unity silently ignores bad ranges, and a silently ignored decorator
-/// is worse than a refused manifest.
+/// A decorator changes only how the Inspector draws a field, but a slider whose
+/// minimum is above its maximum, or a text box with zero lines, is a mistake
+/// nobody sees: Unity silently ignores bad ranges, and a decorator that is
+/// silently ignored is worse than a manifest that is refused.
 ///
 /// # Errors
 ///
@@ -547,11 +571,16 @@ pub(super) fn validate_decorations(
     Ok(())
 }
 
-/// The editor decorators a managed field declares, as the layout carries them.
+// =============================================================================
+// Type Mapping
+// =============================================================================
+
+/// The editor decorators a managed field declares, in the form the layout
+/// carries them.
 ///
-/// Payload strings are owned here: a managed declaration's text arrives in the
-/// parsed JSON, not in a static, so the descriptor owns it. An empty list stays
-/// the borrowed empty slice every undecorated field shares.
+/// Text payloads are owned here: a managed declaration's text comes from the
+/// parsed JSON, not from a static, so the descriptor must own it. An empty list
+/// returns the borrowed empty slice that every undecorated field shares.
 pub(super) fn field_decorations(
     decorations: &[ManagedFieldDecorator],
 ) -> std::borrow::Cow<'static, [FieldDecorator]> {
@@ -588,11 +617,13 @@ pub(super) fn field_decorations(
     )
 }
 
-/// The engine-vocabulary tag one manifest field carries.
+/// The engine-vocabulary tag a field takes in a migration plan.
 ///
-/// Mirrors what [`managed_field_layout`] records for the same field, so a plan
-/// built from a manifest compares like with like. A leaf the engine cannot
-/// decode (the pointer-width types) carries no tag and reads `unsupported`.
+/// For a leaf it is the tag [`managed_field_layout`] records, and for a handle
+/// its `struct:Handle<...>` tag. A nested struct is `struct`, which is also
+/// what the plan folds the registry's longer tag to, so both sides compare like
+/// with like. A leaf the engine cannot decode (the pointer-width types) carries
+/// no tag and reads `unsupported`.
 pub(super) fn manifest_field_tag(field: &ManagedFieldManifest) -> &'static str {
     if field.primitive_type == STRUCT_TYPE {
         return STRUCT_TYPE;
@@ -601,18 +632,23 @@ pub(super) fn manifest_field_tag(field: &ManagedFieldManifest) -> &'static str {
         return handle_tag(asset_path);
     }
     blittable_leaf(&field.primitive_type)
-        .and_then(|leaf| leaf.tag)
+        .and_then(|leaf| leaf.type_tag)
         .unwrap_or("unsupported")
 }
 
 /// Parse one field default literal into native-endian bytes.
 ///
-/// Deliberately literals only: an expression the AOT posture could not
-/// evaluate would be a default that exists in the manifest and not in the
-/// running world. The literal is checked against the field's own declared
-/// type, so a mismatch is a named validation error rather than a marshalling
-/// surprise later and the managed side is free to format its number however
-/// the language does.
+/// Only literals are accepted. A build that compiles the C# ahead of time
+/// cannot evaluate an expression, so the expression would be a default that
+/// exists in the manifest and not in the running world. The literal is parsed
+/// as the field's own declared type, so a mismatch is a named validation error
+/// instead of a surprise at marshalling time.
+///
+/// # Errors
+///
+/// Returns an error when the type has no supported literal form (a
+/// pointer-width type or `Entity`), or when the literal does not parse as that
+/// type.
 pub(super) fn parse_default_bytes(primitive_type: &str, literal: &str) -> Result<Vec<u8>, String> {
     let trimmed = literal.trim();
     let invalid = || format!("field default `{literal}` is not a valid {primitive_type} literal");
@@ -643,12 +679,12 @@ pub(super) fn parse_default_bytes(primitive_type: &str, literal: &str) -> Result
             .parse::<i64>()
             .map(|value| value.to_ne_bytes().to_vec())
             .map_err(|_| invalid()),
-        // UTF-16 code units parse as the engine's `u16` alongside the real
-        // unsigned 16-bit type.
         DefaultLiteral::Unsigned8 => trimmed
             .parse::<u8>()
             .map(|value| value.to_ne_bytes().to_vec())
             .map_err(|_| invalid()),
+        // UTF-16 code units parse as the engine's `u16` alongside the real
+        // unsigned 16-bit type.
         DefaultLiteral::Unsigned16 => trimmed
             .parse::<u16>()
             .map(|value| value.to_ne_bytes().to_vec())
@@ -675,14 +711,14 @@ pub(super) fn parse_default_bytes(primitive_type: &str, literal: &str) -> Result
     }
 }
 
-/// Reduce a field's type tag to what the migration plan should compare.
+/// Reduce a field's type tag to what the migration plan compares.
 ///
-/// The registry records a nested struct as `struct:<owner>::<field>` for the
-/// editor's benefit, while a manifest only knows that the field is a struct.
-/// Comparing those verbatim would mark every nested field retyped - and would
-/// do it again whenever a component is renamed, because the owner is part of
+/// For the editor, the registry records a nested struct as
+/// `struct:<owner>::<field>`, while a manifest only knows that the field is a
+/// struct. Comparing those tags as they are would mark every nested field as
+/// retyped, and again on every component rename, because the owner is part of
 /// the tag. Both sides are folded to `struct`, so the plan asks the question it
-/// actually means: is this field still a struct?
+/// means: is this field still a struct?
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(super) fn plan_tag(type_tag: &str) -> &str {
     if type_tag.starts_with("struct:") {
@@ -692,51 +728,53 @@ pub(super) fn plan_tag(type_tag: &str) -> &str {
     }
 }
 
-/// Strings handed to the engine as `&'static str`, deduplicated by content.
+/// Strings handed to the engine as `&'static str`, stored once per value.
 ///
 /// `ComponentFieldDescriptor` holds `&'static str` because the derive builds it
 /// in an artifact's static data. A manifest-declared component has no statics
-/// to borrow from, so its strings have to be given the same lifetime by hand.
+/// to borrow from, so its strings have to be given that lifetime by hand.
 ///
-/// A bare `Box::leak` per registration would grow with the reload count, since
-/// the C# project re-registers its components on every reload. Interning bounds
-/// the cost by the project's type set: a name a component keeps across a
+/// Leaking a fresh `Box` for every registration would grow with the reload
+/// count, because the C# project re-registers its components on every reload.
+/// Interning limits the cost to the project's type set: a name that survives a
 /// hundred reloads is stored once.
 static INTERNED_FIELD_STRINGS: std::sync::Mutex<Option<HashSet<&'static str>>> =
     std::sync::Mutex::new(None);
 
-/// Return a `&'static str` equal to `value`, allocating only on first sight.
-pub(super) fn intern(value: &str) -> &'static str {
+/// Return a `&'static str` equal to `text`. Only the first call for a given
+/// text allocates.
+pub(super) fn intern(text: &str) -> &'static str {
     let mut guard = INTERNED_FIELD_STRINGS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let table = guard.get_or_insert_with(HashSet::new);
-    if let Some(existing) = table.get(value) {
+    if let Some(existing) = table.get(text) {
         return existing;
     }
-    // First sight: this is the one allocation the string ever costs.
-    let leaked: &'static str = Box::leak(value.to_owned().into_boxed_str());
+    // The first call for a value is the only one that allocates.
+    let leaked: &'static str = Box::leak(text.to_owned().into_boxed_str());
     table.insert(leaked);
     leaked
 }
 
-/// Convert a managed component manifest's field tree into engine descriptors.
+/// Convert the top-level fields of a managed component into engine descriptors.
 ///
 /// Primitive leaves map onto the engine's type-tag vocabulary so the editor
-/// can decode and edit them. Nested `struct:` fields stay opaque: the engine
-/// has no struct walking, so their bytes are visible but not interpretable.
-/// Field names and struct tags are interned, so a component re-registered on
-/// every reload costs its strings once rather than once per reload.
+/// can decode and edit them. A nested struct stays opaque: it gets one
+/// `struct:` tag and the engine does not walk into it, so its bytes are visible
+/// but not interpretable. Field names and struct tags are interned, so a
+/// component that is re-registered on every reload pays for its strings once.
 pub(super) fn managed_field_layout(
     component_name: &str,
     fields: &[ManagedFieldManifest],
 ) -> Vec<ComponentFieldDescriptor> {
-    let mut layout = Vec::new();
+    let mut field_layout = Vec::new();
     for field in fields {
-        // A handle is a leaf the engine decodes as an asset reference; its
-        // asset type is recorded beside the layout (`managed_asset_fields`).
+        // A handle is a leaf the engine decodes as an asset reference. Its
+        // asset type is recorded in the world for the component by
+        // `record_managed_asset_fields`.
         if let Some(asset_path) = handle_asset_path(&field.primitive_type) {
-            layout.push(ComponentFieldDescriptor {
+            field_layout.push(ComponentFieldDescriptor {
                 name: intern(&field.name),
                 type_tag: handle_tag(asset_path),
                 offset: field.offset,
@@ -748,7 +786,7 @@ pub(super) fn managed_field_layout(
             continue;
         }
         if field.primitive_type == STRUCT_TYPE {
-            layout.push(ComponentFieldDescriptor {
+            field_layout.push(ComponentFieldDescriptor {
                 name: intern(&field.name),
                 type_tag: intern(&format!("struct:{component_name}::{}", field.name)),
                 offset: field.offset,
@@ -761,10 +799,11 @@ pub(super) fn managed_field_layout(
         }
         // A leaf the engine cannot decode keeps its bytes in storage but is
         // omitted from the registered layout.
-        let Some(type_tag) = blittable_leaf(&field.primitive_type).and_then(|leaf| leaf.tag) else {
+        let Some(type_tag) = blittable_leaf(&field.primitive_type).and_then(|leaf| leaf.type_tag)
+        else {
             continue;
         };
-        layout.push(ComponentFieldDescriptor {
+        field_layout.push(ComponentFieldDescriptor {
             name: intern(&field.name),
             type_tag,
             offset: field.offset,
@@ -774,14 +813,15 @@ pub(super) fn managed_field_layout(
             decorators: field_decorations(&field.decorations),
         });
     }
-    layout
+    field_layout
 }
 
 /// Render a registered field layout as one stable, parseable line so
-/// integration suites can assert the managed manifest reached the engine
-/// intact: `name@offset:size:type_tag` entries joined by `|`.
-pub(super) fn format_field_layout_line(layout: &[ComponentFieldDescriptor]) -> String {
-    layout
+/// integration suites can check that the managed manifest reached the engine
+/// intact. Each field is `name@offset:size:type_tag`, and the entries are
+/// joined with `|`.
+pub(super) fn format_field_layout_line(field_layout: &[ComponentFieldDescriptor]) -> String {
+    field_layout
         .iter()
         .map(|field| {
             format!(
@@ -793,19 +833,34 @@ pub(super) fn format_field_layout_line(layout: &[ComponentFieldDescriptor]) -> S
         .join("|")
 }
 
+// =============================================================================
+// Manifest Parsing and Plans
+// =============================================================================
+
 /// Parse a managed manifest and check every entry against its own identity.
 ///
-/// Every check here is a property of the manifest alone - identity, uniqueness,
-/// and the shape of each layout - so startup and reload both run it before
-/// either touches the world, and so both validate exactly the same thing.
+/// Every check here is a property of the manifest alone: identity, uniqueness
+/// and the shape of each layout. The startup path and the reload path both run
+/// it before they touch the world, so both validate exactly the same thing.
+///
+/// # Errors
+///
+/// Returns a [`CSharpError`] when the bytes do not parse as a manifest, when an
+/// entry's identity does not match its full name, when two entries declare one
+/// identity, or when an alias is empty, names a live declaration or is declared
+/// by two entries. It also fails on an invalid layout (a size of zero or above
+/// `u32::MAX`, a zero or non-power-of-two alignment, or a layout the allocator
+/// cannot express), on overlapping sibling fields, on any error
+/// [`validate_field_manifest`] reports, and on a resource marked `shared`.
 pub(super) fn parse_and_validate_manifest(
     bytes: &[u8],
-) -> Result<Vec<ManagedComponentManifest>, CSharpError> {
-    // Step 1: Parse and validate every entry against canonical identities.
-    let manifest: Vec<ManagedComponentManifest> = serde_json::from_slice(bytes)?;
+) -> Result<Vec<ManagedManifestEntry>, CSharpError> {
+    // Step 1: Parse the payload.
+    let manifest: Vec<ManagedManifestEntry> = serde_json::from_slice(bytes)?;
     let mut seen = HashSet::new();
     let mut alias_owners: HashMap<&str, &str> = HashMap::new();
     for component in &manifest {
+        // Step 2: Check each entry's identity and its aliases.
         let stable_id =
             StableComponentId::from_halves(component.stable_id_low, component.stable_id_high);
         if stable_component_id(&component.full_name) != stable_id {
@@ -818,7 +873,8 @@ pub(super) fn parse_and_validate_manifest(
         if !seen.insert(stable_id) {
             // Components and resources share one identity space, so this also
             // catches a resource whose declared name collides with a component's
-            // type name - two entries that would answer to one slot.
+            // type name. Without the check, two entries would register under one
+            // slot.
             return Err(format!(
                 "duplicate declaration {} in managed manifest",
                 component.full_name
@@ -826,11 +882,11 @@ pub(super) fn parse_and_validate_manifest(
             .into());
         }
         for alias in &component.aliases {
-            // Resolution is one hop against live names only, so an alias that
-            // is itself a declared name (or another entry's alias) has no
-            // unambiguous predecessor to find. Refused here rather than
-            // resolved by precedence, because the wrong choice would move a
-            // live registration's rows.
+            // An alias is resolved in one step, against live names only. An
+            // alias that is itself a declared name, or another entry's alias,
+            // therefore has no unambiguous predecessor. It is refused here
+            // instead of being resolved by precedence, because the wrong choice
+            // would move a live registration's rows onto the wrong entry.
             if alias.trim().is_empty() {
                 return Err(format!(
                     "managed component {} declares an empty alias",
@@ -853,6 +909,7 @@ pub(super) fn parse_and_validate_manifest(
                 .into());
             }
         }
+        // Step 3: Check the bounds of the declared layout and its field tree.
         if component.size == 0
             || u32::try_from(component.size).is_err()
             || component.alignment == 0
@@ -872,10 +929,12 @@ pub(super) fn parse_and_validate_manifest(
             validate_field_manifest(field, component.size)?;
         }
 
-        // A resource is a singleton, so "the host already binds this natively"
-        // has nothing to mean for one: there is no column to bind and no native
-        // mirror to validate against. Refused where it is declared rather than
-        // silently ignored, so a mis-marked struct is a named error.
+        // Step 4: Refuse a resource that claims a native binding.
+        //
+        // A resource is a singleton, so a native binding has nothing to mean
+        // for one: there is no column to bind and no native mirror to validate
+        // against. The entry is refused where it is declared instead of being
+        // silently ignored, so a mis-marked struct becomes a named error.
         if component.kind == ManifestEntryKind::Resource && component.shared {
             return Err(format!(
                 "managed resource {} is marked shared; resources have no native binding",
@@ -891,22 +950,24 @@ pub(super) fn parse_and_validate_manifest(
 ///
 /// Both halves went through the same identity, layout and field validation
 /// above; only what they are registered as differs.
+///
+/// # Panics
+///
+/// Panics when a declared default does not parse. Both callers pass a manifest
+/// that [`parse_and_validate_manifest`] already validated, and that function
+/// refuses such a default, so this cannot fire for them.
 pub(super) fn split_manifest_kinds(
-    manifest: Vec<ManagedComponentManifest>,
-) -> (
-    Vec<ManagedComponentManifest>,
-    Vec<ManagedResourceDeclaration>,
-) {
+    manifest: Vec<ManagedManifestEntry>,
+) -> (Vec<ManagedManifestEntry>, Vec<ManagedResourceDeclaration>) {
     let mut components = Vec::new();
     let mut resources = Vec::new();
     for entry in manifest {
         match entry.kind {
             ManifestEntryKind::Component => components.push(entry),
             ManifestEntryKind::Resource => {
-                // The tags are folded through the same function the component
-                // plan uses, so a resource migration compares the two sides of
-                // its diff in one vocabulary rather than marking every nested
-                // field retyped.
+                // Both sides go through the same tag function the component
+                // plan uses, so a resource migration compares one vocabulary
+                // instead of marking every nested field retyped.
                 let fields = entry
                     .fields
                     .iter()
@@ -936,20 +997,26 @@ pub(super) fn split_manifest_kinds(
     (components, resources)
 }
 
-/// Build the byte plan from the layout a component has now to the one a
+/// Build the byte plan from the field layout a component has now to the one a
 /// manifest asks for.
 ///
-/// The old side comes from the world rather than from the previous manifest:
-/// the field layout registered with a descriptor component is the layout its
-/// columns actually use, which is the only thing a byte copy can be measured
+/// The earlier side comes from the world, not from the previous manifest: the
+/// layout registered with a descriptor component is the layout its columns
+/// actually use, and that is the only thing a byte copy can be measured
 /// against.
+///
+/// # Panics
+///
+/// Panics when a declared default does not parse or does not fit its field.
+/// [`parse_and_validate_manifest`] refuses both, so a manifest that came
+/// through it cannot panic here.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(super) fn build_field_plan(
     engine: &Engine,
     component_id: ComponentId,
     fields: &[ManagedFieldManifest],
 ) -> FieldPlan {
-    let previous: Vec<LayoutField<'_>> = engine
+    let live_layout_fields: Vec<LayoutField<'_>> = engine
         .world()
         .component_field_layout(component_id)
         .unwrap_or(&[])
@@ -961,10 +1028,10 @@ pub(super) fn build_field_plan(
             size: field.size,
         })
         .collect();
-    // The manifest names a managed type; mapping it through the same function
-    // `managed_field_layout` uses is what makes the two sides of the diff
-    // comparable at all - otherwise every field would look retyped.
-    let next: Vec<LayoutField<'_>> = fields
+    // The manifest names a managed type. Mapping it with the same tag function
+    // `managed_field_layout` uses is what makes the two sides comparable;
+    // without it, every field would look retyped.
+    let manifest_layout_fields: Vec<LayoutField<'_>> = fields
         .iter()
         .map(|field| LayoutField {
             name: field.name.as_str(),
@@ -973,7 +1040,7 @@ pub(super) fn build_field_plan(
             size: field.size,
         })
         .collect();
-    let mut plan = FieldPlan::between(&previous, &next);
+    let mut plan = FieldPlan::between(&live_layout_fields, &manifest_layout_fields);
     // Declared defaults fill the fields the diff leaves empty - an added field
     // or one whose type changed. `set_default` is a no-op on a copied field,
     // which is what keeps a changed default from masking a carried value.

@@ -80,10 +80,12 @@ pub const MODULE_NAME: &str = "pill_master_renderer_data";
 /// Registers the renderer's components, asset types and resources with an
 /// engine and installs its default pipeline, then returns zero.
 ///
+/// This is the half a reload repeats: every declaration below points at code
+/// in the arriving image, so a generation that skipped it would leave the
+/// kept tables calling into an image that is no longer mapped.
+///
 /// It registers no system. Filling the frame and drawing it belong to the GPU
-/// module (`pill_master_renderer`), and a headless engine has neither. The
-/// generated `host_module_pill_master_renderer_data` wrapper carries this
-/// function as `pill_module_init` for the host.
+/// module (`pill_master_renderer`), and a headless engine has neither.
 ///
 /// The components go in through [`register_components`]. The six asset types
 /// and the two resources are declared so the tables that hold their values
@@ -103,7 +105,6 @@ pub const MODULE_NAME: &str = "pill_master_renderer_data";
 /// Panics when one of this crate's asset roots exists but a file it names
 /// below that root is missing. `declare_crate_roots` makes that check while
 /// this function runs.
-#[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     // Step 1: Register the components, field layouts included.
     register_components(engine.world_mut());
@@ -200,6 +201,20 @@ pub fn register(engine: &mut Engine) -> u32 {
         install_default_pbr_pipeline(engine.world_mut());
     }
     0
+}
+
+/// The artifact's one-time entry point.
+///
+/// The module keeps nothing that has to run once: everything it owns is
+/// registration, and [`register`] re-runs all of it on every generation. This
+/// function exists because a statically linked build loads the module once and
+/// calls this entry point alone, so it defers to [`register`].
+///
+/// The generated `host_module_pill_master_renderer_data` wrapper carries it as
+/// `pill_module_init` for the host.
+#[pill_module(register = register)]
+pub fn init(engine: &mut Engine) -> u32 {
+    register(engine)
 }
 
 // =============================================================================

@@ -1,21 +1,32 @@
-//! High-level C# project startup, discovery, and scheduler registration.
+//! Starts a hosted .NET runtime for a C# project, finds the systems it
+//! declares, and registers them with the engine's scheduler.
 //!
 //! # Responsibilities
 //!
-//! - Start .NET and discover the managed interop exports.
-//! - Register reflected component manifests and startup methods.
-//! - Translate reflected system accesses into scheduler registrations.
+//! - Start .NET (CoreCLR through hostfxr, or a NativeAOT library) and resolve
+//!   every managed export the host calls.
+//! - Register the component manifest the managed side reports, then run its
+//!   startup methods so a failure leaves no half-built world.
+//! - Reflect each system's accesses and register the system under that exact
+//!   read/write list.
+//! - Poll the managed loader after a rebuild, decide whether the arriving
+//!   component manifest can be applied, and re-register the project's systems
+//!   when their signatures changed.
 //!
 //! # Design
 //!
 //! Every unmanaged export is resolved once at startup into a plain function
-//! pointer held by the [`CSharpRuntime`] host. Scheduled systems never call
-//! the runtime directly: each registration captures the resolved pointers,
-//! the reflected access list, and a shared [`ComponentBindings`] arc, so the
-//! host outlives every scheduler closure it registers. After a hot reload the
-//! active assembly is re-reflected and compared against the
-//! [`ManagedSystemSnapshot`] captured at startup, so stale index bindings can
-//! never run silently.
+//! pointer held by the [`CSharpRuntime`] host. A registered system never calls
+//! the runtime directly: each registration captures the resolved pointers, its
+//! reflected access list and a shared [`BindingStore`] handle. [`CSharpRuntime`]
+//! owns the runtime and the API table those pointers come from, so keeping the
+//! host alive keeps every registered system valid.
+//!
+//! A reload is a handshake with the managed loader. The loader holds the new
+//! assembly back until the host has applied its component manifest, and only
+//! then swaps it in. [`ManagedSystemSnapshot`] records what the active assembly
+//! declared, so a reload can tell a changed system body (nothing to
+//! re-register) from a changed signature (rebuild the project's systems).
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -39,10 +50,10 @@ use super::components::{
     module_native_bindings, register_component_manifest, BindingStore, ComponentBindings,
     ModuleExposedComponent, StableComponentId,
 };
-use super::context::ActiveSystemGuard;
+use super::context::ActiveScopeGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
 use super::managed_buffer::{fetch_managed_buffer, manifest_fetch_error};
-// Only the reload path distinguishes the failure kinds; a shipping build maps
+// Only the reload path tells the failure kinds apart. A shipping build maps
 // them all through `manifest_fetch_error` and never names them.
 #[cfg(feature = "hot_reload")]
 use super::managed_buffer::ManagedBufferError;
@@ -53,29 +64,32 @@ use crate::CSharpModuleConfig;
 // Constants
 // =============================================================================
 
+/// Poll found no reload to do. Nothing was due, or the file is unchanged.
+#[cfg(feature = "hot_reload")]
+pub const POLL_NO_CHANGE: u8 = 0;
+
+/// Poll swapped in a behaviour-compatible assembly.
+#[cfg(feature = "hot_reload")]
+pub const POLL_RELOADED: u8 = 1;
+
+/// Poll rejected the new assembly, and the current one stays loaded.
+#[cfg(feature = "hot_reload")]
+pub const POLL_REJECTED: u8 = 2;
+
+/// A behaviour-compatible assembly is loaded and waiting for the host to
+/// decide whether its component manifest can be applied.
+///
+/// The managed loader cannot make that decision. Whether a manifest change is
+/// safe depends on what each component is bound to natively, and only the host
+/// holds those bindings. The host answers during the same poll.
+#[cfg(feature = "hot_reload")]
+pub const POLL_MANIFEST_PENDING: u8 = 3;
+
 /// Upper bound for the serialized managed component manifest.
 ///
 /// Real manifests are a few hundred bytes. The cap keeps a buggy or hostile
 /// managed assembly from driving a multi-gigabyte host allocation.
 pub(super) const MAX_COMPONENT_MANIFEST_BYTES: u32 = 16 * 1024 * 1024;
-
-#[cfg(feature = "hot_reload")]
-/// Poll returned without a reload: nothing was due or the file is unchanged.
-pub const POLL_NO_CHANGE: u8 = 0;
-#[cfg(feature = "hot_reload")]
-/// Poll swapped in a behavior-compatible assembly.
-pub const POLL_RELOADED: u8 = 1;
-#[cfg(feature = "hot_reload")]
-/// Poll rejected the new assembly; the old version stays loaded.
-pub const POLL_REJECTED: u8 = 2;
-#[cfg(feature = "hot_reload")]
-/// A behaviour-compatible assembly is loaded and waiting on the host's verdict
-/// about its component manifest.
-///
-/// The managed loader cannot decide it: whether a manifest change can be
-/// applied depends on what each component is bound to natively, and only the
-/// host holds those bindings. It answers within the same poll.
-pub const POLL_MANIFEST_PENDING: u8 = 3;
 
 /// Maximum UTF-8 byte length accepted for a managed system name.
 const MAX_SYSTEM_NAME_BYTES: u32 = 1024;
@@ -85,29 +99,29 @@ const MAX_SYSTEM_ERROR_BYTES: u32 = 4096;
 
 /// Upper bound on the number of systems one managed assembly may report.
 ///
-/// The count sizes the startup snapshot before a single system is reflected,
-/// so it needs the same kind of bound the manifest lengths above have: 4,096
-/// systems is far past any real project.
+/// The count is used to reserve the startup snapshot before any system has
+/// been read, so it needs the same kind of bound as the manifest lengths above.
+/// No real project comes near 4,096 systems.
 pub(super) const MAX_SYSTEMS_PER_ASSEMBLY: u32 = 4096;
 
 /// Upper bound on the accesses one managed system may declare.
 pub(super) const MAX_ACCESSES_PER_SYSTEM: u32 = 1024;
 
-/// Unmanaged ABI contract version shared with `csharp_runtime`.
+/// The unmanaged ABI contract version, shared with `csharp_runtime`.
 ///
-/// Bump whenever any `UnmanagedCallersOnly` export signature changes, when
-/// the [`CsEngineApi`] table's field layout does - the managed runtime copies
-/// that struct field by field, so a new slot makes the two sides disagree
-/// about every slot after it - or when a struct the exports exchange changes
-/// shape. The host refuses to start against a runtime built for a different
-/// version, and the managed side refuses a table whose header it does not
-/// recognize.
+/// Increase it when an `UnmanagedCallersOnly` export signature changes, when
+/// the field layout of the [`CsEngineApi`] table changes, or when a struct the
+/// two sides exchange changes shape. The managed runtime copies that table
+/// field by field, so one new slot makes the two sides disagree about every
+/// slot after it. The host refuses to start against a runtime built for
+/// another version, and the managed side refuses a table whose version and
+/// size it does not accept.
 ///
-/// Each byte payload keeps its own named length/copy export pair rather than
-/// one generic pair keyed by a payload-kind number: a wrong name then fails at
-/// load, in the host's `get_unmanaged_fn`, naming the export it could not
-/// find, where a numeric kind would mis-dispatch at runtime on a live ABI that
-/// AOT projects forward by hand.
+/// Every byte payload has its own named length/copy export pair instead of one
+/// generic pair keyed by a payload-kind number. A wrong name then fails while
+/// loading, in the host's `resolve_unmanaged_function_pointer`, and the error
+/// names the export it could not find. A numeric kind would instead dispatch
+/// wrongly at run time, on a live ABI that AOT projects forward by hand.
 pub const INTEROP_CONTRACT_VERSION: u32 = 18;
 
 // =============================================================================
@@ -147,30 +161,30 @@ type RunSystemFn = extern "system" fn(u32) -> u8;
 type SystemErrorMessageLengthFn = extern "system" fn(u32) -> u32;
 /// Signature copying one system's last error message into a caller buffer.
 type CopySystemErrorMessageFn = extern "system" fn(u32, *mut u8, u32) -> u8;
-/// Signature polling the collectible loader for a new project assembly and
-/// reporting the swap outcome through the status codes below.
+/// Signature polling the collectible loader for a new project assembly. The
+/// return value is one of the `POLL_*` codes above.
 type PollReloadFn = extern "system" fn() -> u8;
 /// Signature telling the loader a new assembly is already complete on disk.
 #[cfg(feature = "hot_reload")]
 type NotifyAssemblyReplacedFn = extern "system" fn();
-/// Signature returning the parked manifest's byte length.
+/// Signature returning the byte length of the pending version's manifest.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 type PendingManifestLengthFn = extern "system" fn() -> u32;
-/// Signature copying the parked manifest into a caller buffer.
+/// Signature copying the pending version's manifest into a caller buffer.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 type CopyPendingManifestFn = extern "system" fn(*mut u8, u32) -> u8;
-/// Signature installing the parked version once its manifest is in force.
+/// Signature installing the pending version once its manifest is in force.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 type CommitReloadFn = extern "system" fn() -> u8;
-/// Signature discarding the parked version when its manifest is refused.
+/// Signature discarding the pending version when its manifest is refused.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 type AbortReloadFn = extern "system" fn() -> u8;
 
-// Every field below is resolved from the loaded assembly in both postures,
-// but only `verify_systems_unchanged` reads them, and that runs solely on the
-// reload path. The allowance is scoped to the configuration where the reader
-// is compiled out rather than applied unconditionally, so a field that becomes
-// genuinely unused still warns in a reloading build.
+// Every field below is filled from the loaded assembly in both postures, but
+// only `verify_systems_unchanged` reads it, and that runs only on the reload
+// path. The allowance is limited to the build where the reader is compiled
+// out, rather than applied unconditionally, so a field that becomes genuinely
+// unused still warns in a reloading build.
 /// Reflected metadata of one managed system, captured at startup.
 ///
 /// The snapshot is compared against a re-reflection after every successful
@@ -184,18 +198,19 @@ struct ManagedSystemSnapshot {
     uses_commands: bool,
     /// The name the system was registered under, after the synthetic fallback.
     ///
-    /// Recorded because a rename changes nothing else a reload can observe -
-    /// not the accesses, not the Commands flag - yet it is the identity the
+    /// Recorded because a rename changes nothing else a reload can see: not
+    /// the accesses, not the Commands flag. The name is still the identity the
     /// scheduler, the profiler and every log line report.
     name: Box<str>,
 }
 
 /// Owns one hosted managed runtime: CoreCLR through hostfxr, or a loaded
-/// NativeAOT library. Keeping this alive guarantees every resolved function
-/// pointer below stays valid for the host's lifetime.
+/// NativeAOT library. Keeping this value alive keeps every function pointer
+/// resolved from that runtime valid.
 ///
-/// The AOT variant is only constructed in the shipping posture (no
-/// `hot_reload`), so a dev build may not reference it.
+/// A NativeAOT project is the shipping posture, where nothing reloads, so a
+/// reloading build never constructs the `Aot` variant and it is allowed to be
+/// unused there.
 #[cfg_attr(feature = "hot_reload", allow(dead_code))]
 pub(crate) enum ManagedRuntimeContext {
     /// CoreCLR booted through hostfxr (framework-dependent posture).
@@ -206,14 +221,15 @@ pub(crate) enum ManagedRuntimeContext {
     Aot(AotRuntimeContext),
 }
 
-/// Owns the hosted .NET context, stable API table, and reload callback.
+/// Owns the hosted .NET context, the stable API table and the reload callback.
 ///
-/// Keeping `_runtime` and `_api` alive guarantees that both the managed
-/// runtime and every native function pointer remain valid for registered
-/// scheduler closures.
-// Same reasoning as `ManagedSystemSnapshot` above: these are the assembly's
-// polling and reflection exports, resolved at startup either way, and read
-// only by `poll_reload` and `verify_systems_unchanged`.
+/// Keeping `_runtime` and `_api` alive keeps the managed runtime and every
+/// native function pointer in this struct valid, for as long as registered
+/// scheduler closures may run.
+// The fields below are the assembly's polling and reflection exports. They are
+// resolved at startup either way, but only `poll_reload` and
+// `verify_systems_unchanged` read them, and both are reload-only, so the
+// allowance is limited to builds where those readers are compiled out.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub struct CSharpRuntime {
     /// Unmanaged export polling the collectible loader for a rebuilt assembly.
@@ -224,54 +240,54 @@ pub struct CSharpRuntime {
     /// methods" is the one that needs it - names the artifact that failed
     /// rather than a fixed project name.
     subject: String,
-    /// Byte length of the manifest a parked version carries.
+    /// Byte length of the manifest the pending version carries.
     #[cfg(feature = "hot_reload")]
     pending_manifest_length: PendingManifestLengthFn,
-    /// Copies the parked version's manifest for validation.
+    /// Copies the pending version's manifest for validation.
     #[cfg(feature = "hot_reload")]
     copy_pending_manifest: CopyPendingManifestFn,
-    /// Installs the parked version once its manifest is in force.
+    /// Installs the pending version once its manifest is in force.
     #[cfg(feature = "hot_reload")]
     commit_reload: CommitReloadFn,
-    /// Discards the parked version when its manifest cannot be applied.
+    /// Discards the pending version when its manifest cannot be applied.
     #[cfg(feature = "hot_reload")]
     abort_reload: AbortReloadFn,
     /// Every export a re-registration pass needs, including the ones the
-    /// reload's cheap metadata comparison reads one system at a time.
+    /// reload's metadata comparison reads one system at a time.
     ///
     /// Held so a reload can rebuild the scheduler's managed systems from the
-    /// arriving assembly, and so that comparison and the re-registration read
+    /// arriving assembly, and so the comparison and the re-registration read
     /// the same descriptors.
     exports: SystemExports,
-    #[cfg(feature = "hot_reload")]
     /// Outcome of the most recent reload poll, for one-shot rejection logging.
+    #[cfg(feature = "hot_reload")]
     last_poll_status: u8,
     /// Set once the world has taken a manifest whose assembly never loaded.
     ///
-    /// The one outcome the commit handshake cannot make safe by ordering: the
-    /// manifest is applied while the outgoing assembly still runs, so a refusal
-    /// normally costs an unload and nothing else - but if the *commit* fails
-    /// after that, the world holds layouts belonging to an assembly that was
-    /// never installed. Every later frame would read migrated rows through the
-    /// old assembly's expectations, so the project's systems are cleared and
-    /// this latches to keep them cleared until the host restarts.
+    /// This is the one outcome the commit handshake cannot make safe by
+    /// ordering. The manifest is applied while the outgoing assembly still
+    /// runs, so a refusal normally costs an unload and nothing else. If the
+    /// *commit* then fails, the world holds layouts that belong to an assembly
+    /// which was never installed, and every later frame would read migrated
+    /// rows through the old assembly's expectations. The project's systems are
+    /// cleared, and this flag keeps them cleared until the host restarts.
     #[cfg(feature = "hot_reload")]
     manifest_applied_without_assembly: bool,
     /// Metadata snapshot the active assembly is verified against after reload.
     system_snapshot: Vec<ManagedSystemSnapshot>,
     /// The live component-binding table, shared with every registered system.
     ///
-    /// Shared rather than cloned per system so a reload can rewrite it in
-    /// place: each run locks it, which is what makes a reshaped component's new
-    /// layout visible without re-registering the systems that read it.
+    /// It is shared instead of copied per system so a reload can rewrite it in
+    /// place. Each run takes a read lock, so a component whose layout was
+    /// reshaped is seen by the systems already registered to read it.
     bindings: Arc<BindingStore>,
     /// Clears the loader's poll interval after an in-process compile.
     ///
-    /// Only useful together with `pill_development_host`'s in-process compiler: the
-    /// certainty it reports is exactly the certainty an in-process compile
-    /// produces. `None` in the AOT posture, which never reloads - and which
-    /// would otherwise oblige every shipped project to re-export a symbol it
-    /// can never call, since NativeAOT exports only from the root assembly.
+    /// Only an in-process compile knows for certain that the assembly file is
+    /// complete, and only `pill_development_host` compiles in process, so no
+    /// shipped build ever calls this. The AOT posture has no export for it at
+    /// all: a shipped project may only export from its root assembly, and it
+    /// would otherwise have to re-export a function it can never call.
     #[cfg(feature = "hot_reload")]
     notify_assembly_replaced: Option<NotifyAssemblyReplacedFn>,
     /// Keeps the hosted .NET runtime alive for the host's lifetime.
@@ -282,9 +298,9 @@ pub struct CSharpRuntime {
 
 /// The managed exports one system-registration pass needs.
 ///
-/// Bundled rather than passed loose: the pass has two callers - the startup
-/// and the reload that re-registers a changed system set - and both read the
-/// same nine function pointers.
+/// Collected instead of passed one by one: the pass has two callers - the
+/// startup and the reload that re-registers a changed system set - and both
+/// read the same nine function pointers.
 #[derive(Clone, Copy)]
 struct SystemExports {
     /// Reports how many systems the assembly registered.
@@ -307,15 +323,15 @@ struct SystemExports {
     copy_system_error: CopySystemErrorMessageFn,
 }
 
-/// One managed system resolved and validated, but not yet handed to the engine.
+/// One managed system that has been resolved and checked, but not yet given to
+/// the engine.
 ///
-/// The split this type exists for is the point: resolving a system can fail -
-/// an access naming a component nobody registered is exactly what
-/// `derive_system_access` refuses - while handing a resolved system to the
-/// scheduler cannot. Preparing every system before registering any of them is
-/// what lets a reload refuse a bad assembly with the previous generation's
-/// systems still installed, instead of clearing them first and discovering the
-/// refusal with nothing left to run.
+/// The type exists to separate the two halves of registration. Resolving a
+/// system can fail, for example when an access names a component nobody
+/// registered. Handing a resolved system to the scheduler cannot fail. Because
+/// every system is resolved before any is registered, a reload can refuse a bad
+/// assembly while the previous generation's systems are still installed,
+/// instead of clearing them first and finding out that the new set cannot run.
 struct PreparedManagedSystem {
     /// Name the system registers under, after the synthetic fallback.
     name: String,
@@ -332,62 +348,72 @@ struct PreparedManagedSystem {
     snapshot: ManagedSystemSnapshot,
 }
 
-/// Resolve every managed system without touching the engine.
+/// Resolves every managed system without touching the engine.
 ///
 /// This is the half that can fail. It reads each system's reflected accesses,
-/// resolves them against the binding table, and captures the metadata the
-/// scheduler closure needs - but registers nothing, so a failure here leaves
-/// the engine exactly as it was.
+/// resolves them against the binding table, and records the metadata the
+/// scheduler closure needs, but it registers nothing. A failure here therefore
+/// leaves the engine exactly as it was.
 ///
 /// # Errors
 ///
-/// Returns [`CSharpError::NoSystems`] when the assembly declares none, and
-/// whatever `derive_system_access` refuses when an access names a component or
-/// resource that is not registered.
+/// Returns [`CSharpError::NoSystems`] when the assembly declares no systems,
+/// and [`CSharpError::SystemCountOutOfRange`] when a reported system or access
+/// count is above its limit. [`CSharpError::SystemSnapshotAllocationFailed`]
+/// reports a snapshot that could not be reserved, and
+/// [`CSharpError::SystemAccessFailed`] an access entry the managed side would
+/// not hand over.
+///
+/// Returns what `derive_system_access` refuses for a bad access:
+/// [`CSharpError::UnregisteredComponent`] when the access names a component
+/// nobody registered, [`CSharpError::UnregisteredResource`] when it names an
+/// unregistered managed resource, and [`CSharpError::UnknownAccessMode`] when
+/// its mode is neither read nor write.
 fn prepare_managed_systems(
     bindings: &Arc<BindingStore>,
     exports: SystemExports,
     subject: &str,
 ) -> Result<Vec<PreparedManagedSystem>, CSharpError> {
-    let count = (exports.system_count)();
-    if count == 0 {
+    let system_count = (exports.system_count)();
+    if system_count == 0 {
         return Err(CSharpError::NoSystems {
             subject: subject.to_string(),
         });
     }
-    let mut prepared = Vec::new();
-    prepared
-        .try_reserve_exact(checked_system_count(count)?)
+    let mut prepared_systems = Vec::new();
+    prepared_systems
+        .try_reserve_exact(checked_system_count(system_count)?)
         .map_err(|_| CSharpError::SystemSnapshotAllocationFailed)?;
-    for system_index in 0..count {
+    for system_index in 0..system_count {
         let system_access_count = (exports.access_count)(system_index);
         let mut managed_access = Vec::with_capacity(checked_access_count(system_access_count)?);
         for access_index in 0..system_access_count {
-            let mut item = NativeSystemAccess {
+            let mut native_access = NativeSystemAccess {
                 component_key: 0,
                 component_key_high: 0,
                 mode: 0,
                 kind: 0,
             };
-            if (exports.get_access)(system_index, access_index, &mut item) == 0 {
+            if (exports.get_access)(system_index, access_index, &mut native_access) == 0 {
                 return Err(CSharpError::SystemAccessFailed {
                     system: system_index,
                     access: access_index,
                 });
             }
-            managed_access.push(item);
+            managed_access.push(native_access);
         }
-        // The reflected count and the recorded accesses move together: a
-        // future early exit inside the fill loop must not leave the snapshot
-        // short of what the managed side reported.
+        // The stored accesses must match the count the managed side reported.
+        // The assert catches a later change to the fill loop that could exit
+        // early and leave the snapshot short.
         debug_assert_eq!(managed_access.len(), system_access_count as usize);
 
         let uses_commands = (exports.system_uses_commands)(system_index) != 0;
         let mut access = derive_system_access(&managed_access, &bindings.read())?;
         access.set_uses_commands(uses_commands);
         // Prefer the reflected managed name (type and method) so profiling and
-        // scheduler debugging show real identities; fall back to a synthetic
-        // index-based name when the export is unavailable.
+        // scheduler debugging show real identities. `resolved_system_name`
+        // falls back to an index-based name when the managed side reports no
+        // usable one.
         let name = resolved_system_name(
             exports.system_name_length,
             exports.copy_system_name,
@@ -401,7 +427,7 @@ fn prepare_managed_systems(
             uses_commands,
             name: name.as_str().into(),
         };
-        prepared.push(PreparedManagedSystem {
+        prepared_systems.push(PreparedManagedSystem {
             name,
             access,
             managed_access: managed_access.into_boxed_slice(),
@@ -410,10 +436,10 @@ fn prepare_managed_systems(
             snapshot,
         });
     }
-    Ok(prepared)
+    Ok(prepared_systems)
 }
 
-/// Hand every prepared system to the scheduler.
+/// Hands every prepared system to the scheduler.
 ///
 /// The half that cannot fail. Every access was resolved by
 /// [`prepare_managed_systems`], so nothing here can refuse, which is what makes
@@ -422,10 +448,10 @@ fn commit_managed_systems(
     engine: &mut Engine,
     bindings: &Arc<BindingStore>,
     exports: SystemExports,
-    prepared: Vec<PreparedManagedSystem>,
+    prepared_systems: Vec<PreparedManagedSystem>,
 ) -> Vec<ManagedSystemSnapshot> {
-    let mut system_snapshot = Vec::with_capacity(prepared.len());
-    for system in prepared {
+    let mut system_snapshots = Vec::with_capacity(prepared_systems.len());
+    for system in prepared_systems {
         let PreparedManagedSystem {
             name,
             access,
@@ -434,26 +460,28 @@ fn commit_managed_systems(
             system_index,
             snapshot,
         } = system;
-        system_snapshot.push(snapshot);
+        system_snapshots.push(snapshot);
         let system_bindings = Arc::clone(bindings);
         let run_system = exports.run_system;
         let system_error_length = exports.system_error_length;
         let copy_system_error = exports.copy_system_error;
-        // SAFETY: `derive_system_access` has resolved every managed access and
-        // the closure exposes the world only under that exact list.
+        // SAFETY: `access` was built by `derive_system_access` from the same
+        // `managed_access` list the closure gives `ActiveSystemGuard`, so the
+        // declaration covers every component and resource the closure can
+        // reach.
         unsafe {
             engine.register_system_with_access(
                 name,
                 access,
                 move |world: &mut World, queue: &mut CommandQueue| -> Result<(), SystemError> {
-                    // Without a scope every managed callback this system makes
-                    // would fail, so report it as a system error rather than
-                    // running it blind. One read of the live table for the
-                    // whole run: a reload can add or reshape a component
-                    // between frames, and the scope has to describe the
-                    // storage this run actually touches.
+                    // Every managed callback needs an active scope, so a
+                    // refused scope is reported as a system error instead of
+                    // running the system without one. The live table is read
+                    // once per run: a reload can add or reshape a component
+                    // between frames, so the scope must describe the storage
+                    // this run touches.
                     let system_bindings = system_bindings.read();
-                    let Some(_guard) = ActiveSystemGuard::set_with_commands(
+                    let Some(_guard) = ActiveScopeGuard::install_scope_with_commands(
                         world,
                         queue,
                         &managed_access,
@@ -478,10 +506,10 @@ fn commit_managed_systems(
             );
         }
     }
-    system_snapshot
+    system_snapshots
 }
 
-/// Resolve and register every managed system in one step.
+/// Resolves and registers every managed system in one step.
 ///
 /// The startup path's entry point: there is nothing installed yet, so the
 /// prepare/commit split buys nothing and the two halves run back to back. A
@@ -496,8 +524,13 @@ fn register_managed_systems(
     exports: SystemExports,
     subject: &str,
 ) -> Result<Vec<ManagedSystemSnapshot>, CSharpError> {
-    let prepared = prepare_managed_systems(bindings, exports, subject)?;
-    Ok(commit_managed_systems(engine, bindings, exports, prepared))
+    let prepared_systems = prepare_managed_systems(bindings, exports, subject)?;
+    Ok(commit_managed_systems(
+        engine,
+        bindings,
+        exports,
+        prepared_systems,
+    ))
 }
 
 /// Resolves one managed artifact (a runtime assembly, its `runtimeconfig.json`,
@@ -507,11 +540,9 @@ fn register_managed_systems(
 /// A shipping bundle is self-contained: every managed file the host needs is
 /// copied into the same dated output folder as the executable, so a shipped
 /// build prefers `current_exe()`'s directory and runs on any machine with no
-/// engine source tree present. The developer layout (running straight from
-/// `cargo run` against the `dotnet build` / `dotnet publish` outputs) has no
-/// sidecars next to the exe, so the `workspace_root`-relative path is the
-/// fallback. Only shipping postures reach this code, so `current_exe()` always
-/// points at the shipping binary rather than a dev target.
+/// engine source tree present. A developer run straight from `cargo run` has no
+/// such files next to its binary, so the `workspace_root`-relative path is the
+/// fallback it ends up using.
 fn shipped_or_baked(workspace_root: &Path, baked_relative_dir: &str, file_name: &str) -> PathBuf {
     if let Some(exe_dir) = std::env::current_exe()
         .ok()
@@ -564,19 +595,19 @@ struct ManagedExports {
     copy_system_error: CopySystemErrorMessageFn,
     /// Polls the collectible loader for a rebuilt assembly.
     poll_reload: PollReloadFn,
-    /// Byte length of the manifest a parked version carries.
+    /// Byte length of the manifest the pending version carries.
     #[cfg(feature = "hot_reload")]
     pending_manifest_length: PendingManifestLengthFn,
-    /// Copies the parked version's manifest for validation.
+    /// Copies the pending version's manifest for validation.
     #[cfg(feature = "hot_reload")]
     copy_pending_manifest: CopyPendingManifestFn,
-    /// Installs the parked version once its manifest is in force.
+    /// Installs the pending version once its manifest is in force.
     #[cfg(feature = "hot_reload")]
     commit_reload: CommitReloadFn,
-    /// Discards the parked version when its manifest cannot be applied.
+    /// Discards the pending version when its manifest cannot be applied.
     #[cfg(feature = "hot_reload")]
     abort_reload: AbortReloadFn,
-    /// Collapses the loader's poll interval after an in-process compile.
+    /// Clears the loader's poll interval after an in-process compile.
     #[cfg(feature = "hot_reload")]
     notify_assembly_replaced: Option<NotifyAssemblyReplacedFn>,
 }
@@ -592,8 +623,11 @@ impl ManagedExports {
         assembly: &Path,
         type_name: &str,
     ) -> Result<Self, CSharpError> {
-        let interop_version =
-            runtime.get_unmanaged_fn::<InteropVersionFn>(assembly, type_name, "InteropVersion")?;
+        let interop_version = runtime.resolve_unmanaged_function_pointer::<InteropVersionFn>(
+            assembly,
+            type_name,
+            "InteropVersion",
+        )?;
         let reported = interop_version();
         if reported != INTEROP_CONTRACT_VERSION {
             return Err(CSharpError::InteropVersionMismatch {
@@ -602,107 +636,116 @@ impl ManagedExports {
             });
         }
         Ok(Self {
-            init: runtime.get_unmanaged_fn::<InitFn>(assembly, type_name, "Init")?,
-            system_count: runtime.get_unmanaged_fn::<SystemCountFn>(
+            init: runtime
+                .resolve_unmanaged_function_pointer::<InitFn>(assembly, type_name, "Init")?,
+            system_count: runtime.resolve_unmanaged_function_pointer::<SystemCountFn>(
                 assembly,
                 type_name,
                 "SystemCount",
             )?,
-            startup_count: runtime.get_unmanaged_fn::<StartupCountFn>(
+            startup_count: runtime.resolve_unmanaged_function_pointer::<StartupCountFn>(
                 assembly,
                 type_name,
                 "StartupCount",
             )?,
-            system_uses_commands: runtime.get_unmanaged_fn::<SystemUsesCommandsFn>(
-                assembly,
-                type_name,
-                "SystemUsesCommands",
-            )?,
-            run_startup: runtime.get_unmanaged_fn::<RunStartupFn>(
+            system_uses_commands: runtime
+                .resolve_unmanaged_function_pointer::<SystemUsesCommandsFn>(
+                    assembly,
+                    type_name,
+                    "SystemUsesCommands",
+                )?,
+            run_startup: runtime.resolve_unmanaged_function_pointer::<RunStartupFn>(
                 assembly,
                 type_name,
                 "RunStartup",
             )?,
-            manifest_length: runtime.get_unmanaged_fn::<ComponentManifestLengthFn>(
-                assembly,
-                type_name,
-                "ComponentManifestLength",
-            )?,
-            copy_manifest: runtime.get_unmanaged_fn::<CopyComponentManifestFn>(
+            manifest_length: runtime
+                .resolve_unmanaged_function_pointer::<ComponentManifestLengthFn>(
+                    assembly,
+                    type_name,
+                    "ComponentManifestLength",
+                )?,
+            copy_manifest: runtime.resolve_unmanaged_function_pointer::<CopyComponentManifestFn>(
                 assembly,
                 type_name,
                 "CopyComponentManifest",
             )?,
             #[cfg(feature = "hot_reload")]
-            pending_manifest_length: runtime.get_unmanaged_fn::<PendingManifestLengthFn>(
-                assembly,
-                type_name,
-                "PendingManifestLength",
-            )?,
+            pending_manifest_length: runtime
+                .resolve_unmanaged_function_pointer::<PendingManifestLengthFn>(
+                    assembly,
+                    type_name,
+                    "PendingManifestLength",
+                )?,
             #[cfg(feature = "hot_reload")]
-            copy_pending_manifest: runtime.get_unmanaged_fn::<CopyPendingManifestFn>(
-                assembly,
-                type_name,
-                "CopyPendingManifest",
-            )?,
+            copy_pending_manifest: runtime
+                .resolve_unmanaged_function_pointer::<CopyPendingManifestFn>(
+                    assembly,
+                    type_name,
+                    "CopyPendingManifest",
+                )?,
             #[cfg(feature = "hot_reload")]
-            commit_reload: runtime.get_unmanaged_fn::<CommitReloadFn>(
+            commit_reload: runtime.resolve_unmanaged_function_pointer::<CommitReloadFn>(
                 assembly,
                 type_name,
                 "CommitReload",
             )?,
             #[cfg(feature = "hot_reload")]
-            abort_reload: runtime.get_unmanaged_fn::<AbortReloadFn>(
+            abort_reload: runtime.resolve_unmanaged_function_pointer::<AbortReloadFn>(
                 assembly,
                 type_name,
                 "AbortReload",
             )?,
-            system_name_length: runtime.get_unmanaged_fn::<SystemNameLengthFn>(
+            system_name_length: runtime.resolve_unmanaged_function_pointer::<SystemNameLengthFn>(
                 assembly,
                 type_name,
                 "SystemNameLength",
             )?,
-            copy_system_name: runtime.get_unmanaged_fn::<CopySystemNameFn>(
+            copy_system_name: runtime.resolve_unmanaged_function_pointer::<CopySystemNameFn>(
                 assembly,
                 type_name,
                 "CopySystemName",
             )?,
-            access_count: runtime.get_unmanaged_fn::<SystemAccessCountFn>(
+            access_count: runtime.resolve_unmanaged_function_pointer::<SystemAccessCountFn>(
                 assembly,
                 type_name,
                 "SystemAccessCount",
             )?,
-            get_access: runtime.get_unmanaged_fn::<GetSystemAccessFn>(
+            get_access: runtime.resolve_unmanaged_function_pointer::<GetSystemAccessFn>(
                 assembly,
                 type_name,
                 "GetSystemAccess",
             )?,
-            run_system: runtime.get_unmanaged_fn::<RunSystemFn>(
+            run_system: runtime.resolve_unmanaged_function_pointer::<RunSystemFn>(
                 assembly,
                 type_name,
                 "RunSystem",
             )?,
-            system_error_length: runtime.get_unmanaged_fn::<SystemErrorMessageLengthFn>(
-                assembly,
-                type_name,
-                "SystemErrorMessageLength",
-            )?,
-            copy_system_error: runtime.get_unmanaged_fn::<CopySystemErrorMessageFn>(
-                assembly,
-                type_name,
-                "CopySystemErrorMessage",
-            )?,
-            poll_reload: runtime.get_unmanaged_fn::<PollReloadFn>(
+            system_error_length: runtime
+                .resolve_unmanaged_function_pointer::<SystemErrorMessageLengthFn>(
+                    assembly,
+                    type_name,
+                    "SystemErrorMessageLength",
+                )?,
+            copy_system_error: runtime
+                .resolve_unmanaged_function_pointer::<CopySystemErrorMessageFn>(
+                    assembly,
+                    type_name,
+                    "CopySystemErrorMessage",
+                )?,
+            poll_reload: runtime.resolve_unmanaged_function_pointer::<PollReloadFn>(
                 assembly,
                 type_name,
                 "PollReload",
             )?,
             #[cfg(feature = "hot_reload")]
-            notify_assembly_replaced: Some(runtime.get_unmanaged_fn::<NotifyAssemblyReplacedFn>(
-                assembly,
-                type_name,
-                "NotifyAssemblyReplaced",
-            )?),
+            notify_assembly_replaced: Some(
+                runtime.resolve_unmanaged_function_pointer::<NotifyAssemblyReplacedFn>(
+                    assembly,
+                    type_name,
+                    "NotifyAssemblyReplaced",
+                )?,
+            ),
         })
     }
 
@@ -711,8 +754,8 @@ impl ManagedExports {
     /// Same contract gate as [`Self::from_dotnet`], applied before any symbol
     /// is read.
     fn from_aot(runtime: &AotRuntimeContext) -> Result<Self, CSharpError> {
-        let interop_version =
-            runtime.get_unmanaged_fn::<InteropVersionFn>("pill_interop_version")?;
+        let interop_version = runtime
+            .resolve_unmanaged_function_pointer::<InteropVersionFn>("pill_interop_version")?;
         let reported = interop_version();
         if reported != INTEROP_CONTRACT_VERSION {
             return Err(CSharpError::InteropVersionMismatch {
@@ -721,40 +764,63 @@ impl ManagedExports {
             });
         }
         Ok(Self {
-            init: runtime.get_unmanaged_fn::<InitFn>("pill_init")?,
-            system_count: runtime.get_unmanaged_fn::<SystemCountFn>("pill_system_count")?,
-            startup_count: runtime.get_unmanaged_fn::<StartupCountFn>("pill_startup_count")?,
+            init: runtime.resolve_unmanaged_function_pointer::<InitFn>("pill_init")?,
+            system_count: runtime
+                .resolve_unmanaged_function_pointer::<SystemCountFn>("pill_system_count")?,
+            startup_count: runtime
+                .resolve_unmanaged_function_pointer::<StartupCountFn>("pill_startup_count")?,
             system_uses_commands: runtime
-                .get_unmanaged_fn::<SystemUsesCommandsFn>("pill_system_uses_commands")?,
-            run_startup: runtime.get_unmanaged_fn::<RunStartupFn>("pill_run_startup")?,
+                .resolve_unmanaged_function_pointer::<SystemUsesCommandsFn>(
+                    "pill_system_uses_commands",
+                )?,
+            run_startup: runtime
+                .resolve_unmanaged_function_pointer::<RunStartupFn>("pill_run_startup")?,
             manifest_length: runtime
-                .get_unmanaged_fn::<ComponentManifestLengthFn>("pill_component_manifest_length")?,
-            copy_manifest: runtime
-                .get_unmanaged_fn::<CopyComponentManifestFn>("pill_copy_component_manifest")?,
-            system_name_length: runtime
-                .get_unmanaged_fn::<SystemNameLengthFn>("pill_system_name_length")?,
-            copy_system_name: runtime
-                .get_unmanaged_fn::<CopySystemNameFn>("pill_copy_system_name")?,
-            access_count: runtime
-                .get_unmanaged_fn::<SystemAccessCountFn>("pill_system_access_count")?,
-            get_access: runtime.get_unmanaged_fn::<GetSystemAccessFn>("pill_get_system_access")?,
-            run_system: runtime.get_unmanaged_fn::<RunSystemFn>("pill_run_system")?,
-            system_error_length: runtime.get_unmanaged_fn::<SystemErrorMessageLengthFn>(
-                "pill_system_error_message_length",
+                .resolve_unmanaged_function_pointer::<ComponentManifestLengthFn>(
+                    "pill_component_manifest_length",
+                )?,
+            copy_manifest: runtime.resolve_unmanaged_function_pointer::<CopyComponentManifestFn>(
+                "pill_copy_component_manifest",
             )?,
+            system_name_length: runtime.resolve_unmanaged_function_pointer::<SystemNameLengthFn>(
+                "pill_system_name_length",
+            )?,
+            copy_system_name: runtime
+                .resolve_unmanaged_function_pointer::<CopySystemNameFn>("pill_copy_system_name")?,
+            access_count: runtime.resolve_unmanaged_function_pointer::<SystemAccessCountFn>(
+                "pill_system_access_count",
+            )?,
+            get_access: runtime.resolve_unmanaged_function_pointer::<GetSystemAccessFn>(
+                "pill_get_system_access",
+            )?,
+            run_system: runtime
+                .resolve_unmanaged_function_pointer::<RunSystemFn>("pill_run_system")?,
+            system_error_length: runtime
+                .resolve_unmanaged_function_pointer::<SystemErrorMessageLengthFn>(
+                    "pill_system_error_message_length",
+                )?,
             copy_system_error: runtime
-                .get_unmanaged_fn::<CopySystemErrorMessageFn>("pill_copy_system_error_message")?,
-            poll_reload: runtime.get_unmanaged_fn::<PollReloadFn>("pill_poll_reload")?,
+                .resolve_unmanaged_function_pointer::<CopySystemErrorMessageFn>(
+                    "pill_copy_system_error_message",
+                )?,
+            poll_reload: runtime
+                .resolve_unmanaged_function_pointer::<PollReloadFn>("pill_poll_reload")?,
             #[cfg(feature = "hot_reload")]
             pending_manifest_length: runtime
-                .get_unmanaged_fn::<PendingManifestLengthFn>("pill_pending_manifest_length")?,
+                .resolve_unmanaged_function_pointer::<PendingManifestLengthFn>(
+                    "pill_pending_manifest_length",
+                )?,
             #[cfg(feature = "hot_reload")]
             copy_pending_manifest: runtime
-                .get_unmanaged_fn::<CopyPendingManifestFn>("pill_copy_pending_manifest")?,
+                .resolve_unmanaged_function_pointer::<CopyPendingManifestFn>(
+                    "pill_copy_pending_manifest",
+                )?,
             #[cfg(feature = "hot_reload")]
-            commit_reload: runtime.get_unmanaged_fn::<CommitReloadFn>("pill_commit_reload")?,
+            commit_reload: runtime
+                .resolve_unmanaged_function_pointer::<CommitReloadFn>("pill_commit_reload")?,
             #[cfg(feature = "hot_reload")]
-            abort_reload: runtime.get_unmanaged_fn::<AbortReloadFn>("pill_abort_reload")?,
+            abort_reload: runtime
+                .resolve_unmanaged_function_pointer::<AbortReloadFn>("pill_abort_reload")?,
             #[cfg(feature = "hot_reload")]
             notify_assembly_replaced: None,
         })
@@ -762,27 +828,34 @@ impl ManagedExports {
 }
 
 impl CSharpRuntime {
-    /// Start .NET, load `csharp_runtime`, discover managed systems, and register
-    /// each system with its reflected read/write access declaration.
+    /// Starts .NET, loads `csharp_runtime`, discovers the managed systems and
+    /// registers each one under its reflected read/write access declaration.
     ///
-    /// `on_runtime_booted` sees the .NET runtime once it is up and before the
-    /// project starts. Development tooling loads its own assemblies into it
-    /// there: `pill_development_host` starts its in-process compiler's warmup, so it
-    /// overlaps component registration, the startup methods and system
-    /// registration instead of landing on the developer's first edit. A
-    /// shipping build passes a no-op.
+    /// `on_runtime_booted` receives the .NET runtime once it is up and before
+    /// the project starts. Development tooling loads its own assemblies into it
+    /// at that point: `pill_development_host` starts its in-process compiler
+    /// here, so the compiler's warmup runs during startup rather than during
+    /// the developer's first edit. A shipped CoreCLR build passes a no-op.
     ///
     /// # Errors
     ///
-    /// Returns an error if the runtime cannot start, a managed export is
-    /// missing, runtime initialization fails, the component manifest cannot be
-    /// copied or registered, a startup method fails, or a reflected access
-    /// references an unregistered component.
+    /// Returns a [`CSharpError`] when .NET cannot be started, such as
+    /// [`CSharpError::HostfxrNotFound`] or
+    /// [`CSharpError::RuntimeInitializationFailed`].
+    /// [`CSharpError::ManagedEntryPointFailed`] reports an export that could not
+    /// be resolved, [`CSharpError::InteropVersionMismatch`] a runtime built for
+    /// another ABI version, and [`CSharpError::RuntimeInitFailed`] a runtime
+    /// that refused host initialization.
+    ///
+    /// It also reports every failure of [`Self::start_with`]: a component
+    /// manifest that could not be read or registered, a startup method that
+    /// failed, an assembly that declares no systems, and a reflected access
+    /// that names a component or resource nobody registered.
     pub fn start(
         engine: &mut Engine,
         workspace_root: &Path,
         config: &CSharpModuleConfig,
-        module_exposed: &[ModuleExposedComponent],
+        exposed_components: &[ModuleExposedComponent],
         mirror_methods: &[ResolvedMirrorMethod],
         on_runtime_booted: &mut dyn FnMut(&DotnetRuntimeContext),
     ) -> Result<Self, CSharpError> {
@@ -830,7 +903,7 @@ impl CSharpRuntime {
             engine,
             ManagedRuntimeContext::Dotnet(runtime),
             exports,
-            module_exposed,
+            exposed_components,
             mirror_methods,
             &config.project_assembly_name,
         )
@@ -844,11 +917,23 @@ impl CSharpRuntime {
     /// registers it with the scheduler. Everything here has one copy, so the
     /// `unsafe` access-registration closure and the startup rollback guarantee
     /// cannot drift between the hostfxr and NativeAOT paths.
+    ///
+    /// # Errors
+    ///
+    /// [`CSharpError::RuntimeInitFailed`] when the managed side refuses host
+    /// initialization. The manifest copy reports
+    /// [`CSharpError::ManifestLengthOutOfRange`],
+    /// [`CSharpError::ManifestAllocationFailed`] or
+    /// [`CSharpError::ManifestCopyFailed`], and registering it reports a parse
+    /// or validation failure of the manifest itself.
+    /// [`CSharpError::StartupFailed`] reports a startup method that failed and
+    /// [`CSharpError::StartupCommandsFailed`] commands that would not apply.
+    /// System registration returns what [`prepare_managed_systems`] refuses.
     fn start_with(
         engine: &mut Engine,
         runtime: ManagedRuntimeContext,
         exports: ManagedExports,
-        module_exposed: &[ModuleExposedComponent],
+        exposed_components: &[ModuleExposedComponent],
         mirror_methods: &[ResolvedMirrorMethod],
         subject: &str,
     ) -> Result<Self, CSharpError> {
@@ -856,7 +941,7 @@ impl CSharpRuntime {
         // managed code - the renderer data's and each extension's - so a
         // generated mirror whose full name matches resolves to the native
         // storage. No component type is bound by hand.
-        let bindings = module_native_bindings(engine, module_exposed);
+        let bindings = module_native_bindings(engine, exposed_components);
 
         // Step 2: Initialize the runtime bridge and register the component
         // manifest copied from the managed assembly.
@@ -865,11 +950,11 @@ impl CSharpRuntime {
             return Err(CSharpError::RuntimeInitFailed);
         }
 
-        // The length comes from managed code, so it is bounded before the host
-        // allocates anything from it and the reservation is fallible; both are
-        // the shared protocol's doing.
-        // The exports are `extern "system"` function pointers, which do not
-        // implement the `Fn` traits, so each is wrapped in a closure that does.
+        // The length comes from managed code, so `fetch_managed_buffer` checks
+        // it against the cap before allocating and reserves the memory in a way
+        // that can fail. The exports are `extern "system"` function pointers,
+        // which do not implement the `Fn` traits, so each one is wrapped in a
+        // closure that does.
         let manifest = fetch_managed_buffer(
             || (exports.manifest_length)(),
             |pointer, length| (exports.copy_manifest)(pointer, length),
@@ -899,7 +984,7 @@ impl CSharpRuntime {
                 // scheduler starts, so a startup's `Res<T>`/`ResMut<T>`
                 // parameters need no declared access.
                 let Some(_guard) =
-                    ActiveSystemGuard::set_exclusive(world, queue, &startup_bindings)
+                    ActiveScopeGuard::install_exclusive_scope(world, queue, &startup_bindings)
                 else {
                     startup_failed = Some(startup_index);
                     break;
@@ -910,10 +995,13 @@ impl CSharpRuntime {
                 }
             }
         });
-        if let Some(index) = startup_failed {
-            // Roll back the queued commands so the failure is truly transactional.
+        if let Some(startup_index) = startup_failed {
+            // Discard the queued commands, so the failure leaves no partial
+            // world state behind.
             engine.discard_deferred_commands();
-            return Err(CSharpError::StartupFailed { index });
+            return Err(CSharpError::StartupFailed {
+                index: startup_index,
+            });
         }
         engine
             .flush_deferred_commands()
@@ -961,7 +1049,7 @@ impl CSharpRuntime {
         })
     }
 
-    /// Tell the loader a complete project assembly is already on disk.
+    /// Tells the loader that a complete project assembly is already on disk.
     ///
     /// The loader samples the assembly's timestamp on an interval because it
     /// cannot otherwise tell a finished build from a half-copied one. An
@@ -975,8 +1063,8 @@ impl CSharpRuntime {
         }
     }
 
-    /// Start a NativeAOT-published library, resolve the loader exports by
-    /// symbol, discover managed systems, and register each system with its
+    /// Starts a NativeAOT-published library, resolves the loader exports by
+    /// symbol, discovers the managed systems and registers each one under its
     /// declared read/write access.
     ///
     /// Mirrors [`Self::start`]: only the export resolution differs - a direct
@@ -986,15 +1074,18 @@ impl CSharpRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error if the library cannot be loaded, an export is missing,
-    /// the ABI contract mismatches, initialization fails, the component
-    /// manifest cannot be registered, a startup method fails, or a reflected
-    /// access references an unregistered component.
+    /// Returns [`CSharpError::AotLibraryNotFound`] or
+    /// [`CSharpError::AotLibraryLoadFailed`] when the library cannot be loaded,
+    /// [`CSharpError::AotExportMissing`] for a symbol the library does not
+    /// export, and [`CSharpError::InteropVersionMismatch`] for a library built
+    /// against another ABI version.
+    ///
+    /// It also reports every failure of [`Self::start_with`].
     pub fn start_aot(
         engine: &mut Engine,
         workspace_root: &Path,
         config: &CSharpModuleConfig,
-        module_exposed: &[ModuleExposedComponent],
+        exposed_components: &[ModuleExposedComponent],
         mirror_methods: &[ResolvedMirrorMethod],
     ) -> Result<Self, CSharpError> {
         // Step 1: load the AOT native library and resolve every export by its
@@ -1013,17 +1104,17 @@ impl CSharpRuntime {
             engine,
             ManagedRuntimeContext::Aot(runtime),
             exports,
-            module_exposed,
+            exposed_components,
             mirror_methods,
             &config.project_assembly_name,
         )
     }
 
-    /// Poll the collectible loader and report the outcome of any swap attempt.
+    /// Polls the collectible loader and reports the outcome of any swap attempt.
     ///
-    /// The managed loader validates the rebuilt assembly's component manifest
-    /// and system signatures before swapping. A rejection is logged once per
-    /// attempt so the per-frame poll cannot drown the terminal in messages.
+    /// The managed loader checks the rebuilt assembly's component manifest and
+    /// system signatures before it swaps anything. A rejection is logged once
+    /// per attempt, so the poll that runs every frame cannot flood the terminal.
     ///
     /// # Errors
     ///
@@ -1034,16 +1125,18 @@ impl CSharpRuntime {
     /// loaded assembly is kept either way.
     #[cfg(feature = "hot_reload")]
     pub fn poll_reload(&mut self, engine: &mut Engine) -> Result<u8, CSharpError> {
-        // A world that took a manifest whose assembly never loaded cannot be
-        // reconciled by another poll: the mismatch is already in the world's
-        // layouts. Stay stopped rather than swapping a second assembly on top.
+        // Step 1: Stay stopped once the world and the assembly disagree. A
+        // world that took a manifest whose assembly never loaded cannot be
+        // repaired by another poll: the mismatch is already in the world's
+        // layouts.
         if self.manifest_applied_without_assembly {
             return Ok(POLL_REJECTED);
         }
+        // Step 2: Poll the loader, and refuse a status this host cannot read.
         let status = (self.poll_reload)();
         if !poll_status_is_known(status) {
             // Logged once per distinct code: the poll runs every frame and a
-            // persistent unknown status must not drown the terminal.
+            // persistent unknown status must not flood the terminal.
             if self.last_poll_status != status {
                 error!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -1054,6 +1147,9 @@ impl CSharpRuntime {
             self.last_poll_status = status;
             return Err(CSharpError::UnknownPollStatus { status });
         }
+        // Step 3: Act on the outcome. A pending manifest is applied and then
+        // committed or aborted here; a swap has to have its system metadata
+        // checked.
         if status == POLL_REJECTED && self.last_poll_status != POLL_REJECTED {
             error!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -1061,14 +1157,14 @@ impl CSharpRuntime {
             );
         }
         if status == POLL_MANIFEST_PENDING {
-            return self.decide_parked_manifest(engine);
+            return self.decide_pending_manifest(engine);
         }
         if status == POLL_RELOADED {
             // A changed system set is rebuilt rather than refused. The
-            // comparison stays because it is what keeps the ordinary
-            // behaviour-only swap cheap: that swap keeps its scheduler graph
-            // and pays one metadata comparison, and only a real signature
-            // change pays for a clear and a re-registration.
+            // comparison stays because it keeps the ordinary behaviour-only
+            // swap cheap: that swap keeps its scheduler graph and pays one
+            // metadata comparison, while only a real signature change pays for
+            // a clear and a re-registration.
             if !self.verify_systems_unchanged() {
                 self.reregister_systems(engine)?;
             }
@@ -1076,26 +1172,27 @@ impl CSharpRuntime {
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "C# hot reload complete"
             );
-            // No post-swap manifest check runs here: a version whose manifest
-            // differs never reaches this arm. The managed loader parks such a
-            // version instead (POLL_MANIFEST_PENDING), and that handshake
-            // applies the manifest before the swap commits, while the outgoing
-            // assembly is still the running one. If that managed refusal is
-            // ever relaxed, re-read the swapped assembly's manifest here and
-            // apply it before the frame's systems run, so a migrated row is in
-            // place before the new generation reads one.
+            // No manifest check runs after the swap here: a version whose
+            // manifest differs never reaches this branch. The managed loader
+            // holds such a version back instead (`POLL_MANIFEST_PENDING`), and
+            // that handshake applies the manifest before the swap commits,
+            // while the outgoing assembly is still the running one. If the
+            // managed side ever stops holding those versions back, re-read the
+            // swapped assembly's manifest here and apply it before the frame's
+            // systems run, so a migrated row is in place before the new
+            // generation reads it.
         }
         self.last_poll_status = status;
         Ok(status)
     }
 
-    /// Decide the parked version's fate: apply its manifest, then commit or
-    /// abort.
+    /// Decides what happens to the pending version: applies its manifest, then
+    /// commits or aborts the swap.
     ///
-    /// The whole point of the handshake is this ordering. The manifest is
-    /// applied while the *old* assembly is still the running one, so a refusal
-    /// costs an unload and nothing else; committing afterwards means the world
-    /// and the incoming assembly agree the moment the swap lands. Applying
+    /// The ordering is the point of the handshake. The manifest is applied
+    /// while the outgoing assembly is still the running one, so a refusal only
+    /// costs an unload. Committing afterwards means the world and the arriving
+    /// assembly agree from the moment the swap happens. Applying the manifest
     /// after a swap would leave a running assembly against a world that never
     /// took its layout.
     ///
@@ -1107,28 +1204,30 @@ impl CSharpRuntime {
     /// Whatever re-registering the arriving assembly's systems refuses, when
     /// the committed version changed them.
     #[cfg(feature = "hot_reload")]
-    fn decide_parked_manifest(&mut self, engine: &mut Engine) -> Result<u8, CSharpError> {
+    fn decide_pending_manifest(&mut self, engine: &mut Engine) -> Result<u8, CSharpError> {
+        // Step 1: Read the manifest the pending version carries.
         let Some(manifest) = self.read_pending_manifest() else {
-            self.abort_parked("its component manifest could not be read");
+            self.abort_pending_version("its component manifest could not be read");
             return Ok(POLL_REJECTED);
         };
 
+        // Step 2: Apply the manifest, then commit or abort the swap.
         match apply_component_manifest_on_reload(engine, &manifest, &self.bindings) {
             Ok(report) => {
                 if (self.commit_reload)() == 0 {
-                    // The manifest is in force but the swap did not happen, so
-                    // the running assembly now disagrees with the world. This is
-                    // the one outcome the handshake cannot make safe by ordering
-                    // alone, and continuing to schedule the project's systems
-                    // against a world they no longer describe is the one
-                    // response that cannot be right - so they are cleared and
-                    // the runtime latches until the host restarts.
-                    let removed = engine.clear_systems_owned_by(SystemOwner::PROJECT);
+                    // The manifest is in force, but the swap did not happen, so
+                    // the running assembly no longer matches the world. This is
+                    // the one outcome the handshake cannot make safe by
+                    // ordering alone. Scheduling the project's systems against
+                    // a world they no longer describe is never right, so they
+                    // are cleared and the runtime stays stopped until the host
+                    // restarts.
+                    let cleared_system_count = engine.clear_systems_owned_by(SystemOwner::PROJECT);
                     self.system_snapshot.clear();
                     self.manifest_applied_without_assembly = true;
                     error!(
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                        cleared_systems = removed,
+                        cleared_systems = cleared_system_count,
                         "the managed loader failed to install a version whose manifest was already applied; the project's systems have been stopped - restart the host"
                     );
                     return Ok(POLL_REJECTED);
@@ -1156,13 +1255,13 @@ impl CSharpRuntime {
                 Ok(POLL_RELOADED)
             }
             Err(error) => {
-                self.abort_parked(&error.to_string());
+                self.abort_pending_version(&error.to_string());
                 Ok(POLL_REJECTED)
             }
         }
     }
 
-    /// Copy the parked version's manifest, or `None` when it cannot be read.
+    /// Copies the pending version's manifest, or `None` when it cannot be read.
     #[cfg(feature = "hot_reload")]
     fn read_pending_manifest(&self) -> Option<Vec<u8>> {
         read_reported_manifest(
@@ -1173,9 +1272,9 @@ impl CSharpRuntime {
         )
     }
 
-    /// Tell the managed loader to discard the parked version, and say why.
+    /// Tells the managed loader to discard the pending version, and says why.
     #[cfg(feature = "hot_reload")]
-    fn abort_parked(&mut self, reason: &str) {
+    fn abort_pending_version(&mut self, reason: &str) {
         error!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             reason,
@@ -1191,31 +1290,32 @@ impl CSharpRuntime {
 
     /// Rebuilds the scheduler's managed systems from the arriving assembly.
     ///
-    /// Only the project's systems are cleared, so a module's survive untouched
-    /// (the same scoping a module reload relies on). This runs between frames,
-    /// at the point the swap is applied, because clearing systems while the
-    /// scheduler is walking them is not safe.
+    /// Only the project's systems are cleared, so a module's systems survive
+    /// untouched (the same scoping a module reload relies on). This runs
+    /// between frames, at the point the swap is applied, because clearing
+    /// systems while the scheduler is running them is not safe.
     ///
-    /// The snapshot is replaced only on success: a failed re-registration
-    /// leaves the world with no managed systems, and the snapshot has to
-    /// describe that rather than the set that is gone.
+    /// A failed re-registration leaves the running generation's systems, and
+    /// the snapshot that describes them, in place: every system is resolved
+    /// before anything is cleared.
     ///
     /// # Errors
     ///
-    /// Whatever [`register_managed_systems`] refuses - most often a system
+    /// Whatever [`prepare_managed_systems`] refuses - most often a system
     /// declaring a component or resource the arriving manifest never
     /// registered.
     #[cfg(feature = "hot_reload")]
     fn reregister_systems(&mut self, engine: &mut Engine) -> Result<(), CSharpError> {
-        // Resolve everything first. A refusal here - an access naming a
+        // Resolve every system first. A refusal here - an access naming a
         // component the arriving assembly never registered is the usual one -
         // must leave the running generation's systems in place, because there
         // is nothing to fall back to once they are cleared.
-        let prepared = prepare_managed_systems(&self.bindings, self.exports, &self.subject)?;
+        let prepared_systems =
+            prepare_managed_systems(&self.bindings, self.exports, &self.subject)?;
         let removed = engine.clear_systems_owned_by(SystemOwner::PROJECT);
         self.system_snapshot.clear();
         self.system_snapshot =
-            commit_managed_systems(engine, &self.bindings, self.exports, prepared);
+            commit_managed_systems(engine, &self.bindings, self.exports, prepared_systems);
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             removed,
@@ -1225,38 +1325,38 @@ impl CSharpRuntime {
         Ok(())
     }
 
-    /// Re-reflect the active project assembly and report whether its system
-    /// metadata still matches the snapshot captured at registration.
+    /// Re-reads the active project assembly and reports whether its system
+    /// metadata still matches the snapshot taken at registration.
     ///
-    /// The answer is a fork, not a gate: a match means the swap changed only
-    /// behaviour, so the scheduler graph stands and the reload costs one
-    /// comparison, while a mismatch sends the reload through
-    /// [`CSharpRuntime::reregister_systems`] to rebuild that graph. Comparing
-    /// first is worth it because the match is the common case - most reloads
-    /// edit a system body, not its signature.
+    /// The answer decides how much work the reload has to do. On a match only
+    /// the behaviour changed, so the scheduler graph stays as it is and the
+    /// reload costs one comparison. On a mismatch the reload goes through
+    /// [`CSharpRuntime::reregister_systems`] and rebuilds that graph. The
+    /// comparison is worth its cost because a match is the common case: most
+    /// reloads edit a system body, not its signature.
     #[cfg(feature = "hot_reload")]
     fn verify_systems_unchanged(&self) -> bool {
-        let count = (self.exports.system_count)();
-        if count as usize != self.system_snapshot.len() {
+        let system_count = (self.exports.system_count)();
+        if system_count as usize != self.system_snapshot.len() {
             return false;
         }
-        for system_index in 0..count {
+        for system_index in 0..system_count {
             let snapshot = &self.system_snapshot[system_index as usize];
             let access_count = (self.exports.access_count)(system_index);
             if access_count as usize != snapshot.accesses.len() {
                 return false;
             }
             for access_index in 0..access_count {
-                let mut item = NativeSystemAccess {
+                let mut native_access = NativeSystemAccess {
                     component_key: 0,
                     component_key_high: 0,
                     mode: 0,
                     kind: 0,
                 };
-                if (self.exports.get_access)(system_index, access_index, &mut item) == 0 {
+                if (self.exports.get_access)(system_index, access_index, &mut native_access) == 0 {
                     return false;
                 }
-                if item != snapshot.accesses[access_index as usize] {
+                if native_access != snapshot.accesses[access_index as usize] {
                     return false;
                 }
             }
@@ -1283,10 +1383,10 @@ impl CSharpRuntime {
 // Free Functions
 // =============================================================================
 
-/// Whether a managed-reported poll status is one this host understands.
+/// Reports whether a managed-reported poll status is one this host understands.
 ///
-/// The four codes are the loader's whole vocabulary; the set is a helper so a
-/// test can pin it without a live runtime.
+/// The four codes are the whole vocabulary the loader reports. The check is a
+/// function of its own so a test can pin that set without a live runtime.
 #[cfg(feature = "hot_reload")]
 pub(super) fn poll_status_is_known(status: u8) -> bool {
     matches!(
@@ -1295,11 +1395,12 @@ pub(super) fn poll_status_is_known(status: u8) -> bool {
     )
 }
 
-/// Read the parked version's component manifest, reporting why not in the
-/// operator's words.
+/// Reads the pending version's component manifest and logs why it could not be
+/// read.
 ///
-/// `assembly` names which assembly reported it and `consequence` says what the
-/// host does next, so every failure line names both.
+/// `assembly` is the word that names the assembly in each message, and
+/// `consequence` is appended to say what the host does next. A caller with
+/// nothing to add passes an empty string.
 #[cfg(feature = "hot_reload")]
 fn read_reported_manifest(
     length: impl FnOnce() -> u32,
@@ -1340,6 +1441,11 @@ fn read_reported_manifest(
 /// `Vec::with_capacity` aborts the process when the allocation fails, so the
 /// count is checked against [`MAX_SYSTEMS_PER_ASSEMBLY`] first and refused as
 /// a typed error instead.
+///
+/// # Errors
+///
+/// Returns [`CSharpError::SystemCountOutOfRange`] when `count` is above
+/// [`MAX_SYSTEMS_PER_ASSEMBLY`].
 pub(super) fn checked_system_count(count: u32) -> Result<usize, CSharpError> {
     if count > MAX_SYSTEMS_PER_ASSEMBLY {
         return Err(CSharpError::SystemCountOutOfRange {
@@ -1350,7 +1456,13 @@ pub(super) fn checked_system_count(count: u32) -> Result<usize, CSharpError> {
     Ok(count as usize)
 }
 
-/// Validates a managed-reported access count; see [`checked_system_count`].
+/// Validates a managed-reported access count the same way; see
+/// [`checked_system_count`].
+///
+/// # Errors
+///
+/// Returns [`CSharpError::SystemCountOutOfRange`] when `count` is above
+/// [`MAX_ACCESSES_PER_SYSTEM`].
 pub(super) fn checked_access_count(count: u32) -> Result<usize, CSharpError> {
     if count > MAX_ACCESSES_PER_SYSTEM {
         return Err(CSharpError::SystemCountOutOfRange {
@@ -1361,8 +1473,8 @@ pub(super) fn checked_access_count(count: u32) -> Result<usize, CSharpError> {
     Ok(count as usize)
 }
 
-/// The name a system is registered under: the reflected one, or a synthetic
-/// fallback when the assembly exposes none.
+/// Returns the name a system is registered under: the reflected one, or a
+/// synthetic fallback when the assembly exposes none.
 ///
 /// Separate from [`managed_system_name`] because two callers must agree on the
 /// fallback - registration records what this returns, and the reload compares
@@ -1377,11 +1489,12 @@ fn resolved_system_name(
         .unwrap_or_else(|| format!("csharp_system_{system_index}"))
 }
 
-/// Copy one managed system's declared name.
+/// Copies one managed system's declared name.
 ///
-/// A thin wrapper over the shared two-call protocol that closes over the system
-/// index; a name the managed side does not report, reports too long, or fails
-/// to copy is all one answer here - there is no name to use.
+/// A thin wrapper over the shared two-call protocol that closes over the
+/// system index. Every failure comes back as `None`: a name the managed side
+/// does not report, one that is too long, one that fails to copy, or bytes
+/// that are not valid UTF-8. In each case there is no name to use.
 fn managed_system_name(
     name_length: SystemNameLengthFn,
     copy_name: CopySystemNameFn,
@@ -1396,52 +1509,54 @@ fn managed_system_name(
     String::from_utf8(buffer).ok()
 }
 
-/// Copy the failure message one managed system reported after a failed run.
+/// Copies the failure message one managed system reported after a failed run.
 ///
-/// Falls back to a neutral message when the managed side reports no text,
-/// an oversized message, or a failed copy.
+/// Falls back to a fixed message when the managed side reports no text, an
+/// oversized message, or a failed copy.
 fn managed_system_error_message(
     length: SystemErrorMessageLengthFn,
     copy: CopySystemErrorMessageFn,
     system_index: u32,
 ) -> String {
-    const NEUTRAL_MESSAGE: &str = "managed system reported failure";
+    const FALLBACK_ERROR_MESSAGE: &str = "managed system reported failure";
     match fetch_managed_buffer(
         || length(system_index),
         |pointer, message_length| copy(system_index, pointer, message_length),
         MAX_SYSTEM_ERROR_BYTES,
     ) {
         Ok(buffer) => String::from_utf8_lossy(&buffer).into_owned(),
-        Err(_) => String::from(NEUTRAL_MESSAGE),
+        Err(_) => String::from(FALLBACK_ERROR_MESSAGE),
     }
 }
 
-/// Translate managed component modes into native scheduler metadata.
+/// Turns declared access modes into the scheduler's metadata.
 ///
 /// # Errors
 ///
-/// Returns an error if a declared component or resource key is not registered,
-/// or an access mode is neither read nor write.
+/// Returns [`CSharpError::UnregisteredComponent`] when an access names a
+/// component nobody registered, [`CSharpError::UnregisteredResource`] when it
+/// names an unregistered managed resource, and
+/// [`CSharpError::UnknownAccessMode`] when its mode is neither read nor write.
 pub(super) fn derive_system_access(
     accesses: &[NativeSystemAccess],
     bindings: &ComponentBindings,
 ) -> Result<SystemAccess, CSharpError> {
-    let mut result = SystemAccess::new();
+    let mut system_access = SystemAccess::new();
     for access in accesses {
-        // A resource access resolves through its own table: the two key spaces
-        // are both name hashes, so only the declared kind tells them apart, and
-        // recording a resource as a component would let two writers of one
-        // resource run in the same batch.
+        // A resource access resolves through its own table. Both key spaces are
+        // name hashes, so only the declared kind tells them apart, and
+        // recording a resource as a component would let two writers of the
+        // same resource run in one batch.
         // A Rust-owned resource (`ResMut<AssetManager>`) is reached by its
-        // shared name, whose identity is the key itself; it has no managed
+        // shared name, whose identity is the key itself. It has no managed
         // binding to look up.
         if access.kind == super::context::ACCESS_KIND_NATIVE_RESOURCE {
             let resource = pill_engine::ResourceId::Shared(
                 StableComponentId::from_halves(access.component_key, access.component_key_high).0,
             );
             match access.mode {
-                0 => result.add_resource_read(resource),
-                1 => result.add_resource_write(resource),
+                0 => system_access.add_resource_read(resource),
+                1 => system_access.add_resource_write(resource),
                 mode => return Err(CSharpError::UnknownAccessMode { mode }),
             }
             continue;
@@ -1452,8 +1567,8 @@ pub(super) fn derive_system_access(
                 access.component_key_high,
             )?;
             match access.mode {
-                0 => result.add_resource_read(resource),
-                1 => result.add_resource_write(resource),
+                0 => system_access.add_resource_read(resource),
+                1 => system_access.add_resource_write(resource),
                 mode => return Err(CSharpError::UnknownAccessMode { mode }),
             }
             continue;
@@ -1470,10 +1585,10 @@ pub(super) fn derive_system_access(
                 ),
             })?;
         match access.mode {
-            0 => result.add_read(component),
-            1 => result.add_write(component),
+            0 => system_access.add_read(component),
+            1 => system_access.add_write(component),
             mode => return Err(CSharpError::UnknownAccessMode { mode }),
         }
     }
-    Ok(result)
+    Ok(system_access)
 }

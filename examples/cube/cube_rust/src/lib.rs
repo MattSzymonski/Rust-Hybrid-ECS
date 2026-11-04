@@ -195,39 +195,3 @@ fn spin_cube_system(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Returns the drawn entity count and the camera count.
-    fn scene_entity_counts(engine: &mut Engine) -> (usize, usize) {
-        let drawn_entity_count = Query::<&MeshRendererComponent>::new(engine.world_mut())
-            .iter_mut()
-            .count();
-        let camera_count = Query::<&CameraComponent>::new(engine.world_mut())
-            .iter_mut()
-            .count();
-        (drawn_entity_count, camera_count)
-    }
-
-    #[test]
-    fn initialization_loads_the_files_and_builds_one_scene() {
-        let mut engine = Engine::new();
-
-        assert_eq!(init(&mut engine), 0);
-
-        assert_eq!(scene_entity_counts(&mut engine), (1, 1));
-    }
-
-    /// A hot reload runs `init` again; it must not build a second scene.
-    #[test]
-    fn initializing_again_keeps_one_scene() {
-        let mut engine = Engine::new();
-        assert_eq!(init(&mut engine), 0);
-
-        assert_eq!(init(&mut engine), 0);
-
-        assert_eq!(scene_entity_counts(&mut engine), (1, 1));
-    }
-}

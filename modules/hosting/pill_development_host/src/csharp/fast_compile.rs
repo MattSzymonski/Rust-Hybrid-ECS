@@ -217,7 +217,7 @@ impl FastCompiler {
         response_file_path: PathBuf,
         output_assembly_path: PathBuf,
     ) -> Result<Self, CSharpError> {
-        let abi_version = runtime.get_unmanaged_fn::<CompilerAbiVersionFn>(
+        let abi_version = runtime.resolve_unmanaged_function_pointer::<CompilerAbiVersionFn>(
             compiler_assembly_path,
             COMPILER_INTEROP_TYPE,
             "CompilerAbiVersion",
@@ -229,17 +229,17 @@ impl FastCompiler {
             });
         }
         Ok(Self {
-            compile: runtime.get_unmanaged_fn::<CompileFn>(
+            compile: runtime.resolve_unmanaged_function_pointer::<CompileFn>(
                 compiler_assembly_path,
                 COMPILER_INTEROP_TYPE,
                 "Compile",
             )?,
-            diagnostics_length: runtime.get_unmanaged_fn::<DiagnosticsLengthFn>(
+            diagnostics_length: runtime.resolve_unmanaged_function_pointer::<DiagnosticsLengthFn>(
                 compiler_assembly_path,
                 COMPILER_INTEROP_TYPE,
                 "DiagnosticsLength",
             )?,
-            copy_diagnostics: runtime.get_unmanaged_fn::<CopyDiagnosticsFn>(
+            copy_diagnostics: runtime.resolve_unmanaged_function_pointer::<CopyDiagnosticsFn>(
                 compiler_assembly_path,
                 COMPILER_INTEROP_TYPE,
                 "CopyDiagnostics",
@@ -254,7 +254,7 @@ impl FastCompiler {
     /// This is best effort: if the export is missing or the request cannot be
     /// made, the first reload simply pays the full Roslyn startup cost.
     fn start_warmup(&self, runtime: &DotnetRuntimeContext, compiler_assembly_path: &Path) {
-        let Ok(warmup) = runtime.get_unmanaged_fn::<WarmupFn>(
+        let Ok(warmup) = runtime.resolve_unmanaged_function_pointer::<WarmupFn>(
             compiler_assembly_path,
             COMPILER_INTEROP_TYPE,
             "Warmup",

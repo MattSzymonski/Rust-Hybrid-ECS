@@ -103,9 +103,9 @@ pub use sound_type::SoundType;
 
 /// Registers this module's components, resources and system with the engine.
 ///
-/// A monolithic build calls it directly. The generated
-/// `host_module_pill_audio` wrapper calls it from `pill_module_init`, the
-/// entry point the host looks up in a loaded DLL.
+/// This is the half a reload repeats: the components, resources and system
+/// whose code moved with the arriving image. It must be idempotent, because a
+/// first load reaches it too, immediately before [`init`].
 ///
 /// The [`AudioManager`] is installed only when the machine has an audio
 /// device. Without one the world still gets the components and the system, so
@@ -113,7 +113,6 @@ pub use sound_type::SoundType;
 /// with. That is what lets this module run on a machine with no sound card.
 ///
 /// Returns 0.
-#[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     // Step 1: Create the shared sound-load queue if the world has none.
     if engine.world().get_resource::<AudioLoadQueue>().is_none() {
@@ -169,6 +168,20 @@ pub fn register(engine: &mut Engine) -> u32 {
         "pill_audio module registered"
     );
     0
+}
+
+/// The artifact's one-time entry point.
+///
+/// The module keeps nothing that has to run once: everything it owns is
+/// registration, and [`register`] re-runs all of it on every generation. This
+/// function exists because a monolithic build loads the module once and calls
+/// this entry point alone, so it defers to [`register`].
+///
+/// Public so the generated `host_module_pill_audio` wrapper can carry it as
+/// `pill_module_init`, the entry point the host looks up in a loaded DLL.
+#[pill_module(register = register)]
+pub fn init(engine: &mut Engine) -> u32 {
+    register(engine)
 }
 
 // =============================================================================

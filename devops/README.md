@@ -130,18 +130,18 @@ is described in `AGENTS.md` ("The theme pipeline"), and
 Shared code, imported by everything above. Nothing here executes a measurement
 or asserts anything.
 
-| Module               | Role                                                                 |
-| -------------------- | -------------------------------------------------------------------- |
-| `paths.py`           | devops/repository layout, plus `ensure_devops_on_path()`             |
-| `projects.py`        | the project catalogue: each suite's `PROJECT_PATH` and edited files  |
-| `environment.py`     | process queries and timestamps                                       |
-| `editor_log_tokens.py` | the editor log tokens the editor suites and the contract share     |
-| `editor_session.py`  | one editor run: sandbox, launch environment and the anchored waits   |
-| `scenario.py`        | the shared edit / wait / assert / restore loop                       |
-| `test_report.py`     | pass/fail/skip tally, summary block, size reports, cargo test totals |
-| `suite_common.py`    | host process plumbing: log tokens, output monitor, backup/restore    |
-| `win_clipboard.py`   | the editor suite's side of the Windows clipboard                     |
-| `workspace_graph.py` | the Cargo-manifest reader the architecture guards check              |
+| Module                 | Role                                                                 |
+| ---------------------- | -------------------------------------------------------------------- |
+| `paths.py`             | devops/repository layout, plus `ensure_devops_on_path()`             |
+| `projects.py`          | the project catalogue: each suite's `PROJECT_PATH` and edited files  |
+| `environment.py`       | process queries and timestamps                                       |
+| `editor_log_tokens.py` | the editor log tokens the editor suites and the contract share       |
+| `editor_session.py`    | one editor run: sandbox, launch environment and the anchored waits   |
+| `scenario.py`          | the shared edit / wait / assert / restore loop                       |
+| `test_report.py`       | pass/fail/skip tally, summary block, size reports, cargo test totals |
+| `suite_common.py`      | host process plumbing: log tokens, output monitor, backup/restore    |
+| `win_clipboard.py`     | the editor suite's side of the Windows clipboard                     |
+| `workspace_graph.py`   | the Cargo-manifest reader the architecture guards check              |
 
 A standalone script reaches it by putting `devops/` on `sys.path` first:
 
@@ -160,7 +160,7 @@ The CI gate, the shipping build and the shell entry points.
 | `check_relevant.py`         | runs only the checks a change set needs, by repository area                      |
 | `build_shipping.py` / `.sh` | shipping builds (they clear `RUSTFLAGS`; a plain `cargo build --release` fails)  |
 | `run_hot_reload_tests.sh`   | the hot-reload regression net: a fixed set of suites in `tests/`                 |
-| `generate_documentation.sh` | shell entry point for the Markdown documentation pipeline in `tools/`         |
+| `generate_documentation.sh` | shell entry point for the Markdown documentation pipeline in `tools/`            |
 
 `check_relevant.py` is the loop to use after a change: it reads the working
 tree's change set (or `--paths`), matches every file against a per-area rule

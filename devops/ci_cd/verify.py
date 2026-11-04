@@ -79,14 +79,19 @@ RUNNING_IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 MODULES_ROOT = REPOSITORY_ROOT / "modules"
 PYTHON = sys.executable
 
-# The two hot_patch feature switches, shared by the check and test steps.
-HOT_PATCH_FEATURES = "pill_development_host/hot_patch,pill_engine/hot_patch"
+# The engine's patch feature, shared by the check and test steps. The host has no
+# feature of its own any more: it pins `pill_engine/hot_patch` in its manifest,
+# and the `PILL_*` switches decide at startup which watchers run.
+HOT_PATCH_FEATURES = "pill_engine/hot_patch"
 # The default test lane must compile without hot_patch, so the plain-reload
-# code paths (`cfg(not(feature = "hot_patch"))`) are built and tested. Cargo
-# unifies features across one invocation, and `pill_standalone` turns
-# hot_patch on by default, so the lane leaves it out; the hot_patch lane runs
-# the whole workspace, it included. The `default-lane-features` step fails if
-# a new member brings hot_patch back.
+# code paths (`cfg(not(feature = "hot_patch"))` in the engine) are built and
+# tested. Cargo unifies features across one invocation, so every member that
+# reaches the engine's patch feature has to stay out of the lane: the two
+# frontends through their host dependency, and the host itself, which pins
+# `pill_engine/hot_patch` in its own manifest so the modules it builds resolve the
+# graph its dylibs were built with. The hot_patch lane runs the whole workspace,
+# host included. The `default-lane-features` step fails if a new member brings
+# hot_patch back.
 DEFAULT_LANE = [
     "--workspace",
     "--exclude",
@@ -97,6 +102,10 @@ DEFAULT_LANE = [
     # hot_patch lane below covers the other one.
     "--exclude",
     "pill_editor",
+    # The host pins the engine's patch feature, so its unit tests run in the
+    # hot_patch lane only.
+    "--exclude",
+    "pill_development_host",
 ]
 
 # The unit-test steps run through nextest when it is installed, and through
@@ -424,6 +433,17 @@ STEPS: List[Step] = [
         "manager-settings",
         "Manager settings suite (created, applied live, kept across a reload)",
         [[PYTHON, "devops/tests/run_all.py", "--only", "test_manager_settings.py"]],
+        working_directory=REPOSITORY_ROOT,
+    ),
+    # The three startup switches: each one is read once, so the suite starts
+    # the host four times - all on, then with reloading, patching and asset
+    # reloading switched off in turn - and reads what each posture does and
+    # does not notice. A host-tier suite, so it runs before the editor lane's
+    # build.
+    Step(
+        "host-switches",
+        "Host switches suite (each switch stops what it names)",
+        [[PYTHON, "devops/tests/run_all.py", "--only", "test_host_switches.py"]],
         working_directory=REPOSITORY_ROOT,
     ),
     # The end-to-end editor lane: the real executable, driven through its

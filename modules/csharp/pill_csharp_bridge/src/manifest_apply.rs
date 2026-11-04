@@ -1,35 +1,38 @@
-//! The one apply pipeline every manifest kind runs through.
+//! The apply pipeline that every managed manifest kind runs through.
 //!
 //! # Responsibilities
 //!
-//! - Resolve each arriving declaration against the live binding table:
-//!   settled, added, renamed through an alias, or reshaped.
-//! - Apply them in the order the reload protocol allows, journaling an undo per
-//!   applied entry so a later refusal unwinds, and retire the entries the
-//!   manifest stopped naming last.
+//! - Decide what each arriving declaration means for the live binding table:
+//!   nothing changed, a new entry, a rename through an alias, or a reshape.
+//! - Apply the entries in manifest order, recording what would undo each
+//!   applied entry so a later refusal can unwind them.
+//! - Retire the entries the manifest stopped naming, after everything else.
 //!
 //! # Design
 //!
-//! Every manifest kind needs the same stages in the same order, and what a kind
-//! contributes arrives as a [`ManifestSubject`], a plain struct of function
-//! pointers in the style of `ColumnOps` and `StorageFactory`; everything else
+//! Every manifest kind needs the same stages in the same order. What one kind
+//! contributes arrives as a [`ManifestSubject`]: a plain struct of function
+//! pointers, in the same style as the `ColumnOps` and `StorageFactory` tables
+//! that carry per-kind behaviour elsewhere in the engine. Everything else
 //! lives here, once.
 //!
-//! - **Aliases resolve before vanished entries are collected**, so an entry
-//!   whose alias reaches a still-live predecessor turns that predecessor from a
-//!   disappearance into a rename.
-//! - **Every entry is resolved before any of it is applied**, so the refusals
-//!   validation cannot foresee leave the world and the table as they were.
+//! - **Aliases are resolved before vanished entries are collected**, so when
+//!   an alias reaches a predecessor that is still live, that predecessor counts
+//!   as renamed instead of as gone.
+//! - **Every entry is resolved before any of them is applied**, so the refusals
+//!   that the manifest's own validation cannot find leave the world and the
+//!   table as they were.
 //! - **Retirement runs last**, because it drops bytes and cannot be undone.
 //!
 //! ## What rollback can and cannot promise
 //!
-//! The table is all-or-nothing: the pipeline works on a copy and the caller
-//! publishes whatever comes back. A component's reshape journals an undo whose
-//! inverse plan puts the rows back; a resource's reshape cannot, because
-//! reversing it would have to invent the bytes it dropped - so it stays applied
-//! with its new binding, since the table must keep describing the layout the
-//! engine holds, which the view callback's size check depends on.
+//! The table is all-or-nothing: the pipeline works on a copy, and the caller
+//! publishes whatever comes back. A component's reshape comes with an undo that
+//! moves the rows back. A resource's reshape cannot do that, because reversing
+//! it would have to invent the bytes it dropped. That reshape therefore stays
+//! applied with its new binding: the table has to keep describing the layout
+//! the engine holds, because the resource view callback checks the live byte
+//! length against it.
 
 // Standard library
 use std::collections::{HashMap, HashSet};
@@ -50,11 +53,12 @@ use super::components::StableComponentId;
 /// The live table one manifest kind keeps, keyed by stable identity.
 pub(super) type BindingTable<Binding> = HashMap<StableComponentId, Binding>;
 
-/// What an action reports: the binding it produced, and how to reverse it.
+/// What a subject action reports: the binding it produced, and how to reverse
+/// it.
 ///
 /// `None` in the second slot means the action's effect on the engine cannot be
-/// reversed, which is a statement about the kind rather than about this call -
-/// see the rollback note in this module's docs.
+/// reversed. That is a property of the kind, not of this call; see the
+/// rollback note in this module's docs.
 pub(super) type Applied<Binding, Undo> = Result<(Binding, Option<Undo>), CSharpError>;
 
 /// Resolve one alias to the live table entry it names, if any.
@@ -77,10 +81,10 @@ type Rename<Declaration, Binding, Undo> = fn(
     &Declaration,
 ) -> Applied<Binding, Undo>;
 
-/// The live entry an arriving declaration's alias reached.
+/// The live entry that an arriving declaration's alias reached.
 ///
-/// Passed whole because applying a rename retires the predecessor: by the time
-/// the data has moved, its registration is gone and this is the only
+/// The whole entry is passed because applying a rename retires the predecessor.
+/// Once the data has moved, the registration is gone, so this is the only
 /// description of what was there.
 pub(super) struct RenamePredecessor<'binding, Binding> {
     /// The table key the predecessor is bound under.
@@ -93,8 +97,8 @@ pub(super) struct RenamePredecessor<'binding, Binding> {
 
 /// What an arriving declaration means for a live binding.
 ///
-/// The one decision the pipeline cannot make for itself: whether the stored
-/// bytes are still valid under the arriving shape is a question about layouts,
+/// This is the one decision the pipeline cannot make for itself: whether the
+/// stored bytes are still valid under the arriving shape depends on layouts,
 /// and only the kind knows how its layouts compare.
 pub(super) enum Settlement {
     /// The live binding already describes the arriving declaration.
@@ -107,8 +111,9 @@ pub(super) enum Settlement {
 ///
 /// A plain struct of function pointers rather than a trait, matching the
 /// `ColumnOps` and `StorageFactory` style this codebase already uses for
-/// per-kind behaviour tables. Every action takes the stable identity the
-/// pipeline resolved, so no action has to re-derive it.
+/// per-kind behaviour tables. The actions that write an entry - `register`,
+/// `reshape` and `rename` - also receive the stable identity the pipeline
+/// resolved, so none of them has to work it out again.
 pub(super) struct ManifestSubject<Declaration, Binding, Undo> {
     /// What this kind is called in log lines - "component", "resource".
     pub(super) kind: &'static str,
@@ -116,20 +121,22 @@ pub(super) struct ManifestSubject<Declaration, Binding, Undo> {
     pub(super) identity: fn(&Declaration) -> StableComponentId,
     /// The declared name, for reports and refusals.
     pub(super) name: fn(&Declaration) -> &str,
-    /// The names of live registrations this declaration renames onto itself.
+    /// The previous names this declaration may have been registered under. A
+    /// live entry under one of them becomes its predecessor.
     pub(super) aliases: fn(&Declaration) -> &[String],
     /// The name a live binding was registered under, for the retirement report.
     pub(super) binding_name: fn(&Engine, &Binding) -> String,
     /// Whether a live entry is one this pipeline owns and may retire.
     ///
-    /// A table can hold entries this manifest does not govern - the component
-    /// table also holds native and module-native bindings - and those are never
-    /// retired for having gone unmentioned.
+    /// A table can hold entries this manifest does not govern. The component
+    /// table also holds module-native bindings - components an extension
+    /// registered in Rust - and those are never retired just because the
+    /// manifest stopped naming them.
     pub(super) is_governed: fn(&Binding) -> bool,
     /// Resolve one alias to the live table entry it names, if any.
     pub(super) resolve_alias: ResolveAlias<Binding>,
-    /// Refuse a declaration the table has no entry for and that cannot be
-    /// registered as it stands.
+    /// Refuse a declaration that cannot be registered as it stands. Called only
+    /// for a declaration the table has no entry for.
     pub(super) check_addable: fn(&Declaration) -> Result<(), CSharpError>,
     /// Decide what an arriving declaration means for a live binding.
     pub(super) settle: fn(&Engine, &Binding, &Declaration) -> Result<Settlement, CSharpError>,
@@ -141,8 +148,10 @@ pub(super) struct ManifestSubject<Declaration, Binding, Undo> {
     pub(super) rename: Rename<Declaration, Binding, Undo>,
     /// Retire every entry the manifest stopped naming, in one call.
     ///
-    /// Runs last and reports how much it touched; it cannot fail, because
-    /// nothing after it could react to a failure.
+    /// The pipeline calls it last, because a retirement cannot be journalled:
+    /// no step that can fail may run after it. It reports how many entries it
+    /// retired and cannot report an error, because nothing would be left to
+    /// react to one.
     pub(super) retire: fn(&mut Engine, &[Binding]) -> usize,
     /// Undo one applied entry during a rollback, best effort.
     pub(super) undo: fn(&mut Engine, Undo),
@@ -150,11 +159,11 @@ pub(super) struct ManifestSubject<Declaration, Binding, Undo> {
 
 /// What one applied manifest changed.
 ///
-/// One shape for every kind: the pipeline fills it and each caller folds it
-/// into whatever report its own callers read.
+/// Every kind fills the same shape. The pipeline fills it in, and each caller
+/// folds it into whatever report its own callers read.
 #[derive(Debug, Default)]
 pub(super) struct ManifestOutcome {
-    /// Entries the arriving generation declares for the first time.
+    /// Entries the arriving manifest declares for the first time.
     pub(super) added: Vec<String>,
     /// Entries whose layout changed and whose stored data was migrated.
     pub(super) migrated: Vec<String>,
@@ -181,39 +190,56 @@ enum Resolution<'declaration, Declaration> {
     Reshape(&'declaration Declaration),
 }
 
-/// One applied entry, recorded so a later refusal can be undone.
+/// One applied entry, recorded so a later refusal can undo it.
 ///
-/// The table half is the pipeline's: it remembers exactly which entries the
-/// step wrote so a rollback can put the map back without the subject knowing a
-/// table exists. The engine half is the subject's, and is absent for a step
-/// whose effect cannot be reversed.
+/// The table half belongs to the pipeline: it records exactly which entries the
+/// step wrote, so a rollback can restore the map without the subject knowing a
+/// table exists. The engine half belongs to the subject and is absent for a
+/// step whose effect cannot be reversed.
 struct JournalEntry<Binding, Undo> {
-    /// The identity the step wrote, and what the table held there before.
-    wrote: (StableComponentId, Option<Binding>),
+    /// The table entry the step wrote: the identity, and the binding that was
+    /// there before, or `None` when the key was new.
+    written_entry: (StableComponentId, Option<Binding>),
     /// A predecessor the step removed, and the binding it held.
     removed: Option<(StableComponentId, Binding)>,
     /// How to reverse the step's effect on the engine, when it can be.
     undo: Option<Undo>,
 }
 
+/// One kind's declarations, resolved against the live table and ready to
+/// apply. [`prepare_manifest`] produces it, and nothing in it has changed the
+/// engine yet.
+pub(super) struct PreparedManifest<'declaration, Declaration, Binding> {
+    /// The table the resolutions were made against. It is passed on so the
+    /// execute half writes into it instead of reading the table again.
+    previous: BindingTable<Binding>,
+    /// The entries the manifest stopped naming, retired after everything else.
+    vanished_identities: Vec<StableComponentId>,
+    /// Each arriving entry and what has to happen to it.
+    resolutions: Vec<(StableComponentId, Resolution<'declaration, Declaration>)>,
+}
+
 // =============================================================================
 // The pipeline
 // =============================================================================
 
-/// The half of the pipeline that resolves a manifest: everything the pipeline
-/// can refuse about the manifest's own shape.
+/// The half of the pipeline that decides what a manifest means, without
+/// changing anything.
 ///
-/// Split from [`execute_manifest`] so one caller can resolve two kinds before
-/// executing either: a resource declaration and a component declaration arrive
-/// in one manifest, and a shape refusal in one kind must not leave the other
-/// kind's relayout already applied. Nothing here mutates the engine or the
-/// table.
+/// It raises every refusal the pipeline can make about the manifest's own
+/// shape. It is split from [`execute_manifest`] so one caller can resolve two
+/// kinds before executing either. Resources and components arrive in one
+/// manifest, and a shape refusal in one kind must not leave the other kind's
+/// relayout already applied. Nothing here changes the engine or the table.
 ///
 /// # Errors
 ///
-/// Returns a [`CSharpError`] when an alias claims more than one predecessor,
-/// when a declaration cannot be registered as it stands, or when an entry the
-/// table already holds declares an alias of its own.
+/// Returns a [`CSharpError`] when an alias names more than one live
+/// registration, when one declaration's aliases reach more than one
+/// predecessor, when a declaration the table has no entry for cannot be
+/// registered as it stands, when an entry the table already holds also declares
+/// an alias, or when the subject refuses the arriving shape against the live
+/// binding.
 pub(super) fn prepare_manifest<'declaration, Declaration, Binding, Undo>(
     subject: &ManifestSubject<Declaration, Binding, Undo>,
     engine: &Engine,
@@ -223,45 +249,52 @@ pub(super) fn prepare_manifest<'declaration, Declaration, Binding, Undo>(
 where
     Binding: Clone,
 {
-    // Step 1: Resolve aliases, before anything else looks at what vanished.
-    // An entry whose alias reaches a live predecessor is a rename, and its
-    // predecessor is not a disappearance.
+    // Step 1: Resolve aliases first, before anything looks at what vanished.
+    // An entry whose alias reaches a live predecessor is a rename, so that
+    // predecessor counts as renamed, not as gone.
     let renames = resolve_renames(subject, engine, &previous, declarations)?;
 
-    // Step 2: Collect the entries the manifest stopped naming, to be retired
-    // after everything else has applied. Collected here because an alias in the
-    // arriving manifest can claim one of them as a rename - its data would
-    // move, not drop - and retired last because a retirement cannot be
-    // journalled: nothing may run after it that could fail.
-    let arriving: HashSet<StableComponentId> = declarations
+    // Step 2: Collect the entries the manifest stopped naming. They are retired
+    // after everything else has applied, so a rename can still claim one of
+    // them here, and its data moves instead of dropping.
+    let arriving_identities: HashSet<StableComponentId> = declarations
         .iter()
         .map(|declaration| (subject.identity)(declaration))
         .collect();
-    let renamed_sources: HashSet<StableComponentId> =
-        renames.values().map(|(source, _)| *source).collect();
-    let vanished: Vec<StableComponentId> = previous
+    let renamed_predecessors: HashSet<StableComponentId> = renames
+        .values()
+        .map(|(predecessor, _)| *predecessor)
+        .collect();
+    let vanished_identities: Vec<StableComponentId> = previous
         .iter()
         .filter(|(identity, binding)| {
-            !arriving.contains(*identity)
-                && !renamed_sources.contains(*identity)
+            !arriving_identities.contains(*identity)
+                && !renamed_predecessors.contains(*identity)
                 && (subject.is_governed)(binding)
         })
         .map(|(identity, _)| *identity)
         .collect();
 
-    // Step 3: Resolve every entry before the first mutation. The reads below
-    // are read-only, so a refusal here leaves the world and the table alone.
+    // Step 3: Resolve every entry before the first change. Everything here only
+    // reads, so a refusal leaves the world and the table alone.
     let resolutions = resolve_entries(subject, engine, &previous, declarations, &renames)?;
 
     Ok(PreparedManifest {
         previous,
-        vanished,
+        vanished_identities,
         resolutions,
     })
 }
 
-/// The mutating half of the pipeline: apply what [`prepare_manifest`]
-/// resolved, unwind on a refusal, and retire last.
+/// The half of the pipeline that changes things: applies what
+/// [`prepare_manifest`] resolved, unwinds on a refusal, and retires last.
+///
+/// # Errors
+///
+/// Returns the error that one of the subject's `register`, `reshape` or
+/// `rename` actions reported, after every entry applied so far has been rolled
+/// back. The table comes back in every case, so the caller can publish it
+/// either way.
 pub(super) fn execute_manifest<Declaration, Binding, Undo>(
     subject: &ManifestSubject<Declaration, Binding, Undo>,
     engine: &mut Engine,
@@ -272,16 +305,17 @@ where
 {
     let PreparedManifest {
         previous,
-        vanished,
+        vanished_identities,
         resolutions,
     } = prepared;
 
-    // Step 4: Execute, journalling one entry per applied resolution.
+    // Step 4: Apply each resolved entry, recording one journal entry per
+    // applied resolution.
     let mut table = previous;
     let mut outcome = ManifestOutcome::default();
     let mut journal: Vec<JournalEntry<Binding, Undo>> = Vec::with_capacity(resolutions.len());
     for (identity, resolution) in resolutions {
-        let applied = apply_one(
+        let applied = apply_resolution(
             subject,
             engine,
             &mut table,
@@ -300,22 +334,23 @@ where
     }
 
     // Step 5: Retire the declarations the manifest stopped naming, once every
-    // add and migration has applied. Nothing may fail after this.
-    if !vanished.is_empty() {
-        let retired: Vec<Binding> = vanished
+    // addition and migration has applied. Nothing else in the pipeline runs
+    // after this, so no later refusal has to undo it.
+    if !vanished_identities.is_empty() {
+        let retired: Vec<Binding> = vanished_identities
             .iter()
             .filter_map(|identity| table.get(identity).cloned())
             .collect();
-        // The names are read before the retirement, not after: retiring an
-        // entry takes its registration with it, and the report needs the name
-        // it was registered under.
+        // Read the names before the retirement, not after: retiring an entry
+        // takes its registration with it, and the report needs the name it was
+        // registered under.
         for binding in &retired {
             outcome
                 .retired
                 .push((subject.binding_name)(engine, binding));
         }
         let touched = (subject.retire)(engine, &retired);
-        for identity in &vanished {
+        for identity in &vanished_identities {
             table.remove(identity);
         }
         info!(
@@ -330,33 +365,20 @@ where
     (Ok(outcome), table)
 }
 
-/// One kind's declarations, resolved against the live table and ready to
-/// apply. [`prepare_manifest`] produces it; nothing in it has touched the
-/// engine yet.
-pub(super) struct PreparedManifest<'declaration, Declaration, Binding> {
-    /// The table the resolutions were made against, handed on so the execute
-    /// half writes into it rather than reading it again.
-    previous: BindingTable<Binding>,
-    /// The entries the manifest stopped naming, retired after everything else.
-    vanished: Vec<StableComponentId>,
-    /// Each arriving entry and what has to happen to it.
-    resolutions: Vec<(StableComponentId, Resolution<'declaration, Declaration>)>,
-}
-
-/// Resolve every declaration's aliases to the live entries they used to name.
+/// Resolve every declaration's aliases to the live entries they name.
 ///
-/// One hop, against live entries only: an alias names something still
-/// registered (otherwise there is no data to carry), and the entry it lands on
-/// becomes a rename instead of an add. An alias that resolves to nothing is
-/// left alone - it names nothing this path owns, and a later registration under
-/// it is an ordinary add.
+/// Each alias is looked up once, and only among live entries: an entry that is
+/// no longer registered has no data left to carry. The entry an alias names
+/// becomes a rename instead of an add. An alias that matches nothing is left
+/// alone: it names nothing this path owns, and a later registration under that
+/// name is an ordinary add.
 ///
 /// # Errors
 ///
-/// Returns a [`CSharpError`] when the name is ambiguous, or when one entry
-/// collects predecessors through more than one alias: two old registrations
-/// cannot both be its past, and picking one would silently drop the other's
-/// data.
+/// Returns a [`CSharpError`] when an alias is ambiguous, or when one entry
+/// collects predecessors through more than one alias. Two old registrations
+/// cannot both be an entry's past, and picking one would silently drop the
+/// other's data.
 fn resolve_renames<Declaration, Binding, Undo>(
     subject: &ManifestSubject<Declaration, Binding, Undo>,
     engine: &Engine,
@@ -385,7 +407,8 @@ fn resolve_renames<Declaration, Binding, Undo>(
     Ok(renames)
 }
 
-/// Resolve every declaration against the live table, refusing before applying.
+/// Resolve every declaration against the live table, refusing before anything is
+/// applied.
 ///
 /// # Errors
 ///
@@ -400,7 +423,7 @@ fn resolve_entries<'declaration, Declaration, Binding, Undo>(
     declarations: &'declaration [Declaration],
     renames: &HashMap<StableComponentId, (StableComponentId, String)>,
 ) -> Result<Vec<(StableComponentId, Resolution<'declaration, Declaration>)>, CSharpError> {
-    let mut resolved = Vec::with_capacity(declarations.len());
+    let mut resolutions = Vec::with_capacity(declarations.len());
     for declaration in declarations {
         let identity = (subject.identity)(declaration);
         let Some(binding) = previous.get(&identity) else {
@@ -415,14 +438,15 @@ fn resolve_entries<'declaration, Declaration, Binding, Undo>(
                 },
                 None => Resolution::Add(declaration),
             };
-            resolved.push((identity, resolution));
+            resolutions.push((identity, resolution));
             continue;
         };
 
-        // A successor's identity is derived from its new name, so a table hit
-        // here means the name was already registered while its aliases still
-        // name an earlier registration. Refused rather than settled: settling
-        // would strand the predecessor's data in a binding nothing tracks.
+        // A successor's identity is derived from its new name, so finding the
+        // identity in the table means the name is already registered while its
+        // aliases still name an earlier registration. This is refused rather
+        // than settled: settling would leave the predecessor's data in a
+        // binding that nothing tracks.
         if renames.contains_key(&identity) {
             return Err(CSharpError::ManifestInvalid {
                 message: format!(
@@ -438,19 +462,24 @@ fn resolve_entries<'declaration, Declaration, Binding, Undo>(
             Settlement::Unchanged => Resolution::Settled,
             Settlement::Reshaped => Resolution::Reshape(declaration),
         };
-        resolved.push((identity, resolution));
+        resolutions.push((identity, resolution));
     }
-    Ok(resolved)
+    Ok(resolutions)
 }
 
 /// Apply one resolved entry, recording what it wrote.
 ///
 /// # Errors
 ///
-/// Whatever the subject's action reports. Nothing is written to the table
-/// unless the action succeeded, so a refusal here leaves the entry untouched
-/// and the journal describes only entries that did apply.
-fn apply_one<Declaration, Binding, Undo>(
+/// Whatever the subject's action reports. The table is only written after the
+/// action succeeded, so a refusal here leaves the entry untouched and the
+/// journal describes only the entries that did apply.
+///
+/// # Panics
+///
+/// Panics when a resolution names an entry the table does not hold, which the
+/// resolve half makes impossible.
+fn apply_resolution<Declaration, Binding, Undo>(
     subject: &ManifestSubject<Declaration, Binding, Undo>,
     engine: &mut Engine,
     table: &mut BindingTable<Binding>,
@@ -465,26 +494,27 @@ where
         Resolution::Settled => Ok(None),
         Resolution::Add(declaration) => {
             let (binding, undo) = (subject.register)(engine, identity, declaration)?;
-            let wrote = (identity, table.insert(identity, binding));
+            let written_entry = (identity, table.insert(identity, binding));
             outcome.added.push((subject.name)(declaration).to_string());
             Ok(Some(JournalEntry {
-                wrote,
+                written_entry,
                 removed: None,
                 undo,
             }))
         }
         Resolution::Reshape(declaration) => {
-            let existing = table
+            let existing_binding = table
                 .get(&identity)
                 .cloned()
                 .expect("a reshape is only resolved for an entry the table holds");
-            let (binding, undo) = (subject.reshape)(engine, identity, &existing, declaration)?;
-            let wrote = (identity, table.insert(identity, binding));
+            let (binding, undo) =
+                (subject.reshape)(engine, identity, &existing_binding, declaration)?;
+            let written_entry = (identity, table.insert(identity, binding));
             outcome
                 .migrated
                 .push((subject.name)(declaration).to_string());
             Ok(Some(JournalEntry {
-                wrote,
+                written_entry,
                 removed: None,
                 undo,
             }))
@@ -508,7 +538,7 @@ where
                 },
                 declaration,
             )?;
-            let wrote = (identity, table.insert(identity, binding));
+            let written_entry = (identity, table.insert(identity, binding));
             let removed = table
                 .remove(&predecessor)
                 .map(|removed| (predecessor, removed));
@@ -516,7 +546,7 @@ where
                 .renamed
                 .push(format!("{alias} -> {}", (subject.name)(declaration)));
             Ok(Some(JournalEntry {
-                wrote,
+                written_entry,
                 removed,
                 undo,
             }))
@@ -526,14 +556,15 @@ where
 
 /// Undo every applied entry, newest first.
 ///
-/// Best effort on the engine side by design: a rollback that fails leaves the
-/// process mixed, and the failure is logged where it happened rather than
-/// raised over the original refusal, which is the error the caller needs.
+/// The engine side is best effort by design. A rollback that fails leaves the
+/// process in a mixed state. That failure is logged where it happened instead
+/// of being returned in place of the original refusal, which is the error the
+/// caller needs.
 ///
-/// The table side is not best effort. An entry whose engine effect was reversed
-/// has its table entry put back exactly as it was; an entry whose effect could
-/// not be reversed keeps the binding it was given, because the table has to
-/// keep describing what the engine actually holds.
+/// The table side is not best effort. When an entry's effect on the engine was
+/// reversed, its table entry is put back exactly as it was. An entry whose
+/// effect could not be reversed keeps the binding it was given, because the
+/// table has to keep describing what the engine actually holds.
 fn roll_back<Declaration, Binding, Undo>(
     subject: &ManifestSubject<Declaration, Binding, Undo>,
     engine: &mut Engine,
@@ -547,8 +578,8 @@ fn roll_back<Declaration, Binding, Undo>(
             continue;
         };
         (subject.undo)(engine, undo);
-        let (identity, replaced) = entry.wrote;
-        match replaced {
+        let (identity, replaced_binding) = entry.written_entry;
+        match replaced_binding {
             Some(binding) => table.insert(identity, binding),
             None => table.remove(&identity),
         };

@@ -65,13 +65,10 @@ include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
 
 /// Registers the shell against the host engine. Returns zero on success.
 ///
-/// Re-claims every resource it owns. A reload releases the resources that the
-/// arriving generation does not register again, and registering an existing
-/// one keeps its value instead of resetting it.
-///
-/// Public so the generated `host_module_pill_editor_shell_egui_editor`
-/// wrapper can carry it as `pill_module_init`.
-#[pill_module]
+/// This is the half a reload repeats: it re-claims every resource it owns. A
+/// reload releases the resources that the arriving generation does not register
+/// again, and registering an existing one keeps its value instead of resetting
+/// it.
 pub fn register(engine: &mut Engine) -> u32 {
     let world = engine.world_mut();
     // Step 1: the command resources every editor action queues into - the
@@ -152,6 +149,19 @@ pub fn register(engine: &mut Engine) -> u32 {
         "[editor] pill_editor_shell_egui_editor loaded"
     );
     0
+}
+
+/// The artifact's one-time entry point: nothing is one-time here.
+///
+/// Every resource and system the shell owns is re-claimed by [`register`] on
+/// each generation, which is exactly what a reload has to repeat. This function
+/// exists because a statically linked build loads the module once and calls
+/// this entry point alone, and because the generated
+/// `host_module_pill_editor_shell_egui_editor` wrapper carries it as
+/// `pill_module_init`.
+#[pill_module(register = register)]
+pub fn init(engine: &mut Engine) -> u32 {
+    register(engine)
 }
 
 // =============================================================================

@@ -23,10 +23,8 @@
 // Standard library
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "hot_patch")]
 use std::sync::mpsc;
 use std::sync::Arc;
-#[cfg(feature = "hot_patch")]
 use std::thread;
 
 // External crates
@@ -37,7 +35,6 @@ use pill_core::utils::format_error_chain;
 use pill_core::warn;
 use pill_core::{error, info};
 // The fast path's own reports: patch outcomes, rollback requests, generations.
-#[cfg(feature = "hot_patch")]
 use pill_core::telemetry::{log_block_colored, Colorize};
 use pill_engine::Engine;
 use pill_engine::EngineApi;
@@ -55,7 +52,6 @@ use crate::asset_watcher::AssetChange;
 use crate::config::project_depends_on_crate;
 use crate::csharp::{BuildCollection, BuildOutcome, BuildReport, ModuleExposedComponent};
 use crate::extension::{ExtensionSlot, ReloadOutcome};
-#[cfg(feature = "hot_patch")]
 use crate::hot_patch::{BeginOutcome, PatchOutcome};
 use crate::native_library::cleanup_temporary_files;
 use crate::notices::{self, HostNotice};
@@ -94,7 +90,6 @@ const SHADER_CHANGE_REFUSED: u32 = u32::MAX;
 ///
 /// The file is removed before the request is acted on, so a request is
 /// honoured exactly once.
-#[cfg(feature = "hot_patch")]
 const ROLLBACK_REQUEST_FILE: &str = "target/hot/rollback.request";
 
 // =============================================================================
@@ -205,14 +200,12 @@ pub struct DevHost {
     /// `None` when the feature is off, when no function is annotated, or when
     /// the project does not also build an `rlib`. In all three cases the
     /// existing whole-module reload stays the only path.
-    #[cfg(feature = "hot_patch")]
     hot_patch: Option<crate::hot_patch::HotPatchSession>,
     /// Per-function fast path for each extension, positionally paired
     /// with `extensions`.
     ///
     /// An entry is `None` when that module annotated nothing, so a module that
     /// has not opted in costs nothing beyond one source scan at startup.
-    #[cfg(feature = "hot_patch")]
     module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>>,
     /// The patch build running on its own thread, when one is.
     ///
@@ -220,7 +213,6 @@ pub struct DevHost {
     /// rlibs the build links against, and a second attempt would race the
     /// first for the same pending edit. The compile runs off the frame loop,
     /// which is the reason the thread exists.
-    #[cfg(feature = "hot_patch")]
     patch_attempt: Option<InFlightPatch>,
     /// Every patch library loaded in this process, newest last.
     ///
@@ -229,7 +221,6 @@ pub struct DevHost {
     /// redirect the copies inside another crate's patches. They are never
     /// unloaded, because a jump or a slot may point into any of them for the
     /// rest of the run.
-    #[cfg(feature = "hot_patch")]
     loaded_patches: Vec<crate::hot_patch::LoadedPatch>,
     /// Watches the project's `res` and queues the assets whose source or
     /// metadata file changed; `None` when no asset directory is configured or
@@ -260,6 +251,14 @@ pub struct DevHost {
     /// every frame without a reload. It only says that the set of loaded code
     /// changed.
     editor_revision: u64,
+    /// What this run's watchers are allowed to do, read once at startup.
+    switches: crate::switches::HostSwitches,
+    /// Whether the startup line about switched-off patching has been written.
+    ///
+    /// The fast path is asked on every frame, and the answer only changes once
+    /// per run, so the message belongs to the first edit rather than to a log
+    /// that scrolls.
+    patch_switched_off_logged: bool,
 }
 
 impl DevHost {
@@ -268,7 +267,6 @@ impl DevHost {
     /// Generation zero - the code each artifact was built with - has no entry
     /// because it needs no loaded library; [`Self::rollback_patch`] still
     /// accepts it.
-    #[cfg(feature = "hot_patch")]
     pub fn patch_generations(&self) -> Vec<crate::hot_patch::PatchGeneration> {
         let mut all = Vec::new();
         if let Some(session) = &self.hot_patch {
@@ -295,7 +293,6 @@ impl DevHost {
     /// generation does not exist, or when an artifact refuses the address. A
     /// slot route leaves the running implementation in place; a prologue route
     /// that fails partway leaves the copies it already rewrote as it put them.
-    #[cfg(feature = "hot_patch")]
     pub fn rollback_patch(&mut self, function: &str, generation: u32) -> Result<(), String> {
         let DevHost {
             hot_patch,
@@ -402,11 +399,9 @@ impl DevHost {
     /// sleeping heartbeat takes a frame when one does, so an edit reaches a
     /// paused, idle editor without user input.
     pub fn source_work_pending(&self) -> bool {
-        #[cfg(feature = "hot_patch")]
         if self.patch_attempt.is_some() {
             return true;
         }
-        #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         if self
             .extensions
             .iter()
@@ -473,33 +468,41 @@ impl DevHost {
             crate::reload::FirstLoadFailure::ClearGenerationData,
         ) {
             Ok(slot) => {
-                if let Err(error) = spawn_source_watcher(
-                    self.workspace_root.clone(),
-                    &pending.config.name,
-                    &pending.config.watch_directory,
-                    Arc::clone(&pending.source_edit_generation),
-                    None,
-                ) {
-                    // The module works; only its watcher failed to start, so
-                    // a later edit will not reload it until a restart. Keep
-                    // the module - the retry's purpose is the working load.
-                    warn!(
-                        target: telemetry_target::HOT_RELOAD,
-                        module = pending.config.name.as_str(),
-                        error = %error,
-                        "the module loaded, but its source watcher did not start"
-                    );
+                if self.switches.hot_reloading {
+                    if let Err(error) = spawn_source_watcher(
+                        self.workspace_root.clone(),
+                        &pending.config.name,
+                        &pending.config.watch_directory,
+                        Arc::clone(&pending.source_edit_generation),
+                        None,
+                    ) {
+                        // The module works; only its watcher failed to start, so
+                        // a later edit will not reload it until a restart. Keep
+                        // the module - the retry's purpose is the working load.
+                        warn!(
+                            target: telemetry_target::HOT_RELOAD,
+                            module = pending.config.name.as_str(),
+                            error = %error,
+                            "the module loaded, but its source watcher did not start"
+                        );
+                    }
                 }
                 self.extensions.push(slot);
-                #[cfg(feature = "hot_patch")]
-                self.module_hot_patch
-                    .push(crate::hot_patch::HotPatchSession::new(
+                // With patching switched off the slot stays empty: the fast
+                // path has nothing to build against, so the module's edits go
+                // to the reload below instead.
+                let module_patch_session = if self.switches.function_hot_patching {
+                    crate::hot_patch::HotPatchSession::new(
                         &self.workspace_root,
                         &pending.config.name,
                         &pending.config.watch_directory,
                         &pending.config.output_subdirectory,
                         &pending.config.build_command,
-                    ));
+                    )
+                } else {
+                    None
+                };
+                self.module_hot_patch.push(module_patch_session);
                 // The module moved out of the pending set into the loaded one
                 // under the owner it reserved; the set as a whole must still be
                 // one owner per subject.
@@ -1566,7 +1569,6 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     // `extensions`, because the frame's fast path reads both lists by the same
     // index. A module whose first load failed - or waits for a retry - has
     // none until it loads.
-    #[cfg(feature = "hot_patch")]
     let mut module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>> = Vec::new();
     for (index, extension_config) in host_config.extensions.iter().enumerate() {
         let module_generation = Arc::new(AtomicU64::new(0));
@@ -1610,24 +1612,32 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
                 return Err(fail_setup(runtime, error));
             }
         };
-        if let Err(error) = spawn_source_watcher(
-            workspace_root.clone(),
-            &extension_config.name,
-            &extension_config.watch_directory,
-            module_generation,
-            None,
-        ) {
-            return Err(fail_setup(runtime, error.into()));
+        // A run with source watching switched off still loads the extension:
+        // the switch stops the watcher, not the posture.
+        if switches.hot_reloading {
+            if let Err(error) = spawn_source_watcher(
+                workspace_root.clone(),
+                &extension_config.name,
+                &extension_config.watch_directory,
+                module_generation,
+                None,
+            ) {
+                return Err(fail_setup(runtime, error.into()));
+            }
         }
         extensions.push(slot);
-        #[cfg(feature = "hot_patch")]
-        module_hot_patch.push(crate::hot_patch::HotPatchSession::new(
-            &workspace_root,
-            &extension_config.name,
-            &extension_config.watch_directory,
-            &extension_config.output_subdirectory,
-            &extension_config.build_command,
-        ));
+        let module_patch_session = if switches.function_hot_patching {
+            crate::hot_patch::HotPatchSession::new(
+                &workspace_root,
+                &extension_config.name,
+                &extension_config.watch_directory,
+                &extension_config.output_subdirectory,
+                &extension_config.build_command,
+            )
+        } else {
+            None
+        };
+        module_hot_patch.push(module_patch_session);
     }
     // By now every extension has declared the read-only resource folders it
     // ships. Check them here, not inside the module initialization, which runs
@@ -1691,14 +1701,22 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
 
     let source_edit_generation = Arc::new(AtomicU64::new(0));
     let source_trigger_log = Arc::new(crate::watcher::TriggerLog::new());
-    if let Err(error) = spawn_source_watcher(
-        workspace_root.clone(),
-        &project_module_config.name,
-        &project_module_config.watch_directory,
-        Arc::clone(&source_edit_generation),
-        Some(Arc::clone(&source_trigger_log)),
-    ) {
-        return Err(fail_setup(runtime, error.into()));
+    if switches.hot_reloading {
+        if let Err(error) = spawn_source_watcher(
+            workspace_root.clone(),
+            &project_module_config.name,
+            &project_module_config.watch_directory,
+            Arc::clone(&source_edit_generation),
+            Some(Arc::clone(&source_trigger_log)),
+        ) {
+            return Err(fail_setup(runtime, error.into()));
+        }
+    } else {
+        info!(
+            target: telemetry_target::ENGINE,
+            variable = crate::switches::HOT_RELOADING_VARIABLE,
+            "source watching is switched off; edits are not noticed until the host restarts"
+        );
     }
 
     // Import the project's source assets when its settings ask for it, once
@@ -1729,25 +1747,32 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     );
 
     // Say how to drive rollback, once, next to where the fast path announces
-    // itself - an interface nothing mentions is one nobody uses.
-    #[cfg(feature = "hot_patch")]
-    info!(
-        target: telemetry_target::HOT_RELOAD,
-        "Patch rollback: write `function@generation`, `function@previous` or `list` to {}",
-        ROLLBACK_REQUEST_FILE
-    );
+    // itself - an interface nothing mentions is one nobody uses. Rollback only
+    // exists for patches, so it is not mentioned when patching is off.
+    if switches.function_hot_patching {
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            "Patch rollback: write `function@generation`, `function@previous` or `list` to {}",
+            ROLLBACK_REQUEST_FILE
+        );
+    }
 
     // Arm the per-function fast path. It reads the project's sources for
     // `#[pill_hot]` annotations and returns `None` when there is nothing to do,
-    // so a project that has not opted in pays nothing.
-    #[cfg(feature = "hot_patch")]
-    let hot_patch = crate::hot_patch::HotPatchSession::new(
-        &workspace_root,
-        &project_module_config.name,
-        &project_module_config.watch_directory,
-        crate::build_runner::PROJECT_HOT_OUTPUT_SUBDIRECTORY,
-        &project_module_config.build_command,
-    );
+    // so a project that has not opted in pays nothing. A run with patching
+    // switched off arms no session at all: the fast path then has nothing to
+    // build against and every edit takes the reload below.
+    let hot_patch = if switches.function_hot_patching {
+        crate::hot_patch::HotPatchSession::new(
+            &workspace_root,
+            &project_module_config.name,
+            &project_module_config.watch_directory,
+            crate::build_runner::PROJECT_HOT_OUTPUT_SUBDIRECTORY,
+            &project_module_config.build_command,
+        )
+    } else {
+        None
+    };
 
     // The per-extension fast path's sessions were built with the slots they
     // mirror (see the load loop). The fast path reads `module_hot_patch` beside
@@ -1784,21 +1809,22 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         last_processed_queued_reload: 0,
         source_trigger_log,
         stale_suspended_owners: Vec::new(),
-        #[cfg(feature = "hot_patch")]
         hot_patch,
-        #[cfg(feature = "hot_patch")]
         module_hot_patch,
-        #[cfg(feature = "hot_patch")]
         patch_attempt: None,
-        #[cfg(feature = "hot_patch")]
         loaded_patches: Vec::new(),
-        asset_watcher: start_asset_watcher(host_config.asset_directory.as_deref()),
+        asset_watcher: start_asset_watcher(
+            host_config.asset_directory.as_deref(),
+            switches.assets_hot_reloading,
+        ),
         asset_directory: host_config.asset_directory.clone(),
         settings_watcher: start_settings_watcher(host_config.settings_directory.as_deref()),
         settings_directory: host_config.settings_directory.clone(),
         manager_settings_editor_revision: 0,
         ensure_asset_metadata: false,
         editor_revision: 0,
+        switches,
+        patch_switched_off_logged: false,
     };
 
     #[cfg(debug_assertions)]
@@ -1925,6 +1951,14 @@ fn unsupported_render_components(
 /// reload; nothing else depends on it.
 #[cfg(feature = "rendering")]
 fn start_shader_watcher(host: &DevHost) -> Option<crate::shader_watcher::ShaderWatcher> {
+    if !host.switches.assets_hot_reloading {
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            variable = crate::switches::ASSETS_HOT_RELOADING_VARIABLE,
+            "shader hot reloading is switched off; shader edits are not noticed until the host restarts"
+        );
+        return None;
+    }
     let data = format!(
         "{}{}",
         host.renderer.as_deref()?,
@@ -1967,6 +2001,14 @@ type RendererModule = crate::renderer_module::RendererModule;
 /// shaders it already loaded.
 #[cfg(feature = "rendering")]
 fn start_project_shader_watcher(host: &DevHost) -> Option<crate::shader_watcher::ShaderWatcher> {
+    if !host.switches.assets_hot_reloading {
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            variable = crate::switches::ASSETS_HOT_RELOADING_VARIABLE,
+            "project shader hot reloading is switched off; shader edits are not noticed until the host restarts"
+        );
+        return None;
+    }
     let shaders_directory = host.asset_directory()?.to_owned();
     let tree_label = host.project_module_config.name.clone();
     match crate::shader_watcher::ShaderWatcher::spawn(&tree_label, shaders_directory) {
@@ -2122,7 +2164,6 @@ where
 /// The active generation of every function goes too. The rebuilt artifact
 /// ships its own body, and an entry left behind would name a generation that
 /// is not running. Calling it twice is safe.
-#[cfg(feature = "hot_patch")]
 fn forget_prologue_records(host: &mut DevHost) {
     if let Some(session) = host.hot_patch.as_mut() {
         session.forget_prologue_patches();
@@ -2132,26 +2173,16 @@ fn forget_prologue_records(host: &mut DevHost) {
     }
 }
 
-/// See the `hot_patch` version above; without the feature nothing is recorded.
-#[cfg(not(feature = "hot_patch"))]
-fn forget_prologue_records(_host: &mut DevHost) {}
-
 /// Arm the thread that owns the frame boundary as the only one allowed to
 /// rewrite live code.
 ///
 /// Declared per frame rather than at setup because setup may run on a different
 /// thread; idempotent, and a single relaxed load once declared.
-#[cfg(feature = "hot_patch")]
 fn arm_patching_thread() {
     pill_engine::hot_patch::declare_patching_thread();
 }
 
-/// See the `hot_patch` version above; without the feature nothing patches.
-#[cfg(not(feature = "hot_patch"))]
-fn arm_patching_thread() {}
-
 /// Which session an in-flight patch build belongs to.
-#[cfg(feature = "hot_patch")]
 #[derive(Clone, Copy)]
 enum PatchSubject {
     /// The project's own session.
@@ -2167,7 +2198,6 @@ enum PatchSubject {
 /// arrives. The thread is joined on collection, on teardown, and nowhere else -
 /// a build that outlived its host would be a thread still running code that is
 /// about to be unloaded.
-#[cfg(feature = "hot_patch")]
 struct InFlightPatch {
     /// Which session the build is for, and who consumes its pending
     /// generation once the patch is live.
@@ -2185,7 +2215,6 @@ struct InFlightPatch {
     thread: Option<thread::JoinHandle<()>>,
 }
 
-#[cfg(feature = "hot_patch")]
 impl Drop for InFlightPatch {
     fn drop(&mut self) {
         if let Some(thread) = self.thread.take() {
@@ -2199,7 +2228,6 @@ impl Drop for InFlightPatch {
 /// The attempt travels through its own channel rather than the closure's
 /// capture. A thread that cannot start therefore leaves it here to build
 /// inline, instead of losing it with the closure.
-#[cfg(feature = "hot_patch")]
 fn start_patch_build(
     attempt: crate::hot_patch::PatchAttempt,
     subject: PatchSubject,
@@ -2260,7 +2288,6 @@ fn start_patch_build(
 ///
 /// The second element is the attempt's own start, so this frame's analytics
 /// total can span the build. It is `None` when nothing was collected.
-#[cfg(feature = "hot_patch")]
 fn advance_patch_attempt(host: &mut DevHost) -> (bool, Option<Instant>) {
     let Some(mut in_flight) = host.patch_attempt.take() else {
         return (false, None);
@@ -2344,21 +2371,29 @@ fn advance_patch_attempt(host: &mut DevHost) -> (bool, Option<Instant>) {
     (!patched, Some(attempt_started))
 }
 
-/// See the `hot_patch` version above; without the feature nothing is built.
-#[cfg(not(feature = "hot_patch"))]
-fn advance_patch_attempt(_host: &mut DevHost) -> (bool, Option<Instant>) {
-    (false, None)
-}
-
 /// Whether a patch build is running on its own thread right now.
-#[cfg(feature = "hot_patch")]
 fn patch_attempt_in_flight(host: &DevHost) -> bool {
     host.patch_attempt.is_some()
 }
 
-/// See the `hot_patch` version above; without the feature there is none.
-#[cfg(not(feature = "hot_patch"))]
-fn patch_attempt_in_flight(_host: &DevHost) -> bool {
+/// Whether the patch fast path may run for this edit.
+///
+/// `PILL_FUNCTION_HOT_PATCHING=0` turns it off for the whole run: every watched
+/// edit is left to the rebuild-and-reload path, which is what makes a
+/// breakpoint in a system body keep binding. The answer is the same on every
+/// frame, so it is said once, when the first edit asks.
+fn fast_patching_allowed(host: &mut DevHost) -> bool {
+    if host.switches.function_hot_patching {
+        return true;
+    }
+    if !host.patch_switched_off_logged {
+        host.patch_switched_off_logged = true;
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            variable = crate::switches::FUNCTION_HOT_PATCHING_VARIABLE,
+            "per-function hot patching is switched off; a watched edit rebuilds and reloads instead"
+        );
+    }
     false
 }
 
@@ -2374,8 +2409,10 @@ fn patch_attempt_in_flight(_host: &DevHost) -> bool {
 ///
 /// A no-op without the `hot_patch` feature, so the frame loop reads the same in
 /// both configurations rather than carrying a `cfg` of its own.
-#[cfg(feature = "hot_patch")]
 fn try_module_fast_path(host: &mut DevHost, may_start: bool) {
+    if !fast_patching_allowed(host) {
+        return;
+    }
     // `may_start` is false for the frame that just collected a failed build:
     // the reload below owes the edit, and a fresh attempt would race it
     // forever.
@@ -2431,18 +2468,16 @@ fn try_module_fast_path(host: &mut DevHost, may_start: bool) {
     }
 }
 
-/// See the `hot_patch` version above; without the feature there is no fast path.
-#[cfg(not(feature = "hot_patch"))]
-fn try_module_fast_path(_host: &mut DevHost, _may_start: bool) {}
-
 /// Try to deliver a pending project edit by patching, not rebuilding.
 ///
 /// This runs at a frame boundary. Reloads are already processed here, before
 /// `process_frame`, so no system is executing while a dispatch slot is written.
 /// A successful patch marks the pending generation handled, which is what skips
 /// the full rebuild. Anything refused falls through to it.
-#[cfg(feature = "hot_patch")]
 fn try_project_fast_path(host: &mut DevHost, may_start: bool) {
+    if !fast_patching_allowed(host) {
+        return;
+    }
     // As in the module path, a frame that just collected a failed build lets
     // the reload below deliver the edit instead of racing it.
     if !may_start || host.patch_attempt.is_some() {
@@ -2491,10 +2526,6 @@ fn try_project_fast_path(host: &mut DevHost, may_start: bool) {
     }
 }
 
-/// See the `hot_patch` version above; without the feature there is no fast path.
-#[cfg(not(feature = "hot_patch"))]
-fn try_project_fast_path(_host: &mut DevHost, _may_start: bool) {}
-
 /// Take a new baseline snapshot for every subject a reload has just rebuilt.
 ///
 /// The fast path decides whether an edit is "body-only" by comparing the file
@@ -2510,7 +2541,6 @@ fn try_project_fast_path(_host: &mut DevHost, _may_start: bool) {}
 /// Call this after the reload, so a save that arrives during the build is not
 /// folded into the baseline. That save has already increased the generation
 /// counter, and the next frame gives it its own reload.
-#[cfg(feature = "hot_patch")]
 fn resync_patch_baselines(
     host: &mut DevHost,
     project_rebuilt: bool,
@@ -2526,15 +2556,6 @@ fn resync_patch_baselines(
             session.refresh_snapshots();
         }
     }
-}
-
-/// See the `hot_patch` version above; without the feature there is no baseline.
-#[cfg(not(feature = "hot_patch"))]
-fn resync_patch_baselines(
-    _host: &mut DevHost,
-    _project_rebuilt: bool,
-    _reloaded_module_indices: &[usize],
-) {
 }
 
 /// What `regenerate_module_csharp_mirror` hands back. It carries the exposed
@@ -3277,7 +3298,16 @@ pub(crate) fn run_reload_phase(host: &mut DevHost) -> Vec<String> {
 /// sitting there unimported.
 fn start_asset_watcher(
     asset_directory: Option<&Path>,
+    assets_hot_reloading: bool,
 ) -> Option<crate::asset_watcher::AssetWatcher> {
+    if !assets_hot_reloading {
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            variable = crate::switches::ASSETS_HOT_RELOADING_VARIABLE,
+            "[assets] asset hot reloading is switched off; asset edits are not noticed until the host restarts"
+        );
+        return None;
+    }
     let asset_directory = asset_directory?;
     if !asset_directory.is_dir() {
         if let Err(error) = std::fs::create_dir_all(asset_directory) {
@@ -3574,7 +3604,6 @@ pub(crate) fn run_frame_phase(host: &mut DevHost, frame_start: Instant) {
 /// Called at the frame boundary, where no system is executing. That is the
 /// same guarantee a patch install relies on, and it is a requirement rather
 /// than a convenience for the prologue route, which rewrites live code.
-#[cfg(feature = "hot_patch")]
 fn process_rollback_request(host: &mut DevHost) {
     let request_path = host.workspace_root.join(ROLLBACK_REQUEST_FILE);
     let Ok(request) = std::fs::read_to_string(&request_path) else {
@@ -3658,16 +3687,10 @@ fn process_rollback_request(host: &mut DevHost) {
     }
 }
 
-/// See the `hot_patch` version above; without the feature there is nothing to
-/// roll back to.
-#[cfg(not(feature = "hot_patch"))]
-fn process_rollback_request(_host: &mut DevHost) {}
-
 /// The generation a rollback naming `previous` resolves to for `function`.
 ///
 /// `None` when the function has no recorded generations at all, which is what
 /// a refusal reads as.
-#[cfg(feature = "hot_patch")]
 fn previous_patch_generation(host: &DevHost, function: &str) -> Option<u32> {
     host.patch_generations()
         .iter()
@@ -3690,7 +3713,6 @@ fn previous_patch_generation(host: &DevHost, function: &str) -> Option<u32> {
 /// the code the running artifact was built with. Nothing retries the rejected
 /// patch: the edit counted as handled when the patch was applied, so the
 /// function stays on the working generation until the next source edit.
-#[cfg(feature = "hot_patch")]
 fn process_patch_faults(host: &mut DevHost) {
     for report in pill_engine::hot_patch::take_fault_reports() {
         let function = report.function;
@@ -3729,16 +3751,10 @@ fn process_patch_faults(host: &mut DevHost) {
     }
 }
 
-/// See the `hot_patch` version above; without the feature there is no dispatch
-/// slot to count panics in.
-#[cfg(not(feature = "hot_patch"))]
-fn process_patch_faults(_host: &mut DevHost) {}
-
 /// Print every generation this session has installed.
 ///
 /// Rollback is unusable without it. The request needs a number, and nothing
 /// else in the host ever reports which numbers exist.
-#[cfg(feature = "hot_patch")]
 fn print_patch_generations(host: &DevHost) {
     let generations = host.patch_generations();
     if generations.is_empty() {
@@ -3784,7 +3800,6 @@ fn print_patch_generations(host: &DevHost) {
 /// Retired generations are deliberately left out. They stay mapped only so
 /// outstanding pointers into their code remain valid, and their systems have
 /// already been cleared, so nothing calls their copy of the function.
-#[cfg(feature = "hot_patch")]
 fn patch_targets<'a>(
     loaded_project: &'a LoadedProject,
     extensions: &'a [ExtensionSlot],
@@ -3803,7 +3818,6 @@ fn patch_targets<'a>(
 ///
 /// `true` means the edit is live and the pending reload has nothing left to do.
 /// Every other outcome falls through to the normal rebuild.
-#[cfg(feature = "hot_patch")]
 fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
     match outcome {
         crate::hot_patch::PatchOutcome::Patched {

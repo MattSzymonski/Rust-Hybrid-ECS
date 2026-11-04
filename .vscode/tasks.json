@@ -25,27 +25,23 @@
             "group": "build"
         },
         {
-            // Same build with per-function hot patching disabled. Use this
-            // when setting breakpoints inside registered systems: with
-            // `hot_patch` on, a system dispatches through a replaceable slot
-            // and a patched implementation runs at a new address, so a
-            // breakpoint bound to the original body stops being hit.
-            "label": "build standalone (debug, no hot patch)",
-            "type": "shell",
-            "command": "cargo",
-            "args": [
-                "build",
-                "--package",
-                "pill_standalone",
-                "--no-default-features",
-                "--features",
-                "hot_reload,rendering",
-                "--offline"
-            ],
+            // The windowed host with per-function hot patching switched off. Use
+            // this when setting breakpoints inside registered systems: a patched
+            // implementation runs at a new address, so a breakpoint bound to the
+            // original body stops being hit. Patching is a startup switch now, so
+            // this is the ordinary build plus `PILL_FUNCTION_HOT_PATCHING=0`.
+            "label": "run standalone (debug, hot patching off)",
+            "type": "process",
+            "command": "${workspaceFolder}/modules/target/debug/pill_standalone.exe",
+            "dependsOn": "build standalone (debug)",
+            "isBackground": true,
             "options": {
-                "cwd": "${workspaceFolder}/modules"
-            },
-            "group": "build"
+                "cwd": "${workspaceFolder}/modules",
+                "env": {
+                    "PROJECT_PATH": "../devops/tests/projects/native",
+                    "PILL_FUNCTION_HOT_PATCHING": "0"
+                }
+            }
         },
         {
             // Start the windowed host on the C# example with everything the

@@ -30,7 +30,6 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 // External crates
-#[cfg(feature = "hot_patch")]
 use pill_core::debug;
 use pill_core::error::BuildError;
 use pill_core::info;
@@ -168,13 +167,11 @@ const ARTIFACT_STAMP_DIRECTORY: &str = "pill_standalone_temp/artifact_stamps";
 /// `pill_engine` - but it still belongs here: a windowed host loads the wgpu
 /// renderer beside its engine dylibs, and a cached artifact is only trusted
 /// for the posture it was built for.
-const HOST_MODULE_FEATURE_SET: &str =
-    match (cfg!(feature = "rendering"), cfg!(feature = "hot_patch")) {
-        (true, true) => "rendering+hot_patch",
-        (true, false) => "rendering",
-        (false, true) => "no-rendering+hot_patch",
-        (false, false) => "no-rendering",
-    };
+const HOST_MODULE_FEATURE_SET: &str = if cfg!(feature = "rendering") {
+    "rendering+hot_patch"
+} else {
+    "no-rendering+hot_patch"
+};
 
 /// The host's profiling level.
 ///
@@ -244,9 +241,7 @@ fn host_build_identity() -> String {
 /// reports exactly the posture the running binary was built with.
 fn host_engine_features() -> Vec<&'static str> {
     let mut features = Vec::new();
-    if cfg!(feature = "hot_patch") {
-        features.push("pill_engine/hot_patch");
-    }
+    features.push("pill_engine/hot_patch");
     if cfg!(feature = "profiling-fine") {
         features.push("pill_engine/profiling-fine");
     } else if cfg!(feature = "profiling-verify") {
@@ -584,10 +579,7 @@ fn is_editor_anchor(package_name: &str) -> bool {
 /// They pick the anchor's feature selection for a build that is anchored: an
 /// editor host, or a host started by the dioxus CLI.
 fn host_posture_features() -> Vec<&'static str> {
-    let mut features = vec!["dev"];
-    if cfg!(feature = "hot_patch") {
-        features.push("hot_patch");
-    }
+    let mut features = vec!["dev", "hot_patch"];
     if cfg!(feature = "rendering") {
         features.push("rendering");
     }
@@ -701,7 +693,6 @@ fn collect_member_manifests(directory: &Path, depth: usize, manifests: &mut Vec<
 /// the console still streams - minus the `Running`, `Fresh` and `Dirty` lines
 /// `-v` adds. Colour is requested explicitly when the host's own stderr is a
 /// terminal, because cargo turns it off for a pipe.
-#[cfg(feature = "hot_patch")]
 struct VerboseCapture {
     /// The crate names to look for: the modules that one invocation builds.
     crate_names: Vec<String>,
@@ -712,7 +703,6 @@ struct VerboseCapture {
     reader: Option<std::thread::JoinHandle<Vec<(String, crate::hot_patch::CargoRustcLine)>>>,
 }
 
-#[cfg(feature = "hot_patch")]
 impl VerboseCapture {
     /// Makes `command` a verbose build whose stderr is read through a pipe, for
     /// cargo only.
@@ -845,7 +835,6 @@ impl VerboseCapture {
 /// label whenever the host's stderr is a terminal. Matching the raw prefix
 /// would silently stop filtering in exactly the case a person is watching, and
 /// dump every multi-kilobyte `rustc` command line into the console.
-#[cfg(feature = "hot_patch")]
 fn is_verbose_only_line(line: &str) -> bool {
     let plain = without_ansi(line);
     let label = plain.trim_start();
@@ -859,7 +848,6 @@ fn is_verbose_only_line(line: &str) -> bool {
 /// Cargo colours the status word alone, so escapes sit both before and
 /// immediately after the word being matched. Dropping only the leading ones
 /// still leaves `Running<ESC>[0m `, which matches nothing.
-#[cfg(feature = "hot_patch")]
 fn without_ansi(line: &str) -> String {
     let mut plain = String::with_capacity(line.len());
     let mut rest = line;
@@ -1280,24 +1268,17 @@ pub(crate) fn run_build_command(
     }
     // Ask this build to say which rustc invocation it used, so the fast patch
     // pipeline never has to run a build of its own to find out.
-    #[cfg(feature = "hot_patch")]
     let capture_crate_names: Vec<&str> = capture_entries
         .into_iter()
         .flatten()
         .map(|(captured_name, _)| *captured_name)
         .collect();
-    #[cfg(feature = "hot_patch")]
     let verbose_capture =
         VerboseCapture::arm(&mut command, program, &capture_crate_names, workspace_root);
-    #[cfg(not(feature = "hot_patch"))]
-    let _ = capture_entries;
     // A cargo build without the capture still copies its stderr into the ring
     // buffer, because a failed build's notice is built from it. A child that
     // inherits the stream outright loses the text once the terminal scrolls.
-    #[cfg(feature = "hot_patch")]
     let stderr_reader_needed = verbose_capture.is_none() && program == "cargo";
-    #[cfg(not(feature = "hot_patch"))]
-    let stderr_reader_needed = program == "cargo";
     if stderr_reader_needed {
         command.stderr(std::process::Stdio::piped());
     }
@@ -1314,7 +1295,6 @@ pub(crate) fn run_build_command(
     // Started before the watchdog loop, because cargo's stderr has to be
     // drained while the build runs; otherwise the pipe fills and the compiler
     // blocks forever.
-    #[cfg(feature = "hot_patch")]
     let verbose_capture = verbose_capture.map(|verbose_capture| verbose_capture.start(&mut child));
     let stderr_reader = if stderr_reader_needed {
         tee_stderr(&mut child)
@@ -1376,7 +1356,6 @@ pub(crate) fn run_build_command(
         if let Some(stderr_reader) = stderr_reader {
             let _ = stderr_reader.join();
         }
-        #[cfg(feature = "hot_patch")]
         if let Some(verbose_capture) = verbose_capture {
             verbose_capture.abandon();
         }
@@ -1391,7 +1370,6 @@ pub(crate) fn run_build_command(
     // Cache the compiler line only after a successful build. A failed build may
     // have recompiled the crate with flags that never produced the artifact now
     // on disk.
-    #[cfg(feature = "hot_patch")]
     if let Some(verbose_capture) = verbose_capture {
         verbose_capture.finish(capture_entries.unwrap_or(&[]));
     }
@@ -1413,7 +1391,6 @@ pub(crate) fn run_build_command(
 ///
 /// When the targets file is missing, the command is returned unchanged. The
 /// fast reload path then costs more, and nothing else changes.
-#[cfg(feature = "hot_reload")]
 fn with_compiler_argument_capture(
     workspace_root: &Path,
     project_config: &ProjectModuleConfig,
@@ -1446,7 +1423,6 @@ fn with_compiler_argument_capture(
 ///
 /// Returns [`BuildError::OutputMissing`] when the compiler project or its output
 /// assembly is absent, or whatever [`run_build_command`] reports.
-#[cfg(feature = "hot_reload")]
 pub(crate) fn build_csharp_compiler(workspace_root: &Path) -> Result<PathBuf, BuildError> {
     let manifest_path = workspace_root.join(crate::config::CSHARP_COMPILER_MANIFEST);
     if !manifest_path.is_file() {
@@ -1568,10 +1544,7 @@ pub(crate) fn build_project_module(
     // A managed build also records the compiler command line MSBuild computed,
     // so a later hot reload can replay it in-process instead of running MSBuild
     // again. See `crate::csharp::fast_compile`.
-    #[cfg(feature = "hot_reload")]
     let build_command = with_compiler_argument_capture(workspace_root, project_config);
-    #[cfg(not(feature = "hot_reload"))]
-    let build_command = project_config.build_command.clone();
 
     // The startup batch may already have built this project with the same flags
     // (see [`build_extension_batch`]). The token covers that first load only: a
@@ -1779,21 +1752,18 @@ fn stage_engine_dylib(workspace_root: &Path) {
 fn stage_build_outputs(
     workspace_root: &Path,
     library_paths: (&Path, &Path),
-    #[cfg_attr(not(feature = "hot_patch"), allow(unused_variables))] rlib: Option<(&Path, &Path)>,
-    #[cfg_attr(not(feature = "hot_patch"), allow(unused_variables))] require_rlib: bool,
+    rlib: Option<(&Path, &Path)>,
+    require_rlib: bool,
 ) -> Result<Vec<PathBuf>, BuildError> {
     let (build_output, hot_output) = library_paths;
     stage_artifact(build_output, hot_output)?;
 
     // The build just produced a consistent set in `deps`. Take the copies now,
     // before anything else can write to those shared per-crate slots.
-    #[cfg(feature = "hot_patch")]
     stage_shared_dependency_rlibs(workspace_root);
 
-    #[cfg_attr(not(feature = "hot_patch"), allow(unused_mut))]
     let mut staged_artifacts = vec![hot_output.to_path_buf()];
 
-    #[cfg(feature = "hot_patch")]
     if let Some((rlib_build_output, rlib_output)) = rlib {
         if require_rlib || rlib_build_output.is_file() {
             stage_artifact(rlib_build_output, rlib_output)?;
@@ -1859,7 +1829,6 @@ pub(crate) fn newest_extension_rlib(build_directory: &Path, package_name: &str) 
 ///
 /// It is a subdirectory of the hot-load directory, private to the host for the
 /// same reason the staged artifacts are.
-#[cfg(feature = "hot_patch")]
 pub(crate) const STAGED_DEPENDENCY_SUBDIRECTORY: &str = "target/hot/deps";
 
 /// Copies every shared per-crate rlib out of cargo's `deps` directory.
@@ -1879,7 +1848,6 @@ pub(crate) const STAGED_DEPENDENCY_SUBDIRECTORY: &str = "target/hot/deps";
 /// [`stage_artifact`] gives the module's own rlib, extended to what it links
 /// against. Only out-of-date copies are made, and a failed copy is skipped rather
 /// than treated as fatal.
-#[cfg(feature = "hot_patch")]
 pub(crate) fn stage_shared_dependency_rlibs(workspace_root: &Path) -> usize {
     let source_directory = workspace_root
         .join(cargo_module_output_subdirectory())
@@ -1936,7 +1904,6 @@ pub(crate) fn stage_shared_dependency_rlibs(workspace_root: &Path) -> usize {
 /// (`hot_patch::compile`) and [`stage_shared_dependency_rlibs`] must agree about
 /// which files are shared. Otherwise a file can be staged and never linked, or
 /// linked and never staged, so both call this one implementation.
-#[cfg(feature = "hot_patch")]
 pub(crate) fn is_shared_slot_rlib(file_name: &str) -> bool {
     let Some(stem) = file_name.strip_suffix(".rlib") else {
         return false;
@@ -1955,7 +1922,6 @@ pub(crate) fn is_shared_slot_rlib(file_name: &str) -> bool {
 /// Their crate names all carry a generated prefix. Nothing links the rlib of a
 /// wrapper or of a generated project member, so the dependency staging skips them
 /// instead of copying files no patch can use.
-#[cfg(feature = "hot_patch")]
 fn is_generated_member_rlib(file_name: &str) -> bool {
     let stem = file_name.strip_suffix(".rlib").unwrap_or(file_name);
     let stem = stem.strip_prefix("lib").unwrap_or(stem);
@@ -2185,7 +2151,7 @@ fn take_batch_validation(module_name: &str, watch_directory: &Path) -> bool {
 ///
 /// The renderer's rebuild request uses this. A reloaded data crate makes the
 /// artifact the batch built stale even though no renderer source changed.
-#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+#[cfg(feature = "rendering")]
 pub(crate) fn forget_batch_validation(module_name: &str) {
     with_batch_validation(|validation_slot| {
         if let Some(validation) = validation_slot.as_mut() {
@@ -2814,7 +2780,6 @@ dependency = { path = "../dependency" }
     /// exactly when a person is reading the console. A filter that matched only
     /// the uncoloured spelling would dump every multi-kilobyte `rustc` command
     /// line in front of the person it was meant to spare.
-    #[cfg(feature = "hot_patch")]
     #[test]
     fn verbose_only_lines_are_recognised_with_and_without_colour() {
         for line in [
@@ -2845,7 +2810,6 @@ dependency = { path = "../dependency" }
     /// Every other crate's invocation is ignored, because a patch must replay
     /// the flags of the crate it is patching, not of whatever else the build
     /// recompiled.
-    #[cfg(feature = "hot_patch")]
     #[test]
     fn the_harvest_picks_only_the_module_crate() {
         let other = r"     Running `C:\rustc.exe --crate-name pill_core --edition=2021 x.rs`";

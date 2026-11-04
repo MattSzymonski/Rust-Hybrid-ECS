@@ -25,8 +25,6 @@ pill_player = { path = "../../hosting/pill_player", features = ["rendering"] }
 # shipping posture yet (Stage 25 decides what a shipped editor is), so
 # unlike `pill_standalone` this dependency is unconditional.
 pill_development_host = { path = "../../hosting/pill_development_host", default-features = false, features = [
-    "hot_reload",
-    "hot_patch",
     "rendering",
 ] }
 # The window and event loop: only frontends link winit.

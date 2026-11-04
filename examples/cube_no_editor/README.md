@@ -10,7 +10,7 @@ tree is exactly what the repository ships and no run writes a file back.
 
 This is the shape of a project that is only ever a game: nothing it draws has
 to be registered in an asset database with a stable guid, and it runs the same
-from a `cargo test`, a headless host and a windowed one.
+from a headless host and a windowed one.
 
 | Project                 | Mesh                                                                 | Material                                         |
 | ----------------------- | -------------------------------------------------------------------- | ------------------------------------------------ |

@@ -8,11 +8,11 @@
 //! # Design
 //!
 //! Every test drives the [`Engine`] through the same ABI entry points the
-//! managed runtime uses, or through the engine API those entry points reach;
-//! a callback test runs inside an [`ActiveSystemGuard`] scope so the declared
+//! managed runtime uses, or through the engine API those entry points reach.
+//! A callback test runs inside an [`ActiveSystemGuard`] scope, so the declared
 //! scheduler access is enforced exactly as in a live frame. Shared fixtures
-//! build a representative world of shared and descriptor components, while
-//! scheduler tests derive [`SystemAccess`] metadata from concise native access
+//! build a representative world of shared and descriptor components.
+//! Scheduler tests derive [`SystemAccess`] metadata from short native access
 //! declarations.
 
 // Standard library
@@ -50,23 +50,24 @@ use super::components::{
     register_component_manifest, stable_component_id, BindingStore, ComponentBinding,
     ComponentBindings, ModuleExposedComponent, StableComponentId,
 };
+use super::context::ActiveScopeGuard;
 use super::managed_buffer::{fetch_managed_buffer, ManagedBufferError};
+use super::manifest::parse_and_validate_manifest;
 use super::parallel::{
     ffi_parallel_for, parallel_for, PARALLEL_NESTED, PARALLEL_NO_SCOPE, PARALLEL_OK,
 };
 use super::queries::ffi_entity_stable_id;
-// The shared-ABI fixtures: the engine's `TransformComponent` and the renderer
-// data's `MeshRendererComponent`, bound the way a managed project gets them.
-use super::context::ActiveSystemGuard;
-use super::manifest::parse_and_validate_manifest;
 use super::queries::{
     ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
 };
-use super::resources::resource_target;
+use super::resources::bound_resource_id_and_width;
+// The shared-ABI fixtures: the engine's `TransformComponent` and the renderer
+// data's `MeshRendererComponent`, bound the way a managed project gets them.
 use pill_engine::common_components::TransformComponent;
-// The host depends on the renderer data crate for its dependency graph only
-// (see `pill_development_host/Cargo.toml`); these tests are the one place that names it,
-// to bind the real renderer components and call its asset functions.
+// The host depends on the renderer data crate only for its dependency graph
+// (see `modules/hosting/pill_development_host/Cargo.toml`). Only this module's
+// code names it, to bind the real renderer components and call its asset
+// functions.
 use renderer_data_dependency_graph as pill_master_renderer_data;
 use renderer_data_dependency_graph::MeshRendererComponent;
 
@@ -74,11 +75,11 @@ use renderer_data_dependency_graph::MeshRendererComponent;
 // Constants
 // =============================================================================
 
-// ABI status codes returned by the native callbacks under test. The command
-// and chunk callbacks report `1` on success, while the entity count and the
-// stable-id query report `0`. The chunk queries report `3` when no managed
-// system is active, and the command callbacks additionally report `4` when
-// the declared command scope cannot be entered and `5` when the entity
+// ABI status codes the native callbacks under test return. The command and
+// chunk callbacks report `1` for success. The entity count and the stable-id
+// query report `0` for success instead. The chunk queries report `3` when no
+// managed system is active. The command callbacks also report `4` when the
+// declared command scope cannot be entered, and `5` when the entity
 // generation no longer matches the live handle.
 const ABI_SUCCESS: u8 = 1;
 const ABI_OUT_OF_SCOPE: u8 = 3;
@@ -86,8 +87,9 @@ const ABI_COMMAND_SCOPE_DENIED: u8 = 4;
 const ABI_STALE_ENTITY_GENERATION: u8 = 5;
 
 /// Undeclared access on the query path: a component mode the system never
-/// declared, or an archetype no validated term served before the entity path
-/// asked for it (the same code, because both are "not declared").
+/// declared, or an archetype that no validated term served before the entity
+/// path asked for it. Both cases share one code because both mean "not
+/// declared".
 const ABI_UNDECLARED_ACCESS: u8 = 4;
 
 /// Number of entities populated by [`setup_test_world`]; row-count assertions
@@ -100,9 +102,9 @@ const TEST_WORLD_ENTITY_COUNT: usize = 100;
 
 /// The managed full name a test component is declared under.
 ///
-/// The two shared-ABI fixtures take the names their generated mirrors carry -
-/// the Rust registration name with `::` as `.` - and every other test
-/// component lives in the project's `TracyLive` namespace.
+/// The two shared-ABI fixtures use the name their generated mirrors carry:
+/// the Rust path with every `::` written as `.`. Every other test component
+/// lives in the project's `TracyLive` namespace.
 fn test_full_name(name: &str) -> String {
     match name {
         "TransformComponent" => "pill_master_renderer.component.TransformComponent".to_owned(),
@@ -120,24 +122,24 @@ fn test_stable_id(name: &str) -> StableComponentId {
 
 /// The bindings a managed project gets for the renderer's data.
 ///
-/// The production path's shape: the renderer data crate registers (it is the
-/// first extension a host loads), and the components that registration added
-/// are exposed like any extension's, as type-erased native bindings. Nothing
-/// here names a component type.
+/// This is the shape of the production path: the renderer data crate registers
+/// (it is the first extension a host loads), and the components that
+/// registration added are exposed like any extension's, as type-erased native
+/// bindings. Nothing here names a component type.
 fn shared_component_bindings(engine: &mut Engine) -> ComponentBindings {
     let sequence = engine.world().component_registration_sequence();
     pill_master_renderer_data::register(engine);
-    let names = engine.world().registered_component_names_since(sequence);
-    let exposed = exposed_components_from_names(engine.world(), &names);
-    module_native_bindings(engine, &exposed)
+    let registered_names = engine.world().registered_component_names_since(sequence);
+    let exposed_components = exposed_components_from_names(engine.world(), &registered_names);
+    module_native_bindings(engine, &exposed_components)
 }
 
 /// The witness these tests hand to `register_component_descriptor`.
 ///
-/// The shapes registered here are four-byte integers named literally, which is
-/// the same evidence the production path earns by running the blittable
-/// vocabulary over a manifest.
-fn test_witness() -> pill_engine::archetype::Blittability {
+/// The descriptors registered here hold four-byte values, and the tests name
+/// their types literally. The production path gets the same evidence by
+/// checking the field types in a manifest.
+fn test_blittability_witness() -> pill_engine::archetype::Blittability {
     pill_engine::archetype::Blittability::from_manifest_fields()
 }
 
@@ -153,22 +155,22 @@ fn native_access(name: &str, mode: u8) -> NativeSystemAccess {
 }
 
 /// Request one native component chunk using the managed component identity.
-fn get_test_chunk(name: &str, mode: u8, index: u32, output: *mut ComponentChunk) -> u8 {
+fn request_component_chunk(name: &str, mode: u8, index: u32, output: *mut ComponentChunk) -> u8 {
     let id = test_stable_id(name).0;
     ffi_get_component_chunk(id as u64, (id >> 64) as u64, mode, index, output)
 }
 
 /// Convert concise test access declarations into scheduler metadata.
-fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
+fn managed_access(declarations: &[(&str, u8)]) -> SystemAccess {
     // Step 1: Build one native access descriptor per test declaration.
-    let native: Vec<_> = entries
+    let native_accesses: Vec<_> = declarations
         .iter()
         .map(|(name, mode)| native_access(name, *mode))
         .collect();
     // Step 2: Register a managed binding for every component not yet shared.
     let mut engine = Engine::new();
     let mut bindings = shared_component_bindings(&mut engine);
-    for (name, _) in entries {
+    for (name, _) in declarations {
         let stable_id = test_stable_id(name);
         if bindings.contains_key(&stable_id) {
             continue;
@@ -181,7 +183,7 @@ fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
                 4,
                 4,
                 1,
-                test_witness(),
+                test_blittability_witness(),
             )
             .unwrap();
         bindings.insert(
@@ -195,13 +197,13 @@ fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
         );
     }
     // Step 3: Derive scheduler access from the bound component identities.
-    derive_system_access(&native, &bindings)
+    derive_system_access(&native_accesses, &bindings)
         .expect("managed access should map to native components")
 }
 
 /// Populate a representative world containing shared and descriptor components.
 fn setup_test_world(engine: &mut Engine) -> ComponentBindings {
-    // Step 1: Register the shared `PhysicsState` component from a manifest.
+    // Step 1: Register the `PhysicsState` descriptor component from a manifest.
     let shared = shared_component_bindings(engine);
     let stable_id = stable_component_id("TracyLive.PhysicsState");
     let manifest = serde_json::json!([{
@@ -262,7 +264,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
             4,
             4,
             1,
-            test_witness(),
+            test_blittability_witness(),
         )
         .unwrap();
     let descriptor_b = engine
@@ -273,7 +275,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
             4,
             4,
             2,
-            test_witness(),
+            test_blittability_witness(),
         )
         .unwrap();
     bindings.insert(
@@ -306,7 +308,8 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     // through the native command queue.
     engine
         .run_deferred_commands(|world, queue| {
-            let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
+            let _guard =
+                ActiveScopeGuard::install_scope_with_commands(world, queue, &[], &bindings, true);
             let mut entity = std::mem::MaybeUninit::uninit();
             assert_eq!(ffi_reserve_entity(entity.as_mut_ptr()), ABI_SUCCESS);
             // SAFETY: successful reserve initialized the output.
@@ -348,7 +351,8 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     // two halves re-assemble into the id the world indexes.
     engine
         .run_deferred_commands(|world, queue| {
-            let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
+            let _guard =
+                ActiveScopeGuard::install_scope_with_commands(world, queue, &[], &bindings, true);
             let expected = world.entity_id(entity).expect("the entity has an id");
             let mut low = 0u64;
             let mut high = 0u64;
@@ -374,7 +378,8 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     // Step 2: Swap DescriptorA for DescriptorB through the native command queue.
     engine
         .run_deferred_commands(|world, queue| {
-            let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
+            let _guard =
+                ActiveScopeGuard::install_scope_with_commands(world, queue, &[], &bindings, true);
             assert_eq!(
                 ffi_queue_add_component(
                     &entity,
@@ -414,7 +419,8 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     // Step 3: Destroy the entity through the native command queue.
     engine
         .run_deferred_commands(|world, queue| {
-            let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
+            let _guard =
+                ActiveScopeGuard::install_scope_with_commands(world, queue, &[], &bindings, true);
             assert_eq!(ffi_queue_destroy(&entity), ABI_SUCCESS);
         })
         .unwrap();
@@ -438,13 +444,15 @@ fn managed_command_abi_rejects_stale_generations_and_undeclared_commands() {
     let _replacement = engine.world_mut().reserve_entity();
     engine
         .run_deferred_commands(|world, queue| {
-            let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
+            let _guard =
+                ActiveScopeGuard::install_scope_with_commands(world, queue, &[], &bindings, true);
             assert_eq!(ffi_queue_destroy(&stale), ABI_STALE_ENTITY_GENERATION);
         })
         .unwrap();
     engine
         .run_deferred_commands(|world, queue| {
-            let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, false);
+            let _guard =
+                ActiveScopeGuard::install_scope_with_commands(world, queue, &[], &bindings, false);
             assert_eq!(ffi_queue_destroy(&stale), ABI_COMMAND_SCOPE_DENIED);
         })
         .unwrap();
@@ -493,7 +501,8 @@ fn empty_chunk() -> ComponentChunk {
     }
 }
 
-/// Reproduce the managed write-marker operation for one row's change tick.
+/// Mark one row as changed the same way managed code does, using the chunk's
+/// change tick.
 ///
 /// # Safety
 ///
@@ -548,16 +557,18 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
     let mut renderable_chunk = empty_chunk();
     let mut entity_chunk = empty_chunk();
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &shared);
+        let _guard = ActiveScopeGuard::install_query_scope(engine.world_mut(), &accesses, &shared);
 
-        // Step 1: one index-based lookup yields the archetype identity the
-        // managed enumerator would carry in its driver chunk.
+        // Step 1: one index-based lookup gives the archetype identity that the
+        // managed enumerator keeps in its driver chunk (the chunk it holds
+        // while it iterates over the archetype).
         assert_eq!(
-            get_test_chunk("TransformComponent", 1, 0, &mut chunk),
+            request_component_chunk("TransformComponent", 1, 0, &mut chunk),
             ABI_SUCCESS
         );
 
-        // Step 2: the archetype-scoped twin resolves the same column directly.
+        // Step 2: the archetype-scoped variant resolves the same column
+        // directly.
         assert_eq!(
             ffi_get_archetype_chunk(
                 chunk.archetype_low,
@@ -616,7 +627,7 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
     }
 }
 
-/// A C#-only component's `Handle<T>` field is a typed asset reference: the
+/// A C#-only component's `Handle<T>` field is a typed asset reference. The
 /// manifest names `T` by its Rust type path, and the world records the type's
 /// registered name, the same one a Rust component's field gets.
 #[test]
@@ -741,7 +752,8 @@ fn managed_manifest_registers_and_queries_a_new_descriptor_component() {
     }];
     let mut chunk = empty_chunk();
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+        let _guard =
+            ActiveScopeGuard::install_query_scope(engine.world_mut(), &accesses, &bindings);
         assert_eq!(
             ffi_get_component_chunk(
                 stable_id.0 as u64,
@@ -919,12 +931,13 @@ fn an_impossible_decorator_is_refused() {
     );
 }
 
-/// A caller that passes nowhere to write gets a status, not silent truncation.
+/// A caller that passes a null output pointer gets a status, not a silent
+/// truncation.
 ///
 /// `0` means "end of iteration" to every managed caller, so answering a null
-/// output buffer with it turned a binding bug into a query that found no rows.
-/// Status `5` names the mistake, and the managed `ValidateStatus` maps it to
-/// an `ArgumentException`.
+/// output buffer with it would turn a binding bug into a query that found no
+/// rows. Status `5` names the mistake, and the managed `ValidateStatus` maps it
+/// to an `ArgumentException`.
 #[test]
 fn null_output_pointer_reports_invalid_argument() {
     assert_eq!(
@@ -951,11 +964,11 @@ fn null_output_pointer_reports_invalid_argument() {
 
 /// The served stride is the live column's, not the binding's copy.
 ///
-/// Managed row arithmetic trusts `element_size`; if a binding ever described a
+/// Managed row arithmetic trusts `element_size`. If a binding ever described a
 /// different layout than the column its pointer addresses, every row after the
 /// first would be read at the wrong offset. The chunk callbacks therefore
-/// serve the registered layout, and a binding that disagrees cannot change
-/// what managed code multiplies by.
+/// serve the registered layout, so a binding that disagrees cannot change what
+/// managed code multiplies by.
 #[test]
 fn descriptor_chunk_stride_comes_from_the_live_column() {
     let mut engine = Engine::new();
@@ -987,8 +1000,8 @@ fn descriptor_chunk_stride_comes_from_the_live_column() {
         .unwrap();
 
     // A store that disagrees with the registered column: the registration
-    // path asserts the two agree, and the serving path must be immune to the
-    // disagreement either way.
+    // path checks that the two agree, and the serving path must keep working
+    // either way.
     bindings.insert(
         stable_id,
         ComponentBinding::Managed {
@@ -1007,7 +1020,8 @@ fn descriptor_chunk_stride_comes_from_the_live_column() {
     }];
     let mut chunk = empty_chunk();
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+        let _guard =
+            ActiveScopeGuard::install_query_scope(engine.world_mut(), &accesses, &bindings);
         assert_eq!(
             ffi_get_component_chunk(
                 stable_id.0 as u64,
@@ -1031,8 +1045,8 @@ fn descriptor_chunk_stride_comes_from_the_live_column() {
 }
 
 /// A module binding whose forwarded layout disagrees with the live column is
-/// dropped at build time, and a stale binding that still reaches a query fails
-/// closed instead of asserting.
+/// dropped when the bindings are built, and a stale binding that still reaches
+/// a query is refused instead of panicking.
 #[test]
 fn module_native_binding_rejects_live_layout_mismatch() {
     let mut engine = Engine::new();
@@ -1045,7 +1059,7 @@ fn module_native_binding_rejects_live_layout_mismatch() {
             8,
             4,
             1,
-            test_witness(),
+            test_blittability_witness(),
         )
         .expect("the module component registers");
     engine
@@ -1056,25 +1070,25 @@ fn module_native_binding_rejects_live_layout_mismatch() {
     // The module forwards a size the live column does not have - a mirror
     // built against a stale generation - and its binding is dropped rather
     // than handed to managed code.
-    let exposed = [ModuleExposedComponent {
+    let exposed_components = [ModuleExposedComponent {
         csharp_name: "TracyLive.ModuleThing".to_string(),
         component_id: module_id,
         size: 16,
         align: 4,
         fields: Vec::new(),
     }];
-    let agreed = module_native_bindings(&mut engine, &exposed);
+    let agreed_bindings = module_native_bindings(&mut engine, &exposed_components);
     assert!(
-        agreed.is_empty(),
+        agreed_bindings.is_empty(),
         "a binding that disagrees with the live column is not handed out"
     );
 
     // A stale binding already in a store fails the query arm with the
-    // "unknown component" status instead of being served.
+    // `NotRegistered` status instead of being served.
     //
-    // `MeshRendererComponent` stands in for the module's component here: it is real native
-    // storage, which is exactly what the `ModuleNative` arm serves, and its
-    // live layout is what the stale binding is compared against.
+    // `MeshRendererComponent` stands in for the module's component here: it is
+    // real native storage, which is exactly what the `ModuleNative` arm serves.
+    // The stale binding is compared against its live layout.
     let mut bindings = shared_component_bindings(&mut engine);
     let renderable_stable_id = test_stable_id("MeshRendererComponent");
     bindings.insert(
@@ -1095,7 +1109,7 @@ fn module_native_binding_rejects_live_layout_mismatch() {
         .unwrap();
     let accesses = [native_access("MeshRendererComponent", 1)];
     let mut chunk = empty_chunk();
-    let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+    let _guard = ActiveScopeGuard::install_query_scope(engine.world_mut(), &accesses, &bindings);
     assert_eq!(
         ffi_get_component_chunk(
             renderable_stable_id.0 as u64,
@@ -1135,9 +1149,9 @@ fn archetype_scoped_module_native_binding_rejects_live_layout_mismatch() {
     let accesses = [native_access("MeshRendererComponent", 1)];
     let mut entity_chunk = empty_chunk();
     let mut chunk = empty_chunk();
-    let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+    let _guard = ActiveScopeGuard::install_query_scope(engine.world_mut(), &accesses, &bindings);
     // The archetype is learned from the entity column, exactly as the managed
-    // enumerator learns it from its driver chunk.
+    // enumerator learns it from the chunk it keeps while iterating.
     assert_eq!(ffi_get_entity_chunk(0, &mut entity_chunk), ABI_SUCCESS);
     assert_eq!(
         ffi_get_archetype_chunk(
@@ -1183,7 +1197,7 @@ fn managed_shared_component_schema_mismatch_is_rejected() {
 /// Verify managed shared bindings use the renderer's concrete component types.
 ///
 /// The engine's `TransformComponent` and the renderer data's
-/// `MeshRendererComponent` are unconditional, so the managed bridge has one
+/// `MeshRendererComponent` are always available, so the managed bridge has one
 /// binding path in every build.
 #[test]
 fn csharp_world_supports_the_renderable_renderer_query() {
@@ -1292,9 +1306,10 @@ fn one_managed_row_write_is_visible_to_rust_changed_filter() {
     let mut component_chunk = empty_chunk();
     let mut entity_chunk = empty_chunk();
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+        let _guard =
+            ActiveScopeGuard::install_query_scope(engine.world_mut(), &accesses, &bindings);
         assert_eq!(
-            get_test_chunk("TransformComponent", 1, 0, &mut component_chunk),
+            request_component_chunk("TransformComponent", 1, 0, &mut component_chunk),
             ABI_SUCCESS
         );
         assert_eq!(ffi_get_entity_chunk(0, &mut entity_chunk), ABI_SUCCESS);
@@ -1327,9 +1342,10 @@ fn managed_read_only_chunk_does_not_trigger_changed_filter() {
     let accesses = [native_access("TransformComponent", 0)];
     let mut chunk = empty_chunk();
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+        let _guard =
+            ActiveScopeGuard::install_query_scope(engine.world_mut(), &accesses, &bindings);
         assert_eq!(
-            get_test_chunk("TransformComponent", 0, 0, &mut chunk),
+            request_component_chunk("TransformComponent", 0, 0, &mut chunk),
             ABI_SUCCESS
         );
         assert!(!chunk.ticks.is_null());
@@ -1359,13 +1375,14 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
     let mut renderables = empty_chunk();
     let mut entities = empty_chunk();
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+        let _guard =
+            ActiveScopeGuard::install_query_scope(engine.world_mut(), &accesses, &bindings);
         assert_eq!(
-            get_test_chunk("TransformComponent", 1, 0, &mut transforms),
+            request_component_chunk("TransformComponent", 1, 0, &mut transforms),
             ABI_SUCCESS
         );
         assert_eq!(
-            get_test_chunk("MeshRendererComponent", 1, 0, &mut renderables),
+            request_component_chunk("MeshRendererComponent", 1, 0, &mut renderables),
             ABI_SUCCESS
         );
         assert_eq!(ffi_get_entity_chunk(0, &mut entities), ABI_SUCCESS);
@@ -1412,7 +1429,7 @@ fn entity_chunks_are_available_only_during_a_managed_system() {
 
     assert_eq!(ffi_get_entity_chunk(0, &mut chunk), ABI_OUT_OF_SCOPE);
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &bindings);
+        let _guard = ActiveScopeGuard::install_query_scope(engine.world_mut(), &[], &bindings);
         assert_eq!(ffi_get_entity_chunk(0, &mut chunk), ABI_SUCCESS);
         assert_eq!(chunk.len as usize, TEST_WORLD_ENTITY_COUNT);
         assert_eq!(
@@ -1441,7 +1458,7 @@ fn entity_chunks_expose_a_const_pointer() {
     let bindings = setup_test_world(&mut engine);
     let mut chunk = empty_chunk();
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &bindings);
+        let _guard = ActiveScopeGuard::install_query_scope(engine.world_mut(), &[], &bindings);
         assert_eq!(ffi_get_entity_chunk(0, &mut chunk), ABI_SUCCESS);
         assert!(
             chunk.data.is_null(),
@@ -1456,18 +1473,17 @@ fn entity_chunks_expose_a_const_pointer() {
 
 /// The entity path serves only archetypes a validated term already reached.
 ///
-/// Without that precondition, `mode == 2` would answer for any archetype id a
-/// managed caller cared to guess - an oracle for component sets nothing
-/// declared. The precondition lives per invocation, so it is gone again for
-/// the next system, and outside a managed invocation the out-of-scope answer
-/// takes precedence.
+/// Without that rule, `mode == 2` would answer for any archetype id a managed
+/// caller guessed, which would tell it about component sets nothing declared.
+/// The rule is kept per invocation, so it is gone again for the next system.
+/// Outside a managed invocation the out-of-scope answer takes precedence.
 #[test]
 fn mode_two_serves_only_observed_archetypes() {
     let mut engine = Engine::new();
     let bindings = setup_test_world(&mut engine);
     let accesses = [native_access("TransformComponent", 0)];
-    // The id, learned the way the world itself knows it; the managed path
-    // never holds one before a validated term served it.
+    // The id is looked up the way the world itself knows it. The managed path
+    // never holds one before a validated term has served it.
     let archetype = engine
         .world()
         .entity_chunk(0)
@@ -1483,7 +1499,8 @@ fn mode_two_serves_only_observed_archetypes() {
         "outside a managed invocation the scope answer comes first"
     );
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+        let _guard =
+            ActiveScopeGuard::install_query_scope(engine.world_mut(), &accesses, &bindings);
 
         // Step 1: a fresh id is refused, because nothing declared it.
         assert_eq!(
@@ -1495,7 +1512,7 @@ fn mode_two_serves_only_observed_archetypes() {
         // Step 2: once a validated component term served the archetype, its
         // entity column resolves.
         assert_eq!(
-            get_test_chunk("TransformComponent", 0, 0, &mut chunk),
+            request_component_chunk("TransformComponent", 0, 0, &mut chunk),
             ABI_SUCCESS
         );
         assert_eq!(
@@ -1507,7 +1524,7 @@ fn mode_two_serves_only_observed_archetypes() {
     }
 
     // Step 3: the observation does not survive the invocation.
-    let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+    let _guard = ActiveScopeGuard::install_query_scope(engine.world_mut(), &accesses, &bindings);
     assert_eq!(
         ffi_get_archetype_chunk(low, high, 0, 0, 2, &mut chunk),
         ABI_UNDECLARED_ACCESS,
@@ -1608,7 +1625,8 @@ fn deeply_nested_manifest_is_rejected_without_stack_overflow() {
     );
 }
 
-/// A descriptor component may only contain blittable value types.
+/// A descriptor component may only contain blittable value types (types that
+/// can be copied byte for byte).
 ///
 /// `ComponentColumn` moves rows with `ptr::copy` and frees its buffer without
 /// running drop glue, and the engine shares those columns across threads on an
@@ -1648,8 +1666,8 @@ fn a_non_blittable_field_type_is_rejected() {
     );
 }
 
-/// A non-blittable type nested inside a value type is rejected too, so the
-/// recursive walk cannot be used to smuggle one past the check.
+/// A non-blittable type nested inside a value type is rejected too, so a
+/// nested type cannot hide one from the check.
 #[test]
 fn a_nested_non_blittable_field_type_is_rejected() {
     let mut engine = Engine::new();
@@ -1719,7 +1737,7 @@ fn overlapping_component_fields_are_rejected() {
     );
 }
 
-/// The three poll codes are the loader's whole vocabulary, and anything else
+/// The four poll codes are the loader's whole vocabulary, and anything else
 /// is a typed error naming the code instead of a silent "nothing happened".
 #[cfg(feature = "hot_reload")]
 #[test]
@@ -1727,9 +1745,10 @@ fn unknown_poll_status_is_a_typed_error() {
     assert!(poll_status_is_known(POLL_NO_CHANGE));
     assert!(poll_status_is_known(POLL_RELOADED));
     assert!(poll_status_is_known(POLL_REJECTED));
-    // A parked version is a status the host answers, not one it rejects:
-    // leaving it unknown would wedge the reload loop, with the loader parked
-    // and every later poll reporting the same unknown status.
+    // A held-back version is a status the host answers, not one it rejects.
+    // If it were left unknown, the reload loop would stall: the loader would
+    // keep holding the version back, and every later poll would report the
+    // same unknown status.
     assert!(poll_status_is_known(POLL_MANIFEST_PENDING));
     assert!(!poll_status_is_known(4));
     assert!(!poll_status_is_known(u8::MAX));
@@ -1748,7 +1767,8 @@ fn unknown_poll_status_is_a_typed_error() {
 /// that the manifest path asks for `MAX_COMPONENT_MANIFEST_BYTES`.
 #[test]
 fn manifest_length_bounds_reject_empty_and_oversized_values() {
-    /// Run the protocol against a reported length, with a copy that refuses.
+    /// Run the protocol against a reported length, using a copy callback that
+    /// always refuses.
     ///
     /// A refused copy is the success case here: reaching it means the length
     /// was accepted, which is what the bound is being tested for.
@@ -1827,7 +1847,7 @@ fn manifest_field_with_default(
     })
 }
 
-/// Build the serialized manifest for one four-byte-fielded test component.
+/// Build the serialized manifest for one descriptor test component.
 fn manifest_bytes(
     name: &str,
     size: usize,
@@ -2046,8 +2066,8 @@ fn a_renamed_component_carries_its_rows_through_the_alias() {
         Some(new_id)
     );
 
-    // Applying the same manifest again settles: the alias no longer resolves
-    // to anything, so there is no predecessor left to rename.
+    // Applying the same manifest again changes nothing: the alias no longer
+    // resolves to anything, so there is no predecessor left to rename.
     let again = apply_component_manifest_on_reload(&mut engine, &after, &store)
         .expect("the second application settles");
     assert!(again.renamed.is_empty());
@@ -2204,8 +2224,8 @@ fn field_defaults_are_validated_against_their_field_type() {
     );
 }
 
-/// The resource twin: a field added to a resource with a default starts from
-/// it instead of zero.
+/// The same rule for resources: a field added with a default starts from that
+/// default instead of zero.
 #[test]
 fn a_resource_field_added_with_a_default_starts_from_it() {
     resource_test_scope();
@@ -2248,9 +2268,9 @@ fn a_resource_field_added_with_a_default_starts_from_it() {
     );
 }
 
-/// A managed component the manifest stopped naming is retired: its rows go,
-/// its registration goes, and a later declaration of the same name starts
-/// clean instead of colliding with storage nothing tracks.
+/// A managed component the manifest stopped naming is retired. Its rows and
+/// its registration go, so a later declaration of the same name starts clean
+/// instead of colliding with storage nothing tracks.
 #[test]
 fn a_vanished_component_is_retired_on_apply() {
     resource_test_scope();
@@ -2298,8 +2318,8 @@ fn a_vanished_component_is_retired_on_apply() {
         "the registration is gone, so the name is free again"
     );
 
-    // Re-declaring the name later is an ordinary addition, not a collision
-    // with storage nothing tracks anymore.
+    // Re-declaring the name later is an ordinary addition: retirement left no
+    // storage behind for the name to collide with.
     let readded = manifest_bytes("Vanished", 4, 4, 1, vec![manifest_field("a", 0, 4)]);
     let report = apply_component_manifest_on_reload(&mut engine, &readded, &store)
         .expect("the name can be declared again");
@@ -2365,7 +2385,7 @@ fn alias_validation_refuses_empty_and_colliding_names() {
     );
 }
 
-/// A manifest whose application fails partway leaves none of it applied: the
+/// A manifest whose application fails partway leaves none of it applied. The
 /// journal is unwound, so the store, the bindings and the migrated rows are
 /// byte-identical to their values before the call.
 #[test]
@@ -2398,7 +2418,7 @@ fn a_refused_manifest_leaves_none_of_it_applied() {
             4,
             4,
             9,
-            test_witness(),
+            test_blittability_witness(),
         )
         .expect("the claiming component registers");
     let claimed_id = engine
@@ -2430,8 +2450,9 @@ fn a_refused_manifest_leaves_none_of_it_applied() {
             manifest_field("d", 12, 4),
         ],
     });
-    // A fresh stable id under the claimed *name*: same identity would land on
-    // the idempotent re-registration path instead of colliding.
+    // A fresh stable id under the claimed *name*: with the same identity the
+    // entry would follow the idempotent re-registration path instead of
+    // colliding.
     let colliding_stable_id = stable_component_id("TracyLive.ClaimedV2");
     let claimed_entry = serde_json::json!({
         "stable_id_low": colliding_stable_id.0 as u64,
@@ -2500,7 +2521,7 @@ fn the_apply_refuses_what_it_cannot_migrate() {
             8,
             4,
             1,
-            test_witness(),
+            test_blittability_witness(),
         )
         .expect("the module component registers");
     let mut bindings = shared_component_bindings(&mut engine);
@@ -2556,9 +2577,9 @@ fn the_apply_refuses_what_it_cannot_migrate() {
 /// Start a resource test from an empty table.
 ///
 /// The table is thread-local under `cargo test` (see `resources`), so tests on
-/// parallel threads cannot reach each other's entries; cargo reuses threads
-/// across tests, though, so the reset is what still gives each test a table of
-/// its own.
+/// parallel threads cannot reach each other's entries. Cargo does reuse
+/// threads across tests, though, so the reset is what still gives each test a
+/// table of its own.
 fn resource_test_scope() {
     super::resources::reset_resource_bindings_for_test();
 }
@@ -2566,7 +2587,8 @@ fn resource_test_scope() {
 /// Build the serialized manifest for one managed resource.
 ///
 /// Same document shape as a component's, with the `kind` tag that tells the
-/// two apart - which is the whole of what a resource entry adds on the wire.
+/// two apart, which is the only thing a resource entry adds to the serialized
+/// document.
 fn resource_manifest_bytes(
     name: &str,
     size: usize,
@@ -2620,15 +2642,15 @@ fn resource_manifest_bytes_with_aliases(
 /// Asked of the binding table rather than recomputed, so the test checks the
 /// id the host actually uses instead of a second opinion about what it is.
 fn resource_id_of(name: &str) -> pill_engine::ResourceId {
-    resource_target(stable_component_id(&format!("TracyLive.{name}")))
+    bound_resource_id_and_width(stable_component_id(&format!("TracyLive.{name}")))
         .expect("the resource is registered")
         .0
 }
 
 /// A manifest resource entry registers the resource and seeds its value.
 ///
-/// The seed is the point: a managed declaration is all there is - nothing on
-/// the C# side inserts a resource the way a Rust `init` does - so a resource
+/// The seed is the point. A managed declaration is all there is: nothing on
+/// the C# side inserts a resource the way a Rust `init` does. A resource
 /// registered and left empty would fail the first `Res<T>` access in the frame
 /// that follows.
 #[test]
@@ -2718,7 +2740,7 @@ fn a_renamed_resource_carries_its_value_through_the_alias() {
         vec!["TracyLive.OldSettings -> TracyLive.NewSettings".to_string()]
     );
     assert!(
-        resource_target(test_stable_id("OldSettings")).is_none(),
+        bound_resource_id_and_width(test_stable_id("OldSettings")).is_none(),
         "the old binding is gone from the table"
     );
     assert_eq!(
@@ -2734,8 +2756,8 @@ fn a_renamed_resource_carries_its_value_through_the_alias() {
         "the predecessor declaration is dropped"
     );
 
-    // Applying the same manifest again settles: the alias no longer names a
-    // live binding, so there is no predecessor left to rename.
+    // Applying the same manifest again changes nothing: the alias no longer
+    // names a live binding, so there is no predecessor left to rename.
     let again = apply_component_manifest_on_reload(&mut engine, &after, &store)
         .expect("the second application settles");
     assert!(again.resources_renamed.is_empty());
@@ -2848,7 +2870,7 @@ fn a_resource_dropped_from_the_manifest_is_retired() {
         vec!["TracyLive.Vanishing".to_string()]
     );
     assert!(
-        resource_target(stable_component_id("TracyLive.Vanishing")).is_none(),
+        bound_resource_id_and_width(stable_component_id("TracyLive.Vanishing")).is_none(),
         "the binding is gone from the table"
     );
     assert_eq!(
@@ -2892,7 +2914,7 @@ fn a_claimed_resource_survives_a_dropped_declaration() {
 /// A reflected resource access reaches the scheduler as a resource.
 ///
 /// Component and resource keys are both 128-bit name hashes, so only the kind
-/// byte tells them apart: recorded as a component, two systems writing one
+/// byte tells them apart. Recorded as a component, two systems writing one
 /// resource would be free to run in the same batch.
 #[test]
 fn a_resource_access_is_derived_as_a_resource() {
@@ -2960,11 +2982,12 @@ fn an_unregistered_resource_access_is_refused() {
     );
 }
 
-/// A managed resource's field layout reaches the engine, and survives a reshape.
+/// A managed resource's field layout reaches the engine, and survives a
+/// reshape.
 ///
 /// The host is the only holder of a foreign resource's field names, so this is
-/// what makes one inspectable at all - and a reload that moves the fields has
-/// to republish them, because the engine drops the layout with the shape it
+/// what makes one inspectable at all. A reload that moves the fields has to
+/// republish them, because the engine drops the layout with the shape it
 /// described.
 #[test]
 fn a_managed_resource_publishes_its_field_layout() {
@@ -3019,7 +3042,8 @@ fn a_managed_resource_publishes_its_field_layout() {
 // Mirrored Rust functions (renderer data crate, reached by address)
 // =============================================================================
 
-/// The qualified name `#[pill_mirror_object]` files the renderer's mesh under.
+/// The qualified name that `#[pill_mirror_object]` records for the renderer's
+/// mesh.
 const MESH_TYPE: &str = "pill_master_renderer_data::assets::mesh::Mesh";
 
 /// The qualified name of the renderer's pipeline resource.
@@ -3028,7 +3052,7 @@ const RENDERING_MANAGER_TYPE: &str =
 
 /// The address of one mirrored function in this binary's own table.
 fn mirrored(type_name: &str, method: &str) -> usize {
-    super::mirror_calls::static_mirror_methods()
+    super::mirror_calls::statically_linked_mirror_methods()
         .into_iter()
         .find(|row| row.type_name == type_name && row.method_name == method)
         .unwrap_or_else(|| panic!("{type_name}::{method} is not mirrored"))
@@ -3039,14 +3063,14 @@ fn mirrored(type_name: &str, method: &str) -> usize {
 /// return buffer.
 fn call_mirrored(address: usize, slots: &[[u8; 16]]) -> (u8, [u8; 64]) {
     type Trampoline = unsafe extern "C" fn(*const u8, *mut u8) -> u8;
-    let mut ret = [0u8; 64];
+    let mut return_buffer = [0u8; 64];
     // SAFETY: the address is a trampoline of the one mirror signature, from
     // this binary's inventory; the slots and the return buffer outlive the call.
     let status = unsafe {
         let trampoline: Trampoline = std::mem::transmute(address);
-        trampoline(slots.as_ptr().cast(), ret.as_mut_ptr())
+        trampoline(slots.as_ptr().cast(), return_buffer.as_mut_ptr())
     };
-    (status, ret)
+    (status, return_buffer)
 }
 
 /// One `str` slot over a borrowed string.
@@ -3101,11 +3125,11 @@ fn take_text(kind: u8) -> Option<String> {
 }
 
 /// A binary that links the renderer data crate carries its mirrored functions
-/// and types in its own inventory, each callable one with its address - the
-/// table a shipping build hands the managed runtime.
+/// and types in its own inventory. Each callable one has its address there,
+/// which is the table a shipping build hands the managed runtime.
 #[test]
 fn the_renderer_data_mirrors_reach_the_static_table() {
-    let rows = super::mirror_calls::static_mirror_methods();
+    let rows = super::mirror_calls::statically_linked_mirror_methods();
     for (type_name, method) in [
         (MESH_TYPE, "from_obj_bytes"),
         (MESH_TYPE, "__type"),
@@ -3137,6 +3161,7 @@ fn a_native_resource_needs_a_declared_access() {
     let mut engine = Engine::new();
     pill_master_renderer_data::register(&mut engine);
     let shared_name = pill_engine::asset::ASSET_MANAGER_SHARED_NAME;
+    // Step 1: outside a managed invocation every request is refused.
     assert_eq!(
         native_resource(shared_name, 1).0,
         3,
@@ -3145,7 +3170,8 @@ fn a_native_resource_needs_a_declared_access() {
 
     let bindings = ComponentBindings::default();
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &bindings);
+        // Step 2: inside an invocation, a write nobody declared is refused.
+        let _guard = ActiveScopeGuard::install_query_scope(engine.world_mut(), &[], &bindings);
         assert_eq!(native_resource(shared_name, 1).0, 2, "nothing was declared");
     }
     let declared = [native_resource_write(shared_name)];
@@ -3155,7 +3181,9 @@ fn a_native_resource_needs_a_declared_access() {
         .map(|assets| assets as *mut pill_engine::AssetManager as usize)
         .expect("the renderer data registers asset types");
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &declared, &bindings);
+        // Step 3: a declared write reaches the resource itself.
+        let _guard =
+            ActiveScopeGuard::install_query_scope(engine.world_mut(), &declared, &bindings);
         assert_eq!(
             native_resource(shared_name, 1),
             (0, expected),
@@ -3164,7 +3192,9 @@ fn a_native_resource_needs_a_declared_access() {
     }
     let mut queue = pill_engine::commands::CommandQueue::default();
     {
-        let _guard = ActiveSystemGuard::set_exclusive(engine.world_mut(), &mut queue, &bindings);
+        // Step 4: a startup holds the world, so no declaration is needed.
+        let _guard =
+            ActiveScopeGuard::install_exclusive_scope(engine.world_mut(), &mut queue, &bindings);
         assert_eq!(
             native_resource(shared_name, 1),
             (0, expected),
@@ -3174,8 +3204,8 @@ fn a_native_resource_needs_a_declared_access() {
 }
 
 /// A mesh built by its mirrored constructor and added through the mirrored
-/// asset store operation lands in the world's store, with no bridge code that
-/// names the renderer.
+/// asset store operation ends up in the world's store, with no bridge code
+/// that names the renderer.
 #[test]
 fn a_mesh_loads_through_its_mirrored_trampolines() {
     let mut engine = Engine::new();
@@ -3184,27 +3214,28 @@ fn a_mesh_loads_through_its_mirrored_trampolines() {
     let declared = [native_resource_write(shared_name)];
     let bindings = ComponentBindings::default();
     let name = "mirrored_triangle";
-    let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    let obj_text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
     let (index, generation) = {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &declared, &bindings);
-        let (status, ret) = call_mirrored(
+        let _guard =
+            ActiveScopeGuard::install_query_scope(engine.world_mut(), &declared, &bindings);
+        let (status, return_buffer) = call_mirrored(
             mirrored(MESH_TYPE, "from_obj_bytes"),
-            &[str_slot(name), str_slot(obj)],
+            &[str_slot(name), str_slot(obj_text)],
         );
         assert_eq!(status, 0, "the OBJ decodes: {:?}", take_text(0));
-        let mesh = usize::from_le_bytes(ret[..8].try_into().unwrap());
+        let mesh = usize::from_le_bytes(return_buffer[..8].try_into().unwrap());
         assert_ne!(mesh, 0, "the constructor returns a boxed mesh");
 
         let (status, assets) = native_resource(shared_name, 1);
         assert_eq!(status, 0);
-        let (status, ret) = call_mirrored(
+        let (status, return_buffer) = call_mirrored(
             mirrored(MESH_TYPE, "__asset_add_named"),
             &[pointer_slot(assets), str_slot(name), pointer_slot(mesh)],
         );
         assert_eq!(status, 0, "the store takes the box: {:?}", take_text(0));
         (
-            u32::from_le_bytes(ret[..4].try_into().unwrap()),
-            u32::from_le_bytes(ret[4..8].try_into().unwrap()),
+            u32::from_le_bytes(return_buffer[..4].try_into().unwrap()),
+            u32::from_le_bytes(return_buffer[4..8].try_into().unwrap()),
         )
     };
 
@@ -3223,10 +3254,10 @@ fn a_mesh_loads_through_its_mirrored_trampolines() {
 #[test]
 fn a_failed_mirrored_call_reports_its_message() {
     let name = "not_a_mesh";
-    let obj = "this is not an OBJ file";
+    let obj_text = "this is not an OBJ file";
     let (status, _) = call_mirrored(
         mirrored(MESH_TYPE, "from_obj_bytes"),
-        &[str_slot(name), str_slot(obj)],
+        &[str_slot(name), str_slot(obj_text)],
     );
     assert_eq!(status, 1, "an undecodable buffer fails the call");
     let message = take_text(0).expect("the failure left its message");
@@ -3255,7 +3286,8 @@ fn the_render_pipeline_clears_through_its_mirrored_method() {
     let declared = [native_resource_write(shared_name)];
     let bindings = ComponentBindings::default();
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &declared, &bindings);
+        let _guard =
+            ActiveScopeGuard::install_query_scope(engine.world_mut(), &declared, &bindings);
         let (status, manager) = native_resource(shared_name, 1);
         assert_eq!(status, 0);
         let (status, _) = call_mirrored(
@@ -3275,6 +3307,10 @@ fn the_render_pipeline_clears_through_its_mirrored_method() {
     );
 }
 
+// =============================================================================
+// Component registration
+// =============================================================================
+
 /// A module that registers a component twice - explicitly and through its
 /// entry point, as the renderer data crate does - exposes it once, so its C#
 /// mirror struct is emitted once.
@@ -3284,10 +3320,10 @@ fn a_component_registered_twice_is_exposed_once() {
     let sequence = engine.world().component_registration_sequence();
     pill_master_renderer_data::register(&mut engine);
     pill_master_renderer_data::register(&mut engine);
-    let names = engine.world().registered_component_names_since(sequence);
+    let registered_names = engine.world().registered_component_names_since(sequence);
 
-    let exposed = exposed_components_from_names(engine.world(), &names);
-    let mut csharp_names: Vec<&str> = exposed
+    let exposed_components = exposed_components_from_names(engine.world(), &registered_names);
+    let mut csharp_names: Vec<&str> = exposed_components
         .iter()
         .map(|component| component.csharp_name.as_str())
         .collect();
@@ -3300,10 +3336,14 @@ fn a_component_registered_twice_is_exposed_once() {
         "no component is exposed twice"
     );
     assert!(
-        names.len() > exposed_count,
+        registered_names.len() > exposed_count,
         "the log itself does repeat names"
     );
 }
+
+// =============================================================================
+// Parallel dispatch
+// =============================================================================
 
 /// Every index of a parallel dispatch reaches the callback, and a large
 /// fan-out runs on more than one Rayon thread.
@@ -3311,23 +3351,23 @@ fn a_component_registered_twice_is_exposed_once() {
 fn parallel_dispatch_runs_every_index_across_threads() {
     let mut engine = Engine::new();
     let shared = shared_component_bindings(&mut engine);
-    let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &shared);
+    let _guard = ActiveScopeGuard::install_query_scope(engine.world_mut(), &[], &shared);
 
-    let count = 4096u32;
-    let visited = AtomicU32::new(0);
-    let threads = Mutex::new(HashSet::new());
-    let status = parallel_for(count, |_index| {
-        visited.fetch_add(1, Ordering::Relaxed);
-        threads
+    let work_item_count = 4096u32;
+    let visited_count = AtomicU32::new(0);
+    let thread_ids = Mutex::new(HashSet::new());
+    let status = parallel_for(work_item_count, |_index| {
+        visited_count.fetch_add(1, Ordering::Relaxed);
+        thread_ids
             .lock()
             .expect("the thread set is not poisoned")
             .insert(std::thread::current().id());
     });
 
     assert_eq!(status, PARALLEL_OK);
-    assert_eq!(visited.load(Ordering::Relaxed), count);
+    assert_eq!(visited_count.load(Ordering::Relaxed), work_item_count);
     if pill_core::rayon::current_num_threads() > 1 {
-        let distinct = threads
+        let distinct = thread_ids
             .lock()
             .expect("the thread set is not poisoned")
             .len();
@@ -3371,7 +3411,7 @@ fn parallel_dispatch_refuses_off_scope_and_nested_calls() {
     let shared = shared_component_bindings(&mut engine);
     let nested_status = AtomicU8::new(255);
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &shared);
+        let _guard = ActiveScopeGuard::install_query_scope(engine.world_mut(), &[], &shared);
         let status = ffi_parallel_for(nested, &nested_status as *const AtomicU8 as *mut c_void, 8);
         assert_eq!(status, PARALLEL_OK);
     }
@@ -3383,27 +3423,27 @@ fn parallel_dispatch_refuses_off_scope_and_nested_calls() {
 fn parallel_dispatch_with_zero_items_runs_nothing() {
     let mut engine = Engine::new();
     let shared = shared_component_bindings(&mut engine);
-    let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &shared);
+    let _guard = ActiveScopeGuard::install_query_scope(engine.world_mut(), &[], &shared);
 
-    let visited = AtomicU32::new(0);
+    let visited_count = AtomicU32::new(0);
     let status = parallel_for(0, |_index| {
-        visited.fetch_add(1, Ordering::Relaxed);
+        visited_count.fetch_add(1, Ordering::Relaxed);
     });
     assert_eq!(status, PARALLEL_OK);
-    assert_eq!(visited.load(Ordering::Relaxed), 0);
+    assert_eq!(visited_count.load(Ordering::Relaxed), 0);
 }
 
 /// A managed zone that is begun and never ended is closed when the invocation
-/// returns, so a per-frame system that forgets to dispose one neither grows the
-/// guard list without bound nor leaves the Tracy timeline open.
+/// returns. A per-frame system that forgets to dispose one therefore neither
+/// grows the guard list without bound nor leaves the Tracy timeline open.
 #[test]
 fn an_unclosed_managed_zone_does_not_outlive_its_invocation() {
     let mut engine = Engine::new();
     let bindings = ComponentBindings::default();
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &bindings);
-        let token = begin_managed_zone_for_test("leaked");
-        assert_ne!(token, 0, "a zone was opened");
+        let _guard = ActiveScopeGuard::install_query_scope(engine.world_mut(), &[], &bindings);
+        let zone_token = begin_managed_zone_for_test("leaked");
+        assert_ne!(zone_token, 0, "a zone was opened");
         assert_eq!(
             managed_zone_count_for_test(),
             1,
