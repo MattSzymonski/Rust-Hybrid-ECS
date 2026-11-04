@@ -81,7 +81,7 @@
 #          Any other argument is passed straight to cargo.
 
 # EXAMPLE USAGE:
-#   set PROJECT_PATH=devops/tests/projects/project_rs
+#   set PROJECT_PATH=devops/tests/projects/native
 #   python devops/ci_cd/build_shipping.py                        # native shipping build
 #   set PROJECT_PATH=devops/tests/projects/managed
 #   python devops/ci_cd/build_shipping.py                        # managed (C#) shipping build
@@ -271,9 +271,9 @@ def resolve_project_root(repository_root: Path, project_path: str) -> Path:
     """Resolves the project directory, honouring both path conventions.
 
     The host resolves PROJECT_PATH against the working directory (so
-    `../devops/tests/projects/project_rs` works from the workspace dir); the shipping tools
+    `../devops/tests/projects/native` works from the workspace dir); the shipping tools
     have historically resolved it against the repository root (so
-    `devops/tests/projects/project_rs` works from anywhere). The working directory is tried
+    `devops/tests/projects/native` works from anywhere). The working directory is tried
     first, then the repository root, so both spellings work from either place.
     """
     cwd_candidate = (Path.cwd() / project_path).resolve()

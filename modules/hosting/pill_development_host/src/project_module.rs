@@ -24,13 +24,9 @@
 //! through `poll_reload`.
 
 // This module covers the whole loaded-project lifecycle: build, load,
-// initialize, reload and retire. A statically linked build does none of it -
-// the project's entry point is called once at setup and there is no library
-// object to keep - so none of this is compiled without `hot_reload`.
-#[cfg(feature = "hot_reload")]
+// initialize, reload and retire.
 pub(crate) use loaded::{LoadedProject, ManagedReloadStart};
 
-#[cfg(feature = "hot_reload")]
 mod loaded {
     // Standard library
     use std::path::Path;
@@ -123,7 +119,6 @@ mod loaded {
         ///
         /// `None` for the C# backend, which has no native redirect slots to
         /// install into.
-        #[cfg(feature = "hot_patch")]
         pub(crate) fn native_library(&self) -> Option<&NativeLibrary> {
             match self {
                 Self::Native { current, .. } => Some(current),
@@ -210,6 +205,20 @@ mod loaded {
                         }
                         .into());
                     }
+                    // What this generation declared its resources' layouts are
+                    // made of, so the first reload can tell a kept value from one
+                    // the edit invalidated.
+                    let watch_directory = workspace_root.join(&config.watch_directory);
+                    let layout_record = crate::layout_record::LayoutRecordTarget::new(
+                        workspace_root,
+                        &watch_directory,
+                        &config.name,
+                    );
+                    crate::layout_record::write_record(
+                        engine.world(),
+                        &layout_record,
+                        &generation_init.registered_resource_ids,
+                    );
                     Ok(Self::Native {
                         current: library,
                         old_libraries: Vec::new(),
@@ -605,6 +614,9 @@ mod loaded {
         // order matters: nothing touches engine state before the compile
         // succeeds. A refused step returns `None`, which for the project means
         // nothing was replaced.
+        // The record this transaction reads and rewrites is keyed by the
+        // project and resolves declared paths against its crate root.
+        let watch_directory = workspace_root.join(&config.watch_directory);
         let transaction = crate::reload::ReloadTransaction {
             kind: crate::reload::ReloadSubjectKind::Project,
             subject: &config.name,
@@ -615,6 +627,11 @@ mod loaded {
             registered_schemas,
             registered_resource_ids,
             peer_component_names,
+            layout_record: crate::layout_record::LayoutRecordTarget::new(
+                workspace_root,
+                &watch_directory,
+                &config.name,
+            ),
             graveyard_policy: crate::reload::GraveyardPolicy::Bounded,
         };
         let Some(commit) = crate::reload::build_load_and_commit(

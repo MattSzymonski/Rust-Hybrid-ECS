@@ -384,7 +384,6 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
 
     state.applied_before = applied_before
     state.begin = begin
-    state.components_before = components_before
     state.count_before = count_before
 
 

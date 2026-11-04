@@ -77,7 +77,7 @@ no .NET install, and no JIT.
 cd D:\Programming\Rust-Hybrid-ECS
 
 set PROJECT_PATH=devops/tests/projects/native
-python devops\ci_cd\build_release.py --features rendering   :: native shipping build
+python devops\ci_cd\build_shipping.py --features rendering   :: native shipping build
 
 set PROJECT_PATH=devops/tests/projects/managed
 python devops\ci_cd\build_shipping.py --features rendering   :: managed (C#), framework-dependent

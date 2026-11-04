@@ -25,13 +25,13 @@ import time
 # Standalone-runnable: put `devops/` on `sys.path` before reaching `core`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.projects import PROJECT_RS_PATH  # noqa: E402
+from core.projects import NATIVE_PROJECT_PATH  # noqa: E402
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
-    parser.add_argument("--project", default=PROJECT_RS_PATH)
+    parser.add_argument("--project", default=NATIVE_PROJECT_PATH)
     parser.add_argument("--cwd", type=Path)
     parser.add_argument("--timeout", type=int, default=240)
     args = parser.parse_args()

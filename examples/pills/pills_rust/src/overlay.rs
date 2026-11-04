@@ -11,62 +11,62 @@
 //! # Design
 //!
 //! Both are ordinary project code, so an edit to either live-patches the
-//! running demo. They are deliberately self-contained - no `crate::` imports
-//! and no file-level constants - because a generated fast patch replays a hot
-//! file's imports into a synthetic crate that links this rlib.
+//! running demo. They are deliberately self-contained - no `crate::` paths and
+//! no file-level constants - because a fast patch copies the file's imports
+//! and the edited body into a small crate that links this library.
 //!
-//! The egui pass is built into the [`GameUi`] resource rather than into a fresh
-//! context, which is what makes the panel survive a project reload: the
-//! context's fonts, its widget state and its textures live in a shared library,
-//! so the reloaded project finds them exactly as they were. [`DemoState`] is
-//! the one writer of the tuning values; the panel displays them and the
-//! reset button restores the defaults.
+//! The egui pass runs in the context that the [`GameUi`] resource owns, not in
+//! a fresh one, and that is what lets the panel survive a project reload: its
+//! fonts, its widget state and its textures live in a shared library, so the
+//! reloaded project finds them exactly as they were. The tuning values live in
+//! [`DemoState`]: the demo's input system changes them from the keys, the panel
+//! displays them, and the panel's reset button restores the defaults.
 
 // External crates
 use pill_core::math::Vector2f;
 use pill_engine::{
     pill_hot, DebugDraw, DebugStyle, Input, KeyCode, Res, ResMut, SystemError, Time,
 };
-// The egui this engine pins, named through the crate that owns it: a project
-// never depends on egui directly, so every artifact shares the one copy.
+// The egui this engine uses, reached through the crate that re-exports it: a
+// project never depends on egui directly, so every artifact shares one copy.
 use pill_project_ui::{egui, GameUi, InputFrame, UiFrameSlot, PRIMARY_SURFACE};
 
 // Current crate
 use pills_rust::{DemoState, PILL_COUNT};
 
-/// Draws the tuning panel for this frame.
+/// Draws the tuning panel: the FPS, the curl noise values and the reset button.
 #[pill_hot]
 pub(crate) fn tuning_overlay_system(
     mut game_ui: ResMut<GameUi>,
     input: Res<Input>,
-    mut slot: ResMut<UiFrameSlot>,
+    mut ui_frame_slot: ResMut<UiFrameSlot>,
     time: Res<Time>,
-    mut state: ResMut<DemoState>,
+    mut demo_state: ResMut<DemoState>,
 ) -> Result<(), SystemError> {
-    let (Some(mut game_ui), Some(input), Some(mut slot), Some(time), Some(mut state)) = (
+    let (Some(mut game_ui), Some(input), Some(mut ui_frame_slot), Some(time), Some(mut demo_state)) = (
         game_ui.get_mut(),
         input.get(),
-        slot.get_mut(),
+        ui_frame_slot.get_mut(),
         time.get(),
-        state.get_mut(),
+        demo_state.get_mut(),
     ) else {
         return Ok(());
     };
 
-    // The engine's input snapshot, captured before the pass: `run` needs the UI
-    // resource mutably, so the snapshot is taken first and the borrow of the
-    // engine's input ends with it.
+    // Capture this frame's input as an owned snapshot. The UI pass takes an
+    // `InputFrame` rather than the engine's `Input` resource, so the system
+    // builds the snapshot once and hands it to the pass.
     let input_frame = InputFrame::capture(input);
-    // The tokens the panel's widgets paint from, cloned out of the resource
-    // because the pass borrows the UI mutably. A reload installs the theme
-    // again, so the clone is this frame's.
+    // The theme the panel's widgets paint with, cloned out of the resource
+    // because the pass borrows the UI mutably. The theme can be re-applied
+    // while the demo runs, so the panel reads it again every frame.
     let theme = game_ui.theme().clone();
 
     // The panel lays out against its own size and sits in the window's top-left
-    // corner, so it needs no window-size input; the renderer applies the
-    // monitor's scale factor, which is why 1.0 is the honest value here.
+    // corner, so it needs no window-size input. A scale factor of 1.0 draws one
+    // logical point as one screen pixel, so the panel keeps its 320 by 260 size.
     game_ui.run(
-        &mut slot,
+        &mut ui_frame_slot,
         &input_frame,
         Vector2f::new(320.0, 260.0),
         1.0,
@@ -84,10 +84,10 @@ pub(crate) fn tuning_overlay_system(
                     ));
                     window.separator();
                     window.collapsing("Curl noise", |section| {
-                        section.label(format!("Scale {:.4}", state.curl_scale));
-                        section.label(format!("Attraction {:.0}", state.curl_attraction));
-                        section.label(format!("Damping {:.2}", state.curl_damping));
-                        section.label(format!("Epsilon {:.4}", state.curl_epsilon));
+                        section.label(format!("Scale {:.4}", demo_state.curl_scale));
+                        section.label(format!("Attraction {:.0}", demo_state.curl_attraction));
+                        section.label(format!("Damping {:.2}", demo_state.curl_damping));
+                        section.label(format!("Epsilon {:.4}", demo_state.curl_epsilon));
                     });
                     window.separator();
                     window.label("O/P scale  L/K attraction  M/N damping  V/B epsilon");
@@ -98,7 +98,7 @@ pub(crate) fn tuning_overlay_system(
                         )
                         .clicked()
                     {
-                        *state = DemoState::default();
+                        *demo_state = DemoState::default();
                     }
                 });
         },
@@ -114,7 +114,7 @@ pub(crate) fn debug_overlay_system(
     mut debug_draw: ResMut<DebugDraw>,
     demo_state: Res<DemoState>,
 ) -> Result<(), SystemError> {
-    // A build without the resource has nothing to draw into.
+    // A world without the resource has nothing to draw into.
     let Some(mut debug_draw) = debug_draw.get_mut() else {
         return Ok(());
     };
@@ -137,16 +137,28 @@ pub(crate) fn debug_overlay_system(
         DebugStyle::colored([0.3, 0.8, 1.0, 1.0]),
     );
 
-    // The axes show through everything, so they stay findable inside the swarm.
-    let on_top = |color| DebugStyle {
+    // The axes and labels draw over the scene, so they stay visible in the swarm.
+    let on_top_style = |color| DebugStyle {
         depth_test: false,
         ..DebugStyle::colored(color)
     };
     debug_draw
-        .arrow([0.0; 3], [3.0, 0.0, 0.0], on_top([1.0, 0.2, 0.2, 1.0]))
-        .arrow([0.0; 3], [0.0, 3.0, 0.0], on_top([0.2, 1.0, 0.2, 1.0]))
-        .arrow([0.0; 3], [0.0, 0.0, 3.0], on_top([0.3, 0.5, 1.0, 1.0]))
-        .label_world([0.0; 3], "origin", on_top([1.0; 4]))
+        .arrow(
+            [0.0; 3],
+            [3.0, 0.0, 0.0],
+            on_top_style([1.0, 0.2, 0.2, 1.0]),
+        )
+        .arrow(
+            [0.0; 3],
+            [0.0, 3.0, 0.0],
+            on_top_style([0.2, 1.0, 0.2, 1.0]),
+        )
+        .arrow(
+            [0.0; 3],
+            [0.0, 0.0, 3.0],
+            on_top_style([0.3, 0.5, 1.0, 1.0]),
+        )
+        .label_world([0.0; 3], "origin", on_top_style([1.0; 4]))
         .label_world(
             [
                 field_center[0] - field_half_extents[0],
@@ -154,15 +166,18 @@ pub(crate) fn debug_overlay_system(
                 field_center[2] - field_half_extents[2],
             ],
             "curl noise field",
-            on_top([0.3, 0.8, 1.0, 1.0]),
+            on_top_style([0.3, 0.8, 1.0, 1.0]),
         );
 
-    if let Some(state) = demo_state.get() {
+    if let Some(demo_state) = demo_state.get() {
         let status = format!(
             "pills - F3: debug draw\ncurl scale {:.4}  attraction {:.2}\ndamping {:.4}  epsilon {:.4}",
-            state.curl_scale, state.curl_attraction, state.curl_damping, state.curl_epsilon
+            demo_state.curl_scale,
+            demo_state.curl_attraction,
+            demo_state.curl_damping,
+            demo_state.curl_epsilon
         );
-        debug_draw.label_screen(16.0, 16.0, &status, on_top([1.0, 0.9, 0.4, 1.0]));
+        debug_draw.label_screen(16.0, 16.0, &status, on_top_style([1.0, 0.9, 0.4, 1.0]));
     }
     Ok(())
 }

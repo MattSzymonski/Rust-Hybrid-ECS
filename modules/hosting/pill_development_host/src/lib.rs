@@ -28,15 +28,12 @@
 ///
 /// Its measurements come from the build, load and reload pipeline, so a
 /// statically linked build has nothing to report.
-#[cfg(feature = "hot_reload")]
 mod analytics;
 /// The startup build plan: logs the modules a start will build, then counts
 /// each build as it begins.
-#[cfg(feature = "hot_reload")]
 mod build_progress;
 /// Build commands for the project and its extensions, artifact staging and
 /// output-path resolution.
-#[cfg(feature = "hot_reload")]
 mod build_runner;
 /// Project and extension configuration shared by every host frontend.
 mod config;
@@ -46,55 +43,57 @@ mod config;
 ///
 /// A shipped C# project needs none of it: it starts through the bridge's
 /// `CSharpBackend`, run by the bridge's runtime.
-#[cfg(feature = "hot_reload")]
 mod csharp;
 /// Per-function hot patching: decides which edits can be patched, then
 /// generates, compiles and activates the patch.
-#[cfg(feature = "hot_patch")]
 mod hot_patch;
 
 /// Builds, loads and reloads the extension modules.
 mod extension;
+/// What a module's resources declared their layouts are made of, and whether
+/// that changed since the last load.
+mod layout_record;
+/// The project's per-manager settings files: created from the manager's
+/// defaults, and applied to the live manager.
+mod manager_settings;
 /// Loads native module libraries from temporary copies that must outlive a
 /// reload.
-#[cfg(feature = "hot_reload")]
 mod native_library;
 /// Reloads, patches, failures and rollbacks, queued as notices for an attached
 /// editor.
-#[cfg(feature = "hot_reload")]
 mod notices;
 /// The loaded project module: its startup build and load, and each reload
 /// after that.
 mod project_module;
 /// The steps every reload runs once its replacement image is loaded.
-#[cfg(feature = "hot_reload")]
 mod reload;
+/// Watches the project's `settings` directory and queues the managers whose
+/// settings file changed.
+mod settings_watcher;
+/// What this run's watchers are allowed to do, read from the `PILL_*` switches.
+mod switches;
 
 /// The GPU renderer as a loaded module: builds and attaches it, then drives
 /// its backend.
-#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+#[cfg(feature = "rendering")]
 mod renderer_module;
 /// The development host: `DevHost` and `RenderingHost`, with the functions
 /// that set them up, run their frames and reload their modules.
-#[cfg(feature = "hot_reload")]
 mod runtime;
 /// Watches the source tree and tells the main thread when to reload.
-#[cfg(feature = "hot_reload")]
 mod watcher;
 
 /// Watches the project's `res` folder so an edited asset is imported again
 /// while the host runs.
-#[cfg(feature = "hot_reload")]
 mod asset_watcher;
 
 /// The project's assets as a tool sees them: the tree listing, import settings
 /// and moves.
-#[cfg(feature = "hot_reload")]
 mod asset_browser;
 
 /// Watches the renderer's shader sources, cooks them again after an edit on a
 /// worker thread, and queues the results.
-#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+#[cfg(feature = "rendering")]
 mod shader_watcher;
 
 /// Test-only helpers: temporary directories and explicit file dates.
@@ -118,7 +117,6 @@ pub use config::{ExtensionConfig, HostConfig, ProjectModuleBackend, ProjectModul
 pub use extension::EXTENSION_ABI_VERSION;
 /// The notice type an editor frontend reads, and the function that empties the
 /// queue each frame.
-#[cfg(feature = "hot_reload")]
 pub use notices::{take as take_notices, HostNotice};
 /// The error types frontends report through, with the message renderers and
 /// the installed report handler.
@@ -137,15 +135,12 @@ pub use pill_player::FrameDriver;
 
 /// The project's assets as an editor tool sees them, plus the standalone asset
 /// types a new asset can be created for.
-#[cfg(feature = "hot_reload")]
 pub use asset_browser::{standalone_file_name, standalone_types, AssetEntry, StandaloneType};
 /// One entry in a patched function's history, as returned by
 /// [`DevHost::patch_generations`](runtime::DevHost::patch_generations).
-#[cfg(feature = "hot_patch")]
 pub use hot_patch::PatchGeneration;
 /// The development host and the entry points that create and drive it without
 /// a window.
-#[cfg(feature = "hot_reload")]
 pub use runtime::{run_frame, setup, DevHost};
 
 /// The engine's composed error. It has no rendering variants, so headless
@@ -167,5 +162,5 @@ pub use pill_renderer_api::{RenderViewport, RendererError};
 
 /// Rendering-only entry points: the windowed host, and attaching the renderer
 /// to a frontend's window.
-#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+#[cfg(feature = "rendering")]
 pub use runtime::{attach_renderer, setup_rendering, RenderingHost};

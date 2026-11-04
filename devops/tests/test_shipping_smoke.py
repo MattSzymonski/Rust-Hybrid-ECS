@@ -66,7 +66,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, find_executable  # noqa: E402
-from core.projects import PROJECT_RS_ROOT, repository_relative  # noqa: E402
+from core.projects import NATIVE_PROJECT_ROOT, repository_relative  # noqa: E402
 from core.suite_common import (  # noqa: E402
     SHIPPING_BUNDLE_PATHS,
     restore_paths,
@@ -192,7 +192,7 @@ def build_shipping_binary(timeout: int) -> str:
     generator = [
         sys.executable,
         str(REPOSITORY_ROOT / "devops" / "tools" / "generate_shipping_bundle.py"),
-        repository_relative(PROJECT_RS_ROOT),
+        repository_relative(NATIVE_PROJECT_ROOT),
     ]
     completed = subprocess.run(
         generator,

@@ -6,14 +6,11 @@ REQUIREMENTS
 
 DESCRIPTION
     Single source of truth for the low-level machinery every host-driving
-    script needs, under `devops/core/` because both the tests and the
-    benchmarks import it:
+    suite needs, under `devops/core/` because every one of them imports it:
 
       * `devops/tests/test_hot_reload_suite.py`     - full suite (sessions A/B)
       * `devops/tests/test_hot_reload_migration.py` - schema-migration suite
       * `devops/tests/test_csharp_bridge.py`        - C# bridge suite
-      * `devops/benchmarks/hot_reload_harness.py`   - reload timing harness
-      * `devops/benchmarks/cold_start.py`           - host startup timing
 
     Shared here: path resolution, the console-color `print` wrapper, the
     rolling output monitor with a dedicated counter-tick tail, atomic source
@@ -55,19 +52,18 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from .paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name
 from .environment import ProcessToolUnavailable, windows_process_commands
 from .projects import (
-    CSHARP_PROJECT_PATH,
-    CSHARP_PROJECT_ROOT,
     EXAMPLES_RELATIVE_PATH,
     EXAMPLES_ROOT,
-    FIXTURE_PROJECT_COMPONENTS_RS,
-    FIXTURE_PROJECT_PATH,
-    FIXTURE_PROJECT_ROOT,
     SCENE_PROJECT_PATH,
     SCENE_PROJECT_RES,
     SCENE_PROJECT_ROOT,
     SCENE_PROJECT_SCENE_RS,
+    NATIVE_PROJECT_LIB_RS,
     NATIVE_PROJECT_PATH,
+    NATIVE_PROJECT_RES,
     NATIVE_PROJECT_ROOT,
+    NATIVE_PROJECT_SETTINGS_RS,
+    NATIVE_PROJECT_SRC,
     OFFICIAL_EXAMPLES_ROOT,
     OFFICIAL_EXAMPLE_PROJECTS,
     MANAGED_PROJECT_PATH,
@@ -76,17 +72,7 @@ from .projects import (
     MANAGED_PROJECT_BRIDGE_PROBE_CS,
     MANAGED_PROJECT_COMPONENTS_CS,
     MANAGED_PROJECT_CSPROJ,
-    MANAGED_PROJECT_PATH,
-    MANAGED_PROJECT_ROOT,
-    MANAGED_PROJECT_SRC,
     MANAGED_PROJECT_SYSTEMS_CS,
-    PROJECT_RS_LIB_RS,
-    PROJECT_RS_PATH,
-    PROJECT_RS_RES,
-    PROJECT_RS_ROOT,
-    PROJECT_RS_SETTINGS_RS,
-    PROJECT_RS_SRC,
-    PROJECT_SANDBOX_LIB_RS,
     PROJECT_SETTINGS_FILENAME,
     TEST_PROJECTS_ROOT,
     TEST_PROJECT_NAMES,
@@ -127,7 +113,7 @@ HOST_EXE = executable_name("pill_standalone")
 
 # Project directories and the files inside them live in `core.projects`, which
 # this module re-exports: the `*_ROOT` Paths, the `*_PATH` values the host
-# receives, `EXAMPLES_ROOT`, `FIXTURE_PROJECT_ROOT` and
+# receives, `EXAMPLES_ROOT`, `NATIVE_PROJECT_ROOT` and
 # `project_settings_yaml`. A suite imports them from here with the rest of the
 # harness, so no suite spells a project path of its own.
 
@@ -145,11 +131,13 @@ HOST_EXE = executable_name("pill_standalone")
 # host went quiet.
 #
 # THE TRAP. Most tokens below are printed by `pill_development_host`, which nobody edits
-# casually. Two are not: MODULE_REGISTERED_MESSAGE and PROJECT_PROBE_PREFIX
-# come from the example project and the example module - the two files the
-# whole hot-reload demo invites you to type into. Editing the probe string
-# breaks these suites with a "Missing required token" that reads like a reload
-# failure and is not: the reload worked, the text just moved.
+# casually. A few come from the native fixture's project and its `pill_spline`
+# module - the files the whole hot-reload demo invites you to type into: the
+# module-register line, the project probe's "N spline(s)" and midpoint. Editing
+# those strings breaks these suites with a "Missing required token", or a
+# timeout, that reads like a reload failure and is not: the reload worked, the
+# text just moved. Those lines are matched with inline literals beside the wait
+# that needs them, so the literal to search for is there rather than here.
 #
 # Prefer matching the part of a line that carries meaning - a count, a computed
 # value - over the part that is only there to be edited. Where a token still
@@ -161,7 +149,7 @@ MODULE_LOADED_TOKEN = "module DLL loaded successfully"
 ANALYTICS_REPORT_TOKEN = "BUILD / LINK / HOT-RELOAD ANALYTICS"
 # The native fixture's package name, taken from its directory (the two agree by
 # convention), so a rename does not silently strand the reload tokens.
-NATIVE_PROJECT_PACKAGE = PROJECT_RS_ROOT.name
+NATIVE_PROJECT_PACKAGE = NATIVE_PROJECT_ROOT.name
 RELOAD_PROJECT_TOKEN = f"[analytics] reload {NATIVE_PROJECT_PACKAGE}"
 RELOAD_MODULE_TOKEN = "[analytics] reload pill_spline"
 MODULE_RELOAD_COMPLETE_TOKEN = "extension hot reload complete"
@@ -172,18 +160,6 @@ MIGRATION_FINISHED_TOKEN = "[persistence] Selective migration finished"
 ROLLBACK_TOKEN = "rolling back"
 PANIC_TOKEN = "panicked at"
 ACCESS_VIOLATION_TOKEN = "STATUS_ACCESS_VIOLATION"
-
-# Module register-log fields (tracing renders them after the message, e.g.
-# "pill_spline module registered  splines=1 existing=0 max_control_points=16").
-MODULE_REGISTERED_MESSAGE = "pill_spline module registered"
-# The project probe line ("[project] xxsees N spline(s), midpoint (...)").
-#
-# `xxsees` is not a word: it is `sees` with characters typed into it during a
-# live-coding session, and it survives only because these suites pin it. That
-# is the trap above in miniature - the prefix carries no meaning. If this breaks
-# again, prefer widening it to "[project] " and asserting on the spline count,
-# rather than restoring whatever the demo happens to print today.
-PROJECT_PROBE_PREFIX = "[project] xxsees"
 
 # =============================================================================
 # Timeouts (seconds)
@@ -535,9 +511,9 @@ def edit_spline_sample_offset(content: str) -> SplineSampleOffsetEdit:
     The constant is the demo's behaviour-only knob: it moves the project
     probe's midpoint without touching any component's shape, so the reload
     takes the ordinary path rather than a schema migration. The native
-    hot-reload suite's cascade scenario and the benchmark harness trigger a
-    reload with it, which is why the edit is planned from the current source
-    instead of pinned to a literal pair.
+    hot-reload suite's cascade scenario triggers a reload with it, which is
+    why the edit is planned from the current source instead of pinned to a
+    literal pair.
 
     A pinned pair ("= 0.0" -> "= 10.0") only applies to a source nobody has
     edited yet, so the suites were order-dependent: a run that ended on a
@@ -1283,24 +1259,16 @@ __all__ = [
     "HOST_EXE",
     "NATIVE_PROJECT_ROOT",
     "NATIVE_PROJECT_PATH",
-    "CSHARP_PROJECT_ROOT",
-    "CSHARP_PROJECT_PATH",
-    "FIXTURE_PROJECT_ROOT",
-    "FIXTURE_PROJECT_PATH",
-    "FIXTURE_PROJECT_COMPONENTS_RS",
-    "PROJECT_SANDBOX_LIB_RS",
+    "NATIVE_PROJECT_SRC",
+    "NATIVE_PROJECT_LIB_RS",
+    "NATIVE_PROJECT_SETTINGS_RS",
+    "NATIVE_PROJECT_RES",
     "PROJECT_SETTINGS_FILENAME",
     "EXAMPLES_ROOT",
     "EXAMPLES_RELATIVE_PATH",
     "OFFICIAL_EXAMPLES_ROOT",
     "OFFICIAL_EXAMPLE_PROJECTS",
     "example_project_roots",
-    "PROJECT_RS_ROOT",
-    "PROJECT_RS_PATH",
-    "PROJECT_RS_SRC",
-    "PROJECT_RS_LIB_RS",
-    "PROJECT_RS_SETTINGS_RS",
-    "PROJECT_RS_RES",
     "MANAGED_PROJECT_ROOT",
     "MANAGED_PROJECT_PATH",
     "MANAGED_PROJECT_SRC",
@@ -1308,9 +1276,6 @@ __all__ = [
     "MANAGED_PROJECT_COMPONENTS_CS",
     "MANAGED_PROJECT_SYSTEMS_CS",
     "MANAGED_PROJECT_BRIDGE_PROBE_CS",
-    "MANAGED_PROJECT_ROOT",
-    "MANAGED_PROJECT_PATH",
-    "MANAGED_PROJECT_SRC",
     "SCENE_PROJECT_ROOT",
     "SCENE_PROJECT_PATH",
     "SCENE_PROJECT_SCENE_RS",
@@ -1342,8 +1307,6 @@ __all__ = [
     "ROLLBACK_TOKEN",
     "PANIC_TOKEN",
     "ACCESS_VIOLATION_TOKEN",
-    "MODULE_REGISTERED_MESSAGE",
-    "PROJECT_PROBE_PREFIX",
     "STARTUP_TIMEOUT",
     "RELOAD_TIMEOUT",
     "PROBE_TIMEOUT",

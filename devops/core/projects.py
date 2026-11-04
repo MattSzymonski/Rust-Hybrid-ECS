@@ -1,5 +1,5 @@
 """
-Project and path configuration shared by every devops suite, benchmark and gate step.
+Project and path configuration shared by every devops suite and gate step.
 
 REQUIREMENTS: Python 3.8+ (standard library only).
 
@@ -30,7 +30,7 @@ DESCRIPTION
     `repository_relative(<root>)` instead of a `*_PATH` value.
 
 USAGE
-  from core.projects import PROJECT_RS_ROOT, PROJECT_RS_PATH
+  from core.projects import NATIVE_PROJECT_ROOT, NATIVE_PROJECT_PATH
 
   With `devops/` on `sys.path`; see `core.paths.ensure_devops_on_path`. Suites
   that import `core.suite_common` receive every public name below through its
@@ -153,18 +153,13 @@ def project_roots() -> list[Path]:
 # the migration witnesses (`src/lib.rs`).
 NATIVE_PROJECT_ROOT = TEST_PROJECTS_ROOT / "native"
 NATIVE_PROJECT_PATH = host_project_path(NATIVE_PROJECT_ROOT)
-PROJECT_RS_SRC = NATIVE_PROJECT_ROOT / "src"
-PROJECT_RS_LIB_RS = PROJECT_RS_SRC / "lib.rs"
+NATIVE_PROJECT_SRC = NATIVE_PROJECT_ROOT / "src"
+NATIVE_PROJECT_LIB_RS = NATIVE_PROJECT_SRC / "lib.rs"
 # The constant the hot-reload harness edits to force a project reload.
-PROJECT_RS_SETTINGS_RS = PROJECT_RS_SRC / "settings.rs"
+NATIVE_PROJECT_SETTINGS_RS = NATIVE_PROJECT_SRC / "settings.rs"
 # The components the migration scenarios rewrite live in the crate root, next
 # to the seeds and the witness systems they are read by.
-PROJECT_RS_RES = NATIVE_PROJECT_ROOT / "res"
-
-# The older spelling of the same role: the suites that predate the rename still
-# import these names, so they stay as aliases of the native fixture.
-PROJECT_RS_ROOT = NATIVE_PROJECT_ROOT
-PROJECT_RS_PATH = NATIVE_PROJECT_PATH
+NATIVE_PROJECT_RES = NATIVE_PROJECT_ROOT / "res"
 
 
 # =============================================================================
@@ -179,19 +174,6 @@ MANAGED_PROJECT_COMPONENTS_CS = MANAGED_PROJECT_SRC / "Components.cs"
 MANAGED_PROJECT_SYSTEMS_CS = MANAGED_PROJECT_SRC / "Systems.cs"
 # The probe file the bridge suite writes and deletes.
 MANAGED_PROJECT_BRIDGE_PROBE_CS = MANAGED_PROJECT_SRC / "BridgeProbe.cs"
-
-# The managed counterpart's role name, matching `NATIVE_PROJECT_ROOT`.
-CSHARP_PROJECT_ROOT = MANAGED_PROJECT_ROOT
-CSHARP_PROJECT_PATH = MANAGED_PROJECT_PATH
-
-
-# =============================================================================
-# The managed benchmark scene: iteration timing only, no renderer
-# =============================================================================
-
-MANAGED_PROJECT_ROOT = TEST_PROJECTS_ROOT / "managed"
-MANAGED_PROJECT_PATH = host_project_path(MANAGED_PROJECT_ROOT)
-MANAGED_PROJECT_SRC = MANAGED_PROJECT_ROOT / "src"
 
 
 # =============================================================================
@@ -233,18 +215,11 @@ THEMED_PROJECT_FONT = SCENE_PROJECT_RES / "fonts" / "Silkscreen-Regular.ttf"
 
 
 # =============================================================================
-# The migration fixture: the components the schema scenarios rewrite
+# The native fixture's crate root: the components the schema scenarios rewrite
 # =============================================================================
 
-# The migration scenarios used to drive a separate crate; their components and
-# witness systems now live in the native fixture's crate root, so both families
-# of scenarios run the same build and there is no second project to keep in
-# step.
-FIXTURE_PROJECT_ROOT = NATIVE_PROJECT_ROOT
-FIXTURE_PROJECT_PATH = NATIVE_PROJECT_PATH
-# The fixture's entry source: the file the native scenarios edit, and the one
-# whose restore settles with a project reload rather than a module reload.
-PROJECT_SANDBOX_LIB_RS = FIXTURE_PROJECT_ROOT / "src" / "lib.rs"
-# The migration scenarios edit the crate root itself, where the witness
-# components and their seeds live.
-FIXTURE_PROJECT_COMPONENTS_RS = PROJECT_RS_LIB_RS
+# The migration scenarios run against the native fixture, where the witness
+# components and their seeds live, so both families of scenarios run the same
+# build and there is no second project to keep in step. `NATIVE_PROJECT_LIB_RS`
+# is the file the native scenarios edit and whose restore settles with a
+# project reload rather than a module reload.

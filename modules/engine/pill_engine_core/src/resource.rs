@@ -46,6 +46,7 @@ use pill_core::error;
 
 use crate::archetype::FieldPlan;
 use crate::error::WorldError;
+use crate::settings::ManagerSettingsOps;
 use crate::world::World;
 
 // =============================================================================
@@ -120,6 +121,58 @@ pub trait Resource: Send + Sync + 'static {
     /// to make one up. When the type has a field vocabulary, derive the value
     /// with [`component_schema_hash`](crate::component::component_schema_hash).
     fn shared_schema_hash() -> Option<u64>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// The files whose contents define this type's layout, or `None`.
+    ///
+    /// A resource outlives the module that inserted it, so a reload keeps the
+    /// live value and re-points its function table at the new image. That is
+    /// safe only while the two images agree on the type's layout: a field
+    /// added, removed or retyped keeps the same bytes but changes what they
+    /// mean, and the value is then read through a type it was not built for.
+    ///
+    /// Declaring the sources lets the development host fingerprint the layout
+    /// instead of assuming it. When the fingerprint is unchanged the value is
+    /// kept; when it changed the value is dropped through the retiring image's
+    /// own drop function and the module rebuilds it, with a warning naming the
+    /// resource and what changed. Paths are relative to the root of the crate
+    /// that declares the resource - the directory the host watches, builds and
+    /// reads the fingerprint from.
+    ///
+    /// The default is `None`, which keeps the behaviour that predates this
+    /// declaration: the value is kept whenever the next generation registers
+    /// the type again. Declaring a list is therefore opt-in and only costs a
+    /// rebuild of this one resource after an edit to these files.
+    ///
+    /// List every file that can change the layout, including ones the type
+    /// embeds by value; a file that is missed is a file whose edit keeps a
+    /// stale value.
+    fn layout_sources() -> Option<&'static [&'static str]>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// The crates whose resolved version can change this type's layout, or
+    /// `None`.
+    ///
+    /// The companion of [`Self::layout_sources`] for the part of a layout that
+    /// comes from another crate: a type that embeds a dependency's type changes
+    /// shape when that dependency is upgraded, without any file of this crate
+    /// changing. The host looks each name up in the workspace's `Cargo.lock`
+    /// and folds the versions into the same fingerprint. A crate that is absent
+    /// from the lockfile is hashed as absent, so adding it later also reads as
+    /// a change.
+    ///
+    /// The default is `None`, and both lists being `None` means the type has
+    /// declared nothing and is handled as before. Names are package names as
+    /// `Cargo.lock` writes them (`serde`, not `serde-1.0.0`).
+    fn layout_dependencies() -> Option<&'static [&'static str]>
     where
         Self: Sized,
     {
@@ -334,6 +387,33 @@ pub struct ErasedResourceOps {
     /// byte accessors and the relayout path read this flag to refuse a Rust
     /// value.
     pub foreign: bool,
+    /// Files the declaring type said define its layout, or `None` when it
+    /// declared nothing.
+    ///
+    /// The list lives in the artifact that declared it, so it has the same
+    /// lifetime as `drop_in_place`: valid while that image is mapped, and
+    /// refreshed by [`World::rehome_resources`] together with the rest of the
+    /// table. Read it through [`World::kept_layout_declaration`], which copies
+    /// it out as owned strings.
+    pub layout_sources: Option<&'static [&'static str]>,
+    /// Crates the declaring type said can change its layout, or `None`.
+    ///
+    /// Same lifetime rule as `layout_sources`.
+    pub layout_dependencies: Option<&'static [&'static str]>,
+    /// Full path of the type this table describes, or `None` for a foreign
+    /// declaration, which has no Rust type to name.
+    ///
+    /// The same type keeps this name across a reload while its [`TypeId`]
+    /// changes, so it is what a record written by one generation is matched
+    /// against in the next.
+    pub declaring_type_name: Option<&'static str>,
+    /// The manager's settings surface, when the type is a
+    /// [`ManagerResource`](crate::settings::ManagerResource).
+    ///
+    /// The applier points into the artifact that registered the manager, so it
+    /// has the same lifetime rule as `drop_in_place` and is refreshed with the
+    /// rest of the table by `World::rehome_resources`.
+    pub manager: Option<ManagerSettingsOps>,
 }
 
 impl ErasedResourceOps {
@@ -345,7 +425,24 @@ impl ErasedResourceOps {
             align: std::mem::align_of::<T>(),
             schema_hash: None,
             foreign: false,
+            layout_sources: T::layout_sources(),
+            layout_dependencies: T::layout_dependencies(),
+            declaring_type_name: Some(std::any::type_name::<T>()),
+            // A manager type adds its settings surface with
+            // [`Self::with_manager`]; a plain resource has none.
+            manager: None,
         }
+    }
+
+    /// Adds the settings surface of a manager type.
+    ///
+    /// Called by `World::insert_manager_resource` and
+    /// `World::register_manager_resource`, which are the only paths a manager
+    /// value should take: a manager registered without it would never be
+    /// found by the host's settings pipeline.
+    pub fn with_manager<T: crate::settings::ManagerResource>(mut self) -> Self {
+        self.manager = Some(ManagerSettingsOps::of::<T>());
+        self
     }
 
     /// Builds the table for a declaration from another language.
@@ -361,7 +458,62 @@ impl ErasedResourceOps {
             align,
             schema_hash: Some(schema_hash),
             foreign: true,
+            // A foreign declaration describes bytes another language owns; it
+            // has no Rust source to name and no crate whose type it embeds, so
+            // it declares nothing and keeps today's keep-on-re-register path.
+            layout_sources: None,
+            layout_dependencies: None,
+            declaring_type_name: None,
+            // No Rust type means no applier to call: a managed manager would
+            // have to expose its own entry point.
+            manager: None,
         }
+    }
+}
+
+/// What a resource type declared about the files and crates that define its
+/// layout, as owned strings.
+///
+/// [`ErasedResourceOps`] holds the same declaration as borrowed slices, which
+/// live in the artifact that declared them. A reader that keeps the answer past
+/// that artifact's retirement - the development host does - copies it into this
+/// type while the image is still mapped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeptLayoutDeclaration {
+    /// Full path of the declaring type, which is stable across a reload.
+    pub declaring_type_name: String,
+    /// Files whose contents define the type's layout.
+    pub sources: Vec<String>,
+    /// Crates whose resolved version can change the type's layout.
+    pub dependencies: Vec<String>,
+}
+
+impl KeptLayoutDeclaration {
+    /// Copies the declaration out of a registered type's table.
+    ///
+    /// Returns `None` when the type declared nothing: that is the state that
+    /// keeps the behaviour which predates the declaration, so a caller that
+    /// gets `None` has no decision to make.
+    #[must_use]
+    pub fn from_ops(resource_ops: ErasedResourceOps) -> Option<Self> {
+        if resource_ops.layout_sources.is_none() && resource_ops.layout_dependencies.is_none() {
+            return None;
+        }
+        let copy_names = |names: Option<&'static [&'static str]>| {
+            names
+                .unwrap_or_default()
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<String>>()
+        };
+        Some(Self {
+            declaring_type_name: resource_ops
+                .declaring_type_name
+                .unwrap_or_default()
+                .to_owned(),
+            sources: copy_names(resource_ops.layout_sources),
+            dependencies: copy_names(resource_ops.layout_dependencies),
+        })
     }
 }
 
@@ -409,7 +561,12 @@ pub struct ErasedResource {
     /// `type_id`; set when the resource declares a shared name.
     has_shared_identity: bool,
     /// Per-type function table; replaceable via [`Self::refresh_ops`].
-    function_table: ErasedResourceOps,
+    ///
+    /// Boxed rather than stored inline: the table carries the type's layout
+    /// declaration, and the box travels by value out of
+    /// [`Self::take`]'s refusal, so an inline copy would make every refusal -
+    /// and every box - larger than an error value should be.
+    function_table: Box<ErasedResourceOps>,
 }
 
 // SAFETY: a Rust box holds a `Resource`, which is `Send + Sync`, and a foreign
@@ -439,7 +596,7 @@ impl ErasedResource {
             // the type differs, so its identity check has to be layout-based;
             // see `holds`.
             has_shared_identity: T::shared_name().is_some(),
-            function_table: ErasedResourceOps::of::<T>(),
+            function_table: Box::new(ErasedResourceOps::of::<T>()),
         }
     }
 
@@ -470,7 +627,7 @@ impl ErasedResource {
             size,
             align,
             has_shared_identity: true,
-            function_table: ErasedResourceOps::foreign(size, align, schema_hash),
+            function_table: Box::new(ErasedResourceOps::foreign(size, align, schema_hash)),
         }
     }
 
@@ -614,7 +771,7 @@ impl ErasedResource {
         // box's table is never refreshed from the resource factories - that is
         // what stops a Rust type sharing the name from handing its drop to
         // these bytes - so this is the one place it changes.
-        self.function_table =
+        *self.function_table =
             ErasedResourceOps::foreign(size, align, self.function_table.schema_hash.unwrap_or(0));
         Ok(())
     }
@@ -642,7 +799,7 @@ impl ErasedResource {
             );
             return;
         }
-        self.function_table = function_table;
+        *self.function_table = function_table;
     }
 
     /// Whether this box is identified by layout rather than by `TypeId`.
@@ -684,6 +841,17 @@ impl ErasedResource {
         }
         // SAFETY: as for `get`, and `&mut self` makes the borrow exclusive.
         Some(unsafe { &mut *self.value_allocation.as_ptr().cast::<T>() })
+    }
+
+    /// The stored value's address, for a caller that holds code knowing the
+    /// type: the world's manager-settings applier, which calls the function
+    /// pointer the type registered.
+    ///
+    /// `pub(crate)` on purpose. A raw pointer into the world is the handle the
+    /// safe API exists to hide, and this one is only sound while the caller's
+    /// type table came from the registration that created this box.
+    pub(crate) fn value_pointer_mut(&mut self) -> *mut u8 {
+        self.value_allocation.as_ptr()
     }
 
     /// Move the stored value out, consuming the box.
@@ -1036,5 +1204,43 @@ mod tests {
 
         drop(erased);
         assert_eq!(drops_of(&drop_count), 1);
+    }
+
+    /// A resource that declares the files and crates behind its layout hands
+    /// both lists to the table, and the copied declaration keeps them.
+    #[test]
+    fn a_declared_layout_is_copied_out_of_the_type_table() {
+        /// Stands in for a module resource whose layout lives in two files.
+        struct Declared;
+
+        impl Resource for Declared {
+            fn layout_sources() -> Option<&'static [&'static str]> {
+                Some(&["src/declared.rs", "src/shared_layout.rs"])
+            }
+
+            fn layout_dependencies() -> Option<&'static [&'static str]> {
+                Some(&["pill_engine"])
+            }
+        }
+
+        let declaration = KeptLayoutDeclaration::from_ops(ErasedResourceOps::of::<Declared>())
+            .expect("a declared layout is reported");
+
+        assert_eq!(
+            declaration.declaring_type_name,
+            std::any::type_name::<Declared>()
+        );
+        assert_eq!(
+            declaration.sources,
+            ["src/declared.rs", "src/shared_layout.rs"]
+        );
+        assert_eq!(declaration.dependencies, ["pill_engine"]);
+    }
+
+    /// A resource that declares nothing reports nothing, which is what keeps
+    /// the behaviour that predates the declaration.
+    #[test]
+    fn an_undeclared_layout_is_not_reported() {
+        assert!(KeptLayoutDeclaration::from_ops(ErasedResourceOps::of::<Tracked>()).is_none());
     }
 }

@@ -133,19 +133,15 @@ const MODULE_INIT_SYMBOL: &[u8] = b"pill_module_init";
 const MODULE_ABI_VERSION_SYMBOL: &[u8] = b"pill_module_abi_version";
 
 /// Export that lets a patch reach an artifact's redirect slots.
-#[cfg(feature = "hot_patch")]
 const PLAIN_FUNCTION_INSTALL_SYMBOL: &[u8] = b"pill_hot_resolve_install";
 
 /// Export that returns one redirect slot to the artifact's own body.
-#[cfg(feature = "hot_patch")]
 const PLAIN_FUNCTION_RESET_SYMBOL: &[u8] = b"pill_hot_resolve_reset";
 
 /// Export that reports any function address in this artifact.
-#[cfg(feature = "hot_patch")]
 const FUNCTION_ADDRESS_SYMBOL: &[u8] = b"pill_hot_resolve_address";
 
 /// Export reporting how many of an artifact's functions have a known length.
-#[cfg(feature = "hot_patch")]
 const EXTENT_COVERAGE_SYMBOL: &[u8] = b"pill_hot_resolve_extent_coverage";
 
 /// Export reporting how many value-type descriptors an artifact declares.
@@ -552,7 +548,6 @@ type ModuleInitFn = unsafe extern "C" fn(*const EngineApi) -> u32;
 /// 1 when this artifact declares no such function, and 2 when the signature no
 /// longer matches - a non-zero result always leaves the running implementation
 /// untouched.
-#[cfg(feature = "hot_patch")]
 type PlainFunctionInstallFn =
     unsafe extern "C" fn(*const std::ffi::c_char, usize, *const std::ffi::c_char) -> u32;
 
@@ -561,16 +556,13 @@ type PlainFunctionInstallFn =
 ///
 /// Takes the function's qualified path and returns 0 when this artifact
 /// emptied its slot, 1 when it declares no such function.
-#[cfg(feature = "hot_patch")]
 type PlainFunctionResetFn = unsafe extern "C" fn(*const std::ffi::c_char) -> u32;
 
 /// Signature of the build-script-backed address resolver.
-#[cfg(feature = "hot_patch")]
 type FunctionAddressFn =
     unsafe extern "C" fn(*const std::ffi::c_char, *mut *const u8, *mut usize) -> usize;
 
 /// Signature of the extent-coverage diagnostic export.
-#[cfg(feature = "hot_patch")]
 type ExtentCoverageFn = unsafe extern "C" fn() -> u64;
 
 /// Signature of the optional ABI revision export.
@@ -1343,7 +1335,6 @@ impl NativeLibrary {
     /// `Ok(false)` when the artifact declares no such function, which includes a
     /// library built before this ABI that exports no resolver at all. Returns
     /// `Err` when the artifact refused because the signature no longer matches.
-    #[cfg(feature = "hot_patch")]
     pub(crate) fn install_plain_function(
         &self,
         qualified_name: &str,
@@ -1393,7 +1384,6 @@ impl NativeLibrary {
     /// this turns a refusal into a diagnosis: it shows whether the one function
     /// happens to be a leaf, or whether nothing in the artifact is reachable by
     /// that route. Returns `None` when the artifact exports no such report.
-    #[cfg(feature = "hot_patch")]
     pub(crate) fn extent_coverage(&self) -> Option<(usize, usize)> {
         let library = self.library.as_ref()?;
         // SAFETY: the symbol is looked up by the name the ABI macros generate,
@@ -1417,7 +1407,6 @@ impl NativeLibrary {
     ///
     /// Returns `None` when the artifact exports no address resolver or has no
     /// entry for the name.
-    #[cfg(feature = "hot_patch")]
     pub(crate) fn function_address(&self, qualified_name: &str) -> Option<(usize, Option<String>)> {
         let library = self.library.as_ref()?;
         // SAFETY: the symbol is looked up by the name the ABI macros generate,
@@ -1456,7 +1445,6 @@ impl NativeLibrary {
     ///
     /// Returns `Ok(true)` when this artifact emptied the slot. Returns
     /// `Ok(false)` when it declares no such function or exports no resolver.
-    #[cfg(feature = "hot_patch")]
     pub(crate) fn reset_plain_function(&self, qualified_name: &str) -> Result<bool, String> {
         let Some(library) = self.library.as_ref() else {
             return Ok(false);

@@ -140,7 +140,10 @@ pub fn register(engine: &mut Engine) -> u32 {
     if engine.world().get_resource::<AudioManager>().is_none() {
         match AudioManager::with_defaults() {
             Some(audio_manager) => {
-                engine.world_mut().insert_resource(audio_manager);
+                // The manager registration, not the plain insert: it records
+                // the settings surface the project configures the device with
+                // (`settings/pill_audio_settings.yaml`).
+                engine.world_mut().insert_manager_resource(audio_manager);
             }
             None => {
                 pill_core::warn!(
@@ -149,6 +152,12 @@ pub fn register(engine: &mut Engine) -> u32 {
                 );
             }
         }
+    } else {
+        // A kept manager re-declares its surface so the stored applier points
+        // at this generation's code.
+        engine
+            .world_mut()
+            .register_manager_resource::<AudioManager>();
     }
     // Step 4: Register the playback system and log the registration.
     engine.register_system("pill_audio", audio_system);

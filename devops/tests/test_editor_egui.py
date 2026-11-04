@@ -270,7 +270,6 @@ def main() -> int:
         preflight=concurrent_workspace_build_refusal,
     )
     state = StepState()
-    state.refusal = refusal
     state.session = session
     state.asset_root = asset_root
     state.editor_settings_path = editor_settings_path

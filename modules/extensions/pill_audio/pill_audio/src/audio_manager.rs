@@ -19,7 +19,7 @@
 //! pool is therefore also the limit on how many voices play at once.
 
 // External crates
-use pill_engine::Resource;
+use pill_engine::{Resource, SettingsDocument, SettingsOutcome};
 
 // Current crate
 use crate::sound::Sound;
@@ -72,6 +72,12 @@ pub struct AudioManager {
     free_ambient_sink_indices: Vec<u32>,
     /// Indices of the spatial sinks that no source holds.
     free_spatial_sink_indices: Vec<u32>,
+    /// Half the distance between the listener's ears, as the project set it.
+    ///
+    /// The sinks were built with [`EAR_SEPARATION`]; a settings document may
+    /// move them while the device runs, so the value the manager was built with
+    /// is kept to tell a real change from a repeated one.
+    ear_separation: f32,
 }
 
 // SAFETY: every field is `Send` in rodio 0.20 except `OutputStream`, which is
@@ -88,7 +94,159 @@ unsafe impl Sync for AudioManager {}
 
 impl Resource for AudioManager {}
 
+// =============================================================================
+// AudioSettings
+// =============================================================================
+
+/// The audio device's tunable settings, as the project's settings document
+/// describes them.
+///
+/// Pool sizes are fixed when the device opens: a pool grows by allocating a
+/// mixer channel per sink, and a source's `sink` index would point into a pool
+/// that changed under it. A document that asks for different sizes is refused
+/// with that reason, and the host is restarted to change them. Ear separation
+/// can move while the device runs, so it is applied live.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioSettings {
+    /// Voices for non-positional playback.
+    pub ambient_sinks: usize,
+    /// Voices for positional playback.
+    pub spatial_sinks: usize,
+    /// Half the distance between the listener's ears, in world units.
+    pub ear_separation: f32,
+}
+
+impl std::default::Default for AudioSettings {
+    /// The values [`AudioManager::with_defaults`] builds.
+    fn default() -> Self {
+        Self {
+            ambient_sinks: DEFAULT_AMBIENT_SINK_COUNT,
+            spatial_sinks: DEFAULT_SPATIAL_SINK_COUNT,
+            ear_separation: EAR_SEPARATION,
+        }
+    }
+}
+
+impl AudioSettings {
+    /// The keys a document may name.
+    const KEYS: [&'static str; 3] = ["ambient_sinks", "spatial_sinks", "ear_separation"];
+
+    /// Reads a document over the settings the manager has now.
+    ///
+    /// A key the document leaves out keeps its current value, so a file that
+    /// only widens the stereo image does not restate the pool sizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the first problem: a key this manager does not
+    /// know, a value of the wrong type, a pool size of zero, or a separation
+    /// that is not positive.
+    pub fn from_document(current: &Self, settings: &SettingsDocument) -> Result<Self, String> {
+        let unknown_keys = settings.unknown_keys(&Self::KEYS);
+        if !unknown_keys.is_empty() {
+            return Err(format!("unknown key(s) {unknown_keys:?}"));
+        }
+        let mut next = *current;
+        if settings.contains("ambient_sinks") {
+            let count = settings
+                .integer("ambient_sinks")
+                .ok_or("`ambient_sinks` must be a whole number")?;
+            if count <= 0 {
+                return Err("`ambient_sinks` must be at least 1".to_owned());
+            }
+            next.ambient_sinks = count as usize;
+        }
+        if settings.contains("spatial_sinks") {
+            let count = settings
+                .integer("spatial_sinks")
+                .ok_or("`spatial_sinks` must be a whole number")?;
+            if count <= 0 {
+                return Err("`spatial_sinks` must be at least 1".to_owned());
+            }
+            next.spatial_sinks = count as usize;
+        }
+        if settings.contains("ear_separation") {
+            let separation = settings
+                .float("ear_separation")
+                .ok_or("`ear_separation` must be a number")?;
+            if separation <= 0.0 {
+                return Err("`ear_separation` must be greater than 0".to_owned());
+            }
+            next.ear_separation = separation as f32;
+        }
+        Ok(next)
+    }
+}
+
+impl pill_engine::ManagerResource for AudioManager {
+    fn settings_name() -> &'static str {
+        "pill_audio"
+    }
+
+    /// Every key, with the value [`AudioManager::with_defaults`] starts from.
+    fn default_settings() -> &'static str {
+        "# Audio settings.\n\
+         # ambient_sinks and spatial_sinks are fixed when the device opens;\n\
+         # restart the host to change them.\n\
+         ambient_sinks: 16\n\
+         spatial_sinks: 16\n\
+         ear_separation: 1.0\n"
+    }
+
+    fn apply_settings(&mut self, settings: &SettingsDocument) -> SettingsOutcome {
+        let current = self.settings();
+        let next = match AudioSettings::from_document(&current, settings) {
+            Ok(next) => next,
+            Err(reason) => {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    reason,
+                    "[audio] settings refused"
+                );
+                return SettingsOutcome::Refused;
+            }
+        };
+        if next.ambient_sinks != current.ambient_sinks
+            || next.spatial_sinks != current.spatial_sinks
+        {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                ambient_sinks = next.ambient_sinks,
+                spatial_sinks = next.spatial_sinks,
+                "[audio] sink counts are fixed when the device opens; restart the host to change them"
+            );
+            return SettingsOutcome::Refused;
+        }
+        if next.ear_separation != self.ear_separation {
+            // Moving the ears is the one change a running device takes: every
+            // sink already open reads its positions from the device state.
+            self.set_ears(
+                [-next.ear_separation, 0.0, 0.0],
+                [next.ear_separation, 0.0, 0.0],
+            );
+            self.ear_separation = next.ear_separation;
+        }
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            ambient_sinks = next.ambient_sinks,
+            spatial_sinks = next.spatial_sinks,
+            ear_separation = next.ear_separation,
+            "[audio] settings applied"
+        );
+        SettingsOutcome::Applied
+    }
+}
+
 impl AudioManager {
+    /// The settings this device is running with.
+    pub fn settings(&self) -> AudioSettings {
+        AudioSettings {
+            ambient_sinks: self.ambient_sinks.len(),
+            spatial_sinks: self.spatial_sinks.len(),
+            ear_separation: self.ear_separation,
+        }
+    }
+
     /// Opens the default output device and builds both sink pools.
     ///
     /// Returns `None` when there is no audio device: a headless CI runner, a
@@ -130,6 +288,7 @@ impl AudioManager {
             spatial_sinks,
             free_ambient_sink_indices,
             free_spatial_sink_indices,
+            ear_separation: EAR_SEPARATION,
         })
     }
 
@@ -309,5 +468,63 @@ impl AudioManager {
             self.free_ambient_sink_indices.len(),
             self.free_spatial_sink_indices.len(),
         )
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    // Current crate
+    use super::*;
+
+    /// The default document reads back as the settings `with_defaults` builds.
+    #[test]
+    fn the_default_document_reads_as_the_default_settings() {
+        let document = SettingsDocument::parse(
+            <AudioManager as pill_engine::ManagerResource>::default_settings(),
+        )
+        .expect("the default document reads");
+
+        assert_eq!(
+            AudioSettings::from_document(&AudioSettings::default(), &document),
+            Ok(AudioSettings::default())
+        );
+    }
+
+    /// A key the document leaves out keeps its current value, so a file that
+    /// only moves the ears does not restate the pool sizes.
+    #[test]
+    fn a_missing_key_keeps_its_current_value() {
+        let document = SettingsDocument::parse("ear_separation: 0.5\n").expect("it reads");
+
+        let next =
+            AudioSettings::from_document(&AudioSettings::default(), &document).expect("it applies");
+
+        assert_eq!(next.ear_separation, 0.5);
+        assert_eq!(next.ambient_sinks, DEFAULT_AMBIENT_SINK_COUNT);
+        assert_eq!(next.spatial_sinks, DEFAULT_SPATIAL_SINK_COUNT);
+    }
+
+    /// A misspelled key, a non-number and a zero count are each refused with a
+    /// message naming the key.
+    #[test]
+    fn a_bad_document_is_refused_with_its_reason() {
+        let current = AudioSettings::default();
+
+        let unknown = SettingsDocument::parse("ear_sep: 0.5\n").expect("it reads");
+        assert!(AudioSettings::from_document(&current, &unknown).is_err());
+
+        let wrong_type = SettingsDocument::parse("ear_separation: wide\n").expect("it reads");
+        assert!(AudioSettings::from_document(&current, &wrong_type)
+            .unwrap_err()
+            .contains("ear_separation"));
+
+        let zero = SettingsDocument::parse("spatial_sinks: 0\n").expect("it reads");
+        assert!(AudioSettings::from_document(&current, &zero)
+            .unwrap_err()
+            .contains("spatial_sinks"));
     }
 }

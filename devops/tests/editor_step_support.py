@@ -598,12 +598,7 @@ class StepState:
     def __init__(self) -> None:
         self.badge_begin = None
         self.begin = None
-        self.found = None
-        self.fraction_x = None
-        self.fraction_y = None
         self.picked_entity = None
-        self.refusal = None
-        self.rows = None
         self.scene_height = None
         self.scene_rect = None
         self.scene_x = None
@@ -612,123 +607,24 @@ class StepState:
         self.splitter_x = None
         self.splitter_y = None
         self.applied_before = None
-        self.dump = None
-        self.entities = None
         self.gizmo_entity = None
-        self.moved = None
-        self.restored = None
-        self.row = None
-        self.before = None
         self.mesh_entity = None
         self.original_material = None
-        self.prior = None
         self.prior_entity = None
-        self.prior_match = None
-        self.created = None
-        self.section_begin = None
-        self.x = None
-        self.y = None
         self.asset_root = None
         self.before_plane = None
-        self.second = None
-        self.third = None
         self.cube_meta = None
         self.flip_before = None
-        self.listed = None
-        self.components_before = None
         self.count_before = None
         self.editor_settings_path = None
-        self.match = None
         self.theme_root = None
-        self.expected = None
         self.font_generation = None
-        self.item = None
-        self.picks = None
-        self.step_begin = None
-        self.viewport = None
         self.showcase_rows = None
         self.slider = None
-        self.after = None
         self.highest = None
         self.original_source = None
         self.original_systems_source = None
         self.original_tab_source = None
-        self.reloads = None
-        self.shell_source = None
-        self.survived = None
-        self.tab_entities_source = None
-        self.tab_systems_source = None
-        self.project_source = None
-
-
-class StepState:
-    """What one step area hands to the next.
-
-    A field exists because a step boundary crosses it: a handle the
-    editor opened, an entity a later step edits, a path a restore step
-    needs. A name an area both assigns and reads stays a local there, so
-    the state holds only what the sequence actually shares.
-    """
-
-    def __init__(self) -> None:
-        self.badge_begin = None
-        self.begin = None
-        self.found = None
-        self.fraction_x = None
-        self.fraction_y = None
-        self.picked_entity = None
-        self.refusal = None
-        self.rows = None
-        self.scene_height = None
-        self.scene_rect = None
-        self.scene_x = None
-        self.scene_y = None
-        self.session = None
-        self.splitter_x = None
-        self.splitter_y = None
-        self.applied_before = None
-        self.dump = None
-        self.entities = None
-        self.gizmo_entity = None
-        self.moved = None
-        self.restored = None
-        self.row = None
-        self.before = None
-        self.mesh_entity = None
-        self.original_material = None
-        self.prior = None
-        self.prior_entity = None
-        self.prior_match = None
-        self.created = None
-        self.section_begin = None
-        self.x = None
-        self.y = None
-        self.asset_root = None
-        self.before_plane = None
-        self.second = None
-        self.third = None
-        self.cube_meta = None
-        self.flip_before = None
-        self.listed = None
-        self.components_before = None
-        self.count_before = None
-        self.editor_settings_path = None
-        self.match = None
-        self.theme_root = None
-        self.expected = None
-        self.font_generation = None
-        self.item = None
-        self.picks = None
-        self.step_begin = None
-        self.viewport = None
-        self.showcase_rows = None
-        self.slider = None
-        self.after = None
-        self.highest = None
-        self.original_source = None
-        self.original_systems_source = None
-        self.original_tab_source = None
-        self.reloads = None
         self.shell_source = None
         self.survived = None
         self.tab_entities_source = None

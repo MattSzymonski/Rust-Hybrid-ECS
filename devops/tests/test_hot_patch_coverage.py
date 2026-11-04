@@ -27,7 +27,7 @@ DESCRIPTION
     checks: that an edit was delivered BY A PATCH, not by a reload.
 
     Crates are discovered rather than listed - the project and the extensions
-     come from `devops/tests/projects/project_rs/project_settings.yaml`, so a module
+     come from `devops/tests/projects/native/project_settings.yaml`, so a module
     added later is
     covered without touching this file. The function to edit is discovered too:
     the scanner looks for a numeric literal inside a function body, preferring
@@ -429,7 +429,7 @@ def plan_edit(crate: Crate) -> bool:
 # print anything. Building through the same posture also guarantees the binary
 # carries the `hot_patch` feature, which is the whole subject of this test.
 #
-# `rendering` is required rather than optional: devops/tests/projects/project_rs links
+# `rendering` is required rather than optional: devops/tests/projects/native links
 # `pill_master_renderer`, so a host without it resolves `pill_core` differently
 # from the project and the project DLL fails to load with "The specified
 # procedure could not be found" (os error 127), the same reason the cascade

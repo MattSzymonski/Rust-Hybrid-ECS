@@ -77,7 +77,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # =============================================================================
 
 SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "pill_spline" / "src" / "pill_spline.rs"
-PROJECT_LIB_RS = PROJECT_RS_LIB_RS
+PROJECT_LIB_RS = NATIVE_PROJECT_LIB_RS
 
 # The component whose identity this suite is about, spelled as the engine
 # registers it. With `#[pill(shared)]` and no explicit name, the derive uses
@@ -90,7 +90,7 @@ SHARED_ATTRIBUTE = "#[pill(persistable, shared)]"
 UNSHARED_ATTRIBUTE = "#[pill(persistable)]"
 
 # The project must load `pill_spline` as a module *and* link it directly, which
-# is exactly the arrangement that produces two `TypeId`s. `devops/tests/projects/project_rs`
+# is exactly the arrangement that produces two `TypeId`s. `devops/tests/projects/native`
 # does both, so this suite drives it rather than the fixture project.
 TEST_PROJECT_SETTINGS = """\
 name: "Shared Identity Test"
@@ -508,7 +508,7 @@ def install_failing_reload_with_resource() -> None:
 # Process helpers
 # =============================================================================
 
-# `rendering` is required, not a preference. `devops/tests/projects/project_rs` links
+# `rendering` is required, not a preference. `devops/tests/projects/native` links
 # `pill_master_renderer` directly, so the project build resolves the wgpu
 # graph, and the host's engine dylibs must match the resolution every spawned
 # build gets (`apply_cargo_host_overrides` in
@@ -517,7 +517,7 @@ HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
 
 
 def launch_host() -> Tuple[subprocess.Popen, OutputMonitor]:
-    """Starts the headless host against `devops/tests/projects/project_rs`."""
+    """Starts the headless host against `devops/tests/projects/native`."""
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = NATIVE_PROJECT_PATH
     return launch_process(host_command(HOST_POSTURE), MODULES_ROOT, process_environment)

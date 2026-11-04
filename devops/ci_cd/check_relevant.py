@@ -59,8 +59,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "devops"))
 
 from core.projects import (  # noqa: E402
-    PROJECT_RS_RES,
-    PROJECT_RS_SRC,
+    NATIVE_PROJECT_RES,
+    NATIVE_PROJECT_SRC,
     repository_relative,
 )
 
@@ -305,6 +305,8 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                     ("test", "-p", "pill_engine_core", "-p", "pill_engine", "--offline"),
                                     "engine core changed"))
         selected.append(suite_check("test_hot_reload_suite.py", "engine core changed"))
+        selected.append(suite_check("test_resource_layout_fingerprint.py", "engine resource path changed"))
+        selected.append(suite_check("test_manager_settings.py", "engine settings path changed"))
 
     # The host: its unit tests and the reload suites that exercise the
     # development postures end to end.
@@ -314,6 +316,9 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                     "host changed"))
         selected.append(suite_check("test_hot_reload_suite.py", "host reload path changed"))
         selected.append(suite_check("test_hot_patch_coverage.py", "host patch path changed"))
+        selected.append(suite_check("test_shader_recompile.py", "host shader reload path changed"))
+        selected.append(suite_check("test_resource_layout_fingerprint.py", "host reload path changed"))
+        selected.append(suite_check("test_manager_settings.py", "host settings path changed"))
     if has("modules/hosting/pill_player/**", "modules/rendering/pill_renderer_api/**"):
         # The shipping posture type-checks against a *generated* bundle, and the
         # tracked one is the project-agnostic stub that deliberately refuses to
@@ -343,15 +348,28 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     if has("modules/extensions/pill_master_renderer/**"):
         selected.append(verify_check("renderer-boundaries", "renderer changed"))
         selected.append(suite_check("test_hot_reload_assets.py", "renderer or shader data changed"))
+        selected.append(suite_check("test_shader_recompile.py", "renderer or shader data changed"))
 
     # The example's committed render chain: the windowed host runs it and the
     # renderer's chain log must name the project's own pass.
     if has(
-        repository_relative(PROJECT_RS_RES) + "/**",
-        repository_relative(PROJECT_RS_SRC) + "/**",
+        repository_relative(NATIVE_PROJECT_RES) + "/**",
+        repository_relative(NATIVE_PROJECT_SRC) + "/**",
     ):
         selected.append(
             suite_check("test_render_chains.py", "the example chain changed")
+        )
+        selected.append(
+            suite_check("test_shader_recompile.py", "the example's shader changed")
+        )
+        selected.append(
+            suite_check(
+                "test_resource_layout_fingerprint.py",
+                "the example's resource declarations changed",
+            )
+        )
+        selected.append(
+            suite_check("test_manager_settings.py", "the example's manager changed")
         )
 
     # The C# half of the ABI.

@@ -16,7 +16,7 @@ DESCRIPTION
     proves a real module edit moves it.
 
     The scenario mirrors `test_hot_reload_suite.py`'s cascade: load `pill_spline`
-    into `devops/tests/projects/project_rs`, edit the module's sample-offset constant, and
+    into `devops/tests/projects/native`, edit the module's sample-offset constant, and
     wait for the reload transaction. The assertion is the host's own log line
     `editor revision bumped`, which the editor surfaces to integration suites
     without a GUI.
@@ -112,7 +112,7 @@ def plan_value_edit(content: str) -> Tuple[str, str, str]:
 # Process helpers
 # =============================================================================
 
-# `rendering` is required rather than optional: devops/tests/projects/project_rs links
+# `rendering` is required rather than optional: devops/tests/projects/native links
 # `pill_master_renderer`, so a host without it resolves `pill_core` differently
 # from the project and the project DLL fails to load with "The specified
 # procedure could not be found" (os error 127), the same reason the cascade

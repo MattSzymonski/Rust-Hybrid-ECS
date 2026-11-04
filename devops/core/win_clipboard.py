@@ -25,9 +25,15 @@ EXAMPLE USAGE
 --- SCRIPT ---
 """
 
+import sys
+
+# The bindings below exist only on Windows, and `ctypes.WinDLL` is missing
+# elsewhere; refuse first so the failure names the platform.
+if sys.platform != "win32":
+    raise RuntimeError("the editor clipboard suite needs Windows")
+
 import ctypes
 from ctypes import wintypes
-import sys
 
 # The registered format both the editor and this helper agree on.
 FORMAT_NAME = "PillEditor.Object"
@@ -170,7 +176,3 @@ def clear():
             raise OSError(ctypes.get_last_error(), "EmptyClipboard failed")
 
     _with_clipboard(action)
-
-
-if sys.platform != "win32":
-    raise RuntimeError("the editor clipboard suite needs Windows")

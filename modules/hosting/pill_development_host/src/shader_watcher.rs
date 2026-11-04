@@ -1,17 +1,22 @@
-//! Development shader reload, host half: watch the renderer data crate's
-//! `shader_sources/` tree, re-cook edits, and queue the results.
+//! Development shader reload, host half: watch a shader source tree, re-cook
+//! edits, and queue the results.
 //!
 //! # Responsibilities
 //!
-//! - Watch that tree for HLSL edits, wait for a burst of events to stop
+//! - Watch one tree for HLSL edits, wait for a burst of events to stop
 //!   (debounce), and then cook the whole tree with
 //!   [`pill_assets::cook_shader_tree`]. That is the same routine the data
 //!   crate's build script runs, so both produce the same outputs.
 //! - Queue every output whose text changed as a [`CookedShader`] for the main
-//!   thread, which passes each one to the data crate's
-//!   `pill_render_data_shader_changed` export.
+//!   thread, with both the output's and its source's path.
 //!
 //! # Design
+//!
+//! Two trees are watched with this worker: the renderer data crate's
+//! `shader_sources/`, whose outputs the data crate's own export applies to the
+//! shaders built from that tree, and the project's `res`, whose outputs are
+//! read by the shader asset's import and therefore only need the asset to be
+//! reimported.
 //!
 //! The worker thread runs only host code and `slangc`, never inside a module
 //! image, so a data crate reload can swap the image at any time. The main
@@ -55,6 +60,11 @@ const SOURCE_EXTENSION: &str = "hlsl";
 /// One re-cooked WGSL file, waiting for the main thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CookedShader {
+    /// The source relative to the watched tree, using `/` as the separator.
+    ///
+    /// The shader asset's import reads the file beside this one, so a project
+    /// shader is reimported by this path.
+    pub(crate) source_relative_path: String,
     /// The file relative to the watched `shader_sources/` tree, using `/` as
     /// the separator.
     pub(crate) relative_path: String,
@@ -71,11 +81,11 @@ pub(crate) struct ShaderWatcher {
 
 impl ShaderWatcher {
     /// Starts a worker thread that watches `shaders_directory` and cooks the
-    /// tree when an edit settles. `data_crate_name` is used only in the log
-    /// line that announces the watch.
+    /// tree when an edit settles. `tree_label` names the tree in the log line
+    /// that announces the watch - the data crate's name, or the project.
     ///
-    /// Returns `Ok(None)` when the directory does not exist: a data crate
-    /// without shaders has nothing to reload.
+    /// Returns `Ok(None)` when the directory does not exist: a tree with no
+    /// shaders has nothing to reload.
     ///
     /// # Errors
     ///
@@ -83,7 +93,7 @@ impl ShaderWatcher {
     /// be created, or when the directory cannot be registered with the
     /// watcher.
     pub(crate) fn spawn(
-        data_crate_name: &str,
+        tree_label: &str,
         shaders_directory: PathBuf,
     ) -> Result<Option<Self>, WatcherError> {
         if !shaders_directory.is_dir() {
@@ -96,9 +106,9 @@ impl ShaderWatcher {
         let (cooked_sender, cooked_shaders) = channel::<CookedShader>();
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            module = data_crate_name,
+            tree = tree_label,
             directory = %shaders_directory.display(),
-            "watching renderer shader sources for edits"
+            "watching shader sources for edits"
         );
         let mut known_outputs = read_output_texts(&shaders_directory);
 
@@ -110,10 +120,7 @@ impl ShaderWatcher {
             "pill shader watcher",
             "shader watcher error",
             is_relevant_event,
-            |path: &Path| {
-                path.extension()
-                    .is_some_and(|extension| extension == SOURCE_EXTENSION)
-            },
+            is_shader_source,
             move |root, edited_paths| {
                 for shader in cook_edited_shaders(root, &edited_paths, &mut known_outputs) {
                     if cooked_sender.send(shader).is_err() {
@@ -138,9 +145,19 @@ impl ShaderWatcher {
 // Free Functions
 // =============================================================================
 
-/// Returns the text of every cooked `.wgsl` file under `shaders_directory`,
-/// keyed by path.
+/// Whether an edited file is one a cook reads.
 ///
+/// Headers count as sources here: a header under an `include/` directory
+/// changes what every source that includes it cooks to, so an edit to one has
+/// to start a cook just as a stage source's edit does. The cooked `.wgsl`
+/// files are excluded, or the cook's own output would feed back in as an edit.
+fn is_shader_source(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == SOURCE_EXTENSION)
+}
+
+/// Returns the text of every cooked `.wgsl` file under `shaders_directory`,
+/// keyed by path.///
 /// An output that cannot be read is left out, so the next cook queues it as
 /// changed.
 fn read_output_texts(shaders_directory: &Path) -> HashMap<PathBuf, String> {
@@ -206,6 +223,9 @@ fn cook_edited_shaders(
         let Some(relative_path) = relative_path_from_root(shaders_directory, &output_path) else {
             continue;
         };
+        let Some(source_relative_path) = relative_path_from_root(shaders_directory, source) else {
+            continue;
+        };
         let wgsl_text = match std::fs::read_to_string(&output_path) {
             Ok(wgsl_text) => wgsl_text,
             Err(error) => {
@@ -222,6 +242,7 @@ fn cook_edited_shaders(
         }
         known_outputs.insert(output_path, wgsl_text.clone());
         changed_shaders.push(CookedShader {
+            source_relative_path,
             relative_path,
             wgsl: wgsl_text,
         });
@@ -274,6 +295,16 @@ mod tests {
             relative_path_from_root(&root, Path::new("elsewhere.wgsl")),
             None
         );
+    }
+
+    #[test]
+    fn a_header_edit_counts_as_a_source_edit() {
+        let root = Path::new("res").join("shaders");
+
+        assert!(is_shader_source(&root.join("unlit_fragment.hlsl")));
+        assert!(is_shader_source(&root.join("include").join("common.hlsl")));
+        assert!(!is_shader_source(&root.join("unlit_fragment.wgsl")));
+        assert!(!is_shader_source(&root.join("unlit_fragment.hlsl.meta")));
     }
 
     #[test]

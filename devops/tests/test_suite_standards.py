@@ -5,8 +5,8 @@ that keep the shared helpers from being forked again.
 
 PROTECTS: Suites keep their run_all header, stop re-forking the core helpers, say
           why they sleep, anchor their output before they write, name project
-          directories through `core.projects`, and leave the fixture set inside
-          its weight budget.
+          directories through `core.projects`, leave the fixture set inside
+          its weight budget, and define each module-level name once.
 TIER: static
 
 REQUIREMENTS: Python 3.8+ (standard library only).
@@ -15,7 +15,7 @@ DESCRIPTION
     The end-to-end suites are the sharpest tools in the repository and the
     easiest to fork by accident: a private `read_log` in one file, a bare
     settle in another, and the shared helpers quietly stop being the only way
-    to drive a host. This lint holds every `devops/tests/test_*.py` to five
+    to drive a host. This lint holds every `devops/tests/test_*.py` to eight
     rules:
 
       1. header   - the docstring declares the `PROTECTS:` line and a valid
@@ -45,6 +45,13 @@ DESCRIPTION
                     fixtures this set replaced weighed 37.4 MB, almost all of
                     it the same maps and models copied three times, and
                     nothing measured it until an audit did.
+      7. poll     - a sleep waits inside a poll loop, or the function that
+                    owns it is a named exception. A fixed sleep that stands
+                    in for a wait is a regression the moment a step cannot
+                    see its own token.
+      8. unique   - each module-level name is defined once. Python rebinds a
+                    repeated `class` or `def` without a warning, so the first
+                    copy is dead code that still looks live.
 
     Each rule ships with a planted-violation self-test (`--self-test`), so a
     rule that stopped matching fails here, where it is cheap to see, instead
@@ -121,6 +128,11 @@ VERIFIED_SLEEP_EXCEPTIONS = {
 def discover_step_files() -> List[Path]:
     """The step-area modules beside the suites: they carry the step bodies."""
     return sorted(SUITES_DIRECTORY.glob(STEP_MODULE_GLOB))
+
+
+def discover_module_files() -> List[Path]:
+    """Every module beside the suites, for the duplicate-definition rule."""
+    return sorted(SUITES_DIRECTORY.glob("*.py"))
 
 
 # Rule 6's two numbers: the whole fixture set's weight, and the size below which
@@ -299,6 +311,35 @@ def fixture_findings(
     return total_bytes, found
 
 
+# Rule 8: one definition per module-level name.
+#
+# Python rebinds a repeated name at module scope silently, so the first copy
+# of a pasted class or function is dead while still looking like the live one.
+# Only the module's own body is read: a name assigned inside an `if` is not a
+# second definition of the same thing.
+def duplicate_definition_findings(path: Path, text: str) -> List[str]:
+    found = []
+    first_lines: Dict[str, int] = {}
+    for node in ast.parse(text).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names = [node.name]
+        elif isinstance(node, ast.Assign):
+            names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+        elif isinstance(node, ast.AnnAssign):
+            names = [node.target.id] if isinstance(node.target, ast.Name) else []
+        else:
+            continue
+        for name in names:
+            if name in first_lines:
+                found.append(
+                    f"{path.name}:{node.lineno}: `{name}` is defined again; the "
+                    f"definition at line {first_lines[name]} is dead"
+                )
+            else:
+                first_lines[name] = node.lineno
+    return found
+
+
 # Every rule's findings, in report order.
 def collect() -> List[Tuple[str, List[str]]]:
     sources = [(path, path.read_text(encoding="utf-8")) for path in discover_files()]
@@ -343,6 +384,16 @@ def collect() -> List[Tuple[str, List[str]]]:
                 finding
                 for path, text in editor_sources + step_sources
                 for finding in sleep_outside_poll_findings(path, text)
+            ],
+        ),
+        (
+            "rule 8: every module-level name is defined once",
+            [
+                finding
+                for path in discover_module_files()
+                for finding in duplicate_definition_findings(
+                    path, path.read_text(encoding="utf-8")
+                )
             ],
         ),
     ]
@@ -438,16 +489,33 @@ def self_test() -> int:
         == [],
     )
     expect(
+        "a duplicated definition is caught",
+        len(
+            duplicate_definition_findings(
+                fixture,
+                "class " + "StepState:\n    pass\n\n\nclass StepState:\n    pass\n",
+            )
+        )
+        == 1,
+    )
+    expect(
+        "one definition per name passes",
+        duplicate_definition_findings(
+            fixture, "class " + "StepState:\n    pass\n\ndef helper():\n    pass\n"
+        )
+        == [],
+    )
+    expect(
         "a literal project path is caught",
         len(project_findings(fixture, "PROJECT_ROOT = " + PROJECT_LITERAL_FIXTURE + "\n")) == 1,
     )
     expect(
         "a catalog name passes",
-        project_findings(fixture, "PROJECT_ROOT = PROJECT_RS_ROOT\n") == [],
+        project_findings(fixture, "PROJECT_ROOT = NATIVE_PROJECT_ROOT\n") == [],
     )
     expect(
         "a path into a project file passes",
-        project_findings(fixture, 'source = "devops/tests/projects/project_rs/src/lib.rs"\n') == [],
+        project_findings(fixture, 'source = "devops/tests/projects/native/src/lib.rs"\n') == [],
     )
     expect(
         "a missing PROTECTS line is caught",

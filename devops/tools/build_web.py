@@ -44,7 +44,7 @@
 # EXAMPLE USAGE:
 #   python devops/tools/build_web.py devops/tests/projects/scene
 #   python devops/tools/build_web.py --dev devops/tests/projects/scene
-#   python devops/tools/build_web.py --dev --editor devops/tests/projects/project_rs
+#   python devops/tools/build_web.py --dev --editor devops/tests/projects/native
 #   python -m http.server 8000 -d devops/tests/projects/scene/build/web
 
 # --- SCRIPT ---

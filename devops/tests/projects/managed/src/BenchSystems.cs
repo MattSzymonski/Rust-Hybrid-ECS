@@ -161,6 +161,10 @@ internal static class BenchState
     private static bool _doneAnnounced;
 
     /// <summary>Print the terminator the benchmark wrapper waits for.</summary>
+    /// <remarks>
+    /// The wrapper lives outside the tracked tree, so this line is outside the
+    /// log-token contract `test_log_contract.py` enforces.
+    /// </remarks>
     internal static void AnnounceDoneOnce()
     {
         if (_doneAnnounced || !AllReported)

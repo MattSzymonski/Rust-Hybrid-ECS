@@ -220,6 +220,13 @@ pub(crate) struct ReloadTransaction<'a> {
     /// cannot say who declares a type now. That is why the caller passes the
     /// set in instead of this code querying it.
     pub(crate) peer_component_names: &'a [String],
+    /// Where this subject's layout record lives, and what a declared source
+    /// path resolves against.
+    ///
+    /// The record describes the generation that loaded last, so a step before
+    /// the new `init` can compare the declared resources with it and drop the
+    /// ones whose layout changed.
+    pub(crate) layout_record: crate::layout_record::LayoutRecordTarget<'a>,
     /// Whether retired generations may be released.
     pub(crate) graveyard_policy: GraveyardPolicy,
 }
@@ -312,6 +319,56 @@ impl ReloadTransaction<'_> {
         if self.kind.scopes_registration() {
             engine.end_module_registration();
         }
+    }
+
+    /// Drops the resources whose declared layout changed since the last load,
+    /// so the module rebuilds them instead of keeping a value of the old shape.
+    ///
+    /// Only a resource that declared its layout is considered, because only
+    /// then is there a fingerprint to compare. A resource that declared
+    /// nothing keeps today's behaviour: it is kept whenever the new generation
+    /// registers the type again.
+    ///
+    /// Each dropped resource is reported once, naming what changed and what was
+    /// done. The person edited a file, and the edit having a consequence for
+    /// live state is worth a line at warning level.
+    fn drop_resources_whose_layout_changed(&self, engine: &mut Engine) {
+        let recorded = crate::layout_record::read_record(&self.layout_record);
+        let changes = crate::layout_record::changed_layouts(
+            engine.world(),
+            &self.layout_record,
+            &recorded,
+            self.registered_resource_ids,
+        );
+        if changes.is_empty() {
+            return;
+        }
+        let changed_resource_ids: Vec<pill_engine::ResourceId> =
+            changes.iter().map(|change| change.id).collect();
+        // Same two calls the retirement path makes below: the claim this
+        // generation holds has to go before its value can be dropped, and the
+        // claim count is what keeps a value another subject still owns.
+        engine
+            .world_mut()
+            .release_resource_claims(&changed_resource_ids);
+        let dropped_resource_count = engine.world_mut().drop_resources(&changed_resource_ids);
+        for change in &changes {
+            warn!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = self.subject,
+                resource = change.resource.as_str(),
+                sources = ?change.changed_sources,
+                dependencies = ?change.changed_dependencies,
+                "resource layout changed; dropped the live value so the module rebuilds it"
+            );
+        }
+        debug!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            module = self.subject,
+            dropped = dropped_resource_count,
+            declared = changes.len(),
+            "dropped the resources whose declared layout changed"
+        );
     }
 
     /// Moves a library into the graveyard. Releases the oldest generation when
@@ -489,6 +546,13 @@ impl ReloadTransaction<'_> {
         engine
             .world_mut()
             .mark_stale_superseded_persist_registrations(&retiring_stale_type_names);
+        // Step 4b: Drop every declared resource whose layout changed since the
+        // record was written. It has to happen before the new init: a module
+        // rebuilds a missing resource by inserting it, so a drop after the init
+        // would remove the fresh value instead. It also has to happen while the
+        // retiring image is mapped, because the value's drop function lives in
+        // it.
+        self.drop_resources_whose_layout_changed(engine);
         self.begin_registration(engine);
         let status = new_library.call_init(engine_api);
         self.end_registration(engine);
@@ -752,6 +816,15 @@ impl ReloadTransaction<'_> {
             );
         }
         *self.registered_resource_ids = claimed_resource_ids_now;
+        // Step 5b: Record what the generation that just loaded said its
+        // resources' layouts are made of, so the next load can tell a kept value
+        // from one that has to be rebuilt. This runs only on the success path:
+        // a rolled-back generation never describes the world.
+        crate::layout_record::write_record(
+            engine.world(),
+            &self.layout_record,
+            self.registered_resource_ids,
+        );
 
         // Step 6: Point every native storage column at the new generation's
         // function table. Columns created by older generations hold function

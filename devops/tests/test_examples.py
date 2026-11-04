@@ -37,7 +37,7 @@ USAGE
 
 EXAMPLE USAGE
   python devops/tests/test_examples.py
-  python devops/tests/test_examples.py devops/tests/projects/project_rs
+  python devops/tests/test_examples.py devops/tests/projects/native
   python devops/tests/test_examples.py --list
 
   Exit status: 0 when every example built, 1 when any failed, 2 on a usage
@@ -263,7 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "examples:\n"
             "  test_examples.py\n"
-            "  test_examples.py devops/tests/projects/project_rs\n"
+            "  test_examples.py devops/tests/projects/native\n"
             "  test_examples.py --list\n"
         ),
     )

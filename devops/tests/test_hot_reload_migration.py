@@ -61,8 +61,8 @@ from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario 
 
 # The migration scenarios drive the native fixture: its components live in
 # `src/migration.rs`, apart from the reload scenarios' anchors in `lib.rs`.
-TEST_PROJECT_ROOT = FIXTURE_PROJECT_ROOT
-PROJECT_LIB_RS = FIXTURE_PROJECT_COMPONENTS_RS
+TEST_PROJECT_ROOT = NATIVE_PROJECT_ROOT
+PROJECT_LIB_RS = NATIVE_PROJECT_LIB_RS
 
 # The scenarios rewrite a persistable component's shape. A schema migration
 # while extension modules are loaded overflows the host's stack - the module
@@ -533,7 +533,7 @@ def validate_witness_tokens(
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the standalone host and returns process + monitor."""
     process_environment = os.environ.copy()
-    process_environment["PROJECT_PATH"] = FIXTURE_PROJECT_PATH
+    process_environment["PROJECT_PATH"] = NATIVE_PROJECT_PATH
     return launch_process(host_command(HOST_POSTURE), WORKSPACE_ROOT / "modules", process_environment)
 
 
@@ -900,7 +900,7 @@ def build_fixture_project() -> bool:
                 "cargo",
                 "build",
                 "--manifest-path",
-                str(FIXTURE_PROJECT_ROOT / "Cargo.toml"),
+                str(NATIVE_PROJECT_ROOT / "Cargo.toml"),
             ],
             cwd=str(WORKSPACE_ROOT),
             capture_output=True,

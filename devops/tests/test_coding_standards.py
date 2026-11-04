@@ -38,7 +38,7 @@ EXAMPLE USAGE
   python devops/tests/test_coding_standards.py --root modules/engine/pill_engine/src
   python devops/tests/test_coding_standards.py modules/engine/pill_core/src/lib.rs
   python devops/tests/test_coding_standards.py modules/engine/pill_core/src/lib.rs \
-      devops/tests/projects/project_rs/src/lib.rs --report local/lint.json
+      devops/tests/projects/native/src/lib.rs --report local/lint.json
   python devops/tests/test_coding_standards.py --root modules \
       --exclude modules/extensions/pill_master_renderer
 

@@ -672,13 +672,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
 
     state.applied_before = applied_before
     state.begin = begin
-    state.dump = dump
-    state.entities = entities
-    state.found = found
     state.gizmo_entity = gizmo_entity
-    state.moved = moved
-    state.restored = restored
-    state.row = row
 
 
 def _area_entry(context: "StepContext") -> None:

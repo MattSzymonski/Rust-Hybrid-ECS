@@ -424,10 +424,8 @@ def run_popouts_and_reloads_steps(state: StepState) -> None:
         "dump tabs", DOCK_DUMP_PATTERN, 30, "dock dump after the reload"
     )
 
-    state.after = after
     state.begin = begin
     state.highest = highest
-    state.reloads = reloads
     state.survived = survived
 
 

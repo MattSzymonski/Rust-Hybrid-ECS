@@ -72,7 +72,7 @@ from typing import Dict, List, Optional, Sequence
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "devops"))
 
-from core.projects import PROJECT_RS_ROOT, repository_relative  # noqa: E402
+from core.projects import NATIVE_PROJECT_ROOT, repository_relative  # noqa: E402
 
 # Set by GitHub Actions; switches on log groups and the job summary.
 RUNNING_IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
@@ -205,7 +205,7 @@ STEPS: List[Step] = [
         [
             # The generator is named by absolute path: the step runs from
             # `modules/`, where the cargo command below has to run.
-            [PYTHON, str(REPOSITORY_ROOT / "devops" / "tools" / "generate_shipping_bundle.py"), repository_relative(PROJECT_RS_ROOT)],
+            [PYTHON, str(REPOSITORY_ROOT / "devops" / "tools" / "generate_shipping_bundle.py"), repository_relative(NATIVE_PROJECT_ROOT)],
             [
                 "cargo", "clippy", "-p", "pill_standalone",
                 "--no-default-features", "--features", "shipping",
@@ -385,7 +385,7 @@ STEPS: List[Step] = [
         working_directory=REPOSITORY_ROOT,
     ),
     # The example's committed render chain: the windowed host runs
-    # `devops/tests/projects/project_rs`, whose `init` loads `res/pipelines/main.pipeline`
+    # `devops/tests/projects/native`, whose `init` loads `res/pipelines/main.pipeline`
     # by path, and the renderer's `Pass chain:` line must name the project's
     # own pass with draws. A host-tier suite, so it runs before the editor
     # lane's build.
@@ -393,6 +393,37 @@ STEPS: List[Step] = [
         "renderer-chains",
         "Render chain suite (a committed .pipeline runs the frame)",
         [[PYTHON, "devops/tests/run_all.py", "--only", "test_render_chains.py"]],
+        working_directory=REPOSITORY_ROOT,
+    ),
+    # The project's own shader: the windowed host cooks a source that has no
+    # cooked output, then re-cooks, reimports and rebuilds it after an edit.
+    # Nothing else covers a project shader reaching the GPU, and the renderer's
+    # rebuild line only exists for this. A host-tier suite, so it runs before
+    # the editor lane's build.
+    Step(
+        "renderer-shaders",
+        "Project shader recompile suite (an edited .hlsl reaches the GPU)",
+        [[PYTHON, "devops/tests/run_all.py", "--only", "test_shader_recompile.py"]],
+        working_directory=REPOSITORY_ROOT,
+    ),
+    # A resource that declares its layout: kept across an edit to a file it does
+    # not declare, dropped through the retiring image and rebuilt when the file
+    # its layout lives in changes. The fixture's own drop line is what proves
+    # the old value was released rather than leaked. A host-tier suite, so it
+    # runs before the editor lane's build.
+    Step(
+        "resource-layout",
+        "Resource layout fingerprint suite (kept, dropped and rebuilt across a reload)",
+        [[PYTHON, "devops/tests/run_all.py", "--only", "test_resource_layout_fingerprint.py"]],
+        working_directory=REPOSITORY_ROOT,
+    ),
+    # A manager's settings file: created from the manager's own defaults, applied
+    # at startup, re-applied live when edited, and refused when the document does
+    # not read. A host-tier suite, so it runs before the editor lane's build.
+    Step(
+        "manager-settings",
+        "Manager settings suite (created, applied live, kept across a reload)",
+        [[PYTHON, "devops/tests/run_all.py", "--only", "test_manager_settings.py"]],
         working_directory=REPOSITORY_ROOT,
     ),
     # The end-to-end editor lane: the real executable, driven through its

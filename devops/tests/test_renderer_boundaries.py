@@ -17,7 +17,7 @@ DESCRIPTION
 
       1. wgpu          - only a GPU module depends on `wgpu` (or one of the
                          named exceptions, `pill_editor` and
-                         `pill_web`), and at least one
+                         `pill_web_editor`), and at least one
                          GPU module does.
       2. api deps      - `pill_renderer_api` depends only on the contract's
                          crates: pill_core, pill_core_macros, pill_engine,

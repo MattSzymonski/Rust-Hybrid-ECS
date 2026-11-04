@@ -1,11 +1,11 @@
 """
-Terminal result reporting for the Python test and benchmark scripts.
+Terminal result reporting for the Python test scripts.
 
 REQUIREMENTS: Python 3.8+ (standard library only).
 
 DESCRIPTION
     The pass/fail/skip tally, the summary block, the binary-size report and
-    the cargo test-result summary, shared by the lint, build and harness
+    the cargo test-result summary, shared by the lint, build and suite
     scripts so they all print the same output shape.
 
     The color handling is deliberately kept here rather than imported from

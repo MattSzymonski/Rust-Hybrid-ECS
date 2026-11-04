@@ -24,6 +24,7 @@ modules/pill_standalone_temp/
 # globs from matching nothing.
 modules/extensions/*/generated/
 modules/extensions/*/*/generated/
+modules/extensions/**/generated/
 !modules/extensions/_workspace_anchor/generated/
 modules/projects_generated/*
 !modules/projects_generated/README.md

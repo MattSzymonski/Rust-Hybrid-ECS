@@ -330,14 +330,10 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
     )
     print_ok("the reference cleared and came back")
 
-    state.before = before
     state.begin = begin
-    state.dump = dump
     state.mesh_entity = mesh_entity
     state.original_material = original_material
-    state.prior = prior
     state.prior_entity = prior_entity
-    state.prior_match = prior_match
 
 
 def _area_entry(context: "StepContext") -> None:

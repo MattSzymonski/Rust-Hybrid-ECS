@@ -4,41 +4,24 @@ All development tooling for Rust-Hybrid-ECS.
 
 ```
 devops/
-├── benchmarks/   things that measure   - each runs standalone
 ├── tests/        things that assert    - each runs standalone
-├── core/         shared code both import
-├── pill_lab/     the web app and the CLI that drives the scripts
+├── core/         shared code every script imports
 ├── ci_cd/        the CI gate (verify.py), shipping builds and shell entry points
-└── docs/         the rustdoc -> Markdown documentation pipeline
+├── tools/        builders, probes and one-off repository tools
+└── setup/        host environment setup scripts
 ```
 
 `ci_cd/verify.py` is the CI gate: CI runs its steps, and a local run is the
 same gate. The shell scripts in `ci_cd/` hold no check logic of their own; each
-locates the repository root and runs Python scripts in `tests/` or `docs/`.
+locates the repository root and runs Python scripts in `tests/` or `tools/`.
 
-The dependency direction is one-way: `benchmarks/` and `tests/` import
-`core/`, and `pill_lab/` imports both. Nothing in `core/` imports upward.
+The dependency direction is one-way: `tests/` and `tools/` import `core/`.
+Nothing in `core/` imports upward.
 
-## benchmarks/
-
-Performance measurement. Every script reports numbers; none of them assert.
-Each is directly runnable, from any working directory:
-
-```powershell
-python devops/benchmarks/engine.py --bench minimal --quick
-python devops/benchmarks/hot_reload.py --iterations 5
-python devops/benchmarks/cold_start.py --clean-scope none
-python devops/benchmarks/hot_reload_harness.py --iterations 5 --csv perf.csv
-```
-
-Each writes a JSON measurement into `pill_lab/measurements/` and accepts
-`--json` for a machine-readable result line. `hot_reload_harness.py` is the
-host-driving harness `hot_reload.py` uses; it stays separately runnable
-because it exposes raw flags (`--max-wall-ms`, `--csv`) the wrapper does not.
-
-Every script also appears as a `pill_lab.py` subcommand. That is not a second
-implementation: the CLI mounts the script's own argument parser and calls its
-`execute()`, so both paths accept identical flags and run identical code.
+Performance measurement (the Pill Lab CLI, the benchmark scripts and their
+stored measurements) lives in the untracked `local/devops/` tree. It is not
+part of this repository, so nothing here imports it and no tracked suite
+asserts on it.
 
 ## tests/
 
@@ -51,7 +34,9 @@ python devops/tests/test_hot_reload_suite.py
 python devops/tests/test_hot_reload_migration.py --cycles 2
 python devops/tests/test_csharp_bridge.py
 python devops/tests/test_ui_theme.py            # the UI theme pipeline, `pills_rust`
-python devops/tests/test_render_chains.py       # a committed .pipeline runs the frame, `project_rs`
+python devops/tests/test_render_chains.py       # a committed .pipeline runs the frame, the native fixture
+python devops/tests/test_shader_recompile.py    # an edited project .hlsl reaches the GPU, the native fixture
+python devops/tests/test_resource_layout_fingerprint.py  # a declared resource is kept, dropped or rebuilt, the native fixture
 python devops/tests/test_module_resource_assert.py  # a module's declared resource is missing
 python devops/tests/test_shipping_smoke.py
 python devops/tests/test_web_smoke.py          # browser build in headless Chrome/Edge
@@ -102,6 +87,10 @@ pass: process references (work-item ids, stage numbers, plan decisions),
 history wording, overlong doc blocks and TODO markers, weighted by the file's
 public surface. It prints the ranking and writes a JSON or Markdown report on
 request; `--self-test` checks the analyzers after a heuristic change.
+`tools/sync_local_devops_core.py` keeps the shared `core` modules copied into
+the gitignored `local/devops/core` in step with `devops/core`; it rewrites the
+copy's root derivation so the moved measurement tooling still resolves the
+repository, and `--check` fails when the copy is stale.
 
 ### Styling a project or the editor
 
@@ -141,36 +130,24 @@ is described in `AGENTS.md` ("The theme pipeline"), and
 Shared code, imported by everything above. Nothing here executes a measurement
 or asserts anything.
 
-| Module             | Role                                                                 |
-| ------------------ | -------------------------------------------------------------------- |
-| `paths.py`         | devops/repository layout, plus `ensure_devops_on_path()`             |
-| `projects.py`      | the project catalogue: each suite's `PROJECT_PATH` and edited files  |
-| `environment.py`   | git / OS / CPU / toolchain metadata                                  |
-| `storage.py`       | measurement files and the `index.json` manifest                      |
-| `compare.py`       | baseline comparison behind `pill_lab.py compare`                     |
-| `criterion.py`     | Criterion output parsing                                             |
-| `cargo_timings.py` | cargo `--timings` report parsing                                     |
-| `cli.py`           | the argument-parser and store/report contract benchmarks share       |
-| `test_report.py`   | pass/fail/skip tally, summary block, size reports, cargo test totals |
-| `suite_common.py`  | host process plumbing: log tokens, output monitor, backup/restore    |
+| Module               | Role                                                                 |
+| -------------------- | -------------------------------------------------------------------- |
+| `paths.py`           | devops/repository layout, plus `ensure_devops_on_path()`             |
+| `projects.py`        | the project catalogue: each suite's `PROJECT_PATH` and edited files  |
+| `environment.py`     | process queries and timestamps                                       |
+| `editor_log_tokens.py` | the editor log tokens the editor suites and the contract share     |
+| `editor_session.py`  | one editor run: sandbox, launch environment and the anchored waits   |
+| `scenario.py`        | the shared edit / wait / assert / restore loop                       |
+| `test_report.py`     | pass/fail/skip tally, summary block, size reports, cargo test totals |
+| `suite_common.py`    | host process plumbing: log tokens, output monitor, backup/restore    |
+| `win_clipboard.py`   | the editor suite's side of the Windows clipboard                     |
+| `workspace_graph.py` | the Cargo-manifest reader the architecture guards check              |
 
 A standalone script reaches it by putting `devops/` on `sys.path` first:
 
 ```python
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core import criterion
-```
-
-## pill_lab/
-
-The web app for browsing and comparing stored measurements, plus `pill_lab.py`,
-the CLI that orchestrates the scripts above. It holds no measurement logic of
-its own. See `pill_lab/README.md`.
-
-```powershell
-python devops/pill_lab/pill_lab.py all       # run every benchmark
-python devops/pill_lab/pill_lab.py compare   # what changed
-python devops/pill_lab/pill_lab.py serve     # browse the history
 ```
 
 ## ci_cd/
@@ -183,7 +160,7 @@ The CI gate, the shipping build and the shell entry points.
 | `check_relevant.py`         | runs only the checks a change set needs, by repository area                      |
 | `build_shipping.py` / `.sh` | shipping builds (they clear `RUSTFLAGS`; a plain `cargo build --release` fails)  |
 | `run_hot_reload_tests.sh`   | the hot-reload regression net: a fixed set of suites in `tests/`                 |
-| `generate_documentation.sh` | `docs/generate_documentation_markdown.py`                                        |
+| `generate_documentation.sh` | shell entry point for the Markdown documentation pipeline in `tools/`         |
 
 `check_relevant.py` is the loop to use after a change: it reads the working
 tree's change set (or `--paths`), matches every file against a per-area rule

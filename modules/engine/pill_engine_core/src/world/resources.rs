@@ -55,6 +55,28 @@ impl World {
     /// reader accepts. When the two layouts happen to match, it would also let
     /// one type read another type's bytes.
     pub fn insert_resource<T: Resource>(&mut self, resource: T) {
+        self.insert_resource_with_table(resource, ErasedResourceOps::of::<T>());
+    }
+
+    /// Inserts a manager resource: a subsystem owner a project can configure.
+    ///
+    /// The value is stored exactly like [`Self::insert_resource`] stores one,
+    /// and its per-type table additionally carries the settings surface the
+    /// type declared ([`ManagerResource`](crate::settings::ManagerResource)):
+    /// the file stem, the complete default document and the applier. That is
+    /// what lets a host find the manager, write its settings file when the
+    /// project has none, and apply an edited document to the live value.
+    ///
+    /// A manager that must survive a reload needs a `shared_name`: an id built
+    /// from `TypeId` differs in every generation, so the value would be
+    /// retired instead of kept (see [`Resource::shared_name`]).
+    pub fn insert_manager_resource<T: crate::settings::ManagerResource>(&mut self, resource: T) {
+        self.insert_resource_with_table(resource, ErasedResourceOps::of::<T>().with_manager::<T>());
+    }
+
+    /// The storage half of every insert path, taking the per-type table the
+    /// caller built.
+    fn insert_resource_with_table<T: Resource>(&mut self, resource: T, table: ErasedResourceOps) {
         let _zone = crate::profile_scope!(
             "insert resource",
             [(
@@ -76,8 +98,7 @@ impl World {
         self.resource_ticks.insert(id, ComponentTicks::new(tick));
         // Step 3: Record the table too, so a later reload can re-home this
         // value even if the next generation never inserts it again.
-        self.resource_factories
-            .insert(id, ErasedResourceOps::of::<T>());
+        self.resource_factories.insert(id, table);
     }
 
     /// Returns a shared reference to the resource, or `None` when nothing is
@@ -166,6 +187,29 @@ impl World {
         self.register_resource_claiming::<T>();
     }
 
+    /// Declares that this artifact owns a manager resource type, without
+    /// inserting a value.
+    ///
+    /// The manager counterpart of [`Self::register_resource`]: the stored table
+    /// gains the type's settings surface, so a host that already holds the
+    /// live value - or that finds no value at all - still knows the manager's
+    /// file stem and default document.
+    pub fn register_manager_resource<T: crate::settings::ManagerResource>(&mut self) {
+        self.register_resource_with_table::<T>(ErasedResourceOps::of::<T>().with_manager::<T>());
+    }
+
+    /// The declaration half of every register path, taking the per-type table
+    /// the caller built.
+    fn register_resource_with_table<T: Resource>(&mut self, table: ErasedResourceOps) -> bool {
+        let id = ResourceId::of::<T>();
+        if !self.claim_shared_resource_name::<T>() {
+            return false;
+        }
+        self.resource_factories.insert(id, table);
+        self.note_resource_registration(id);
+        true
+    }
+
     /// [`Self::register_resource`], reporting whether the claim was accepted.
     ///
     /// The public call ignores the result because its callers cannot act on a
@@ -174,14 +218,7 @@ impl World {
     /// not install a serializer that reads the live value through code that is
     /// about to be discarded.
     pub(crate) fn register_resource_claiming<T: Resource>(&mut self) -> bool {
-        let id = ResourceId::of::<T>();
-        if !self.claim_shared_resource_name::<T>() {
-            return false;
-        }
-        self.resource_factories
-            .insert(id, ErasedResourceOps::of::<T>());
-        self.note_resource_registration(id);
-        true
+        self.register_resource_with_table::<T>(ErasedResourceOps::of::<T>())
     }
 
     /// Declares a resource defined by another language, without storing a
@@ -629,6 +666,88 @@ impl World {
         ids
     }
 
+    /// The layout declaration of the type registered under `id`, copied out of
+    /// the artifact that registered it.
+    ///
+    /// Returns `None` when nothing is registered under the id, or when the type
+    /// declared neither sources nor crates. `None` is not an empty declaration:
+    /// it is the state that keeps the behaviour which predates the declaration,
+    /// so a caller has no decision to make.
+    ///
+    /// The copy is the point. The declaration sits in the image of the artifact
+    /// that registered it, and a reader such as the development host keeps its
+    /// answer past that image's retirement, so it must not keep the slices.
+    #[must_use]
+    pub fn kept_layout_declaration(&self, id: ResourceId) -> Option<KeptLayoutDeclaration> {
+        let resource_ops = self.resource_factories.get(&id)?;
+        KeptLayoutDeclaration::from_ops(*resource_ops)
+    }
+
+    /// Ids of every manager resource the world holds a live value for.
+    ///
+    /// A manager is a registered type whose table carries the settings surface
+    /// its declaration contributed ([`ManagerResource`](crate::settings::ManagerResource)).
+    /// Sorted, so a host that creates one settings file per manager writes
+    /// them in a stable order.
+    #[must_use]
+    pub fn manager_resource_ids(&self) -> Vec<ResourceId> {
+        let mut ids: Vec<ResourceId> = self
+            .resource_factories
+            .iter()
+            .filter(|(id, resource_ops)| {
+                resource_ops.manager.is_some() && self.resources.contains_key(id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The settings surface registered under `id`, copied out of the artifact
+    /// that registered it.
+    ///
+    /// Returns `None` for an id nothing registered, or whose type is not a
+    /// manager. The names and the default document are copied for the same
+    /// reason [`Self::kept_layout_declaration`] copies its lists: they live in
+    /// the registering image, and a host keeps them past its retirement.
+    #[must_use]
+    pub fn manager_settings(&self, id: ResourceId) -> Option<ManagerSettingsEntry> {
+        let resource_ops = self.resource_factories.get(&id)?;
+        let manager = resource_ops.manager?;
+        Some(ManagerSettingsEntry {
+            declaring_type_name: resource_ops
+                .declaring_type_name
+                .unwrap_or_default()
+                .to_owned(),
+            settings_name: manager.settings_name.to_owned(),
+            default_document: manager.default_document.to_owned(),
+        })
+    }
+
+    /// Applies a parsed document to the live manager stored under `id`.
+    ///
+    /// Returns `None` when nothing is stored under the id or its type declared
+    /// no settings surface, and the manager's own [`SettingsOutcome`]
+    /// otherwise. A refusal is the manager's call: it kept what it had and
+    /// logged why.
+    #[must_use]
+    pub fn apply_manager_settings(
+        &mut self,
+        id: ResourceId,
+        settings: &SettingsDocument,
+    ) -> Option<SettingsOutcome> {
+        let resource_ops = *self.resource_factories.get(&id)?;
+        let manager = resource_ops.manager?;
+        let resource = self.resources.get_mut(&id)?;
+        let value_pointer = resource.value_pointer_mut();
+        // SAFETY: the table was built by the type's own registration
+        // (`insert_manager_resource` or `register_manager_resource`), and the
+        // box under this id was created by that same registration, so the
+        // pointer names a live value of the type the applier expects. The box
+        // outlives the call, and the document is borrowed only for it.
+        Some(unsafe { (manager.apply)(value_pointer, settings) })
+    }
+
     /// Names declared by the shared resources this world holds a claim for,
     /// sorted and deduplicated.
     ///
@@ -707,7 +826,6 @@ impl World {
     /// record, for the same reason in reverse. This function does not record the
     /// error it returns: the Rust wrapper above records it as a registration
     /// error, while a foreign declaration's caller acts on the refusal itself.
-
     // Seven arguments describe one declaration. The name, the declaring type,
     // the layout, the foreign flag and the schema hash all come from the
     // manifest or the Rust type, and the caller passes each one because none

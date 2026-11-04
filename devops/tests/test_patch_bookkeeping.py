@@ -77,7 +77,7 @@ ROLLBACK_REQUEST = MODULES_ROOT / "target" / "hot" / "rollback.request"
 
 # Launched through cargo for the same reason the coverage suite does: the
 # binary needs the toolchain's dynamic runtime on the loader path, and
-# `rendering` is required because devops/tests/projects/project_rs links the renderer.
+# `rendering` is required because devops/tests/projects/native links the renderer.
 HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
 
 # Reported by the native project reload when the build produced nothing usable

@@ -506,9 +506,6 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     state.applied_before = applied_before
     state.before_plane = before_plane
     state.begin = begin
-    state.dump = dump
-    state.second = second
-    state.third = third
 
 
 def _area_entry(context: "StepContext") -> None:

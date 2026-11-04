@@ -22,14 +22,14 @@
 18. **Lint before done.** `check_changed.py` formats and lints the changed Rust files before an agent calls work finished.
 19. **Keep out while it runs.** Don't edit a file a running suite owns - its restore would overwrite it. That applies to agents too.
 20. **Docs come from the suites.** The catalogue below is generated from each suite's own header (`--write-catalogue`).
-21. **Numbers live elsewhere.** Performance measurement is in `devops/benchmarks/`, not here.
+21. **Numbers live elsewhere.** Performance measurement lives in the untracked `local/devops/`, not here.
 22. **The full gate.** `verify.py` runs this directory plus every other CI check - it is what CI calls.
 23. **Editor rule.** Build `pill_editor` right before its suite, with nothing in between.
 
 The pass/fail checks for Rust-Hybrid-ECS. Every script here asserts and
 returns a non-zero exit code on failure, and every script runs standalone
-from any working directory. Performance measurement lives in
-`devops/benchmarks/` because it reports numbers instead of asserting on them.
+from any working directory. Performance measurement lives in the untracked
+`local/devops/` tree because it reports numbers instead of asserting on them.
 
 The scripts fall into three kinds:
 
@@ -168,8 +168,9 @@ hand.
 ## How an end-to-end suite works
 
 All host-driving suites share their plumbing through
-`devops/core/suite_common.py` (in `devops/core/`, because the benchmarks use it
-too). A run goes through the same steps every time:
+`devops/core/suite_common.py` (in `devops/core/`, because the suites and the
+untracked measurement scripts use it too). A run goes through the same steps
+every time:
 
 1. **Take the host lock.** `ensure_host_lock` takes an exclusive lock on
    `%TEMP%\pill_host_suite.lock`. If another suite holds it, this one prints a
@@ -217,13 +218,15 @@ suites without any compiler error. Two scripts guard against that:
 - `test_log_contract.py` checks that every `*_TOKEN` literal the suites define
   still appears verbatim somewhere in the Rust sources (or is listed as
   produced elsewhere, with a reason). It runs in under a second.
-- `test_harness_parsing.py` unit-tests the parsing the suites rely on (the
-  analytics-line regex, patch routes, the brace scanner) against real captured
-  host output.
+- `test_harness_parsing.py` unit-tests the parsing and file-editing helpers
+  the suites rely on (the brace scanner, the patch-coverage scanner, the
+  editor session) against real captured host output and Rust source.
 
-Two tokens come from code you are likely to edit by hand:
-`MODULE_REGISTERED_MESSAGE` (printed by `pill_spline`) and
-`PROJECT_PROBE_PREFIX`, `[project] xxsees`, printed by `devops/tests/projects/native`.
+Two lines come from code you are likely to edit by hand: the module-register
+message `pill_spline module registered` (printed by `pill_spline`) and the
+project probe line `[project] 12xxsees N spline(s)`, printed by the native
+fixture. The suites match them with inline literals, so grep the wait that
+needs the line.
 Changing either text makes the suites report `Missing required token`, which
 looks like a reload failure but isn't: the reload worked and the text moved.
 
@@ -243,6 +246,7 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 | `test_csharp_analyzer.py`           | Creates `devops/tests/projects/managed/src/_AnalyzerProbe.cs`                                                                                                                                                                                                                             | Deleted at the end unless `--keep-probe`                                                                          |
 | `test_reload_edit_during_build.py`  | `pill_spline.rs`                                                                                                                                                                                                                                                                          | `BackupRegistry`, fresh timestamp                                                                                 |
 | `test_hot_reload_assets.py`         | In `devops/tests/projects/scene/res/`: `textures/reimport_sample.png` (overwritten with junk bytes), its `.meta`, `materials/teapot.material`; moves the image pair into `textures/moved_by_suite/` and back. Also `pill_master_renderer_data.rs` (a comment appended to force a rebuild) | `BackupRegistry`, fresh timestamp; the move is undone in its own `finally`                                        |
+| `test_manager_settings.py`          | `devops/tests/projects/native/src/simulation_time.rs` (a comment appended to force a reload), and the manager settings files the host creates under `devops/tests/projects/native/settings/`                                                                                               | `BackupRegistry` for the source, fresh timestamp; the whole `settings/` directory is removed at the end             |
 | `test_hot_patch_coverage.py`        | One function body in every crate listed in `devops/tests/projects/native/project_settings.yaml`, plus the project                                                                                                                                                                         | `BackupRegistry`, original bytes and timestamp                                                                    |
 | `test_ui_theme.py`                  | `devops/tests/projects/scene/res/ui/accent.theme` (the accent, twice) and `.../src/lib.rs` (a comment appended to force a reload)                                                                                                                                                         | `BackupRegistry`; the project's mtime stays fresh so the next host start rebuilds the original                    |
 | `test_patch_bookkeeping.py`         | A system in `devops/tests/projects/native/src/` (a body edit, then a broken tail); creates `modules/target/hot/rollback.request`                                                                                                                                                          | `BackupRegistry`, fresh timestamp; the request file is deleted                                                    |
@@ -303,37 +307,40 @@ edit the suite, not this table. `run_all.py --catalogue` prints the same table
 with each suite's last recorded result from `.construction_site/runs/`.
 
 <!-- catalogue:start (generated by run_all.py --write-catalogue) -->
-| Suite                               | Tier          | Sets                                | Protects                                                                                                               |
-| ----------------------------------- | ------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `test_asset_metadata.py`            | static        |                                     | Every .meta under a project's `res` (examples and the suites' fixtures) has its asset, and no two assets share a guid. |
-| `test_coding_standards.py`          | static        |                                     | Every .rs file follows the Pill comment and layout rules.                                                              |
-| `test_engine_feature_drift.py`      | static        |                                     | Every build the host spawns resolves the same engine features as the host itself.                                      |
-| `test_engine_layout.py`             | static        |                                     | The engine core never links the facade or reads a registry; shared dylibs stay UI-free.                                |
-| `test_harness_parsing.py`           | static        | hot-reload                          | The parsing the end-to-end suites decide pass or fail with, on real host output.                                       |
-| `test_keycode_mirror.py`            | static        |                                     | The C# KeyCode mirror names the same keys in the same order as the engine table.                                       |
-| `test_log_contract.py`              | static        | hot-reload                          | Every host log token a suite waits for still exists in the Rust sources.                                               |
-| `test_renderer_boundaries.py`       | static        |                                     | Only GPU modules link wgpu, the renderer API stays renderer-free, data crates GPU-free.                                |
-| `test_suite_standards.py`           | static        |                                     | Suites keep their run_all header, stop re-forking the core helpers, say                                                |
-| `test_csharp_bridge.py`             | host          | hot-reload                          | C# hot reload: mirror layout, calls both ways, assembly swaps keeping state, layout migration.                         |
-| `test_editor_revision.py`           | host          |                                     | A module reload bumps the editor revision counter, so the editor drops its caches.                                     |
-| `test_hot_patch_coverage.py`        | host          | hot-reload                          | Body-only edits in every loaded crate are live-patched rather than reloaded.                                           |
-| `test_hot_reload_assets.py`         | host          |                                     | Live asset reimport: .meta edits, broken and restored images, moved files, renderer reloads.                           |
-| `test_hot_reload_migration.py`      | host          | hot-reload, nightly                 | Component schema changes on reload migrate the data, or are refused and rolled back.                                   |
-| `test_hot_reload_suite.py`          | host          | hot-reload, nightly-allowed-to-fail | Project and module hot reload keep data, migrate schemas, cascade and stay stable.                                     |
-| `test_multi_surface.py`             | host          |                                     | One renderer drives two windows; a renderer reload reattaches the second surface.                                      |
-| `test_patch_bookkeeping.py`         | host          |                                     | A failed reload keeps the live patch records, so rolling the patch back still works.                                   |
-| `test_pbr_native.py`                | host (manual) |                                     | The windowed frontend presents frames and shuts down cleanly.                                                          |
-| `test_picking.py`                   | host          |                                     | Picking returns the entity under the cursor, or nothing, and outlines the hit entity.                                  |
-| `test_reload_edit_during_build.py`  | host          | hot-reload                          | A save made during a build wins: the newer edit is the one built and loaded.                                           |
-| `test_shared_component_identity.py` | host          |                                     | Types linked by two DLLs share one registration with #[pill(shared)], else startup fails.                              |
-| `test_ui_theme.py`                  | host          | hot-reload                          | The game half of the theme pipeline: the `.theme` override, live re-apply, refusals, fonts and packing.                |
-| `test_editor_egui.py`               | editor        | editor                              | The egui editor: startup, shell module, dock rearrangement, patch and reload state survival.                           |
-| `test_csharp_analyzer.py`           | build         |                                     | The PILL Roslyn analyzer rules: the C# project builds clean and a rule-breaking probe fails.                           |
-| `test_engine_exports.py`            | build         |                                     | Each engine dylib stays below the Windows limit of 65,535 exported symbols.                                            |
-| `test_examples.py`                  | build         |                                     | Every example project builds with the release profile.                                                                 |
-| `test_shipping_smoke.py`            | build         |                                     | The shipping binary has no reload machinery, runs the project and never starts cargo.                                  |
-| `test_web_smoke.py`                 | build         |                                     | A project built for the browser mounts its assets and draws frames with WebGPU.                                        |
-| `test_wrapper_entry_points.py`      | build         |                                     | A wrapper DLL exports the full loadable-artifact entry-point set.                                                      |
+| Suite | Tier | Sets | Protects |
+| --- | --- | --- | --- |
+| `test_asset_metadata.py` | static |  | Every .meta under each project's res directory has its asset, and no two assets share a guid. |
+| `test_coding_standards.py` | static |  | Every .rs file follows the Pill comment and layout rules. |
+| `test_engine_feature_drift.py` | static |  | Every build the host spawns resolves the same engine features as the host itself. |
+| `test_engine_layout.py` | static |  | The engine core never links the facade or reads a registry; shared dylibs stay UI-free. |
+| `test_harness_parsing.py` | static | hot-reload | The parsing the end-to-end suites decide pass or fail with, on real host output. |
+| `test_keycode_mirror.py` | static |  | The C# KeyCode mirror names the same keys in the same order as the engine table. |
+| `test_log_contract.py` | static | hot-reload | Every host log token a suite waits for still exists in the Rust sources. |
+| `test_renderer_boundaries.py` | static |  | Only GPU modules link wgpu, the renderer API stays renderer-free, data crates GPU-free. |
+| `test_shipping_bundle_roots.py` | static |  | A shipped build reads a module's resources from its asset pack: the generated build script names every linked module's `res` and `shader_sources` and packs them with the multi-root writer. |
+| `test_suite_standards.py` | static |  | Suites keep their run_all header, stop re-forking the core helpers, say |
+| `test_csharp_bridge.py` | host | hot-reload | C# hot reload: mirror layout, calls both ways, assembly swaps keeping state, layout migration. |
+| `test_editor_revision.py` | host |  | A module reload bumps the editor revision counter, so the editor drops its caches. |
+| `test_hot_patch_coverage.py` | host | hot-reload | Body-only edits in every loaded crate are live-patched rather than reloaded. |
+| `test_hot_reload_assets.py` | host |  | Live asset reimport: .meta edits, broken and restored images, moved files, renderer reloads. |
+| `test_hot_reload_migration.py` | host | hot-reload, nightly | Component schema changes on reload migrate the data, or are refused and rolled back. |
+| `test_hot_reload_suite.py` | host | hot-reload, nightly-allowed-to-fail | Project and module hot reload keep data, migrate schemas, cascade and stay stable. |
+| `test_module_resource_assert.py` | host |  | A module's declared asset root stops the host, naming the module and the path, when a required file is gone. |
+| `test_multi_surface.py` | host |  | One renderer drives two windows; a renderer reload reattaches the second surface. |
+| `test_patch_bookkeeping.py` | host |  | A failed reload keeps the live patch records, so rolling the patch back still works. |
+| `test_pbr_native.py` | host (manual) |  | The windowed frontend presents frames and shuts down cleanly. |
+| `test_picking.py` | host |  | Picking returns the entity under the cursor, or nothing, and outlines the hit entity. |
+| `test_reload_edit_during_build.py` | host | hot-reload | A save made during a build wins: the newer edit is the one built and loaded. |
+| `test_render_chains.py` | host |  | The example's .pipeline loads by path and the renderer records its pass in the frame chain with a positive draw count. |
+| `test_shared_component_identity.py` | host |  | Types linked by two DLLs share one registration with #[pill(shared)], else startup fails. |
+| `test_ui_theme.py` | host | hot-reload | The game half of the theme pipeline: the `.theme` override, live re-apply, refusals, fonts and packing. |
+| `test_editor_egui.py` | editor | editor | The egui editor: startup, shell patch and reload, dock and viewports, selection and gizmo, inspector and assets, systems and preferences, theme layers, game view, toolbox and grid, recovery and clean exit. |
+| `test_csharp_analyzer.py` | build |  | The PILL Roslyn analyzer rules: the C# project builds clean and a rule-breaking probe fails. |
+| `test_engine_exports.py` | build |  | Each engine dylib stays below the Windows limit of 65,535 exported symbols. |
+| `test_examples.py` | build |  | Every example project builds in the release profile. |
+| `test_shipping_smoke.py` | build |  | The shipping binary has no reload machinery, runs the project and never starts cargo. |
+| `test_web_smoke.py` | build |  | A project built for the browser mounts its assets and draws frames with WebGPU. |
+| `test_wrapper_entry_points.py` | build |  | A wrapper DLL exports the full loadable-artifact entry-point set. |
 <!-- catalogue:end -->
 
 ### Static checks (no host)
@@ -356,7 +363,7 @@ with each suite's last recorded result from `.construction_site/runs/`.
 | `test_hot_reload_migration.py`      | Component schema changes on reload: unchanged shape (fast path), added, removed, renamed and reordered fields, persistable downgraded to plain, a widened `Vec` element type, a retyped one whose snapshot no longer parses (row reset), and an alignment change that must be refused and rolled back. Asserts migrated entity counts and values. `--cycles N` repeats it.                                                                                                                                                                                                                                                                                                                                                                                   |
 | `test_multi_surface.py`             | One renderer, two windows: the standalone dev host's test frontend (`PILL_SECOND_VIEW=1`) opens surface 1 with its own camera; both present, a renderer reload reattaches surface 1, and closing its window detaches only it. Backs up and restores `pill_master_renderer/src/lib.rs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `test_picking.py`                   | Picking and outlines: the standalone dev host's test frontend (`PILL_PICK_TEST=1`) picks the center and the corner of `scene`'s window in one frame; the center answers with the model's entity, the corner with nothing, and the hit entity is outlined while the host keeps drawing without a GPU error.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `test_shared_component_identity.py` | A component and a resource linked by both the project and a module DLL, so each binary has its own `TypeId`. With `#[pill(shared)]` they bind to one registration; without it startup must fail with a collision error. Also: a module reload with two registrants, a resource inserted by one DLL and read by the other, and releasing values after a failed reload or failed first load. Runs the windowed host, because `project_rs` links the renderer.                                                                                                                                                                                                                                                                                                  |
+| `test_shared_component_identity.py` | A component and a resource linked by both the project and a module DLL, so each binary has its own `TypeId`. With `#[pill(shared)]` they bind to one registration; without it startup must fail with a collision error. Also: a module reload with two registrants, a resource inserted by one DLL and read by the other, and releasing values after a failed reload or failed first load. Runs the windowed host, because the native fixture links the renderer.                                                                                                                                                                                                                                                                                                  |
 | `test_csharp_bridge.py`             | The C# side (needs .NET 8 SDK): the generated mirror's exact layout, a warning-free managed build, calls in both directions, assembly swaps keeping state, three swaps in one session (the old `AssemblyLoadContext` must unload), component layout migration, systems re-registered after a signature change, and a changed startup method refused while the old assembly keeps running. Also checks the committed mirror matches what the host generates.                                                                                                                                                                                                                                                                                                  |
 | `test_reload_edit_during_build.py`  | Two saves, the second during the build started by the first: the newer save must win and actually be built. `--second-edit-delay` tunes the gap.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `test_hot_reload_assets.py`         | Live asset reimport in the headless host on `devops/tests/projects/scene`: a `.meta` edit reimports in place, a broken image keeps the loaded value and recovers when restored, reimport still works after the renderer data crate reloads, a moved image and `.meta` are followed without a new import, and a material edit applies.                                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -467,8 +474,7 @@ the regenerated file.
 
 ## Performance measurement
 
-Hot-reload timing is in `devops/benchmarks/hot_reload.py` and
-`hot_reload_harness.py`, driven by Pill Lab
-(`python devops/pill_lab/pill_lab.py hot-reload --iterations 5`). It uses the
-same `suite_common.py` plumbing, so a reworded log token must keep both working.
-See `devops/pill_lab/README.md`.
+Hot-reload timing lives in the untracked `local/devops/` tree
+(`benchmarks/hot_reload.py`, `benchmarks/hot_reload_harness.py`), driven by the
+Pill Lab CLI there. It uses the same `suite_common.py` plumbing, so a reworded
+log token must keep both working.

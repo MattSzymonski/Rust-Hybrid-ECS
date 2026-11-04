@@ -1,5 +1,5 @@
-//! The demo's components, its tuning resource, the scene it builds and the keys
-//! that tune the field live.
+//! The demo's components, its tuning resource, the scene it builds and the
+//! keyboard controls that tune the field.
 //!
 //! # Responsibilities
 //!
@@ -11,13 +11,15 @@
 //!
 //! # Design
 //!
-//! The scene is built only into a world that does not hold it yet, so the
-//! `init` a reload runs finds the live scene instead of a second one.
+//! The scene is built only into a world that does not hold it yet. The `init`
+//! that a reload runs then finds the live scene instead of making a second
+//! one.
 //!
-//! The scatter is a pure function of a pill's index ([`scatter_between`])
-//! rather than a generator with state: a thread-local value owned by a project
-//! DLL registers a destructor in that DLL, which a hot reload unmaps while the
-//! thread lives on.
+//! The scatter is a pure function of a pill's index ([`scatter_between`]),
+//! not a generator with state. A thread-local generator owned by the project
+//! DLL would register its destructor there. A hot reload unmaps the DLL while
+//! the thread lives on, so the destructor would point at code that is no
+//! longer loaded.
 
 // Standard library
 use std::f32::consts::PI;
@@ -39,16 +41,17 @@ pub const PILL_COUNT: usize = 200_000;
 /// Uniform scale of every pill.
 const PILL_SCALE: f32 = 0.35;
 
-/// Where the camera starts: at eye height, ten units in front of the origin,
-/// turned around to face it (a camera looks down its local -Z axis).
-const CAMERA_START: [f32; 3] = [0.0, 1.6, -10.0];
+/// Where the camera starts: eye height, ten units out along -Z.
+const CAMERA_START_TRANSLATION: [f32; 3] = [0.0, 1.6, -10.0];
+/// Yaw that turns the camera around to face the origin. A camera looks down
+/// its local -Z axis.
 const CAMERA_START_YAW_DEGREES: f32 = 180.0;
 
 /// How far each tuning key moves its value per frame.
-const SCALE_STEP: f32 = 0.0005;
-const ATTRACTION_STEP: f32 = 5.0;
-const DAMPING_STEP: f32 = 0.01;
-const EPSILON_STEP: f32 = 0.001;
+const CURL_SCALE_STEP: f32 = 0.0005;
+const CURL_ATTRACTION_STEP: f32 = 5.0;
+const CURL_DAMPING_STEP: f32 = 0.01;
+const CURL_EPSILON_STEP: f32 = 0.001;
 
 /// One pill's motion through the curl noise field.
 #[repr(C)]
@@ -59,7 +62,8 @@ pub struct CurlNoiseComponent {
     pub velocity: [f32; 3],
     /// How strongly the field pushes this pill.
     pub curl_strength: f32,
-    /// Per-pill noise scale, drawn at spawn; the field uses the shared scale.
+    /// Per-pill noise scale, set at spawn; the field uses the shared scale
+    /// instead.
     pub noise_scale: f32,
 }
 
@@ -82,13 +86,13 @@ pub struct CameraMovementComponent {
     pub current_velocity: [f32; 3],
     /// Velocity the keys ask for.
     pub target_velocity: [f32; 3],
-    /// View this frame: pitch and yaw in degrees (the third value is unused).
+    /// Current view as pitch and yaw in degrees. The third value is unused.
     pub current_rotation: [f32; 3],
-    /// View the mouse asks for: pitch and yaw in degrees.
+    /// The view the mouse asks for, as pitch and yaw in degrees.
     pub target_rotation: [f32; 3],
 }
 
-/// The curl noise field's live tuning.
+/// The curl noise field's tuning, adjustable while the demo runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DemoState {
@@ -96,14 +100,14 @@ pub struct DemoState {
     pub curl_scale: f32,
     /// Finite difference step used to take the curl.
     pub curl_epsilon: f32,
-    /// Pull towards the middle of the field.
+    /// Strength of the pull towards the field's attraction point.
     pub curl_attraction: f32,
     /// Velocity multiplier applied every frame.
     pub curl_damping: f32,
 }
 
 impl Default for DemoState {
-    /// The values the original demo was tuned to.
+    /// The tuning the demo starts with.
     fn default() -> Self {
         Self {
             curl_scale: 0.1005,
@@ -159,9 +163,13 @@ pub(crate) fn create_scene(
 }
 
 /// Spawns the free flying camera at the scene's starting spot.
+///
+/// # Errors
+///
+/// Returns the engine's entity creation error as text.
 fn spawn_camera(world: &mut World) -> Result<(), String> {
-    let start_rotation = [0.0, CAMERA_START_YAW_DEGREES, 0.0];
-    let rotation = glam::Quat::from_euler(
+    let start_rotation_degrees = [0.0, CAMERA_START_YAW_DEGREES, 0.0];
+    let start_rotation_quaternion = glam::Quat::from_euler(
         glam::EulerRot::YXZ,
         CAMERA_START_YAW_DEGREES.to_radians(),
         0.0,
@@ -170,8 +178,8 @@ fn spawn_camera(world: &mut World) -> Result<(), String> {
     world
         .create_entity()
         .with(TransformComponent {
-            translation: CAMERA_START,
-            rotation: rotation.to_array(),
+            translation: CAMERA_START_TRANSLATION,
+            rotation: start_rotation_quaternion.to_array(),
             ..Default::default()
         })
         .with(CameraComponent {
@@ -184,8 +192,8 @@ fn spawn_camera(world: &mut World) -> Result<(), String> {
             lerp_speed: 8.0,
             mouse_sensitivity: 0.1,
             rotation_lerp_speed: 25.0,
-            current_rotation: start_rotation,
-            target_rotation: start_rotation,
+            current_rotation: start_rotation_degrees,
+            target_rotation: start_rotation_degrees,
             ..Default::default()
         })
         .build()
@@ -193,21 +201,26 @@ fn spawn_camera(world: &mut World) -> Result<(), String> {
     Ok(())
 }
 
-/// Scatters `count` pills through the field, each turned and pushed at random.
+/// Scatters `pill_count` pills through the field, each turned and pushed at
+/// random.
+///
+/// # Errors
+///
+/// Returns the engine's entity creation error as text.
 fn spawn_pills(
     world: &mut World,
     mesh: Handle<Mesh>,
     material: Handle<Material>,
-    count: usize,
+    pill_count: usize,
 ) -> Result<(), String> {
-    let renderer = MeshRendererComponent::builder()
+    let mesh_renderer = MeshRendererComponent::builder()
         .mesh(&mesh)
         .material(&material)
         .build();
-    for index in 0..count {
-        // Each pill draws its eight values from its own block of seeds, so the
-        // scatter depends only on the index and a reload rebuilds the same
-        // scene.
+    for index in 0..pill_count {
+        // Each pill takes its eight random values from eight seeds of its own,
+        // so the scatter depends only on the index. Building the scene again
+        // gives the same layout.
         let seed = index as u64 * 8;
         let rotation = glam::Quat::from_euler(
             glam::EulerRot::XYZ,
@@ -231,18 +244,18 @@ fn spawn_pills(
                 rotation: rotation.to_array(),
                 scale: [PILL_SCALE; 3],
             })
-            .with(renderer)
+            .with(mesh_renderer)
             .build()
             .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
 
-/// A pseudo random value in `[0, 1)` for a seed.
+/// Returns a pseudo random value in `[0, 1)` for a seed.
 ///
-/// The SplitMix64 finalizer: a bijection on 64 bits, so consecutive seeds give
-/// uncorrelated values.
-fn scatter(seed: u64) -> f32 {
+/// This is the mixing step of SplitMix64. It is a bijection on 64 bits, so
+/// two seeds that differ by one give unrelated values.
+fn scatter_unit_value(seed: u64) -> f32 {
     let mut mixed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -251,18 +264,17 @@ fn scatter(seed: u64) -> f32 {
     (mixed >> 40) as f32 / (1u64 << 24) as f32
 }
 
-/// A pseudo random value in `[minimum, maximum)` for a seed.
+/// Returns a pseudo random value in `[minimum, maximum)` for a seed.
 fn scatter_between(seed: u64, minimum: f32, maximum: f32) -> f32 {
-    minimum + scatter(seed) * (maximum - minimum)
+    minimum + scatter_unit_value(seed) * (maximum - minimum)
 }
 
 /// Tunes the curl noise field while its keys are held, and logs the new values
 /// on every frame that changed them.
 ///
-/// The overlay has first claim on the keyboard: while it wants it - a field is
-/// focused, or a widget listens for keys - the tuning keys are the UI's, which
-/// keeps typing into the overlay from flying the camera and rescaling the field
-/// at the same time.
+/// The overlay gets the keyboard first. While it wants it - a text field has
+/// focus or a widget listens for keys - the tuning keys belong to the UI.
+/// Typing in the overlay then does not also retune the field.
 #[pill_hot]
 pub(crate) fn demo_control_system(
     input: Res<Input>,
@@ -281,30 +293,47 @@ pub(crate) fn demo_control_system(
         });
     };
 
-    // Two keys per value, one step each way (O/P, L/K, M/N, V/B).
+    // Each value has two keys, one to raise it and one to lower it (O/P,
+    // L/K, M/N, V/B).
     let mut tuned = false;
-    let mut tune = |key: KeyCode, step: f32, value: &mut f32| {
+    let mut tune = |key: KeyCode, step: f32, tuning_value: &mut f32| {
         if input.key_held(key) {
-            *value += step;
+            *tuning_value += step;
             tuned = true;
         }
     };
-    tune(KeyCode::KeyO, SCALE_STEP, &mut demo_state.curl_scale);
-    tune(KeyCode::KeyP, -SCALE_STEP, &mut demo_state.curl_scale);
+    tune(KeyCode::KeyO, CURL_SCALE_STEP, &mut demo_state.curl_scale);
+    tune(KeyCode::KeyP, -CURL_SCALE_STEP, &mut demo_state.curl_scale);
     tune(
         KeyCode::KeyL,
-        ATTRACTION_STEP,
+        CURL_ATTRACTION_STEP,
         &mut demo_state.curl_attraction,
     );
     tune(
         KeyCode::KeyK,
-        -ATTRACTION_STEP,
+        -CURL_ATTRACTION_STEP,
         &mut demo_state.curl_attraction,
     );
-    tune(KeyCode::KeyM, DAMPING_STEP, &mut demo_state.curl_damping);
-    tune(KeyCode::KeyN, -DAMPING_STEP, &mut demo_state.curl_damping);
-    tune(KeyCode::KeyV, EPSILON_STEP, &mut demo_state.curl_epsilon);
-    tune(KeyCode::KeyB, -EPSILON_STEP, &mut demo_state.curl_epsilon);
+    tune(
+        KeyCode::KeyM,
+        CURL_DAMPING_STEP,
+        &mut demo_state.curl_damping,
+    );
+    tune(
+        KeyCode::KeyN,
+        -CURL_DAMPING_STEP,
+        &mut demo_state.curl_damping,
+    );
+    tune(
+        KeyCode::KeyV,
+        CURL_EPSILON_STEP,
+        &mut demo_state.curl_epsilon,
+    );
+    tune(
+        KeyCode::KeyB,
+        -CURL_EPSILON_STEP,
+        &mut demo_state.curl_epsilon,
+    );
 
     if tuned {
         tracing::info!(

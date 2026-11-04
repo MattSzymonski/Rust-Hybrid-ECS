@@ -9,15 +9,16 @@
 //!
 //! # Design
 //!
-//! The file-authored twin of `cube_no_editor`: same camera, same cube, same
-//! spin, but neither the mesh nor the material is built in code. The material
-//! names the renderer's PBR shader by guid, so it can only be imported after
-//! `pill_master_renderer_data::register` has installed that chain.
+//! The file-authored twin of `cube_no_editor`: the same camera and the same
+//! cube, spun around the same axes, but neither the mesh nor the material is
+//! built in code. The material names the renderer's PBR shader by guid, so it
+//! can only be imported after `pill_master_renderer_data::register` has
+//! installed that chain.
 //!
-//! `init` runs again on every hot reload, against the live world. Every step
-//! is idempotent - the asset store hands back an already-loaded path, and the
-//! scene is only built into a world that has no camera and no drawn entity
-//! yet - so a reload finds the running scene instead of a second copy.
+//! `init` runs again on every hot reload, against the live world. Both setup
+//! steps can run twice without adding a second copy: the asset store hands
+//! back an already-loaded path, and each entity is only added when the world
+//! has none of that kind yet. So a reload finds the running scene.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -30,90 +31,106 @@ use pill_master_renderer_data::{
     CameraComponent, Material, Mesh, MeshRendererComponent, TransformComponent,
 };
 
-/// The cube's model, relative to `res`.
-const CUBE_MESH: &str = "models/cube.obj";
+/// The path to the cube's model, relative to `res`.
+const CUBE_MESH_PATH: &str = "models/cube.obj";
 
-/// The cube's material, relative to `res`.
-const CUBE_MATERIAL: &str = "materials/cube.material";
+/// The path to the cube's material, relative to `res`.
+const CUBE_MATERIAL_PATH: &str = "materials/cube.material";
 
 /// Spin speed around X, Y and Z, in radians per second.
-const SPIN_RADIANS_PER_SECOND: [f32; 3] = [0.6, 1.0, 0.3];
+const SPIN_RATES_RADIANS_PER_SECOND: [f32; 3] = [0.6, 1.0, 0.3];
 
 /// Where the camera stands: on +Z, looking down -Z at the cube.
 const CAMERA_TRANSLATION: [f32; 3] = [0.0, 0.0, 5.0];
 
-/// Registers the renderer, loads the cube's files and builds the scene.
+/// Registers the renderer's data, loads the cube's files, builds the scene and
+/// registers the spin system.
+///
+/// Returns `0` when the scene is ready, or `1` after logging why loading the
+/// files or building the scene failed.
 #[pill_project]
 pub fn init(engine: &mut Engine) -> u32 {
-    // Installs the PBR chain whose shader `cube.material` names by guid.
+    // Step 1: Register the renderer's data and point the asset store at this
+    // project's `res`. The material names the PBR shader by guid, so the chain
+    // has to be installed before the material is imported.
     pill_master_renderer_data::register(engine);
     AssetLoader::set_root(res_directory());
 
-    let (mesh, material) = match load_assets(engine.world_mut()) {
-        Ok(assets) => assets,
+    // Step 2: Load the mesh and the material.
+    let (mesh_handle, material_handle) = match load_assets(engine.world_mut()) {
+        Ok(asset_handles) => asset_handles,
         Err(error) => {
             pill_engine::tracing::error!("asset loading failed: {error}");
             return 1;
         }
     };
-    if let Err(error) = create_scene(engine.world_mut(), &mesh, &material) {
+
+    // Step 3: Add the camera and the cube to the world.
+    if let Err(error) = create_scene(engine.world_mut(), &mesh_handle, &material_handle) {
         pill_engine::tracing::error!("scene creation failed: {error}");
         return 1;
     }
 
+    // Step 4: Register the system that spins every drawn entity each frame.
     engine.register_system("spin_cube", spin_cube_system);
     0
 }
 
-/// This project's `res` directory.
+/// Returns the path to this project's `res` directory.
 ///
-/// `file!()` names this source relative to the manifest in an ordinary build,
-/// and as an absolute path when the dev host compiles the project through its
-/// generated workspace member, whose own manifest lives elsewhere. Joining it
-/// onto `CARGO_MANIFEST_DIR` gives this file's real location either way.
+/// In a normal build, `file!()` gives this source's path relative to the
+/// project manifest. When the dev host builds the project from a generated
+/// crate elsewhere in the engine workspace, the manifest lives elsewhere and
+/// `file!()` gives an absolute path instead. Joining it onto
+/// `CARGO_MANIFEST_DIR` gives this file's real location in both cases.
 fn res_directory() -> PathBuf {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
-    source
+    let source_file_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
+    source_file_path
         .parent()
         .and_then(Path::parent)
         .expect("this file lives in the project's `src`")
         .join("res")
 }
 
-/// Imports the model and the material file, in that order: the material names
-/// the shader by guid, and a reference to a shader the store has not imported
-/// yet resolves to the renderer's built-in one.
+/// Imports the model and the material file, in that order.
+///
+/// The order matters: the material names its shader by guid, and a reference
+/// to a shader that is not loaded yet resolves to the renderer's built-in
+/// shader instead.
 ///
 /// # Errors
 ///
-/// Returns the engine's message when a file cannot be read, does not decode as
-/// its type, or names an asset of another type.
+/// Returns the engine's message when no asset types are registered, when a
+/// file cannot be read, does not decode as its type, or names an asset of
+/// another type. It returns its own message when the world has no
+/// `AssetManager` resource.
 fn load_assets(world: &mut World) -> Result<(Handle<Mesh>, Handle<Material>), String> {
-    let mesh = world.load_asset::<Mesh>(CUBE_MESH)?;
-    let assets = world
+    let mesh_handle = world.load_asset::<Mesh>(CUBE_MESH_PATH)?;
+    let asset_manager = world
         .get_resource_mut::<AssetManager>()
         .ok_or("the engine AssetManager resource is missing")?;
-    let material = assets
-        .import_standalone::<Material>(Path::new(CUBE_MATERIAL))
+    let material_handle = asset_manager
+        .import_standalone::<Material>(Path::new(CUBE_MATERIAL_PATH))
         .map_err(|error| error.to_string())?
         .handle;
-    Ok((mesh, material))
+    Ok((mesh_handle, material_handle))
 }
 
 /// Adds the camera and the cube, unless the world already has them.
 ///
-/// No light entity: the shipped passes carry their own light rig baked into
-/// their shaders, so a `DirectionalLightComponent` would travel the scene
-/// contract without changing the picture.
+/// There is no light entity: every shipped pass writes its own lights into
+/// its shader, so a `DirectionalLightComponent` would be saved with the scene
+/// and never read.
 ///
 /// # Errors
 ///
 /// Returns the engine's entity-creation error as text.
 fn create_scene(
     world: &mut World,
-    mesh: &Handle<Mesh>,
-    material: &Handle<Material>,
+    mesh_handle: &Handle<Mesh>,
+    material_handle: &Handle<Material>,
 ) -> Result<(), String> {
+    // Step 1: Add a camera unless the world already has one.
     if Query::<&CameraComponent>::new(world)
         .iter_mut()
         .next()
@@ -130,6 +147,7 @@ fn create_scene(
             .map_err(|error| error.to_string())?;
     }
 
+    // Step 2: Add the cube unless an entity is already drawn.
     if Query::<&MeshRendererComponent>::new(world)
         .iter_mut()
         .next()
@@ -140,8 +158,8 @@ fn create_scene(
             .with(TransformComponent::default())
             .with(
                 MeshRendererComponent::builder()
-                    .mesh(mesh)
-                    .material(material)
+                    .mesh(mesh_handle)
+                    .material(material_handle)
                     .build(),
             )
             .build()
@@ -150,23 +168,30 @@ fn create_scene(
     Ok(())
 }
 
-/// Spins every drawn entity around X, Y and Z, scaled by the frame's delta so
-/// the speed does not depend on the frame rate.
+/// Spins every drawn entity around X, Y and Z.
+///
+/// The rotation is scaled by the time the frame took, so the spin speed does
+/// not depend on the frame rate.
 fn spin_cube_system(
-    time: Res<Time>,
-    mut cubes: Query<(&mut TransformComponent, &MeshRendererComponent)>,
+    time_resource: Res<Time>,
+    mut drawn_entities: Query<(&mut TransformComponent, &MeshRendererComponent)>,
 ) -> Result<(), SystemError> {
-    let Some(time) = time.get() else {
+    let Some(frame_time) = time_resource.get() else {
         return Ok(());
     };
-    let delta = time.delta_seconds();
-    let [x, y, z] = SPIN_RADIANS_PER_SECOND;
-    let step = glam::Quat::from_euler(glam::EulerRot::XYZ, x * delta, y * delta, z * delta);
-    for (mut transform, _) in cubes.iter_mut() {
-        let current = glam::Quat::from_array(pill_engine::common_components::rotation_or_identity(
-            transform.rotation,
-        ));
-        transform.rotation = (step * current).normalize().to_array();
+    let delta_seconds = frame_time.delta_seconds();
+    let [x, y, z] = SPIN_RATES_RADIANS_PER_SECOND;
+    let frame_rotation = glam::Quat::from_euler(
+        glam::EulerRot::XYZ,
+        x * delta_seconds,
+        y * delta_seconds,
+        z * delta_seconds,
+    );
+    for (mut transform, _) in drawn_entities.iter_mut() {
+        let current_rotation = glam::Quat::from_array(
+            pill_engine::common_components::rotation_or_identity(transform.rotation),
+        );
+        transform.rotation = (frame_rotation * current_rotation).normalize().to_array();
     }
     Ok(())
 }
@@ -175,15 +200,15 @@ fn spin_cube_system(
 mod tests {
     use super::*;
 
-    /// Counts the drawn entities, the cameras and the lights.
-    fn scene_counts(engine: &mut Engine) -> (usize, usize) {
-        let drawn = Query::<&MeshRendererComponent>::new(engine.world_mut())
+    /// Returns the drawn entity count and the camera count.
+    fn scene_entity_counts(engine: &mut Engine) -> (usize, usize) {
+        let drawn_entity_count = Query::<&MeshRendererComponent>::new(engine.world_mut())
             .iter_mut()
             .count();
-        let cameras = Query::<&CameraComponent>::new(engine.world_mut())
+        let camera_count = Query::<&CameraComponent>::new(engine.world_mut())
             .iter_mut()
             .count();
-        (drawn, cameras)
+        (drawn_entity_count, camera_count)
     }
 
     #[test]
@@ -192,7 +217,7 @@ mod tests {
 
         assert_eq!(init(&mut engine), 0);
 
-        assert_eq!(scene_counts(&mut engine), (1, 1));
+        assert_eq!(scene_entity_counts(&mut engine), (1, 1));
     }
 
     /// A hot reload runs `init` again; it must not build a second scene.
@@ -203,6 +228,6 @@ mod tests {
 
         assert_eq!(init(&mut engine), 0);
 
-        assert_eq!(scene_counts(&mut engine), (1, 1));
+        assert_eq!(scene_entity_counts(&mut engine), (1, 1));
     }
 }

@@ -46,10 +46,6 @@ from editor_step_support import (
 
 def run_menus_and_dock_steps(state: StepState) -> None:
     """The steps through: the Add Component button added {chosen} and the suite removed it."""
-    fraction_x = state.fraction_x
-    fraction_y = state.fraction_y
-    x = state.x
-    y = state.y
     session = state.session
 
 
@@ -406,6 +402,6 @@ AREA = StepArea(
     name="menus_and_dock",
     order=10,
     run=_area_entry,
-    needs=("fraction_x", "fraction_y", "x", "y",),
+    needs=(),
     provides=("showcase_rows", "slider",),
 )

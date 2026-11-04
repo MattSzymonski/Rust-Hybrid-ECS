@@ -44,9 +44,6 @@ from editor_step_support import (
 
 def run_material_and_entity_references_steps(state: StepState) -> None:
     """The steps through: the prior selection is back."""
-    section_begin = state.section_begin
-    x = state.x
-    y = state.y
     session = state.session
 
 
@@ -561,10 +558,6 @@ def run_material_and_entity_references_steps(state: StepState) -> None:
 
     state.applied_before = applied_before
     state.begin = begin
-    state.created = created
-    state.section_begin = section_begin
-    state.x = x
-    state.y = y
 
 
 def _area_entry(context: "StepContext") -> None:
@@ -577,5 +570,5 @@ AREA = StepArea(
     order=4,
     run=_area_entry,
     needs=("mesh_entity", "original_material", "picked_entity", "prior_entity",),
-    provides=("x", "y",),
+    provides=(),
 )

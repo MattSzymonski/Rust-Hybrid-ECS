@@ -1,10 +1,11 @@
 //! The demo's debug overlay: the field's bounds, the world axes and the
-//! tuning values, drawn through the engine's `DebugDraw`.
+//! tuning values, drawn through the engine's [`DebugDraw`].
 //!
 //! # Responsibilities
 //!
-//! - Draw the volume the pills spawn in, the axes at the origin and labels
-//!   naming them, every frame ([`debug_overlay_system`]).
+//! - Draw the box the pills spawn in, an arrow for each world axis and the
+//!   labels naming the origin and the field ([`debug_overlay_system`]).
+//! - Draw the tuning values as a line of text in the window's top-left corner.
 //! - Toggle debug drawing at runtime with F3, in any build.
 
 // External crates
@@ -16,22 +17,26 @@ use crate::game::DemoState;
 /// The key that switches debug drawing on and off.
 const TOGGLE_KEY: KeyCode = KeyCode::F3;
 
-/// The volume pills spawn in: its center and half its size on each axis.
+/// Center of the box the pills spawn in.
 const FIELD_CENTER: [f32; 3] = [0.0, 20.0, 0.0];
+
+/// Half the box's size on each axis, so every side is 40 world units long.
 const FIELD_HALF_EXTENTS: [f32; 3] = [20.0, 20.0, 20.0];
 
 /// Length of each drawn world axis.
 const AXIS_LENGTH: f32 = 3.0;
 
-/// Draws the field's bounds, the world axes and the tuning values, and
-/// toggles debug drawing with F3.
+/// Draws the field's bounds, the world axes and the tuning values.
+///
+/// Pressing F3 turns debug drawing on and off. While it is off, the system
+/// draws nothing.
 #[pill_hot]
 pub(crate) fn debug_overlay_system(
     input: Res<Input>,
     mut debug_draw: ResMut<DebugDraw>,
     demo_state: Res<DemoState>,
 ) -> Result<(), SystemError> {
-    // A build without the resource has nothing to draw into.
+    // A build without the `DebugDraw` resource has nothing to draw into.
     let Some(mut debug_draw) = debug_draw.get_mut() else {
         return Ok(());
     };
@@ -51,8 +56,9 @@ pub(crate) fn debug_overlay_system(
         FIELD_HALF_EXTENTS,
         DebugStyle::colored([0.3, 0.8, 1.0, 1.0]),
     );
-    // The axes show through everything, so they stay findable inside the
-    // swarm.
+    // The axes and labels are drawn without the depth test (the check that
+    // hides whatever sits behind other geometry), so the pills never cover
+    // them.
     let on_top = |color| DebugStyle {
         depth_test: false,
         ..DebugStyle::colored(color)
@@ -84,13 +90,13 @@ pub(crate) fn debug_overlay_system(
             on_top([0.3, 0.8, 1.0, 1.0]),
         );
 
-    let status = match demo_state.get() {
+    let overlay_text = match demo_state.get() {
         Some(state) => format!(
             "pills awakens - F3: debug draw\ncurl scale {:.4}  attraction {:.2}\ndamping {:.4}  epsilon {:.4}",
             state.curl_scale, state.curl_attraction, state.curl_damping, state.curl_epsilon
         ),
         None => String::from("circus demo - F3: debug draw"),
     };
-    debug_draw.label_screen(16.0, 16.0, &status, on_top([1.0, 0.9, 0.4, 1.0]));
+    debug_draw.label_screen(16.0, 16.0, &overlay_text, on_top([1.0, 0.9, 0.4, 1.0]));
     Ok(())
 }

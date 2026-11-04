@@ -231,6 +231,12 @@ pub const EDITOR_SETTINGS_FILE: &str = "editor_settings.yaml";
 /// A project's source asset directory, relative to the project root.
 const PROJECT_ASSET_DIRECTORY: &str = "res";
 
+/// A project's manager settings directory, relative to the project root.
+///
+/// Outside `res` on purpose: a settings file is not an asset, is never
+/// imported, and is read by the host rather than the asset store.
+pub(crate) const PROJECT_SETTINGS_DIRECTORY: &str = "settings";
+
 /// The editor theme a project's editor layer uses when `editor_settings.yaml`
 /// names none and the file is there.
 const DEFAULT_EDITOR_THEME: &str = "editor/editor.theme";
@@ -500,6 +506,10 @@ pub struct HostConfig {
     /// The project's `res` directory, which asset paths are relative to;
     /// `None` when the configuration was not read from a project directory.
     pub asset_directory: Option<PathBuf>,
+
+    /// The project's `settings` directory, which holds one file per manager;
+    /// `None` when the configuration was not read from a project directory.
+    pub settings_directory: Option<PathBuf>,
 }
 
 /// The `assets:` section of `project_settings.yaml`.
@@ -735,6 +745,7 @@ impl HostConfig {
             shipping_debug_draw: project_settings.debug_draw.unwrap_or(false),
             startup_scene,
             asset_directory: Some(project_root.join(PROJECT_ASSET_DIRECTORY)),
+            settings_directory: Some(project_root.join(PROJECT_SETTINGS_DIRECTORY)),
         })
     }
 
@@ -1031,6 +1042,7 @@ impl From<ProjectModuleConfig> for HostConfig {
             shipping_debug_draw: false,
             startup_scene: None,
             asset_directory: None,
+            settings_directory: None,
         }
     }
 }

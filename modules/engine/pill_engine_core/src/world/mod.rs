@@ -40,8 +40,11 @@ use crate::component::{
 };
 use crate::entity::{Entity, EntityId};
 use crate::query::change_detection::Mut;
-use crate::resource::{ErasedResource, ErasedResourceOps, Resource, ResourceId};
+use crate::resource::{
+    ErasedResource, ErasedResourceOps, KeptLayoutDeclaration, Resource, ResourceId,
+};
 use crate::scripting::{ScriptComponent, ScriptContext};
+use crate::settings::{ManagerSettingsEntry, SettingsDocument, SettingsOutcome};
 
 // =============================================================================
 // Module Tree

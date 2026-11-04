@@ -24,9 +24,8 @@ DESCRIPTION
     the project's startup batch, each plus the engine features
     `build_runner::host_engine_features` mirrors from the running host. Any
     crate whose features differ from the host's own resolution is reported.
-    A posture is measured only against the dylibs it loads: the two editors
-    skip each other's editor parts (`editor_frontend`), so one family's
-    dylibs never reach the other's process.
+    A posture is measured only against the dylibs named in its row; every
+    posture today loads every shared dylib.
 
     What is measured comes from tracked sources only - the extension crates by
     their `extensions/<folder>/<crate>` convention, the projects from their
@@ -37,9 +36,10 @@ DESCRIPTION
     visible.
 
     Every posture receives its engine features explicitly, exactly like the
-    standalone builders. An editor host additionally anchors its module builds
-    to its own package, because only that package's graph reproduces the
-    renderer and UI feature unions onto the engine dylibs.
+    standalone builders. An editor host instead anchors its module builds to
+    its own package, because only that package's graph reproduces the renderer
+    and UI feature unions onto the engine dylibs; an anchored build ignores the
+    engine features.
 
     Extensions are found by convention (every `extensions/<folder>/<crate>`
     crate); the projects are every example with both a `project_settings.yaml`
@@ -97,12 +97,13 @@ EGUI_EDITOR_DYLIBS = (
 ALL_DYLIBS = ENGINE_DYLIBS + EGUI_EDITOR_DYLIBS
 
 # The host postures module and project builds run under: the host's own cargo
-# selection, and the engine features `build_runner::host_engine_features`
-# mirrors from that host (the engine-affecting features `pill_development_host` declares:
-# `hot_patch`, the profiling levels, `metrics`, `dev-logs`). No native
-# frontend keeps a cargo anchor since the dioxus editor retired; the anchor
-# slot stays in the shape so a posture that ever needs one is measured with
-# it (`build_runner::apply_cargo_host_overrides`).
+# selection, the engine features `build_runner::host_engine_features`
+# mirrors from a game host (the engine-affecting features `pill_development_host`
+# declares: `hot_patch`, the profiling levels, `metrics`, `dev-logs`), and the
+# cargo anchor a posture appends to every spawned build
+# (`build_runner::apply_cargo_host_overrides`). The editor host anchors its
+# module builds to `pill_editor` with no features of its own; an anchored
+# build ignores the engine features.
 FRONTENDS = {
     "headless": (
         ["--package", "pill_standalone"],
@@ -124,8 +125,8 @@ FRONTENDS = {
     ),
     "editor": (
         ["--package", "pill_editor"],
-        ["pill_engine/hot_patch"],
-        None,
+        [],
+        ("pill_editor", ()),
         # The editor loads every shared dylib, including its own parts.
         ALL_DYLIBS,
     ),
@@ -241,19 +242,19 @@ def engine_selection(engine_features):
 # The extra `--package`/`--features` a posture appends to every build when it
 # keeps a cargo anchor (`build_runner::apply_cargo_host_overrides`), without
 # its defaults and with the features the running host was built with. One
-# helper, so the build shapes below cannot drift apart on it. No posture sets
-# one today; the dioxus editor was the last that did.
+# helper, so the build shapes below cannot drift apart on it. A posture whose
+# anchor declares no features (the editor) emits no `--features` at all.
 def anchor_selection(anchor):
     if not anchor:
         return []
     anchor_package, anchor_features = anchor
-    return [
-        "--package",
-        anchor_package,
-        "--no-default-features",
-        "--features",
-        ",".join(f"{anchor_package}/{feature}" for feature in anchor_features),
-    ]
+    selection = ["--package", anchor_package, "--no-default-features"]
+    if anchor_features:
+        selection += [
+            "--features",
+            ",".join(f"{anchor_package}/{feature}" for feature in anchor_features),
+        ]
+    return selection
 
 
 # The module build of `name`: the crate selected directly, with the features
@@ -351,8 +352,32 @@ def differences(reference, measured):
     return found
 
 
+# The packages `build_runner::is_editor_anchor` treats as an editor anchor.
+# Read from the Rust source, so a posture anchored to a package the host does
+# not recognise fails here instead of measuring a shape the host never builds.
+def editor_anchor_packages():
+    source = (
+        MODULES / "hosting" / "pill_development_host" / "src" / "build_runner.rs"
+    ).read_text(encoding="utf-8")
+    match = re.search(
+        r"fn is_editor_anchor\([^)]*\)[^{]*\{(.*?)\}", source, re.DOTALL
+    )
+    if match is None:
+        raise TreeError("is_editor_anchor is gone from build_runner.rs")
+    return set(re.findall(r'"([\w-]+)"', match.group(1)))
+
+
 def main():
     verbose = "--verbose" in sys.argv
+    anchor_packages = editor_anchor_packages()
+    for frontend, (_, _, anchor, _) in FRONTENDS.items():
+        if anchor and anchor[0] not in anchor_packages:
+            print(
+                f"error: {frontend} anchors to {anchor[0]}, which "
+                "build_runner::is_editor_anchor does not recognise",
+                file=sys.stderr,
+            )
+            return 2
     drift = {}
     measured_count = 0
     try:
@@ -369,6 +394,10 @@ def main():
     print(f"modules: {', '.join(module_names())}")
     print(f"projects: {', '.join(crate.directory.name for crate in rust_projects()) or 'none'}")
     print(f"builds measured: {measured_count}")
+    if verbose:
+        for frontend, (_, _, anchor, _) in FRONTENDS.items():
+            if anchor:
+                print(f"  anchor {frontend}: {' '.join(anchor_selection(anchor))}")
     for (dylib, package, description), builds in sorted(drift.items()):
         print(f"  FAIL  {dylib}: {package} {description} ({len(builds)} build(s))")
         if verbose:

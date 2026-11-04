@@ -47,12 +47,10 @@ use serde_json::Value;
 /// The list is capped instead of growing without bound. The tally's counters
 /// still count every refusal and failure, so a long session loses only the
 /// listing of one more distinct cause, never the totals.
-#[cfg(feature = "hot_patch")]
 const MAX_TRACKED_FALLBACK_REASONS: usize = 8;
 
 /// How much of one explanation is kept. Compiler errors can run long, and this
 /// line sits inside a reload report that has to stay readable.
-#[cfg(feature = "hot_patch")]
 const MAX_FALLBACK_DETAIL_CHARS: usize = 160;
 
 // =============================================================================
@@ -723,7 +721,6 @@ impl ModuleAnalytics {
 /// reads both; the `kind=` field tells them apart. A patch is not a second
 /// format. It is a reload whose phases happen to be much cheaper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(feature = "hot_patch"), allow(dead_code))]
 pub(crate) enum EventKind {
     /// A module or project DLL was rebuilt, reloaded and re-registered.
     Reload,
@@ -751,7 +748,6 @@ impl EventKind {
 /// and the twelve-byte write is not atomic. Averaging the two would mix a
 /// guarantee with an approximation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(feature = "hot_patch"), allow(dead_code))]
 pub(crate) enum PatchRoute {
     /// A `#[pill_hot]` system, replaced through the engine's own registry. The
     /// registry lives once per process, so one install reaches every caller.
@@ -780,7 +776,6 @@ impl PatchRoute {
     /// Only the hot-patch path asks, so without `hot_patch` this has no
     /// caller. That is the same reason [`EventKind`] carries the allow on its
     /// own declaration.
-    #[cfg_attr(not(feature = "hot_patch"), allow(dead_code))]
     pub(crate) fn is_provable(self) -> bool {
         matches!(self, Self::EngineSlot | Self::ArtifactSlot)
     }
@@ -1064,7 +1059,6 @@ pub(crate) fn record_reload(name: &str) {
 /// the same job `pill_module_init` does for a reload. `migrate` is always zero,
 /// because a patch cannot change a component schema - that is exactly the kind
 /// of edit it refuses.
-#[cfg(feature = "hot_patch")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_patch(
     function: &str,
@@ -1101,7 +1095,6 @@ pub(crate) fn record_patch(
 }
 
 /// Record that the fast path declined a change and fell through to a reload.
-#[cfg(feature = "hot_patch")]
 pub(crate) fn record_patch_refusal(code: &str, detail: &str) {
     let mut collector = analytics()
         .lock()
@@ -1111,7 +1104,6 @@ pub(crate) fn record_patch_refusal(code: &str, detail: &str) {
 }
 
 /// Record that a patch was attempted and failed, keeping the previous code.
-#[cfg(feature = "hot_patch")]
 pub(crate) fn record_patch_failure(function: &str, code: &str, detail: &str) {
     let mut collector = analytics()
         .lock()
@@ -1126,7 +1118,6 @@ pub(crate) fn record_patch_failure(function: &str, code: &str, detail: &str) {
 /// The match uses the function, the outcome and the code, not the detail text,
 /// so a compiler message whose column number moves between saves is not a new
 /// cause.
-#[cfg(feature = "hot_patch")]
 fn remember_fallback(
     collector: &mut Analytics,
     function: Option<&str>,

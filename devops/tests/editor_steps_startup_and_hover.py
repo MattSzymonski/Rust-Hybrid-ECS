@@ -32,9 +32,6 @@ from editor_step_support import (
 def run_startup_and_hover_steps(state: StepState) -> None:
     """The steps through: hovering the splitter asked for the resize cursor."""
     begin = state.begin
-    found = state.found
-    fraction_x = state.fraction_x
-    fraction_y = state.fraction_y
     session = state.session
 
     # Step 1: startup, all the way to both tabs reporting rows.
@@ -192,11 +189,7 @@ def run_startup_and_hover_steps(state: StepState) -> None:
 
     state.badge_begin = badge_begin
     state.begin = begin
-    state.found = found
-    state.fraction_x = fraction_x
-    state.fraction_y = fraction_y
     state.picked_entity = picked_entity
-    state.rows = rows
     state.scene_height = scene_height
     state.scene_rect = scene_rect
     state.scene_x = scene_x
@@ -215,5 +208,5 @@ AREA = StepArea(
     order=1,
     run=_area_entry,
     needs=(),
-    provides=("badge_begin", "fraction_x", "fraction_y", "picked_entity", "scene_height", "scene_rect", "scene_x", "scene_y", "splitter_x", "splitter_y",),
+    provides=("badge_begin", "picked_entity", "scene_height", "scene_rect", "scene_x", "scene_y", "splitter_x", "splitter_y",),
 )

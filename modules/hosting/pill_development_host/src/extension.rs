@@ -23,27 +23,18 @@
 //! one module therefore never disturbs the project or another module.
 
 // Standard library
-#[cfg(feature = "hot_reload")]
 use std::path::Path;
-#[cfg(feature = "hot_reload")]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "hot_reload")]
 use std::sync::Arc;
 
 // External crates
-#[cfg(feature = "hot_reload")]
 use pill_core::error::{HostError, ModuleError};
-#[cfg(feature = "hot_reload")]
 use pill_core::info;
-#[cfg(feature = "hot_reload")]
 use pill_engine::{Engine, EngineApi, SystemOwner};
 
 // Current crate
-#[cfg(feature = "hot_reload")]
 use crate::build_runner::build_extension;
-#[cfg(feature = "hot_reload")]
 use crate::native_library::NativeLibrary;
-#[cfg(feature = "hot_reload")]
 use crate::ExtensionConfig;
 
 // =============================================================================
@@ -65,14 +56,9 @@ pub use pill_engine::module_abi::MODULE_ABI_VERSION as EXTENSION_ABI_VERSION;
 // ExtensionSlot
 // =============================================================================
 
-// Everything below loads, versions and replaces a module DLL; a build without
-// the `hot_reload` feature never does that. The ABI constant above is compiled
-// in every build: it describes the contract a module crate is compiled
-// against, and that holds whether or not this host can load one.
-#[cfg(feature = "hot_reload")]
+// Everything below loads, versions and replaces a module DLL.
 pub(crate) use slot::{ExtensionSlot, ReloadOutcome};
 
-#[cfg(feature = "hot_reload")]
 mod slot {
     use super::*;
 
@@ -245,6 +231,21 @@ mod slot {
                 module = extension_config.name.as_str(),
                 owner = system_owner.0,
                 "extension loaded"
+            );
+
+            // What this generation declared its resources' layouts are made of,
+            // so the first reload can tell a kept value from one the edit
+            // invalidated.
+            let watch_directory = workspace_root.join(&extension_config.watch_directory);
+            let layout_record = crate::layout_record::LayoutRecordTarget::new(
+                workspace_root,
+                &watch_directory,
+                &extension_config.name,
+            );
+            crate::layout_record::write_record(
+                engine.world(),
+                &layout_record,
+                &initialized_generation.registered_resource_ids,
             );
 
             Ok(Self {
@@ -420,7 +421,6 @@ mod slot {
         /// rebuild. It returns the generation itself rather than a flag, so the
         /// caller can pass the exact generation it handled to
         /// [`Self::consume_pending_reload`].
-        #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         pub(crate) fn pending_reload_generation(&self) -> Option<u64> {
             let generation = self.source_edit_generation.load(Ordering::Acquire);
             (generation != self.last_processed_source_edit_generation).then_some(generation)
@@ -437,7 +437,6 @@ mod slot {
         /// the counter past that generation, and nothing has delivered that
         /// save. Recording it as handled would leave the edit on disk, never
         /// compiled.
-        #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         pub(crate) fn consume_pending_reload(&mut self, generation: u64) {
             self.last_processed_source_edit_generation = generation;
         }
@@ -445,7 +444,6 @@ mod slot {
         /// The library of the generation that is loaded now. It is a patch
         /// target, and the renderer module resolves its attach and detach
         /// exports from it.
-        #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         pub(crate) fn current_library(&self) -> &NativeLibrary {
             &self.current_library
         }
@@ -557,6 +555,9 @@ mod slot {
             // save during the build cancels it and the next frame retries),
             // then load a private copy and verify its ABI, and finally swap
             // through the transaction, whose own step order is load-bearing.
+            // The record this transaction reads and rewrites is keyed by the
+            // module and resolves declared paths against its crate root.
+            let watch_directory = workspace_root.join(&self.extension_config.watch_directory);
             let transaction = crate::reload::ReloadTransaction {
                 kind: crate::reload::ReloadSubjectKind::Extension,
                 subject: &self.extension_config.name,
@@ -567,6 +568,11 @@ mod slot {
                 registered_schemas: &mut self.registered_schema_hashes,
                 registered_resource_ids: &mut self.registered_resource_ids,
                 peer_component_names,
+                layout_record: crate::layout_record::LayoutRecordTarget::new(
+                    workspace_root,
+                    &watch_directory,
+                    &self.extension_config.name,
+                ),
                 graveyard_policy: self.graveyard_policy,
             };
             let Some(commit) = crate::reload::build_load_and_commit(

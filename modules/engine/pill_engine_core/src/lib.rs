@@ -184,6 +184,10 @@ pub mod scheduler;
 /// that defers structural changes until it is safe to apply them.
 pub mod scripting;
 
+/// Manager settings: the `key: value` document a project configures a
+/// subsystem-owning resource with, and the trait a manager declares it through.
+pub mod settings;
+
 /// The startup scene: the `.scene` a project's settings name, loaded before
 /// the project's own `init` fills the world.
 pub mod startup_scene;
@@ -254,7 +258,7 @@ pub use pill_core::DynamicBuffer;
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
-pub use resource::{ResHandle, Resource, ResourceId};
+pub use resource::{KeptLayoutDeclaration, ResHandle, Resource, ResourceId};
 pub use saved_references::{
     restore_asset_reference, saved_reference, SavedAssetReference, SavedEntityLink,
     SavedEntityLinks, SavedReference,
@@ -262,6 +266,10 @@ pub use saved_references::{
 pub use scene::{load_scene, save_scene, Scene, SceneDocument, SceneEntity, SceneLoad, SceneSave};
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
+pub use settings::{
+    ManagerResource, ManagerSettingsEntry, SettingsDocument, SettingsError, SettingsOutcome,
+    SettingsValue,
+};
 pub use startup_scene::{apply_startup_scene, queue_startup_scene, StartupScene};
 pub use time::Time;
 

@@ -31,20 +31,19 @@ DESCRIPTION
     those reloads with no phase breakdown at all, which is indistinguishable
     from the C# category that legitimately has none.
 
-    So these tests use REAL lines, copied verbatim from host output, as
-    fixtures. Invented strings would have kept passing throughout that bug,
-    because the bug was in the gap between what the host prints and what the
-    harness expected.
+    So these tests use REAL input, copied verbatim from host output and Rust
+    source, as fixtures. Invented strings would keep passing while the gap
+    between what the host prints and what the scanner expects widens.
 
-    Two of these checks used to compare a copy of an engine rule against
-    another copy of the same rule, both written here: the provable-route set
-    was asserted against a literal that restated it, and the shared-slot rule
-    was reimplemented in the test and then asserted against itself. Neither
-    could fail when the engine changed - the failure mode this whole file
-    exists to catch. Both now read the rule out of the engine's own source
-    (`pill_development_host/src/analytics.rs`, `pill_development_host/src/build_runner.rs`) and compare
-    it with what the harness and this file believe, so a route relabelled or
-    reclassified in Rust fails here.
+    The checks cover the patch-coverage scanner, the shared edit/restore
+    helpers and the editor session. The analytics-line parsing checks moved
+    with their harness into the untracked `local/devops/` tree; nothing in this
+    repository reads that harness, so those checks live beside it.
+
+    The shared-slot rule used to be reimplemented in the test and then asserted
+    against itself, so it could not fail when the engine changed. It now reads
+    the rule out of `pill_development_host/src/build_runner.rs` and compares it
+    with the names Cargo produces.
 
 USAGE
   python devops/tests/test_harness_parsing.py
@@ -63,11 +62,11 @@ import tempfile
 from pathlib import Path
 from typing import Callable, List, Tuple
 
-DEVOPS_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(DEVOPS_ROOT))
+# Standalone-runnable: put `devops/` on `sys.path` before reaching `core`.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.paths import MODULES_ROOT, REPOSITORY_ROOT  # noqa: E402
-from core.projects import PROJECT_RS_LIB_RS  # noqa: E402
+from core.paths import CI_CD_ROOT, DEVOPS_ROOT, MODULES_ROOT, REPOSITORY_ROOT, TESTS_ROOT  # noqa: E402
+from core.projects import NATIVE_PROJECT_LIB_RS  # noqa: E402
 from core.suite_common import (  # noqa: E402
     apply_replacements,
     restore_paths,
@@ -84,26 +83,25 @@ from core.workspace_graph import (  # noqa: E402
 )
 
 
-def load_module(relative_path: str, name: str):
+def load_module(path: Path, name: str):
     """Import a devops module by path.
 
-    The benchmark and suite files are standalone scripts rather than an
-    installed package, so they are loaded by location instead of by import.
+    The suites are standalone scripts rather than an installed package, so they
+    are loaded by location instead of by import.
     """
-    spec = importlib.util.spec_from_file_location(name, DEVOPS_ROOT / relative_path)
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.argv = [name]  # the modules parse argv at import time
     spec.loader.exec_module(module)
     return module
 
 
-harness = load_module("benchmarks/hot_reload_harness.py", "hot_reload_harness")
-coverage = load_module("tests/test_hot_patch_coverage.py", "test_hot_patch_coverage")
+coverage = load_module(TESTS_ROOT / "test_hot_patch_coverage.py", "test_hot_patch_coverage")
 
-# The engine sources the two rules under test are defined in. Read as text: a
-# rule that moves, is renamed or is reworded fails the check that reads it.
+# The engine source the shared-slot rule under test is defined in. Read as
+# text: a rule that moves, is renamed or is reworded fails the check that reads
+# it.
 PILL_HOST_SOURCE = MODULES_ROOT / "hosting" / "pill_development_host" / "src"
-ANALYTICS_SOURCE = PILL_HOST_SOURCE / "analytics.rs"
 BUILD_RUNNER_SOURCE = PILL_HOST_SOURCE / "build_runner.rs"
 
 # Cargo's configuration hash: `-<16 hex digits>` appended to a crate's filename
@@ -113,33 +111,8 @@ CONFIGURATION_HASH_HEX_DIGITS = 16
 
 
 # =============================================================================
-# Fixtures - verbatim host output
+# Fixtures - verbatim host output and Rust source
 # =============================================================================
-
-# Copied unmodified from real runs. Do not "tidy" these: their exact shape,
-# including the spaces and commas inside function names, is the thing under
-# test.
-REAL_ANALYTICS_LINES = [
-    # A whole-artifact reload.
-    "[analytics] reload project (reload #1) | build=1.91s | stage=3.2ms | load=90.2ms"
-    " | init=0.4ms | migrate=0.0ms | size=767.5KB | kind=reload",
-    # A patch through a per-artifact slot, with the route fields.
-    "[analytics] reload pill_dummy_color::get_color_a (reload #1) | build=479ms"
-    " | stage=28.0ms | load=24.1ms | init=0.3ms | migrate=0.0ms | size=45.5KB"
-    " | kind=patch | route=artifact-slot | copies=3",
-    # A trait method: the name contains spaces inside `<Type as Trait>`.
-    "[analytics] reload pill_spline::<Spline as ColorTweak>::tweak (reload #1)"
-    " | build=507ms | stage=99.6ms | load=49.6ms | init=1.6ms | migrate=0.0ms"
-    " | size=516.0KB | kind=patch | route=prologue | copies=2",
-    # Two bodies patched in one save: the name contains a comma and a space.
-    "[analytics] reload pill_dummy_color::get_color_a, pill_dummy_color::Tint::mix"
-    " (reload #1) | build=360ms | stage=22.7ms | load=19.8ms | init=1.6ms"
-    " | migrate=0.0ms | size=45.5KB | kind=patch",
-    # A host predating the kind/route fields, and predating the export-column
-    # removal: the optional groups are what keep stored measurements readable.
-    "[analytics] reload pill_spline (reload #2) | build=401ms | stage=3.2ms"
-    " | load=76.6ms | init=0.3ms | migrate=0.0ms | size=510.0KB | exports=9",
-]
 
 # Real `cargo test` output, one line per test binary, as `rust_tests` sees it.
 REAL_CARGO_TEST_OUTPUT = """\
@@ -205,7 +178,7 @@ def rust_block(source: str, marker: str) -> str:
     """
     start = source.find(marker)
     if start < 0:
-        fail(f"{marker!r} is gone from {ANALYTICS_SOURCE.name} / {BUILD_RUNNER_SOURCE.name}")
+        fail(f"{marker!r} is gone from {BUILD_RUNNER_SOURCE.name}")
     opening = source.find("{", start)
     if opening < 0:
         fail(f"{marker!r} has no body")
@@ -213,99 +186,6 @@ def rust_block(source: str, marker: str) -> str:
     if end < 0:
         fail(f"{marker!r} has no closing brace")
     return source[opening + 1 : end]
-
-
-def check_every_real_analytics_line_parses() -> None:
-    """Each fixture line must match, and expose its phase numbers."""
-    for line in REAL_ANALYTICS_LINES:
-        match = harness.RELOAD_LINE_RE.search(line)
-        if match is None:
-            fail(f"unparsed analytics line: {line[:90]}")
-        if float(match.group(3)) < 0:
-            fail(f"stage did not parse as a number: {match.group(3)!r}")
-
-
-def check_function_names_with_spaces_and_commas_survive() -> None:
-    """The two shapes that a `\\S+` name group silently dropped.
-
-    Both are produced by features this repo actually has - trait-method patching
-    and patching several bodies from one save - so neither is exotic.
-    """
-    trait_line = next(line for line in REAL_ANALYTICS_LINES if "ColorTweak" in line)
-    trait_name = harness.RELOAD_LINE_RE.search(trait_line).group(1)
-    if trait_name != "pill_spline::<Spline as ColorTweak>::tweak":
-        fail(f"a trait-method name must be captured whole, spaces included: {trait_name!r}")
-
-    multi_line = next(line for line in REAL_ANALYTICS_LINES if "Tint::mix" in line)
-    multi_name = harness.RELOAD_LINE_RE.search(multi_line).group(1)
-    if multi_name != "pill_dummy_color::get_color_a, pill_dummy_color::Tint::mix":
-        fail(f"a multi-function name must be captured whole, comma included: {multi_name!r}")
-
-
-def check_optional_fields_are_really_optional() -> None:
-    """A host predating `kind=` and `route=` must still parse.
-
-    The harness is expected to read output from an older binary; the groups are
-    optional precisely so an upgrade does not invalidate stored measurements.
-    """
-    old_line = next(line for line in REAL_ANALYTICS_LINES if "kind=" not in line)
-    match = harness.RELOAD_LINE_RE.search(old_line)
-    if match is None:
-        fail("a line without the optional fields must still match")
-    if match.group(8) is not None:
-        fail("kind must be absent, not defaulted")
-    if match.group(9) is not None:
-        fail("route must be absent, not defaulted")
-
-
-def check_route_is_read_only_when_present() -> None:
-    """`route` and `copies` parse together, or not at all."""
-    with_route = next(line for line in REAL_ANALYTICS_LINES if "route=" in line)
-    match = harness.RELOAD_LINE_RE.search(with_route)
-    if match.group(9) != "artifact-slot":
-        fail(f"route was {match.group(9)!r}")
-    if match.group(10) != "3":
-        fail(f"copies was {match.group(10)!r}")
-
-
-def check_provable_routes_match_the_engine() -> None:
-    """The harness's idea of a provable route must match the engine's.
-
-    `PatchRoute::is_provable` in `pill_development_host/src/analytics.rs` is the definition;
-    the harness's `PROVABLE_ROUTES` mirrors it. If they drift, the benchmark
-    silently reclassifies a best-effort patch as a guaranteed one - so both
-    sides are read here, and the labels the engine actually prints are the ones
-    compared.
-    """
-    source = ANALYTICS_SOURCE.read_text(encoding="utf-8")
-    variants = {
-        line.strip().rstrip(",")
-        for line in rust_block(source, "enum PatchRoute").splitlines()
-        if re.fullmatch(r"[A-Z]\w*,?", line.strip())
-    }
-    if not variants:
-        fail("no PatchRoute variants parsed: the enum's shape changed")
-
-    implementation = rust_block(source, "impl PatchRoute")
-    labels = dict(re.findall(r'Self::(\w+)\s*=>\s*"([\w+-]+)"', implementation))
-    if set(labels) != variants:
-        fail(
-            "PatchRoute::label does not name every variant: "
-            f"{sorted(variants ^ set(labels))} is on one side only"
-        )
-
-    match = re.search(r"matches!\(\s*self\s*,\s*(.+?)\)", implementation, re.DOTALL)
-    if match is None:
-        fail("PatchRoute::is_provable no longer states its routes as a matches! arm")
-    provable = {
-        labels[name] for name in re.findall(r"Self::(\w+)", match.group(1)) if name in labels
-    }
-
-    if provable != set(harness.PROVABLE_ROUTES):
-        fail(
-            "PROVABLE_ROUTES drifted from PatchRoute::is_provable in analytics.rs: "
-            f"engine says {sorted(provable)}, harness says {sorted(harness.PROVABLE_ROUTES)}"
-        )
 
 
 def check_cargo_test_totals_are_summed() -> None:
@@ -821,7 +701,7 @@ def check_hook_and_ci_lint_the_same_files() -> None:
     root: a `--root modules` scan leaves tracked files outside `modules/`
     unlinted while the hook still flags them.
     """
-    verify_steps = load_module("ci_cd/verify.py", "verify_steps")
+    verify_steps = load_module(CI_CD_ROOT / "verify.py", "verify_steps")
     step = next((step for step in verify_steps.STEPS if step.name == "coding-standards"), None)
     if step is None:
         fail("verify.py no longer has a coding-standards step")
@@ -831,7 +711,7 @@ def check_hook_and_ci_lint_the_same_files() -> None:
     if "devops/tests/test_coding_standards.py" not in command:
         fail(f"the coding-standards step runs {command}, not the lint")
 
-    lint = load_module("tests/test_coding_standards.py", "test_coding_standards_scope")
+    lint = load_module(TESTS_ROOT / "test_coding_standards.py", "test_coding_standards_scope")
     scanned = {path.resolve() for path in lint.find_rust_files(REPOSITORY_ROOT)}
 
     tracked = subprocess.run(
@@ -873,7 +753,7 @@ def check_hook_and_ci_lint_the_same_files() -> None:
     probes = [REPOSITORY_ROOT / name for name in tracked[:3] + tracked[-3:] + ignored]
     probes += [
         REPOSITORY_ROOT / "local" / "temp" / "probe.rs",
-        PROJECT_RS_LIB_RS,
+        NATIVE_PROJECT_LIB_RS,
     ]
     for probe in probes:
         if lint.is_linted(probe) != hook_lint.is_linted(probe):
@@ -892,7 +772,7 @@ def check_the_gate_denies_warnings_everywhere() -> None:
     so the default clippy step must add `--all-targets` (the test, example and
     bench targets) and each posture step must pass `-D warnings` on to rustc.
     """
-    verify_steps = load_module("ci_cd/verify.py", "verify_warning_steps")
+    verify_steps = load_module(CI_CD_ROOT / "verify.py", "verify_warning_steps")
     steps = {step.name: step for step in verify_steps.STEPS}
     for name in ("clippy", "check-hot-patch", "check-shipping", "check-rendering"):
         if name not in steps:
@@ -909,11 +789,6 @@ def check_the_gate_denies_warnings_everywhere() -> None:
 
 
 CHECKS: List[Tuple[str, Callable[[], None]]] = [
-    ("every real analytics line parses", check_every_real_analytics_line_parses),
-    ("names with spaces and commas survive", check_function_names_with_spaces_and_commas_survive),
-    ("optional fields are optional", check_optional_fields_are_really_optional),
-    ("route and copies read together", check_route_is_read_only_when_present),
-    ("provable routes match the engine", check_provable_routes_match_the_engine),
     ("cargo test totals are summed", check_cargo_test_totals_are_summed),
     ("brace scan survives strings and comments",
      check_function_body_scan_handles_braces_in_strings_and_comments),

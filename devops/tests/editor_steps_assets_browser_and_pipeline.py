@@ -462,7 +462,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     # writes a valid `.pipeline`: the standard header, a guid and the
     # type's default document (an empty passes list, which is valid - a
     # chain names its passes by guid). The committed chain in
-    # `devops/tests/projects/project_rs` is what exercises a populated file.
+    # `devops/tests/projects/native` is what exercises a populated file.
     begin = session.length()
     session.send("dump standalone-types")
     session.wait(
@@ -587,12 +587,9 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     session.send("command editor.undo")
 
     state.applied_before = applied_before
-    state.before = before
     state.begin = begin
     state.cube_meta = cube_meta
-    state.dump = dump
     state.flip_before = flip_before
-    state.listed = listed
 
 
 def _area_entry(context: "StepContext") -> None:

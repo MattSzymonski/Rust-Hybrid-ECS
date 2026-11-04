@@ -19,12 +19,14 @@ DESCRIPTION
     the build script it emits does with them - by importing
     `devops/tools/generate_shipping_bundle.py` and asserting:
 
-      - `devops/tests/projects/project_rs` selects the renderer data crate's `res` and
+      - `devops/tests/projects/native` selects the renderer data crate's `res` and
         `shader_sources`, in that order, and a module that ships nothing
         beside its code contributes no root;
       - the emitted build script calls `write_asset_pack_with_roots`, names
-        both roots relative to the bundle, and cooks the shader tree before
-        packing it.
+        both roots relative to the bundle, cooks each module's shader tree
+        before packing it, and cooks the project's own shader sources too - a
+        project has no build script to cook them, and the shader import reads
+        the cooked file, not the source.
 
 USAGE
   python devops/tests/test_shipping_bundle_roots.py
@@ -43,10 +45,10 @@ DEVOPS_ROOT = Path(__file__).resolve().parent.parent
 REPOSITORY_ROOT = DEVOPS_ROOT.parent
 sys.path.insert(0, str(DEVOPS_ROOT))
 
-from core.projects import PROJECT_RS_ROOT  # noqa: E402
+from core.projects import NATIVE_PROJECT_ROOT  # noqa: E402
 
 GENERATOR_PATH = DEVOPS_ROOT / "tools" / "generate_shipping_bundle.py"
-PROJECT_ROOT = PROJECT_RS_ROOT
+PROJECT_ROOT = NATIVE_PROJECT_ROOT
 RENDERER = "pill_master_renderer"
 DATA_CRATE_NAME = RENDERER + "_data"
 DATA_CRATE = REPOSITORY_ROOT / "modules" / "extensions" / RENDERER / DATA_CRATE_NAME
@@ -111,9 +113,44 @@ def main() -> int:
         and "pill_assets::cook_shader_tree(root)" in script,
     )
     expect(
+        "the build script cooks the project's shader tree before packing it",
+        "pill_assets::cook_shader_tree(&source)" in script,
+    )
+    expect(
         "the build script reports every root as an input",
         "for root in &module_roots {\n        println!(\"cargo:rerun-if-changed={}\", root.display());"
         in script,
+    )
+
+    # A manager's settings document is baked as text rather than packed: a
+    # shipped build has no writable project directory, so the document the
+    # generator read is what the manager applies at startup.
+    expect(
+        "a project without settings bakes no manager documents",
+        generator.load_manager_settings(PROJECT_ROOT) == [],
+    )
+    emitted = "\n".join(
+        generator.build_manager_settings_literal([("fixture", "gain: 2.0\nlabel: \"a\"\n")])
+    )
+    expect(
+        "a baked document becomes a StaticManagerSettings entry",
+        'StaticManagerSettings { name: "fixture", document: "gain: 2.0\\nlabel: \\"a\\"\\n" }'
+        in emitted,
+    )
+    source = generator.build_library_source(
+        "bundle_package",
+        "Bundle Project",
+        modules,
+        "native",
+        "../../example",
+        BUNDLE_DIRECTORY,
+        REPOSITORY_ROOT / "modules",
+        manager_settings=[("fixture", "gain: 2.0\n")],
+    )
+    expect(
+        "the bundle's StaticProject carries the baked documents",
+        "manager_settings: MANAGER_SETTINGS," in source
+        and "StaticManagerSettings" in source,
     )
 
     if failures:

@@ -3,15 +3,15 @@
 RESPONSIBILITIES
   - EditorSession: one editor run for a suite - the machine-global host lock,
     the stray-editor cleanup under it, a per-run folder (log, command file,
-    LOCALAPPDATA sandbox), the launch environment and the byte-anchored log
-    waits the editor suite is built on.
+    LOCALAPPDATA sandbox), the launch environment and the character-anchored
+    log waits the editor suite is built on.
   - The shared editor log tokens (*_TOKEN) the suite waits on, as plain
     substrings, so `test_log_contract.py` checks each against the Rust
     sources that print it.
 
 DESIGN
-  The suite anchors waits on byte offsets into a growing log file: an
-  assertion captures `start = len(read_log())` before it sends a command and
+  The suite anchors waits on character offsets into a growing log file: an
+  assertion captures `start = session.length()` before it sends a command and
   re-scans only what arrives after. `OutputMonitor` in `suite_common` is a
   pipe-based line monitor with token searches; it cannot serve an offset
   anchor over the whole stream without changing every assertion, so
@@ -396,7 +396,7 @@ class EditorSession:
         return self._process.poll()
 
     # -------------------------------------------------------------------------
-    # The log: file-backed, byte-anchored waits
+    # The log: file-backed, character-anchored waits
     # -------------------------------------------------------------------------
 
     def _reset_log_cursor(self) -> None:
@@ -453,12 +453,19 @@ class EditorSession:
         return self._log_text
 
     def length(self) -> int:
-        """The log's length in characters, the unit every anchor uses."""
+        """The log's length in characters, the unit every anchor uses.
+
+        This is the only anchor a caller should take - never a byte count
+        from `log_path.stat()`: the log carries multi-byte characters, so a
+        byte count can land inside one and re-expose earlier output to a
+        wait's probe.
+        """
         self._refresh_log()
         return len(self._log_text)
 
     def read_since(self, offset: int) -> str:
-        """The log text from character `offset` on."""
+        """The log text from character `offset` on, where `offset` is the
+        character index `length()` reports."""
         self._refresh_log()
         return self._log_text[offset:]
 
@@ -524,7 +531,12 @@ class EditorSession:
         raise TimeoutError(timeout_message + self.read_log()[-4000:])
 
     def wait(self, pattern: str, timeout: float, label: str, start: int = 0) -> int:
-        """Waits for `pattern` after byte offset `start`; returns the new length.
+        """Waits for `pattern` after character offset `start`; returns the new length.
+
+        `start` is a character index into the decoded log, which is what
+        `length()` and `read_since()` use - never a byte count from
+        `log_path.stat()`: the log carries multi-byte characters, so a byte
+        count can land inside one and re-expose earlier output to the probe.
 
         Same contract the suites grew up with: prints `[OK] <label>` on a
         match, raises `RuntimeError` when a running editor exits first, and

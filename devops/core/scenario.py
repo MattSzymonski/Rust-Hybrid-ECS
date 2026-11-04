@@ -41,7 +41,7 @@ from typing import Callable, Optional, Sequence, Tuple
 # `print` here is suite_common's console-color wrapper, as in every suite.
 from .suite_common import (  # noqa: A004
     BACKUP,
-    PROJECT_SANDBOX_LIB_RS,
+    NATIVE_PROJECT_LIB_RS,
     RELOAD_MODULE_TOKEN,
     RELOAD_PROJECT_TOKEN,
     RELOAD_TIMEOUT,
@@ -111,7 +111,7 @@ def settle_token_for_fixture_path(path: Path) -> str:
     line - so the module token is the one that arrives first, and it is the one
     that means the module is back.
     """
-    if path == PROJECT_SANDBOX_LIB_RS:
+    if path == NATIVE_PROJECT_LIB_RS:
         return RELOAD_PROJECT_TOKEN
     return RELOAD_MODULE_TOKEN
 
@@ -158,8 +158,7 @@ def settle_restored_source(
 
     Returns False when the token never arrived. A suite warns and carries on
     (its assertions are window-based, and the next scenario waits for its own
-    reload anyway), while the benchmark treats it as fatal: the next
-    measurement would otherwise time a host that is still reloading.
+    reload anyway).
     """
     if start_index is None:
         start_index = monitor.line_count

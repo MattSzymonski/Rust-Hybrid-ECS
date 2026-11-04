@@ -80,7 +80,7 @@ pub trait Asset: Send + Sync + 'static {
     /// [`Component::shared_name`](crate::Component::shared_name).
     ///
     /// Every binary that compiles its own copy of the crate defining the type
-    /// - a module and the crates that link it, for example - gets its own
+    /// (a module and the crates that link it, for example) gets its own
     /// `TypeId` for that type. A shared name gives those copies one column
     /// instead of one each; registration also checks that the copies agree on
     /// the type's size and alignment.

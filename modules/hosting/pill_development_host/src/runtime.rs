@@ -238,6 +238,18 @@ pub struct DevHost {
     /// The project's `res` directory, for the asset browser; `None` when the
     /// configuration did not come from a project directory.
     asset_directory: Option<PathBuf>,
+    /// Watches the project's `settings` directory and queues the managers whose
+    /// settings file changed; `None` when no project directory is configured or
+    /// the watch could not start.
+    settings_watcher: Option<crate::settings_watcher::SettingsWatcher>,
+    /// The project's `settings` directory; `None` when the configuration did
+    /// not come from a project directory.
+    settings_directory: Option<PathBuf>,
+    /// The [`Self::editor_revision`] the manager settings were last applied for.
+    ///
+    /// A reload replaces managers, so the files are applied again after one;
+    /// the revision counter is the signal that something loaded or unloaded.
+    manager_settings_editor_revision: u64,
     /// Whether every source asset is kept paired with a `.meta` file; see
     /// [`DevHost::set_ensure_asset_metadata`]. Off unless a frontend asks.
     ensure_asset_metadata: bool,
@@ -730,6 +742,10 @@ pub struct RenderingHost {
     /// what it re-cooks. `None` without a renderer, or when its data crate has
     /// no shaders or the watch could not start.
     shader_watcher: Option<crate::shader_watcher::ShaderWatcher>,
+    /// Watches the project's own shader sources under its asset directory and
+    /// queues what it re-cooks. `None` when the project has no asset
+    /// directory, or when the watch could not start.
+    project_shader_watcher: Option<crate::shader_watcher::ShaderWatcher>,
     /// Set whenever a renderer backend attaches; the next frame then reports
     /// the render data the renderer ignores, once per renderer generation.
     unsupported_data_check_pending: bool,
@@ -935,6 +951,19 @@ impl RenderingHost {
         step
     }
 
+    /// Deliver everything the shader watchers re-cooked since the last frame.
+    ///
+    /// The renderer's data crate and the project each have a tree of their
+    /// own, and their outputs reach the running world by different routes, so
+    /// each half is handled on its own. The result says whether anything was
+    /// delivered, which is one of the things that keeps an idle frame from
+    /// skipping its redraw.
+    fn deliver_shader_changes(&mut self, data_extension: Option<&str>) -> bool {
+        let data_delivered = self.deliver_data_crate_shader_changes(data_extension);
+        let project_delivered = self.deliver_project_shader_changes();
+        data_delivered || project_delivered
+    }
+
     /// Hand every shader the watcher re-cooked to the renderer data crate's
     /// `pill_render_data_shader_changed`, which puts the WGSL into the shader
     /// assets built from it.
@@ -945,7 +974,7 @@ impl RenderingHost {
     /// that replaced it. A data crate without the export (a shipping build,
     /// where this path is compiled out) leaves the edits undelivered and logs
     /// a warning.
-    fn deliver_shader_changes(&mut self, data_extension: Option<&str>) -> bool {
+    fn deliver_data_crate_shader_changes(&mut self, data_extension: Option<&str>) -> bool {
         let Some(watcher) = &self.shader_watcher else {
             return false;
         };
@@ -1000,6 +1029,59 @@ impl RenderingHost {
                 );
             } else {
                 delivered = true;
+            }
+        }
+        delivered
+    }
+
+    /// Reimport every project shader whose cooked text the project watcher
+    /// replaced.
+    ///
+    /// A project's shader asset reads the `.wgsl` cooked beside its `.hlsl`
+    /// source at import time, so the cook alone changes nothing: the asset has
+    /// to be decoded again for the new text to reach its slot and for the
+    /// renderer to rebuild the shader from it. `ImportRegistry::reimport` is
+    /// that decode, and it imports a source nothing has loaded yet.
+    ///
+    /// The registry and the store are read from the world on every delivery,
+    /// so a reloaded renderer data crate's registrations are the ones used.
+    fn deliver_project_shader_changes(&mut self) -> bool {
+        let Some(watcher) = &self.project_shader_watcher else {
+            return false;
+        };
+        let cooked = watcher.drain();
+        if cooked.is_empty() {
+            return false;
+        }
+        let world: &mut pill_engine::World = self.host.runtime.engine_mut().world_mut();
+        // A clone, so the registry can be called against the asset manager,
+        // which is a second resource of the same world.
+        let Some(registry) = world.get_resource::<pill_engine::ImportRegistry>().cloned() else {
+            return false;
+        };
+        let Some(assets) = world.get_resource_mut::<pill_engine::AssetManager>() else {
+            return false;
+        };
+        let mut delivered = false;
+        for shader in cooked {
+            let path = Path::new(&shader.source_relative_path);
+            match registry.reimport(assets, path) {
+                Ok(outcome) => {
+                    delivered = true;
+                    info!(
+                        target: telemetry_target::HOT_RELOAD,
+                        asset = shader.source_relative_path.as_str(),
+                        guid = %guid_text(outcome.guid),
+                        content_version_before = ?outcome.previous_content_version,
+                        content_version = ?outcome.content_version,
+                        "[assets] project shader reimported"
+                    );
+                }
+                Err(error) => warn!(
+                    target: telemetry_target::HOT_RELOAD,
+                    asset = shader.source_relative_path.as_str(),
+                    "[assets] project shader reimport failed; keeping the loaded value: {error}"
+                ),
             }
         }
         delivered
@@ -1213,6 +1295,35 @@ fn assert_unique_owners(subjects: &[(&str, SystemOwner)]) {
     }
 }
 
+/// Cook every stale shader source under the project's asset directory, beside
+/// itself, and log what it did.
+///
+/// The project's shaders follow the cooker's conventions: a source is a stage
+/// by its file name, and a directory named `include` holds the headers it can
+/// `#include`. The output goes next to the source, which is where the shader
+/// import reads it from.
+///
+/// A failed cook is logged and otherwise ignored. The outputs cooked before
+/// the failure stay on disk, and so do the ones from an earlier run, which is
+/// what the shaders already built draw.
+fn cook_project_shader_sources(asset_directory: &Path) {
+    let cook_started_at = Instant::now();
+    match pill_assets::cook_shader_tree(asset_directory) {
+        Ok(report) => info!(
+            target: telemetry_target::HOT_RELOAD,
+            directory = %asset_directory.display(),
+            rebuilt = report.rebuilt_outputs.len(),
+            cook_ms = cook_started_at.elapsed().as_millis() as u64,
+            "[assets] cooked the project's shader sources"
+        ),
+        Err(error) => warn!(
+            target: telemetry_target::HOT_RELOAD,
+            directory = %asset_directory.display(),
+            "[assets] the project's shader sources were not cooked; the cooked files on disk stay as they are: {error}"
+        ),
+    }
+}
+
 /// Import every known source under `asset_directory` through the world's
 /// import registry, writing missing metadata files, and log what it did.
 ///
@@ -1367,6 +1478,10 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     let workspace_root = crate::config::engine_workspace_root()?;
 
     print_startup_configuration(&workspace_root, &project_module_config);
+    // Which watchers this run may start, read once: a hard case to debug when
+    // it is silent, so every start says it out loud.
+    let switches = crate::switches::HostSwitches::from_environment();
+    switches.log();
 
     // Delete what an earlier run staged, whichever backend this is.
     //
@@ -1555,6 +1670,13 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
             all_mirror_methods.extend(crate::csharp::accessor_rows(&accessors));
         }
     }
+    // The project's shaders have no build script of their own to cook them, and
+    // the shader importer reads the cooked file rather than the source. Cook
+    // them before the project module initializes, which is when the project
+    // imports the shaders it names.
+    if let Some(asset_directory) = &host_config.asset_directory {
+        cook_project_shader_sources(asset_directory);
+    }
     let loaded_project = match LoadedProject::start(
         runtime.engine_mut(),
         &engine_api,
@@ -1639,6 +1761,13 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     if let Some(directory) = &host_config.asset_directory {
         pill_engine::asset_store::mount_directory(directory.clone());
     }
+    // The project's managers take their settings now: every manager exists by
+    // this point, because the project's `init` is the last artifact to
+    // register one. A project without `settings/` gets one file per manager,
+    // written from the manager's own defaults.
+    if let Some(directory) = &host_config.settings_directory {
+        crate::manager_settings::apply_all(runtime.engine_mut().world_mut(), directory);
+    }
     let host = DevHost {
         workspace_root,
         project_module_config,
@@ -1665,6 +1794,9 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         loaded_patches: Vec::new(),
         asset_watcher: start_asset_watcher(host_config.asset_directory.as_deref()),
         asset_directory: host_config.asset_directory.clone(),
+        settings_watcher: start_settings_watcher(host_config.settings_directory.as_deref()),
+        settings_directory: host_config.settings_directory.clone(),
+        manager_settings_editor_revision: 0,
         ensure_asset_metadata: false,
         editor_revision: 0,
     };
@@ -1823,6 +1955,33 @@ fn start_shader_watcher(host: &DevHost) -> Option<crate::shader_watcher::ShaderW
 #[cfg(feature = "rendering")]
 type RendererModule = crate::renderer_module::RendererModule;
 
+/// Start watching the project's own shader sources.
+///
+/// A project has no build script to cook its shaders, so the watcher that
+/// keeps the renderer data crate's tree current keeps the project's too. The
+/// tree is the project's asset directory, the same root the asset watcher
+/// watches and the same conventions the cooker applies to a crate's
+/// `shader_sources/`.
+///
+/// A watch that cannot start is reported and leaves the host running the
+/// shaders it already loaded.
+#[cfg(feature = "rendering")]
+fn start_project_shader_watcher(host: &DevHost) -> Option<crate::shader_watcher::ShaderWatcher> {
+    let shaders_directory = host.asset_directory()?.to_owned();
+    let tree_label = host.project_module_config.name.clone();
+    match crate::shader_watcher::ShaderWatcher::spawn(&tree_label, shaders_directory) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                module = tree_label.as_str(),
+                "project shader reload is off: the shader watcher could not start: {error}"
+            );
+            None
+        }
+    }
+}
+
 /// Load the renderer module and attach it to `window`.
 ///
 /// The module registers under the engine's reserved renderer owner. Its
@@ -1933,6 +2092,7 @@ where
     let (renderer_module, attached_renderer) =
         attach_renderer_module(&mut host, window, width, height)?;
     let shader_watcher = start_shader_watcher(&host);
+    let project_shader_watcher = start_project_shader_watcher(&host);
     Ok(RenderingHost {
         host,
         attached_renderer,
@@ -1941,6 +2101,7 @@ where
         scene_quiet: false,
         scene_drawn_last_frame: true,
         shader_watcher,
+        project_shader_watcher,
         unsupported_data_check_pending: true,
     })
 }
@@ -3101,6 +3262,9 @@ pub(crate) fn run_reload_phase(host: &mut DevHost) -> Vec<String> {
     // Step 8: Apply asset edits, after every reload of this boundary, so they
     // go through the registrations current now.
     apply_asset_changes(host);
+    // Step 9: The same for manager settings, and for a reload that replaced a
+    // manager under a document the project already had.
+    apply_manager_settings_changes(host);
     reloaded_extensions
 }
 
@@ -3144,6 +3308,71 @@ fn start_asset_watcher(
 /// (a path registered under a name alone, with no metadata file).
 fn guid_text(guid: Option<AssetGuid>) -> String {
     guid.map_or_else(|| "none".to_owned(), |guid| guid.to_string())
+}
+
+/// Start watching the project's settings directory for manager settings edits.
+///
+/// The directory is created when it does not exist yet: a project that has no
+/// manager settings today may gain one, and a watch that never started cannot
+/// be started later without this path running again.
+fn start_settings_watcher(
+    settings_directory: Option<&Path>,
+) -> Option<crate::settings_watcher::SettingsWatcher> {
+    let settings_directory = settings_directory?;
+    if !settings_directory.is_dir() {
+        if let Err(error) = std::fs::create_dir_all(settings_directory) {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                directory = %settings_directory.display(),
+                error = %error,
+                "[settings] could not create the project's settings directory; edits to manager settings will not be applied"
+            );
+            return None;
+        }
+    }
+    match crate::settings_watcher::SettingsWatcher::spawn(settings_directory.to_owned()) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                directory = %settings_directory.display(),
+                error = %error,
+                "[settings] could not watch the project's manager settings; edits will not be applied"
+            );
+            None
+        }
+    }
+}
+
+/// Re-apply the manager settings whose files changed, and every file after a
+/// reload.
+///
+/// A reload replaces managers, so the documents the project already had are
+/// applied again - a manager that was rebuilt has to take them once more. The
+/// editor revision is what says a reload happened; nothing here needs to know
+/// which artifact it replaced.
+fn apply_manager_settings_changes(host: &mut DevHost) {
+    let Some(settings_directory) = host.settings_directory.clone() else {
+        return;
+    };
+    if host.manager_settings_editor_revision != host.editor_revision {
+        host.manager_settings_editor_revision = host.editor_revision;
+        crate::manager_settings::apply_all(
+            host.runtime.engine_mut().world_mut(),
+            &settings_directory,
+        );
+    }
+    let Some(settings_watcher) = &host.settings_watcher else {
+        return;
+    };
+    let changed_managers = settings_watcher.drain();
+    for settings_name in changed_managers {
+        crate::manager_settings::apply_named(
+            host.runtime.engine_mut().world_mut(),
+            &settings_directory,
+            &settings_name,
+        );
+    }
 }
 
 /// Import or reimport every asset the watcher reported, through the world's

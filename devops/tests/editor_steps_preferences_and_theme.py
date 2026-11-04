@@ -448,8 +448,6 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
 
     state.applied_before = applied_before
     state.begin = begin
-    state.dump = dump
-    state.match = match
 
 
 def _area_entry(context: "StepContext") -> None:

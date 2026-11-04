@@ -1,0 +1,5 @@
+# Fixture manager settings.
+# Every key the manager reads, with the value it takes when untouched.
+enabled: true
+gain: 1.0
+label: fixture

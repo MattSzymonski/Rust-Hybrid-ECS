@@ -48,8 +48,6 @@ from editor_step_support import (
 
 def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     """The steps through: three scene views hold three independent cameras."""
-    expected = state.expected
-    item = state.item
     session = state.session
 
     write_theme_file(
@@ -452,12 +450,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     print_ok("three scene views hold three independent cameras")
 
     state.begin = begin
-    state.expected = expected
     state.font_generation = font_generation
-    state.item = item
-    state.picks = picks
-    state.step_begin = step_begin
-    state.viewport = viewport
 
 
 def _area_entry(context: "StepContext") -> None:

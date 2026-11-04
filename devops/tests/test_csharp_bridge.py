@@ -977,7 +977,7 @@ def write_bridge_probe() -> None:
 def launch_host():
     """Launches the standalone host exe with PROJECT_PATH pinned to the C# project."""
     environment = os.environ.copy()
-    environment["PROJECT_PATH"] = CSHARP_PROJECT_PATH
+    environment["PROJECT_PATH"] = MANAGED_PROJECT_PATH
     return launch_process([str(HOST_EXE)], MODULES_ROOT, environment)
 
 
@@ -1039,7 +1039,7 @@ def csharp_runner() -> ScenarioRunner:
 def run_csharp_session() -> bool:
     """Writes the C# project's settings, launches the host, and runs the scenarios."""
     print("\n  [TEST] Launching standalone host with managed...")
-    write_project_settings(CSHARP_PROJECT_ROOT, CSHARP_SETTINGS)
+    write_project_settings(MANAGED_PROJECT_ROOT, CSHARP_SETTINGS)
     write_bridge_probe()
     process, monitor = launch_host()
     session_passed = True
@@ -1183,7 +1183,7 @@ def main() -> None:
     # probe file is not captured here: it does not exist yet, and the scenarios
     # that edit it capture it themselves.
     for path in (
-        project_settings_yaml(CSHARP_PROJECT_ROOT),
+        project_settings_yaml(MANAGED_PROJECT_ROOT),
         MANAGED_PROJECT_COMPONENTS_CS,
         SPLINE_GENERATED_FILE,
         DUMMY_GENERATED_FILE,
@@ -1211,7 +1211,7 @@ def main() -> None:
         # Always restore the developer's files, even on failure.
         BACKUP.restore_all()
         # Restore the C# project's settings file last.
-        csharp_settings_path = project_settings_yaml(CSHARP_PROJECT_ROOT)
+        csharp_settings_path = project_settings_yaml(MANAGED_PROJECT_ROOT)
         if BACKUP.captured(csharp_settings_path):
             BACKUP.restore_one(csharp_settings_path)
         # The probe file belongs to the suite, so it is removed rather than

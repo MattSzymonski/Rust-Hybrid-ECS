@@ -188,7 +188,7 @@ def last_probe_midpoint(output: str) -> Tuple[float, float]:
 
 # This suite measures the plain reload transaction, so it pins the reload-only
 # posture to keep the patch fast path out of the host it drives. `rendering`
-# stays ON because session B drives `devops/tests/projects/project_rs`, which links
+# stays ON because session B drives `devops/tests/projects/native`, which links
 # `pill_master_renderer`: a host without it resolves `pill_core` differently
 # from that project and the project DLL fails to load with "The specified
 # procedure could not be found" (os error 127).
@@ -395,7 +395,7 @@ SESSION_A_SCENARIOS = [
             ScenarioPhase(
                 edits=[
                     (
-                        PROJECT_SANDBOX_LIB_RS,
+                        NATIVE_PROJECT_LIB_RS,
                         [("const THRESHOLD: u64 = 200;", "const THRESHOLD: u64 = 150;")],
                     )
                 ],
@@ -405,13 +405,13 @@ SESSION_A_SCENARIOS = [
                 alive_tokens=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
             )
         ],
-        restore_after=[PROJECT_SANDBOX_LIB_RS],
+        restore_after=[NATIVE_PROJECT_LIB_RS],
     ),
     Scenario(
         name="schema_migration",
         phases=[
             ScenarioPhase(
-                edits=[(PROJECT_SANDBOX_LIB_RS, FRAMECOUNTER_MIGRATION_EDITS)],
+                edits=[(NATIVE_PROJECT_LIB_RS, FRAMECOUNTER_MIGRATION_EDITS)],
                 wait_token=RELOAD_PROJECT_TOKEN,
                 required_tokens=[
                     MIGRATION_START_TOKEN,
@@ -421,13 +421,13 @@ SESSION_A_SCENARIOS = [
                 alive_tokens=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
             )
         ],
-        restore_after=[PROJECT_SANDBOX_LIB_RS],
+        restore_after=[NATIVE_PROJECT_LIB_RS],
     ),
     Scenario(
         name="project_forgotten_type",
         phases=[
             ScenarioPhase(
-                edits=[(PROJECT_SANDBOX_LIB_RS, PROJECT_FORGOTTEN_EDITS)],
+                edits=[(NATIVE_PROJECT_LIB_RS, PROJECT_FORGOTTEN_EDITS)],
                 wait_token=RELOAD_PROJECT_TOKEN,
                 required_tokens=[
                     PROJECT_FORGOTTEN_WARN_TOKEN,
@@ -444,7 +444,7 @@ SESSION_A_SCENARIOS = [
                 # is actually removed.
             )
         ],
-        restore_after=[PROJECT_SANDBOX_LIB_RS],
+        restore_after=[NATIVE_PROJECT_LIB_RS],
     ),
     Scenario(
         name="module_hot_reload",
@@ -866,9 +866,9 @@ def main() -> None:
     # Capture originals for every file the suite may touch, including both
     # sessions' project settings files.
     for path in (
-        project_settings_yaml(FIXTURE_PROJECT_ROOT),
         project_settings_yaml(NATIVE_PROJECT_ROOT),
-        PROJECT_SANDBOX_LIB_RS,
+        project_settings_yaml(NATIVE_PROJECT_ROOT),
+        NATIVE_PROJECT_LIB_RS,
         SPLINE_LIB_RS,
     ):
         BACKUP.capture(path)
@@ -881,11 +881,11 @@ def main() -> None:
 
         results.append(
             (
-                "A ({} + pill_spline)".format(FIXTURE_PROJECT_ROOT.name),
+                "A ({} + pill_spline)".format(NATIVE_PROJECT_ROOT.name),
                 run_session(
                     "A",
-                    FIXTURE_PROJECT_ROOT,
-                    FIXTURE_PROJECT_PATH,
+                    NATIVE_PROJECT_ROOT,
+                    NATIVE_PROJECT_PATH,
                     SESSION_A_SETTINGS,
                     session_a_scenarios,
                 ),
@@ -913,7 +913,7 @@ def main() -> None:
         BACKUP.restore_all(reset_mtime=all_passed)
         # Restore the project settings files last.
         for path in (
-            project_settings_yaml(FIXTURE_PROJECT_ROOT),
+            project_settings_yaml(NATIVE_PROJECT_ROOT),
             project_settings_yaml(NATIVE_PROJECT_ROOT),
         ):
             if BACKUP.captured(path):

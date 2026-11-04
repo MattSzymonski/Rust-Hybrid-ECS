@@ -1,26 +1,28 @@
-//! One spinning cube whose model is an OBJ file and whose material is built in
-//! code: no `.meta`, no scene file, no editor layer.
+//! One spinning cube. Its model is an OBJ file, and its material is built in
+//! code: the project ships no `.meta` file, no scene file and no editor theme.
 //!
 //! # Responsibilities
 //!
-//! - Register the renderer's data and point it at the simple lit pipeline: one
-//!   geometry pass onto the surface, without the PBR chain's post-processing.
+//! - Register the renderer's data and install the simple lit pipeline: one
+//!   geometry pass drawn onto the surface, with none of the PBR chain's
+//!   post-processing.
 //! - Import `res/models/cube.obj` without writing metadata beside it, then
 //!   build the tinted material in memory.
 //! - Spin the cube around all three axes.
 //!
 //! # Design
 //!
-//! The twin of `cube`, which ships the same model *and* a committed `.meta` so
-//! the asset has a stable guid for references and the editor can edit it. This
-//! project imports the model with [`MetadataPolicy::ReadIfPresent`]: the source
-//! decodes under the importer's defaults and its guid lives only in memory, so
-//! the `res` tree stays exactly what the repository ships.
+//! The counterpart of the `cube` example. That project ships the same model
+//! with a committed `.meta`, which gives the asset a stable guid for references
+//! and lets the editor edit it. This project imports the model with
+//! [`MetadataPolicy::ReadIfPresent`]. The model decodes with the importer's
+//! default settings, its guid exists only in memory, and no run adds a file to
+//! the `res` tree.
 //!
-//! Setup is idempotent - the asset store hands back an already-loaded path, and
-//! entities are looked up before they are created - so a hot reload re-running
-//! `init` finds the live scene instead of failing on names that are already
-//! taken.
+//! Setup is idempotent, so a hot reload that runs `init` again finds the live
+//! scene. The asset store returns the handle of a path that is already loaded,
+//! and the entities are looked up before they are created, so nothing is stored
+//! twice or fails on a name that is already taken.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -35,93 +37,108 @@ use pill_master_renderer_data::{
     RenderingManager, Shader, TransformComponent,
 };
 
-/// The cube's model, relative to `res`. Deliberately no `cube.obj.meta` beside
-/// it: the import below must not create one.
+/// The cube's model, relative to `res`. There is no `cube.obj.meta` beside
+/// it, and the import must not create one.
 const CUBE_MESH: &str = "models/cube.obj";
 
-/// The material's name, also what makes setup idempotent.
+/// The material's name in the asset store. Looking it up by name is what makes
+/// a reload reuse the live material instead of adding a second one.
 const CUBE_MATERIAL: &str = "cube.material";
 
-/// The original example's tint.
+/// The cube's surface tint, the same colour as the `cube` example's material.
 const CUBE_TINT: [f32; 3] = [0.80, 0.80, 0.82];
 
-/// Where the camera stands: on +Z, looking down -Z at the cube.
+/// The camera's position: on the +Z axis, looking down -Z at the cube.
 const CAMERA_TRANSLATION: [f32; 3] = [0.0, 0.0, 5.0];
 
-/// Spin speed around X, Y and Z, in radians per second, as in the original.
+/// Spin speed around X, Y and Z, in radians per second.
 const SPIN_RADIANS_PER_SECOND: [f32; 3] = [2.0, 3.5, 1.0];
 
-/// Registers the renderer, imports the model and builds the spin system.
+/// Registers the renderer's data, creates the camera and the cube, and
+/// registers the system that spins the cube.
 #[pill_project]
 pub fn init(engine: &mut Engine) -> u32 {
+    // Step 1: Register the renderer's data and point the asset loader at the
+    // project's `res`. The model is read from there and nothing is written
+    // back.
     pill_master_renderer_data::register(engine);
-    // The model is read through the project's `res`; nothing is written back
-    // into it.
     AssetLoader::set_root(res_directory());
 
+    // Step 2: Build the mesh and the material.
     let (mesh, material) = match create_assets(engine.world_mut()) {
-        Ok(assets) => assets,
+        Ok(mesh_and_material) => mesh_and_material,
         Err(error) => {
             pill_engine::tracing::error!("asset setup failed: {error}");
             return 1;
         }
     };
+
+    // Step 3: Create the camera and the cube.
     if let Err(error) = create_scene(engine.world_mut(), &mesh, &material) {
         pill_engine::tracing::error!("scene creation failed: {error}");
         return 1;
     }
 
+    // Step 4: Register the system that spins the cube.
     engine.register_system("rotate_cubes", rotate_cubes_system);
     0
 }
 
-/// This project's `res` directory.
+/// Returns this project's `res` directory.
 ///
-/// `file!()` names this source relative to the manifest in an ordinary build,
-/// and as an absolute path when the dev host compiles the project through its
-/// generated workspace member, whose own manifest lives elsewhere. Joining it
-/// onto `CARGO_MANIFEST_DIR` gives this file's real location either way.
+/// `file!()` gives this source's path relative to the project manifest in an
+/// ordinary build, and an absolute path when the dev host builds the project
+/// through its generated workspace member, whose manifest lives elsewhere.
+/// Joining it onto `CARGO_MANIFEST_DIR` names the real file either way; the
+/// two parent folders are the project root, and `res` lives there.
 fn res_directory() -> PathBuf {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
-    source
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
+    source_path
         .parent()
         .and_then(Path::parent)
         .expect("this file lives in the project's `src`")
         .join("res")
 }
 
-/// Installs the simple pipeline, makes it the frame, imports the model file and
-/// adds the material (or finds it, after a reload).
+/// Installs the simple pipeline, imports the model, finds or adds the
+/// material, and sets the pipeline the renderer runs.
 ///
 /// # Errors
 ///
-/// Returns an error when a resource the renderer data registers is missing, when
-/// the pipeline fails to install, or when the model does not decode.
+/// Returns an error when:
+///
+/// - the `AssetManager` or `RenderingManager` resource is missing;
+/// - the pipeline cannot be installed, or its shader is missing after the
+///   install;
+/// - the model file does not import;
+/// - the material cannot be stored under its name.
 fn create_assets(
     world: &mut World,
 ) -> Result<(Handle<Mesh>, Handle<Material>), Box<dyn std::error::Error>> {
-    let assets = world
+    // Step 1: Install the simple pipeline and find the shader it installed.
+    let asset_manager = world
         .get_resource_mut::<AssetManager>()
         .ok_or("the engine AssetManager resource is missing")?;
 
-    let pipeline = simple_pipeline::install(assets)?;
-    let shader = assets
+    let pipeline = simple_pipeline::install(asset_manager)?;
+    let shader = asset_manager
         .handle_by_name::<Shader>(simple_pipeline::SHADER_PATH)
         .ok_or("the simple pipeline installed without its shader")?;
 
-    // `ReadIfPresent` is the point of this project: the source decodes under
-    // the importer's defaults, the guid stays in memory, and no `.meta` is
-    // written beside the file. An already-loaded path hands back its handle, so
-    // a reload imports nothing twice.
-    let mesh = assets
+    // Step 2: Import the mesh, then find the material or add it. `ReadIfPresent`
+    // is the point of this project: the model decodes with the importer's
+    // default settings, its guid stays in memory, and no `.meta` file appears
+    // beside it. Importing a path that is already loaded returns the existing
+    // handle, so a reload imports nothing twice.
+    let mesh = asset_manager
         .import(AssetImport::<Mesh>::new(
             CUBE_MESH,
             MetadataPolicy::ReadIfPresent,
         ))?
         .handle;
-    let material = match assets.handle_by_name::<Material>(CUBE_MATERIAL) {
+    let material = match asset_manager.handle_by_name::<Material>(CUBE_MATERIAL) {
         Some(material) => material,
-        None => assets.add_named(
+        None => asset_manager.add_named(
             CUBE_MATERIAL,
             Material::builder(CUBE_MATERIAL)
                 .shader(&shader)
@@ -130,6 +147,7 @@ fn create_assets(
         )?,
     };
 
+    // Step 3: Make the simple pipeline the one the renderer runs.
     world
         .get_resource_mut::<RenderingManager>()
         .ok_or("the RenderingManager resource is missing")?
@@ -147,6 +165,7 @@ fn create_scene(
     mesh: &Handle<Mesh>,
     material: &Handle<Material>,
 ) -> Result<(), String> {
+    // Step 1: Add the camera unless the world already has one.
     if Query::<&CameraComponent>::new(world)
         .iter_mut()
         .next()
@@ -163,6 +182,7 @@ fn create_scene(
             .map_err(|error| error.to_string())?;
     }
 
+    // Step 2: Add the cube unless the world already draws something.
     if Query::<&MeshRendererComponent>::new(world)
         .iter_mut()
         .next()
@@ -183,8 +203,8 @@ fn create_scene(
     Ok(())
 }
 
-/// Spins every drawn entity around X, Y and Z, scaled by the frame's delta so
-/// the speed does not depend on the frame rate.
+/// Spins every drawn entity around the X, Y and Z axes. Each step is scaled by
+/// the frame's delta time, so the spin speed does not depend on the frame rate.
 fn rotate_cubes_system(
     time: Res<Time>,
     mut cubes: Query<(&mut TransformComponent, &MeshRendererComponent)>,
@@ -192,14 +212,19 @@ fn rotate_cubes_system(
     let Some(time) = time.get() else {
         return Ok(());
     };
-    let delta = time.delta_seconds();
+    let delta_seconds = time.delta_seconds();
     let [x, y, z] = SPIN_RADIANS_PER_SECOND;
-    let step = glam::Quat::from_euler(glam::EulerRot::XYZ, x * delta, y * delta, z * delta);
+    let rotation_step = glam::Quat::from_euler(
+        glam::EulerRot::XYZ,
+        x * delta_seconds,
+        y * delta_seconds,
+        z * delta_seconds,
+    );
     for (mut transform, _) in cubes.iter_mut() {
-        let current = glam::Quat::from_array(pill_engine::common_components::rotation_or_identity(
-            transform.rotation,
-        ));
-        transform.rotation = (step * current).normalize().to_array();
+        let current_rotation = glam::Quat::from_array(
+            pill_engine::common_components::rotation_or_identity(transform.rotation),
+        );
+        transform.rotation = (rotation_step * current_rotation).normalize().to_array();
     }
     Ok(())
 }
@@ -224,19 +249,19 @@ mod tests {
         assert_eq!((cubes, cameras), (1, 1));
     }
 
-    /// The import must read the shipped defaults and write nothing: a `.meta`
-    /// appearing here would mean the project grew a file the repository does
-    /// not carry.
+    /// The import must read the shipped defaults and write nothing. A `.meta`
+    /// file appearing here would mean a run added a file the repository does
+    /// not ship.
     #[test]
     fn the_model_imports_without_writing_metadata() {
         let mut engine = Engine::new();
         assert_eq!(init(&mut engine), 0);
 
-        let metadata = res_directory().join("models").join("cube.obj.meta");
+        let metadata_path = res_directory().join("models").join("cube.obj.meta");
         assert!(
-            !metadata.exists(),
+            !metadata_path.exists(),
             "the no-editor project wrote {}",
-            metadata.display()
+            metadata_path.display()
         );
     }
 }

@@ -1,5 +1,5 @@
-//! Two hundred thousand pills drifting through a curl noise field, watched
-//! through a free flying camera, with an in-game tuning overlay.
+//! Two hundred thousand pills drift through a curl noise field. A free flying
+//! camera watches them, and an in-game overlay tunes the field live.
 //!
 //! # Responsibilities
 //!
@@ -8,24 +8,27 @@
 //!
 //! # Design
 //!
-//! The pills are the whole scene: no level geometry and no sky. What the
-//! project ships is one model, one map, one material, one font and a theme
-//! override, so the loader is the four imports in [`load_assets`] rather than a
-//! module of its own.
+//! The pills are the whole scene: there is no level geometry and no sky. The
+//! project ships one model, one map, one material, one font and a theme
+//! override, so the loading code is a few calls in [`load_assets`] and in
+//! `init`, not a module of its own.
 //!
-//! Every other file holds a `#[pill_hot]` system, and a generated fast patch
-//! replays such a file's top-level imports into a synthetic crate that links
-//! this rlib. Those files must not name `crate::`, so the components and the
-//! resource they share are re-exported below and reached as `pills_rust::...`.
-//! A patch carries the function's body only, so a system that calls its own
-//! file's helpers - the field's maths, the scene's scatter - still falls back to
-//! a reload, which the host reports and applies; the overlay calls nothing of
-//! its own and patches in place.
+//! Every other file holds at least one `#[pill_hot]` system. The generated
+//! fast patch builds a small crate from the edited file. It copies the file's
+//! top-level imports and links this library. Those files therefore must not
+//! name `crate::`: the components and the resource they share are re-exported
+//! below and reached as `pills_rust::...`.
+//!
+//! A patch carries only the function's body. A system that calls a helper in
+//! its own file, like the field's maths, cannot be patched that way and falls
+//! back to a reload; the host reports it and reloads the project. The overlay
+//! calls no helper of its own, so its edits patch in place.
 //!
 //! `init` runs again on every hot reload, on the same world. Every step it
-//! takes is idempotent: imports hand back the assets already loaded, the scene
-//! is only built into a world that does not hold it yet, and the tuning
-//! resource is only inserted when no earlier generation left one behind.
+//! takes can run twice without changing anything: imports hand back the assets
+//! that are already loaded, the scene is only built into a world that does not
+//! hold it yet, and the tuning resource is only inserted when an earlier
+//! generation did not leave one behind.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -38,8 +41,8 @@ use pill_master_renderer_data::{
     config::pbr_pipeline, Material, Mesh, Texture, TextureImportSettings, TextureType,
 };
 
-// The crate's own name, so the hot files can name its items as
-// `pills_rust::...` in the patch crate too, where `crate::` has no meaning.
+// The crate's own name, so a hot file can say `pills_rust::...` in its patch
+// crate too, where `crate::` means nothing.
 extern crate self as pills_rust;
 
 mod camera;
@@ -47,14 +50,16 @@ mod curl_noise_system;
 mod game;
 mod overlay;
 
-// The items the hot files name, reachable in their generated patches through
+// The items the hot files name, so their patches can reach them through
 // `pills_rust::...`.
 pub use game::{CameraMovementComponent, CurlNoiseComponent, DemoState, PILL_COUNT};
 
-/// Registers everything the demo uses, loads its assets and builds the scene.
+/// Registers what the demo uses, loads its assets, installs the UI theme and
+/// builds the scene.
 #[pill_project]
 pub fn init(engine: &mut Engine) -> u32 {
-    // Installs the renderer's PBR chain, whose shader the material names.
+    // Registers the renderer's data and installs its PBR chain, which is where
+    // the pill material's shader comes from.
     pill_master_renderer_data::register(engine);
     game::register(engine.world_mut());
 
@@ -70,15 +75,17 @@ pub fn init(engine: &mut Engine) -> u32 {
         return 1;
     }
 
-    // The overlay's egui context: installed once and kept across a project
-    // reload, so the reloaded overlay finds the same fonts and widget state.
-    // `install_with_theme` claims both resource types every generation - the
-    // reload releases exactly what the new generation does not re-register -
-    // and inserts the values only when no earlier generation left them behind.
-    // The frame slot it installs is also what tells the renderer that this
-    // world's UI is the game's. The code default is the brutalist recipe; the
-    // `.theme` file changes only the accent and the heading size, and the code
-    // default names the body font the project ships.
+    // The overlay draws its egui UI through this context. It is installed once
+    // and kept across a project reload, so the reloaded overlay finds the same
+    // fonts and widget state. On every generation `install_with_theme`
+    // registers both resource types, so a reload releases only what the new
+    // generation does not register again, and it inserts a value only when an
+    // earlier generation left none.
+    //
+    // The frame slot is what tells the renderer that this world's UI is the
+    // game's. The base theme is `Theme::brutalist`, with the body font the
+    // project ships; `ui/accent.theme` changes only the accent and the heading
+    // size.
     let mut theme = pill_project_ui::Theme::brutalist();
     theme.fonts.body = Some("fonts/Silkscreen-Regular.ttf".to_string());
     pill_project_ui::install_with_theme(
@@ -94,16 +101,17 @@ pub fn init(engine: &mut Engine) -> u32 {
     0
 }
 
-/// Imports the pill mesh, the map its material binds and the material itself.
+/// Loads the pill mesh, the map the material binds and the material itself.
 ///
-/// The material names its map by guid, so the map loads first; the shader it
-/// names comes from the PBR chain, so that installs first too. Every import is
-/// idempotent, so a reload gets the assets already loaded.
+/// The order matters. The material names its map by guid, so the map loads
+/// first, and it names a shader that comes from the PBR chain, so the chain
+/// installs first too. Every import can run again without harm, so a reload
+/// gets the assets that are already loaded.
 ///
 /// # Errors
 ///
-/// Returns an error when the asset manager is missing, when a file or its
-/// metadata fails to load, or when the chain does not install.
+/// Returns an error when the world has no asset manager, when a file or its
+/// metadata fails to load, or when the PBR chain does not install.
 fn load_assets(
     world: &mut World,
 ) -> Result<(Handle<Mesh>, Handle<Material>), Box<dyn std::error::Error>> {
@@ -133,13 +141,15 @@ fn load_assets(
 
 /// This project's `res` directory.
 ///
-/// `file!()` names this source relative to the manifest in an ordinary build,
-/// and as an absolute path when the dev host compiles the project through its
-/// generated workspace member, whose own manifest lives elsewhere. Joining it
-/// onto `CARGO_MANIFEST_DIR` gives this file's real location either way.
+/// In an ordinary build, `file!()` gives this source's path relative to the
+/// project's manifest. The dev host compiles the project through a generated
+/// workspace member that has its own manifest elsewhere, and there `file!()`
+/// gives an absolute path instead. Joining the path onto `CARGO_MANIFEST_DIR`
+/// completes a relative path and leaves an absolute one alone, so both builds
+/// find this file.
 fn res_directory() -> PathBuf {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
-    source
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
+    source_path
         .parent()
         .and_then(Path::parent)
         .expect("this file lives in the project's `src`")
@@ -152,15 +162,15 @@ mod tests {
     use pill_engine::Query;
     use pill_master_renderer_data::{CameraComponent, MeshRendererComponent};
 
-    /// Counts the entities that draw a mesh, and the cameras.
-    fn scene_counts(engine: &mut Engine) -> (usize, usize) {
-        let drawn = Query::<&MeshRendererComponent>::new(engine.world_mut())
+    /// Returns how many entities draw a mesh and how many cameras there are.
+    fn mesh_entity_and_camera_counts(engine: &mut Engine) -> (usize, usize) {
+        let mesh_entity_count = Query::<&MeshRendererComponent>::new(engine.world_mut())
             .iter_mut()
             .count();
-        let cameras = Query::<&CameraComponent>::new(engine.world_mut())
+        let camera_count = Query::<&CameraComponent>::new(engine.world_mut())
             .iter_mut()
             .count();
-        (drawn, cameras)
+        (mesh_entity_count, camera_count)
     }
 
     /// The scene is every pill, seen by one camera.
@@ -170,7 +180,7 @@ mod tests {
 
         assert_eq!(init(&mut engine), 0);
 
-        assert_eq!(scene_counts(&mut engine), (PILL_COUNT, 1));
+        assert_eq!(mesh_entity_and_camera_counts(&mut engine), (PILL_COUNT, 1));
     }
 
     /// A hot reload runs `init` again; it must not build a second scene.
@@ -181,6 +191,6 @@ mod tests {
 
         assert_eq!(init(&mut engine), 0);
 
-        assert_eq!(scene_counts(&mut engine), (PILL_COUNT, 1));
+        assert_eq!(mesh_entity_and_camera_counts(&mut engine), (PILL_COUNT, 1));
     }
 }

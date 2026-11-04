@@ -483,7 +483,12 @@ impl RenderingResourcesManager {
                 continue;
             }
             self.changed_asset_keys.insert(key);
-            if let Some(old_handle) = self.shaders.remove(key) {
+            // An object already in the cache makes this a rebuild rather than
+            // the asset's first compile, which is what the log line below
+            // reports.
+            let previous_handle = self.shaders.remove(key);
+            let shader_recompiled = previous_handle.is_some();
+            if let Some(old_handle) = previous_handle {
                 state.renderer_resource_storage.shaders.remove(old_handle);
             }
             let compiled_shader = RendererShader::new(
@@ -516,6 +521,14 @@ impl RenderingResourcesManager {
                         .shaders
                         .insert(shader_object);
                     self.shaders.insert(key, gpu_handle, version);
+                    if shader_recompiled {
+                        pill_core::info!(
+                            target: pill_core::telemetry::telemetry_target::RENDERING,
+                            shader = shader.name.as_str(),
+                            version,
+                            "shader recompiled"
+                        );
+                    }
                     epoch_moved = true;
                 }
                 Err(error) => pill_core::warn!(

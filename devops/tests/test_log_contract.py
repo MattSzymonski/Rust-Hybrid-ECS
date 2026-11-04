@@ -30,9 +30,12 @@ DESCRIPTION
     detected".
 
     This test closes that gap statically. It collects every `*_TOKEN` literal
-    the suites define and requires each one to be printable by a Rust string
-    literal: verbatim, or through the `{...}` placeholders a format string
-    carries, since most host lines are built at runtime:
+    the suites define, plus every module-level string constant a
+    `wait_for(...)` call passes whatever its name, and requires each one to be
+    printable by a Rust string literal - in `modules/` or in the tracked
+    fixture projects, which the host also runs: verbatim, or through the
+    `{...}` placeholders a format string carries, since most host lines are
+    built at runtime:
 
         "[analytics] reload pill_spline "  <-  "{} reload {} {} | build={} ..."
 
@@ -67,7 +70,7 @@ import sys
 import tokenize
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, NamedTuple, Optional, Set, Tuple
 
 # Standalone-runnable: put `devops/` on `sys.path` before reaching `core`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -82,11 +85,19 @@ from core.suite_common import run_suite_with_timing  # noqa: E402
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 # Directories whose Python modules declare host-output tokens.
-TOKEN_SOURCE_DIRECTORIES = ("devops/tests", "devops/core", "devops/benchmarks")
+TOKEN_SOURCE_DIRECTORIES = ("devops/tests", "devops/core")
 
 # Matches `SOME_TOKEN = "literal"` at module level, capturing name and literal.
 TOKEN_DEFINITION_RE = re.compile(
     r"^([A-Z][A-Z0-9_]*TOKEN[A-Z0-9_]*)\s*=\s*(\"|')(?P<literal>.*?)\2\s*$",
+    re.MULTILINE,
+)
+
+# Any other module-level uppercase string constant. A constant with no TOKEN in
+# its name still joins the contract when a `wait_for(...)` call passes it: the
+# call site, not the spelling, is what makes the text an interface.
+STRING_ASSIGNMENT_RE = re.compile(
+    r"^([A-Z][A-Z0-9_]*)\s*=\s*(\"|')(?P<literal>[^\"'\n]*)\2\s*$",
     re.MULTILINE,
 )
 
@@ -128,14 +139,7 @@ STRING_ESCAPES: Dict[str, str] = {
 # the coincidence is stated rather than read as coverage.
 EXTERNALLY_PRODUCED: Dict[str, str] = {
     "STATUS_ACCESS_VIOLATION": "Windows prints this exit status, not the host.",
-    "panicked at": "Emitted by the Rust panic runtime, not by our code.",
-    "counter tick": "Printed by the example project in devops/tests/projects/project_rs.",
-    "[project]": "Printed by the example project in devops/tests/projects/project_rs, which "
-    "is outside the `modules/` tree this test scans.",
     "warning CS": "Emitted by the C# compiler.",
-    "[csharp_bench] done":
-        "Printed by the C# benchmark scene in devops/tests/projects/managed, "
-        "whose source is C# rather than Rust.",
     "[csharp_runtime] reloaded managed.dll":
         "Emitted by the .NET bridge, whose source is C# rather than Rust.",
     "'native::FrameCounter' -> migrating":
@@ -168,6 +172,10 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
         "Printed by the C# BridgeProbe fixture test_csharp_bridge.py injects "
         "into devops/tests/projects/managed during the run: the values are the "
         "ones C# reads out of the module's column.",
+    "omo=(12,34) sum=47 a=1212 b=1234 alpha=1":
+        "Printed by the C# BridgeProbe fixture test_csharp_bridge.py injects "
+        "into devops/tests/projects/managed during the run, with the extra "
+        "field the wider probe line carries.",
     "cs spline bridge: sees 2 spline(s)":
         "Printed by the C# BridgeProbe fixture test_csharp_bridge.py injects "
         "into devops/tests/projects/managed during the run.",
@@ -233,7 +241,53 @@ def collect_declared_tokens() -> Dict[str, List[str]]:
                     continue
                 origin = f"{directory}/{module_path.name}:{match.group(1)}"
                 tokens.setdefault(literal, []).append(origin)
+            waited = waited_constant_names(module_path)
+            for match in STRING_ASSIGNMENT_RE.finditer(text):
+                if "TOKEN" in match.group(1) or match.group(1) not in waited:
+                    continue
+                literal = match.group("literal")
+                if not literal:
+                    continue
+                origin = f"{directory}/{module_path.name}:{match.group(1)}"
+                tokens.setdefault(literal, []).append(origin)
     return tokens
+
+
+def waited_constant_names(module_path: Path) -> Set[str]:
+    """
+    The bare names passed to a `wait_for(...)` call in one module.
+
+    A suite can wait on a host line through a constant whose name does not say
+    TOKEN; the call site is the declaration of intent, so the name is collected
+    whatever it is called. Tokenising keeps a `wait_for(` mentioned in prose
+    from counting.
+    """
+    names: Set[str] = set()
+    tokens = list(
+        tokenize.generate_tokens(
+            io.StringIO(module_path.read_text(encoding="utf-8")).readline
+        )
+    )
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.NAME or token.string != "wait_for":
+            continue
+        if index and tokens[index - 1].string == "def":
+            continue
+        call = tokens[index + 1:]
+        if not call or call[0].string != "(":
+            continue
+        depth = 0
+        for following in call:
+            if following.type == tokenize.OP:
+                if following.string in "([{":
+                    depth += 1
+                elif following.string in ")]}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            elif depth == 1 and following.type == tokenize.NAME:
+                names.add(following.string)
+    return names
 
 
 def iter_inline_wait_lines(module_path: Path) -> Iterator[int]:
@@ -277,8 +331,10 @@ def iter_inline_wait_lines(module_path: Path) -> Iterator[int]:
 
 def read_rust_sources() -> str:
     """
-    Concatenates every first-party Rust source under `modules/` into one haystack.
+    Concatenates every first-party Rust source into one haystack.
 
+    The sources are `modules/` and the tracked fixture projects: a suite may
+    wait on a line the fixture prints, and the fixture is code the host runs.
     Decoding errors are replaced rather than raised so that a stray non-UTF-8
     byte in an unrelated file cannot mask a genuine contract break.
     """
@@ -288,7 +344,7 @@ def read_rust_sources() -> str:
 @lru_cache(maxsize=1)
 def rust_source_files() -> Tuple[Tuple[Path, str], ...]:
     """
-    Every first-party Rust source under `modules/`, with its text, once a run.
+    Every first-party Rust source under `modules/` and the fixture projects.
 
     Only git-tracked files count: the host leaves hot-patch copies under
     `modules/pill_standalone_temp/` and generated `host_module_*` crates in the
@@ -297,7 +353,7 @@ def rust_source_files() -> Tuple[Tuple[Path, str], ...]:
     the bulk of this suite's runtime.
     """
     completed = subprocess.run(
-        ["git", "ls-files", "-z", "--", "modules"],
+        ["git", "ls-files", "-z", "--", "modules", "devops/tests/projects"],
         cwd=str(REPOSITORY_ROOT),
         capture_output=True,
         text=True,
@@ -550,6 +606,21 @@ def is_exempt(token: str) -> bool:
     return token in EXTERNALLY_PRODUCED or token in SHAPE_ONLY_FITS
 
 
+def check_token_source_directories_exist() -> None:
+    """
+    Fails when a directory the contract scans is not in the tree.
+
+    A missing directory contributes no tokens, so without this check a moved
+    tree would silently narrow the contract instead of failing it.
+    """
+    missing = [
+        directory
+        for directory in TOKEN_SOURCE_DIRECTORIES
+        if not (REPOSITORY_ROOT / directory).is_dir()
+    ]
+    assert not missing, "no such token directory: " + ", ".join(missing)
+
+
 def check_every_declared_token_exists_in_rust() -> None:
     """Fails if a suite matches on a string the host no longer prints."""
     missing = []
@@ -683,6 +754,7 @@ def check_migration_banners_are_printed() -> None:
 # =============================================================================
 
 CHECKS: List[Tuple[str, Callable[[], None]]] = [
+    ("token source directories exist", check_token_source_directories_exist),
     ("every declared token exists in Rust", check_every_declared_token_exists_in_rust),
     ("exemptions are still needed", check_exemptions_are_still_needed),
     (

@@ -41,6 +41,21 @@ public partial struct MeshVertex
 
 namespace pill_master_renderer.component {
 
+[StructLayout(LayoutKind.Explicit, Size = 12)]
+public partial struct PipelinePass
+{
+    [FieldOffset(0)] public global::TracyLive.Handle<global::pill_master_renderer_data.RenderPass> Pass;
+    [FieldOffset(8)] public byte Enabled;
+    /// Live ABI bytes of this component row (safe code).
+    public readonly Span<byte> Raw =>
+        MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
+}
+
+
+}
+
+namespace pill_master_renderer.component {
+
 [StructLayout(LayoutKind.Explicit, Size = 20)]
 public partial struct CameraComponent
 {

@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""
+An edited project shader reaches the GPU while the host runs.
+
+PROTECTS: A project's `.hlsl` edit is re-cooked, reimported and rebuilt on the GPU, and a project with no cooked output still loads its shader.
+TIER: host
+
+REQUIREMENTS
+  - Python 3.8+
+  - Rust toolchain (cargo) and a display: the rebuild only happens in a
+    windowed host, which is the host that has a renderer to compile for.
+
+DESCRIPTION
+    A project's shader asset is a fragment source plus its `.hlsl.meta`, and
+    the asset's import reads the `.wgsl` cooked beside the source. Nothing in
+    a project cooks that file: the renderer data crate's build script cooks its
+    own tree only. The development host therefore owes the project two things,
+    and this suite checks both in one windowed run against
+    `devops/tests/projects/native`, whose `init` imports
+    `shaders/reload_probe_fragment.hlsl`:
+
+      1. cook at startup - the suite deletes the committed `.wgsl` before the
+         host starts. The host must log `[assets] cooked the project's shader
+         sources` with one rebuilt output, the project must initialize (its
+         own `[project]` line proves its systems run), and its shader must
+         compile.
+      2. recompile on an edit - the suite writes the edited fragment (`0.75`
+         becomes `0.25`). The host must log `[assets] project shader
+         reimported` naming the source, then `shader recompiled` naming the
+         same asset. The second line is only printed when a shader object is
+         replaced, so it cannot come from the boot compile, and the cooked
+         `.wgsl` on disk must hold the edited value: that is what separates a
+         real re-cook from a reimport of the previous text.
+
+    Both files are restored byte for byte afterwards - the source, and the
+    cooked output the host rewrites from it. The host is terminated on every
+    path.
+
+USAGE
+  python devops/tests/test_shader_recompile.py [--timeout-scale S] [--skip-build]
+
+EXAMPLE USAGE
+  python devops/tests/test_shader_recompile.py
+  python devops/tests/test_shader_recompile.py --skip-build
+
+--- SCRIPT ---
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# Standalone-runnable: `devops/` holds `core`, and the suites sit beside it.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.projects import NATIVE_PROJECT_PATH, NATIVE_PROJECT_ROOT  # noqa: E402
+from core.suite_common import (  # noqa: E402
+    HOST_DEV_RENDERING,
+    MODULES_ROOT,
+    add_common_suite_arguments,
+    ensure_host_lock,
+    host_command,
+    launch_process,
+    prepare_host,
+    run_suite_with_timing,
+    terminate_process,
+)
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+PROJECT_ROOT = NATIVE_PROJECT_ROOT
+SHADER_DIRECTORY = PROJECT_ROOT / "res" / "shaders"
+
+# The asset's own name, which is its path under the project's `res`: both the
+# import and the reimport are keyed by it.
+SHADER_ASSET = "shaders/reload_probe_fragment.hlsl"
+SOURCE_FILE = PROJECT_ROOT / "res" / SHADER_ASSET
+COOKED_FILE = SOURCE_FILE.with_suffix(".wgsl")
+
+# What the suite changes: the constant the fragment multiplies by, and what the
+# cooked WGSL shows instead once the host has re-cooked it.
+ORIGINAL_CONSTANT = "0.75;"
+EDITED_CONSTANT = "0.25;"
+COOKED_ORIGINAL = "0.75f"
+COOKED_EDITED = "0.25f"
+
+# Host log lines this suite asserts on.
+COOKED_TOKEN = "[assets] cooked the project's shader sources"
+REIMPORTED_TOKEN = "[assets] project shader reimported"
+RECOMPILED_TOKEN = "shader recompiled"
+# Printed by the fixture's own system on every frame, so it only appears once
+# the project initialized and the host runs its systems.
+PROJECT_ALIVE_TOKEN = "[project]"
+
+# The host builds the project DLL on its first run; a cold one is slow.
+STARTUP_TIMEOUT_SECONDS = 240
+# A cook and a reimport are milliseconds once the host is up; this is slack.
+RELOAD_TIMEOUT_SECONDS = 90
+
+
+# =============================================================================
+# Free functions
+# =============================================================================
+
+
+def lines_with(text: str, token: str) -> list:
+    """Every line in `text` that carries `token`, oldest first."""
+    return [line for line in text.splitlines() if token in line]
+
+
+def first_line_with(text: str, token: str) -> str:
+    """The first line in `text` that carries `token`, or an empty string."""
+    matches = lines_with(text, token)
+    return matches[0] if matches else ""
+
+
+def check_startup_cook(text: str) -> list:
+    """One `(ok, description)` pair per assertion about the startup cook."""
+    cook_lines = lines_with(text, COOKED_TOKEN)
+    rebuilt_one = [line for line in cook_lines if "rebuilt=1" in line]
+    return [
+        (
+            bool(cook_lines),
+            "the host cooked the project's shader sources at startup",
+        ),
+        (
+            bool(rebuilt_one),
+            "the cook rebuilt the missing cooked output (rebuilt=1)",
+        ),
+        (
+            bool(lines_with(text, PROJECT_ALIVE_TOKEN)),
+            "the project initialized and its systems run",
+        ),
+    ]
+
+
+def check_live_edit(text: str, cooked_text: str) -> list:
+    """One `(ok, description)` pair per assertion about the edited shader."""
+    reimported = first_line_with(text, REIMPORTED_TOKEN)
+    # The rebuild this suite cares about is the one after the reimport. A
+    # source edit can also reimport through the asset watcher first, with the
+    # text the cook has not replaced yet, and that rebuild is not the proof.
+    after_reimport = text.split(reimported, 1)[1] if reimported else ""
+    rebuilt_after = [
+        line for line in lines_with(after_reimport, RECOMPILED_TOKEN) if SHADER_ASSET in line
+    ]
+    return [
+        (
+            SHADER_ASSET in reimported,
+            "the host reimported the edited shader asset",
+        ),
+        (
+            bool(rebuilt_after),
+            "the renderer rebuilt the shader after the reimport",
+        ),
+        (
+            COOKED_EDITED in cooked_text,
+            "the cooked WGSL holds the edited constant ({})".format(COOKED_EDITED),
+        ),
+    ]
+
+
+def report(checks: list) -> int:
+    """Prints every check and returns the number that failed."""
+    failures = 0
+    for ok, description in checks:
+        print("  [{}] {}".format("OK" if ok else "FAIL", description))
+        if not ok:
+            failures += 1
+    return failures
+
+
+def main() -> int:
+    """Runs the windowed host, edits the shader, checks the log and restores."""
+    parser = argparse.ArgumentParser(
+        description="Check that an edited project shader reaches the GPU."
+    )
+    add_common_suite_arguments(parser)
+    arguments = parser.parse_args()
+    scale = arguments.timeout_scale
+
+    print("\n  Project shader recompile suite")
+    print("  Project: {}".format(PROJECT_ROOT))
+
+    # Step 1: Take the bytes of both files, then remove the cooked output so
+    # the host has to cook it at startup. The anchor is read before the write
+    # it guards, and both files are restored in the `finally` below.
+    source_bytes = SOURCE_FILE.read_bytes()
+    cooked_bytes = COOKED_FILE.read_bytes()
+    edited_source = source_bytes.replace(
+        ORIGINAL_CONSTANT.encode("utf-8"), EDITED_CONSTANT.encode("utf-8")
+    )
+    if edited_source == source_bytes:
+        print("  [FAIL] the fragment does not hold {}".format(ORIGINAL_CONSTANT))
+        return 1
+
+    ensure_host_lock()
+    if not prepare_host(HOST_DEV_RENDERING, arguments):
+        return 1
+
+    environment = dict(os.environ, PROJECT_PATH=NATIVE_PROJECT_PATH)
+    process = None
+    monitor = None
+    failures = 0
+    try:
+        COOKED_FILE.unlink()
+        process, monitor = launch_process(
+            host_command(HOST_DEV_RENDERING), MODULES_ROOT, environment
+        )
+        if not monitor.wait_for(COOKED_TOKEN, STARTUP_TIMEOUT_SECONDS * scale):
+            print("  [FAIL] the host logged no startup cook; the last output was:")
+            print(monitor.output_since(0)[-1500:])
+            return 1
+        # The cook runs before the project module builds and initializes, so
+        # the project's own lines only start once its build is done.
+        if not monitor.wait_for(PROJECT_ALIVE_TOKEN, STARTUP_TIMEOUT_SECONDS * scale):
+            print("  [FAIL] the project never started; the last output was:")
+            print(monitor.output_since(0)[-1500:])
+            return 1
+        failures += report(check_startup_cook(monitor.output_since(0)))
+
+        # Step 2: Edit the fragment while the host runs, and wait for the two
+        # lines that carry the edit through the pipeline.
+        SOURCE_FILE.write_bytes(edited_source)
+        if not monitor.wait_for(REIMPORTED_TOKEN, RELOAD_TIMEOUT_SECONDS * scale):
+            print("  [FAIL] the host reimported no project shader; last output was:")
+            print(monitor.output_since(0)[-1500:])
+            return 1
+        monitor.wait_for(RECOMPILED_TOKEN, RELOAD_TIMEOUT_SECONDS * scale)
+        failures += report(
+            check_live_edit(monitor.output_since(0), COOKED_FILE.read_text(encoding="utf-8"))
+        )
+    finally:
+        SOURCE_FILE.write_bytes(source_bytes)
+        COOKED_FILE.write_bytes(cooked_bytes)
+        if process is not None and monitor is not None:
+            print("\n  [CLEANUP] Stopping the windowed host...")
+            terminate_process(process, monitor)
+
+    if failures:
+        print("\n  [FAIL] {} check(s) failed".format(failures))
+        return 1
+    print("\n  [OK] the edited project shader reached the GPU")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run_suite_with_timing(main))
