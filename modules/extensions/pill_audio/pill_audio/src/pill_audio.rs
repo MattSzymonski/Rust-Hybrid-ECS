@@ -126,6 +126,12 @@ pub fn register(engine: &mut Engine) -> u32 {
     // that layout; without it a component is an opaque blob to both.
     audio_listener_component::register(engine.world_mut());
     audio_source_component::register(engine.world_mut());
+    // The playback system reads both positions from the transform, so a module
+    // without one is a module that plays nothing. A renderer's data crate
+    // usually registers it; a headless project loading this module alone has
+    // no renderer, which is why the module does it itself. Registration is
+    // idempotent, so a world that already has it is unaffected.
+    pill_engine::register_transform_component(engine.world_mut());
     // Declare the asset type this module stores. The world's asset store
     // outlives a reload of this DLL, so a column's per-type table has to be
     // re-pointed at the generation still mapped. Registering the type as an

@@ -64,9 +64,11 @@ TEST_PROJECT_NAMES = (
 
 # The official examples, the tracked counterpart of the local checkout above:
 # each group holds one Rust project and one C# project running the same demo,
-# and both are read from disk the same way. ONE ENTRY PER GROUP: a suite that
-# needs a project by role imports its name below, and a new example is an edit
-# here rather than a path spelled inside a suite.
+# and both are read from disk the same way. This is a CURATED set, not the
+# discovery rule: it names the projects a suite can ask for by role, and it
+# deliberately omits groups that are on disk but not built in CI
+# (`pills_awakens`). A new example is discovered by the walk in
+# `example_project_roots`, never by an edit here.
 OFFICIAL_EXAMPLES_ROOT = REPOSITORY_ROOT / "examples"
 OFFICIAL_EXAMPLE_PROJECTS = {
     "cube_rust": OFFICIAL_EXAMPLES_ROOT / "cube" / "cube_rust",
@@ -82,6 +84,37 @@ OFFICIAL_EXAMPLE_PROJECTS = {
 # Every project directory is named by its manifest, so this is the file a
 # discovery walk looks for.
 PROJECT_SETTINGS_FILENAME = "project_settings.yaml"
+
+# Extension examples: an extension ships its own runnable projects under
+# `modules/extensions/<extension>/examples/<name>/`. Nothing lists them - a
+# directory holding a manifest is one - so an extension can add an example
+# without an edit anywhere under `devops/`.
+EXTENSION_EXAMPLES_ROOT = MODULES_ROOT / "extensions"
+
+
+def extension_example_roots(search_root=None) -> list[Path]:
+    """Returns every project an extension ships under its `examples/` folder.
+
+    The rule is the path, not a list:
+    `<search_root>/<extension>/examples/<name>/project_settings.yaml`.
+    `search_root` defaults to [`EXTENSION_EXAMPLES_ROOT`] and exists so a test
+    can point the same rule at a temporary tree.
+
+    An extension with no `examples/` folder contributes nothing, and a
+    directory inside `examples/` without a manifest of its own is skipped
+    rather than guessed at.
+    """
+    root = EXTENSION_EXAMPLES_ROOT if search_root is None else search_root
+    if not root.is_dir():
+        return []
+    roots: list[Path] = []
+    for extension in sorted(root.iterdir()):
+        if not extension.is_dir():
+            continue
+        for example in sorted((extension / "examples").glob("*")):
+            if example.is_dir() and project_settings_yaml(example).is_file():
+                roots.append(example)
+    return roots
 
 
 def host_project_path(project_root: Path) -> str:
@@ -104,11 +137,13 @@ def project_settings_yaml(project_root: Path) -> Path:
 
 
 def example_project_roots() -> list[Path]:
-    """Returns every example project directory, local and official.
+    """Returns every example project directory: local, official and extension.
 
     The local checkout is walked, because its projects are a developer's own
-    and nothing names them here; the official examples come from the catalog
-    above, so a suite and the build sweep agree on what the official set is.
+    and nothing names them here; the official examples come from the curated
+    catalog above, so a suite and the build sweep agree on what the official
+    set is; and the extension examples are walked, so a module that ships one
+    is discovered without an edit here.
 
     The local checkout uses the same two layouts the official examples do: a
     project directory (its `project_settings.yaml`) or a group directory
@@ -131,6 +166,7 @@ def example_project_roots() -> list[Path]:
                 )
             )
     roots.extend(sorted(OFFICIAL_EXAMPLE_PROJECTS.values()))
+    roots.extend(extension_example_roots())
     return roots
 
 

@@ -2,4 +2,3 @@ name: "Native Fixture"
 build_binary_name: "NativeFixture"
 modules:
   - "pill_spline"
-  - "pill_audio"

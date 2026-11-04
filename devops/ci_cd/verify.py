@@ -353,6 +353,15 @@ STEPS: List[Step] = [
         working_directory=REPOSITORY_ROOT,
     ),
     Step(
+        "extension-examples",
+        "Extension examples (every one builds and runs headless)",
+        # Discovery is the same glob the build sweep reads, and an empty
+        # discovery fails: the suite exists so an extension's example cannot
+        # rot, and a rule that finds nothing is the failure it guards.
+        [[PYTHON, "devops/tests/test_extension_examples.py"]],
+        working_directory=REPOSITORY_ROOT,
+    ),
+    Step(
         "wrapper-entry-points",
         "Wrapper entry points (the wrapper exports the full entry-point set)",
         # Builds the fixture extension both ways and compares PE export names.

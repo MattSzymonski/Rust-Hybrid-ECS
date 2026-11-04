@@ -42,6 +42,24 @@ cargo run --package pill_standalone --features rendering
 reports artifact sizes; `--list` names what it found. The suite finds projects
 by convention, so a folder added here is picked up without an edit.
 
+## Extension examples
+
+An extension ships its own examples beside its code:
+`modules/extensions/<extension>/examples/<name>/`, one complete project per
+folder (`project_settings.yaml` listing the extension under `modules:`, a
+`Cargo.toml` or a `.csproj`, `src/`, `res/`).
+
+They are discovered by that path alone - nothing under `devops/` lists them -
+and `devops/tests/test_extension_examples.py` builds every one and runs it
+headless, so an example cannot rot and a new one cannot be forgotten. The suite
+waits for a line carrying the example's folder name in brackets
+(`[audio_scene] ready`), so an example states its own name once and needs no
+entry anywhere else.
+
+The difference from the folders above is curation: these are the `examples/`
+projects chosen to be built in CI, while an extension example exists for the
+module that ships it and is always run.
+
 ## `examples/local`
 
 `examples/local/` is a developer checkout, not repository content: the whole

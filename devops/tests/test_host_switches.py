@@ -200,6 +200,13 @@ def scenario_defaults(arguments) -> list:
     try:
         if not wait_until_running(monitor, arguments.timeout_scale):
             return [(False, "the host started with no switches set")]
+        # The asset and settings watchers start after the project loop is
+        # entered, one or two lines after the liveness token the wait above
+        # returns on. Wait for the watcher rather than snapshot in the window
+        # between them: how much a fixture prints while starting up decides
+        # whether that snapshot happens to be wide enough, which is not a
+        # property this check should depend on.
+        monitor.wait_for(ASSET_WATCH_TOKEN, STARTUP_TIMEOUT_SECONDS * arguments.timeout_scale)
         text = monitor.output_since(0)
         switch_line = first_line_with(text, SWITCHES_TOKEN)
         return [

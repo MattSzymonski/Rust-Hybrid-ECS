@@ -1204,6 +1204,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
+name = "host_module_pill_audio"
+version = "0.1.0"
+dependencies = [
+ "pill_audio",
+ "pill_engine",
+]
+
+[[package]]
 name = "host_module_pill_master_renderer"
 version = "0.1.0"
 dependencies = [
@@ -1220,16 +1228,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "host_project_native"
+name = "host_project_audio_scene"
 version = "0.1.0"
 dependencies = [
  "pill_audio",
- "pill_core",
  "pill_engine",
- "pill_master_renderer_data",
- "pill_spline",
- "serde",
- "tracing",
 ]
 
 [[package]]
