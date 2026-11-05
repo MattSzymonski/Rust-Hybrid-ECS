@@ -215,6 +215,7 @@ pub fn level_value(level: Level) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::telemetry_target;
 
     /// A captured line has the same shape as the line the terminal formatter
     /// writes: the same fields, the same spelling for each value, and the
@@ -231,7 +232,7 @@ mod tests {
             tracing_subscriber::registry().with(CaptureLayer::new(buffer.clone(), Level::INFO));
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(
-                target: "engine::resources",
+                target: telemetry_target::RESOURCES,
                 module = "pill_spline",
                 "texture created"
             );

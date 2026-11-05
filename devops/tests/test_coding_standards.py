@@ -16,11 +16,13 @@ DESCRIPTION
 
     Deliberate exemptions are listed beside the rule they weaken.
 
-    The checks are the eleven `section()` titles `main()` prints, in run
+    The checks are the twelve `section()` titles `main()` prints, in run
     order: module headers, safety comments, public docs, import groups, tests
     placement, egui state, colour literals, comment content (Rust, managed and
-    devops), shell patch openings, shader comment content and shell re-export
-    blocks. That list is the single source; this header does not repeat it.
+    devops), shell patch openings, shader comment content, shell re-export
+    blocks and log calls (the logging guide's string and long targets,
+    value-only messages, trailing periods, `message` fields and prints). That
+    list is the single source; this header does not repeat it.
 
     The two window sizes are tunable through the environment:
     `SAFETY_WINDOW_LINES` (default 30) and `DOC_WINDOW_LINES` (default 12).
@@ -1067,6 +1069,225 @@ def check_colour_literals(
 
 
 # =============================================================================
+# Check - log calls follow the logging guide
+# =============================================================================
+
+# Log calls are linted only under `modules/`: a fixture or example project
+# logs on its own `target: "project"`, which the guide asks of projects.
+LOG_CALL_AREA = "modules/"
+# A `tracing` (or `pill_core`) log macro, with or without its path. `log::`
+# macros are left alone: they only stand in for an external crate in the
+# bridge's tests.
+LOG_MACRO_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_:])((?:pill_core|pill_engine|tracing)::(?:tracing::)?)?"
+    r"(info|warn|error|debug|trace)!\s*\("
+)
+PRINT_MACRO_PATTERN = re.compile(r"(?<![A-Za-z0-9_:])(e?println)!\s*\(")
+STRING_TARGET_PATTERN = re.compile(r'target\s*:\s*"')
+LONG_TARGET_PATTERN = re.compile(r"target\s*:\s*pill_core::telemetry::telemetry_target::")
+MESSAGE_FIELD_PATTERN = re.compile(r"^\s*message\s*=[^=]")
+PLACEHOLDER_ONLY_PATTERN = re.compile(r"\{[^{}]*\}")
+STRING_LITERAL_PATTERN = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+# A message that is only a placeholder is allowed when what fills it is a
+# fixed text or a block, never a bare value:
+PLACEHOLDER_MESSAGE_ALLOWLIST = (
+    # A block (`log_block`/`log_block_colored`, or a report helper that
+    # returns one): the heading becomes the message.
+    "log_block",
+    "render_startup_report(",
+    "render_plan(",
+    # Message-selecting helpers: each returns one fixed sentence per kind,
+    # kept per kind because the suites wait for the exact text.
+    "_message()",
+    "forgotten_types_warning()",
+    # A watcher's callback line: each watcher passes its own fixed sentence.
+    "callback_error_message",
+    # The collision and layout refusals: one shared constant per sentence.
+    "_REFUSAL",
+)
+# The C# bridge forwards text written in managed code; it has no wording of
+# its own to give it.
+PLACEHOLDER_MESSAGE_FILES = ("modules/csharp/pill_csharp_bridge/src/abi.rs",)
+
+# A print is allowed only where telemetry cannot be: build scripts (and the
+# build-script source they include), proc macros, and a frontend's `main.rs`
+# before logging starts. Test code prints to the harness, not to the engine.
+PRINT_ALLOWED_PATH_FRAGMENTS = (
+    "/build.rs",
+    "modules/build_support/",
+    "_macros/src/",
+    "modules/frontends/pill_standalone/src/main.rs",
+    "modules/editor/pill_editor/src/main.rs",
+    "/tests.rs",
+    "/tests/",
+)
+
+
+def iterate_macro_calls(text: str, pattern) -> List[Tuple[int, re.Match, str]]:
+    """Every macro call `pattern` opens in `text`: (line, match, argument text).
+
+    The argument text runs to the matching `)`, skipping string contents, so a
+    call that spans lines is read whole. Calls on comment lines are skipped.
+    """
+    calls = []
+    for match in pattern.finditer(text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        if text[line_start:match.start()].lstrip().startswith("//"):
+            continue
+        depth = 0
+        index = match.end() - 1
+        in_string = False
+        while index < len(text):
+            character = text[index]
+            if in_string:
+                if character == "\\":
+                    index += 2
+                    continue
+                if character == '"':
+                    in_string = False
+            elif character == '"':
+                in_string = True
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            index += 1
+        line_number = text.count("\n", 0, match.start()) + 1
+        calls.append((line_number, match, text[match.end():index]))
+    return calls
+
+
+def split_top_level_arguments(arguments: str) -> List[str]:
+    """`arguments` split at its top-level commas (outside brackets and strings)."""
+    parts: List[str] = []
+    depth = 0
+    in_string = False
+    current = []
+    index = 0
+    while index < len(arguments):
+        character = arguments[index]
+        if in_string:
+            current.append(character)
+            if character == "\\" and index + 1 < len(arguments):
+                current.append(arguments[index + 1])
+                index += 2
+                continue
+            if character == '"':
+                in_string = False
+        elif character == '"':
+            in_string = True
+            current.append(character)
+        elif character in "([{":
+            depth += 1
+            current.append(character)
+        elif character in ")]}":
+            depth -= 1
+            current.append(character)
+        elif character == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(character)
+        index += 1
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def test_code_start(lines: List[str]) -> int:
+    """The 1-based line where the file's `#[cfg(test)] mod tests` starts, or 0."""
+    for index, line in enumerate(lines):
+        if TESTS_MODULE_PATTERN.match(line):
+            return index + 1
+    return 0
+
+
+# Flags log calls and prints that break the logging guide; see the patterns.
+def check_log_calls(
+    text: str, lines: List[str], display_path: str, collector: ViolationCollector
+) -> None:
+    """Flags string and long targets, value-only messages, trailing periods,
+    `message =` fields and prints, in Rust code under `modules/`.
+
+    Each rule names the guide's rule it enforces; the allowlists above carry
+    the reason each exemption exists.
+    """
+    if not display_path.startswith(LOG_CALL_AREA):
+        return
+    tests_from = test_code_start(lines)
+    for line_number, _match, arguments in iterate_macro_calls(text, LOG_MACRO_PATTERN):
+        if STRING_TARGET_PATTERN.search(arguments):
+            collector.record(
+                display_path,
+                "log target",
+                f"line {line_number}: a string target; use a `telemetry_target` constant",
+            )
+        if LONG_TARGET_PATTERN.search(arguments):
+            collector.record(
+                display_path,
+                "log target",
+                f"line {line_number}: write the target as `telemetry_target::X`, "
+                "with the module imported",
+            )
+        parts = split_top_level_arguments(arguments)
+        for part in parts:
+            if MESSAGE_FIELD_PATTERN.match(part):
+                collector.record(
+                    display_path,
+                    "log field",
+                    f"line {line_number}: a field named `message` replaces the "
+                    "line's text; name it after its concept (`error`, ...)",
+                )
+        # The message is the first positional string literal; a field's value
+        # always follows its name.
+        literals = [
+            (position, part) for position, part in enumerate(parts) if part.startswith('"')
+        ]
+        if not literals:
+            continue
+        message_position, message = literals[0]
+        literal = STRING_LITERAL_PATTERN.fullmatch(message)
+        if literal is None:
+            continue
+        message_text = literal.group(1)
+        if message_text.endswith("."):
+            collector.record(
+                display_path,
+                "log message",
+                f"line {line_number}: the message ends with a period",
+            )
+        if PLACEHOLDER_ONLY_PATTERN.fullmatch(message_text):
+            rest = ", ".join(parts[message_position + 1:])
+            allowed = display_path in PLACEHOLDER_MESSAGE_FILES or any(
+                fragment in rest for fragment in PLACEHOLDER_MESSAGE_ALLOWLIST
+            )
+            if not allowed:
+                collector.record(
+                    display_path,
+                    "log message",
+                    f"line {line_number}: the message is only a value; say what "
+                    "happened and put the value in a field",
+                )
+    if any(fragment in display_path for fragment in PRINT_ALLOWED_PATH_FRAGMENTS):
+        return
+    for line_number, match, arguments in iterate_macro_calls(text, PRINT_MACRO_PATTERN):
+        if tests_from and line_number >= tests_from:
+            continue
+        if arguments.lstrip().startswith('"cargo:'):
+            continue
+        collector.record(
+            display_path,
+            "print",
+            f"line {line_number}: `{match.group(1)}!` bypasses the log; use "
+            "`tracing` so the `logging:` settings reach the line",
+        )
+
+
+# =============================================================================
 # Check - comments carry no development-process references
 # =============================================================================
 
@@ -1854,6 +2075,142 @@ def self_test() -> int:
         outcome = "PASS" if collector.violation_count == expected else "FAIL"
         passed &= outcome == "PASS"
         print(f"  {outcome}  {description}")
+
+    # Log calls: each guide rule fires on its plant and passes a clean line.
+    log_cases = (
+        (
+            "a constant target with fields passes",
+            "modules/hosting/acme/src/lib.rs",
+            'info!(target: telemetry_target::HOT_RELOAD, module = name, "hot reload complete");\n',
+            0,
+        ),
+        (
+            "a string target fails",
+            "modules/hosting/acme/src/lib.rs",
+            'info!(target: "engine::hot_reload", "hot reload complete");\n',
+            1,
+        ),
+        (
+            "a fixture project's string target passes",
+            "devops/tests/projects/native/src/lib.rs",
+            'pill_engine::tracing::info!(target: "project", "counter tick");\n',
+            0,
+        ),
+        (
+            "a fully qualified target fails",
+            "modules/hosting/acme/src/lib.rs",
+            'pill_core::info!(\n    target: pill_core::telemetry::telemetry_target::ECS,\n    "world cleared"\n);\n',
+            1,
+        ),
+        (
+            "a value-only message fails",
+            "modules/hosting/acme/src/lib.rs",
+            'error!(target: telemetry_target::HOT_RELOAD, "{}", error);\n',
+            1,
+        ),
+        (
+            "a named placeholder-only message fails",
+            "modules/hosting/acme/src/lib.rs",
+            'error!(target: telemetry_target::HOT_RELOAD, "{message}");\n',
+            1,
+        ),
+        (
+            "a block print passes",
+            "modules/hosting/acme/src/lib.rs",
+            'info!(target: telemetry_target::SYSTEM, "{}", log_block("system specs", lines));\n',
+            0,
+        ),
+        (
+            "a per-kind message helper passes",
+            "modules/hosting/acme/src/lib.rs",
+            'warn!(target: telemetry_target::HOT_RELOAD, error = %error, "{}", kind.build_failed_message());\n',
+            0,
+        ),
+        (
+            "a refusal constant passes",
+            "modules/engine/acme/src/lib.rs",
+            'warn!(target: telemetry_target::ECS, "{}", COMPONENT_LAYOUT_CHANGED_REFUSAL);\n',
+            0,
+        ),
+        (
+            "the C# forwarder passes",
+            "modules/csharp/pill_csharp_bridge/src/abi.rs",
+            'tracing::info!(target: telemetry_target::CSHARP, managed_target = %target, "{message}");\n',
+            0,
+        ),
+        (
+            "a message ending in a period fails",
+            "modules/hosting/acme/src/lib.rs",
+            'warn!(target: telemetry_target::ECS, "value skipped.");\n',
+            1,
+        ),
+        (
+            "a period inside a field value passes",
+            "modules/hosting/acme/src/lib.rs",
+            'warn!(target: telemetry_target::ECS, path = "a.", "value skipped");\n',
+            0,
+        ),
+        (
+            "a field named message fails",
+            "modules/hosting/acme/src/lib.rs",
+            'warn!(target: telemetry_target::EDITOR, message = text.as_str(), "[editor] command failed");\n',
+            1,
+        ),
+        (
+            "a field whose name ends in message passes",
+            "modules/hosting/acme/src/lib.rs",
+            'warn!(target: telemetry_target::EDITOR, error_message = text.as_str(), "[editor] command failed");\n',
+            0,
+        ),
+        (
+            "a println in engine code fails",
+            "modules/hosting/acme/src/lib.rs",
+            'fn report() {\n    println!("\\n");\n}\n',
+            1,
+        ),
+        (
+            "an eprintln in engine code fails",
+            "modules/hosting/acme/src/lib.rs",
+            'fn report() {\n    eprintln!("failed: {error}");\n}\n',
+            1,
+        ),
+        (
+            "a cargo directive passes",
+            "modules/hosting/acme/src/lib.rs",
+            'fn emit() {\n    println!("cargo:rerun-if-changed={}", path.display());\n}\n',
+            0,
+        ),
+        (
+            "a build script print passes",
+            "modules/hosting/acme/build.rs",
+            'fn main() {\n    println!("{}", value);\n}\n',
+            0,
+        ),
+        (
+            "a frontend's early error passes",
+            "modules/frontends/pill_standalone/src/main.rs",
+            'fn main() {\n    eprintln!("[standalone] telemetry setup failed: {error}");\n}\n',
+            0,
+        ),
+        (
+            "a print inside the tests module passes",
+            "modules/hosting/acme/src/lib.rs",
+            'fn real() {}\n\n#[cfg(test)]\nmod tests {\n    fn probe() {\n        println!("skipped");\n    }\n}\n',
+            0,
+        ),
+        (
+            "a commented log line passes",
+            "modules/hosting/acme/src/lib.rs",
+            '// info!(target: "engine::ecs", "{}", value);\n',
+            0,
+        ),
+    )
+    for description, display_path, source, expected in log_cases:
+        collector = SilentCollector()
+        check_log_calls(source, source.splitlines(), display_path, collector)
+        outcome = "PASS" if collector.violation_count == expected else "FAIL"
+        passed &= outcome == "PASS"
+        print(f"  {outcome}  {description}")
     return 0 if passed else 1
 
 
@@ -2007,7 +2364,7 @@ def main() -> int:
         return 0
 
     collector = ViolationCollector()
-    # Every file is read once and its lines reused by all eleven checks.
+    # Every file is read once and its lines reused by all twelve checks.
     sources = [(path, display_path_for(path), *read_lines(path)) for path in files]
     csharp_files = collect_csharp_files(targets)
     csharp_sources = [
@@ -2018,36 +2375,36 @@ def main() -> int:
         (display_path_for(path), read_lines(path)[1]) for path in python_files
     ]
 
-    section("(1/11) Module header")
+    section("(1/12) Module header")
     for _, display_path, lines, text in sources:
         check_module_header(lines, text, display_path, collector)
 
-    section("(2/11) Safety comments")
+    section("(2/12) Safety comments")
     for _, display_path, lines, _text in sources:
         check_safety_comments(lines, display_path, collector)
 
-    section("(3/11) Public item docs")
+    section("(3/12) Public item docs")
     for _, display_path, lines, _text in sources:
         check_public_item_docs(lines, display_path, collector)
 
-    section("(4/11) Import groups")
+    section("(4/12) Import groups")
     for _, display_path, lines, _text in sources:
         check_import_group_order(lines, display_path, collector)
         check_import_group_contents(lines, display_path, collector)
 
-    section("(5/11) Tests at the bottom")
+    section("(5/12) Tests at the bottom")
     for _, display_path, lines, text in sources:
         check_tests_at_bottom(lines, text, display_path, collector)
 
-    section("(6/11) egui state (reloadable crates)")
+    section("(6/12) egui state (reloadable crates)")
     for _, display_path, lines, _text in sources:
         check_egui_context_storage(lines, display_path, collector)
 
-    section("(7/11) colour literals (editor UI)")
+    section("(7/12) colour literals (editor UI)")
     for _, display_path, lines, _text in sources:
         check_colour_literals(lines, display_path, collector)
 
-    section("(8/11) comment content (modules/, csharp, devops)")
+    section("(8/12) comment content (modules/, csharp, devops)")
     for _, display_path, lines, _text in sources:
         check_comment_content(lines, display_path, collector)
     for display_path, lines, _text in csharp_sources:
@@ -2055,7 +2412,7 @@ def main() -> int:
     for display_path, text in python_sources:
         check_python_comment_content(text, display_path, collector)
 
-    section("(9/11) shell patch openings (editor shell)")
+    section("(9/12) shell patch openings (editor shell)")
     for _, display_path, lines, _text in sources:
         check_shell_patch_openings(lines, display_path, collector)
 
@@ -2063,14 +2420,18 @@ def main() -> int:
     excluded = [Path(entry) for entry in arguments.exclude]
     for target in targets:
         shaders.extend(find_shader_files(target, excluded))
-    section(f"(10/11) shader comment content ({len(shaders)} shader source(s))")
+    section(f"(10/12) shader comment content ({len(shaders)} shader source(s))")
     for path in shaders:
         _lines, text = read_lines(path)
         check_shader_comment_content(text, display_path_for(path), collector)
 
-    section("(11/11) shell re-export blocks (editor shell)")
+    section("(11/12) shell re-export blocks (editor shell)")
     for _, display_path, lines, _text in sources:
         check_shell_reexport_blocks(lines, display_path, collector)
+
+    section("(12/12) log calls and prints (modules/)")
+    for _, display_path, lines, text in sources:
+        check_log_calls(text, lines, display_path, collector)
 
     if arguments.report:
         write_report(Path(arguments.report), files, collector)

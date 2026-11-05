@@ -1134,7 +1134,7 @@ mod tests {
         );
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(
-                target: "engine::resources",
+                target: telemetry_target::RESOURCES,
                 texture = "default_normal",
                 "texture created"
             );
@@ -1204,7 +1204,7 @@ mod tests {
         );
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(
-                target: "engine::hot_reload",
+                target: telemetry_target::HOT_RELOAD,
                 "{}",
                 log_block_colored(
                     "\u{1b}[1mModules to build:\u{1b}[0m",
@@ -1237,7 +1237,7 @@ mod tests {
         );
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(
-                target: "engine::hot_reload",
+                target: telemetry_target::HOT_RELOAD,
                 total = 2,
                 "{}",
                 log_block("Modules to build:", ["1. pill_spline", "2. project"])
@@ -1280,7 +1280,7 @@ mod tests {
     fn terminal_formatter_renders_a_plain_block_exactly() {
         let output = render_plain(|| {
             tracing::info!(
-                target: "engine::system",
+                target: telemetry_target::SYSTEM,
                 "{}",
                 log_block("system specs", ["CPU: test", "Cores: 4"])
             );
@@ -1299,7 +1299,7 @@ mod tests {
     fn terminal_formatter_renders_a_colored_block_heading_inline() {
         let output = render_plain(|| {
             tracing::info!(
-                target: "engine::hot_reload",
+                target: telemetry_target::HOT_RELOAD,
                 "{}",
                 log_block_colored("reload analytics".cyan().bold(), ["build=1ms"])
             );
@@ -1318,7 +1318,7 @@ mod tests {
     #[test]
     fn terminal_formatter_renders_a_headless_block() {
         let output = render_plain(|| {
-            tracing::info!(target: "engine::ecs", rows = 2, "\nfirst\nsecond\n");
+            tracing::info!(target: telemetry_target::ECS, rows = 2, "\nfirst\nsecond\n");
         });
         let lines: Vec<&str> = output.lines().collect();
         assert!(
@@ -1349,7 +1349,7 @@ mod tests {
             );
             tracing::subscriber::with_default(subscriber, || {
                 tracing::info!(
-                    target: "engine::hot_reload",
+                    target: telemetry_target::HOT_RELOAD,
                     module = "pill_spline",
                     owner = 2,
                     "extension loaded"
