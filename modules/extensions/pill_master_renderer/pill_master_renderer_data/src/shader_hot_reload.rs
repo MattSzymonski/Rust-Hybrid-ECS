@@ -141,7 +141,7 @@ pub unsafe extern "C" fn pill_render_data_shader_changed(
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         path,
-        shaders = ?changed_shader_asset_names,
+        shaders = %changed_shader_asset_names.join(", "),
         "shader source applied"
     );
     changed_shader_asset_names.len() as u32

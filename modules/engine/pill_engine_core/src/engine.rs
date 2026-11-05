@@ -1321,7 +1321,11 @@ impl Engine {
                     );
                     warn!(
                         target: pill_core::telemetry::telemetry_target::ECS,
-                        labels = ?duplicates,
+                        labels = %duplicates
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", "),
                         "duplicate parallel-iterator labels this frame; two iterators sharing a .label() corrupt per-label timing"
                     );
                 }

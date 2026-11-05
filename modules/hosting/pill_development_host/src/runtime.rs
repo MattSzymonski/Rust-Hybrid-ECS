@@ -3215,7 +3215,7 @@ fn suspend_stale_subjects(host: &mut DevHost) {
             error!(
                 target: telemetry_target::HOT_RELOAD,
                 subject = subject.as_str(),
-                components = ?stale,
+                components = %stale.join(", "),
                 "systems suspended: this binary was built against a previous layout of these shared components; they resume once it is rebuilt"
             );
         } else if stale.is_empty() && suspended {
@@ -3971,7 +3971,6 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
             // `devops/benchmarks/hot_reload_harness.py` reads both.
             analytics::record_patch(
                 &function,
-                generation,
                 stages.classify + stages.generate + stages.flags,
                 stages.compile as u64,
                 stages.load,
@@ -4027,12 +4026,32 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
 }
 
 /// Print the selected backend before any build output starts streaming.
+///
+/// The backend is logged as its kind, the library it loads and the directory
+/// that library is built into, so the line carries plain values.
 fn print_startup_configuration(workspace_root: &Path, project_module_config: &ProjectModuleConfig) {
+    let (backend, library, output_directory) = match &project_module_config.backend {
+        crate::config::ProjectModuleBackend::NativeLibrary {
+            library_name,
+            output_subdirectory,
+        } => (
+            "native",
+            library_name.as_str(),
+            output_subdirectory.as_str(),
+        ),
+        crate::config::ProjectModuleBackend::CSharp(csharp_module_config) => (
+            "csharp",
+            csharp_module_config.project_assembly_name.as_str(),
+            csharp_module_config.project_output_subdirectory.as_str(),
+        ),
+    };
     info!(
         target: telemetry_target::ENGINE,
         workspace = %workspace_root.display(),
         module = project_module_config.name.as_str(),
-        backend = ?project_module_config.backend,
+        backend,
+        library,
+        output_directory,
         build_command = %project_module_config.build_command.join(" "),
         watch_directory = project_module_config.watch_directory.as_str(),
         "ECS host starting"

@@ -213,7 +213,12 @@ fn resolve_passes(
     if !surface_positions.is_empty() && !surface_is_last {
         warn!(
             target: pill_core::telemetry::telemetry_target::RENDERING,
-            "Pass chain: {} surface pass(es) at {surface_positions:?}; only the last pass's writes reach the window",
+            positions = %surface_positions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            "Pass chain: {} surface pass(es); only the last pass's writes reach the window",
             surface_positions.len()
         );
     }

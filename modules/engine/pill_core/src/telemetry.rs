@@ -410,13 +410,17 @@ where
         if !(accepts_ansi && colored::control::SHOULD_COLORIZE.should_colorize()) {
             visitor.message = strip_color_codes(&visitor.message);
         }
-        // A message with a line break is a block (see `log_block`): the prefix
-        // line keeps the time, level, target and fields, and the message starts
-        // on the next line at the left edge. Wide tables and trees then keep
-        // their full width.
-        let is_block = visitor.message.contains('\n');
-        if !is_block {
-            write!(writer, "  {}", visitor.message)?;
+        // A message with a line break is a block (see `log_block`): its first
+        // line is the heading, which stays on the prefix line as the message,
+        // and the body starts on the next line at the left edge. Wide tables
+        // and trees then keep their full width. The block's closing line
+        // breaks are dropped, so no empty line follows it.
+        let (heading, body) = match visitor.message.split_once('\n') {
+            Some((heading, body)) => (heading, Some(body.trim_end_matches(['\n', '\r']))),
+            None => (visitor.message.as_str(), None),
+        };
+        if !heading.is_empty() {
+            write!(writer, "  {heading}")?;
         }
         if !visitor.fields.is_empty() {
             write!(writer, "  {}", visitor.fields)?;
@@ -431,8 +435,8 @@ where
                 write!(writer, "  {location}")?;
             }
         }
-        if is_block {
-            write!(writer, "\n{}", visitor.message)?;
+        if let Some(body) = body.filter(|body| !body.is_empty()) {
+            write!(writer, "\n{body}")?;
         }
         writeln!(writer)?;
         Ok(())
@@ -914,15 +918,14 @@ pub enum TelemetryError {
 /// Join a heading and its lines into one multi-line log message.
 ///
 /// The formatter prints a message that contains a line break as a block: the
-/// time, level, target and fields stay on the first line, and the message
-/// starts on the next line at the left edge. The block ends with a line break,
-/// so an empty line separates it from the next entry:
+/// heading stays on the first line as the message, after the time, level and
+/// target and before the fields, and the remaining lines follow at the left
+/// edge. The string ends with a line break, which the formatter drops, so the
+/// next entry follows directly:
 ///
 /// ```text
-/// [21:51:45:003] INFO  engine::hot_reload
-/// Modules to build:
+/// [21:51:45:003] INFO  engine::hot_reload  Modules to build:  total=1
 /// 1. pill_spline  extension
-///
 /// ```
 ///
 /// Pass the result to any logging macro: `info!(target: ..., "{}", block)`.
@@ -1212,8 +1215,9 @@ mod tests {
         );
     }
 
-    /// A multi-line message logs as a block: the prefix and fields alone on the
-    /// first line, then the message from the left edge.
+    /// A multi-line message logs as a block: the heading on the prefix line
+    /// before the fields, then the body from the left edge, with no empty line
+    /// after it.
     #[test]
     fn terminal_formatter_lays_out_a_multi_line_block() {
         use std::sync::{Arc, Mutex};
@@ -1239,14 +1243,84 @@ mod tests {
         // Only the start of the prefix line: another test may switch the
         // process-wide source location on while this one runs.
         assert!(
-            lines[0].starts_with("INFO  engine::hot_reload  total=2"),
+            lines[0].starts_with("INFO  engine::hot_reload  Modules to build:  total=2"),
             "{output}"
         );
-        // The trailing empty line is the block's own closing line break.
-        assert_eq!(
-            lines[1..],
-            ["Modules to build:", "1. pill_spline", "2. project", ""]
+        assert_eq!(lines[1..], ["1. pill_spline", "2. project"]);
+        assert!(output.ends_with("2. project\n"), "{output:?}");
+    }
+
+    /// Render one event through the terminal formatter with no timestamps and
+    /// no colors, for the exact-text block tests below.
+    fn render_plain(emit: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        let captured = Arc::new(Mutex::new(String::new()));
+        let writer = CapturingMakeWriter(Arc::clone(&captured));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .event_format(EngineTerminalFormatter::new().without_timestamps()),
         );
+        tracing::subscriber::with_default(subscriber, emit);
+        let output = captured.lock().unwrap().clone();
+        output
+    }
+
+    /// A plain block renders exactly: heading inline, body below, nothing
+    /// after. Source locations are opt-in and another test may switch them on,
+    /// so the check reads only the start of the prefix line.
+    #[test]
+    fn terminal_formatter_renders_a_plain_block_exactly() {
+        let output = render_plain(|| {
+            tracing::info!(
+                target: "engine::system",
+                "{}",
+                log_block("system specs", ["CPU: test", "Cores: 4"])
+            );
+        });
+        let lines: Vec<&str> = output.lines().collect();
+        assert!(
+            lines[0].starts_with("INFO  engine::system  system specs"),
+            "{output}"
+        );
+        assert_eq!(lines[1..], ["CPU: test", "Cores: 4"], "{output}");
+    }
+
+    /// A coloured heading reaches a plain layer as plain text on the prefix
+    /// line.
+    #[test]
+    fn terminal_formatter_renders_a_colored_block_heading_inline() {
+        let output = render_plain(|| {
+            tracing::info!(
+                target: "engine::hot_reload",
+                "{}",
+                log_block_colored("reload analytics".cyan().bold(), ["build=1ms"])
+            );
+        });
+        let lines: Vec<&str> = output.lines().collect();
+        assert!(
+            lines[0].starts_with("INFO  engine::hot_reload  reload analytics"),
+            "{output}"
+        );
+        assert!(!output.contains('\u{1b}'), "{output:?}");
+        assert_eq!(lines[1..], ["build=1ms"], "{output}");
+    }
+
+    /// A message that starts with a line break has no heading: the prefix
+    /// line keeps the fields and the body follows.
+    #[test]
+    fn terminal_formatter_renders_a_headless_block() {
+        let output = render_plain(|| {
+            tracing::info!(target: "engine::ecs", rows = 2, "\nfirst\nsecond\n");
+        });
+        let lines: Vec<&str> = output.lines().collect();
+        assert!(
+            lines[0].starts_with("INFO  engine::ecs  rows=2"),
+            "{output}"
+        );
+        assert_eq!(lines[1..], ["first", "second"], "{output}");
     }
 
     /// The message is separated from its fields, the source location appears

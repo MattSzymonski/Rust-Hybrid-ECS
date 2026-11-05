@@ -357,8 +357,8 @@ impl ReloadTransaction<'_> {
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 module = self.subject,
                 resource = change.resource.as_str(),
-                sources = ?change.changed_sources,
-                dependencies = ?change.changed_dependencies,
+                sources = %change.changed_sources.join(", "),
+                dependencies = %change.changed_dependencies.join(", "),
                 "resource layout changed; dropped the live value so the module rebuilds it"
             );
         }
@@ -672,7 +672,11 @@ impl ReloadTransaction<'_> {
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     module = self.subject,
                     count = stranded_component_ids.len(),
-                    ids = ?stranded_component_ids,
+                    ids = %stranded_component_ids
+                        .iter()
+                        .map(|id| format!("{id:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     "dropping registrations from the failed generation; their storage factories point into the image being retired"
                 );
                 let dropped_entity_count = engine
@@ -770,7 +774,7 @@ impl ReloadTransaction<'_> {
             warn!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 module = self.subject,
-                forgotten_types = ?forgotten_type_names,
+                forgotten_types = %forgotten_type_names.join(", "),
                 "{}", self.kind.forgotten_types_warning()
             );
 
@@ -924,7 +928,12 @@ impl ReloadTransaction<'_> {
                 warn!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     module = self.subject,
-                    skipped_types = ?migration_report.skipped_types,
+                    skipped_types = %migration_report
+                        .skipped_types
+                        .iter()
+                        .map(|skipped| format!("{} ({})", skipped.type_name, skipped.reason))
+                        .collect::<Vec<_>>()
+                        .join("; "),
                     "migration skipped some module component types"
                 );
             }
@@ -942,7 +951,7 @@ impl ReloadTransaction<'_> {
             debug!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 module = self.subject,
-                migrated_resources = ?migrated_resources,
+                migrated_resources = %migrated_resources.join(", "),
                 "reshaped resources migrated"
             );
         }

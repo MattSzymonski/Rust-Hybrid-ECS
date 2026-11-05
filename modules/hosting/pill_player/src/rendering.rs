@@ -531,14 +531,19 @@ impl AttachedRenderer {
             self.has_presented_scene = true;
             // Through the log rather than stdout, because a browser has no
             // stdout. The terminal lane prints the same line on native.
+            let metrics = self.renderer.metrics();
             info!(
                 target: telemetry_target::RENDERING,
-                "[render] First frame: {outcome:?}; camera={}; instances={}; {:?}",
+                passes = metrics.passes,
+                passes_with_draws = metrics.passes_with_draws,
+                instance_bytes = metrics.instance_bytes,
+                prepare_micros = metrics.prepare_micros,
+                submit_micros = metrics.submit_micros,
+                "[render] First frame: {outcome:?}; camera={}; instances={}",
                 frame
                     .surface_views
                     .contains_key(&pill_renderer_api::SurfaceId::PRIMARY),
-                frame.instances.len(),
-                self.renderer.metrics()
+                frame.instances.len()
             );
         }
         Ok(())

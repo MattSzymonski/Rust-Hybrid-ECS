@@ -108,19 +108,6 @@ impl Renderer {
         }))
         .map_err(|error| RendererError::AdapterRequest { source: error })?;
 
-        // Which adapter and backend won is not visible from the surface
-        // capabilities, and an adapter that cannot present to this window looks
-        // identical to one that can until the first frame fails.
-        let adapter_info = adapter.get_info();
-        println!(
-            "[render] Adapter: {} ({:?}, {:?}) driver={} {}",
-            adapter_info.name,
-            adapter_info.backend,
-            adapter_info.device_type,
-            adapter_info.driver,
-            adapter_info.driver_info
-        );
-
         // Step 3: request the device and queue from the adapter.
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("ECS renderer device"),
@@ -142,7 +129,6 @@ impl Renderer {
         let alpha_mode =
             select_alpha_mode(&capabilities.alpha_modes).ok_or(RendererError::NoAlphaModes)?;
         let present_mode = select_present_mode(&capabilities.present_modes);
-        println!("[render] Present mode: {present_mode:?}");
 
         let mut surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -202,23 +188,15 @@ impl Renderer {
                     // The probe frame is discarded; the frontend acquires its
                     // own once the first real frame is drawn.
                     drop(frame);
-                    println!(
-                        "[render] Surface configured: {candidate_present:?} / {candidate_alpha:?}"
-                    );
                     configured = true;
                     break;
                 }
-                (failure, _) => {
-                    eprintln!(
-                        "[render] Rejected {candidate_present:?} / {candidate_alpha:?}: {}",
-                        failure.unwrap_or_else(|| "unknown failure".to_owned())
-                    );
-                }
+                (_, _) => {}
             }
         }
 
         if !configured {
-            // Every candidate was refused; the backend errors are on stderr above.
+            // Every candidate was refused.
             return Err(RendererError::SurfaceConfigure);
         }
 

@@ -481,7 +481,12 @@ fn requested_present_mode(
     if !available_present_modes.contains(&present_mode) {
         warn!(
             target: pill_core::telemetry::telemetry_target::RENDERING,
-            "{PRESENT_MODE_VARIABLE} asked for {present_mode:?}, which this surface does not offer ({available_present_modes:?}); using Fifo"
+            available = %available_present_modes
+                .iter()
+                .map(|mode| format!("{mode:?}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            "{PRESENT_MODE_VARIABLE} asked for {present_mode:?}, which this surface does not offer; using Fifo"
         );
         return None;
     }

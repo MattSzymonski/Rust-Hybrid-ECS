@@ -798,8 +798,8 @@ struct ReloadEvent {
     init_ms: f64,
     migrate_ms: f64,
     artifact_bytes: u64,
-    /// The module's completed-reload count, or a patched function's
-    /// generation.
+    /// This event's ordinal among every reload and patch of the process, so
+    /// no two events in one session print the same `(reload #N)`.
     reload_count: u32,
     /// Crates that actually compiled or linked in this reload's cargo
     /// invocations, with their wall times, sorted by time descending. This is
@@ -848,6 +848,9 @@ struct Analytics {
     last_cargo_total_seconds: f64,
     /// Function patches that went live in this process.
     patches: u64,
+    /// Reloads and patches recorded so far in this process, which numbers
+    /// each event's `(reload #N)`.
+    reload_events: u32,
     /// Changes the fast path declined to patch, which fell through to a reload.
     patch_refusals: u64,
     /// Patches that were attempted and failed, leaving the previous
@@ -872,6 +875,7 @@ fn analytics() -> &'static Mutex<Analytics> {
             builds: 0,
             last_cargo_total_seconds: 0.0,
             patches: 0,
+            reload_events: 0,
             patch_refusals: 0,
             patch_failures: 0,
             patch_fallbacks: Vec::new(),
@@ -1016,11 +1020,9 @@ pub(crate) fn record_reload(name: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let index = find_or_create(&mut collector, name, ModuleKind::Extension);
-    let reloads = {
-        let module = &mut collector.modules[index];
-        module.reloads += 1;
-        module.reloads
-    };
+    collector.modules[index].reloads += 1;
+    collector.reload_events += 1;
+    let reload_count = collector.reload_events;
     // Snapshot the module's latest phase timings and the crates this reload's
     // builds actually rebuilt, then clear the pending set so the next reload
     // transaction starts fresh.
@@ -1043,7 +1045,7 @@ pub(crate) fn record_reload(name: &str) {
             init_ms: module.init_ms,
             migrate_ms: module.migrate_ms,
             artifact_bytes: module.artifact_bytes,
-            reload_count: reloads,
+            reload_count,
             cargo_crates,
         }
     };
@@ -1062,7 +1064,6 @@ pub(crate) fn record_reload(name: &str) {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_patch(
     function: &str,
-    generation: u32,
     stage_ms: f64,
     build_ms: u64,
     load_ms: f64,
@@ -1075,6 +1076,8 @@ pub(crate) fn record_patch(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     collector.patches += 1;
+    collector.reload_events += 1;
+    let reload_count = collector.reload_events;
     collector.pending_reload_events.push(ReloadEvent {
         kind: EventKind::Patch,
         route: Some((routes.to_vec(), copies)),
@@ -1085,10 +1088,9 @@ pub(crate) fn record_patch(
         init_ms: activate_ms,
         migrate_ms: 0.0,
         artifact_bytes,
-        // A function's generation is its patch count, so the shared
-        // `(reload #N)` column means the same thing for a patch as for a
-        // reload.
-        reload_count: generation,
+        // Patches and reloads share one session-wide count, so the
+        // `(reload #N)` column names one event whichever kind it was.
+        reload_count,
         // No cargo invocation ran, so there is no per-crate breakdown to show.
         cargo_crates: Vec::new(),
     });
@@ -1770,6 +1772,7 @@ mod tests {
             builds: 4,
             last_cargo_total_seconds: 0.0,
             patches: 0,
+            reload_events: 0,
             patch_refusals: 0,
             patch_failures: 0,
             patch_fallbacks: Vec::new(),
@@ -1942,6 +1945,42 @@ const CONCURRENCY_DATA = [
         };
         assert!(event.route.is_none());
         assert_eq!(event.kind.label(), "reload");
+    }
+
+    /// A patch and a reload in one session take consecutive numbers from one
+    /// count, so `(reload #N)` never names two events.
+    #[test]
+    fn patches_and_reloads_share_one_session_count() {
+        record_patch(
+            "test_module::patched_function",
+            1.0,
+            10,
+            1.0,
+            1.0,
+            0,
+            &[],
+            0,
+        );
+        record_reload("test_module_counted");
+        let collector = analytics()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counts: Vec<u32> = collector
+            .pending_reload_events
+            .iter()
+            .filter(|event| {
+                event.name == "test_module::patched_function" || event.name == "test_module_counted"
+            })
+            .map(|event| event.reload_count)
+            .collect();
+        assert_eq!(counts.len(), 2);
+        assert!(counts[1] > counts[0], "{counts:?}");
+        let module = collector
+            .modules
+            .iter()
+            .find(|module| module.name == "test_module_counted")
+            .unwrap();
+        assert_eq!(module.reloads, 1);
     }
 
     /// Build a throwaway workspace whose `cargo-timings` directory holds the

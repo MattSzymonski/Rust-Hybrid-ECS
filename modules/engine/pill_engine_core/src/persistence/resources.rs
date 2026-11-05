@@ -412,7 +412,7 @@ impl World {
         if !migrated_resource_names.is_empty() {
             debug!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                migrated_resources = ?migrated_resource_names,
+                migrated_resources = %migrated_resource_names.join(", "),
                 "[persistence] Migrated reshaped resources"
             );
         }

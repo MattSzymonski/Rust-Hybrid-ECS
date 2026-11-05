@@ -96,10 +96,6 @@ pub(crate) fn announce_build(module: &str) -> bool {
     };
     current.pending_builds.remove(pending_build_index);
     current.started_build_count += 1;
-    // Two blank lines separate each build from the cargo output above it.
-    // They are printed straight to the terminal: an empty log event would
-    // still add the time, level and target.
-    println!("\n");
     info!(
         target: HOT_RELOAD,
         "{}",

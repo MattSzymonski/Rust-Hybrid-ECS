@@ -694,7 +694,7 @@ fn relayout_declared_resource(
         warn!(
             target: telemetry_target::HOT_RELOAD,
             resource = %arriving.full_name,
-            fields = ?retyped,
+            fields = %retyped.join(", "),
             "managed resource fields changed type; their values were reset"
         );
     }
