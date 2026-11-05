@@ -226,12 +226,14 @@ SPATIAL_POSITION_WIDENED = """struct SpatialPosition {
     horizontal: f64,
 }"""
 
-WITNESS_POSITION_PRINT_BASE = """        println!(
+WITNESS_POSITION_PRINT_BASE = """        pill_engine::tracing::info!(
+            target: "project",
             "[project] witness SpatialPosition({:.2},{:.2})",
             position.horizontal, position.vertical
         );"""
 
-WITNESS_POSITION_PRINT_WITH_DEPTH = """        println!(
+WITNESS_POSITION_PRINT_WITH_DEPTH = """        pill_engine::tracing::info!(
+            target: "project",
             "[project] witness SpatialPosition({:.2},{:.2},{:.2})",
             position.horizontal, position.vertical, position.depth
         );"""
@@ -329,7 +331,8 @@ MARKER_TRAIL_SEED_BETA_U32 = """.with(MarkerTrail {
 
 WITNESS_TRAIL_PRINT_BASE = r"""        let sum: f32 = trail.points.iter().sum();
         let last = trail.samples.last().copied().unwrap_or(0.0);
-        println!(
+        pill_engine::tracing::info!(
+            target: "project",
             "[project] witness MarkerTrail(points={},sum={:.2},label=\"{}\",samples={},last={:.2})",
             trail.points.len(),
             sum,
@@ -340,7 +343,8 @@ WITNESS_TRAIL_PRINT_BASE = r"""        let sum: f32 = trail.points.iter().sum();
 
 WITNESS_TRAIL_PRINT_WITH_STAMPS = r"""        let sum: f32 = trail.points.iter().sum();
         let last = trail.samples.last().copied().unwrap_or(0.0);
-        println!(
+        pill_engine::tracing::info!(
+            target: "project",
             "[project] witness MarkerTrail(points={},sum={:.2},label=\"{}\",samples={},last={:.2},stamps={})",
             trail.points.len(),
             sum,
@@ -352,7 +356,8 @@ WITNESS_TRAIL_PRINT_WITH_STAMPS = r"""        let sum: f32 = trail.points.iter()
 
 WITNESS_TRAIL_PRINT_WITH_STAMPS_F64 = r"""        let sum: f64 = trail.points.iter().sum();
         let last = trail.samples.last().copied().unwrap_or(0.0);
-        println!(
+        pill_engine::tracing::info!(
+            target: "project",
             "[project] witness MarkerTrail(points={},sum={:.2},label=\"{}\",samples={},last={:.2},stamps={})",
             trail.points.len(),
             sum,
@@ -364,7 +369,8 @@ WITNESS_TRAIL_PRINT_WITH_STAMPS_F64 = r"""        let sum: f64 = trail.points.it
 
 WITNESS_TRAIL_PRINT_NAMED = r"""        let sum: f64 = trail.points.iter().sum();
         let last = trail.samples.last().copied().unwrap_or(0.0);
-        println!(
+        pill_engine::tracing::info!(
+            target: "project",
             "[project] witness MarkerTrail(points={},sum={:.2},name=\"{}\",samples={},last={:.2},stamps={})",
             trail.points.len(),
             sum,
@@ -376,7 +382,8 @@ WITNESS_TRAIL_PRINT_NAMED = r"""        let sum: f64 = trail.points.iter().sum()
 
 WITNESS_TRAIL_PRINT_U32 = r"""        let sum: f64 = trail.points.iter().map(|&value| value as f64).sum();
         let last = trail.samples.last().copied().unwrap_or(0.0);
-        println!(
+        pill_engine::tracing::info!(
+            target: "project",
             "[project] witness MarkerTrail(points={},sum={:.2},name=\"{}\",samples={},last={:.2},stamps={})",
             trail.points.len(),
             sum,

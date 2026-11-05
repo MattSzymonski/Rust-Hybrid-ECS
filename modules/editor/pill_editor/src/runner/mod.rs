@@ -2240,11 +2240,20 @@ impl EditorWindow {
                 Some(directory) => pill_development_host::read_editor_settings(directory),
                 None => Ok(pill_development_host::EditorSettings::default()),
             });
-            if let Some(Err(message)) = &self.theme_watch.settings {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    "[editor] theme refused layer=project: {message}"
-                );
+            match &self.theme_watch.settings {
+                Some(Err(message)) => {
+                    let message = message.clone();
+                    if self
+                        .theme_watch
+                        .is_new_refusal("project_settings", &message)
+                    {
+                        warn!(
+                            target: telemetry_target::ENGINE,
+                            "[editor] theme refused layer=project: {message}"
+                        );
+                    }
+                }
+                _ => self.theme_watch.clear_refusal("project_settings"),
             }
         }
         let project_path = match (&project_directory, &self.theme_watch.settings) {
@@ -2271,6 +2280,21 @@ impl EditorWindow {
         // with one stamp per family. An edit to a font re-installs it without
         // waiting for a theme change.
         let fonts_moved = self.stamp_fonts();
+        // A moved input is a new read: its refusal, even one with the same
+        // text, logs again.
+        if user_moved {
+            self.theme_watch.clear_refusal("user");
+            self.theme_watch.clear_refusal("merge:user");
+        }
+        if path_moved || file_moved {
+            self.theme_watch.clear_refusal("project");
+            self.theme_watch.clear_refusal("merge:project");
+        }
+        if fonts_moved {
+            self.theme_watch
+                .refusals_logged
+                .retain(|slot, _| !slot.starts_with("font:"));
+        }
         if !user_moved
             && !path_moved
             && !file_moved
@@ -2285,24 +2309,34 @@ impl EditorWindow {
         let project_overrides = self.load_project_layer(path_moved, file_moved);
         // Step 4: the user layer's document. A file that does not parse is a
         // refused layer, not an empty one.
+        // Each refusal logs once per distinct text: the poll re-reads an
+        // unchanged broken file every cadence tick.
         let user_overrides = match &selection {
             UserThemeSelection::File(path) => match std::fs::read_to_string(path) {
                 Ok(text) => match ThemeOverrides::from_json_str(&text) {
-                    Ok(overrides) => Some(overrides),
+                    Ok(overrides) => {
+                        self.theme_watch.clear_refusal("user");
+                        Some(overrides)
+                    }
                     Err(error) => {
-                        warn!(
-                            target: telemetry_target::ENGINE,
-                            "[editor] theme refused layer=user: {error}"
-                        );
+                        let refusal = error.to_string();
+                        if self.theme_watch.is_new_refusal("user", &refusal) {
+                            warn!(
+                                target: telemetry_target::ENGINE,
+                                "[editor] theme refused layer=user: {refusal}"
+                            );
+                        }
                         None
                     }
                 },
                 Err(error) => {
-                    warn!(
-                        target: telemetry_target::ENGINE,
-                        "[editor] theme refused layer=user: `{}` could not be read: {error}",
-                        path.display()
-                    );
+                    let refusal = format!("`{}` could not be read: {error}", path.display());
+                    if self.theme_watch.is_new_refusal("user", &refusal) {
+                        warn!(
+                            target: telemetry_target::ENGINE,
+                            "[editor] theme refused layer=user: {refusal}"
+                        );
+                    }
                     None
                 }
             },
@@ -2328,11 +2362,25 @@ impl EditorWindow {
             user_pair,
             project_pair,
         );
+        // A merge refusal repeats on every poll while the layer is
+        // unchanged, so each layer's text logs once.
+        for slot in ["merge:user", "merge:project"] {
+            let still_refused = merge
+                .refused
+                .iter()
+                .any(|(layer, _)| format!("merge:{layer}") == slot);
+            if !still_refused {
+                self.theme_watch.clear_refusal(slot);
+            }
+        }
         for (layer, message) in &merge.refused {
-            warn!(
-                target: telemetry_target::ENGINE,
-                "[editor] theme refused layer={layer}: {message}"
-            );
+            let slot = format!("merge:{layer}");
+            if self.theme_watch.is_new_refusal(&slot, &message.to_string()) {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    "[editor] theme refused layer={layer}: {message}"
+                );
+            }
         }
         // Step 6: the fonts the applied layers name, each resolved against the
         // layer that named it.
@@ -2456,42 +2504,47 @@ impl EditorWindow {
     }
 
     /// The bytes one font source holds, or `None` with the refusal logged.
+    ///
+    /// A refusal logs once per source and text: the merge re-reads the fonts
+    /// on every poll it runs.
     fn read_font_bytes(&mut self, source: &FontSource) -> Option<Vec<u8>> {
+        let slot = match source {
+            FontSource::Project(path) => format!("font:project:{path}"),
+            FontSource::User(file) => format!("font:user:{}", file.display()),
+        };
+        match self.read_font_source(source) {
+            Ok(bytes) => {
+                self.theme_watch.clear_refusal(&slot);
+                bytes
+            }
+            Err(refusal) => {
+                if self.theme_watch.is_new_refusal(&slot, &refusal) {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] font refused: {refusal}"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// The bytes one font source holds (`None` when the store holds no
+    /// copy), or the refusal's text.
+    fn read_font_source(&mut self, source: &FontSource) -> Result<Option<Vec<u8>>, String> {
         match source {
             FontSource::Project(path) => {
                 let world = self.host.host_mut().engine_mut().world_mut();
-                match pill_ui_theme::load_font(world, path, ThemePathScope::Editor) {
-                    Ok(loaded) => world
-                        .get_resource::<pill_engine_core::AssetManager>()
-                        .and_then(|assets| assets.get(loaded.handle))
-                        .map(|font| font.bytes.clone()),
-                    Err(message) => {
-                        warn!(
-                            target: telemetry_target::ENGINE,
-                            "[editor] font refused: {message}"
-                        );
-                        None
-                    }
-                }
+                let loaded = pill_ui_theme::load_font(world, path, ThemePathScope::Editor)?;
+                Ok(world
+                    .get_resource::<pill_engine_core::AssetManager>()
+                    .and_then(|assets| assets.get(loaded.handle))
+                    .map(|font| font.bytes.clone()))
             }
             FontSource::User(file) => match std::fs::read(file) {
-                Ok(bytes) if !bytes.is_empty() => Some(bytes),
-                Ok(_) => {
-                    warn!(
-                        target: telemetry_target::ENGINE,
-                        "[editor] font refused: `{}` is empty",
-                        file.display()
-                    );
-                    None
-                }
-                Err(error) => {
-                    warn!(
-                        target: telemetry_target::ENGINE,
-                        "[editor] font refused: `{}` could not be read: {error}",
-                        file.display()
-                    );
-                    None
-                }
+                Ok(bytes) if !bytes.is_empty() => Ok(Some(bytes)),
+                Ok(_) => Err(format!("`{}` is empty", file.display())),
+                Err(error) => Err(format!("`{}` could not be read: {error}", file.display())),
             },
         }
     }
@@ -2526,12 +2579,20 @@ impl EditorWindow {
             self.theme_watch.project_version = None;
             let world = self.host.host_mut().engine_mut().world_mut();
             match load_overrides(world, &path, ThemePathScope::Editor) {
-                Ok(handle) => self.theme_watch.project_handle = Some(handle),
+                Ok(handle) => {
+                    self.theme_watch.project_handle = Some(handle);
+                    self.theme_watch.clear_refusal("project");
+                }
                 Err(message) => {
-                    warn!(
-                        target: telemetry_target::ENGINE,
-                        "[editor] theme refused layer=project: {message}"
-                    );
+                    // A failed load leaves no handle, so every poll retries
+                    // it; the refusal logs once per distinct text.
+                    let refusal = message.to_string();
+                    if self.theme_watch.is_new_refusal("project", &refusal) {
+                        warn!(
+                            target: telemetry_target::ENGINE,
+                            "[editor] theme refused layer=project: {refusal}"
+                        );
+                    }
                     return None;
                 }
             }
@@ -2541,12 +2602,16 @@ impl EditorWindow {
             if let Err(error) =
                 assets.reimport_standalone::<ThemeOverrides>(std::path::Path::new(&path))
             {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    "[editor] theme refused layer=project: `{path}` did not load: {error}"
-                );
+                let refusal = format!("`{path}` did not load: {error}");
+                if self.theme_watch.is_new_refusal("project", &refusal) {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] theme refused layer=project: {refusal}"
+                    );
+                }
                 return None;
             }
+            self.theme_watch.clear_refusal("project");
         }
         let handle = self.theme_watch.project_handle?;
         let world = self.host.host_mut().engine_mut().world();

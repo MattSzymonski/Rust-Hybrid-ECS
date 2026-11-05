@@ -327,6 +327,28 @@ pub(super) struct ThemeWatch {
     pub(super) font_stamps: [FileStamp; 3],
     /// The font bytes the sources gave, as last installed.
     pub(super) fonts: pill_editor_core::kit::style::ThemeFonts,
+    /// The refusal text last logged per input (a layer, a merge result or a
+    /// font file), so a poll that re-reads an unchanged broken file stays
+    /// quiet and only a different text logs again.
+    pub(super) refusals_logged: std::collections::HashMap<String, String>,
+}
+impl ThemeWatch {
+    /// Record `refusal` for `slot` and report whether it is new, which is
+    /// when the caller logs it: the first refusal, or one whose text changed.
+    pub(super) fn is_new_refusal(&mut self, slot: &str, refusal: &str) -> bool {
+        if self.refusals_logged.get(slot).map(String::as_str) == Some(refusal) {
+            return false;
+        }
+        self.refusals_logged
+            .insert(slot.to_string(), refusal.to_string());
+        true
+    }
+
+    /// Forget the refusal logged for `slot`, after the input read cleanly or
+    /// its file moved, so the same refusal later logs again.
+    pub(super) fn clear_refusal(&mut self, slot: &str) {
+        self.refusals_logged.remove(slot);
+    }
 }
 /// Where one font family's bytes come from.
 #[derive(Clone, Debug, PartialEq, Eq)]

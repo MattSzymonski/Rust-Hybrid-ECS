@@ -659,7 +659,7 @@ fn seed_migration_entities(world: &mut World) {
 }
 
 /// Increments the counter every frame. When it reaches the threshold,
-/// resets and prints a timestamp to the console.
+/// resets and logs `counter tick`, the suites' liveness signal.
 #[system(name = "counter", order = 60)]
 fn counter_system(mut query: Query<&mut FrameCounter>) {
     const THRESHOLD: u64 = 200;
@@ -669,39 +669,28 @@ fn counter_system(mut query: Query<&mut FrameCounter>) {
         if counter.count >= THRESHOLD {
             counter.count = 0;
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            let seconds = now.as_secs();
-            let milliseconds = now.subsec_millis();
-
-            let hours = (seconds / 3600) % 24;
-            let minutes = (seconds / 60) % 60;
-            let secs = seconds % 60;
-
-            println!(
-                "counter tick [{:02}:{:02}:{:02}.{:03}]",
-                hours, minutes, secs, milliseconds
-            );
+            // The formatter stamps the time; the suites wait for the text.
+            pill_engine::tracing::info!(target: "project", "counter tick");
         }
     }
 }
 
-/// Prints every `SpatialPosition` value once per module generation.
+/// Logs every `SpatialPosition` value once per module generation.
 #[system(name = "position_witness", order = 70)]
 fn position_witness_system(mut query: Query<&SpatialPosition>) {
     if POSITION_WITNESS_PRINTED.swap(true, Ordering::Relaxed) {
         return;
     }
     for position in query.iter_mut() {
-        println!(
+        pill_engine::tracing::info!(
+            target: "project",
             "[project] witness SpatialPosition({:.2},{:.2})",
             position.horizontal, position.vertical
         );
     }
 }
 
-/// Prints every `MarkerTrail` value once per module generation, including the
+/// Logs every `MarkerTrail` value once per module generation, including the
 /// heap contents migration must carry across (element count, sum, text, and
 /// the engine-owned buffer's length and last element).
 #[system(name = "trail_witness", order = 80)]
@@ -712,7 +701,8 @@ fn trail_witness_system(mut query: Query<&MarkerTrail>) {
     for trail in query.iter_mut() {
         let sum: f32 = trail.points.iter().sum();
         let last = trail.samples.last().copied().unwrap_or(0.0);
-        println!(
+        pill_engine::tracing::info!(
+            target: "project",
             "[project] witness MarkerTrail(points={},sum={:.2},label=\"{}\",samples={},last={:.2})",
             trail.points.len(),
             sum,
