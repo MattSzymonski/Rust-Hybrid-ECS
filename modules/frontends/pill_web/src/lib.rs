@@ -82,7 +82,11 @@ impl ApplicationHandler for WebApplication {
         let canvas = match canvas_element(&self.canvas_id) {
             Ok(canvas) => canvas,
             Err(message) => {
-                error!(target: telemetry_target::ENGINE, "{message}");
+                error!(
+                    target: telemetry_target::ENGINE,
+                    error = message.as_str(),
+                    "canvas not found; the game does not start"
+                );
                 return;
             }
         };

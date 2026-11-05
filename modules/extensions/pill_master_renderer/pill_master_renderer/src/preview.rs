@@ -498,7 +498,8 @@ impl PreviewRenderer {
             target: telemetry_target::RENDERING,
             dropped = dropped.len(),
             bytes,
-            "[preview] {cache_name} cache trimmed"
+            cache = cache_name,
+            "[render] preview cache trimmed"
         );
     }
 
@@ -755,7 +756,8 @@ impl PreviewRenderer {
             Readback::Failed => {
                 pill_core::warn!(
                     target: telemetry_target::RENDERING,
-                    "[preview] the readback could not be read: request {id} is refused"
+                    request = id,
+                    "[render] preview readback failed; the request is refused"
                 );
                 self.in_flight_request_id = None;
                 self.refuse(id);

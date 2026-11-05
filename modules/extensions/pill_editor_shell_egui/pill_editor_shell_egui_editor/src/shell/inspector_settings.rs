@@ -1198,7 +1198,7 @@ pub fn settings_commit(
         pill_core::warn!(
             target: telemetry_target::EDITOR,
             key,
-            message = message.as_str(),
+            error = message.as_str(),
             "[editor] asset settings edit refused"
         );
         return;

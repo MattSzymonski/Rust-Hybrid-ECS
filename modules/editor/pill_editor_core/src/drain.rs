@@ -111,7 +111,7 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
             pill_core::warn!(
                 target: telemetry_target::EDITOR,
                 index,
-                message = %message,
+                error = %message,
                 "[editor] command failed"
             );
         }

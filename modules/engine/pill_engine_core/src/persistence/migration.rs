@@ -68,7 +68,7 @@ impl World {
 
         info!(
             target: telemetry_target::HOT_RELOAD,
-            "[persistence] Selective migration starting for {} component type(s)...",
+            "[persistence] Selective migration starting for {} component type(s)",
             sorted_changed_type_names.len(),
         );
 
@@ -129,7 +129,7 @@ impl World {
 
         info!(
             target: telemetry_target::HOT_RELOAD,
-            "[persistence] Selective migration finished: {} type(s) migrated, {} entities touched, {} type(s) skipped.",
+            "[persistence] Selective migration finished: {} type(s) migrated, {} entities touched, {} type(s) skipped",
             migration_report.migrated_type_count,
             migration_report.migrated_entity_count,
             migration_report.skipped_types.len(),

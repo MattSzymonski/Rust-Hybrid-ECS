@@ -575,7 +575,7 @@ pub fn run_project_init(
                 pill_core::warn!(
                     target: telemetry_target::ENGINE,
                     reason,
-                    "[engine] startup scene not loaded"
+                    "startup scene not loaded; the project starts without it"
                 );
             }
         },

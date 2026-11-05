@@ -3214,7 +3214,7 @@ fn suspend_stale_subjects(host: &mut DevHost) {
             host.stale_suspended_owners.push(owner);
             warn!(
                 target: telemetry_target::HOT_RELOAD,
-                subject = subject.as_str(),
+                module = subject.as_str(),
                 components = %stale.join(", "),
                 "systems suspended: this binary was built against a previous layout of these shared components; they resume once it is rebuilt"
             );
@@ -3225,7 +3225,7 @@ fn suspend_stale_subjects(host: &mut DevHost) {
             host.stale_suspended_owners.retain(|other| *other != owner);
             info!(
                 target: telemetry_target::HOT_RELOAD,
-                subject = subject.as_str(),
+                module = subject.as_str(),
                 "systems resumed: rebuilt against the current shared component layouts"
             );
         }

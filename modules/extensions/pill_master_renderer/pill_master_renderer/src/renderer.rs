@@ -36,9 +36,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 // External crates
+use pill_core::info;
 use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
-use pill_core::{info, PillStyle};
 use pill_engine::common_components::TransformComponent;
 use pill_engine::AssetManager;
 use pill_renderer_api::{CameraComponent, RawWindowData, SurfaceId, SurfaceOptions};
@@ -294,7 +294,7 @@ impl Renderer {
     /// it alive. A frontend holds the window for as long as it holds the
     /// renderer, and drops the renderer first.
     pub async unsafe fn new_async(window: RawWindowData, width: u32, height: u32) -> Result<Self> {
-        info!(target: telemetry_target::RENDERING, "Initializing {}", "Renderer".module_object_style());
+        info!(target: telemetry_target::RENDERING, "initializing the renderer");
         // Step 1: Build the shared state and the primary surface's target.
         // SAFETY: forwarded from this function's own contract.
         let (mut state, primary) = unsafe { State::new(window, width, height) }.await?;
@@ -1401,7 +1401,7 @@ fn record_preview(renderer: &mut Renderer, frame: &RenderFrame, assets_manager: 
                     target: telemetry_target::RENDERING,
                     id = request.id,
                     reason,
-                    "[preview] not drawn"
+                    "[render] preview not drawn"
                 );
             } else {
                 continue;

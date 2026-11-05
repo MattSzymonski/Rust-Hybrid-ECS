@@ -504,10 +504,11 @@ impl Engine {
                     // report was due, so one slow frame cannot leave a backlog
                     // that prints several reports in a row.
                     next_report = Some(elapsed + interval);
+                    let snapshot = crate::diagnostics::EcsSnapshot::gather(world).render();
                     pill_core::info!(
                         target: telemetry_target::ECS,
                         "{}",
-                        crate::diagnostics::EcsSnapshot::gather(world).render()
+                        pill_core::telemetry::log_block("ECS snapshot", snapshot.lines())
                     );
                     Ok(())
                 },

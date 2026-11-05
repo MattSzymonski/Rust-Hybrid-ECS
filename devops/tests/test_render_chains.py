@@ -17,7 +17,7 @@ DESCRIPTION
     exists, so the suite launches the windowed development host on that project
     and reads the renderer's observation line:
 
-        Pass chain: <pass label>(<draws>) ...
+        pass chain: <pass label>(<draws>) ...
 
     The line is printed once per change. The suite requires a line whose only
     entry is the project's pass with a positive draw count: that is the chain
@@ -74,7 +74,7 @@ PASS_LABEL = "dwdw.render_pass"
 # line as the project's pass would mean the file's chain never replaced it.
 DEFAULT_CHAIN_LABEL = "pill.pbr.pass."
 
-CHAIN_TOKEN = "Pass chain:"
+CHAIN_TOKEN = "pass chain:"
 ENTRY_PATTERN = re.compile(r"(?P<label>[^\s()]+)\((?P<draws>\d+)\)")
 
 # The host builds the project DLL on its first run; a cold one is slow.
@@ -87,7 +87,7 @@ CHAIN_TIMEOUT_SECONDS = 240
 
 
 def chain_lines(text: str) -> list:
-    """Every `Pass chain:` line in `text`, newest last."""
+    """Every `pass chain:` line in `text`, newest last."""
     return [line for line in text.splitlines() if CHAIN_TOKEN in line]
 
 

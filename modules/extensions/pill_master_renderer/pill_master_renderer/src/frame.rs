@@ -125,7 +125,7 @@ fn resolve_passes(
         if handle.is_some() {
             warn!(
                 target: telemetry_target::RENDERING,
-                "The pipeline the manager holds no longer resolves; running the built-in pass"
+                "the pipeline the manager holds no longer resolves; running the built-in pass"
             );
         }
         return vec![ResolvedPass::builtin()];
@@ -171,8 +171,8 @@ fn resolve_passes(
                 }
                 None => warn!(
                     target: telemetry_target::RENDERING,
-                    "Pass {} names a material that is not loaded",
-                    pass.name
+                    pass = pass.name.as_str(),
+                    "pass names a material that is not loaded"
                 ),
             }
         }
@@ -195,8 +195,9 @@ fn resolve_passes(
     if stale_pass_handle_count > 0 {
         warn!(
             target: telemetry_target::RENDERING,
-            "Pass chain: {stale_pass_handle_count} of {} pass handles no longer resolve and are left out",
-            pipeline.passes.len()
+            stale_passes = stale_pass_handle_count,
+            passes = pipeline.passes.len(),
+            "pass handles no longer resolve and are left out of the chain"
         );
     }
     passes.sort_by_key(|pass| pass.settings.order);
@@ -219,8 +220,8 @@ fn resolve_passes(
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", "),
-            "Pass chain: {} surface pass(es); only the last pass's writes reach the window",
-            surface_positions.len()
+            surface_passes = surface_positions.len(),
+            "more than one surface pass, or one before the end; only the last pass's writes reach the window"
         );
     }
     passes

@@ -1441,7 +1441,7 @@ impl EditorWindow {
             warn!(
                 target: telemetry_target::EDITOR,
                 key,
-                message = message.as_str(),
+                error = message.as_str(),
                 "[editor] asset settings edit refused"
             );
             return;
@@ -1530,7 +1530,7 @@ impl EditorWindow {
                 Err(message) => {
                     warn!(
                         target: telemetry_target::EDITOR,
-                        message = message.as_str(),
+                        error = message.as_str(),
                         "[editor] clipboard write failed"
                     );
                     self.push_toast(NoticeLevel::Warning, format!("clipboard: {message}"));
@@ -1555,7 +1555,7 @@ impl EditorWindow {
             Err(message) => {
                 warn!(
                     target: telemetry_target::EDITOR,
-                    message = message.as_str(),
+                    error = message.as_str(),
                     "[editor] clipboard read failed"
                 );
                 self.push_toast(NoticeLevel::Warning, format!("clipboard: {message}"));
@@ -1572,7 +1572,7 @@ impl EditorWindow {
             Err(message) => {
                 warn!(
                     target: telemetry_target::EDITOR,
-                    message = message.as_str(),
+                    error = message.as_str(),
                     "[editor] clipboard payload refused"
                 );
                 self.push_toast(NoticeLevel::Warning, format!("clipboard: {message}"));
@@ -1592,7 +1592,7 @@ impl EditorWindow {
             Err(message) => {
                 warn!(
                     target: telemetry_target::EDITOR,
-                    message = message.as_str(),
+                    error = message.as_str(),
                     "[editor] clipboard paste refused"
                 );
                 self.push_toast(NoticeLevel::Warning, format!("clipboard: {message}"));
@@ -1714,7 +1714,7 @@ impl EditorWindow {
                 warn!(
                     target: telemetry_target::EDITOR,
                     field,
-                    message = message.as_str(),
+                    error = message.as_str(),
                     "[editor] panel field write: value not understood"
                 );
                 return;
@@ -1764,7 +1764,7 @@ impl EditorWindow {
                 warn!(
                     target: telemetry_target::EDITOR,
                     field,
-                    message = message.as_str(),
+                    error = message.as_str(),
                     "[editor] panel element write: value not understood"
                 );
                 return;
@@ -1992,7 +1992,7 @@ impl EditorWindow {
                 Err(message) => warn!(
                     target: telemetry_target::EDITOR,
                     path = path.as_str(),
-                    message = message.as_str(),
+                    error = message.as_str(),
                     "[editor] reveal refused"
                 ),
             }
@@ -2671,7 +2671,11 @@ impl EditorWindow {
         // rebinding that silently stops working is exactly what the overlay
         // is for.
         for problem in problems {
-            warn!(target: telemetry_target::EDITOR, "{}", problem.as_str());
+            warn!(
+                target: telemetry_target::EDITOR,
+                error = problem.as_str(),
+                "[editor] keybinding not applied"
+            );
             self.push_toast(NoticeLevel::Warning, problem);
         }
         for (chord, commands) in conflicts {

@@ -466,7 +466,7 @@ impl GpuChain {
                                     .iter()
                                     .map(|range| (range.end - range.start) as usize)
                                     .sum::<usize>(),
-                                "Pass draws the instances no pass in the chain claimed"
+                                "pass draws the instances no pass in the chain claimed"
                             );
                             ranges.extend(unclaimed.into_iter().map(|range| DrawRange {
                                 range,
@@ -581,7 +581,7 @@ impl GpuChain {
 
         // Logged once per change, like the renderer's other diagnostics: this
         // line is what a reader has when the window shows the wrong thing.
-        info!(target: telemetry_target::RENDERING, "Pass chain: {chain_signature}");
+        info!(target: telemetry_target::RENDERING, "pass chain: {chain_signature}");
         self.chain_log = Some(chain_signature);
     }
 
@@ -592,7 +592,12 @@ impl GpuChain {
         }
 
         // Logged once per change, like the renderer's other diagnostics.
-        warn!(target: telemetry_target::RENDERING, "Pass {pass_name} is not drawn: {reason}");
+        warn!(
+            target: telemetry_target::RENDERING,
+            pass = pass_name,
+            error = reason,
+            "pass not drawn; the chain runs without it"
+        );
     }
 }
 
@@ -721,8 +726,9 @@ fn build_pass(
             Some(handle) => textures.push((slot.clone(), handle)),
             None => warn!(
                 target: telemetry_target::RENDERING,
-                "Pass {} binds texture `{slot}`, which is not loaded; the shader's default is used",
-                pass.name
+                pass = pass.name.as_str(),
+                slot = %slot,
+                "pass binds a texture that is not loaded; the shader's default is used"
             ),
         }
     }

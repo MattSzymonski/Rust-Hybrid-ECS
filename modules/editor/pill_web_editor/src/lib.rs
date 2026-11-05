@@ -158,7 +158,11 @@ impl ApplicationHandler for WebEditorApplication {
         let scene_canvas = match canvas_element(&self.scene_canvas_id) {
             Ok(canvas) => canvas,
             Err(message) => {
-                error!(target: telemetry_target::EDITOR, "{message}");
+                error!(
+                    target: telemetry_target::EDITOR,
+                    error = message.as_str(),
+                    "scene canvas not found; the editor does not start"
+                );
                 return;
             }
         };
@@ -177,7 +181,11 @@ impl ApplicationHandler for WebEditorApplication {
         let ui_canvas = match canvas_element(&self.ui_canvas_id) {
             Ok(canvas) => canvas,
             Err(message) => {
-                error!(target: telemetry_target::EDITOR, "{message}");
+                error!(
+                    target: telemetry_target::EDITOR,
+                    error = message.as_str(),
+                    "UI canvas not found; the editor does not start"
+                );
                 return;
             }
         };
@@ -242,7 +250,11 @@ impl ApplicationHandler for WebEditorApplication {
                     ui_window.request_redraw();
                 }
                 Err(message) => {
-                    error!(target: telemetry_target::EDITOR, "{message}");
+                    error!(
+                        target: telemetry_target::EDITOR,
+                        error = message.as_str(),
+                        "UI renderer not attached; the editor UI is not drawn"
+                    );
                 }
             }
         });

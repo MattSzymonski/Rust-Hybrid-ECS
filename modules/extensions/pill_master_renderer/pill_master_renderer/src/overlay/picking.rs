@@ -189,8 +189,8 @@ impl PickReadback {
                 Readback::Failed => {
                     pill_core::warn!(
                         target: telemetry_target::RENDERING,
-                        "[pick] {} request(s) could not be read back",
-                        requests.len()
+                        requests = requests.len(),
+                        "[render] pick readback failed; its requests answer nothing"
                     );
                     self.finished_answers
                         .extend(answer_every_request_with_nothing(requests));

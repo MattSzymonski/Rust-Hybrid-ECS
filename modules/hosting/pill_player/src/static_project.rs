@@ -384,7 +384,7 @@ fn apply_project_startup_scene(engine: &mut Engine, scene_path: &str) {
             target: telemetry_target::ENGINE,
             path = scene_path,
             reason,
-            "[engine] startup scene not loaded"
+            "startup scene not loaded; the project starts without it"
         );
     }
 }

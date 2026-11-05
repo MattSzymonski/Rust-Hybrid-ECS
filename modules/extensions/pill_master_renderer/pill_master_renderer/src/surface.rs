@@ -144,7 +144,7 @@ impl Surface {
             })?;
         let adapter_info = adapter.get_info();
         let backend = adapter_info.backend;
-        info!(target: telemetry_target::RENDERING, "Using GPU: {} ({:?})", adapter_info.name, adapter_info.backend);
+        info!(target: telemetry_target::RENDERING, adapter = adapter_info.name.as_str(), backend = ?adapter_info.backend, "using GPU");
         let mut wanted_features = wgpu::Features::DEPTH_CLIP_CONTROL;
         // Only when GPU profiling was asked for: the query features change
         // nothing until a query is recorded, and the renderer asks the device
@@ -221,7 +221,7 @@ impl Surface {
             surface_configuration.present_mode = wgpu::PresentMode::Fifo;
             configure_first(&surface, &device, &mut surface_configuration).await?;
         }
-        info!(target: telemetry_target::RENDERING, "Present mode: {:?}", surface_configuration.present_mode);
+        info!(target: telemetry_target::RENDERING, present_mode = ?surface_configuration.present_mode, "present mode chosen");
         Ok((
             Self {
                 surface,
@@ -593,7 +593,7 @@ async fn configure_first(
         .await;
         match configuration_attempt_failure(probe_outcome, errors) {
             None => {
-                info!(target: telemetry_target::RENDERING, "Surface configured: {alpha_mode:?}");
+                info!(target: telemetry_target::RENDERING, alpha_mode = ?alpha_mode, "surface configured");
                 return Ok(());
             }
             Some(failure) => failures.push(format!("{alpha_mode:?} ({failure})")),

@@ -85,7 +85,7 @@ pub fn apply_startup_scene(engine: &mut Engine) -> Option<Result<SceneLoad, Stri
             pill_core::warn!(
                 target: telemetry_target::ENGINE,
                 error = %error,
-                "[engine] startup scene request could not be taken"
+                "startup scene request could not be taken; no scene is loaded"
             );
             return None;
         }

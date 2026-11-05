@@ -760,7 +760,7 @@ impl EditorWindow {
                 ),
                 Err(message) => warn!(
                     target: telemetry_target::EDITOR,
-                    message = message.as_str(),
+                    error = message.as_str(),
                     "[editor] clipboard write failed"
                 ),
             }

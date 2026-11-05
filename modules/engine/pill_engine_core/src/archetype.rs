@@ -1985,8 +1985,18 @@ impl Archetype {
     /// Logs information about this archetype (component names and entity count).
     #[cold]
     pub fn print_info(&self, registry: &crate::component::ComponentRegistry) {
-        let summary = self.get_archetype_info(registry);
-        pill_core::info!(target: telemetry_target::ECS, "{}", summary);
+        let component_names: Vec<&str> = self
+            .component_types
+            .iter()
+            .map(|component_id| registry.get_name(component_id).unwrap_or("Unknown"))
+            .collect();
+        pill_core::info!(
+            target: telemetry_target::ECS,
+            archetype = ?self.id,
+            entities = self.entities.len(),
+            components = %component_names.join(", "),
+            "archetype info"
+        );
     }
 
     /// Estimates the memory footprint of this archetype in bytes.

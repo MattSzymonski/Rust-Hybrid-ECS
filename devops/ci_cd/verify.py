@@ -413,7 +413,7 @@ STEPS: List[Step] = [
     ),
     # The example's committed render chain: the windowed host runs
     # `devops/tests/projects/native`, whose `init` loads `res/pipelines/main.pipeline`
-    # by path, and the renderer's `Pass chain:` line must name the project's
+    # by path, and the renderer's `pass chain:` line must name the project's
     # own pass with draws. A host-tier suite, so it runs before the editor
     # lane's build.
     Step(

@@ -76,7 +76,8 @@ pub(crate) fn report_uncaptured_errors(device: &wgpu::Device) {
     device.on_uncaptured_error(std::sync::Arc::new(|error| {
         pill_core::error!(
             target: telemetry_target::RENDERING,
-            "GPU error: {error}"
+            error = %error,
+            "GPU error; the refused call draws nothing"
         );
     }));
 }
@@ -111,7 +112,9 @@ pub(crate) fn latch_device_loss(device: &wgpu::Device) {
         };
         pill_core::error!(
             target: telemetry_target::RENDERING,
-            "{detail}"
+            reason = ?reason,
+            error = message.as_str(),
+            "GPU device lost; nothing is drawn until the renderer is rebuilt"
         );
         *latched_device_loss() = Some(detail);
     });

@@ -328,8 +328,9 @@ impl RendererPass {
             if !renderer_shader.texture_slots.contains_key(slot_name) {
                 warn!(
                     target: telemetry_target::RENDERING,
-                    "Pass {} names input `{slot_name}`, which its shader has no slot for",
-                    pass.name
+                    pass = pass.name.as_str(),
+                    slot = %slot_name,
+                    "pass names an input its shader has no slot for"
                 );
             }
         }
@@ -337,8 +338,9 @@ impl RendererPass {
             if !renderer_shader.texture_slots.contains_key(slot_name) {
                 warn!(
                     target: telemetry_target::RENDERING,
-                    "Pass {} binds texture `{slot_name}`, which its shader has no slot for",
-                    pass.name
+                    pass = pass.name.as_str(),
+                    slot = %slot_name,
+                    "pass binds a texture its shader has no slot for"
                 );
             }
         }

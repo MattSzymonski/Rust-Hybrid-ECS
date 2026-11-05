@@ -391,7 +391,7 @@ impl ReloadTransaction<'_> {
         if self.graveyard_policy == GraveyardPolicy::KeepAll {
             debug!(
                 target: telemetry_target::HOT_RELOAD,
-                subject = self.subject,
+                module = self.subject,
                 generations = self.old_libraries.len(),
                 "keeping every retired generation mapped"
             );
@@ -408,7 +408,7 @@ impl ReloadTransaction<'_> {
                 if deferral_count >= MAX_DEFERRED_EVICTIONS {
                     error!(
                         target: telemetry_target::HOT_RELOAD,
-                        subject = self.subject,
+                        module = self.subject,
                         generations = self.old_libraries.len(),
                         columns = orphaned_column_count,
                         consecutive_deferrals = deferral_count,
@@ -417,7 +417,7 @@ impl ReloadTransaction<'_> {
                 } else {
                     warn!(
                         target: telemetry_target::HOT_RELOAD,
-                        subject = self.subject,
+                        module = self.subject,
                         generations = self.old_libraries.len(),
                         columns = orphaned_column_count,
                         "deferring eviction: native columns still reference a retired image"
@@ -434,7 +434,7 @@ impl ReloadTransaction<'_> {
             // else.
             info!(
                 target: telemetry_target::HOT_RELOAD,
-                subject = self.subject,
+                module = self.subject,
                 generations = self.old_libraries.len(),
                 "evicting the oldest retired generation"
             );

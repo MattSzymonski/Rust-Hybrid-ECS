@@ -515,7 +515,7 @@ where
         Err(error) => {
             warn!(
                 target: telemetry_target::HOT_RELOAD,
-                "[persistence] Failed to deserialize resource '{}': {}. Value skipped.",
+                "[persistence] Failed to deserialize resource '{}': {}; the value is skipped",
                 std::any::type_name::<T>(),
                 error
             );

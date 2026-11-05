@@ -180,11 +180,12 @@ impl World {
                     incoming_id: component_id,
                     live_rows: live_row_count,
                 });
-                error!(
+                warn!(
                     target: telemetry_target::ECS,
                     type_name = %type_name,
                     live_rows = live_row_count,
-                    message = COMPONENT_NAME_COLLISION_REFUSAL
+                    "{}",
+                    COMPONENT_NAME_COLLISION_REFUSAL
                 );
                 return;
             }
@@ -223,14 +224,15 @@ impl World {
                             incoming_size,
                             incoming_align,
                         });
-                        error!(
+                        warn!(
                             target: telemetry_target::ECS,
                             type_name = %type_name,
                             existing_size = existing_layout.size,
                             existing_align = existing_layout.align,
                             incoming_size,
                             incoming_align,
-                            message = COMPONENT_LAYOUT_CHANGED_REFUSAL
+                            "{}",
+                            COMPONENT_LAYOUT_CHANGED_REFUSAL
                         );
                         return;
                     }
@@ -434,7 +436,7 @@ where
         Err(error) => {
             warn!(
                 target: telemetry_target::HOT_RELOAD,
-                "[persistence] Failed to deserialize '{}': {}. Component data skipped.",
+                "[persistence] Failed to deserialize '{}': {}; the component data is skipped",
                 std::any::type_name::<T>(),
                 error
             );

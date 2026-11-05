@@ -199,14 +199,18 @@ impl pill_engine::SettingsAssetManager for AudioManager {
         if settings.ambient_sinks < 1 || settings.spatial_sinks < 1 {
             pill_core::warn!(
                 target: telemetry_target::ECS,
-                "[audio] settings refused: both sink counts must be at least 1"
+                manager = "pill_audio",
+                error = "both sink counts must be at least 1",
+                "[settings] audio settings refused; the manager keeps its values"
             );
             return SettingsOutcome::Refused;
         }
         if !settings.ear_separation.is_finite() || settings.ear_separation <= 0.0 {
             pill_core::warn!(
                 target: telemetry_target::ECS,
-                "[audio] settings refused: ear_separation must be greater than 0"
+                manager = "pill_audio",
+                error = "ear_separation must be greater than 0",
+                "[settings] audio settings refused; the manager keeps its values"
             );
             return SettingsOutcome::Refused;
         }
@@ -219,7 +223,7 @@ impl pill_engine::SettingsAssetManager for AudioManager {
                 target: telemetry_target::ECS,
                 ambient_sinks = settings.ambient_sinks,
                 spatial_sinks = settings.spatial_sinks,
-                "[audio] sink counts are fixed when the device opens; restart the host to change them"
+                "[settings] audio sink counts are fixed when the device opens; restart the host to change them"
             );
             return SettingsOutcome::Refused;
         }
@@ -237,7 +241,7 @@ impl pill_engine::SettingsAssetManager for AudioManager {
             ambient_sinks = settings.ambient_sinks,
             spatial_sinks = settings.spatial_sinks,
             ear_separation = settings.ear_separation,
-            "[audio] settings applied"
+            "[settings] audio settings applied"
         );
         SettingsOutcome::Applied
     }

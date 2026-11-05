@@ -6,8 +6,8 @@
 //! - Log that hot reloading of a project is starting, with the numbered list
 //!   of modules the host is about to build, as one multi-line entry
 //!   ([`announce_plan`]).
-//! - Log `[n/m] ------------- Building of <module> started` when one of those
-//!   builds begins ([`announce_build`]), once per module.
+//! - Log `module build started` with the module and its `step` of `steps`
+//!   when one of those builds begins ([`announce_build`]), once per module.
 //!
 //! # Design
 //!
@@ -98,8 +98,10 @@ pub(crate) fn announce_build(module: &str) -> bool {
     current.started_build_count += 1;
     info!(
         target: telemetry_target::HOT_RELOAD,
-        "{}",
-        render_step(current.started_build_count, current.total_build_count, module)
+        step = current.started_build_count,
+        steps = current.total_build_count,
+        module,
+        "module build started"
     );
     // The plan is dropped once every planned build has started; from then on,
     // any build is a reload.
@@ -134,13 +136,6 @@ fn render_plan(project_name: &str, planned_builds: &[PlannedBuild]) -> String {
     log_block(
         &format!("Hot reloading of {project_name} is starting. Modules to build:"),
         lines,
-    )
-}
-
-/// Builds the `[n/m] ------------- Building of <module> started` message.
-fn render_step(started_build_count: usize, total_build_count: usize, module_name: &str) -> String {
-    format!(
-        "[{started_build_count}/{total_build_count}] ------------- Building of {module_name} started"
     )
 }
 
@@ -204,10 +199,6 @@ mod tests {
         assert!(
             !announce_build("module_a"),
             "the plan is over once every build started"
-        );
-        assert_eq!(
-            render_step(1, 4, "pill_spline"),
-            "[1/4] ------------- Building of pill_spline started"
         );
     }
 }

@@ -121,21 +121,27 @@ impl pill_engine::SettingsAssetManager for PhysicsManager {
         if !settings.fixed_timestep.is_finite() || settings.fixed_timestep <= 0.0 {
             pill_core::warn!(
                 target: telemetry_target::ECS,
-                "[physics] settings refused: fixed_timestep must be greater than 0"
+                manager = "pill_physics",
+                error = "fixed_timestep must be greater than 0",
+                "[settings] physics settings refused; the manager keeps its values"
             );
             return SettingsOutcome::Refused;
         }
         if settings.max_substeps == 0 {
             pill_core::warn!(
                 target: telemetry_target::ECS,
-                "[physics] settings refused: max_substeps must be at least 1"
+                manager = "pill_physics",
+                error = "max_substeps must be at least 1",
+                "[settings] physics settings refused; the manager keeps its values"
             );
             return SettingsOutcome::Refused;
         }
         if settings.gravity.iter().any(|value| !value.is_finite()) {
             pill_core::warn!(
                 target: telemetry_target::ECS,
-                "[physics] settings refused: gravity must be finite"
+                manager = "pill_physics",
+                error = "gravity must be finite",
+                "[settings] physics settings refused; the manager keeps its values"
             );
             return SettingsOutcome::Refused;
         }
