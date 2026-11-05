@@ -16,6 +16,7 @@
 
 // External crates
 use pill_core::slot_map::SlotMap;
+use pill_core::telemetry::telemetry_target;
 
 // Current crate
 use crate::{
@@ -238,7 +239,7 @@ impl RendererResourceStorage {
                     );
                 }
                 Err(error) => pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "stand-in texture `{path}` is not readable; using the built-in texel: {error}"
                 ),
             }

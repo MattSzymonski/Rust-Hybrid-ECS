@@ -54,7 +54,7 @@ pub fn menu_bar(
             let mut open_menu: Option<menubar::Menu> = None;
             if session.geometry.remember_exact(MenubarSlot::Bar, bar_rect) {
                 pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     x = bar_rect.min.x,
                     y = bar_rect.min.y,
                     width = bar_rect.width(),
@@ -89,7 +89,7 @@ pub fn menu_bar(
                         .remember_exact(MenubarSlot::Title(index), title_response.rect)
                     {
                         pill_core::info!(
-                            target: pill_core::telemetry::telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             name = menu.name(),
                             x = title_response.rect.min.x,
                             y = title_response.rect.min.y,
@@ -105,7 +105,7 @@ pub fn menu_bar(
                 if session.open != Some(menu) {
                     session.open = Some(menu);
                     pill_core::info!(
-                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         menu = menu.name(),
                         "[editor] menu opened"
                     );
@@ -148,7 +148,7 @@ pub fn menu_body(
                 let entry_key = format!("{}/{}", menu.name(), label);
                 if session.entries.remember_exact(entry_key, row_response.rect) {
                     pill_core::info!(
-                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         menu = menu.name(),
                         label,
                         x = row_response.rect.min.x,
@@ -252,7 +252,7 @@ pub fn run_menu_action(
                 viewer.pending,
             );
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 action = match clipboard_action {
                     pill_editor_core::clipboard::ClipboardAction::Copy => "copy",
                     pill_editor_core::clipboard::ClipboardAction::Cut => "cut",
@@ -265,7 +265,7 @@ pub fn run_menu_action(
     }
     // Step 2: Log which menu ran which row, so a suite can follow the surface.
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         menu = menu_name,
         label,
         "[editor] menu action"

@@ -140,7 +140,7 @@ pub fn panel_windows(
                     .inner;
             if let Some(accepted) = modal_answer {
                 pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ECS,
+                    target: telemetry_target::EDITOR,
                     window = window.id.as_str(),
                     accepted,
                     "[editor] panel modal answered"

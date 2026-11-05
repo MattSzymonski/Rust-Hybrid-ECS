@@ -34,6 +34,9 @@
 //! forwards to a `#[pill_hot_fn] pub fn` beside the impl, and the body lives
 //! there.
 
+// External crates
+use pill_core::telemetry::telemetry_target;
+
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 
@@ -522,7 +525,7 @@ pub fn run_frame(
             .as_ref()
             .map_or(0, |detail| detail.components.len());
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             frames = frame_index,
             entities = snapshot.entities.len(),
             systems = snapshot.systems.len(),
@@ -706,7 +709,7 @@ pub fn run_frame(
             match request {
                 PanelCommand::OpenWindow(request) => {
                     pill_core::info!(
-                        target: pill_core::telemetry::telemetry_target::ECS,
+                        target: telemetry_target::EDITOR,
                         slot,
                         window = request.id.as_str(),
                         modal = request.modal,
@@ -716,7 +719,7 @@ pub fn run_frame(
                 }
                 PanelCommand::CloseWindow(id) => {
                     pill_core::info!(
-                        target: pill_core::telemetry::telemetry_target::ECS,
+                        target: telemetry_target::EDITOR,
                         slot,
                         window = id.as_str(),
                         "[editor] panel window closed"
@@ -775,7 +778,7 @@ pub fn run_frame(
     // window.
     if frame_index.is_multiple_of(210) || ui_micros >= SLOW_UPDATE_MICROS {
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             frames = frame_index,
             ui_us = ui_micros,
             "[editor] egui frame"
@@ -858,7 +861,7 @@ pub fn run_popout_passes(
     for tab in redock {
         if dock.redock(tab) {
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 tab = tab.name().as_str(),
                 "[editor] popout returned"
             );
@@ -1064,7 +1067,7 @@ pub fn draw_module_panel(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, sl
     let over_budget = viewer.panel_budget.record(slot, micros);
     if over_budget {
         pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             slot,
             micros,
             budget = PANEL_BUDGET_MICROS,

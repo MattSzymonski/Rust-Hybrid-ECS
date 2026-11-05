@@ -33,6 +33,7 @@ use std::time::Duration;
 use pill_core::platform::Instant;
 use pill_core::rayon;
 use pill_core::rayon::prelude::*;
+use pill_core::telemetry::telemetry_target;
 use pill_core::warn;
 
 // Current crate
@@ -504,7 +505,7 @@ impl Engine {
                     // that prints several reports in a row.
                     next_report = Some(elapsed + interval);
                     pill_core::info!(
-                        target: pill_core::telemetry::telemetry_target::ECS,
+                        target: telemetry_target::ECS,
                         "{}",
                         crate::diagnostics::EcsSnapshot::gather(world).render()
                     );
@@ -730,7 +731,7 @@ impl Engine {
             }
         }
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
+            target: telemetry_target::ECS,
             "{}",
             pill_core::telemetry::log_block("System execution graph", lines)
         );
@@ -1320,7 +1321,7 @@ impl Engine {
                         duplicates
                     );
                     warn!(
-                        target: pill_core::telemetry::telemetry_target::ECS,
+                        target: telemetry_target::ECS,
                         labels = %duplicates
                             .iter()
                             .map(ToString::to_string)

@@ -23,6 +23,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_core::warn;
 
 // Current crate
@@ -787,7 +788,7 @@ impl ComponentRegistry {
                     && self.shared_without_layout_reported.insert(component_id)
                 {
                     warn!(
-                        target: pill_core::telemetry::telemetry_target::ECS,
+                        target: telemetry_target::ECS,
                         shared_name,
                         type_name = std::any::type_name::<T>(),
                         "shared component registered without field descriptors; cross-binary agreement falls back to size and alignment, which cannot tell two same-shaped layouts apart"
@@ -809,7 +810,7 @@ impl ComponentRegistry {
                     if supersedes && !recorded.is_compatible_with(&layout) =>
                 {
                     warn!(
-                        target: pill_core::telemetry::telemetry_target::ECS,
+                        target: telemetry_target::ECS,
                         shared_name,
                         type_name = std::any::type_name::<T>(),
                         previous_size = recorded.size,

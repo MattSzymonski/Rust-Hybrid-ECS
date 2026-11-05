@@ -65,7 +65,7 @@ pub fn preferences_tab(
                         values: vec![(field.key.to_string(), buffer.clone())],
                     }]);
                     pill_core::info!(
-                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         enabled,
                         "[editor] preference applied"
                     );
@@ -98,7 +98,7 @@ pub fn preferences_tab(
             // rows show the values the save wrote rather than the edited text.
             *draft = None;
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] preferences save queued"
             );
         }
@@ -107,7 +107,7 @@ pub fn preferences_tab(
             // again, just as it does after a save.
             *draft = None;
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] preferences cancel"
             );
         }

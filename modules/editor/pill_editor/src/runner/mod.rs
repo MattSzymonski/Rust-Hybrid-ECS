@@ -241,7 +241,7 @@ fn create_overlay(
 ) -> Option<OverlaySurface> {
     if no_overlay {
         warn!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             variable = NO_OVERLAY_ENV,
             "[editor] no overlay posture: the UI is drawn on the window surface"
         );
@@ -258,7 +258,7 @@ fn create_overlay(
         Ok(overlay) => Some(overlay),
         Err(error) => {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 error = %error,
                 "[editor] composition overlay unavailable; drawing the UI on the window surface"
             );
@@ -279,7 +279,7 @@ fn create_window_overlay(
         Ok(overlay) => Some(overlay),
         Err(error) => {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 error = %error,
                 "[editor] window surface overlay unavailable; the UI will not be drawn"
             );
@@ -337,7 +337,7 @@ impl ApplicationHandler for EditorApplication {
             }
             Err(error) => {
                 pill_core::error!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     error = %error,
                     "[editor] window creation failed"
                 );
@@ -430,7 +430,7 @@ impl ApplicationHandler for EditorApplication {
                     }
                     Err(error) => {
                         pill_core::error!(
-                            target: telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             error = %error,
                             "[editor] frame failed"
                         );
@@ -683,7 +683,7 @@ impl EditorWindow {
         if self.gizmo_drag.is_none() {
             if let Some(handle) = self.handle_at(view, x, y) {
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     view,
                     handle,
                     path = "handle",
@@ -706,7 +706,7 @@ impl EditorWindow {
             request_id: id,
         });
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             view,
             x = physical_x,
             y = physical_y,
@@ -746,7 +746,7 @@ impl EditorWindow {
             last_point: start,
         });
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             view,
             navigation = camera_navigation_name(navigation),
             "[editor] camera navigation started"
@@ -803,7 +803,7 @@ impl EditorWindow {
             return;
         };
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             view = drag.view,
             navigation = camera_navigation_name(drag.navigation),
             "[editor] camera navigation ended"
@@ -815,7 +815,7 @@ impl EditorWindow {
         self.cameras[view].zoom(lines);
         self.camera_dirty[view] = true;
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             view,
             lines,
             distance = self.cameras[view].distance,
@@ -858,13 +858,13 @@ impl EditorWindow {
         self.hovered_handle = handle;
         match handle {
             Some(handle) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 view,
                 handle,
                 "[editor] gizmo hover handle"
             ),
             None => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 view,
                 "[editor] gizmo hover none"
             ),
@@ -975,7 +975,7 @@ impl EditorWindow {
                     if delta.is_some() || self.synthetic_gizmo_hold {
                         let view = self.synthetic_gizmo_view.take().unwrap_or(0);
                         info!(
-                            target: telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             handle,
                             "[editor] scene pick handle"
                         );
@@ -996,7 +996,7 @@ impl EditorWindow {
                     self.synthetic_gizmo_hold = false;
                     self.synthetic_gizmo_view = None;
                     warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         "[editor] gizmo drag refused: the press point hit no handle"
                     );
                 }
@@ -1015,7 +1015,7 @@ impl EditorWindow {
             match result.hit {
                 PickHit::Entity(entity) => {
                     info!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         entity = %entity,
                         "[editor] scene pick entity"
                     );
@@ -1041,7 +1041,7 @@ impl EditorWindow {
                             pending.push_recorded(vec![edit], label, Some(coalesce));
                         }
                         info!(
-                            target: telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             component = armed_request.component.as_str(),
                             field = armed_request.field.as_str(),
                             "[editor] inspector entity pick answered"
@@ -1050,7 +1050,7 @@ impl EditorWindow {
                         if selection.primary() != Some(entity) || selection.entities().len() != 1 {
                             selection.select_only(entity);
                             info!(
-                                target: telemetry_target::ENGINE,
+                                target: telemetry_target::EDITOR,
                                 entity = %entity,
                                 "[editor] selection changed"
                             );
@@ -1059,7 +1059,7 @@ impl EditorWindow {
                 }
                 PickHit::Nothing => {
                     info!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         "[editor] scene pick nothing"
                     );
                     if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
@@ -1068,7 +1068,7 @@ impl EditorWindow {
                 }
                 PickHit::Handle(handle) => {
                     info!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         handle,
                         "[editor] scene pick handle"
                     );
@@ -1081,7 +1081,7 @@ impl EditorWindow {
                         handle_press = Some((view, handle, press_x, press_y, None));
                     } else {
                         info!(
-                            target: telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             handle,
                             "[editor] gizmo drag skipped: the press was released"
                         );
@@ -1099,7 +1099,7 @@ impl EditorWindow {
                     self.end_gizmo_drag();
                 } else {
                     warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         "[editor] gizmo drag refused the scripted press"
                     );
                 }
@@ -1226,7 +1226,7 @@ impl EditorWindow {
             *resource = selection;
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             surfaces,
             entities = restored_entity_count,
             "[editor] recovered editor state after an unclean exit"
@@ -1293,13 +1293,13 @@ impl EditorWindow {
         }
         match selected.last() {
             Some(entity) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entity = %entity,
                 count = selected.len(),
                 "[editor] outline set"
             ),
             None => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] outline cleared"
             ),
         }
@@ -1325,7 +1325,7 @@ impl EditorWindow {
         };
         if let Some(action) = command_action(&command) {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 command = command.as_str(),
                 "[editor] shortcut ran"
             );
@@ -1338,7 +1338,7 @@ impl EditorWindow {
             }
         } else {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 command = command.as_str(),
                 "[editor] shortcut has no action yet"
             );
@@ -1399,7 +1399,7 @@ impl EditorWindow {
     fn pick_reference(&mut self, path: &str, key: &str, guid: &str) {
         let Some(document) = self.read_asset_settings(path) else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 path,
                 "[editor] asset settings edit refused"
             );
@@ -1428,7 +1428,7 @@ impl EditorWindow {
         };
         let Ok(key_path) = inspector::parse_settings_key_path(key) else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 key,
                 "[editor] asset settings edit refused"
             );
@@ -1439,7 +1439,7 @@ impl EditorWindow {
             inspector::patch_settings_inserting(&mut patched, &key_path, reference_value)
         {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 key,
                 message = message.as_str(),
                 "[editor] asset settings edit refused"
@@ -1485,7 +1485,7 @@ impl EditorWindow {
                 }
             };
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 id = request.id,
                 slot,
                 source = request.source,
@@ -1522,14 +1522,14 @@ impl EditorWindow {
         match request {
             ClipboardRequest::Write(text) => match crate::clipboard::write(&text) {
                 Ok(()) => info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     bytes = text.len(),
                     writer = crate::clipboard::process_id(),
                     "[editor] clipboard written"
                 ),
                 Err(message) => {
                     warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         message = message.as_str(),
                         "[editor] clipboard write failed"
                     );
@@ -1554,7 +1554,7 @@ impl EditorWindow {
             }
             Err(message) => {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     message = message.as_str(),
                     "[editor] clipboard read failed"
                 );
@@ -1571,7 +1571,7 @@ impl EditorWindow {
             Ok(clipboard_payload) => clipboard_payload,
             Err(message) => {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     message = message.as_str(),
                     "[editor] clipboard payload refused"
                 );
@@ -1591,7 +1591,7 @@ impl EditorWindow {
             Ok(plan) => plan,
             Err(message) => {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     message = message.as_str(),
                     "[editor] clipboard paste refused"
                 );
@@ -1610,7 +1610,7 @@ impl EditorWindow {
             self.push_toast(NoticeLevel::Warning, format!("clipboard: {}", plan.note));
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             kind = clipboard_payload.kind(),
             label = plan.label.as_str(),
             skipped = plan.skipped.len(),
@@ -1644,7 +1644,7 @@ impl EditorWindow {
                         selection.select_only(entity);
                     }
                     info!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         entity = %entity,
                         "[editor] panel selected an entity"
                     );
@@ -1668,7 +1668,7 @@ impl EditorWindow {
                 // it draws; the executable has nothing to do with them.
                 PanelCommand::OpenWindow(_) | PanelCommand::CloseWindow(_) => {}
                 PanelCommand::Log(text) => info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     text = text.as_str(),
                     "[editor] panel log"
                 ),
@@ -1687,7 +1687,7 @@ impl EditorWindow {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(component) = resolve_component_name(world, component) else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 component,
                 "[editor] panel field write: no such component"
             );
@@ -1697,7 +1697,7 @@ impl EditorWindow {
             Ok(current) => current,
             Err(_) => {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     component = component.as_str(),
                     field,
                     "[editor] panel field write: no such field"
@@ -1712,7 +1712,7 @@ impl EditorWindow {
             Ok(recorded) => recorded,
             Err(message) => {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     field,
                     message = message.as_str(),
                     "[editor] panel field write: value not understood"
@@ -1724,7 +1724,7 @@ impl EditorWindow {
             pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             component = component.as_str(),
             field,
             value = value_text,
@@ -1747,7 +1747,7 @@ impl EditorWindow {
         };
         let Ok(current) = world.read_component_field(entity, &component, field) else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 component = component.as_str(),
                 field,
                 "[editor] panel element write: no such field"
@@ -1762,7 +1762,7 @@ impl EditorWindow {
             Ok(recorded) => recorded,
             Err(message) => {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     field,
                     message = message.as_str(),
                     "[editor] panel element write: value not understood"
@@ -1774,7 +1774,7 @@ impl EditorWindow {
             pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             component = component.as_str(),
             field,
             index,
@@ -1865,7 +1865,7 @@ impl EditorWindow {
         {
             self.snapshot_changed_field = Some(changed_fields.clone());
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 fields = changed_fields.as_str(),
                 "[editor] snapshot changed"
             );
@@ -1931,7 +1931,7 @@ impl EditorWindow {
                 state.browser.open(&folder);
             }
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 path = key.as_str(),
                 "[editor] asset focused in the panel"
             );
@@ -1964,7 +1964,7 @@ impl EditorWindow {
         else {
             for path in reveal_paths {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     path = path.as_str(),
                     "[editor] reveal refused: the host knows no asset directory"
                 );
@@ -1983,14 +1983,14 @@ impl EditorWindow {
                 Ok(target) => {
                     open_in_file_manager(&target);
                     info!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         path = path.as_str(),
                         target = %target.display(),
                         "[editor] reveal"
                     );
                 }
                 Err(message) => warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     path = path.as_str(),
                     message = message.as_str(),
                     "[editor] reveal refused"
@@ -2026,14 +2026,14 @@ impl EditorWindow {
         let directory = layout_directory();
         match write_gizmo_preferences(&directory, &project_key, &gizmo_settings) {
             Ok(()) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 project = project_key.as_str(),
                 mode = ?gizmo_settings.mode,
                 snap = gizmo_settings.snap,
                 "[editor] gizmo preferences written"
             ),
             Err(error) => warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 error = error.as_str(),
                 "[editor] gizmo preferences write failed"
             ),
@@ -2073,7 +2073,7 @@ impl EditorWindow {
                     // and said out loud; folding it into an empty document
                     // silently is how a corrupt file goes unnoticed.
                     warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         error = message.as_str(),
                         "[editor] preferences refused"
                     );
@@ -2089,7 +2089,7 @@ impl EditorWindow {
         if keymap != self.keymap {
             self.keymap = keymap;
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 preset = %keymap,
                 "[editor] camera keymap"
             );
@@ -2100,7 +2100,7 @@ impl EditorWindow {
         if (hit_radius - self.gizmo_hit_radius).abs() > f32::EPSILON {
             self.gizmo_hit_radius = hit_radius;
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 hit_radius,
                 "[editor] gizmo hit radius"
             );
@@ -2135,7 +2135,7 @@ impl EditorWindow {
                 state.previews.clear_refused();
             }
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 enabled = render_previews,
                 "[editor] asset previews"
             );
@@ -2151,14 +2151,14 @@ impl EditorWindow {
         if let Some(history) = world.get_resource_mut::<CommandHistory>() {
             let trim_outcome = history.set_limits(step_cap, memory_mb * 1024 * 1024);
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 step_cap,
                 memory_mb,
                 "[editor] preferences applied"
             );
             if trim_outcome.trimmed > 0 {
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     dropped = trim_outcome.trimmed,
                     reason = ?trim_outcome.trim_reason,
                     "[editor] history trimmed"
@@ -2214,7 +2214,7 @@ impl EditorWindow {
             if self.theme_watch.legacy_logged.as_deref() != Some(name.as_str()) {
                 self.theme_watch.legacy_logged = Some(name.clone());
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     "[editor] theme name '{name}' is not a file; no user layer"
                 );
             }
@@ -2248,7 +2248,7 @@ impl EditorWindow {
                         .is_new_refusal("project_settings", &message)
                     {
                         warn!(
-                            target: telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             "[editor] theme refused layer=project: {message}"
                         );
                     }
@@ -2322,7 +2322,7 @@ impl EditorWindow {
                         let refusal = error.to_string();
                         if self.theme_watch.is_new_refusal("user", &refusal) {
                             warn!(
-                                target: telemetry_target::ENGINE,
+                                target: telemetry_target::EDITOR,
                                 "[editor] theme refused layer=user: {refusal}"
                             );
                         }
@@ -2333,7 +2333,7 @@ impl EditorWindow {
                     let refusal = format!("`{}` could not be read: {error}", path.display());
                     if self.theme_watch.is_new_refusal("user", &refusal) {
                         warn!(
-                            target: telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             "[editor] theme refused layer=user: {refusal}"
                         );
                     }
@@ -2377,7 +2377,7 @@ impl EditorWindow {
             let slot = format!("merge:{layer}");
             if self.theme_watch.is_new_refusal(&slot, &message.to_string()) {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     "[editor] theme refused layer={layer}: {message}"
                 );
             }
@@ -2405,7 +2405,7 @@ impl EditorWindow {
         self.theme_fonts = self.theme_watch.fonts.clone();
         self.theme_generation = self.theme_generation.wrapping_add(1);
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             layers = %layers_text(&self.theme_layers),
             generation = self.theme_generation,
             "[editor] theme resolved"
@@ -2520,7 +2520,7 @@ impl EditorWindow {
             Err(refusal) => {
                 if self.theme_watch.is_new_refusal(&slot, &refusal) {
                     warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         "[editor] font refused: {refusal}"
                     );
                 }
@@ -2589,7 +2589,7 @@ impl EditorWindow {
                     let refusal = message.to_string();
                     if self.theme_watch.is_new_refusal("project", &refusal) {
                         warn!(
-                            target: telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             "[editor] theme refused layer=project: {refusal}"
                         );
                     }
@@ -2605,7 +2605,7 @@ impl EditorWindow {
                 let refusal = format!("`{path}` did not load: {error}");
                 if self.theme_watch.is_new_refusal("project", &refusal) {
                     warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         "[editor] theme refused layer=project: {refusal}"
                     );
                 }
@@ -2662,7 +2662,7 @@ impl EditorWindow {
             (problems, preset, overrides, conflicts)
         };
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             preset = %preset,
             overrides,
             "[editor] keybindings applied"
@@ -2671,12 +2671,12 @@ impl EditorWindow {
         // rebinding that silently stops working is exactly what the overlay
         // is for.
         for problem in problems {
-            warn!(target: telemetry_target::ENGINE, "{}", problem.as_str());
+            warn!(target: telemetry_target::EDITOR, "{}", problem.as_str());
             self.push_toast(NoticeLevel::Warning, problem);
         }
         for (chord, commands) in conflicts {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 chord = chord.as_str(),
                 commands = commands.as_str(),
                 "[editor] keybinding conflict"
@@ -2700,7 +2700,7 @@ impl EditorWindow {
     /// or empty preference falls back to `code`.
     fn open_problem(&mut self, index: usize) {
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             index,
             problems = self.notices.problems.len(),
             "[editor] problem open requested"
@@ -2732,13 +2732,13 @@ impl EditorWindow {
             .spawn()
         {
             Ok(_child) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 command = command.as_str(),
                 target = target.as_str(),
                 "[editor] problem opened"
             ),
             Err(error) => warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 command = command.as_str(),
                 error = %error,
                 "[editor] problem open failed"
@@ -2800,7 +2800,7 @@ impl EditorWindow {
             return;
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             title = title.as_str(),
             "[editor] scene title"
         );
@@ -2821,7 +2821,7 @@ impl EditorWindow {
             .map(|directory| directory.to_path_buf())
         else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 path,
                 "[editor] drag out refused: no asset directory"
             );
@@ -2838,20 +2838,20 @@ impl EditorWindow {
         };
         match crate::drag_out::start(&absolute.to_string_lossy()) {
             crate::drag_out::DragOutOutcome::Dropped(effect) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 path = %absolute.display(),
                 effect = effect.0,
                 "[editor] drag out finished"
             ),
             crate::drag_out::DragOutOutcome::Cancelled => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 path = %absolute.display(),
                 "[editor] drag out cancelled"
             ),
             // A drag needs the pointer's button down; without it the modal
             // loop would never see the input that ends it.
             crate::drag_out::DragOutOutcome::NoButtonHeld => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 path = %absolute.display(),
                 "[editor] drag out skipped: no button held"
             ),
@@ -2876,7 +2876,7 @@ impl EditorWindow {
             return;
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = notices.len(),
             "[editor] notices drained"
         );
@@ -2895,7 +2895,7 @@ impl EditorWindow {
                     // what the panel holds and where each row would jump to.
                     for row in rows.iter().take(10) {
                         info!(
-                            target: telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             module = row.module.as_str(),
                             file = row.problem.file.as_deref().unwrap_or(""),
                             line = row.problem.line.unwrap_or(0),
@@ -2913,7 +2913,7 @@ impl EditorWindow {
                     // request arrives this same frame.
                     if self.panel_markers.remove(module).is_some() {
                         info!(
-                            target: telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             module = module.as_str(),
                             "[editor] panel source reloaded"
                         );
@@ -2965,7 +2965,7 @@ impl EditorWindow {
         match world.get_resource_mut::<EditorNotices>() {
             Some(resource) => *resource = self.notices.clone(),
             None => warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] notices resource missing"
             ),
         }
@@ -2986,7 +2986,7 @@ impl EditorWindow {
         match world.get_resource_mut::<EditorNotices>() {
             Some(resource) => *resource = self.notices.clone(),
             None => warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] notices resource missing"
             ),
         }
@@ -2997,7 +2997,7 @@ impl EditorWindow {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(state) = world.get_resource_mut::<EguiShellState>() else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] undock needs the shell module's state"
             );
             return;
@@ -3008,7 +3008,7 @@ impl EditorWindow {
         let dock = state.dock.state_mut();
         let Some(location) = dock.find_tab(&tab) else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 tab = tab.name(),
                 "[editor] undock needs the tab in the dock"
             );
@@ -3017,7 +3017,7 @@ impl EditorWindow {
         let rect = egui::Rect::from_min_size(egui::pos2(220.0, 160.0), egui::vec2(360.0, 480.0));
         let index = dock.detach_tab(location, rect);
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             tab = tab.name(),
             surface = index.0,
             "[editor] tab undocked"
@@ -3032,14 +3032,14 @@ impl EditorWindow {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(state) = world.get_resource_mut::<EguiShellState>() else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] tab activation needs the shell module's state"
             );
             return;
         };
         if pill_editor_core::layout::activate_tab(state.dock.state_mut(), tab) {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 tab = tab.name(),
                 "[editor] tab activated"
             );
@@ -3049,7 +3049,7 @@ impl EditorWindow {
             // than rewriting their arrangement.
             state.dock.state_mut().push_to_focused_leaf(tab);
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 tab = tab.name(),
                 "[editor] module tab docked"
             );
@@ -3059,7 +3059,7 @@ impl EditorWindow {
             state.dock.state_mut().push_to_focused_leaf(tab);
             pill_editor_core::layout::activate_tab(state.dock.state_mut(), tab);
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 tab = tab.name(),
                 "[editor] scene tab docked"
             );
@@ -3070,7 +3070,7 @@ impl EditorWindow {
             state.dock.state_mut().push_to_focused_leaf(tab);
             pill_editor_core::layout::activate_tab(state.dock.state_mut(), tab);
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 tab = tab.name(),
                 "[editor] tab docked"
             );
@@ -3112,7 +3112,7 @@ impl EditorWindow {
         }
         if quit_requested {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] quit requested"
             );
             self.request_quit();
@@ -3146,7 +3146,7 @@ impl EditorWindow {
             let surfaces = state.dock.state().surfaces_count();
             pill_editor_core::layout::save(&state.dock);
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 surfaces,
                 "[editor] layout saved"
             );
@@ -3184,7 +3184,7 @@ impl SceneView {
         let window = SurfaceWindow::open(event_loop, main, &title, "scene")
             .map_err(|error| {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     error = %error,
                     "[editor] scene view window refused"
                 )
@@ -3216,14 +3216,14 @@ impl SceneView {
                 host.set_surface_camera(self.surface_id, Some(camera_binding(camera)));
                 if rebound {
                     info!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         surface = self.surface_id.0,
                         popped = self.popped,
                         "[editor] scene view rebound"
                     );
                 } else {
                     info!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         surface = self.surface_id.0,
                         detached = self.window.detached,
                         "[editor] scene surface attached"
@@ -3231,7 +3231,7 @@ impl SceneView {
                 }
             }
             Err(error) => warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 surface = self.surface_id.0,
                 error = %error,
                 "[editor] scene surface refused; the scene view stays empty"
@@ -3446,7 +3446,7 @@ impl SurfaceWindow {
         let child_attributes = child_attributes.flatten();
         if force_detached {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] child {kind} window forced off; using the detached fallback"
             );
         }
@@ -3463,7 +3463,7 @@ impl SurfaceWindow {
                 }
                 Err(error) => {
                     warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         error = %error,
                         "[editor] child {kind} window refused, using the detached fallback"
                     );

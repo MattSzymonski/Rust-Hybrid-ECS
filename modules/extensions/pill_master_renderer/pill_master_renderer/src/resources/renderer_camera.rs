@@ -26,6 +26,7 @@
 
 // External crates
 use pill_core::math::{Matrix4f, Vector3f, Vector4f};
+use pill_core::telemetry::telemetry_target;
 use wgpu::util::DeviceExt;
 
 // Current crate
@@ -247,7 +248,7 @@ impl RendererCamera {
         match substitution_report {
             Some(reason) if !self.projection_reported => {
                 pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "camera projection has unusable values ({reason}); the renderer substitutes defaults"
                 );
                 self.projection_reported = true;

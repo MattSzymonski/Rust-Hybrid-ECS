@@ -59,6 +59,7 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 
 // Current crate
 use crate::component::{Component, ComponentId, ComponentMask, ComponentTicks};
@@ -1985,7 +1986,7 @@ impl Archetype {
     #[cold]
     pub fn print_info(&self, registry: &crate::component::ComponentRegistry) {
         let summary = self.get_archetype_info(registry);
-        pill_core::info!(target: pill_core::telemetry::telemetry_target::ECS, "{}", summary);
+        pill_core::info!(target: telemetry_target::ECS, "{}", summary);
     }
 
     /// Estimates the memory footprint of this archetype in bytes.

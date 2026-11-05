@@ -31,6 +31,7 @@
 use std::sync::Arc;
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_editor_core::egui::epaint::ClippedPrimitive;
 use pill_editor_core::egui::TexturesDelta;
 use winit::window::Window;
@@ -252,7 +253,7 @@ impl OverlaySurface {
         if let Some(composition) = &self.composition {
             if let Err(error) = composition.commit() {
                 pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::ECS,
+                    target: telemetry_target::EDITOR,
                     "[editor] overlay commit failed after resize: {error}"
                 );
             }

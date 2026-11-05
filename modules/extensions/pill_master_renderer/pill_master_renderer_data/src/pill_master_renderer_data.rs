@@ -52,6 +52,7 @@ pub mod shader_hot_reload;
 // Standard library
 use std::path::Path;
 // External crates
+use pill_core::telemetry::telemetry_target;
 pub use pill_engine::AssetLoader;
 use pill_engine::{pill_module, AssetManager, Engine, World};
 pub use pill_renderer_api::frame::{
@@ -283,7 +284,7 @@ fn install_default_pbr_pipeline(world: &mut World) {
             }
         }
         Err(error) => pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             "the default PBR pipeline was not installed: {error}"
         ),
     }

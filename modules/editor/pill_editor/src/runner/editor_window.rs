@@ -461,7 +461,7 @@ impl EditorWindow {
         );
         if let Some(overlay) = &overlay {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 window_surface = matches!(overlay.mode(), OverlayMode::Window),
                 "[editor] overlay posture"
             );
@@ -474,7 +474,7 @@ impl EditorWindow {
         let game_surface = SurfaceWindow::open(event_loop, &window, "Pill Editor Game", "game")
             .map_err(|error| {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     error = %error,
                     "[editor] game view window refused; the primary surface stays on the main window"
                 )
@@ -499,7 +499,7 @@ impl EditorWindow {
             primary_size.1,
         )?;
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             detached = game_surface.as_ref().is_some_and(|game| game.detached),
             width = primary_size.0,
             height = primary_size.1,
@@ -691,13 +691,13 @@ impl EditorWindow {
                 let cadence = Cadence::from_environment();
                 if cadence.continuous() {
                     info!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         variable = pill_editor_core::cadence::CONTINUOUS_REDRAW_ENV,
                         "[editor] redraw continuous"
                     );
                 } else {
                     info!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         idle_poll_ms = pill_editor_core::cadence::IDLE_POLL.as_millis() as u64,
                         "[editor] redraw on demand"
                     );
@@ -716,7 +716,7 @@ impl EditorWindow {
         };
         editor.place_views();
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             width = size.0,
             height = size.1,
             "[editor] window created"

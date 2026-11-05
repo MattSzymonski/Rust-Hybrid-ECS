@@ -20,6 +20,9 @@
 //! reused while live rows still reference it would make two component sets
 //! share one column.
 
+// External crates
+use pill_core::telemetry::telemetry_target;
+
 use super::*;
 
 // =============================================================================
@@ -92,7 +95,7 @@ impl World {
             Ok(component_id) => component_id,
             Err(error) => {
                 error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     type_name = %type_name,
                     error = %error,
                     "component type name is ambiguous; treating it as unresolved"

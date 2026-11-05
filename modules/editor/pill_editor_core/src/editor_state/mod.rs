@@ -29,6 +29,7 @@
 use std::path::{Path, PathBuf};
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{Engine, Entity, FieldValue, SystemOwner};
 
@@ -1285,7 +1286,7 @@ fn warn_left_behind(left_behind_paths: &[String]) {
         return;
     }
     pill_core::warn!(
-        target: pill_core::telemetry::telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         paths = left_behind_paths.join(","),
         "[editor] rollback left files behind"
     );

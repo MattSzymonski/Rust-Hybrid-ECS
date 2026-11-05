@@ -155,7 +155,7 @@ pub fn open_create(
     // would be refused when it runs.
     if is_read_only_key(assets, &folder) {
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             folder,
             "[editor] create refused: a module's resources are read-only"
         );
@@ -174,7 +174,7 @@ pub fn open_create(
         overwrite: None,
     });
     pill_core::info!(
-        target: telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         dialog = "create",
         folder = folder.as_str(),
         "[editor] asset dialog opened"
@@ -202,7 +202,7 @@ pub fn open_create_scene(
         .find(|info| info.extension.eq_ignore_ascii_case("scene"))
     else {
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             "[editor] no scene type is registered"
         );
         return;
@@ -218,7 +218,7 @@ pub fn open_create_scene(
         *chosen_kind = kind;
     }
     pill_core::info!(
-        target: telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         dialog = "create scene",
         "[editor] asset dialog opened"
     );
@@ -275,7 +275,7 @@ pub fn open_rename(
 ) {
     let Some(row) = selected_row(selection, assets).filter(|row| !browser::is_folder(row)) else {
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             "[editor] rename asset needs a selected file"
         );
         return;
@@ -287,7 +287,7 @@ pub fn open_rename(
         name: stem.to_string(),
     });
     pill_core::info!(
-        target: telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         dialog = "rename",
         from = row.path.as_str(),
         "[editor] asset dialog opened"
@@ -315,14 +315,14 @@ pub fn submit_create(
     }) = dialog.as_ref()
     else {
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             "[editor] create asset without its dialog"
         );
         return false;
     };
     if type_name.is_empty() || name.trim().is_empty() {
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             "[editor] create asset needs a type and a name"
         );
         return false;
@@ -361,7 +361,7 @@ pub fn submit_create(
     }
     // Step 3: report the command and close the dialog.
     pill_core::info!(
-        target: telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         type_name = type_name.as_str(),
         name = name.as_str(),
         "[editor] asset create queued"
@@ -394,7 +394,7 @@ pub fn submit_rename(
     // Step 1: the dialog must exist and name something.
     let Some(AssetDialog::Rename { from, name }) = dialog.as_ref() else {
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             "[editor] rename asset without its dialog"
         );
         return false;
@@ -403,14 +403,14 @@ pub fn submit_rename(
     let typed_name = name.trim().to_string();
     if from.is_empty() || typed_name.is_empty() {
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             "[editor] rename asset needs a name"
         );
         return false;
     }
     if typed_name.contains(['/', '\\']) {
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             name = typed_name.as_str(),
             "[editor] rename asset refuses a path separator"
         );
@@ -450,7 +450,7 @@ pub fn submit_rename(
         None,
     );
     pill_core::info!(
-        target: telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         from = from.as_str(),
         to = to.as_str(),
         "[editor] asset rename queued"
@@ -470,7 +470,7 @@ pub fn cancel(dialog: &mut Option<AssetDialog>) -> bool {
     };
     *dialog = None;
     pill_core::info!(
-        target: telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         dialog = dialog_kind,
         "[editor] asset dialog closed"
     );
@@ -487,7 +487,7 @@ pub fn queue_delete(pending: &mut PendingEditorCommands, path: &str) {
         None,
     );
     pill_core::info!(
-        target: telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         path,
         "[editor] asset delete queued"
     );
@@ -504,7 +504,7 @@ pub fn queue_write_meta(pending: &mut PendingEditorCommands, path: &str) {
         None,
     );
     pill_core::info!(
-        target: telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         path,
         "[editor] asset meta queued"
     );
@@ -524,7 +524,7 @@ pub fn queue_move(pending: &mut PendingEditorCommands, from: &str, to: &str) {
         None,
     );
     pill_core::info!(
-        target: telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         from,
         to,
         "[editor] asset move queued"
@@ -570,7 +570,7 @@ pub fn delete_selection(
 ) -> bool {
     let Some(row) = selected_row(selection, assets).filter(|row| !browser::is_folder(row)) else {
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             "[editor] delete asset needs a selected file"
         );
         return false;
@@ -578,7 +578,7 @@ pub fn delete_selection(
     if !can_delete(selection, assets) {
         // The row is a file, so a read-only tree is the only refusal left.
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             path = row.key().as_str(),
             "[editor] delete refused: a module's resources are read-only"
         );
@@ -602,7 +602,7 @@ pub fn write_meta_selection(
 ) -> bool {
     let Some(row) = selected_row(selection, assets).filter(|row| takes_meta_write(row)) else {
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             "[editor] write asset meta needs a sourced file without one"
         );
         return false;
@@ -611,7 +611,7 @@ pub fn write_meta_selection(
         // The row takes a sidecar, so a read-only tree is the only refusal
         // left.
         pill_core::warn!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             path = row.key().as_str(),
             "[editor] meta refused: a module's resources are read-only"
         );
@@ -731,7 +731,7 @@ pub fn reveal_target(asset_root: &Path, path: &str) -> Result<PathBuf, String> {
 fn close_dialog(dialog: &mut Option<AssetDialog>, dialog_kind: &str) {
     *dialog = None;
     pill_core::info!(
-        target: telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         dialog = dialog_kind,
         "[editor] asset dialog closed"
     );

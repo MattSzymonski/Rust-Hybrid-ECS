@@ -33,6 +33,7 @@ use std::{
 };
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_core::{debug, info, warn};
 use pill_engine::AssetManager;
 
@@ -459,7 +460,7 @@ impl GpuChain {
                             // Per frame, so it stays at debug: the chain's own
                             // line already reports the pass's draw count.
                             debug!(
-                                target: pill_core::telemetry::telemetry_target::RENDERING,
+                                target: telemetry_target::RENDERING,
                                 pass = pass.name.as_str(),
                                 instances = unclaimed
                                     .iter()
@@ -580,7 +581,7 @@ impl GpuChain {
 
         // Logged once per change, like the renderer's other diagnostics: this
         // line is what a reader has when the window shows the wrong thing.
-        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Pass chain: {chain_signature}");
+        info!(target: telemetry_target::RENDERING, "Pass chain: {chain_signature}");
         self.chain_log = Some(chain_signature);
     }
 
@@ -591,7 +592,7 @@ impl GpuChain {
         }
 
         // Logged once per change, like the renderer's other diagnostics.
-        warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "Pass {pass_name} is not drawn: {reason}");
+        warn!(target: telemetry_target::RENDERING, "Pass {pass_name} is not drawn: {reason}");
     }
 }
 
@@ -719,7 +720,7 @@ fn build_pass(
         match context.texture_handles.handle(key.0) {
             Some(handle) => textures.push((slot.clone(), handle)),
             None => warn!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
+                target: telemetry_target::RENDERING,
                 "Pass {} binds texture `{slot}`, which is not loaded; the shader's default is used",
                 pass.name
             ),
@@ -867,7 +868,7 @@ fn ensure_offscreen_targets(
                 // failure path would produce.
                 Err(error) => {
                     warn!(
-                        target: pill_core::telemetry::telemetry_target::RENDERING,
+                        target: telemetry_target::RENDERING,
                         "offscreen target `{name}` was not created: {error}"
                     );
                 }

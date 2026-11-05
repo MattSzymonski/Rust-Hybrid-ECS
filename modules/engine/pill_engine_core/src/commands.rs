@@ -59,6 +59,7 @@
 //! ```
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_core::warn;
 
 // Current crate
@@ -474,7 +475,7 @@ impl CommandQueue {
             for err in &errors {
                 crate::profile_error!("deferred command failed: {}", err);
                 warn!(
-                    target: pill_core::telemetry::telemetry_target::ECS,
+                    target: telemetry_target::ECS,
                     error = %err,
                     "deferred command failed"
                 );

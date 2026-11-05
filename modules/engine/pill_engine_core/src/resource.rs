@@ -41,6 +41,9 @@ use std::any::TypeId;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
+// External crates
+use pill_core::telemetry::telemetry_target;
+
 // Current crate
 use pill_core::error;
 
@@ -794,7 +797,7 @@ impl ErasedResource {
         // case through, so reaching it means a caller made a mistake.
         if function_table.foreign != self.type_id.is_none() {
             error!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 foreign_table = function_table.foreign,
                 foreign_box = self.type_id.is_none(),
                 "a resource's function table disagrees with the ownership its box was created with; keeping the existing table"

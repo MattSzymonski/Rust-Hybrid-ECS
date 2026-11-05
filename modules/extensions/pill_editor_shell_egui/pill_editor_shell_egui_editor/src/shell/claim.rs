@@ -75,7 +75,7 @@ pub fn claim_shell_context(
     }
     let context_claim = session.claim_generation();
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         entries = context_claim.main_entries,
         windows = session.popout_contexts.len(),
         cleared = context_claim.popout_windows,
@@ -103,7 +103,7 @@ pub fn claim_context_once(claimed: &AtomicBool, context: &egui::Context) -> bool
         entry_count_before_clear
     });
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         entries = entry_count,
         "[editor] shell context claimed"
     );

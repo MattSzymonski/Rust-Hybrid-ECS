@@ -22,6 +22,9 @@
 //! `TypeId`, an identity derived from a name, or a validated layout - and all
 //! three use the same column type.
 
+// External crates
+use pill_core::telemetry::telemetry_target;
+
 use super::*;
 
 // =============================================================================
@@ -91,7 +94,7 @@ impl World {
                     .unwrap_or("<unnamed>")
                     .to_owned();
                 error!(
-                    target: pill_core::telemetry::telemetry_target::ECS,
+                    target: telemetry_target::ECS,
                     component = %component_name,
                     query = query_type,
                     declared_hash = format!("{declared_hash:#018x}"),
@@ -260,7 +263,7 @@ impl World {
                 // instead of panicking, and `register_all_components` makes the
                 // whole reload fail when it drains the record.
                 error!(
-                    target: pill_core::telemetry::telemetry_target::ECS,
+                    target: telemetry_target::ECS,
                     type_name = %type_name,
                     error = %error,
                     remaining = self.component_registry.available_slots(),
@@ -275,7 +278,7 @@ impl World {
         let remaining_slot_count = self.component_registry.available_slots();
         if remaining_slot_count <= REGISTRATION_HEADROOM_WARNING_THRESHOLD {
             warn!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 remaining = remaining_slot_count,
                 type_name = %type_name,
                 "component-type headroom is low; the 128-type ceiling is approaching"
@@ -319,7 +322,7 @@ impl World {
             // startup and reload logs, not only in the periodic ECS report,
             // which needs frames to run.
             info!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 shared,
                 bit,
                 "component registered under a declared shared identity"

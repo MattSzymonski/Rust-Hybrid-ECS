@@ -38,6 +38,7 @@ mod loaded {
     // External crates
     use pill_core::error::{HostError, LibraryError};
     use pill_core::platform::Instant;
+    use pill_core::telemetry::telemetry_target;
     use pill_core::{error, info};
     use pill_engine::{Engine, EngineApi, SystemOwner};
 
@@ -449,7 +450,7 @@ mod loaded {
                 // instant.
                 if let Some(summary) = project.finish_reload_timing() {
                     info!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        target: telemetry_target::HOT_RELOAD,
                         total_ms = format!("{:.1}", summary.total_ms).as_str(),
                         detect_ms = format!("{:.1}", summary.detect_ms).as_str(),
                         queue_ms = format!("{:.1}", summary.queue_ms).as_str(),
@@ -471,7 +472,7 @@ mod loaded {
             }
             Err(error) => {
                 error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     error = %error,
                     "the managed reload poll failed; the project may now be running without its systems"
                 );
@@ -504,7 +505,7 @@ mod loaded {
                 FastCompileOutcome::Failed { diagnostics } => BuildOutcome::Failed { diagnostics },
                 FastCompileOutcome::Unavailable { reason } => {
                     info!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        target: telemetry_target::HOT_RELOAD,
                         reason = reason.as_str(),
                         "falling back to a full C# build"
                     );
@@ -513,7 +514,7 @@ mod loaded {
             },
             None => {
                 info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     reason = "no in-process compiler is loaded",
                     "falling back to a full C# build"
                 );

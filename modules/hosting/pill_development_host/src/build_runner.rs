@@ -34,6 +34,7 @@ use pill_core::debug;
 use pill_core::error::BuildError;
 use pill_core::info;
 use pill_core::platform::Instant;
+use pill_core::telemetry::telemetry_target;
 use pill_core::warn;
 
 // Current crate
@@ -798,13 +799,13 @@ impl VerboseCapture {
             let cache_path = crate::hot_patch::flags_cache_path(&self.workspace_root, &name);
             match line.save(&cache_path, build_command) {
                 Ok(()) => debug!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     module = name.as_str(),
                     cache = %cache_path.display(),
                     "captured the patch compiler flags from this build"
                 ),
                 Err(error) => debug!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     module = name.as_str(),
                     error = %error,
                     "could not cache the patch compiler flags; the next patch will re-capture"
@@ -1169,7 +1170,7 @@ pub(crate) fn join_process_tree(tree: Option<&BuildProcessTree>, child: &Child) 
     };
     if !tree.join(child.id()) {
         warn!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             process_id = child.id(),
             "could not join the build process to its job object; a cancelled build will only stop the direct child"
         );
@@ -1198,7 +1199,7 @@ pub(crate) fn stop_process_tree(tree: Option<&BuildProcessTree>, child: &mut Chi
     let _ = child.wait();
     if !tree.wait_until_empty(Instant::now() + TREE_DRAIN_TIMEOUT) {
         warn!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             active_processes = tree.active_processes(),
             "a stopped build's process tree is still running; the next build may block on cargo's package lock or see its staged artifacts rewritten"
         );
@@ -1437,7 +1438,7 @@ pub(crate) fn build_csharp_compiler(workspace_root: &Path) -> Result<PathBuf, Bu
             crate::config::CSHARP_COMPILER_ASSEMBLY_NAME
         ));
     info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        target: telemetry_target::HOT_RELOAD,
         "building the in-process C# compiler"
     );
     let build_command = vec![
@@ -1482,7 +1483,7 @@ pub(crate) fn build_project_module(
     // build is logged here instead, and the suites wait for that line.
     if !crate::build_progress::announce_build(&project_config.name) {
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             module = project_config.name.as_str(),
             "building project module"
         );
@@ -1721,7 +1722,7 @@ fn stage_engine_dylib(workspace_root: &Path) {
         }
         if let Err(error) = std::fs::copy(source, destination) {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 error = %error,
                 dylib = %file_name,
                 "could not stage the module-world engine dylib into the hot-load directory"
@@ -1885,7 +1886,7 @@ pub(crate) fn stage_shared_dependency_rlibs(workspace_root: &Path) -> usize {
     }
     if copied_count > 0 {
         debug!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             copied = copied_count,
             directory = %staged_directory.display(),
             "staged shared dependency rlibs for patch linking"
@@ -2064,7 +2065,7 @@ pub(crate) fn build_extension_batch(
         ));
     }
     info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        target: telemetry_target::HOT_RELOAD,
         modules = package_count,
         "building every module in one cargo invocation"
     );
@@ -2074,7 +2075,7 @@ pub(crate) fn build_extension_batch(
     let artifact_directory = workspace_root.join(crate::config::module_build_artifact_directory());
     if !artifact_directory.exists() {
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             directory = %artifact_directory.display(),
             "cold module build tree: the startup batch compiles every module from scratch"
         );
@@ -2109,7 +2110,7 @@ pub(crate) fn build_extension_batch(
         }
         Err(error) => {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 error = %error,
                 "the startup batch build failed; each module builds on its own"
             );
@@ -2136,7 +2137,7 @@ fn take_batch_validation(module_name: &str, watch_directory: &Path) -> bool {
         }
         if source_newer_than(watch_directory, validation.completed_at) {
             pill_core::debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = module_name,
                 "source changed after the startup batch; the module builds on its own"
             );
@@ -2215,7 +2216,7 @@ pub(crate) fn build_extension(
     // build is logged here instead, and the suites wait for that line.
     if !crate::build_progress::announce_build(&extension_config.name) {
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             module = extension_config.name.as_str(),
             "building extension"
         );

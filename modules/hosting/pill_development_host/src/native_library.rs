@@ -45,6 +45,7 @@ use libloading::os::windows as windows_loader;
 use libloading::{Library, Symbol};
 use pill_core::error::{LibraryError, ModuleError};
 use pill_core::platform::Instant;
+use pill_core::telemetry::telemetry_target;
 use pill_core::{debug, info, warn};
 use pill_engine::component_registry::{
     PillFieldAccessorDescriptor, PillMethodDescriptor, PillValueTypeDescriptor,
@@ -392,7 +393,7 @@ fn diagnose_load_failure(
     match &explanation {
         LoadFailureExplanation::MissingImport(unresolved) => {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = module_name,
                 dll = unresolved.dll.as_str(),
                 symbol = unresolved.symbol.as_str(),
@@ -405,7 +406,7 @@ fn diagnose_load_failure(
             // differ, and then only the loader's own message says why. That
             // message is logged here because the returned error replaces it.
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = module_name,
                 error = %error,
                 "load failed while the engine dylibs differ; the loader reported this"
@@ -797,12 +798,12 @@ impl NativeLibrary {
                     .or_else(|_| std::fs::copy(&symbol_source, &symbol_target).map(|_| ()));
                 match symbol_staging_result {
                     Ok(()) => debug!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        target: telemetry_target::HOT_RELOAD,
                         path = %symbol_target.display(),
                         "staged module debug symbols beside the loaded copy"
                     ),
                     Err(error) => debug!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        target: telemetry_target::HOT_RELOAD,
                         path = %symbol_source.display(),
                         %error,
                         "module debug symbols not staged; module code will have no debugger symbols"
@@ -815,7 +816,7 @@ impl NativeLibrary {
         // `NativeLibrary` must delete it again; the guard owns that duty.
         let mut temporary_copy = TemporaryCopy::new(temporary_path);
         debug!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             path = %temporary_copy.path().display(),
             "copied project DLL"
         );
@@ -881,7 +882,7 @@ impl NativeLibrary {
         temporary_copy.disarm();
         analytics::record_load(module_name, load_started.elapsed().as_secs_f64() * 1000.0);
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             module = module_name,
             abi_version = %native_library
                 .abi_version
@@ -1533,7 +1534,7 @@ impl Drop for NativeLibrary {
         // in this drop, so the image is named before it is unmapped. The last
         // line printed then identifies which image the process died in.
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             path = %self.temporary_path.display(),
             "unmapping module copy"
         );
@@ -1554,7 +1555,7 @@ impl Drop for NativeLibrary {
 fn remove_temporary_file(path: &Path) {
     if let Err(error) = std::fs::remove_file(path) {
         warn!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             "Failed to remove temporary DLL {}: {error}",
             path.display()
         );
@@ -1598,7 +1599,7 @@ fn remove_generation_directory(directory: &Path) {
     let _ = std::fs::remove_dir(directory);
     if kept > 0 {
         debug!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             path = %directory.display(),
             kept,
             "generation directory kept the files this process still maps"
@@ -1759,7 +1760,7 @@ fn remove_staging_directory(path: &Path, pid: u32, reason: &str) {
         Ok(()) => {
             if pid != std::process::id() {
                 info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     "Cleaned up temporary files from process {pid} ({reason})"
                 );
             }
@@ -1767,7 +1768,7 @@ fn remove_staging_directory(path: &Path, pid: u32, reason: &str) {
         Err(error) => {
             if pid == std::process::id() {
                 warn!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     "Could not remove temporary directory {}: {error}",
                     path.display()
                 );
@@ -1775,7 +1776,7 @@ fn remove_staging_directory(path: &Path, pid: u32, reason: &str) {
                 // The removal can fail simply because another live host still
                 // holds the files. That is why it is logged as a note here.
                 info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     "Temporary directory {} left in place (possibly still in use): {error}",
                     path.display()
                 );

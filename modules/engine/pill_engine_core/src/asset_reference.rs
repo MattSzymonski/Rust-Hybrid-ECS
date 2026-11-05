@@ -27,6 +27,7 @@
 use std::marker::PhantomData;
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use trait_type_map::TraitAccessible;
 
 // Current crate
@@ -113,8 +114,10 @@ impl<T: Asset> AssetReference<T> {
         if let Some(guid) = self.guid {
             if crate::saved_references::first_report_of(guid) {
                 pill_core::warn!(
-                    "asset reference {guid} ({}) resolves to no loaded asset; using the invalid handle",
-                    std::any::type_name::<T>()
+                    target: telemetry_target::RESOURCES,
+                    guid = %guid,
+                    asset_type = std::any::type_name::<T>(),
+                    "asset reference resolves to no loaded asset; using the invalid handle"
                 );
             }
         }

@@ -40,7 +40,7 @@ use super::*;
 /// timing out.
 fn reject_scripted_command(command: &str, reason: &str) {
     warn!(
-        target: telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         command,
         reason,
         "[editor] scripted command rejected"
@@ -102,7 +102,7 @@ impl EditorWindow {
                 });
                 self.scripted_drag = None;
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     from_x = from.0,
                     from_y = from.1,
                     to_x = to.0,
@@ -117,7 +117,7 @@ impl EditorWindow {
     /// with its kind and flags. A suite reads the listing from these lines.
     pub(super) fn dump_assets(&mut self) {
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = self.asset_entries.len(),
             "[test] assets"
         );
@@ -125,7 +125,7 @@ impl EditorWindow {
             // The suites' patterns read the other fields first, in this order,
             // so the root and the read-only flag come last.
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 path = row.key().as_str(),
                 kind = row.kind.text(),
                 standalone = row.standalone,
@@ -150,14 +150,14 @@ impl EditorWindow {
         };
         let browser_rows = pill_editor_core::browser::children(&self.asset_entries, &folder);
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             folder = folder.as_str(),
             count = browser_rows.len(),
             "[test] browser"
         );
         for row in browser_rows {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 path = row.path.as_str(),
                 kind = row.kind.text(),
                 "[test] browser item"
@@ -173,7 +173,7 @@ impl EditorWindow {
     pub(super) fn dump_cadence(&mut self) {
         let paused = self.host.host().engine().systems_paused();
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             continuous = self.cadence.continuous(),
             frames = self.cadence.frames(),
             demanded = self.cadence.demanded(),
@@ -212,7 +212,7 @@ impl EditorWindow {
             .map(|line| format!("{} {}: {}", line.level_name(), line.target, line.message))
             .unwrap_or_default();
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             level = pill_editor_core::console::level_name(view.minimum_level),
             channel = view.channel.map_or("both", ConsoleChannel::name),
             search = view.search.as_str(),
@@ -237,13 +237,13 @@ impl EditorWindow {
                 .unwrap_or_default()
         };
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = engine_assets.len(),
             "[test] engine assets"
         );
         for row in &engine_assets {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 kind = row.kind.as_str(),
                 name = row.name.as_str(),
                 guid = row.guid.as_deref().unwrap_or(""),
@@ -261,13 +261,13 @@ impl EditorWindow {
             .map(|snapshot| snapshot.entities.clone())
             .unwrap_or_default();
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = entities.len(),
             "[test] entities"
         );
         for entry in &entities {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 display = entry.display.as_str(),
                 components = entry.archetype_label.as_str(),
                 "[test] entity"
@@ -285,7 +285,7 @@ impl EditorWindow {
             .and_then(|entity| resolve_component_name(world, component).map(|name| (entity, name)));
         let Some((entity, component)) = resolved_target else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entity = entity_text,
                 component,
                 field,
@@ -295,12 +295,12 @@ impl EditorWindow {
         };
         match world.read_component_field(entity, &component, field) {
             Ok(value) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 value = ?value,
                 "[test] field"
             ),
             Err(_) => warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entity = entity_text,
                 component = component.as_str(),
                 field,
@@ -328,7 +328,7 @@ impl EditorWindow {
             _ => String::new(),
         };
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             enabled = grid.enabled,
             cell = grid.cell_size,
             surfaces = %surface_ids_text,
@@ -347,7 +347,7 @@ impl EditorWindow {
             .map(|state| state.panel_budget.clone())
             .unwrap_or_default();
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = registry.len(),
             live = registry
                 .entries()
@@ -359,7 +359,7 @@ impl EditorWindow {
         for (slot, entry) in registry.entries().iter().enumerate() {
             let timing = panel_budget.get(slot as u16);
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 slot,
                 id = entry.id.as_str(),
                 source = entry.source.as_str(),
@@ -384,7 +384,7 @@ impl EditorWindow {
             self.gizmo_project.as_deref(),
         );
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             keymap_preset = view.text("keymap_preset"),
             code_editor_command = view.text("code_editor_command"),
             autosave_interval_seconds = view.text("autosave_interval_seconds"),
@@ -396,7 +396,7 @@ impl EditorWindow {
             "[test] preferences"
         );
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             project = view.project.as_deref().unwrap_or("-"),
             remembered = view.project_remembered,
             mode = ?view.project_gizmo.mode,
@@ -409,13 +409,13 @@ impl EditorWindow {
     /// Log the Problems count and the first ten rows, for the suites.
     pub(super) fn dump_problems(&mut self) {
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = self.notices.problems.len(),
             "[test] problems"
         );
         for row in self.notices.problems.iter().take(10) {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 module = row.module.as_str(),
                 severity = row.problem.severity.name(),
                 file = row.problem.file.as_deref().unwrap_or(""),
@@ -434,13 +434,13 @@ impl EditorWindow {
             .map(|snapshot| snapshot.resources.clone())
             .unwrap_or_default();
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = resources.len(),
             "[test] resources"
         );
         for view in &resources {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 name = view.name.as_str(),
                 label = view.label.as_str(),
                 fields = view.fields.len(),
@@ -448,7 +448,7 @@ impl EditorWindow {
             );
             for field in &view.fields {
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     resource = view.name.as_str(),
                     field = field.field.as_str(),
                     label = field.label.as_str(),
@@ -470,7 +470,7 @@ impl EditorWindow {
             let (origin_x, origin_y) = self.view_origin(view);
             let (width, height) = scene.window.size();
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 view,
                 x = origin_x as i32,
                 y = origin_y as i32,
@@ -483,7 +483,7 @@ impl EditorWindow {
         if let Some(game) = &self.game_surface {
             let (width, height) = game.size();
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 x = game.origin.0,
                 y = game.origin.1,
                 width,
@@ -503,7 +503,7 @@ impl EditorWindow {
             .map(|selection| (selection.entities().to_vec(), selection.asset.clone()))
             .unwrap_or_default();
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = entities.len(),
             asset = asset.as_deref().unwrap_or("none"),
             primary = entities
@@ -515,7 +515,7 @@ impl EditorWindow {
         );
         for entity in &entities {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entity = %entity,
                 "[test] selected entity"
             );
@@ -527,7 +527,7 @@ impl EditorWindow {
     pub(super) fn dump_standalone_types(&mut self) {
         for standalone_type in &self.standalone_types {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 type_name = standalone_type.type_name.as_str(),
                 display = standalone_type.display_name.as_str(),
                 extension = standalone_type.extension.as_str(),
@@ -544,7 +544,7 @@ impl EditorWindow {
         };
         let stats = &shell_state.stats;
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             fps = stats.frames_per_second,
             shell_us = stats.shell_micros,
             passes = stats.shell_passes,
@@ -553,7 +553,7 @@ impl EditorWindow {
         );
         for entry in &stats.tabs {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 name = entry.tab.name(),
                 us = entry.micros,
                 passes = entry.passes,
@@ -575,14 +575,14 @@ impl EditorWindow {
             }
         };
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = systems.len(),
             paused,
             "[test] systems"
         );
         for system in &systems {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 index = system.index,
                 name = system.name.as_str(),
                 owner = system.owner_label.as_str(),
@@ -600,14 +600,14 @@ impl EditorWindow {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(shell_state) = world.get_resource::<EguiShellState>() else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] dump needs the shell module's state"
             );
             return;
         };
         let surfaces = shell_state.dock.state().surfaces_count();
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             surfaces,
             "[editor] egui dock dump"
         );
@@ -637,7 +637,7 @@ impl EditorWindow {
             .collect();
         for (surface, node, active, tabs) in leaves {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 surface,
                 node,
                 active = %active,
@@ -655,7 +655,7 @@ impl EditorWindow {
             .collect();
         for tab in popouts {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 tab = tab.as_str(),
                 "[editor] egui dock popout"
             );
@@ -680,7 +680,7 @@ impl EditorWindow {
             .find(|layer_info| layer_info.layer == ThemeLayer::Project)
             .map_or("none", ThemeLayerInfo::path_text);
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             layers = %layers_text(&self.theme_layers),
             user = %user_layer_path,
             project = %project_layer_path,
@@ -711,7 +711,7 @@ impl EditorWindow {
             .get_resource::<EguiShellState>()
             .map_or(0, |state| state.frame_index);
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             active = self.active_view,
             interaction = self.interaction_name(),
             hovered = hovered_handle_text.as_str(),
@@ -724,7 +724,7 @@ impl EditorWindow {
             let eye = camera.eye();
             let pivot = camera.pivot;
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 view,
                 eye = format!("{:.3},{:.3},{:.3}", eye[0], eye[1], eye[2]).as_str(),
                 pivot = format!("{:.3},{:.3},{:.3}", pivot[0], pivot[1], pivot[2]).as_str(),
@@ -744,13 +744,13 @@ impl EditorWindow {
             .map(|state| state.panel_windows.windows.clone())
             .unwrap_or_default();
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = windows.len(),
             "[test] windows"
         );
         for window in &windows {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 id = window.id.as_str(),
                 source = window.source.as_str(),
                 slot = window.slot,
@@ -781,7 +781,7 @@ impl EditorWindow {
             state: ButtonState::Released,
         });
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             x,
             y,
             "[editor] click injected"
@@ -800,7 +800,7 @@ impl EditorWindow {
             if !over_ui {
                 let (origin_x, origin_y) = self.view_origin(view);
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     view,
                     x,
                     y,
@@ -859,7 +859,7 @@ impl EditorWindow {
             },
         });
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             chord = chord.label().as_str(),
             "[editor] key injected"
         );
@@ -894,7 +894,7 @@ impl EditorWindow {
             state: ButtonState::Released,
         });
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             x,
             y,
             "[editor] right click injected"
@@ -968,7 +968,7 @@ impl EditorWindow {
     pub(super) fn run_scripted(&mut self, line: &str, command: ScriptedCommand) {
         match command {
             ScriptedCommand::Quit => {
-                info!(target: telemetry_target::ENGINE, "[editor] quit requested");
+                info!(target: telemetry_target::EDITOR, "[editor] quit requested");
                 self.request_quit();
             }
             ScriptedCommand::Undock(tab) => self.undock_tab(tab),
@@ -992,7 +992,7 @@ impl EditorWindow {
                     pending.reveal(path.clone());
                 }
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     path = path.as_str(),
                     "[editor] reveal queued"
                 );
@@ -1013,7 +1013,7 @@ impl EditorWindow {
                 match guid {
                     Some(guid) => {
                         info!(
-                            target: telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             key = key.as_str(),
                             candidate = candidate.as_str(),
                             guid = guid.as_str(),
@@ -1271,14 +1271,14 @@ impl EditorWindow {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(shell_state) = world.get_resource_mut::<EguiShellState>() else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] browser navigation needs the shell module's state"
             );
             return;
         };
         if !shell_state.browser.open(folder) {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 folder,
                 "[editor] browser folder unchanged"
             );
@@ -1296,7 +1296,7 @@ impl EditorWindow {
         let view = self.active_view;
         self.apply_camera_gesture(view, navigation, delta_x, delta_y);
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             view,
             navigation = camera_navigation_name(navigation),
             "[editor] camera gesture applied"
@@ -1331,7 +1331,7 @@ impl EditorWindow {
             }
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             action = match action {
                 ClipboardAction::Copy => "copy",
                 ClipboardAction::Cut => "cut",
@@ -1372,7 +1372,7 @@ impl EditorWindow {
             pending.push_recorded(vec![edit], label, None);
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             component = component.as_str(),
             add,
             "[editor] component edit queued"
@@ -1385,7 +1385,7 @@ impl EditorWindow {
     pub(super) fn scripted_console_filter(&mut self, level: &str) {
         let Some(minimum_level) = pill_editor_core::console::level_from_name(level) else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 level,
                 "[editor] console filter ignored"
             );
@@ -1396,7 +1396,7 @@ impl EditorWindow {
             state.console_filters.minimum_level = minimum_level;
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             level,
             "[editor] console filter"
         );
@@ -1410,7 +1410,7 @@ impl EditorWindow {
             state.console_filters.search = text.clone();
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             search = text.as_str(),
             "[editor] console search"
         );
@@ -1427,7 +1427,7 @@ impl EditorWindow {
                     *field = dialog_name.to_string();
                 }
                 None => warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     "[editor] dialog set without an open dialog"
                 ),
             }
@@ -1450,7 +1450,7 @@ impl EditorWindow {
         };
         if dialog.is_none() {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] dialog submit without an open dialog"
             );
             return;
@@ -1518,7 +1518,7 @@ impl EditorWindow {
             }]);
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             key,
             value,
             "[editor] preference edit queued"
@@ -1559,7 +1559,7 @@ impl EditorWindow {
             Some(format!("resource.{resource}.{field}")),
         );
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             resource,
             field,
             value = value_text,
@@ -1618,7 +1618,7 @@ impl EditorWindow {
             pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             component = component.as_str(),
             field,
             entities = written_command_count,
@@ -1663,7 +1663,7 @@ impl EditorWindow {
             pending.push_recorded(vec![edit], label, None);
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             index,
             enabled,
             "[editor] system edit queued"
@@ -1680,7 +1680,7 @@ impl EditorWindow {
             pending.push_recorded(vec![command], label, None);
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             "[editor] new entity queued"
         );
     }
@@ -1698,7 +1698,7 @@ impl EditorWindow {
         };
         let Some(entity) = entity else {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] delete entity skipped nothing selected"
             );
             return;
@@ -1709,7 +1709,7 @@ impl EditorWindow {
             pending.push_recorded(commands, label, None);
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             entity = %entity,
             "[editor] delete entity queued"
         );
@@ -1731,7 +1731,7 @@ impl EditorWindow {
         };
         if gizmo_settings.mode != GizmoMode::Translate {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 mode = gizmo_mode_name(gizmo_settings.mode),
                 "[editor] plane handles belong to the translate tool"
             );
@@ -1783,7 +1783,7 @@ impl EditorWindow {
         self.scene_cursor[view] = Some((x, y));
         self.update_hover(view, (x, y));
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             view,
             x,
             y,
@@ -1804,7 +1804,7 @@ impl EditorWindow {
         self.shell_events.push(InputEvent::CursorMoved { position });
         self.demand.input = true;
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             x,
             y,
             "[editor] pointer hovered"
@@ -1833,7 +1833,7 @@ impl EditorWindow {
         // line, because the same command works once it is.
         let Some((tab, has_room)) = scene_view_choice else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] scene view needs the shell module's state"
             );
             return Ok(());
@@ -1846,7 +1846,7 @@ impl EditorWindow {
         }
         self.activate_tab(tab);
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             tab = tab.name().as_str(),
             view = tab.scene_view().unwrap_or_default(),
             "[editor] scene view added"
@@ -1872,7 +1872,7 @@ impl EditorWindow {
                 shell_state.palette.selected = 0;
                 shell_state.palette.logged_query = None;
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     query = shell_state.palette.query.as_str(),
                     "[editor] palette opened"
                 );
@@ -1882,7 +1882,7 @@ impl EditorWindow {
                 shell_state.palette.open = false;
                 shell_state.palette.run_requested = false;
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     "[editor] palette dismissed"
                 );
             }
@@ -1926,7 +1926,7 @@ impl EditorWindow {
         }
         if queued {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entity = %entity,
                 component,
                 field,
@@ -1945,7 +1945,7 @@ impl EditorWindow {
         // Step 1: Report a source that is still bound and stop.
         if self.panel_markers.contains_key(source) {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 source,
                 restored = 0,
                 "[editor] panel source restored"
@@ -1980,7 +1980,7 @@ impl EditorWindow {
                 .insert(source.to_string(), liveness_marker);
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             source,
             restored,
             "[editor] panel source restored"
@@ -1996,7 +1996,7 @@ impl EditorWindow {
     pub(super) fn scripted_panel_unload(&mut self, source: &str) {
         let dropped = self.panel_markers.remove(source).is_some();
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             source,
             dropped,
             "[editor] panel source unloaded"
@@ -2012,14 +2012,14 @@ impl EditorWindow {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(shell_state) = world.get_resource_mut::<EguiShellState>() else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] panel window request needs the shell module's state"
             );
             return;
         };
         shell_state.pending_panel_window = Some((slot, id.to_string()));
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             slot,
             window = id,
             "[editor] panel window requested"
@@ -2036,7 +2036,7 @@ impl EditorWindow {
             pending.push(vec![systems::pause_toggle_command(paused)]);
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             paused = !paused,
             "[editor] pause toggled"
         );
@@ -2089,7 +2089,7 @@ impl EditorWindow {
         // line.
         let Some(shell_state) = world.get_resource_mut::<EguiShellState>() else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] popout needs the shell module's state"
             );
             return Ok(());
@@ -2101,7 +2101,7 @@ impl EditorWindow {
         };
         if moved {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 tab = tab.name().as_str(),
                 redock,
                 "[editor] popout moved"
@@ -2124,7 +2124,7 @@ impl EditorWindow {
     /// calls, so the two paths differ only in when they run.
     pub(super) fn scripted_problem_open(&mut self, index: usize) {
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             index,
             "[editor] problem open scripted"
         );
@@ -2158,7 +2158,7 @@ impl EditorWindow {
             selection.asset = Some(path.to_string());
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             path,
             "[editor] asset selected"
         );
@@ -2222,7 +2222,7 @@ impl EditorWindow {
             );
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             entity = %entity,
             count,
             "[editor] selection changed"
@@ -2245,7 +2245,7 @@ impl EditorWindow {
             None,
         );
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             resource = resource_name,
             "[editor] resource selection queued"
         );
@@ -2258,7 +2258,7 @@ impl EditorWindow {
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
             pending.push(vec![EditorCommand::StepOnce]);
         }
-        info!(target: telemetry_target::ENGINE, "[editor] step queued");
+        info!(target: telemetry_target::EDITOR, "[editor] step queued");
     }
 
     /// Runs one Assets toolbar button from the scripted channel, through the
@@ -2346,7 +2346,7 @@ impl EditorWindow {
             stage: ScriptedDragStage::Press,
         });
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             from_x = from.0,
             from_y = from.1,
             to_x = to.0,

@@ -78,7 +78,7 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
         let recorded_apply = EditorCommand::apply_recorded(engine, &batch.commands);
         let failed_command_count = recorded_apply.failures.len();
         pill_core::info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = batch.commands.len(),
             failed = failed_command_count,
             "[editor] engine commands applied"
@@ -109,7 +109,7 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
         }
         for (index, message) in recorded_apply.failures {
             pill_core::warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 index,
                 message = %message,
                 "[editor] command failed"
@@ -129,7 +129,7 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
                         HistoryDirection::Redo => history.redo_rollback(),
                     }
                     pill_core::warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         direction = direction.name(),
                         undo = history.undo_depth(),
                         redo = history.redo_depth(),
@@ -149,7 +149,7 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
             };
             history.remap_entity(*previous, *assigned);
             pill_core::info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 previous = %previous,
                 assigned = %assigned,
                 "[editor] history remap"
@@ -173,7 +173,7 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
                 let pushed =
                     history.push(entry, now_millis, CommandHistory::DEFAULT_COALESCE_WINDOW);
                 pill_core::info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     label = batch.label.as_str(),
                     steps = pushed.steps,
                     coalesced = pushed.coalesced,
@@ -212,7 +212,7 @@ fn follow_selection(
             {
                 selection.asset = Some(to.clone());
                 pill_core::info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     path = to.as_str(),
                     "[editor] selection followed the move"
                 );
@@ -222,7 +222,7 @@ fn follow_selection(
             {
                 selection.asset = None;
                 pill_core::info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     path = path.as_str(),
                     "[editor] selection cleared with the delete"
                 );
@@ -299,7 +299,7 @@ pub fn step_history(engine: &mut Engine, direction: HistoryDirection) -> History
         .is_some();
     if !queue_present {
         pill_core::warn!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             direction = direction_name,
             "[editor] history step without a command queue"
         );
@@ -316,7 +316,7 @@ pub fn step_history(engine: &mut Engine, direction: HistoryDirection) -> History
     };
     let Some(history_entry) = history_entry else {
         pill_core::info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             "[editor] history {} empty",
             direction_name
         );
@@ -343,7 +343,7 @@ pub fn step_history(engine: &mut Engine, direction: HistoryDirection) -> History
         }
     }
     pill_core::info!(
-        target: telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         label = label.as_str(),
         remaining = remaining_step_count,
         "[editor] history {}",
@@ -383,7 +383,7 @@ pub fn prune_history(engine: &mut Engine) -> usize {
     );
     if dropped_entry_count > 0 {
         pill_core::info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             dropped = dropped_entry_count,
             steps = step_count,
             "[editor] history pruned"

@@ -25,6 +25,7 @@
 use std::ops::Range;
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_core::{debug, PillStyle};
 
 // Current crate
@@ -76,7 +77,7 @@ impl DrawingContext {
     /// log alone.
     pub fn log(&self) {
         debug!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             "Draw {} instance(s) {}->{} command recorded [Shader: {}, Material: {}, Mesh: {}]",
             self.accumulated_instance_count,
             self.accumulated_instance_range.start,
@@ -157,7 +158,7 @@ impl DrawingContext {
             .unwrap();
         self.shader_name = shader.name.clone();
 
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Changing shader to: {}", self.shader_name.name_style());
+        debug!(target: telemetry_target::RENDERING, "Changing shader to: {}", self.shader_name.name_style());
 
         // A pass that has its own pipeline draws through it. That pipeline was
         // built for the pass's target format, depth, and culling, which the
@@ -170,7 +171,7 @@ impl DrawingContext {
                 &renderer_resource_storage.engine_parameters.bind_group,
                 &[],
             );
-            debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Engine parameters bound");
+            debug!(target: telemetry_target::RENDERING, "Engine parameters bound");
         }
 
         if shader.reads_camera_parameters {
@@ -179,10 +180,10 @@ impl DrawingContext {
                 &camera.bind_group,
                 &[],
             );
-            debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Camera parameters bound");
+            debug!(target: telemetry_target::RENDERING, "Camera parameters bound");
         }
 
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Renderer pipeline shader changed to: {}", self.shader_name.name_style());
+        debug!(target: telemetry_target::RENDERING, "Renderer pipeline shader changed to: {}", self.shader_name.name_style());
     }
 
     /// Binds the parameter and texture bind groups the given material draws
@@ -205,7 +206,7 @@ impl DrawingContext {
             .unwrap();
         self.material_name = material.name.clone();
 
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Changing material to: {}", self.material_name.name_style());
+        debug!(target: telemetry_target::RENDERING, "Changing material to: {}", self.material_name.name_style());
 
         if let Some(ref parameters_bind_group) = material.parameters_bind_group {
             render_pass.set_bind_group(
@@ -213,7 +214,7 @@ impl DrawingContext {
                 parameters_bind_group,
                 &[],
             );
-            debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Material parameters bound");
+            debug!(target: telemetry_target::RENDERING, "Material parameters bound");
         }
 
         if let Some(ref texture_bind_group) = material.textures_bind_group {
@@ -222,10 +223,10 @@ impl DrawingContext {
                 texture_bind_group,
                 &[],
             );
-            debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Material textures bound");
+            debug!(target: telemetry_target::RENDERING, "Material textures bound");
         }
 
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Renderer pipeline material changed to: {}", self.material_name.name_style());
+        debug!(target: telemetry_target::RENDERING, "Renderer pipeline material changed to: {}", self.material_name.name_style());
     }
 
     /// Binds the vertex and index buffers of the given mesh.
@@ -246,7 +247,7 @@ impl DrawingContext {
         render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
         render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Renderer pipeline mesh changed to: {}", self.mesh_name.name_style());
+        debug!(target: telemetry_target::RENDERING, "Renderer pipeline mesh changed to: {}", self.mesh_name.name_style());
     }
 }
 

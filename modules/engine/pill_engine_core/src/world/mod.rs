@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_core::{error, info, warn};
 
 // Current crate
@@ -776,7 +777,7 @@ impl World {
                 Ok(_) => continue,
                 Err(error) => {
                     warn!(
-                        target: pill_core::telemetry::telemetry_target::ECS,
+                        target: telemetry_target::ECS,
                         error = %error,
                         "the platform has no random source; entity ids are derived from a counter"
                     );
@@ -1073,7 +1074,7 @@ impl World {
         // should never end up here.
         if old_archetype_id == new_archetype_id {
             warn!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 entity = ?entity,
                 archetype_id = ?new_archetype_id,
                 "entity already lives in the destination archetype; nothing to migrate"
@@ -1410,7 +1411,7 @@ impl World {
                     // logged rather than panicked on, because this runs inside
                     // `process_frame` for managed projects.
                     warn!(
-                        target: pill_core::telemetry::telemetry_target::ECS,
+                        target: telemetry_target::ECS,
                         component_id = ?component_id,
                         archetype_id = ?archetype.id,
                         "destroy_entity: component has no storage column; skipping"

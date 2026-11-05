@@ -368,7 +368,7 @@ pub fn reference_list_entry_row(
                     walk.session.settings_picker = Some(key.to_string());
                     walk.session.settings_search.clear();
                     pill_core::info!(
-                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         slot = key,
                         target = field.target.as_str(),
                         "[editor] settings reference picker"
@@ -407,7 +407,7 @@ pub fn reference_list_entry_row(
             JsonValue::Array(remaining_entries),
         );
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             slot = key,
             "[editor] settings list entry removed"
         );
@@ -561,7 +561,7 @@ pub fn list_drag_update(
         JsonValue::Array(reordered_entries),
     );
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         family,
         from = released.index,
         to = insert_at_index,
@@ -629,7 +629,7 @@ pub fn remember_list_row_rect(
         return;
     }
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         row = key.as_str(),
         min_x = rect.min.x,
         min_y = rect.min.y,
@@ -1006,7 +1006,7 @@ pub fn reference_row(
             walk.session.settings_picker = Some(key.to_string());
             walk.session.settings_search.clear();
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 slot = key,
                 target = field.target.as_str(),
                 "[editor] settings reference picker"
@@ -1122,7 +1122,7 @@ pub fn reference_picker(
                                 walk.pending.focus_asset(candidate.key());
                                 walk.session.settings_picker = None;
                                 pill_core::info!(
-                                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                                    target: telemetry_target::EDITOR,
                                     path = candidate.path.as_str(),
                                     "[editor] asset focused"
                                 );
@@ -1196,7 +1196,7 @@ pub fn settings_commit(
     // unbound-texture case.
     if let Err(message) = inspector::patch_settings_inserting(&mut document, &path, value) {
         pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             key,
             message = message.as_str(),
             "[editor] asset settings edit refused"

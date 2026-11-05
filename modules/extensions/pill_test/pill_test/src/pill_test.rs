@@ -23,6 +23,7 @@
 
 // External crates
 use pill_core::info;
+use pill_core::telemetry::telemetry_target;
 use pill_engine::*;
 use serde::{Deserialize, Serialize};
 
@@ -129,7 +130,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     }
 
     info!(
-        target: pill_core::telemetry::telemetry_target::ECS,
+        target: telemetry_target::ECS,
         entities = MODULE_TEST_ENTITY_COUNT,
         existing = existing_entity_count,
         "pill_test module registered"

@@ -103,7 +103,7 @@ pub fn remember_tile_rect(browser: &mut ProjectBrowser, path: &str, rect: egui::
         browser.tile_rects.push((path.to_owned(), corners));
     }
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         path,
         min_x = rect.min.x,
         min_y = rect.min.y,
@@ -130,7 +130,7 @@ pub fn remember_tree_row_rect(browser: &mut ProjectBrowser, path: &str, rect: eg
         browser.tree_rects.push((path.to_owned(), corners));
     }
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         path,
         min_x = rect.min.x,
         min_y = rect.min.y,
@@ -149,7 +149,7 @@ pub fn remember_pane_rect(browser: &mut ProjectBrowser, rect: egui::Rect) {
     }
     browser.pane_rect = Some(corners);
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         min_x = rect.min.x,
         min_y = rect.min.y,
         max_x = rect.max.x,
@@ -319,7 +319,7 @@ pub fn asset_tile(
         if left_window {
             *writes.drag_out = Some(row.path.clone());
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 path = row.path.as_str(),
                 "[editor] drag out requested"
             );
@@ -452,7 +452,7 @@ pub fn asset_container_menu(
     {
         pending.reveal(folder.to_owned());
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             path = folder,
             "[editor] reveal queued"
         );

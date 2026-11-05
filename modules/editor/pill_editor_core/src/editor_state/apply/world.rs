@@ -18,6 +18,7 @@
 //! `plain()` for a command that cannot be undone.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::Engine;
 
 // Current crate
@@ -308,7 +309,7 @@ pub(super) fn apply(
                 .write_component_field(*entity, component, field, value)
                 .map_err(|error| format!("{command:?}: {error}"))?;
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 component = component.as_str(),
                 field = field.as_str(),
                 asset = reference.as_deref().unwrap_or("none"),
@@ -363,7 +364,7 @@ pub(super) fn apply(
                 .write_component_field(*entity, component, field, value)
                 .map_err(|error| format!("{command:?}: {error}"))?;
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 component = component.as_str(),
                 field = field.as_str(),
                 reference = reference

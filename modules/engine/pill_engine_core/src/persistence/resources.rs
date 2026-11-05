@@ -19,6 +19,9 @@
 //! reproducible: hash-map order is not, and a snapshot that differs between two
 //! identical runs cannot be diffed, compared or used as a test fixture.
 
+// External crates
+use pill_core::telemetry::telemetry_target;
+
 use super::*;
 
 // =============================================================================
@@ -259,7 +262,7 @@ impl World {
         // diffed, compared or used as a test fixture.
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             "[persistence] Snapshotting {} resource(s)",
             entries.len(),
         );
@@ -289,7 +292,7 @@ impl World {
             }
         }
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             "[persistence] Restored {} resource(s), {} skipped",
             restored_count,
             skipped_count,
@@ -313,7 +316,7 @@ impl World {
         }
         let Some(bytes) = decode_foreign_resource_payload(payload, ops.size) else {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 resource = %type_name,
                 expected_size = ops.size,
                 "[persistence] Foreign resource payload does not match the declared size; skipped"
@@ -391,7 +394,7 @@ impl World {
                 carried_payloads.push((entry.type_name.clone(), payload));
             } else {
                 warn!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     resource = %entry.type_name,
                     "[persistence] Reshaped resource held no readable value; leaving it to the new default"
                 );
@@ -411,7 +414,7 @@ impl World {
         migrated_resource_names.sort();
         if !migrated_resource_names.is_empty() {
             debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 migrated_resources = %migrated_resource_names.join(", "),
                 "[persistence] Migrated reshaped resources"
             );
@@ -464,7 +467,7 @@ where
     serde_json::to_vec(world.get_resource::<T>()?)
         .map_err(|error| {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "[persistence] Failed to serialize resource '{}': {}",
                 std::any::type_name::<T>(),
                 error
@@ -493,7 +496,7 @@ where
         Ok(value) => value,
         Err(error) => {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "[persistence] Failed to parse JSON for resource '{}': {}",
                 std::any::type_name::<T>(),
                 error
@@ -511,7 +514,7 @@ where
         }
         Err(error) => {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "[persistence] Failed to deserialize resource '{}': {}. Value skipped.",
                 std::any::type_name::<T>(),
                 error

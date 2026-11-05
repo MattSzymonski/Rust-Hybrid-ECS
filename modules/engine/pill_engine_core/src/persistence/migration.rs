@@ -21,6 +21,9 @@
 //! with the current serializer while every older row goes through the
 //! retiring one.
 
+// External crates
+use pill_core::telemetry::telemetry_target;
+
 use super::*;
 
 // =============================================================================
@@ -57,14 +60,14 @@ impl World {
         let mut sorted_changed_type_names: Vec<&str> =
             changed_type_names.iter().map(String::as_str).collect();
         if tracing::enabled!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             tracing::Level::INFO
         ) {
             sorted_changed_type_names.sort_unstable();
         }
 
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             "[persistence] Selective migration starting for {} component type(s)...",
             sorted_changed_type_names.len(),
         );
@@ -73,7 +76,7 @@ impl World {
             let Some(previous_metadata) = previous_metadata_by_name.get(*type_name) else {
                 let reason = "missing previous metadata".to_string();
                 debug!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     "[persistence]   '{}' -> SKIP ({})",
                     type_name,
                     reason,
@@ -91,7 +94,7 @@ impl World {
                 .copied()
                 .unwrap_or(0);
             info!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "[persistence]   '{}' -> migrating (schema {} -> {})",
                 type_name, previous_metadata.schema_hash, current_schema_hash,
             );
@@ -103,7 +106,7 @@ impl World {
             ) {
                 Ok(migrated_entity_count_for_type) => {
                     info!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        target: telemetry_target::HOT_RELOAD,
                         "[persistence]   '{}' -> OK ({} entities)",
                         type_name, migrated_entity_count_for_type,
                     );
@@ -113,7 +116,7 @@ impl World {
                 Err(error) => {
                     let reason = error.to_string();
                     debug!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        target: telemetry_target::HOT_RELOAD,
                         "[persistence]   '{type_name}' -> SKIP ({reason})",
                     );
                     migration_report.skipped_types.push(SkippedType {
@@ -125,7 +128,7 @@ impl World {
         }
 
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             "[persistence] Selective migration finished: {} type(s) migrated, {} entities touched, {} type(s) skipped.",
             migration_report.migrated_type_count,
             migration_report.migrated_entity_count,
@@ -194,7 +197,7 @@ impl World {
 
         if previous_metadata.component_id == current_component_id {
             debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "[persistence]     strategy: in-place column swap for '{}'",
                 type_name,
             );
@@ -218,7 +221,7 @@ impl World {
             )
         } else {
             debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "[persistence]     strategy: archetype remap for '{}' (component id changed)",
                 type_name,
             );

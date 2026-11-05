@@ -35,6 +35,7 @@
 use std::collections::{HashMap, HashSet};
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_core::warn;
 
 // Current crate
@@ -326,7 +327,7 @@ impl RendererPass {
         for slot_name in pass.inputs.keys() {
             if !renderer_shader.texture_slots.contains_key(slot_name) {
                 warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "Pass {} names input `{slot_name}`, which its shader has no slot for",
                     pass.name
                 );
@@ -335,7 +336,7 @@ impl RendererPass {
         for (slot_name, _key) in textures {
             if !renderer_shader.texture_slots.contains_key(slot_name) {
                 warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "Pass {} binds texture `{slot_name}`, which its shader has no slot for",
                     pass.name
                 );

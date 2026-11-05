@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 // External crates
 use pill_core::error::EngineMessage;
+use pill_core::telemetry::telemetry_target;
 use thiserror::Error;
 
 // Current crate
@@ -100,7 +101,7 @@ fn load_from_path(path: &Path) -> EditorDock {
                 // the user arranged and write it back with the current version.
                 save(&dock);
                 pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     path = %path.display(),
                     from = previous_schema_version,
                     to = LAYOUT_SCHEMA_VERSION,
@@ -174,7 +175,7 @@ fn append_beside(dock: &mut EditorDock, anchor: super::EditorTab, tab: super::Ed
 /// Log that the document at `path` was replaced, and the reason it was.
 fn reset_layout(path: &Path, reason: &str) {
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         path = %path.display(),
         reason,
         "[editor] layout reset"
@@ -189,7 +190,7 @@ pub fn save(dock: &EditorDock) {
     let path = layout_directory().join(LAYOUT_FILE);
     if let Err(error) = save_to_path(dock, path) {
         pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             "Cannot save dock layout: {}",
             error.to_plain_message()
         );

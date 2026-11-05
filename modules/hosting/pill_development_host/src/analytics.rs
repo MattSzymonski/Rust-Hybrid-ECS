@@ -35,6 +35,7 @@ use std::time::UNIX_EPOCH;
 // External crates
 use pill_core::info;
 use pill_core::platform::Instant;
+use pill_core::telemetry::telemetry_target;
 use pill_core::telemetry::{log_block_colored, Colorize};
 use serde_json::Value;
 
@@ -1247,7 +1248,7 @@ pub(crate) fn print_startup_report() {
     // every crate the startup built.
     collector.pending_cargo_crates.clear();
     info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        target: telemetry_target::HOT_RELOAD,
         "{}",
         render_startup_report(&collector)
     );
@@ -1716,7 +1717,7 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
         gap_ms.to_string().yellow(),
     ));
     info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        target: telemetry_target::HOT_RELOAD,
         "{}",
         log_block_colored("Reload analytics".cyan().bold(), lines)
     );

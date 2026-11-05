@@ -276,7 +276,7 @@ fn read_open() -> Result<Option<String>, String> {
         let _ = unsafe { GlobalUnlock(HGLOBAL(handle.0)) };
         if unterminated {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 bytes = bytes,
                 "[editor] clipboard refused: the block carries no terminator"
             );

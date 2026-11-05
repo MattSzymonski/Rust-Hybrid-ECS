@@ -19,6 +19,7 @@
 //! another family hits `unreachable!`.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::Engine;
 
 // Current crate
@@ -59,7 +60,7 @@ pub(super) fn apply(
                     existing_entities.push(*entity);
                 } else {
                     pill_core::info!(
-                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         entity = %entity,
                         "[editor] selection command dropped; the entity no longer exists"
                     );
@@ -101,7 +102,7 @@ pub(super) fn apply(
             // fields are a contract: it checks the selection a resource row
             // makes, and the one its undo restores.
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 resource = resource.as_deref().unwrap_or("none"),
                 "[editor] resource selected"
             );
@@ -137,7 +138,7 @@ pub(super) fn apply(
             // undo has to bring the entity slot back. Clearing only the
             // resource slot is not enough.
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entity = selection
                     .primary()
                     .map(|entity| entity.to_string())
@@ -165,7 +166,7 @@ pub(super) fn apply(
                 field: field.clone(),
             });
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entity = %entity,
                 component = component.as_str(),
                 field = field.as_str(),

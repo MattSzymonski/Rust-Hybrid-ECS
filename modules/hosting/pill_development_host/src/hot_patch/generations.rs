@@ -26,6 +26,7 @@
 // External crates
 use pill_core::info;
 use pill_core::platform::Instant;
+use pill_core::telemetry::telemetry_target;
 use pill_engine::Engine;
 
 // Current crate
@@ -196,7 +197,7 @@ impl HotPatchSession {
         // just rolled a patch back would see the rollback come undone and
         // find no reason in the log.
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             functions = function_names.join(", ").as_str(),
             "reload rebuilt from source; live-patch history reset (the reloaded \
              image supersedes the prologue patches)"
@@ -327,7 +328,7 @@ impl HotPatchSession {
         self.active_generations
             .insert(qualified.to_string(), generation_number);
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             function = qualified,
             generation = generation_number,
             "patch generation rolled back"

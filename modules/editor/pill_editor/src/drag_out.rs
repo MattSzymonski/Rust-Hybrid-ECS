@@ -30,6 +30,7 @@
 //! [`start`] reads the button first and starts no drag.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use windows::core::implement;
 use windows::Win32::Foundation::{BOOL, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, S_OK};
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -137,7 +138,7 @@ pub fn start(absolute_path: &str) -> DragOutOutcome {
         )
     } {
         pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             path = absolute_path,
             reason = %error,
             "[editor] drag out target not resolvable"
@@ -154,7 +155,7 @@ pub fn start(absolute_path: &str) -> DragOutOutcome {
     let outcome = match data_object {
         Ok(data_object) => {
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 path = absolute_path,
                 "[editor] drag out prepared"
             );
@@ -169,7 +170,7 @@ pub fn start(absolute_path: &str) -> DragOutOutcome {
         }
         Err(error) => {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 path = absolute_path,
                 reason = %error,
                 "[editor] drag out data object refused"
@@ -202,7 +203,7 @@ fn run_modal_drag(data_object: windows::Win32::System::Com::IDataObject) -> Drag
     };
     if drag_result.is_err() {
         pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             reason = %windows::core::Error::from_hresult(drag_result),
             "[editor] drag out refused by OLE"
         );
@@ -233,7 +234,7 @@ fn initialize_ole() -> bool {
                 // `windows` crate turns into `Ok`. Only a real failure reaches
                 // this arm.
                 pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     reason = %error,
                     "[editor] drag out needs OLE, which this thread refused"
                 );

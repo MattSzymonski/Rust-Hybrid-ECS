@@ -25,6 +25,9 @@
 //! A load that fails is logged and not passed back: a missing or unreadable
 //! scene must not stop a project from starting with its own scene.
 
+// External crates
+use pill_core::telemetry::telemetry_target;
+
 // Current crate
 use crate::engine::Engine;
 use crate::resource::Resource;
@@ -80,7 +83,7 @@ pub fn apply_startup_scene(engine: &mut Engine) -> Option<Result<SceneLoad, Stri
         Ok(queued_scene) => queued_scene?,
         Err(error) => {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::ENGINE,
                 error = %error,
                 "[engine] startup scene request could not be taken"
             );
@@ -107,7 +110,7 @@ pub fn apply_startup_scene(engine: &mut Engine) -> Option<Result<SceneLoad, Stri
 fn load_startup_scene(engine: &mut Engine, path: &str) -> Result<SceneLoad, String> {
     let scene_load = crate::asset_loading::load_scene_asset(engine, path)?;
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::ENGINE,
         path,
         entities = scene_load.entities,
         components = scene_load.components,

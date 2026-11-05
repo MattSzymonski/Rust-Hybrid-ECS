@@ -34,6 +34,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 /// Field layouts, the layout trait and the value-type resolver, which are the
 /// same for every DLL.
 pub use pill_engine_core::component_registry::*;
@@ -572,7 +573,7 @@ pub fn run_project_init(
         |engine| {
             if let Some(Err(reason)) = pill_engine_core::apply_startup_scene(engine) {
                 pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    target: telemetry_target::ENGINE,
                     reason,
                     "[engine] startup scene not loaded"
                 );

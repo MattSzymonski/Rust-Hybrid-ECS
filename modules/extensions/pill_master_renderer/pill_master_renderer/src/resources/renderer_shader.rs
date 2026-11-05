@@ -32,6 +32,7 @@
 // External crates
 use indexmap::IndexMap;
 use pill_core::debug;
+use pill_core::telemetry::telemetry_target;
 
 // Current crate
 use crate::{
@@ -326,7 +327,7 @@ impl RendererShader {
                 .join(", ")
         };
         debug!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             shader = name,
             parameters = %joined_slot_names(parameter_slots.keys().collect()),
             textures = %joined_slot_names(texture_slots.keys().collect()),

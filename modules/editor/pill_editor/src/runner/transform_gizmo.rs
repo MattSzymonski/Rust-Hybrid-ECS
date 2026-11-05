@@ -135,13 +135,13 @@ impl EditorWindow {
             self.gizmo_guides = Some(guide_kind.is_some());
             match dragged_axis {
                 Some(axis) => info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     axis = gizmo_axis_name(axis),
                     dotted,
                     "[editor] gizmo guides"
                 ),
                 None => info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     guides = guide_kind.is_some(),
                     dotted,
                     "[editor] gizmo guides"
@@ -165,7 +165,7 @@ impl EditorWindow {
                 self.gizmo_logged = Some(anchor_key);
                 let geometry = &self.gizmo_geometry;
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     entity = %entity,
                     mode = gizmo_mode_name(gizmo_settings.mode),
                     space = gizmo_space_name(gizmo_settings.space),
@@ -220,7 +220,7 @@ impl EditorWindow {
         }
         gizmo_state.settings.mode = mode;
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             mode = gizmo_mode_name(mode),
             "[editor] gizmo tool"
         );
@@ -308,7 +308,7 @@ impl EditorWindow {
     ) {
         let Some(kind) = gizmo::handle_kind(handle) else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 handle,
                 "[editor] gizmo drag refused: unknown handle"
             );
@@ -345,7 +345,7 @@ impl EditorWindow {
                     gizmo::ray_plane_point(gizmo_origin, basis[axis], ray_origin, ray_direction)
                 else {
                     warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         "[editor] gizmo drag refused: the ray is parallel to the ring"
                     );
                     return;
@@ -357,7 +357,7 @@ impl EditorWindow {
                     gizmo::closest_axis_point(gizmo_origin, basis[axis], ray_origin, ray_direction)
                 else {
                     warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         "[editor] gizmo drag refused: the ray is parallel to the axis"
                     );
                     return;
@@ -372,7 +372,7 @@ impl EditorWindow {
                     gizmo::ray_plane_point(gizmo_origin, normal, ray_origin, ray_direction)
                 else {
                     warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         "[editor] gizmo drag refused: the ray is parallel to the plane"
                     );
                     return;
@@ -403,7 +403,7 @@ impl EditorWindow {
         self.set_hovered_handle(view, Some(handle));
         match kind.plane() {
             Some((first, second)) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 mode = gizmo_mode_name(GizmoMode::Translate),
                 plane = gizmo_plane_name(first, second),
                 entity = %entity,
@@ -411,7 +411,7 @@ impl EditorWindow {
                 "[editor] gizmo drag started"
             ),
             None => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 mode = gizmo_mode_name(gizmo::handle_axis(handle).map(|(mode, _)| mode).unwrap_or(GizmoMode::Translate)),
                 axis = gizmo_axis_name(kind.axis().map(|(_, axis)| axis).unwrap_or(0)),
                 entity = %entity,
@@ -619,7 +619,7 @@ impl EditorWindow {
                 FieldValue::F32(*value),
             ) {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     entity = %entity,
                     field = %transform_field,
                     index,
@@ -687,7 +687,7 @@ impl EditorWindow {
             pending.push_recorded(recorded_commands, label, None);
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             entity = %drag.entity,
             field = %transform_field,
             "[editor] gizmo drag recorded"
@@ -705,7 +705,7 @@ impl EditorWindow {
         let mode = gizmo_drag_mode(drag.kind);
         match (drag.kind.plane(), drag.last_value) {
             (Some((first, second)), Some(value)) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 mode = gizmo_mode_name(mode),
                 plane = gizmo_plane_name(first, second),
                 entity = %drag.entity,
@@ -714,14 +714,14 @@ impl EditorWindow {
                 "[editor] gizmo drag ended"
             ),
             (Some((first, second)), None) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 mode = gizmo_mode_name(mode),
                 plane = gizmo_plane_name(first, second),
                 entity = %drag.entity,
                 "[editor] gizmo drag ended without a move"
             ),
             (None, Some(value)) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 mode = gizmo_mode_name(mode),
                 axis = gizmo_axis_name(drag.kind.axis().map(|(_, axis)| axis).unwrap_or(0)),
                 entity = %drag.entity,
@@ -730,7 +730,7 @@ impl EditorWindow {
                 "[editor] gizmo drag ended"
             ),
             (None, None) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 mode = gizmo_mode_name(mode),
                 axis = gizmo_axis_name(drag.kind.axis().map(|(_, axis)| axis).unwrap_or(0)),
                 entity = %drag.entity,
@@ -751,13 +751,13 @@ impl EditorWindow {
         let restored = self.restore_transform(drag.entity, &drag.original);
         if !restored {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entity = %drag.entity,
                 "[editor] gizmo drag restore failed"
             );
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             mode = gizmo_mode_name(gizmo_drag_mode(drag.kind)),
             entity = %drag.entity,
             "[editor] gizmo drag canceled"
@@ -770,7 +770,7 @@ impl EditorWindow {
     pub(super) fn cancel_interactions(&mut self, reason: &str) {
         if self.camera_drag.take().is_some() {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 reason,
                 "[editor] camera navigation canceled"
             );
@@ -790,7 +790,7 @@ impl EditorWindow {
         // selected entity with a transform.
         let Some(kind) = gizmo::handle_kind(handle) else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 handle,
                 "[editor] gizmo drag refused: unknown handle"
             );
@@ -798,14 +798,14 @@ impl EditorWindow {
         };
         if self.gizmo_drag.is_some() {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] gizmo drag refused: one is already in flight"
             );
             return;
         }
         let Some(view) = self.visible_scene_view() else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] gizmo drag refused: no scene view is visible"
             );
             return;
@@ -821,14 +821,14 @@ impl EditorWindow {
                 .and_then(|selection| selection.primary());
             let Some(entity) = selected_entity else {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     "[editor] gizmo drag refused: nothing is selected"
                 );
                 return;
             };
             let Some(transform) = read_transform(world, entity) else {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     entity = %entity,
                     "[editor] gizmo drag refused: the entity has no transform"
                 );
@@ -868,7 +868,7 @@ impl EditorWindow {
         };
         let Some((x, y)) = self.project_to_screen_in(view, grab_point) else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] gizmo drag refused: the handle is behind the camera"
             );
             return;
@@ -880,14 +880,14 @@ impl EditorWindow {
         self.synthetic_gizmo_view = Some(view);
         match kind.plane() {
             Some((first, second)) => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 plane = gizmo_plane_name(first, second),
                 x,
                 y,
                 "[editor] gizmo drag press"
             ),
             None => info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 axis = gizmo_axis_name(kind.axis().map(|(_, axis)| axis).unwrap_or(0)),
                 x,
                 y,

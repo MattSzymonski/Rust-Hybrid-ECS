@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 // External crates
 use egui::{ImageData, TextureId as EguiTextureId, TexturesDelta};
+use pill_core::telemetry::telemetry_target;
 use pill_ui_frame::{TextureId, UiTextureFilter, UiTextureSet};
 
 // Current crate
@@ -126,7 +127,7 @@ impl TextureMirror {
                     Some([x, y]) => {
                         let Some(mirrored_texture) = self.textures.get_mut(texture_id) else {
                             pill_core::warn!(
-                                target: pill_core::telemetry::telemetry_target::UI,
+                                target: telemetry_target::UI,
                                 "[ui] a texture patch arrived before its whole image"
                             );
                             continue;
@@ -137,7 +138,7 @@ impl TextureMirror {
                             || y as u32 + patch_height > mirrored_texture.height
                         {
                             pill_core::warn!(
-                                target: pill_core::telemetry::telemetry_target::UI,
+                                target: telemetry_target::UI,
                                 "[ui] a texture patch fell outside the mirrored image"
                             );
                             continue;

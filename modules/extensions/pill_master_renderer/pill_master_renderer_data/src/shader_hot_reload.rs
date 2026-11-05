@@ -33,6 +33,7 @@
 use std::slice;
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::{AssetManager, World};
 
 // Current crate
@@ -139,7 +140,7 @@ pub unsafe extern "C" fn pill_render_data_shader_changed(
     // Step 3: Write the text into the assets built from it.
     let changed_shader_asset_names = apply_shader_source(assets, path, wgsl, all_shader_sources());
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        target: telemetry_target::HOT_RELOAD,
         path,
         shaders = %changed_shader_asset_names.join(", "),
         "shader source applied"

@@ -30,6 +30,7 @@ use std::sync::Arc;
 // External crates
 use pill_core::error::{HostError, ModuleError};
 use pill_core::info;
+use pill_core::telemetry::telemetry_target;
 use pill_engine::{Engine, EngineApi, SystemOwner};
 
 // Current crate
@@ -227,7 +228,7 @@ mod slot {
             }
 
             info!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = extension_config.name.as_str(),
                 owner = system_owner.0,
                 "extension loaded"
@@ -345,7 +346,7 @@ mod slot {
             // Step 2: The reload itself. A refusal leaves the current
             // generation and its patch state untouched.
             info!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = self.extension_config.name.as_str(),
                 generation,
                 "extension reload triggered"
@@ -604,7 +605,7 @@ mod slot {
         /// itself in the log before its images go.
         fn drop(&mut self) {
             info!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = %self.extension_config.name,
                 generations = self.retired_libraries.len() + 1,
                 "unloading extension"

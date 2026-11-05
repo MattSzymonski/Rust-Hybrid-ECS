@@ -18,6 +18,9 @@
 //! first. Registration removes a superseded generation's entries, so a name
 //! always resolves to one live registration.
 
+// External crates
+use pill_core::telemetry::telemetry_target;
+
 use super::*;
 
 /// One persistable component type's registration, as the reload sees it.
@@ -147,7 +150,7 @@ impl World {
                 if registered_hash != incoming_hash {
                     self.superseded_persist_names.remove(&type_name);
                     warn!(
-                        target: pill_core::telemetry::telemetry_target::ECS,
+                        target: telemetry_target::ECS,
                         type_name = %type_name,
                         "kept the registered layout: this binary was built against a previous layout of the component and stays stale until it is rebuilt"
                     );
@@ -178,7 +181,7 @@ impl World {
                     live_rows: live_row_count,
                 });
                 error!(
-                    target: pill_core::telemetry::telemetry_target::ECS,
+                    target: telemetry_target::ECS,
                     type_name = %type_name,
                     live_rows = live_row_count,
                     message = COMPONENT_NAME_COLLISION_REFUSAL
@@ -221,7 +224,7 @@ impl World {
                             incoming_align,
                         });
                         error!(
-                            target: pill_core::telemetry::telemetry_target::ECS,
+                            target: telemetry_target::ECS,
                             type_name = %type_name,
                             existing_size = existing_layout.size,
                             existing_align = existing_layout.align,
@@ -400,7 +403,7 @@ where
     let snapshot_json: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "[persistence] Failed to parse JSON for '{}': {}",
                 std::any::type_name::<T>(),
                 error
@@ -414,7 +417,7 @@ where
     let default_json: serde_json::Value = serde_json::to_value(&default_instance)
         .map_err(|error| {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "[persistence] Failed to serialize default for '{}': {}",
                 std::any::type_name::<T>(),
                 error
@@ -430,7 +433,7 @@ where
         Ok(value) => Some(Box::new(value)),
         Err(error) => {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "[persistence] Failed to deserialize '{}': {}. Component data skipped.",
                 std::any::type_name::<T>(),
                 error

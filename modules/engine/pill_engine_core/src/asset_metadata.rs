@@ -54,6 +54,7 @@
 use std::path::{Path, PathBuf};
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use trait_type_map::TraitAccessible;
@@ -713,10 +714,15 @@ impl AssetManager {
                     }
                 }
                 Ok(None) => pill_core::debug!(
-                    "asset `{asset_name}` is not on a writable filesystem; its metadata was not written"
+                    target: telemetry_target::RESOURCES,
+                    asset = asset_name.as_str(),
+                    "asset is not on a writable filesystem; its metadata was not written"
                 ),
                 Err(error) => pill_core::warn!(
-                    "asset `{asset_name}` loaded, but its metadata could not be written: {error}"
+                    target: telemetry_target::RESOURCES,
+                    asset = asset_name.as_str(),
+                    error = %error,
+                    "asset loaded, but its metadata could not be written"
                 ),
             }
         }
@@ -905,11 +911,13 @@ impl AssetManager {
             // is the file's truth, and it was not written here.
             Some(written_path) => {
                 pill_core::debug!(
-                    "metadata for `{asset_name}` written with {}",
-                    match recorded_settings {
-                        Some(_) => "the settings the asset was loaded with",
-                        None => "the type's defaults",
-                    }
+                    target: telemetry_target::RESOURCES,
+                    asset = asset_name.as_str(),
+                    settings = match recorded_settings {
+                        Some(_) => "loaded",
+                        None => "defaults",
+                    },
+                    "asset metadata written"
                 );
                 let bytes =
                     std::fs::read(&written_path).map_err(|source| AssetLoadError::Read {

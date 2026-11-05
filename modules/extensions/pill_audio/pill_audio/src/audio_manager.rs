@@ -19,6 +19,7 @@
 //! pool is therefore also the limit on how many voices play at once.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::{Asset, AssetLoadResult, AssetManager, PillAsset, PillResource, SettingsOutcome};
 use serde::{Deserialize, Serialize};
 
@@ -197,14 +198,14 @@ impl pill_engine::SettingsAssetManager for AudioManager {
         // refused rather than trusted.
         if settings.ambient_sinks < 1 || settings.spatial_sinks < 1 {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 "[audio] settings refused: both sink counts must be at least 1"
             );
             return SettingsOutcome::Refused;
         }
         if !settings.ear_separation.is_finite() || settings.ear_separation <= 0.0 {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 "[audio] settings refused: ear_separation must be greater than 0"
             );
             return SettingsOutcome::Refused;
@@ -215,7 +216,7 @@ impl pill_engine::SettingsAssetManager for AudioManager {
             || settings.spatial_sinks != current.spatial_sinks
         {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 ambient_sinks = settings.ambient_sinks,
                 spatial_sinks = settings.spatial_sinks,
                 "[audio] sink counts are fixed when the device opens; restart the host to change them"
@@ -232,7 +233,7 @@ impl pill_engine::SettingsAssetManager for AudioManager {
             self.ear_separation = settings.ear_separation;
         }
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
+            target: telemetry_target::ECS,
             ambient_sinks = settings.ambient_sinks,
             spatial_sinks = settings.spatial_sinks,
             ear_separation = settings.ear_separation,

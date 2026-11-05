@@ -67,7 +67,7 @@ pub fn push_notices(state: &mut EguiShellState, notices: &EditorNotices) {
             expires_at_frame: state.frame_index + TOAST_FRAMES,
         });
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             seq = event.seq,
             level = event.level.name(),
             "[editor] toast queued"
@@ -152,7 +152,7 @@ pub fn draw_toasts(
         if !toasts.logged.contains(&seq) {
             toasts.logged.push(seq);
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 level = level.name(),
                 seq,
                 text = text.as_str(),

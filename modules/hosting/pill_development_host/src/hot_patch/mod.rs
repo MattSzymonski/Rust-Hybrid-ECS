@@ -45,6 +45,7 @@ use std::time::SystemTime;
 
 // External crates
 use pill_core::platform::Instant;
+use pill_core::telemetry::telemetry_target;
 use pill_core::{debug, info, warn};
 use pill_engine::Engine;
 
@@ -519,7 +520,7 @@ impl HotPatchSession {
             // developer needs to know, and an INFO line is easy to lose among
             // the startup output.
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = package,
                 expected = %session.package_rlib.display(),
                 "hot patching is idle: the project rlib a patch links to reach the \
@@ -529,7 +530,7 @@ impl HotPatchSession {
         }
 
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             module = package,
             functions = addressable_function_count,
             hot_functions = annotated_function_count,
@@ -1227,7 +1228,7 @@ impl HotPatchSession {
         self.active_generations
             .insert(qualified.to_string(), generation);
         debug!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             function = qualified,
             generation,
             generations = self.generations.len(),
@@ -1563,7 +1564,7 @@ impl HotPatchSession {
             )
         })?;
         debug!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             package = self.package.as_str(),
             source = %newest_rlib.display(),
             "restaged the rlib so the patch links a consistent closure"

@@ -158,7 +158,7 @@ impl ApplicationHandler for WebEditorApplication {
         let scene_canvas = match canvas_element(&self.scene_canvas_id) {
             Ok(canvas) => canvas,
             Err(message) => {
-                error!(target: telemetry_target::ENGINE, "{message}");
+                error!(target: telemetry_target::EDITOR, "{message}");
                 return;
             }
         };
@@ -177,7 +177,7 @@ impl ApplicationHandler for WebEditorApplication {
         let ui_canvas = match canvas_element(&self.ui_canvas_id) {
             Ok(canvas) => canvas,
             Err(message) => {
-                error!(target: telemetry_target::ENGINE, "{message}");
+                error!(target: telemetry_target::EDITOR, "{message}");
                 return;
             }
         };
@@ -192,7 +192,7 @@ impl ApplicationHandler for WebEditorApplication {
         };
         if let Err(error) = focus_without_scrolling(&focus_target) {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 error = ?error,
                 "could not focus the UI canvas; click it to send keys"
             );
@@ -224,7 +224,7 @@ impl ApplicationHandler for WebEditorApplication {
                         attached.resize_surface(SurfaceId::PRIMARY, size.width, size.height);
                     }
                     *driver.borrow_mut() = Some(attached);
-                    info!(target: telemetry_target::RENDERING, "renderer attached to the scene canvas");
+                    info!(target: telemetry_target::EDITOR, "renderer attached to the scene canvas");
                     scene_window.request_redraw();
                 }
                 Err(error) => report_failure("renderer attachment", &error),
@@ -237,12 +237,12 @@ impl ApplicationHandler for WebEditorApplication {
         pill_core::platform::futures::spawn(async move {
             match attach_ui_surface(ui_canvas, ui_laid_out_size).await {
                 Ok(surface) => {
-                    info!(target: telemetry_target::RENDERING, "UI renderer attached to the UI canvas");
+                    info!(target: telemetry_target::EDITOR, "UI renderer attached to the UI canvas");
                     *ui_surface.borrow_mut() = Some(surface);
                     ui_window.request_redraw();
                 }
                 Err(message) => {
-                    error!(target: telemetry_target::RENDERING, "{message}");
+                    error!(target: telemetry_target::EDITOR, "{message}");
                 }
             }
         });
@@ -431,7 +431,7 @@ impl WebEditorApplication {
                     (snapshot.entities.len(), snapshot.systems.len())
                 });
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 frames = self.frame_index,
                 entities,
                 systems,
@@ -466,7 +466,7 @@ pub fn run(project: StaticProject, scene_canvas_id: &str, ui_canvas_id: &str) {
             Err(error) => return report_failure("event loop creation", &error),
         };
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             scene = %scene_canvas_id,
             ui = %ui_canvas_id,
             "starting the editor in the browser"
@@ -522,7 +522,7 @@ fn run_scripted_lines(engine: &mut pill_engine_core::Engine, lines: &[String]) {
         match ScriptedCommand::parse(line) {
             Ok(command) => run_scripted_command(engine, line, command),
             Err(error) => warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 command = line.as_str(),
                 reason = error.reason.as_str(),
                 "[editor] scripted command rejected"
@@ -557,7 +557,7 @@ fn run_scripted_command(
                 pending_commands.push(vec![systems::pause_toggle_command(paused)]);
             }
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 paused = !paused,
                 "[editor] pause toggled"
             );
@@ -569,7 +569,7 @@ fn run_scripted_command(
             {
                 pending_commands.push(vec![EditorCommand::StepOnce]);
             }
-            info!(target: telemetry_target::ENGINE, "[editor] step queued");
+            info!(target: telemetry_target::EDITOR, "[editor] step queued");
         }
         ScriptedCommand::EntityCreate => {
             let (command, label) = entities::entity_create();
@@ -579,7 +579,7 @@ fn run_scripted_command(
             {
                 pending_commands.push_recorded(vec![command], label, None);
             }
-            info!(target: telemetry_target::ENGINE, "[editor] new entity queued");
+            info!(target: telemetry_target::EDITOR, "[editor] new entity queued");
         }
         ScriptedCommand::EntityDelete => {
             let (entity, asset) = engine
@@ -589,7 +589,7 @@ fn run_scripted_command(
                 .unwrap_or((None, None));
             let Some(entity) = entity else {
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     "[editor] delete entity skipped nothing selected"
                 );
                 return;
@@ -602,7 +602,7 @@ fn run_scripted_command(
                 pending_commands.push_recorded(commands, label, None);
             }
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entity = %entity,
                 "[editor] delete entity queued"
             );
@@ -631,7 +631,7 @@ fn run_scripted_command(
                     (snapshot.entities.len(), snapshot.systems.len())
                 });
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entities,
                 systems,
                 "[editor] web rows"
@@ -649,7 +649,7 @@ fn refuse_in_browser(line: &str, command: &ScriptedCommand) {
         scripted_name(command)
     );
     warn!(
-        target: telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         command = line,
         reason = reason.as_str(),
         "[editor] scripted command rejected"
@@ -817,7 +817,7 @@ fn draw_ui_frame(ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>, shell_frame:
         wgpu::CurrentSurfaceTexture::Success(texture)
         | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
         other => {
-            warn!(target: telemetry_target::RENDERING, error = ?other, "UI canvas surface unavailable");
+            warn!(target: telemetry_target::EDITOR, error = ?other, "UI canvas surface unavailable");
             return;
         }
     };
@@ -957,7 +957,7 @@ async fn attach_ui_surface(
     // instead of being picked from the list.
     configuration.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
     info!(
-        target: telemetry_target::RENDERING,
+        target: telemetry_target::EDITOR,
         format = ?surface_format,
         alpha_mode = ?configuration.alpha_mode,
         "UI canvas configured"

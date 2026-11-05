@@ -15,6 +15,7 @@
 //! glob would have nothing to point at.
 
 // External crates
+pub use pill_core::telemetry::telemetry_target;
 pub use pill_editor_core::assets::{self, AssetDialog};
 pub use pill_editor_core::boundary::{
     frame_from_output, EguiShellFrame, EguiShellInput, ShellBadge, ShellRect, BADGES_PER_VIEW_MAX,

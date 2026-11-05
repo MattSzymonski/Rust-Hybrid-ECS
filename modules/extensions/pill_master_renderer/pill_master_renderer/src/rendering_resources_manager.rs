@@ -32,6 +32,7 @@
 use std::collections::{HashMap, HashSet};
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::{AssetManager, Handle};
 
 // Current crate
@@ -440,7 +441,7 @@ impl RenderingResourcesManager {
                 // The key stays unrecorded, so a later revision tries again,
                 // and the warning names the asset that is not on the GPU.
                 Err(error) => pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "texture `{}` is not uploaded: {error}",
                     texture.name
                 ),
@@ -523,7 +524,7 @@ impl RenderingResourcesManager {
                     self.shaders.insert(key, gpu_handle, version);
                     if shader_recompiled {
                         pill_core::info!(
-                            target: pill_core::telemetry::telemetry_target::RENDERING,
+                            target: telemetry_target::RENDERING,
                             shader = shader.name.as_str(),
                             version,
                             "shader recompiled"
@@ -532,7 +533,7 @@ impl RenderingResourcesManager {
                     epoch_moved = true;
                 }
                 Err(error) => pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "shader `{}` is not compiled: {error}",
                     shader.name
                 ),
@@ -578,7 +579,7 @@ impl RenderingResourcesManager {
                     self.meshes.insert(key, gpu_handle, version);
                 }
                 Err(error) => pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "mesh `{}` is not on the GPU: {error}",
                     mesh.name
                 ),
@@ -620,7 +621,7 @@ impl RenderingResourcesManager {
                 shader_handle
             } else {
                 pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "material `{}` names a shader that is not loaded; drawing with the default shader",
                     material.name
                 );
@@ -652,7 +653,7 @@ impl RenderingResourcesManager {
                     self.materials.insert(key, gpu_handle, version);
                 }
                 Err(error) => pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "material `{}` has no pipeline: {error}",
                     material.name
                 ),

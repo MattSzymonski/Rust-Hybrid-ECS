@@ -30,6 +30,9 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+// External crates
+use pill_core::telemetry::telemetry_target;
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -108,7 +111,7 @@ pub(crate) fn push(notice: HostNotice) {
     // Step 1: Log the notice. When no editor drains the queue, this line is
     // the only record of what the host did.
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::ENGINE,
         kind = notice_kind_log_name(&notice),
         "[editor] host notice"
     );

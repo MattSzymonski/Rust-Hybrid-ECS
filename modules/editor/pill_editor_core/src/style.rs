@@ -29,6 +29,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 // External crates
 use egui::{Color32, Context, CornerRadius, Stroke};
+use pill_core::telemetry::telemetry_target;
 use pill_ui_theme::{
     Rgba, Shadow as TokenShadow, Stroke as TokenStroke, Theme, WidgetStates, WidgetStyle,
 };
@@ -730,7 +731,7 @@ pub fn apply_theme(
             .find(|info| info.layer == ThemeLayer::Project)
             .map_or("none", ThemeLayerInfo::path_text);
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             layers = %layers_text(layers),
             user = %user,
             project = %project,
@@ -748,7 +749,7 @@ pub fn apply_theme(
     let fonts_installed = kit::style::install(context, theme, fonts, append_fonts, &mut signature);
     if fonts_installed {
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             signature = %signature,
             "[editor] fonts installed"
         );

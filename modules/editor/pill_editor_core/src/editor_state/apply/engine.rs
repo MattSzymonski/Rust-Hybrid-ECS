@@ -15,6 +15,7 @@
 //! family never arrives here; it hits `unreachable!`.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::Engine;
 
 // Current crate
@@ -110,7 +111,7 @@ pub(super) fn apply(
             if surface_cameras.grid.enabled != *enabled {
                 surface_cameras.grid.enabled = *enabled;
                 pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     enabled = *enabled,
                     "[editor] scene grid"
                 );

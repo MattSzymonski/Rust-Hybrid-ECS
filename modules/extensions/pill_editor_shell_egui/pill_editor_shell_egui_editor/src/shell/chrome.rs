@@ -161,7 +161,7 @@ pub fn report_selection_change(
         return false;
     }
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         entity = %entity,
         count = selection.entities().len(),
         "[editor] selection changed"
@@ -177,7 +177,7 @@ pub fn select_asset(selection: &mut EditorSelection, path: &str) -> bool {
     }
     selection.asset = Some(path.to_string());
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         path,
         "[editor] asset selected"
     );
@@ -206,7 +206,7 @@ pub fn apply_tab_redock(dock: &mut DockState<EditorTab>, surface: SurfaceIndex) 
         dock.push_to_first_leaf(*tab);
     }
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         count = tabs.len(),
         "[editor] tabs redocked"
     );
@@ -226,7 +226,7 @@ pub fn empty_area(ui: &egui::Ui) -> egui::Vec2 {
 /// response.
 pub fn log_context_menu(area: &str) {
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         area,
         "[editor] context menu"
     );

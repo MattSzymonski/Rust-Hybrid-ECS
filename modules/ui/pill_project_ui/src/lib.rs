@@ -50,6 +50,7 @@ pub use pill_ui_theme::{Theme, ThemeOverrides, ThemePathScope};
 use egui::Context;
 use pill_core::math::Vector2f;
 use pill_core::platform::Instant;
+use pill_core::telemetry::telemetry_target;
 use pill_engine_core::{
     AssetManager, Engine, Handle, Res, ResMut, Resource, SystemError, SystemOwner,
 };
@@ -218,7 +219,7 @@ impl GameUi {
         );
         if fonts_installed {
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::ENGINE,
                 signature = %self.font_signature,
                 "[ui] fonts installed"
             );
@@ -232,7 +233,7 @@ impl GameUi {
         };
         let path = self.override_path.as_deref().unwrap_or("none");
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::ENGINE,
             layers = %layers,
             path = %path,
             generation = self.generation,
@@ -272,7 +273,7 @@ impl GameUi {
             }
             Err(error) => {
                 pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    target: telemetry_target::ENGINE,
                     "[ui] theme refused: {error}"
                 );
             }
@@ -500,7 +501,7 @@ pub fn install_with_theme(engine: &mut Engine, install: ThemeInstall) {
                 Ok(loaded) => override_handle = Some(loaded),
                 Err(error) => {
                     pill_core::warn!(
-                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        target: telemetry_target::ENGINE,
                         "[ui] theme refused: {error}"
                     );
                     override_path = None;
@@ -519,7 +520,7 @@ pub fn install_with_theme(engine: &mut Engine, install: ThemeInstall) {
                         Ok(theme) => Some(theme),
                         Err(error) => {
                             pill_core::warn!(
-                                target: pill_core::telemetry::telemetry_target::ENGINE,
+                                target: telemetry_target::ENGINE,
                                 "[ui] theme refused: {error}"
                             );
                             None
@@ -574,7 +575,7 @@ fn resolve_fonts(world: &mut pill_engine_core::World, theme: &Theme) -> Resolved
                 resolved.font_versions[index] = loaded.version;
             }
             Err(message) => pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::ENGINE,
                 "[ui] font refused: {message}"
             ),
         }

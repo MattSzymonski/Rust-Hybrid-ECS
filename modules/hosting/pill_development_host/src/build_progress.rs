@@ -22,7 +22,7 @@ use std::sync::Mutex;
 
 // External crates
 use pill_core::info;
-use pill_core::telemetry::{log_block, telemetry_target::HOT_RELOAD};
+use pill_core::telemetry::{log_block, telemetry_target};
 
 // =============================================================================
 // Constants
@@ -61,7 +61,7 @@ struct BuildPlan {
 ///
 /// `project_name` is the project's display name. Any earlier plan is replaced.
 pub(crate) fn announce_plan(project_name: &str, builds: Vec<PlannedBuild>) {
-    info!(target: HOT_RELOAD, "{}", render_plan(project_name, &builds));
+    info!(target: telemetry_target::HOT_RELOAD, "{}", render_plan(project_name, &builds));
     // A panic while the lock was held poisons it. Ignore that: the plan holds
     // only counts and names, and dropping it would cost the rest of the start
     // its progress, so the poisoned value is used as it is.
@@ -97,7 +97,7 @@ pub(crate) fn announce_build(module: &str) -> bool {
     current.pending_builds.remove(pending_build_index);
     current.started_build_count += 1;
     info!(
-        target: HOT_RELOAD,
+        target: telemetry_target::HOT_RELOAD,
         "{}",
         render_step(current.started_build_count, current.total_build_count, module)
     );

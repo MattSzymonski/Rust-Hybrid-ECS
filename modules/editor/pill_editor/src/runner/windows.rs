@@ -64,7 +64,7 @@ impl EditorWindow {
         let (width, height) = (width.max(1), height.max(1));
         self.host.resize_surface(scene.surface_id, width, height);
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             width,
             height,
             view,
@@ -86,7 +86,7 @@ impl EditorWindow {
         let (width, height) = (width.max(1), height.max(1));
         self.host.resize_surface(SurfaceId::PRIMARY, width, height);
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             width,
             height,
             "[editor] game surface resized"
@@ -126,7 +126,7 @@ impl EditorWindow {
             if let Some(mut scene) = opened_scene {
                 scene.attach(&mut self.host, &self.cameras[view_index]);
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     view = view_index,
                     surface = scene.surface_id.0,
                     "[editor] scene view opened"
@@ -194,7 +194,7 @@ impl EditorWindow {
                 }
                 Err(error) => {
                     warn!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         view,
                         error = %error,
                         "[editor] popped-out scene window refused"
@@ -232,7 +232,7 @@ impl EditorWindow {
                 }
             }
             Err(error) => warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 view,
                 error = %error,
                 "[editor] scene view redock refused"
@@ -384,7 +384,7 @@ impl EditorWindow {
         }
         self.active_view = view;
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             view,
             "[editor] active viewport"
         );
@@ -420,7 +420,7 @@ impl EditorWindow {
         for tab in stale_tabs {
             if self.popouts.remove(&tab).is_some() {
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     tab = tab.as_str(),
                     "[editor] popout closed"
                 );
@@ -481,14 +481,14 @@ impl EditorWindow {
                     if has_drawn && !popout.presented {
                         popout.presented = true;
                         info!(
-                            target: telemetry_target::ENGINE,
+                            target: telemetry_target::EDITOR,
                             tab = frame.tab.as_str(),
                             "[editor] popout presented"
                         );
                     }
                 }
                 Err(error) => warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     tab = frame.tab.as_str(),
                     error = %error,
                     "[editor] popout frame failed"
@@ -507,7 +507,7 @@ impl EditorWindow {
             Ok(window) => window,
             Err(error) => {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     tab,
                     error = %error,
                     "[editor] popout window refused"
@@ -528,7 +528,7 @@ impl EditorWindow {
             Ok(surface) => surface,
             Err(error) => {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     tab,
                     error = %error,
                     "[editor] popout surface refused"
@@ -542,7 +542,7 @@ impl EditorWindow {
             egui_wgpu::RendererOptions::default(),
         );
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             tab,
             width = size.width,
             height = size.height,
@@ -613,7 +613,7 @@ impl EditorWindow {
             }
         }
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             tab,
             "[editor] popout closed"
         );
@@ -730,7 +730,7 @@ impl EditorWindow {
         // pointer or the keyboard.
         if wants_pointer != self.claimed_pointer || wants_keyboard != self.claimed_keyboard {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 pointer = wants_pointer,
                 keyboard = wants_keyboard,
                 "[editor] egui input claims changed"
@@ -754,12 +754,12 @@ impl EditorWindow {
             // same clipboard writer the editor's structured copy uses.
             match crate::clipboard::write(&text) {
                 Ok(()) => info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     bytes = text.len(),
                     "[editor] clipboard written"
                 ),
                 Err(message) => warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     message = message.as_str(),
                     "[editor] clipboard write failed"
                 ),
@@ -786,7 +786,7 @@ impl EditorWindow {
             pixels_per_point,
         ) {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 error = %error,
                 "[editor] overlay frame failed"
             );
@@ -818,7 +818,7 @@ impl EditorWindow {
         if !self.reported_fallback {
             self.reported_fallback = true;
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 module = SHELL_MODULE_NAME,
                 problems = self.notices.problems.len(),
                 "[editor] safe mode"
@@ -917,14 +917,14 @@ impl EditorWindow {
         ) {
             Ok(overlay) => {
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     "[editor] composition overlay created"
                 );
                 self.overlay = Some(overlay);
             }
             Err(error) => {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     error = %error,
                     "[editor] composition overlay still unavailable"
                 );
@@ -942,7 +942,7 @@ impl EditorWindow {
         match retry_outcome {
             Ok(()) => {
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     module = SHELL_MODULE_NAME,
                     "[editor] safe mode retry requested"
                 );
@@ -951,7 +951,7 @@ impl EditorWindow {
                 self.reported_fallback = false;
             }
             Err(error) => warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 module = SHELL_MODULE_NAME,
                 error = error.as_str(),
                 "[editor] safe mode retry failed"
@@ -968,7 +968,7 @@ impl EditorWindow {
     pub(super) fn apply_cursor_icon(&mut self, icon: egui::CursorIcon) {
         if icon != self.last_cursor {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 icon = format!("{icon:?}").as_str(),
                 "[editor] cursor icon"
             );
@@ -1012,7 +1012,7 @@ impl EditorWindow {
             window.set_ime_allowed(allowed);
             self.ime_allowed = allowed;
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 allowed,
                 "[editor] ime allowed changed"
             );
@@ -1028,7 +1028,7 @@ impl EditorWindow {
                     winit::dpi::LogicalSize::new(rect.width as f64, rect.height as f64),
                 );
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     x = rect.x,
                     y = rect.y,
                     width = rect.width,

@@ -30,6 +30,7 @@
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 pub use pill_renderer_api::error::{ErrorContext, RendererError, Result};
 
 // =============================================================================
@@ -74,7 +75,7 @@ pub(crate) struct CapturedErrors {
 pub(crate) fn report_uncaptured_errors(device: &wgpu::Device) {
     device.on_uncaptured_error(std::sync::Arc::new(|error| {
         pill_core::error!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             "GPU error: {error}"
         );
     }));
@@ -109,7 +110,7 @@ pub(crate) fn latch_device_loss(device: &wgpu::Device) {
             format!("the GPU device was lost ({reason:?}): {message}")
         };
         pill_core::error!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             "{detail}"
         );
         *latched_device_loss() = Some(detail);

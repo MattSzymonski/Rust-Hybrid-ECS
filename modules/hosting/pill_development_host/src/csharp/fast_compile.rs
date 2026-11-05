@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 // External crates
 use pill_core::error::CSharpError;
 use pill_core::platform::Instant;
-use pill_core::telemetry::telemetry_target::HOT_RELOAD;
+use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_csharp_bridge::{fetch_managed_buffer, DotnetRuntimeContext};
 
@@ -160,7 +160,7 @@ impl FastCompiler {
         // keeps it out of the shipping bundle.
         if let Err(error) = crate::build_runner::build_csharp_compiler(workspace_root) {
             warn!(
-                target: HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 error = %error,
                 "could not build the in-process C# compiler; hot reload will run a full build each time"
             );
@@ -182,7 +182,7 @@ impl FastCompiler {
             Ok(compiler) => compiler,
             Err(error) => {
                 warn!(
-                    target: HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     error = %error,
                     "could not load the in-process C# compiler; hot reload will run a full build each time"
                 );
@@ -196,7 +196,7 @@ impl FastCompiler {
         // keeps the cost away from the developer's first edit.
         compiler.start_warmup(runtime, &compiler_assembly_path);
         info!(
-            target: HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             "in-process C# compiler ready; reloads will skip MSBuild"
         );
         Some(compiler)

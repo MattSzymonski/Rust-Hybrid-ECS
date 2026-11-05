@@ -25,6 +25,7 @@
 use std::cell::RefCell;
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::{ComponentTicks, Entity};
 
 // Current crate
@@ -415,6 +416,13 @@ fn copy_managed_bytes(managed_buffer: *const u8, managed_buffer_length: u32) -> 
 }
 
 /// Forwards one managed log line to the engine's tracing subscriber.
+///
+/// The line lands on [`telemetry_target::CSHARP`] at the managed level, with
+/// the managed logger's own category as the `managed_target` field. The
+/// message is forwarded text written by managed code, so it is passed through
+/// as the message rather than worded here. A level outside the five known
+/// ones logs at `warn`, so an unexpected value is visible without reading as
+/// a failure.
 extern "C" fn ffi_csharp_log(
     level: u8,
     target: *const u8,
@@ -427,11 +435,27 @@ extern "C" fn ffi_csharp_log(
     let target = String::from_utf8_lossy(&target_bytes).into_owned();
     let message = String::from_utf8_lossy(&message_bytes).into_owned();
     match level {
-        0 => tracing::trace!(target: "csharp", target = %target, message = %message),
-        1 => tracing::debug!(target: "csharp", target = %target, message = %message),
-        2 => tracing::info!(target: "csharp", target = %target, message = %message),
-        3 => tracing::warn!(target: "csharp", target = %target, message = %message),
-        _ => tracing::error!(target: "csharp", target = %target, message = %message),
+        0 => {
+            tracing::trace!(target: telemetry_target::CSHARP, managed_target = %target, "{message}")
+        }
+        1 => {
+            tracing::debug!(target: telemetry_target::CSHARP, managed_target = %target, "{message}")
+        }
+        2 => {
+            tracing::info!(target: telemetry_target::CSHARP, managed_target = %target, "{message}")
+        }
+        3 => {
+            tracing::warn!(target: telemetry_target::CSHARP, managed_target = %target, "{message}")
+        }
+        4 => {
+            tracing::error!(target: telemetry_target::CSHARP, managed_target = %target, "{message}")
+        }
+        _ => tracing::warn!(
+            target: telemetry_target::CSHARP,
+            managed_target = %target,
+            managed_level = level,
+            "{message}"
+        ),
     }
 }
 

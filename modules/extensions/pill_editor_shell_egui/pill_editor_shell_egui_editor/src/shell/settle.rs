@@ -118,7 +118,7 @@ pub fn settle_pass(
     if let Some(tab) = viewer.deferred.tab_popout {
         if dock.pop_out(tab) {
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 tab = tab.name().as_str(),
                 "[editor] popout moved"
             );
@@ -140,7 +140,7 @@ pub fn settle_pass(
         } else if dock.can_open_scene_view() {
             dock.state_mut().push_to_focused_leaf(tab);
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 tab = tab.name().as_str(),
                 view = tab.scene_view().unwrap_or_default(),
                 "[editor] scene view added"
@@ -148,7 +148,7 @@ pub fn settle_pass(
             viewer.requests.pending_tab = Some(tab);
         } else {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 limit = pill_editor_core::boundary::SCENE_VIEWS_MAX,
                 "[editor] scene view refused: the view limit is reached"
             );

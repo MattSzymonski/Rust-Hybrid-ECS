@@ -26,6 +26,7 @@
 
 // External crates
 use pill_core::math::Vector3f;
+use pill_core::telemetry::telemetry_target;
 use pill_engine::*;
 use serde::{Deserialize, Serialize};
 
@@ -462,7 +463,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     // than spawning a fresh set. Reword either and those suites fail with
     // "Missing required token", which reads like a reload failure and is not.
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ECS,
+        target: telemetry_target::ECS,
         splines = DEMO_SPLINE_COUNT,
         existing = existing_spline_count,
         max_control_points = MAX_CONTROL_POINTS,

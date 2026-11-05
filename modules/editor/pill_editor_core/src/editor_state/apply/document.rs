@@ -16,6 +16,7 @@
 //! [`CommandOutcome::plain()`], because none of these commands can be undone.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::Engine;
 
 // Current crate
@@ -68,7 +69,7 @@ pub(super) fn apply(
             crate::preferences::write_document(&directory, &document)
                 .map_err(|message| format!("{command:?}: {message}"))?;
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 keys = written_key_count,
                 "[editor] preferences saved"
             );
@@ -78,7 +79,7 @@ pub(super) fn apply(
         EditorCommand::SceneNew => {
             let removed_entity_count = crate::scene_workflow::new_scene(engine);
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entities = removed_entity_count,
                 "[editor] scene new"
             );

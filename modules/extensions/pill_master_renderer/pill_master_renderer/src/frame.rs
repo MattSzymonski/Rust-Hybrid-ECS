@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_engine::{
     system, AssetManager, Component, Entity, Handle, Query, Res, ResMut, SystemError,
@@ -123,7 +124,7 @@ fn resolve_passes(
         // pipeline is not news. Both fall back to the built-in pass.
         if handle.is_some() {
             warn!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
+                target: telemetry_target::RENDERING,
                 "The pipeline the manager holds no longer resolves; running the built-in pass"
             );
         }
@@ -169,7 +170,7 @@ fn resolve_passes(
                     );
                 }
                 None => warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "Pass {} names a material that is not loaded",
                     pass.name
                 ),
@@ -193,7 +194,7 @@ fn resolve_passes(
     }
     if stale_pass_handle_count > 0 {
         warn!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             "Pass chain: {stale_pass_handle_count} of {} pass handles no longer resolve and are left out",
             pipeline.passes.len()
         );
@@ -212,7 +213,7 @@ fn resolve_passes(
     let surface_is_last = surface_positions.len() == 1 && surface_positions[0] + 1 == passes.len();
     if !surface_positions.is_empty() && !surface_is_last {
         warn!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             positions = %surface_positions
                 .iter()
                 .map(ToString::to_string)
@@ -278,7 +279,7 @@ pub(crate) fn consumed_component_names() -> Vec<String> {
 fn note_ui_producer(producer: u8, producer_name: &str) {
     if UI_PRODUCER.swap(producer, Ordering::Relaxed) != producer {
         info!(
-            target: pill_core::telemetry::telemetry_target::UI,
+            target: telemetry_target::UI,
             "[ui] producer={producer_name}"
         );
     }

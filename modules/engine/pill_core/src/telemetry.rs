@@ -86,6 +86,11 @@ pub mod telemetry_target {
     pub const UI: &str = "engine::ui";
     /// Resource loading and storage.
     pub const RESOURCES: &str = "engine::resources";
+    /// The editor and its panels: the executable, its shared core and the
+    /// shell module.
+    pub const EDITOR: &str = "engine::editor";
+    /// Lines forwarded from managed C# code through the bridge.
+    pub const CSHARP: &str = "engine::csharp";
 
     /// The coarse profiling lane, for frame, system and pass zones.
     pub const PROFILE_COARSE: &str = "profile::coarse";

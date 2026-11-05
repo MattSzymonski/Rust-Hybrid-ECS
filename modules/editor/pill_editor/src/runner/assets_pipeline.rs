@@ -55,7 +55,7 @@ impl EditorWindow {
                 if image.is_empty() {
                     state.previews.mark_refused(&path);
                     info!(
-                        target: telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         path = path.as_str(),
                         id = image.id,
                         "[editor] preview refused"
@@ -70,7 +70,7 @@ impl EditorWindow {
                 );
                 state.previews.mark_ready(&path, texture);
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     path = path.as_str(),
                     width = image.width,
                     height = image.height,
@@ -132,7 +132,7 @@ impl EditorWindow {
             }
             for key in &skipped_keys {
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     path = key.as_str(),
                     "[editor] preview skipped"
                 );
@@ -153,7 +153,7 @@ impl EditorWindow {
         };
         self.preview_in_flight.insert(id, path.clone());
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             path = path.as_str(),
             id,
             "[editor] preview requested"
@@ -269,7 +269,7 @@ impl EditorWindow {
         let listing_changed = tree_moved || requested_by_edit;
         if listing_changed {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 count = self.asset_entries.len(),
                 types = self.standalone_types.len(),
                 "[editor] asset listing refreshed"
@@ -542,7 +542,7 @@ impl EditorWindow {
             .map(|file_name| file_name.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string());
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             path = %path.display(),
             folder = folder.as_str(),
             "[editor] drop preview"
@@ -554,7 +554,7 @@ impl EditorWindow {
     pub(super) fn cancel_drop_preview(&mut self) {
         if self.drop_preview.take().is_some() {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] drop preview cancelled"
             );
         }
@@ -592,7 +592,7 @@ impl EditorWindow {
             .map(|directory| directory.to_path_buf())
         else {
             warn!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 "[editor] drop refused: the host knows no asset directory"
             );
             self.push_toast(
@@ -606,7 +606,7 @@ impl EditorWindow {
             Ok(relative) => relative,
             Err(message) => {
                 warn!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     folder = folder.as_str(),
                     "[editor] drop refused: {message}"
                 );
@@ -625,7 +625,7 @@ impl EditorWindow {
         for path in paths {
             if path.is_dir() {
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     path = %path.display(),
                     "[editor] drop refused: folder"
                 );
@@ -659,7 +659,7 @@ impl EditorWindow {
         }
         self.asset_listing_dirty = true;
         info!(
-            target: telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = sources.len(),
             folder = folder.as_str(),
             "[editor] files dropped"

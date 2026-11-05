@@ -33,6 +33,7 @@
 extern crate self as pill_editor_shell_egui_editor;
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_editor_core::boundary::{EguiPopoutInputs, EguiShellFrame, EguiShellInput};
 use pill_editor_core::commands::{ensure_command_resources, PendingEditorCommands};
 use pill_editor_core::editor_state::{EditorSelection, EditorSnapshot};
@@ -146,7 +147,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     // generation.
     // Note: the egui editor's end-to-end suite looks for this exact line.
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ECS,
+        target: telemetry_target::EDITOR,
         "[editor] pill_editor_shell_egui_editor loaded"
     );
     0

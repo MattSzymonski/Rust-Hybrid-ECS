@@ -36,6 +36,7 @@ use notify::event::EventKind;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use pill_core::error::WatcherError;
 use pill_core::platform::Instant;
+use pill_core::telemetry::telemetry_target;
 use pill_core::{error, info};
 
 // =============================================================================
@@ -310,7 +311,7 @@ where
             // own threads. Log the error and carry on.
             Err(error) => {
                 error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     error = %error,
                     "{}",
                     callback_error_message
@@ -389,7 +390,7 @@ pub(crate) fn spawn_source_watcher(
     }
 
     info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        target: telemetry_target::HOT_RELOAD,
         module = module_name,
         // The configured form, relative to the workspace: shorter than the
         // joined absolute path, and with one kind of separator.
@@ -450,7 +451,7 @@ pub(crate) fn spawn_source_watcher(
                 .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
                 .unwrap_or(f64::NAN);
             info!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 changed_paths = %changed_path_report,
                 detection_delay_ms = format!("{detection_delay_ms:.0}").as_str(),
                 debounce_ms = debounce_duration().as_millis() as u64,

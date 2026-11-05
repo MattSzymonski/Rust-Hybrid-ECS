@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 // External crates
 use pill_core::error::{engine_report, install_engine_report_handler};
+use pill_core::telemetry::telemetry_target;
 
 // Current crate
 use crate::error::RunError;
@@ -127,7 +128,7 @@ fn main() -> miette::Result<()> {
         // Also send the fatal failure to the tracing output, so it appears in
         // any active spans and in the log files.
         pill_core::error!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::ENGINE,
             error = %error,
             "host terminated with an error"
         );

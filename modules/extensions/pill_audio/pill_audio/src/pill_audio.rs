@@ -41,6 +41,7 @@
 //! turns a listener's placement into the two points rodio pans against.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::*;
 
 // =============================================================================
@@ -192,7 +193,7 @@ pub fn register(engine: &mut Engine) -> u32 {
             }
             None => {
                 pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::ECS,
+                    target: telemetry_target::ECS,
                     "no audio output device; pill_audio loaded without playback"
                 );
             }
@@ -202,7 +203,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     // its own: `audio_system` declares itself, so the engine registers it
     // before this function runs, on every generation.
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ECS,
+        target: telemetry_target::ECS,
         ambient_sinks = DEFAULT_AMBIENT_SINK_COUNT,
         spatial_sinks = DEFAULT_SPATIAL_SINK_COUNT,
         "pill_audio module registered"

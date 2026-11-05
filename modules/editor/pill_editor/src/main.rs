@@ -24,6 +24,7 @@ use std::path::PathBuf;
 // External crates
 use pill_core::error;
 use pill_core::error::{engine_report, install_engine_report_handler};
+use pill_core::telemetry::telemetry_target;
 
 // Current crate
 use crate::frontend::EditorError;
@@ -96,7 +97,7 @@ fn main() -> miette::Result<()> {
         // The fatal error is also logged, so it appears inside any active
         // spans and in the log files next to the run's other messages.
         error!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             error = %error,
             "editor terminated with an error"
         );

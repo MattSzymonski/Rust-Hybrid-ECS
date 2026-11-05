@@ -25,6 +25,7 @@
 //! winit frontend (the standalone host, the editor) attach this renderer.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_renderer_api::RawWindowData;
 
@@ -143,7 +144,7 @@ impl Surface {
             })?;
         let adapter_info = adapter.get_info();
         let backend = adapter_info.backend;
-        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Using GPU: {} ({:?})", adapter_info.name, adapter_info.backend);
+        info!(target: telemetry_target::RENDERING, "Using GPU: {} ({:?})", adapter_info.name, adapter_info.backend);
         let mut wanted_features = wgpu::Features::DEPTH_CLIP_CONTROL;
         // Only when GPU profiling was asked for: the query features change
         // nothing until a query is recorded, and the renderer asks the device
@@ -214,13 +215,13 @@ impl Surface {
                 return Err(error);
             }
             warn!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
+                target: telemetry_target::RENDERING,
                 "present mode {:?} was refused ({error}); falling back to Fifo", surface_configuration.present_mode
             );
             surface_configuration.present_mode = wgpu::PresentMode::Fifo;
             configure_first(&surface, &device, &mut surface_configuration).await?;
         }
-        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Present mode: {:?}", surface_configuration.present_mode);
+        info!(target: telemetry_target::RENDERING, "Present mode: {:?}", surface_configuration.present_mode);
         Ok((
             Self {
                 surface,
@@ -324,7 +325,7 @@ impl Surface {
                 return Err(error);
             }
             warn!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
+                target: telemetry_target::RENDERING,
                 "present mode {:?} was refused for an additional surface ({error}); falling back to Fifo",
                 surface_configuration.present_mode
             );
@@ -472,7 +473,7 @@ fn requested_present_mode(
         "fifo" => wgpu::PresentMode::Fifo,
         _ => {
             warn!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
+                target: telemetry_target::RENDERING,
                 "{PRESENT_MODE_VARIABLE}={requested} is not a present mode (immediate, mailbox, fifo); using Fifo"
             );
             return None;
@@ -480,7 +481,7 @@ fn requested_present_mode(
     };
     if !available_present_modes.contains(&present_mode) {
         warn!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             available = %available_present_modes
                 .iter()
                 .map(|mode| format!("{mode:?}"))
@@ -592,7 +593,7 @@ async fn configure_first(
         .await;
         match configuration_attempt_failure(probe_outcome, errors) {
             None => {
-                info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Surface configured: {alpha_mode:?}");
+                info!(target: telemetry_target::RENDERING, "Surface configured: {alpha_mode:?}");
                 return Ok(());
             }
             Some(failure) => failures.push(format!("{alpha_mode:?} ({failure})")),

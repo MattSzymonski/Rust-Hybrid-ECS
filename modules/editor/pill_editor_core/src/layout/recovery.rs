@@ -23,6 +23,7 @@
 //! rule.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use serde::{Deserialize, Serialize};
 
 // Current crate
@@ -98,7 +99,7 @@ pub fn write(document: &RecoveryDocument) -> bool {
         Ok(()) => true,
         Err(message) => {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 reason = message.as_str(),
                 "[editor] recovery write failed"
             );
@@ -119,7 +120,7 @@ pub fn read() -> Option<RecoveryDocument> {
         Ok(document) if document.is_current() => Some(document),
         Ok(document) => {
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 version = document.version,
                 "[editor] recovery document ignored"
             );
@@ -128,7 +129,7 @@ pub fn read() -> Option<RecoveryDocument> {
         }
         Err(error) => {
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 reason = %error,
                 "[editor] recovery document ignored"
             );
@@ -144,12 +145,12 @@ pub fn remove() {
     let path = recovery_path();
     match std::fs::remove_file(&path) {
         Ok(()) => pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             "[editor] recovery document removed"
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             reason = %error,
             "[editor] recovery document could not be removed"
         ),

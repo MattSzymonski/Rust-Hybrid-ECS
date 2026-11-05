@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::{
     import_scene_document, load_scene, render_standalone, save_scene, scene_database, AssetGuid,
     AssetManager, Engine, ImportRegistry, Resource, Scene, SceneLoad, World,
@@ -153,7 +154,7 @@ pub fn open_scene(engine: &mut Engine, path: &str) -> Result<SceneLoad, String> 
     }
     reset_document_state(world);
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         path,
         guid = %guid,
         entities = scene_load.entities,
@@ -217,7 +218,7 @@ pub fn write_scene(engine: &mut Engine, path: Option<&str>) -> Result<OpenScene,
     // project that builds its meshes in code from saving a scene.
     if !save_report.skipped_fields.is_empty() {
         pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = save_report.skipped_fields.len(),
             fields = save_report.skipped_fields.join(", ").as_str(),
             "[editor] scene fields not written"
@@ -228,7 +229,7 @@ pub fn write_scene(engine: &mut Engine, path: Option<&str>) -> Result<OpenScene,
     // goes ahead, and the author is told which components were dropped.
     if !save_report.skipped_components.is_empty() {
         pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             count = save_report.skipped_components.len(),
             components = save_report.skipped_components.join(", ").as_str(),
             "[editor] scene components not written"
@@ -276,7 +277,7 @@ pub fn write_scene(engine: &mut Engine, path: Option<&str>) -> Result<OpenScene,
         session.dirty = false;
     }
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         path = saved_scene.path.as_str(),
         guid = %saved_scene.guid,
         entities = document.entities.len(),

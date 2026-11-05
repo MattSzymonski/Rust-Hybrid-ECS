@@ -1332,7 +1332,7 @@ fn scan_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path)
     // is a second resource of the same world.
     let Some(registry) = world.get_resource::<pill_engine::ImportRegistry>().cloned() else {
         info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
+            target: telemetry_target::ECS,
             "[assets] scan_on_start: no imported asset types are registered; nothing to scan"
         );
         return;
@@ -1347,13 +1347,13 @@ fn scan_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path)
     );
     for (name, error) in &report.failed {
         warn!(
-            target: pill_core::telemetry::telemetry_target::ECS,
+            target: telemetry_target::ECS,
             asset = name.as_str(),
             "[assets] scan_on_start could not import an asset: {error}"
         );
     }
     info!(
-        target: pill_core::telemetry::telemetry_target::ECS,
+        target: telemetry_target::ECS,
         directory = %asset_directory.display(),
         imported = report.imported.len(),
         already_loaded = report.already_loaded.len(),
@@ -1379,7 +1379,7 @@ fn index_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path
     let database = pill_engine::AssetDatabase::from_directory(asset_directory, &registry);
     for conflict in database.conflicts() {
         warn!(
-            target: pill_core::telemetry::telemetry_target::ECS,
+            target: telemetry_target::ECS,
             guid = %conflict.guid,
             kept = conflict.kept.as_str(),
             refused = conflict.refused.as_str(),
@@ -1387,7 +1387,7 @@ fn index_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path
         );
     }
     info!(
-        target: pill_core::telemetry::telemetry_target::ECS,
+        target: telemetry_target::ECS,
         directory = %asset_directory.display(),
         assets = database.len(),
         conflicts = database.conflicts().len(),

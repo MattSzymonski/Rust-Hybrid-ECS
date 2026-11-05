@@ -26,6 +26,7 @@
 //! the host has never heard of.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use trait_type_map::TraitAccessible;
 
 // Current crate
@@ -888,7 +889,7 @@ impl World {
                     existing_name: existing.shared_name.clone(),
                 };
                 error!(
-                    target: pill_core::telemetry::telemetry_target::ECS,
+                    target: telemetry_target::ECS,
                     shared_name = %shared_name,
                     existing_name = %existing.shared_name,
                     error = %error,
@@ -909,7 +910,7 @@ impl World {
                     incoming_type: incoming.declaring_type.clone(),
                 };
                 error!(
-                    target: pill_core::telemetry::telemetry_target::ECS,
+                    target: telemetry_target::ECS,
                     shared_name = %shared_name,
                     existing_type = %existing.declaring_type,
                     incoming_type = %incoming.declaring_type,
@@ -927,7 +928,7 @@ impl World {
                     incoming_align: incoming.align,
                 };
                 error!(
-                    target: pill_core::telemetry::telemetry_target::ECS,
+                    target: telemetry_target::ECS,
                     shared_name = %shared_name,
                     existing_size = existing.size,
                     existing_align = existing.align,
@@ -951,7 +952,7 @@ impl World {
                         incoming_hash,
                     };
                     error!(
-                        target: pill_core::telemetry::telemetry_target::ECS,
+                        target: telemetry_target::ECS,
                         shared_name = %shared_name,
                         error = %error,
                         "shared resource registered with two different field shapes"
@@ -1005,7 +1006,7 @@ impl World {
             if let Some(&resource_ops) = self.resource_factories.get(id) {
                 if resource_ops.foreign {
                     error!(
-                        target: pill_core::telemetry::telemetry_target::ECS,
+                        target: telemetry_target::ECS,
                         resource = ?id,
                         "a Rust resource is declared foreign; keeping its own drop"
                     );

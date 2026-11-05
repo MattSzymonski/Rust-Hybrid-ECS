@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 // External crates
 use pill_core::error::CSharpError;
+use pill_core::telemetry::telemetry_target;
 #[cfg(feature = "hot_reload")]
 use pill_core::{error, info};
 use pill_engine::commands::CommandQueue;
@@ -1139,7 +1140,7 @@ impl CSharpRuntime {
             // persistent unknown status must not flood the terminal.
             if self.last_poll_status != status {
                 error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     status,
                     "the managed loader reported an unknown reload status; keeping the currently loaded assembly"
                 );
@@ -1152,7 +1153,7 @@ impl CSharpRuntime {
         // checked.
         if status == POLL_REJECTED && self.last_poll_status != POLL_REJECTED {
             error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "C# reload rejected: component or system signatures changed; restart the host to rebuild the native component registry and scheduler"
             );
         }
@@ -1169,7 +1170,7 @@ impl CSharpRuntime {
                 self.reregister_systems(engine)?;
             }
             info!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "C# hot reload complete"
             );
             // No manifest check runs after the swap here: a version whose
@@ -1226,7 +1227,7 @@ impl CSharpRuntime {
                     self.system_snapshot.clear();
                     self.manifest_applied_without_assembly = true;
                     error!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        target: telemetry_target::HOT_RELOAD,
                         cleared_systems = cleared_system_count,
                         "the managed loader failed to install a version whose manifest was already applied; the project's systems have been stopped - restart the host"
                     );
@@ -1241,7 +1242,7 @@ impl CSharpRuntime {
                     self.reregister_systems(engine)?;
                 }
                 info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     added = report.added.len(),
                     migrated = report.migrated.len(),
                     renamed = report.renamed.len(),
@@ -1276,13 +1277,13 @@ impl CSharpRuntime {
     #[cfg(feature = "hot_reload")]
     fn abort_pending_version(&mut self, reason: &str) {
         error!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             reason,
             "C# reload rejected: the component manifest could not be applied; the running assembly keeps its rows"
         );
         if (self.abort_reload)() == 0 {
             error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "the managed loader failed to discard the parked version; restart the host"
             );
         }
@@ -1317,7 +1318,7 @@ impl CSharpRuntime {
         self.system_snapshot =
             commit_managed_systems(engine, &self.bindings, self.exports, prepared_systems);
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             removed,
             registered = self.system_snapshot.len(),
             "re-registered the project's managed systems after a signature change"
@@ -1412,7 +1413,7 @@ fn read_reported_manifest(
         Ok(manifest) => Some(manifest),
         Err(ManagedBufferError::LengthOutOfRange { length, .. }) => {
             error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 length,
                 "the {assembly} assembly reported a component manifest length outside the accepted range{consequence}"
             );
@@ -1420,7 +1421,7 @@ fn read_reported_manifest(
         }
         Err(ManagedBufferError::AllocationFailed { length }) => {
             error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 length,
                 "could not reserve a buffer for the {assembly} component manifest{consequence}"
             );
@@ -1428,7 +1429,7 @@ fn read_reported_manifest(
         }
         Err(ManagedBufferError::CopyFailed) => {
             error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "could not copy the {assembly} component manifest{consequence}"
             );
             None

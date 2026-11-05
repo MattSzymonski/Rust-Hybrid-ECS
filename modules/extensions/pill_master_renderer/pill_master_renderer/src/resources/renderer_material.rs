@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 
 // External crates
 use pill_core::debug;
+use pill_core::telemetry::telemetry_target;
 
 // Current crate
 use crate::{
@@ -141,7 +142,7 @@ impl RendererMaterial {
             .collect::<Vec<_>>()
             .join(", ");
         debug!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             material = name,
             shader = shader.name.as_str(),
             defaulted_textures = %defaulted_texture_names,

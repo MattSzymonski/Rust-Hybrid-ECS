@@ -29,6 +29,7 @@ use std::time::SystemTime;
 use libloading::Library;
 use pill_core::debug;
 use pill_core::platform::Instant;
+use pill_core::telemetry::telemetry_target;
 
 // Current crate
 use super::compile::CargoRustcLine;
@@ -203,7 +204,7 @@ fn build_body(body: &PreparedBody) -> Result<BuiltBody, PatchRefusal> {
         // of guessed at. DEBUG because it is long and only wanted once
         // something has already gone wrong.
         debug!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             command = body
                 .line
                 .replay_args(

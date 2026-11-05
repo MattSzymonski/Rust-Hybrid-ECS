@@ -106,7 +106,7 @@ macro_rules! log_row_once {
         if !$logged.has($flag) {
             $logged.mark($flag);
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 component = $type_name,
                 $($field)*
                 "[editor] inspector row kind={}",
@@ -526,7 +526,7 @@ pub fn inspector_asset_row(
     let key = format!("{}.{type_name}.{}", row_input.entity, row_input.field);
     if remember_asset_row_text(session, &key, &text) {
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             entity = %row_input.entity,
             component = type_name,
             field = row_input.field,
@@ -749,7 +749,7 @@ pub fn inspector_entity_row(
     let key = format!("{}.{type_name}.{}", row_input.entity, row_input.field);
     if remember_entity_row_text(session, &key, &text) {
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             entity = %row_input.entity,
             component = type_name,
             field = row_input.field,
@@ -927,7 +927,7 @@ pub fn remember_entity_row_rect(
         return;
     }
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         row = key,
         min_x = rect.min.x,
         min_y = rect.min.y,
@@ -990,7 +990,7 @@ pub fn remember_asset_row_rect(
         return;
     }
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         row = key,
         min_x = rect.min.x,
         min_y = rect.min.y,

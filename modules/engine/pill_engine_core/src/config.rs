@@ -27,6 +27,7 @@
 use pill_core::info;
 use pill_core::rayon;
 use pill_core::telemetry::log_block;
+use pill_core::telemetry::telemetry_target;
 
 // =============================================================================
 // Profiling
@@ -221,7 +222,7 @@ pub fn print_parallel_config() {
         ),
     ];
     info!(
-        target: pill_core::telemetry::telemetry_target::SYSTEM,
+        target: telemetry_target::SYSTEM,
         "{}",
         log_block("Parallel execution config", lines)
     );

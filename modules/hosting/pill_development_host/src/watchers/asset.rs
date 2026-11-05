@@ -39,6 +39,7 @@ use std::sync::mpsc::{channel, Receiver};
 use notify::event::{EventKind, ModifyKind, RenameMode};
 use pill_core::error::WatcherError;
 use pill_core::info;
+use pill_core::telemetry::telemetry_target;
 
 // Current crate
 use super::shared::{is_relevant_event, spawn_settled_watcher};
@@ -102,7 +103,7 @@ impl AssetWatcher {
         // Step 1: Open the queue the worker fills and the main thread drains.
         let (change_sender, changes) = channel::<AssetChange>();
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             directory = %asset_directory.display(),
             "[assets] watching the project's assets for edits"
         );

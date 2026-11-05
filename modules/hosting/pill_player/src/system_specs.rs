@@ -17,6 +17,7 @@
 // External crates
 use pill_core::info;
 use pill_core::telemetry::log_block;
+use pill_core::telemetry::telemetry_target;
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 
 // =============================================================================
@@ -103,7 +104,7 @@ pub(crate) fn report_machine_specs() {
     lines.push(format!("│  └─ Uptime: {uptime_text}"));
     lines.push("└─ GPU: use external tools (dxdiag / lspci)".to_string());
     info!(
-        target: pill_core::telemetry::telemetry_target::SYSTEM,
+        target: telemetry_target::SYSTEM,
         "{}",
         log_block("System specs", lines)
     );

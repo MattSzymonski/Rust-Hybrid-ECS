@@ -23,6 +23,7 @@ use std::collections::HashSet;
 
 // External crates
 use pill_core::error;
+use pill_core::telemetry::telemetry_target;
 use pill_engine::archetype::ArchetypeId;
 use pill_engine::commands::CommandQueue;
 use pill_engine::{Entity, World};
@@ -173,7 +174,7 @@ impl ActiveScopeGuard {
         let already_active = ACTIVE_SCOPE.with(|scope_slot| scope_slot.get().is_some());
         if already_active {
             error!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 "nested managed ECS system invocation rejected; a managed system                  re-entered the host while one was already running"
             );
             return None;
@@ -300,7 +301,7 @@ pub(super) fn guard_managed_callback(
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "a non-string panic payload".to_string());
             error!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 callback = callback_name,
                 detail = detail.as_str(),
                 "a managed callback panicked; reporting failure to the calling system instead of aborting"

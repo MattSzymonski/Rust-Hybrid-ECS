@@ -69,13 +69,13 @@ pub fn palette_window(
         palette.logged_query = Some(palette.query.clone());
         for row in &unresolved {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 command = row.id.as_str(),
                 "[editor] command has no action"
             );
         }
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             query = palette.query.as_str(),
             matches = rows.len(),
             first = rows.first().map_or("", |row| row.title.as_str()),
@@ -153,7 +153,7 @@ pub fn palette_window(
             height: rect.height(),
         });
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             x = rect.min.x,
             y = rect.min.y,
             width = rect.width(),
@@ -184,7 +184,7 @@ pub fn run_selected(
     let action = menubar::action_for(row, viewer.snapshot, viewer.selection);
     palette.open = false;
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         command = row.id.as_str(),
         "[editor] palette closed"
     );
@@ -194,7 +194,7 @@ pub fn run_selected(
         // from the popup. It stays for a caller that hands in rows of its own,
         // where a row with no action warns instead of silently doing nothing.
         None => pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             command = row.id.as_str(),
             "[editor] command has no action"
         ),

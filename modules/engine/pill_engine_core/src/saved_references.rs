@@ -42,6 +42,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 // Current crate
@@ -279,31 +280,38 @@ pub fn restore_asset_reference(
             Err(error) => error,
         };
     let Some(path) = saved.path.as_deref() else {
-        report_unresolved_once(
-            saved.guid,
-            &format!(
-                "resolves to no asset ({guid_error}) and carries no path hint; \
-                 using the invalid handle"
-            ),
-        );
+        if first_report_of(saved.guid) {
+            pill_core::warn!(
+                target: telemetry_target::RESOURCES,
+                guid = %saved.guid,
+                error = %guid_error,
+                "saved asset reference resolves to no asset and has no path hint; using the invalid handle"
+            );
+        }
         return FieldValue::unset_asset();
     };
     match registry.load_by_path(assets, Path::new(path), MetadataPolicy::ReadIfPresent) {
         Ok(outcome) => {
-            report_unresolved_once(
-                saved.guid,
-                &format!("is unknown here; resolved by its path hint `{path}` instead"),
-            );
+            if first_report_of(saved.guid) {
+                pill_core::warn!(
+                    target: telemetry_target::RESOURCES,
+                    guid = %saved.guid,
+                    path,
+                    "saved asset reference is unknown here; resolved by its path hint instead"
+                );
+            }
             asset_field_value_from_outcome(&outcome)
         }
         Err(path_error) => {
-            report_unresolved_once(
-                saved.guid,
-                &format!(
-                    "resolves to no asset ({guid_error}; the path hint `{path}`: \
-                     {path_error}); using the invalid handle"
-                ),
-            );
+            if first_report_of(saved.guid) {
+                pill_core::warn!(
+                    target: telemetry_target::RESOURCES,
+                    guid = %saved.guid,
+                    path,
+                    error = %format!("{guid_error}; the path hint: {path_error}"),
+                    "saved asset reference resolves to no asset by guid or path hint; using the invalid handle"
+                );
+            }
             FieldValue::unset_asset()
         }
     }
@@ -333,13 +341,6 @@ pub(crate) fn first_report_of(guid: AssetGuid) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(guid)
-}
-
-/// Logs one warning for `guid`, unless this process already reported it.
-fn report_unresolved_once(guid: AssetGuid, reason: &str) {
-    if first_report_of(guid) {
-        pill_core::warn!("saved asset reference {guid} {reason}");
-    }
 }
 
 // =============================================================================

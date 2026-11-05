@@ -41,6 +41,7 @@ use std::sync::mpsc::{channel, Receiver};
 // External crates
 use pill_core::error::WatcherError;
 use pill_core::platform::Instant;
+use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 
 // Current crate
@@ -105,7 +106,7 @@ impl ShaderWatcher {
         // file is queued only once its text differs from that.
         let (cooked_sender, cooked_shaders) = channel::<CookedShader>();
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             tree = tree_label,
             directory = %shaders_directory.display(),
             "watching shader sources for edits"
@@ -209,7 +210,7 @@ fn cook_edited_shaders(
         Ok(report) => report,
         Err(error) => {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "shader cook failed; keeping the previous shaders: {error}"
             );
             return Vec::new();
@@ -230,7 +231,7 @@ fn cook_edited_shaders(
             Ok(wgsl_text) => wgsl_text,
             Err(error) => {
                 warn!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     path = %output_path.display(),
                     "cooked shader could not be read: {error}"
                 );
@@ -248,7 +249,7 @@ fn cook_edited_shaders(
         });
     }
     info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        target: telemetry_target::HOT_RELOAD,
         edited = edited_paths.len(),
         recooked = report.rebuilt_outputs.len(),
         changed = changed_shaders.len(),

@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 // External crates
 use indexmap::IndexMap;
+use pill_core::telemetry::telemetry_target;
 use pill_engine::{
     pill_mirror_impl, pill_mirror_method, pill_mirror_object, AssetLoadError, AssetLoadResult,
     AssetLoader, ImportedAsset, PillAsset, PillMirror,
@@ -479,7 +480,7 @@ pub fn slots_by_name<S: SlotName>(
     for slot in slots {
         if keyed.contains_key(slot.slot_name()) {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
+                target: telemetry_target::RENDERING,
                 "shader `{shader_name}` declares {declared} slot `{}` twice; the later declaration is ignored",
                 slot.slot_name()
             );

@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, HashMap};
 
 // External crates
 use pill_core::platform::Instant;
+use pill_core::telemetry::telemetry_target;
 use pill_core::{info, PillStyle};
 use pill_engine::common_components::TransformComponent;
 use pill_engine::AssetManager;
@@ -293,7 +294,7 @@ impl Renderer {
     /// it alive. A frontend holds the window for as long as it holds the
     /// renderer, and drops the renderer first.
     pub async unsafe fn new_async(window: RawWindowData, width: u32, height: u32) -> Result<Self> {
-        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Initializing {}", "Renderer".module_object_style());
+        info!(target: telemetry_target::RENDERING, "Initializing {}", "Renderer".module_object_style());
         // Step 1: Build the shared state and the primary surface's target.
         // SAFETY: forwarded from this function's own contract.
         let (mut state, primary) = unsafe { State::new(window, width, height) }.await?;
@@ -323,7 +324,7 @@ impl Drop for Renderer {
             timeout: None,
         }) {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 "the GPU did not go idle before the renderer was released: {error}"
             );
         }
@@ -521,7 +522,7 @@ impl PillRenderer for Renderer {
                     if !target.presented {
                         target.presented = true;
                         info!(
-                            target: pill_core::telemetry::telemetry_target::RENDERING,
+                            target: telemetry_target::RENDERING,
                             "[render] surface {id} first frame presented"
                         );
                     }
@@ -532,7 +533,7 @@ impl PillRenderer for Renderer {
                 // draw.
                 Err(error) if id == primary_surface_id => return Err(error),
                 Err(error) => pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "surface {id} was not drawn: {error}"
                 ),
             }
@@ -620,7 +621,7 @@ impl PillRenderer for Renderer {
                 .remove(replaced_target.camera);
         }
         info!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             "surface {} attached ({width}x{height})", id.0
         );
         Ok(())
@@ -642,7 +643,7 @@ impl PillRenderer for Renderer {
             timeout: None,
         }) {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
+                target: telemetry_target::RENDERING,
                 "the GPU did not go idle before surface {} was released: {error}", id.0
             );
         }
@@ -652,7 +653,7 @@ impl PillRenderer for Renderer {
             .remove(target.camera);
         drop(target);
         info!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             "surface {} detached", id.0
         );
     }
@@ -666,7 +667,7 @@ impl PillRenderer for Renderer {
             // not worth killing a running game over, and the next resize event
             // tries again.
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
+                target: telemetry_target::RENDERING,
                 "surface {} resize to {width}x{height} failed: {error}", id.0
             );
         }
@@ -904,7 +905,7 @@ impl State {
         if self.frames_since_ui_report >= GPU_REPORT_INTERVAL {
             self.frames_since_ui_report = 0;
             info!(
-                target: pill_core::telemetry::telemetry_target::UI,
+                target: telemetry_target::UI,
                 "[ui] surface={} draws={} vertices={}",
                 surface_id,
                 draw_count,
@@ -1397,7 +1398,7 @@ fn record_preview(renderer: &mut Renderer, frame: &RenderFrame, assets_manager: 
             drawable = false;
             if let Err(reason) = draw_preview(renderer, request, assets_manager) {
                 pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     id = request.id,
                     reason,
                     "[preview] not drawn"
@@ -1522,13 +1523,13 @@ fn create_gpu_profiler(
         .contains(crate::profiler::GPU_PROFILE_FEATURES)
     {
         pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             "PILL_GPU_PROFILE is set, but this device has no timestamp or pipeline statistics queries"
         );
         return None;
     }
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::RENDERING,
+        target: telemetry_target::RENDERING,
         "GPU profiling on: pass timings every {GPU_REPORT_INTERVAL} frames"
     );
     let mut profiler = Profiler::new(

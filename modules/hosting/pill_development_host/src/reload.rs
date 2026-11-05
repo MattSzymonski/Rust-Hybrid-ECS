@@ -36,6 +36,7 @@ use std::sync::atomic::AtomicU64;
 // External crates
 use pill_core::error::BuildError;
 use pill_core::platform::Instant;
+use pill_core::telemetry::telemetry_target;
 use pill_core::{debug, error, info, warn};
 use pill_engine::{ComponentId, Engine, EngineApi, SystemOwner, World};
 
@@ -354,7 +355,7 @@ impl ReloadTransaction<'_> {
         let dropped_resource_count = engine.world_mut().drop_resources(&changed_resource_ids);
         for change in &changes {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = self.subject,
                 resource = change.resource.as_str(),
                 sources = %change.changed_sources.join(", "),
@@ -363,7 +364,7 @@ impl ReloadTransaction<'_> {
             );
         }
         debug!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             module = self.subject,
             dropped = dropped_resource_count,
             declared = changes.len(),
@@ -389,7 +390,7 @@ impl ReloadTransaction<'_> {
         self.old_libraries.push(library);
         if self.graveyard_policy == GraveyardPolicy::KeepAll {
             debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 subject = self.subject,
                 generations = self.old_libraries.len(),
                 "keeping every retired generation mapped"
@@ -406,7 +407,7 @@ impl ReloadTransaction<'_> {
                 // image that can never be released.
                 if deferral_count >= MAX_DEFERRED_EVICTIONS {
                     error!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        target: telemetry_target::HOT_RELOAD,
                         subject = self.subject,
                         generations = self.old_libraries.len(),
                         columns = orphaned_column_count,
@@ -415,7 +416,7 @@ impl ReloadTransaction<'_> {
                     );
                 } else {
                     warn!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        target: telemetry_target::HOT_RELOAD,
                         subject = self.subject,
                         generations = self.old_libraries.len(),
                         columns = orphaned_column_count,
@@ -432,7 +433,7 @@ impl ReloadTransaction<'_> {
             // it, and this line is what tells that apart from a crash somewhere
             // else.
             info!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 subject = self.subject,
                 generations = self.old_libraries.len(),
                 "evicting the oldest retired generation"
@@ -500,7 +501,7 @@ impl ReloadTransaction<'_> {
         // reloads.
         let removed_system_count = engine.clear_systems_owned_by(self.owner);
         debug!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             module = self.subject,
             removed_systems = removed_system_count,
             "cleared the retiring generation's systems"
@@ -565,7 +566,7 @@ impl ReloadTransaction<'_> {
         let status = match new_library.call_register(engine_api) {
             Some(status) => {
                 info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     module = self.subject,
                     "this artifact exports a registration entry point; its one-time init does not run again"
                 );
@@ -573,7 +574,7 @@ impl ReloadTransaction<'_> {
             }
             None => {
                 info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     module = self.subject,
                     "this artifact has no registration entry point; its one-time init runs again on this reload"
                 );
@@ -589,7 +590,7 @@ impl ReloadTransaction<'_> {
             // the systems that were just cleared. No migration runs on this
             // path because the old registrations are still intact.
             error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = self.subject,
                 status,
                 "new generation failed to initialize; rolling back"
@@ -632,7 +633,7 @@ impl ReloadTransaction<'_> {
             engine.world_mut().clear_superseded_persist_registrations();
             if rollback_status != 0 {
                 error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     module = self.subject,
                     status = rollback_status,
                     "rollback also failed; this module now contributes no systems"
@@ -669,7 +670,7 @@ impl ReloadTransaction<'_> {
                 .collect();
             if !stranded_component_ids.is_empty() {
                 warn!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     module = self.subject,
                     count = stranded_component_ids.len(),
                     ids = %stranded_component_ids
@@ -683,7 +684,7 @@ impl ReloadTransaction<'_> {
                     .world_mut()
                     .retire_component_storage(&stranded_component_ids);
                 debug!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     dropped = dropped_entity_count, "removed rows that belonged to the failed generation"
                 );
             }
@@ -716,7 +717,7 @@ impl ReloadTransaction<'_> {
                 let dropped_resource_count =
                     engine.world_mut().drop_resources(&stranded_resource_ids);
                 warn!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     module = self.subject,
                     dropped = dropped_resource_count,
                     "dropped resources claimed only by the failed generation"
@@ -772,7 +773,7 @@ impl ReloadTransaction<'_> {
             .collect();
         if !forgotten_type_names.is_empty() {
             warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = self.subject,
                 forgotten_types = %forgotten_type_names.join(", "),
                 "{}", self.kind.forgotten_types_warning()
@@ -794,7 +795,7 @@ impl ReloadTransaction<'_> {
                     .world_mut()
                     .drop_forgotten_components(&unclaimed_component_type_names);
                 debug!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     module = self.subject,
                     dropped_entities = dropped_forgotten_entity_count,
                     "dropped orphaned columns for component types no longer registered"
@@ -838,7 +839,7 @@ impl ReloadTransaction<'_> {
                 .release_resource_claims(&retired_resource_ids);
             let dropped_resource_count = engine.world_mut().drop_resources(&retired_resource_ids);
             debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = self.subject,
                 dropped = dropped_resource_count,
                 "dropped resources for types this generation no longer registers"
@@ -901,13 +902,13 @@ impl ReloadTransaction<'_> {
             // Avoid touching archetype storage when every persisted layout is
             // byte-for-byte identical to the previous generation.
             info!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = self.subject,
                 "schema unchanged for all persistable component types - fast path"
             );
         } else {
             debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = self.subject,
                 changed_types = changed_type_names.len(),
                 "migrating changed persistable module types"
@@ -918,7 +919,7 @@ impl ReloadTransaction<'_> {
                 Some(&pre_swap_entities),
             );
             debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = self.subject,
                 migrated_types = migration_report.migrated_type_count,
                 migrated_entities = migration_report.migrated_entity_count,
@@ -926,7 +927,7 @@ impl ReloadTransaction<'_> {
             );
             if !migration_report.skipped_types.is_empty() {
                 warn!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     module = self.subject,
                     skipped_types = %migration_report
                         .skipped_types
@@ -949,7 +950,7 @@ impl ReloadTransaction<'_> {
             .migrate_changed_persistable_resources(&previous_resource_manifest);
         if !migrated_resources.is_empty() {
             debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = self.subject,
                 migrated_resources = %migrated_resources.join(", "),
                 "reshaped resources migrated"
@@ -970,7 +971,7 @@ impl ReloadTransaction<'_> {
         let orphaned_column_count = engine.world_mut().drop_columns_without_factory();
         if orphaned_column_count != 0 {
             debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = self.subject,
                 orphaned_columns = orphaned_column_count,
                 "dropped native columns whose registration is gone"
@@ -986,7 +987,7 @@ impl ReloadTransaction<'_> {
         analytics::record_reload(self.subject);
 
         info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            target: telemetry_target::HOT_RELOAD,
             module = self.subject,
             entities = engine.world().entity_count(),
             graveyard = self.old_libraries.len(),
@@ -1060,7 +1061,7 @@ pub(crate) fn initialize_generation(
             FirstLoadFailure::ClearSystemsOnly => {
                 let removed_system_count = engine.clear_systems_owned_by(clearing_owner);
                 info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     module = subject,
                     removed_systems = removed_system_count,
                     "cleared the failed generation's systems and kept the world"
@@ -1093,7 +1094,7 @@ pub(crate) fn initialize_generation(
                     .world_mut()
                     .drop_forgotten_components(&owned_components);
                 info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    target: telemetry_target::HOT_RELOAD,
                     module = subject,
                     removed_systems = removed_system_count,
                     dropped_resources = dropped_resource_count,
@@ -1190,7 +1191,7 @@ fn clear_failed_generation(engine: &mut Engine, subject: &str, system_owner: Sys
     let resource_count = abandoned_world.resource_count();
     drop(abandoned_world);
     info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        target: telemetry_target::HOT_RELOAD,
         module = subject,
         resources = resource_count,
         "cleared the world before unmapping the generation that failed to initialize"
@@ -1234,7 +1235,7 @@ pub(crate) fn build_load_and_commit(
         Ok(path) => path,
         Err(error) => {
             error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = subject,
                 error = %error,
                 "{}", kind.build_failed_message()
@@ -1255,7 +1256,7 @@ pub(crate) fn build_load_and_commit(
         Ok(library) => library,
         Err(error) => {
             error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = subject,
                 error = %error,
                 "{}", kind.load_failed_message()
@@ -1272,7 +1273,7 @@ pub(crate) fn build_load_and_commit(
     if let LoadValidation::ModuleAbi = validation {
         if let Err(error) = new_library.check_module_abi(subject) {
             error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                target: telemetry_target::HOT_RELOAD,
                 module = subject,
                 error = %error,
                 "{}", kind.rejected_message()

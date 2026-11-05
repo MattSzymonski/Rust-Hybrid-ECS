@@ -79,7 +79,7 @@ impl EditorWindow {
             let idle_frame_millis_max = self.idle_frame_millis_max;
             self.idle_frame_millis_max = 0.0;
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 fps = self.fps,
                 frame = self.frame_index,
                 overlay_frames = overlay_frame_count,
@@ -264,7 +264,7 @@ impl EditorWindow {
         if let Some(seconds) = self.test_seconds {
             if self.started.elapsed().as_secs_f64() >= seconds {
                 info!(
-                    target: telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     "[editor] test deadline reached; quitting"
                 );
                 self.request_quit();
@@ -305,7 +305,7 @@ impl EditorWindow {
         }
         if polling && !self.polling {
             info!(
-                target: telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 poll_millis = pill_editor_core::cadence::IDLE_POLL.as_millis() as u64,
                 frame_millis,
                 "[editor] frame idle"

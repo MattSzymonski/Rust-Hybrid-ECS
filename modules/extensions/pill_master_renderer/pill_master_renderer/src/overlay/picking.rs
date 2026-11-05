@@ -22,6 +22,7 @@
 // Standard library
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::Entity;
 use pill_renderer_api::{decode_pick_value, PickHit, PickRequest, PickResult};
 
@@ -187,7 +188,7 @@ impl PickReadback {
                 // warning is logged once, when the failure is found.
                 Readback::Failed => {
                     pill_core::warn!(
-                        target: pill_core::telemetry::telemetry_target::RENDERING,
+                        target: telemetry_target::RENDERING,
                         "[pick] {} request(s) could not be read back",
                         requests.len()
                     );

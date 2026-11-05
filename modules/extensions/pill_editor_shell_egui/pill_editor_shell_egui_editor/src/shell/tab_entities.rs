@@ -44,7 +44,7 @@ pub fn remember_hierarchy_row_rect(
         return;
     }
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
+        target: telemetry_target::EDITOR,
         entity = %entity,
         min_x = rect.min.x,
         min_y = rect.min.y,
@@ -89,7 +89,7 @@ pub fn entity_menu_items(
         let (command, label) = entities::entity_create();
         pending.push_recorded(vec![command], label, None);
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             "[editor] new entity queued"
         );
         ui.close();
@@ -102,7 +102,7 @@ pub fn entity_menu_items(
             let (commands, label) = entities::entity_delete(entity, selection.asset.clone());
             pending.push_recorded(commands, label, None);
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 entity = %entity,
                 "[editor] delete entity queued"
             );

@@ -141,7 +141,7 @@ impl ProjectBrowser {
         }
         self.folder = folder;
         pill_core::info!(
-            target: telemetry_target::ECS,
+            target: telemetry_target::EDITOR,
             path = self.folder.as_str(),
             "[editor] browser folder"
         );

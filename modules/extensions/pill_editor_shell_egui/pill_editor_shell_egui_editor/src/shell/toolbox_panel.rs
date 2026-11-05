@@ -61,7 +61,7 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
     }
     if response.drag_stopped() {
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             view,
             x = origin.x,
             y = origin.y,
@@ -104,7 +104,7 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
         if button.clicked() {
             viewer.pending.push(vec![item.command(&state)]);
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 view,
                 item = item.name(),
                 "[editor] toolbox click"
@@ -118,7 +118,7 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
     viewer.overlay_regions.push(shell_rect(panel));
     if viewer.toolbox.remember_logged(view, panel) {
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             view,
             x = panel.min.x,
             y = panel.min.y,
@@ -132,7 +132,7 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
                 .map(|item| (item.name(), toolbox::item_rect(*item, origin))),
         ) {
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 view,
                 item,
                 x = rect.min.x,

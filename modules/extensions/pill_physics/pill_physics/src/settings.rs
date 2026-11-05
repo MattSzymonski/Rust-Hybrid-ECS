@@ -16,6 +16,7 @@
 //! rather than clamped, and the manager keeps what it had.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::*;
 use serde::{Deserialize, Serialize};
 
@@ -119,21 +120,21 @@ impl pill_engine::SettingsAssetManager for PhysicsManager {
         // a typo in the file is easy to find.
         if !settings.fixed_timestep.is_finite() || settings.fixed_timestep <= 0.0 {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 "[physics] settings refused: fixed_timestep must be greater than 0"
             );
             return SettingsOutcome::Refused;
         }
         if settings.max_substeps == 0 {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 "[physics] settings refused: max_substeps must be at least 1"
             );
             return SettingsOutcome::Refused;
         }
         if settings.gravity.iter().any(|value| !value.is_finite()) {
             pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ECS,
+                target: telemetry_target::ECS,
                 "[physics] settings refused: gravity must be finite"
             );
             return SettingsOutcome::Refused;
@@ -149,7 +150,7 @@ impl pill_engine::SettingsAssetManager for PhysicsManager {
         self.set_interpolation(interpolate);
         self.set_debug_draw(debug_draw);
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
+            target: telemetry_target::ECS,
             gravity_x = settings.gravity[0],
             gravity_y = settings.gravity[1],
             gravity_z = settings.gravity[2],

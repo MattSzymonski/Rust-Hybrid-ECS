@@ -116,7 +116,7 @@ pub fn inspector_tab(
             // the first draw.
             if session.notices_logged.insert(detail.key()) {
                 pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     asset = detail.key().as_str(),
                     "[editor] inspector row kind=asset-read-only"
                 );
@@ -187,7 +187,7 @@ pub fn inspector_header(
             {
                 session.add_rect = Some(button.rect);
                 pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    target: telemetry_target::EDITOR,
                     x = button.rect.min.x,
                     y = button.rect.min.y,
                     width = button.rect.width(),
@@ -199,7 +199,7 @@ pub fn inspector_header(
                 session.add_open = !session.add_open;
                 if session.add_open {
                     pill_core::info!(
-                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        target: telemetry_target::EDITOR,
                         "[editor] inspector add opened"
                     );
                 }
@@ -254,7 +254,7 @@ pub fn inspector_add_popup(
                                 response.rect,
                             ) {
                                 pill_core::info!(
-                                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                                    target: telemetry_target::EDITOR,
                                     component = type_name,
                                     x = response.rect.min.x,
                                     y = response.rect.min.y,
@@ -343,7 +343,7 @@ pub fn entity_inspector(
                 session.collapsed.insert(component.type_name.clone());
             }
             pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
+                target: telemetry_target::EDITOR,
                 component = component.type_name.as_str(),
                 collapsed = !collapsed,
                 "[editor] inspector section"
@@ -437,7 +437,7 @@ pub fn inspector_section_header(
     let rect = frame.response.rect;
     if remember_moved_rect(&mut session.section_rects, &component.type_name, rect) {
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::EDITOR,
             component = component.type_name.as_str(),
             x = rect.min.x,
             y = rect.min.y,

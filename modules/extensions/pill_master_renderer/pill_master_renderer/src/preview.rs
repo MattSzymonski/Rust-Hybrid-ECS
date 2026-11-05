@@ -32,6 +32,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_renderer_api::PreviewImage;
 
 // Current crate
@@ -494,7 +495,7 @@ impl PreviewRenderer {
             _ => self.texture_sources.bytes,
         };
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
+            target: telemetry_target::RENDERING,
             dropped = dropped.len(),
             bytes,
             "[preview] {cache_name} cache trimmed"
@@ -753,7 +754,7 @@ impl PreviewRenderer {
             }
             Readback::Failed => {
                 pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    target: telemetry_target::RENDERING,
                     "[preview] the readback could not be read: request {id} is refused"
                 );
                 self.in_flight_request_id = None;

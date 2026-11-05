@@ -23,6 +23,7 @@
 // External crates
 use libloading::{Library, Symbol};
 use pill_core::debug;
+use pill_core::telemetry::telemetry_target;
 
 // Current crate
 use super::{PATCH_PLAIN_EXPORT, PATCH_RESOLVER_EXPORT};
@@ -473,7 +474,7 @@ fn report_reached_copies(
         return Err(nothing_reached());
     }
     debug!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        target: telemetry_target::HOT_RELOAD,
         function,
         artifacts = reached_labels.join(", ").as_str(),
         message

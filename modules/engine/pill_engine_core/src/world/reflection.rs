@@ -18,6 +18,9 @@
 //! also the one identity that survives a reload: a tool keeps names between
 //! generations and resolves the ids again in each new one.
 
+// External crates
+use pill_core::telemetry::telemetry_target;
+
 use super::*;
 
 // =============================================================================
@@ -274,7 +277,7 @@ impl World {
             .collect();
         lines.push(format!("Total entities: {}", self.entity_locations.len()));
         pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
+            target: telemetry_target::ECS,
             "{}",
             pill_core::telemetry::log_block(
                 &format!("World archetypes (total: {})", self.archetypes.len()),

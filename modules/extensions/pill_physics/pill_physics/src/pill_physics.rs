@@ -23,6 +23,7 @@
 //! graph, a saved scene file and the managed mirror.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
 use pill_engine::*;
 
 // =============================================================================
@@ -174,7 +175,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     // managers to create and apply settings for: zero means the document is
     // never read.
     pill_core::info!(
-        target: pill_core::telemetry::telemetry_target::ECS,
+        target: telemetry_target::ECS,
         settings_managers = engine.world().settings_asset_manager_ids().len(),
         "pill_physics module registered"
     );

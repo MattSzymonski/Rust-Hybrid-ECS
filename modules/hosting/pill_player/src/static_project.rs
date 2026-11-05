@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 // External crates
 use pill_core::error::{HostError, LibraryError, ModuleError};
+use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_engine::{Engine, SystemOwner};
 
@@ -234,7 +235,7 @@ impl StaticProject {
                     .registered_component_names_since(registration_sequence),
             );
             info!(
-                target: pill_core::telemetry::telemetry_target::LINK,
+                target: telemetry_target::LINK,
                 module = module.name,
                 owner = system_owner.0,
                 "extension linked"
@@ -266,7 +267,7 @@ impl StaticProject {
         };
 
         info!(
-            target: pill_core::telemetry::telemetry_target::LINK,
+            target: telemetry_target::LINK,
             project = self.name,
             modules = self.modules.len(),
             external = project_guard.is_some(),
@@ -349,19 +350,19 @@ fn apply_manager_settings(engine: &mut Engine) {
         };
         match world.apply_manager_settings_asset(manager) {
             Some(Ok(pill_engine::SettingsOutcome::Applied)) => info!(
-                target: pill_core::telemetry::telemetry_target::LINK,
+                target: telemetry_target::LINK,
                 manager = surface.settings_name.as_str(),
                 path = path.as_str(),
                 "[settings] applied manager settings"
             ),
             Some(Ok(pill_engine::SettingsOutcome::Refused)) => warn!(
-                target: pill_core::telemetry::telemetry_target::LINK,
+                target: telemetry_target::LINK,
                 manager = surface.settings_name.as_str(),
                 path = path.as_str(),
                 "[settings] refused manager settings; the manager keeps its values"
             ),
             Some(Err(reason)) => warn!(
-                target: pill_core::telemetry::telemetry_target::LINK,
+                target: telemetry_target::LINK,
                 manager = surface.settings_name.as_str(),
                 path = path.as_str(),
                 reason = reason.as_str(),
@@ -380,7 +381,7 @@ fn apply_project_startup_scene(engine: &mut Engine, scene_path: &str) {
     pill_engine::queue_startup_scene(engine.world_mut(), scene_path);
     if let Some(Err(reason)) = pill_engine::apply_startup_scene(engine) {
         pill_core::warn!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
+            target: telemetry_target::ENGINE,
             path = scene_path,
             reason,
             "[engine] startup scene not loaded"

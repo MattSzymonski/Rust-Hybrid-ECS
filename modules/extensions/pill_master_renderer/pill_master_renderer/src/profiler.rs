@@ -23,6 +23,7 @@ use std::cell::Cell;
 // External crates
 use pill_core::profiling::{GpuApi, GpuStatistics, GpuTimeline, GpuTimelineSpan};
 use pill_core::telemetry::log_block;
+use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use wgpu::{
     Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Features,
@@ -292,7 +293,7 @@ impl Profiler {
             return;
         };
         let Some(now_ticks) = read_current_timestamp(device, queue, query_set) else {
-            warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: could not read a starting timestamp, so Tracy shows no GPU timeline");
+            warn!(target: telemetry_target::RENDERING, "GPU profiler: could not read a starting timestamp, so Tracy shows no GPU timeline");
             self.timeline_api = None;
             return;
         };
@@ -495,7 +496,7 @@ impl Profiler {
                 .latest_timings
                 .iter()
                 .map(|(label, milliseconds)| format!("{label:<24}: {milliseconds:6.3} ms"));
-            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU timestamps", lines));
+            info!(target: telemetry_target::RENDERING, "{}", log_block("GPU timestamps", lines));
         }
         if !self.latest_occlusion.is_empty() {
             let total: u64 = self.latest_occlusion.iter().sum();
@@ -516,7 +517,7 @@ impl Profiler {
                 })
                 .collect();
             lines.push(format!("{:<24}: {total} samples ({coverage})", "visible"));
-            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU occlusion", lines));
+            info!(target: telemetry_target::RENDERING, "{}", log_block("GPU occlusion", lines));
         }
         if !self.latest_statistics.is_empty() {
             let lines = self.latest_statistics.iter().enumerate().flat_map(
@@ -542,7 +543,7 @@ impl Profiler {
                     ]
                 },
             );
-            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU pipeline statistics", lines));
+            info!(target: telemetry_target::RENDERING, "{}", log_block("GPU pipeline statistics", lines));
         }
     }
 
@@ -571,7 +572,7 @@ impl Profiler {
         if let Some(query_set) = &self.timestamp_query_set {
             // Refuse the timestamp once this frame's cap is reached.
             if self.current_timestamp_query.get() >= self.max_timestamp_queries {
-                warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: timestamp queries are full for this frame");
+                warn!(target: telemetry_target::RENDERING, "GPU profiler: timestamp queries are full for this frame");
                 return None;
             }
 
@@ -662,7 +663,7 @@ impl Profiler {
             // Refuse the query once this frame's cap is reached.
             if self.current_pipeline_statistics_query.get() >= self.max_pipeline_statistics_queries
             {
-                warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: pipeline statistics queries are full for this frame");
+                warn!(target: telemetry_target::RENDERING, "GPU profiler: pipeline statistics queries are full for this frame");
                 return None;
             }
 
@@ -742,7 +743,7 @@ impl Profiler {
             return None;
         }
         if self.current_occlusion_query.get() >= self.max_occlusion_queries {
-            warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: occlusion queries are full for this frame");
+            warn!(target: telemetry_target::RENDERING, "GPU profiler: occlusion queries are full for this frame");
             return None;
         }
         let index = self.current_occlusion_query.get();
@@ -866,7 +867,7 @@ fn first_u64_values(bytes: &[u8], count: usize) -> Vec<u64> {
 /// explains why it has no numbers instead of staying silent.
 fn warn_readback(measurement: &str) {
     warn!(
-        target: pill_core::telemetry::telemetry_target::RENDERING,
+        target: telemetry_target::RENDERING,
         "PILL_GPU_PROFILE: the {measurement} readback could not be read, so this frame reports none"
     );
 }
