@@ -23,6 +23,9 @@
 //! and the running engine, where two systems batched together would trip the
 //! debug write lock.
 
+// Relayout and re-homing are development-only engine APIs.
+#![cfg(feature = "development")]
+
 // External crates
 use pill_engine::query::{Res, ResMut};
 use pill_engine::scheduler::{SystemAccess, SystemScheduler};

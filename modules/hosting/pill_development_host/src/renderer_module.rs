@@ -143,7 +143,7 @@ impl RendererModule {
             ExtensionConfig::located_workspace_member(workspace_root, renderer_name);
         extension_config.validate()?;
         let source_edit_generation = Arc::new(AtomicU64::new(0));
-        crate::watcher::spawn_source_watcher(
+        crate::watchers::spawn_source_watcher(
             workspace_root.to_path_buf(),
             &extension_config.name,
             &extension_config.watch_directory,

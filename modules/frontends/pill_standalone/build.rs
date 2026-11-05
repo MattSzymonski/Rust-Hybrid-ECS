@@ -24,10 +24,9 @@ mod stage_std_dylib;
 
 fn main() {
     // Refused here rather than in the binary, which cannot see the profile. A
-    // release-lineage build is always the shipping mode, and `hot_patch`
-    // enables `development`, so checking that one feature covers both. Cargo
-    // passes the profile as `PROFILE` and each enabled feature as
-    // `CARGO_FEATURE_*`.
+    // release-lineage build is always the shipping mode, so the `development`
+    // posture is refused there. Cargo passes the profile as `PROFILE` and each
+    // enabled feature as `CARGO_FEATURE_*`.
     let profile = std::env::var("PROFILE").unwrap_or_default();
     let development_enabled = std::env::var_os("CARGO_FEATURE_DEVELOPMENT").is_some();
     if profile != "debug" && development_enabled {

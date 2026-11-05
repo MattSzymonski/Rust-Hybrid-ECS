@@ -651,6 +651,37 @@ mod tests {
         );
     }
 
+    /// A plain declaration of the same type - what a project image runs when it
+    /// links the module that owns a manager - keeps the settings surface the
+    /// module recorded, so the host still finds the manager.
+    #[test]
+    fn a_plain_registration_keeps_the_recorded_settings_surface() {
+        let mut world = World::new();
+        world.insert_settings_asset_manager(FixtureManager::default());
+        let manager = ResourceId::of::<FixtureManager>();
+
+        world.register_resource::<FixtureManager>();
+
+        assert_eq!(world.settings_asset_manager_ids(), vec![manager]);
+        assert_eq!(
+            world.manager_settings_path(manager).as_deref(),
+            Some("settings/fixture_manager.fixture_settings")
+        );
+    }
+
+    /// A plain insert of a manager value replaces the value, not the type's
+    /// declaration, so the recorded surface stays too.
+    #[test]
+    fn a_plain_insert_keeps_the_recorded_settings_surface() {
+        let mut world = World::new();
+        world.insert_settings_asset_manager(FixtureManager::default());
+        let manager = ResourceId::of::<FixtureManager>();
+
+        world.insert_resource(FixtureManager::default());
+
+        assert_eq!(world.settings_asset_manager_ids(), vec![manager]);
+    }
+
     /// A scratch `res` directory for one test, mounted under the process-wide
     /// directory lock while it lives.
     struct ScratchRes {

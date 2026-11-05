@@ -85,15 +85,18 @@ profiling-verify = [
     "tracy-client/verify",
     "pill_core/profiling-verify",
 ]
-# Per-function hot patching: registered systems dispatch through a replaceable
-# slot so a rebuilt implementation can be swapped in without re-registering them
-# or touching the World. Development only; see `src/hot_patch.rs`.
+# The development posture: this process is a development host, so the engine
+# keeps the code only such a host reaches - per-function hot patching, the
+# persistence migration and re-homing a module swap needs, and the relayout
+# APIs that reshape component, resource and asset storage. A shipping build
+# never enables it, so it has no way to change a registered type's layout; see
+# `src/hot_patch.rs` and `src/persistence/migration.rs`.
 #
 # NOTE: a module or project built WITHOUT this feature is still safe to load
 # into a host built WITH it - `HotPatchRegistry` is an unconditional field, so
 # `Engine`s layout does not change. Such a module simply registers systems that
 # are not hot-patchable.
-hot_patch = []
+development = []
 
 # Emit repeated numerical measurements through the shared `metrics` recorder.
 metrics = ["dep:metrics", "pill_core/metrics"]

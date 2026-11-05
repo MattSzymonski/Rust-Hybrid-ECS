@@ -314,6 +314,7 @@ impl World {
     /// [`Self::clear_superseded_persist_registrations`] drops the rest: a name
     /// the new generation no longer declares was forgotten, not superseded, and
     /// must not let a later peer through.
+    #[cfg(feature = "development")]
     pub fn supersede_persist_registrations(&mut self, type_names: &[String]) {
         self.superseded_persist_names
             .extend(type_names.iter().cloned());
@@ -328,6 +329,7 @@ impl World {
     /// whose rebuild failed - would otherwise take the component back to a
     /// layout every current subject has left. That registration is skipped, and
     /// the registered layout is kept.
+    #[cfg(feature = "development")]
     pub fn mark_stale_superseded_persist_registrations(&mut self, type_names: &[String]) {
         self.stale_superseded_persist_names
             .extend(type_names.iter().cloned());

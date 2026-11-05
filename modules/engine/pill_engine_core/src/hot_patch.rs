@@ -44,7 +44,7 @@
 //!
 //! ## Feature gating
 //!
-//! The dispatch behavior is gated behind the `hot_patch` feature, but
+//! The dispatch behavior is gated behind the `development` feature, but
 //! [`HotPatchRegistry`] is a field on [`Engine`](crate::Engine)
 //! **unconditionally**: gating it would change `Engine`'s layout between
 //! feature configurations, and a module built with the other configuration
@@ -1045,7 +1045,7 @@ pub fn verify_abi() -> bool {
 
 /// End-to-end checks that a system registered through the normal engine API can
 /// have its implementation replaced, and that everything around it stays put.
-#[cfg(all(test, feature = "hot_patch"))]
+#[cfg(all(test, feature = "development"))]
 mod integration_tests {
     // External crates
     use pill_core::error::EngineMessage;

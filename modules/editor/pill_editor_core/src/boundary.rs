@@ -247,6 +247,22 @@ pub struct PopoutFrame {
 
 impl Resource for EguiShellFrame {}
 
+impl EguiShellFrame {
+    /// Clears every texture update the frame still carries.
+    ///
+    /// epaint panics when a `TexturesDelta` with unapplied updates is dropped.
+    /// A pass can replace a frame the executable never drew - a reload runs a
+    /// pass while the previous frame is still queued - so the old frame's
+    /// updates are discarded first. Popped-out windows carry frames of their
+    /// own and are cleared with it.
+    pub fn discard_unapplied_textures(&mut self) {
+        self.textures.clear();
+        for popout in &mut self.popout_frames {
+            popout.frame.discard_unapplied_textures();
+        }
+    }
+}
+
 impl Default for EguiShellFrame {
     fn default() -> Self {
         Self {
@@ -352,7 +368,8 @@ pub fn frame_from_output(context: &Context, egui_output: FullOutput) -> EguiShel
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui::RawInput;
+    use egui::epaint::ImageDelta;
+    use egui::{ColorImage, RawInput};
 
     #[test]
     fn a_frame_reports_meshes_and_drops_callbacks() {
@@ -401,5 +418,39 @@ mod tests {
         let mut frame = frame_from_output(&context, egui_output);
         assert_eq!(frame.clipboard_text.as_deref(), Some("copied"));
         frame.textures.clear();
+    }
+
+    /// A frame the executable never draws discards its texture updates instead
+    /// of tripping epaint's drop assertion, popped-out frames included.
+    #[test]
+    fn a_discarded_frame_clears_its_texture_updates() {
+        // The pixel's colour is irrelevant; it only has to be a real colour,
+        // so it comes from the theme rather than being written here.
+        let image = || ColorImage {
+            size: [1, 1],
+            source_size: egui::vec2(1.0, 1.0),
+            pixels: vec![crate::style::panel()],
+        };
+        let mut frame = EguiShellFrame::default();
+        frame.textures.push(
+            egui::TextureId::User(7),
+            ImageDelta::full(image(), egui::TextureOptions::NEAREST),
+        );
+        let mut popout = EguiShellFrame::default();
+        popout.textures.push(
+            egui::TextureId::User(8),
+            ImageDelta::full(image(), egui::TextureOptions::NEAREST),
+        );
+        frame.popout_frames.push(PopoutFrame {
+            tab: "assets".to_string(),
+            title: "Pill Editor - Assets".to_string(),
+            frame: Box::new(popout),
+        });
+
+        frame.discard_unapplied_textures();
+
+        assert!(frame.textures.set.is_empty());
+        assert!(frame.popout_frames[0].frame.textures.set.is_empty());
+        // Dropping the frame is what used to panic.
     }
 }

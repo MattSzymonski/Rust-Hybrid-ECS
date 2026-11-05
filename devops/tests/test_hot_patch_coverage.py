@@ -427,7 +427,8 @@ def plan_edit(crate: Crate) -> bool:
 # workspace's `pill_core.dll` on the loader path, and `cargo run` is what sets
 # that up - executed directly, the process dies in the loader before it can
 # print anything. Building through the same posture also guarantees the binary
-# carries the `hot_patch` feature, which is the whole subject of this test.
+# carries the engine's `development` feature, which is the whole subject of this
+# test.
 #
 # `rendering` is required rather than optional: devops/tests/projects/native links
 # `pill_master_renderer`, so a host without it resolves `pill_core` differently

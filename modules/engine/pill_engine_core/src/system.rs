@@ -428,7 +428,7 @@ pub trait IntoSystem<Input: SystemParam> {
     /// The slot is set up here because this is the only place that knows the
     /// concrete `F` and `Input`. `name` is the identity a panicking patched body
     /// is reported under, which lets the host roll that function back.
-    #[cfg(feature = "hot_patch")]
+    #[cfg(feature = "development")]
     fn into_hot_system(
         self,
         slot: std::sync::Arc<crate::hot_patch::HotSlot>,
@@ -465,7 +465,7 @@ where
         })
     }
 
-    #[cfg(feature = "hot_patch")]
+    #[cfg(feature = "development")]
     fn into_hot_system(
         mut self,
         slot: std::sync::Arc<crate::hot_patch::HotSlot>,

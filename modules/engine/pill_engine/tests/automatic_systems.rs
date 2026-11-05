@@ -15,6 +15,12 @@
 //! to one resource, so they conflict and the scheduler must run them one after
 //! another in registration order; independent systems would run as one
 //! parallel batch and the observation would say nothing about order.
+//!
+//! A loaded artifact shares its declaration collection with the images already
+//! mapped in the process, so the host takes a baseline before mapping it. The
+//! last test walks from such a baseline and proves the declarations in front of
+//! it stay unregistered, which is what keeps a reloaded generation from
+//! registering the retired generation's systems a second time.
 
 // Current crate
 use pill_engine::component_registry;
@@ -111,4 +117,32 @@ fn declared_systems_run_in_their_declared_order() {
         .entries
         .clone();
     assert_eq!(entries, ["unnamed", "first", "second", "after_flush"]);
+}
+
+/// A registration walks from the baseline the host took before mapping the
+/// image, so the declarations already in the process stay unregistered. Without
+/// a baseline - a static build, a test, the first artifact of a process - the
+/// same declarations register.
+#[test]
+fn a_load_baseline_leaves_the_declarations_taken_before_it_alone() {
+    let baseline = pill_engine::declarations::DeclarationBaseline::current();
+    let mut engine = Engine::new();
+    pill_engine::declarations::with_declaration_baseline(baseline, || {
+        component_registry::run_artifact_registration(
+            &mut engine,
+            component_registry::no_registration,
+        );
+    });
+    assert!(
+        engine.system_snapshots().is_empty(),
+        "declarations present before the load belong to an earlier image"
+    );
+
+    let mut engine = Engine::new();
+    component_registry::run_artifact_registration(&mut engine, component_registry::no_registration);
+    assert_eq!(
+        engine.system_snapshots().len(),
+        4,
+        "without a baseline the declarations register"
+    );
 }

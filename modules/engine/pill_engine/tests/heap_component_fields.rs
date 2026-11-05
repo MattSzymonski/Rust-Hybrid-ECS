@@ -14,6 +14,9 @@
 //! - Pin reload migration of heap fields, including the path that leaves an
 //!   unchanged allocation in place.
 
+// Reload migration is a development-only engine API.
+#![cfg(feature = "development")]
+
 // Standard library
 use std::collections::HashSet;
 

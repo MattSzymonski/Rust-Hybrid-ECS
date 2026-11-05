@@ -32,7 +32,7 @@ profiling-fine = ["profiling", "pill_engine_core/profiling-fine"]
 profiling-memory = ["profiling", "pill_engine_core/profiling-memory"]
 profiling-minimal = ["pill_engine_core/profiling-minimal"]
 profiling-verify = ["profiling", "pill_engine_core/profiling-verify"]
-hot_patch = ["pill_engine_core/hot_patch"]
+development = ["pill_engine_core/development"]
 metrics = ["pill_engine_core/metrics"]
 
 [lib]

@@ -14,6 +14,9 @@
 //!   unchanged-schema migration pass.
 //! - Pin balanced ownership of the shared native allocation service.
 
+// Reload migration is a development-only engine API.
+#![cfg(feature = "development")]
+
 // Standard library
 use std::collections::HashSet;
 use std::sync::Mutex;

@@ -21,6 +21,9 @@
 //! and `ModuleSpline` for the module DLL's copy; everything below is written
 //! from that reading.
 
+// Relayout and re-homing are development-only engine APIs.
+#![cfg(feature = "development")]
+
 // Standard library
 use std::collections::HashSet;
 

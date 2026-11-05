@@ -365,6 +365,7 @@ impl World {
     /// keeping its allocation and its change ticks.
     ///
     /// Returns the names that were migrated, sorted.
+    #[cfg(feature = "development")]
     pub fn migrate_changed_persistable_resources(
         &mut self,
         previous_manifest: &[PersistResourceManifestEntry],

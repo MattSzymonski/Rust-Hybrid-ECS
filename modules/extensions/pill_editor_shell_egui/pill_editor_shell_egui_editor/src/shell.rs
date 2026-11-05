@@ -745,6 +745,12 @@ pub fn run_frame(
     // in the order the pass needs (its module docs say why each request sits
     // where it does). Passing the viewer whole means the value needs no second
     // argument and cannot disagree with itself.
+    //
+    // A pass can replace a frame the executable never drew: a reload runs a
+    // pass while the previous frame is still queued. epaint panics when a
+    // texture update is dropped unapplied, so the queued frame's updates go
+    // before the assignment drops it.
+    frame.discard_unapplied_textures();
     *frame = pill_editor_shell_egui_editor::shell::settle_pass(
         dock,
         popout_contexts,
@@ -814,7 +820,7 @@ pub fn run_popout_passes(
         let input = inputs.by_tab.get(&name).cloned().unwrap_or_default();
         let raw_input = pill_editor_core::input::raw_input(&input);
         viewer.scene_rects = vec![None; dock.scene_view_count()];
-        let output = context.run_ui(raw_input, |ui| {
+        let mut output = context.run_ui(raw_input, |ui| {
             // The window has no dock around it, so it draws the one control
             // the dock would give it: the Redock button.
             let mut send_back = false;
@@ -835,7 +841,9 @@ pub fn run_popout_passes(
         });
         if redock.contains(&tab) {
             // Its window closes the moment the dock stops listing it, so no
-            // frame is built for this pass.
+            // frame is built for this pass. Its texture updates are never
+            // applied, and epaint panics when a delta is dropped unapplied.
+            output.textures_delta.clear();
             continue;
         }
         let mut frame = pill_editor_core::boundary::frame_from_output(&context, output);

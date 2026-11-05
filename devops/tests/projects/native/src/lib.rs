@@ -740,7 +740,24 @@ mod tests {
         // A host mounts this project's `res` and registers the modules the
         // project lists before its entry points; the test mounts the directory
         // and registers what the scene needs itself.
-        AssetLoader::set_root(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("res"));
+        //
+        // The same file compiles as this project's crate and, when a host runs
+        // the project, as the generated workspace member under
+        // `modules/projects_generated/`. The member's manifest directory is not
+        // the project root, so the source file anchors the directory both
+        // builds share: the member points its `[lib] path` straight at it.
+        let manifest_directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let source_file = std::path::Path::new(file!());
+        let source_file = if source_file.is_absolute() {
+            source_file.to_path_buf()
+        } else {
+            manifest_directory.join(source_file)
+        };
+        let project_root = source_file
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the project's lib.rs sits in src/");
+        AssetLoader::set_root(project_root.join("res"));
         let mut engine = Engine::new();
         engine
             .world_mut()

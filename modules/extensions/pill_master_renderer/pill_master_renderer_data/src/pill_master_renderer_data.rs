@@ -396,7 +396,13 @@ f 1/1 2/2 3/3
         .unwrap();
         pill_engine::asset_store::mount_directory(&asset_root_directory);
         let mut engine = Engine::new();
-        assert_eq!(register(&mut engine), 0);
+        // The asset types declare themselves, so the import registry learns
+        // their extensions from the artifact entry point; `register` keeps the
+        // half a reload repeats and declares no type of its own.
+        assert_eq!(
+            pill_engine::component_registry::run_artifact_registration(&mut engine, register),
+            0
+        );
 
         let world = engine.world_mut();
         let import_registry = world

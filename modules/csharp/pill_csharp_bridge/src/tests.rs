@@ -1935,6 +1935,7 @@ fn an_unchanged_manifest_applies_nothing() {
 }
 
 /// A reshaped descriptor component keeps its entities and moves their bytes.
+#[cfg(feature = "hot_reload")]
 #[test]
 fn a_reshaped_descriptor_component_is_migrated_on_apply() {
     let mut engine = Engine::new();
@@ -1994,8 +1995,55 @@ fn a_reshaped_descriptor_component_is_migrated_on_apply() {
     assert_eq!((size, align, schema_hash), (16, 8, 2));
 }
 
+/// A build without the reload posture has no manifest apply path that can
+/// reshape storage: a changed component layout is refused, and the registered
+/// column keeps the shape it had.
+#[cfg(not(feature = "hot_reload"))]
+#[test]
+fn a_reshaped_descriptor_component_is_refused_on_apply() {
+    let mut engine = Engine::new();
+    let (store, _before) = store_with_component(
+        &mut engine,
+        "Relayout",
+        8,
+        4,
+        1,
+        vec![manifest_field("a", 0, 4), manifest_field("b", 4, 4)],
+    );
+    let stable_id = test_stable_id("Relayout");
+    let component_id = store.read()[&stable_id].component_id();
+
+    // `b` first, then `a`, then two fields that did not exist.
+    let after = manifest_bytes(
+        "Relayout",
+        16,
+        8,
+        2,
+        vec![
+            manifest_field("b", 0, 4),
+            manifest_field("a", 4, 4),
+            manifest_field("c", 8, 4),
+            manifest_field("d", 12, 4),
+        ],
+    );
+    let error = apply_component_manifest_on_reload(&mut engine, &after, &store)
+        .expect_err("a build without the reload posture refuses to reshape a component");
+
+    assert!(
+        error.to_plain_message().contains("cannot reshape storage"),
+        "the refusal says why: {}",
+        error.to_plain_message()
+    );
+    assert_eq!(
+        engine.world().component_layout(component_id),
+        Some((8, 4)),
+        "the registered column keeps its shape"
+    );
+}
+
 /// A rename declared through an alias migrates the predecessor's rows onto
 /// the successor instead of being refused as a disappearance.
+#[cfg(feature = "hot_reload")]
 #[test]
 fn a_renamed_component_carries_its_rows_through_the_alias() {
     // The apply path reads the resource table too; clear whatever an earlier
@@ -2074,6 +2122,7 @@ fn a_renamed_component_carries_its_rows_through_the_alias() {
 }
 
 /// A field added with a default starts from that value, not zero.
+#[cfg(feature = "hot_reload")]
 #[test]
 fn an_added_field_starts_from_its_declared_default() {
     resource_test_scope();
@@ -2121,6 +2170,7 @@ fn an_added_field_starts_from_its_declared_default() {
 
 /// A default declares what an empty field starts from; a field the row already
 /// carries keeps its value even when the default for it changed.
+#[cfg(feature = "hot_reload")]
 #[test]
 fn a_changed_default_never_resets_a_carried_field() {
     resource_test_scope();
@@ -2226,6 +2276,7 @@ fn field_defaults_are_validated_against_their_field_type() {
 
 /// The same rule for resources: a field added with a default starts from that
 /// default instead of zero.
+#[cfg(feature = "hot_reload")]
 #[test]
 fn a_resource_field_added_with_a_default_starts_from_it() {
     resource_test_scope();
@@ -2613,6 +2664,7 @@ fn resource_manifest_bytes(
 
 /// Build the serialized manifest for one managed resource that declares
 /// aliases.
+#[cfg(feature = "hot_reload")]
 fn resource_manifest_bytes_with_aliases(
     name: &str,
     aliases: &[&str],
@@ -2704,6 +2756,7 @@ fn a_manifest_resource_joins_the_snapshot() {
 
 /// A resource rename declared through an alias moves the stored value onto
 /// the successor instead of being refused as a disappearance.
+#[cfg(feature = "hot_reload")]
 #[test]
 fn a_renamed_resource_carries_its_value_through_the_alias() {
     resource_test_scope();
@@ -2795,6 +2848,7 @@ fn a_shared_resource_entry_is_refused() {
 }
 
 /// A reshaped resource keeps its value and moves its bytes by field name.
+#[cfg(feature = "hot_reload")]
 #[test]
 fn a_reshaped_resource_is_migrated_on_reload() {
     resource_test_scope();
@@ -2841,6 +2895,63 @@ fn a_reshaped_resource_is_migrated_on_reload() {
         engine.world().foreign_resource_bytes(id),
         Some(expected.as_slice()),
         "values follow their field names and the new field starts zeroed"
+    );
+}
+
+/// A build without the reload posture refuses a reshaped resource instead of
+/// reshaping its storage; the value keeps the bytes it was written with.
+#[cfg(not(feature = "hot_reload"))]
+#[test]
+fn a_reshaped_resource_is_refused_on_reload() {
+    resource_test_scope();
+    let mut engine = Engine::new();
+    let before = resource_manifest_bytes(
+        "RelaidRes",
+        8,
+        4,
+        1,
+        vec![manifest_field("a", 0, 4), manifest_field("b", 4, 4)],
+    );
+    let store = BindingStore::new(
+        register_component_manifest(&mut engine, &before, ComponentBindings::new())
+            .expect("the manifest registers"),
+    );
+    let id = resource_id_of("RelaidRes");
+    let payload = [1.0_f32, 2.0].map(f32::to_ne_bytes).concat();
+    engine
+        .world_mut()
+        .insert_foreign_resource_bytes(id, &payload)
+        .expect("the payload is the declared width");
+
+    // `b` first, then `a`, then a field that did not exist.
+    let after = resource_manifest_bytes(
+        "RelaidRes",
+        12,
+        4,
+        2,
+        vec![
+            manifest_field("b", 0, 4),
+            manifest_field("a", 4, 4),
+            manifest_field("c", 8, 4),
+        ],
+    );
+    let error = apply_component_manifest_on_reload(&mut engine, &after, &store)
+        .expect_err("a build without the reload posture refuses to reshape a resource");
+
+    assert!(
+        error.to_plain_message().contains("cannot reshape storage"),
+        "the refusal says why: {}",
+        error.to_plain_message()
+    );
+    assert_eq!(
+        engine.world().foreign_resource_layout(id),
+        Some((8, 4, 1)),
+        "the stored value keeps the layout it was written with"
+    );
+    assert_eq!(
+        engine.world().foreign_resource_bytes(id),
+        Some(payload.as_slice()),
+        "the stored bytes are untouched"
     );
 }
 
@@ -2989,6 +3100,7 @@ fn an_unregistered_resource_access_is_refused() {
 /// what makes one inspectable at all. A reload that moves the fields has to
 /// republish them, because the engine drops the layout with the shape it
 /// described.
+#[cfg(feature = "hot_reload")]
 #[test]
 fn a_managed_resource_publishes_its_field_layout() {
     resource_test_scope();

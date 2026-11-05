@@ -59,7 +59,7 @@ compile_error!(
 );
 #[cfg(all(feature = "development", feature = "shipping"))]
 compile_error!(
-    "pill_standalone cannot be both `development` and `shipping`: build a shipped project as `--no-default-features --features shipping` (and never with `hot_patch`)."
+    "pill_standalone cannot be both `development` and `shipping`: build a shipped project as `--no-default-features --features shipping`."
 );
 
 // =============================================================================

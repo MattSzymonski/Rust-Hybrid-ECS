@@ -59,18 +59,37 @@ impl PatchScope<'_> {
         statements: &[String],
         body: &str,
     ) -> Vec<String> {
-        let mut imports = self.own_items_used_by(file_source, body);
+        // A file below the crate root imports its own public items by their
+        // full path. The crate root needs none of that, because the generated
+        // source imports the package already.
+        let own_item_names = if self.module_path.len() >= 2 {
+            public_item_names(file_source)
+        } else {
+            Vec::new()
+        };
+        let mut imports = self.own_items_used_by(&own_item_names, body);
         for statement in statements {
             let Some(path) = use_path(statement) else {
                 continue;
             };
-            let body_may_use_it = imports_a_glob(path)
-                || bound_names(path)
-                    .iter()
-                    .any(|name| names_identifier(body, name));
-            if body_may_use_it {
-                imports.push(self.rooted(statement, path));
+            let names = bound_names(path);
+            let body_may_use_it =
+                imports_a_glob(path) || names.iter().any(|name| names_identifier(body, name));
+            if !body_may_use_it {
+                continue;
             }
+            // A `pub use` re-export is one of the file's public items and one
+            // of its top-level `use` statements at once, so it binds a name the
+            // item import above already bound. The item import wins and the
+            // statement goes: `use path::name;` brings every namespace of that
+            // item into scope, so the second binding collides even where one is
+            // a module and the other a function of the same name. A glob binds
+            // no listable name and so can never collide, which is why it is
+            // kept whatever the body says.
+            if !imports_a_glob(path) && names.iter().all(|name| own_item_names.contains(name)) {
+                continue;
+            }
+            imports.push(self.rooted(statement, path));
         }
         imports
     }
@@ -80,8 +99,8 @@ impl PatchScope<'_> {
     ///
     /// The crate root contributes nothing here: the generated source already
     /// imports the package, so its own public items are in scope.
-    fn own_items_used_by(&self, file_source: &str, body: &str) -> Vec<String> {
-        if self.module_path.len() < 2 {
+    fn own_items_used_by(&self, own_item_names: &[String], body: &str) -> Vec<String> {
+        if own_item_names.is_empty() {
             return Vec::new();
         }
         // The patch defines this function itself, and its text names it, so
@@ -95,10 +114,10 @@ impl PatchScope<'_> {
         let crate_root_names = public_item_names(&crate_root_source);
         let module_path = self.module_path.join("::");
         let mut imports: Vec<String> = Vec::new();
-        for name in public_item_names(file_source) {
-            if name == defined_name
-                || crate_root_names.contains(&name)
-                || !names_identifier(body, &name)
+        for name in own_item_names {
+            if *name == defined_name
+                || crate_root_names.contains(name)
+                || !names_identifier(body, name)
             {
                 continue;
             }
@@ -349,11 +368,17 @@ fn split_top_level_items(group: &str) -> Vec<&str> {
     items
 }
 
-/// Whether `body` names `name` as a whole identifier.
+/// Whether `body` names `name` as a whole identifier of its code.
+///
+/// Comments and string literals are not code, so a name written only in one is
+/// not a use. The shell mentions its own `tests` module in a comment, and
+/// reading that as a use made the patch import a module that is declared in
+/// test builds only, which does not compile.
 fn names_identifier(body: &str, name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
+    let code = source::code_mask(body);
     let mut search_from = 0;
     while let Some(offset) = body[search_from..].find(name) {
         let start = search_from + offset;
@@ -366,7 +391,10 @@ fn names_identifier(body: &str, name: &str) -> bool {
             .chars()
             .next()
             .is_some_and(is_identifier_character);
-        if !before_is_identifier && !after_is_identifier {
+        if !before_is_identifier
+            && !after_is_identifier
+            && code[start..end].iter().all(|flag| *flag)
+        {
             return true;
         }
         search_from = end;
@@ -437,6 +465,62 @@ mod tests {
         );
 
         assert!(imports.is_empty(), "{imports:?}");
+    }
+
+    /// A `pub use` re-export is a public item of the file and one of its
+    /// top-level `use` statements at once, so a body naming it reaches the name
+    /// twice. Only one import may be emitted: two explicit imports of one name
+    /// do not compile, and a patch that does not compile costs the fast path.
+    #[test]
+    fn a_re_export_the_body_names_is_imported_once() {
+        let module_path = vec![
+            String::from("pill_editor_shell_egui_editor"),
+            String::from("shell"),
+        ];
+        let scope = module_scope("pill_editor_shell_egui_editor", &module_path);
+        let file_source = "pub mod claim;\n\npub use claim::claim_shell_context;\n";
+
+        let imports = scope.imports_for(
+            file_source,
+            &[String::from("use claim::claim_shell_context;")],
+            "fn run_frame(context: u8) { claim_shell_context(context); }",
+        );
+
+        assert_eq!(
+            imports,
+            vec!["use pill_editor_shell_egui_editor::shell::claim_shell_context;"]
+        );
+    }
+
+    /// The case that broke `shell::run_frame`: the file declares a module and
+    /// re-exports a function under that same name. `use path::panel_windows;`
+    /// brings every namespace of the name into scope, so the re-export
+    /// statement binding the function collides with it and has to go.
+    #[test]
+    fn a_re_export_of_a_module_of_its_own_name_is_imported_once() {
+        let module_path = vec![
+            String::from("pill_editor_shell_egui_editor"),
+            String::from("shell"),
+        ];
+        let scope = module_scope("pill_editor_shell_egui_editor", &module_path);
+        let file_source =
+            "pub mod panel_windows;\n\npub use panel_windows::{panel_windows, PanelFeed};\n";
+
+        let imports = scope.imports_for(
+            file_source,
+            &[String::from(
+                "use panel_windows::{panel_windows, PanelFeed};",
+            )],
+            "fn run_frame(feed: &mut PanelFeed) { panel_windows(feed); }",
+        );
+
+        assert_eq!(
+            imports,
+            vec![
+                "use pill_editor_shell_egui_editor::shell::panel_windows;",
+                "use pill_editor_shell_egui_editor::shell::PanelFeed;",
+            ]
+        );
     }
 
     /// The crate root needs no import of its own: the generated source imports
@@ -583,6 +667,27 @@ mod tests {
             ]
         );
         assert!(bound_names("*").is_empty());
+    }
+
+    /// A name written only in a comment is not a use. The shell mentions its
+    /// own `tests` module in a comment, and reading that as a use made the
+    /// patch import a module that is declared in test builds only.
+    #[test]
+    fn a_name_in_a_comment_is_not_a_use() {
+        let module_path = vec![
+            String::from("pill_editor_shell_egui_editor"),
+            String::from("shell"),
+        ];
+        let scope = module_scope("pill_editor_shell_egui_editor", &module_path);
+        let file_source = "#[cfg(test)]\npub mod tests;\n\npub fn run_frame() {}\n";
+
+        let imports = scope.imports_for(
+            file_source,
+            &[],
+            "fn run_frame() {\n    // The shell's own tests read this line.\n}",
+        );
+
+        assert!(imports.is_empty(), "{imports:?}");
     }
 
     /// A name is matched as a whole identifier, so a longer name containing it

@@ -99,7 +99,7 @@ ALL_DYLIBS = ENGINE_DYLIBS + EGUI_EDITOR_DYLIBS
 # The host postures module and project builds run under: the host's own cargo
 # selection, the engine features `build_runner::host_engine_features`
 # mirrors from a game host (the engine-affecting features `pill_development_host`
-# declares: `hot_patch`, the profiling levels, `metrics`, `dev-logs`), and the
+# declares: `development`, the profiling levels, `metrics`, `dev-logs`), and the
 # cargo anchor a posture appends to every spawned build
 # (`build_runner::apply_cargo_host_overrides`). The editor host anchors its
 # module builds to `pill_editor` with no features of its own; an anchored
@@ -107,19 +107,19 @@ ALL_DYLIBS = ENGINE_DYLIBS + EGUI_EDITOR_DYLIBS
 FRONTENDS = {
     "headless": (
         ["--package", "pill_standalone"],
-        ["pill_engine/hot_patch"],
+        ["pill_engine/development"],
         None,
         ALL_DYLIBS,
     ),
     "headless reload-only": (
         ["--package", "pill_standalone", "--no-default-features", "--features", "development"],
-        ["pill_engine/hot_patch"],
+        ["pill_engine/development"],
         None,
         ALL_DYLIBS,
     ),
     "windowed": (
         ["--package", "pill_standalone", "--features", "pill_standalone/rendering"],
-        ["pill_engine/hot_patch"],
+        ["pill_engine/development"],
         None,
         ALL_DYLIBS,
     ),

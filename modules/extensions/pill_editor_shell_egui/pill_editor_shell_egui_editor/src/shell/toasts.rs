@@ -110,7 +110,11 @@ pub fn draw_toasts(
     for (index, (seq, level, text)) in rows.into_iter().enumerate() {
         let top = TOAST_TOP + index as f32 * (TOAST_HEIGHT + TOAST_GAP);
         let area = egui::Area::new(egui::Id::new(("editor-toast", seq)))
-            .order(egui::Order::Foreground)
+            // The middle layer, not the foreground one: a menu popup lives in
+            // the foreground layer and has to stay above the stack. A toast
+            // drawn after the menu bar in the same layer would cover an open
+            // menu's rows and take the click meant for them.
+            .order(egui::Order::Middle)
             .fixed_pos(egui::pos2(TOAST_LEFT, top))
             .show(context, |ui| {
                 egui::Frame::new()

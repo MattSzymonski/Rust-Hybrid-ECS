@@ -607,6 +607,13 @@ type CopyFieldAccessorsFn = unsafe extern "C" fn(*mut PillFieldAccessorDescripto
 pub(crate) struct NativeLibrary {
     /// Loaded module handle; keeps the native library mapped in memory.
     library: Option<Library>,
+    /// Declarations the process already held when this image was mapped.
+    ///
+    /// The entry points register declarations from this position, so a
+    /// reloaded generation declares its own systems, resources and asset types
+    /// and leaves the retired generation's - whose image the host keeps mapped
+    /// - alone.
+    declaration_baseline: pill_engine::declarations::DeclarationBaseline,
     /// Required registration entry point, resolved once at load time.
     module_init: ModuleInitFn,
     /// Optional registration-only entry point, resolved once at load time.
@@ -1103,6 +1110,11 @@ impl NativeLibrary {
         isolated_engine: bool,
     ) -> Result<Self, LibraryError> {
         // Step 1: Open the native library and map it into this process.
+        //
+        // The declaration baseline is counted first: mapping runs the
+        // artifact's constructors, which append its declarations to the
+        // process-wide collections, and the entry point must stop before them.
+        let declaration_baseline = pill_engine::declarations::DeclarationBaseline::current();
         // SAFETY: The `# Safety` contract of `load` guarantees `path` names a
         // valid native library. Mapping runs the module's constructors, and the
         // handle that comes back keeps the module mapped; it is stored in the
@@ -1266,6 +1278,7 @@ impl NativeLibrary {
         let module_init_pointer = *module_init;
         Ok(Self {
             library: Some(library),
+            declaration_baseline,
             module_init: module_init_pointer,
             module_register,
             abi_version,
@@ -1291,7 +1304,10 @@ impl NativeLibrary {
         // it. The `library` field keeps the module mapped for as long as this
         // `NativeLibrary` lives, and `api` is only borrowed for the duration of
         // the call.
-        Some(unsafe { module_register(api as *const EngineApi) })
+        Some(pill_engine::declarations::with_declaration_baseline(
+            self.declaration_baseline,
+            || unsafe { module_register(api as *const EngineApi) },
+        ))
     }
 
     /// Calls the module's registration entry point.
@@ -1305,7 +1321,9 @@ impl NativeLibrary {
         // defines for it. The `library` field keeps the module mapped for as
         // long as this `NativeLibrary` lives, and `api` is only borrowed for the
         // duration of the call.
-        unsafe { (self.module_init)(api as *const EngineApi) }
+        pill_engine::declarations::with_declaration_baseline(self.declaration_baseline, || unsafe {
+            (self.module_init)(api as *const EngineApi)
+        })
     }
 
     /// Rejects an artifact built against a different revision of the module ABI.

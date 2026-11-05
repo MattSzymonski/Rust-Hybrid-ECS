@@ -30,5 +30,10 @@ renderer_data_dependency_graph = { package = "pill_master_renderer_data", path =
 [features]
 # The reloading posture: polling the collectible loader, applying a changed
 # component manifest, re-registering systems, republishing the asset exports.
-# Enabled by `pill_development_host`'s `hot_reload`; a shipping bundle leaves it off.
-hot_reload = []
+# Enabled by `pill_development_host`; a shipping bundle leaves it off.
+#
+# It also enables the engine's `development` feature, which is what makes the
+# relayout and re-homing APIs the reshape arms call exist at all. A shipping
+# build therefore compiles the arms out and refuses a changed manifest instead
+# of reshaping storage.
+hot_reload = ["pill_engine/development"]

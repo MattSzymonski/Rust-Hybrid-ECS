@@ -161,16 +161,16 @@ const ARTIFACT_STAMP_DIRECTORY: &str = "pill_standalone_temp/artifact_stamps";
 /// The host's feature set, which module builds must reproduce.
 ///
 /// When the host is rebuilt with a different feature set, every cached module
-/// artifact becomes invalid. `hot_patch` is passed into every module and
+/// artifact becomes invalid. `development` is passed into every module and
 /// project build, so it changes the engine each module links. `rendering` does
 /// not change the module's own engine - the renderer lives outside
 /// `pill_engine` - but it still belongs here: a windowed host loads the wgpu
 /// renderer beside its engine dylibs, and a cached artifact is only trusted
 /// for the posture it was built for.
 const HOST_MODULE_FEATURE_SET: &str = if cfg!(feature = "rendering") {
-    "rendering+hot_patch"
+    "rendering+development"
 } else {
-    "no-rendering+hot_patch"
+    "no-rendering+development"
 };
 
 /// The host's profiling level.
@@ -241,7 +241,7 @@ fn host_build_identity() -> String {
 /// reports exactly the posture the running binary was built with.
 fn host_engine_features() -> Vec<&'static str> {
     let mut features = Vec::new();
-    features.push("pill_engine/hot_patch");
+    features.push("pill_engine/development");
     if cfg!(feature = "profiling-fine") {
         features.push("pill_engine/profiling-fine");
     } else if cfg!(feature = "profiling-verify") {
@@ -501,7 +501,7 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
                 // The anchor's manifest was not found, so keep its defaults
                 // and add the features the host is known to need.
                 for feature in host_posture_features() {
-                    if feature != "dev" && feature != "hot_patch" {
+                    if feature != "dev" && feature != "development" {
                         command
                             .arg("--features")
                             .arg(format!("{anchor_package}/{feature}"));
@@ -579,7 +579,7 @@ fn is_editor_anchor(package_name: &str) -> bool {
 /// They pick the anchor's feature selection for a build that is anchored: an
 /// editor host, or a host started by the dioxus CLI.
 fn host_posture_features() -> Vec<&'static str> {
-    let mut features = vec!["dev", "hot_patch"];
+    let mut features = vec!["dev", "development"];
     if cfg!(feature = "rendering") {
         features.push("rendering");
     }
@@ -1221,7 +1221,7 @@ pub(crate) fn stop_process_tree(_tree: Option<&BuildProcessTree>, child: &mut Ch
 /// produced artifact is left to the caller. `timeout` is the caller's limit:
 /// [`BUILD_TIMEOUT`] for one module, [`STARTUP_BATCH_TIMEOUT`] for the batch.
 ///
-/// With the `hot_patch` feature this also takes the compiler flags the fast
+/// With the `development` feature this also takes the compiler flags the fast
 /// patch pipeline needs out of the build it runs anyway (see
 /// [`VerboseCapture`]); `capture_entries` names the crates to harvest.
 ///
@@ -1837,7 +1837,7 @@ pub(crate) const STAGED_DEPENDENCY_SUBDIRECTORY: &str = "target/hot/deps";
 /// `deps/libpill_dummy_color.rlib`, and overwrites it in place on every build.
 /// Third-party crates get a metadata hash and are safe. A workspace crate shares
 /// one slot per crate name across every feature configuration. The host builds
-/// modules with `--features pill_engine/hot_patch`, while a plain `cargo build`
+/// modules with `--features pill_engine/development`, while a plain `cargo build`
 /// writes a differently-featured artifact to the same path. A generated patch
 /// then links a module rlib built against one variant while its dependency's
 /// `--extern` names the other, which fails as `error[E0463]: can't find crate`
@@ -2428,7 +2428,7 @@ mod tests {
             "cargo".to_string(),
             "build".to_string(),
             "--features".to_string(),
-            "pill_engine/hot_patch".to_string(),
+            "pill_engine/development".to_string(),
         ];
 
         record_artifact_stamp(
@@ -2485,7 +2485,7 @@ mod tests {
 
         let windowed = artifact_stamp(
             "rustc 1.95.0
-rendering+hot_patch",
+rendering+development",
             "module/src",
             &command,
             artifacts,
@@ -2493,7 +2493,7 @@ rendering+hot_patch",
         .expect("the artifact exists");
         let headless = artifact_stamp(
             "rustc 1.95.0
-no-rendering+hot_patch",
+no-rendering+development",
             "module/src",
             &command,
             artifacts,
@@ -2518,7 +2518,7 @@ no-rendering+hot_patch",
             "cargo".to_string(),
             "build".to_string(),
             "--features".to_string(),
-            "pill_engine/hot_patch".to_string(),
+            "pill_engine/development".to_string(),
         ];
         let without_feature = vec!["cargo".to_string(), "build".to_string()];
 

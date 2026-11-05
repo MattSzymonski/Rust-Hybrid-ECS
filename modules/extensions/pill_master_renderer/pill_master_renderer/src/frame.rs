@@ -810,12 +810,20 @@ mod tests {
     }
 
     /// Builds an engine the rendering system can run in: the frame and the
-    /// asset store are inserted as resources, and the system is registered.
+    /// asset store are inserted as resources, and the artifact entry point
+    /// registers the declared `rendering` system.
     fn renderable_engine() -> Engine {
         let mut engine = Engine::new();
         engine.world_mut().insert_resource(RenderFrame::default());
         engine.world_mut().insert_resource(AssetManager::new());
-        crate::register(&mut engine);
+        // The system is declared with `#[system]`, so it reaches the engine
+        // through the artifact entry point. `register` is the half a reload
+        // repeats, and it declares no system of its own.
+        let status = pill_engine::component_registry::run_artifact_registration(
+            &mut engine,
+            crate::register,
+        );
+        assert_eq!(status, 0, "the renderer's registration reports success");
         engine
     }
 

@@ -33,9 +33,9 @@
 // Enable it only in a debug profile.
 #[cfg(not(debug_assertions))]
 compile_error!(
-    "the `hot_patch` feature is a development facility and cannot be built with \
+    "hot patching is a development facility and cannot be built with \
      optimizations: it invokes `rustc` at runtime and loads generated libraries \
-     into the process. Build without `--release`, or drop the feature."
+     into the process. Build without `--release`."
 );
 
 // Standard library

@@ -444,7 +444,12 @@ impl ApplicationHandler for EditorApplication {
                     editor.resize_scene(view, size.width, size.height);
                 } else if is_game {
                     editor.resize_game(size.width, size.height);
-                } else {
+                } else if is_main {
+                    // Only the main window's size reaches the shell: its
+                    // logical screen is what every panel and popup is laid out
+                    // in. A popped-out window's resize already re-sized its own
+                    // surface above, and treating it as the main window's would
+                    // shrink the shell to the pop-out's size.
                     editor.resize(size.width, size.height);
                 }
             }

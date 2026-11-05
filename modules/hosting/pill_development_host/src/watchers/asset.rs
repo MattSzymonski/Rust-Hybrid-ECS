@@ -41,7 +41,7 @@ use pill_core::error::WatcherError;
 use pill_core::info;
 
 // Current crate
-use crate::watcher::{is_relevant_event, spawn_settled_watcher};
+use super::shared::{is_relevant_event, spawn_settled_watcher};
 
 // =============================================================================
 // Constants

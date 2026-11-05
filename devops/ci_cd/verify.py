@@ -79,31 +79,31 @@ RUNNING_IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 MODULES_ROOT = REPOSITORY_ROOT / "modules"
 PYTHON = sys.executable
 
-# The engine's patch feature, shared by the check and test steps. The host has no
-# feature of its own any more: it pins `pill_engine/hot_patch` in its manifest,
-# and the `PILL_*` switches decide at startup which watchers run.
-HOT_PATCH_FEATURES = "pill_engine/hot_patch"
-# The default test lane must compile without hot_patch, so the plain-reload
-# code paths (`cfg(not(feature = "hot_patch"))` in the engine) are built and
+# The engine's development-posture feature, shared by the check and test steps.
+# The host has no feature of its own any more: it pins `pill_engine/development`
+# in its manifest, and the `PILL_*` switches decide at startup which watchers run.
+DEVELOPMENT_FEATURES = "pill_engine/development"
+# The default test lane must compile without `development`, so the shipping
+# code paths (`cfg(not(feature = "development"))` in the engine) are built and
 # tested. Cargo unifies features across one invocation, so every member that
-# reaches the engine's patch feature has to stay out of the lane: the two
+# reaches the engine's development feature has to stay out of the lane: the two
 # frontends through their host dependency, and the host itself, which pins
-# `pill_engine/hot_patch` in its own manifest so the modules it builds resolve the
-# graph its dylibs were built with. The hot_patch lane runs the whole workspace,
+# `pill_engine/development` in its own manifest so the modules it builds resolve the
+# graph its dylibs were built with. The development lane runs the whole workspace,
 # host included. The `default-lane-features` step fails if a new member brings
-# hot_patch back.
+# development back.
 DEFAULT_LANE = [
     "--workspace",
     "--exclude",
     "pill_standalone",
     # The egui editor frontend links `pill_development_host` with its default features, so
-    # leaving it in the default lane turns `pill_engine_core/hot_patch` on for
-    # every crate in it - the lane exists to test the plain path, and the
-    # hot_patch lane below covers the other one.
+    # leaving it in the default lane turns `pill_engine_core/development` on for
+    # every crate in it - the lane exists to test the shipping path, and the
+    # development lane below covers the other one.
     "--exclude",
     "pill_editor",
-    # The host pins the engine's patch feature, so its unit tests run in the
-    # hot_patch lane only.
+    # The host pins the engine's development feature, so its unit tests run in the
+    # development lane only.
     "--exclude",
     "pill_development_host",
 ]
@@ -185,9 +185,9 @@ STEPS: List[Step] = [
     # rustc without touching rustflags, so a warning in a posture fails its
     # step.
     Step(
-        "check-hot-patch",
-        "Clippy (hot_patch posture)",
-        [["cargo", "clippy", "--workspace", "--features", HOT_PATCH_FEATURES, "--", "-D", "warnings"]],
+        "check-development",
+        "Clippy (development posture)",
+        [["cargo", "clippy", "--workspace", "--features", DEVELOPMENT_FEATURES, "--", "-D", "warnings"]],
     ),
     Step(
         "bundle-stub",
@@ -235,12 +235,21 @@ STEPS: List[Step] = [
     ),
     Step(
         "default-lane-features",
-        "Default test lane is free of hot_patch",
+        "Default test lane is free of development",
         [[PYTHON, "devops/ci_cd/verify.py", "--assert-default-lane-features"]],
         working_directory=REPOSITORY_ROOT,
     ),
-    unit_test_step("test", "Unit tests (default lane, no hot_patch)", DEFAULT_LANE),
-    unit_test_step("test-hot-patch", "Unit tests (hot_patch lane)", ["--workspace", "--features", HOT_PATCH_FEATURES]),
+    unit_test_step("test", "Unit tests (default lane, no development)", DEFAULT_LANE),
+    unit_test_step("test-development", "Unit tests (development lane)", ["--workspace", "--features", DEVELOPMENT_FEATURES]),
+    Step(
+        "test-shipping-engine",
+        "Engine refuses layout changes in the shipping posture",
+        # The shipping posture has no `development` feature: the migration,
+        # re-homing and relayout code is absent, and the registration refusals
+        # are what stops a type being registered again with a changed layout.
+        # The unit tests prove all three refusal paths in this build.
+        [["cargo", "test", "-p", "pill_engine_core"]],
+    ),
     Step(
         "test-metrics",
         "Unit tests (metrics posture)",
@@ -490,12 +499,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def assert_default_lane_features() -> int:
-    """0 when the default test lane's feature graph has no hot_patch, else 1.
+    """0 when the default test lane's feature graph has no development feature, else 1.
 
     Asks cargo which features of `pill_engine_core` the lane would enable; a
-    member that turns hot_patch on (directly or through a dependency) shows up
-    here before it silently turns the "no hot_patch" lane into a second
-    hot_patch lane.
+    member that turns `development` on (directly or through a dependency) shows up
+    here before it silently turns the shipping lane into a second development
+    lane.
     """
     command = ["cargo", "tree", "--offline", "-e", "features", *DEFAULT_LANE, "-i", "pill_engine_core"]
     print(f"$ {format_command(command)}", flush=True)
@@ -507,14 +516,14 @@ def assert_default_lane_features() -> int:
     if result.returncode != 0:
         print(result.stderr[-2000:], file=sys.stderr)
         return 1
-    offenders = [line.strip() for line in result.stdout.splitlines() if "hot_patch" in line]
+    offenders = [line.strip() for line in result.stdout.splitlines() if "development" in line]
     if offenders:
-        print("ERROR: the default test lane enables hot_patch through:", file=sys.stderr)
+        print("ERROR: the default test lane enables the engine's development feature through:", file=sys.stderr)
         for line in offenders:
             print(f"  {line}", file=sys.stderr)
         print("Exclude the member that turns it on in DEFAULT_LANE (verify.py).", file=sys.stderr)
         return 1
-    print("default test lane: no hot_patch in the feature graph")
+    print("default test lane: no development feature in the graph")
     return 0
 
 

@@ -17,6 +17,7 @@
 
 // Current crate
 use super::*;
+#[cfg(feature = "development")]
 use crate::archetype::{FieldSource, LayoutField};
 use crate::test_fixtures::{setup_world, Health, Position, Velocity};
 
@@ -125,6 +126,7 @@ fn descriptor_components_coexist_and_survive_archetype_migration() {
 /// A relayout rewrites each row in place. Entities keep their rows, values
 /// follow their field names, and a field that the previous layout did not have
 /// starts at zero instead of reusing a byte of the old shape.
+#[cfg(feature = "development")]
 #[test]
 fn relayout_migrates_rows_and_keeps_entities_in_their_rows() {
     let mut world = World::new();
@@ -230,6 +232,7 @@ fn relayout_migrates_rows_and_keeps_entities_in_their_rows() {
 
 /// A relayout is a structural edit, not an add, so rows keep their ticks. No
 /// `Added` filter fires, and a row that was already changed stays changed.
+#[cfg(feature = "development")]
 #[test]
 fn relayout_leaves_change_ticks_alone() {
     let mut world = World::new();
@@ -274,6 +277,7 @@ fn relayout_leaves_change_ticks_alone() {
 /// The values move with them, the successor answers to its own name, and the
 /// predecessor's registration is retired. An entity whose only component this
 /// is survives the move.
+#[cfg(feature = "development")]
 #[test]
 fn remap_moves_rows_to_the_successor_and_retires_the_source() {
     let mut world = World::new();
@@ -381,6 +385,7 @@ fn remap_moves_rows_to_the_successor_and_retires_the_source() {
 /// The plan's field mapping decides what moves, not the raw bytes. A shape
 /// with a moved field and an added one is reordered and zero-filled, just as a
 /// relayout would do it.
+#[cfg(feature = "development")]
 #[test]
 fn remap_reshapes_rows_through_the_plan() {
     let mut world = World::new();
@@ -462,6 +467,7 @@ fn remap_reshapes_rows_through_the_plan() {
 /// A plan can carry default bytes. An added field is filled with them instead
 /// of zero, and a default set on a copied field is accepted but ignored, so it
 /// does not overwrite a value that was copied.
+#[cfg(feature = "development")]
 #[test]
 fn a_plan_default_fills_an_added_field_and_never_overrides_a_copied_one() {
     let mut world = World::new();
@@ -541,6 +547,7 @@ fn a_plan_default_fills_an_added_field_and_never_overrides_a_copied_one() {
 /// Retiring a descriptor component's storage removes its rows and its
 /// registration, and frees the name and the bit for a later declaration. A
 /// managed manifest relies on this when a type is removed.
+#[cfg(feature = "development")]
 #[test]
 fn retire_component_storage_frees_a_descriptor_component() {
     let mut world = World::new();
@@ -616,6 +623,7 @@ fn retire_component_storage_frees_a_descriptor_component() {
 /// The resource version of the remap. The value moves to the successor's id,
 /// the claims move with it, and the source declaration is dropped after they
 /// do.
+#[cfg(feature = "development")]
 #[test]
 fn remap_foreign_resource_moves_the_value_and_the_claim() {
     let mut world = World::new();
@@ -678,6 +686,7 @@ fn remap_foreign_resource_moves_the_value_and_the_claim() {
 /// The id and the registry bit survive a relayout, because archetype masks and
 /// the scheduler's access sets hold them. A relayout must update the layout in
 /// place and never register the component again.
+#[cfg(feature = "development")]
 #[test]
 fn relayout_keeps_the_component_id_and_its_bit() {
     let mut world = World::new();
@@ -709,6 +718,7 @@ fn relayout_keeps_the_component_id_and_its_bit() {
 /// A relayout must also reach an archetype whose last row is gone. The next
 /// entity added there has to be stored at the new size, so the push below only
 /// succeeds when that column really was rewritten.
+#[cfg(feature = "development")]
 #[test]
 fn relayout_reaches_an_archetype_that_lost_its_last_row() {
     let mut world = World::new();
@@ -749,6 +759,7 @@ fn relayout_reaches_an_archetype_that_lost_its_last_row() {
 
 /// Only a registered descriptor component has a layout to replace, and a plan
 /// that does not fit both layouts is refused before anything is touched.
+#[cfg(feature = "development")]
 #[test]
 fn relayout_refuses_what_it_cannot_migrate() {
     let mut world = World::new();
@@ -1171,6 +1182,7 @@ fn byte_component_adder_writes_native_bytes() {
 /// still holds rows or not. The archetype stops listing the id, so the host
 /// can unmap a retired image without leaving a column whose drop code lived in
 /// it.
+#[cfg(feature = "development")]
 #[test]
 fn a_column_whose_factory_vanished_is_dropped_before_eviction() {
     let mut world = World::new();
@@ -2605,6 +2617,7 @@ fn registering_a_resource_records_the_table_without_a_value() {
 }
 
 /// Re-homing leaves the value intact and still droppable exactly once.
+#[cfg(feature = "development")]
 #[test]
 fn rehoming_resources_preserves_the_value_and_its_drop() {
     let (probe, drop_counter) = rehome_probe();
@@ -2889,6 +2902,7 @@ fn a_shared_claim_survives_one_subjects_retirement() {
 ///
 /// Storage shape has one owner, so this pins the factory to the column that
 /// allocates the rows and to the size readers consult.
+#[cfg(feature = "development")]
 #[test]
 fn relayout_moves_the_factory_and_the_column_together() {
     let mut world = World::new();
@@ -3042,6 +3056,7 @@ fn foreign_bytes_round_trip_and_stamp_the_change_tick() {
 
 /// A private resource has no byte view. Its id is a `TypeId`, which no other
 /// language can name, so there is no id for one to address.
+#[cfg(feature = "development")]
 #[test]
 fn a_private_resource_has_no_foreign_view() {
     let mut world = World::new();
@@ -3062,6 +3077,7 @@ fn a_private_resource_has_no_foreign_view() {
 
 /// A relayout moves the stored bytes through the plan, updates the declared
 /// layout, and reports how many values it migrated.
+#[cfg(feature = "development")]
 #[test]
 fn relayout_migrates_a_foreign_value_through_the_plan() {
     let mut world = World::new();
@@ -3135,6 +3151,7 @@ fn relayout_migrates_a_foreign_value_through_the_plan() {
 /// A Rust value's shape is its type, so a foreign declaration cannot
 /// reshape it, and a plan that does not fit the payload is refused before
 /// anything moves.
+#[cfg(feature = "development")]
 #[test]
 fn relayout_refuses_a_rust_value_and_a_plan_that_leaves_the_payload() {
     let mut world = World::new();
@@ -3188,6 +3205,7 @@ fn relayout_refuses_a_rust_value_and_a_plan_that_leaves_the_payload() {
 
 /// Re-homing leaves a foreign box's table alone. The bytes are not the Rust
 /// type's to drop, even when the two share a name.
+#[cfg(feature = "development")]
 #[test]
 fn rehoming_leaves_a_foreign_box_alone() {
     let mut world = World::new();
@@ -3512,6 +3530,7 @@ fn an_impossible_resource_field_layout_is_refused() {
 /// Serving the previous generation's offsets over migrated bytes would be
 /// worse than serving nothing. The engine therefore forgets the layout, and
 /// the declarer publishes it again, as the host does in the same pass.
+#[cfg(feature = "development")]
 #[test]
 fn a_relayout_drops_the_stored_resource_field_layout() {
     let mut world = World::new();
@@ -3856,4 +3875,100 @@ fn a_re_registered_script_component_dispatches_on_its_new_bit() {
         1,
         "a re-registered script type must dispatch through its current bit"
     );
+}
+
+// =============================================================================
+// Shipping posture: the registration refusals
+// =============================================================================
+
+// A shipping build has no `development` feature, so the migration and
+// re-homing code - and every API that could reshape a registered type's storage
+// - is absent. The registration refusals below are what is left, and they run
+// in both postures; `verify.py`'s `test-shipping-engine` step runs them in the
+// build without `development`.
+
+/// A copy of one shared resource type from another artifact: the two module
+/// paths differ, so the declaring type's last segment is what matches.
+mod shipping_schema_a {
+    use crate::resource::Resource;
+
+    /// The first copy's declared schema.
+    pub(super) struct Settings;
+
+    impl Resource for Settings {
+        fn shared_name() -> Option<&'static str> {
+            Some("shipping::Settings")
+        }
+
+        fn shared_schema_hash() -> Option<u64> {
+            Some(1)
+        }
+    }
+}
+
+/// The same declared name and shape family, one schema generation later.
+mod shipping_schema_b {
+    use crate::resource::Resource;
+
+    /// The second copy's declared schema.
+    pub(super) struct Settings;
+
+    impl Resource for Settings {
+        fn shared_name() -> Option<&'static str> {
+            Some("shipping::Settings")
+        }
+
+        fn shared_schema_hash() -> Option<u64> {
+            Some(2)
+        }
+    }
+}
+
+/// A descriptor registered again with a changed layout is refused instead of
+/// reshaping the live column.
+#[test]
+fn a_descriptor_registered_again_with_a_changed_layout_is_refused() {
+    let mut world = World::new();
+    world
+        .register_component_descriptor(
+            0x51,
+            "shipping::Described",
+            4,
+            4,
+            1,
+            Blittability::engine_verified(),
+        )
+        .expect("the first layout registers");
+
+    let error = world
+        .register_component_descriptor(
+            0x51,
+            "shipping::Described",
+            8,
+            8,
+            2,
+            Blittability::engine_verified(),
+        )
+        .expect_err("the changed layout is refused");
+
+    assert!(matches!(error, WorldError::DescriptorAlreadyRegistered));
+}
+
+/// A shared resource whose declared schema changed is refused at the claim, so
+/// a stale artifact cannot bind to storage it does not understand.
+#[test]
+fn a_shared_resource_registered_again_with_a_changed_schema_is_refused() {
+    let mut world = World::new();
+    world.register_resource::<shipping_schema_a::Settings>();
+    assert!(world.take_registration_error().is_none());
+
+    world.register_resource::<shipping_schema_b::Settings>();
+
+    let error = world
+        .take_registration_error()
+        .expect("the changed schema is refused");
+    assert!(matches!(
+        error,
+        WorldError::SharedResourceSchemaMismatch { .. }
+    ));
 }

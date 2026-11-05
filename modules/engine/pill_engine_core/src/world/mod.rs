@@ -30,9 +30,11 @@ use std::collections::HashMap;
 use pill_core::{error, info, warn};
 
 // Current crate
+#[cfg(feature = "development")]
+use crate::archetype::FieldPlan;
 use crate::archetype::{
     validate_component_layout, Archetype, ArchetypeId, Blittability, ColumnLayout,
-    ComponentColumns, FieldPlan, StorageFactory,
+    ComponentColumns, StorageFactory,
 };
 use crate::commands::CommandQueue;
 use crate::component::{
@@ -40,9 +42,9 @@ use crate::component::{
 };
 use crate::entity::{Entity, EntityId};
 use crate::query::change_detection::Mut;
-use crate::resource::{
-    ErasedResource, ErasedResourceOps, KeptLayoutDeclaration, Resource, ResourceId,
-};
+#[cfg(feature = "development")]
+use crate::resource::KeptLayoutDeclaration;
+use crate::resource::{ErasedResource, ErasedResourceOps, Resource, ResourceId};
 use crate::scripting::{ScriptComponent, ScriptContext};
 
 // =============================================================================

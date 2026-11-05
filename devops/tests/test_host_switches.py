@@ -304,6 +304,10 @@ def scenario_assets_off(arguments) -> list:
     try:
         if not wait_until_running(monitor, arguments.timeout_scale):
             return [(False, "the host started with asset hot reloading off")]
+        # The asset watcher starts after the project module is loaded, so the
+        # switch-off line lands a few lines after the liveness token the wait
+        # above returns on. Wait for it rather than snapshot in that window.
+        monitor.wait_for(ASSETS_OFF_TOKEN, STARTUP_TIMEOUT_SECONDS * arguments.timeout_scale)
         text = monitor.output_since(0)
         mark = monitor.line_count
         ASSET_FILE.write_bytes(original + ASSET_APPENDED_LINE.encode("utf-8"))

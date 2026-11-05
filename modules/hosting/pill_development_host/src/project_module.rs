@@ -48,7 +48,7 @@ mod loaded {
         FastCompiler, POLL_REJECTED, POLL_RELOADED,
     };
     use crate::native_library::NativeLibrary;
-    use crate::watcher::SourceTrigger;
+    use crate::watchers::SourceTrigger;
     use crate::{ProjectModuleBackend, ProjectModuleConfig};
 
     // =============================================================================

@@ -44,7 +44,9 @@ use std::ptr::NonNull;
 // Current crate
 use pill_core::error;
 
+#[cfg(feature = "development")]
 use crate::archetype::FieldPlan;
+#[cfg(feature = "development")]
 use crate::error::WorldError;
 use crate::settings::SettingsAssetOps;
 use crate::world::World;
@@ -721,6 +723,7 @@ impl ErasedResource {
     /// # Panics
     ///
     /// Panics when `size` and `align` cannot describe an allocation.
+    #[cfg(feature = "development")]
     pub(crate) fn migrate_bytes(
         &mut self,
         size: usize,

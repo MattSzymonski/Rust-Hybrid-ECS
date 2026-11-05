@@ -42,9 +42,11 @@ use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{ComponentId, Engine, World};
 
 // Current crate
+#[cfg(feature = "hot_reload")]
+use super::manifest::build_field_plan;
 use super::manifest::{
-    build_field_plan, format_field_layout_line, handle_asset_path, managed_field_layout,
-    parse_and_validate_manifest, plan_tag, split_manifest_kinds, ManagedManifestEntry,
+    format_field_layout_line, handle_asset_path, managed_field_layout, parse_and_validate_manifest,
+    plan_tag, split_manifest_kinds, ManagedManifestEntry,
 };
 use super::manifest_apply::{BindingTable, ManifestSubject, RenamePredecessor, Settlement};
 
@@ -804,13 +806,31 @@ fn register_component_entry(
     ))
 }
 
+/// A shipping build has no manifest apply path: the real arm is compiled only
+/// with the `hot_reload` feature. The stub keeps the call graph whole while
+/// refusing a changed layout explicitly if it is ever reached.
+#[cfg(not(feature = "hot_reload"))]
+fn reshape_component_entry(
+    _engine: &mut Engine,
+    _stable_id: StableComponentId,
+    _existing: &ComponentBinding,
+    component: &ManagedManifestEntry,
+) -> Result<(ComponentBinding, Option<ComponentUndo>), CSharpError> {
+    Err(CSharpError::ManifestInvalid {
+        message: format!(
+            "managed component {} changed its layout; a shipping build cannot reshape storage",
+            component.full_name
+        ),
+    })
+}
+
 /// Migrate one managed component's rows into the arriving layout.
 ///
 /// # Errors
 ///
 /// Returns a [`CSharpError`] when the engine refuses the row migration or the
 /// new field layout.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+#[cfg(feature = "hot_reload")]
 fn reshape_component_entry(
     engine: &mut Engine,
     _stable_id: StableComponentId,
@@ -869,13 +889,30 @@ fn reshape_component_entry(
     ))
 }
 
+/// A shipping build never applies a manifest, so it refuses a rename rather
+/// than moving rows onto a successor.
+#[cfg(not(feature = "hot_reload"))]
+fn rename_component_entry(
+    _engine: &mut Engine,
+    _stable_id: StableComponentId,
+    _predecessor: &RenamePredecessor<'_, ComponentBinding>,
+    component: &ManagedManifestEntry,
+) -> Result<(ComponentBinding, Option<ComponentUndo>), CSharpError> {
+    Err(CSharpError::ManifestInvalid {
+        message: format!(
+            "managed component {} was renamed; a shipping build cannot move storage",
+            component.full_name
+        ),
+    })
+}
+
 /// Register the successor of a renamed component and move the rows across.
 ///
 /// # Errors
 ///
 /// Returns a [`CSharpError`] when the successor cannot be registered, or when
 /// the engine refuses to move the predecessor's rows onto it.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+#[cfg(feature = "hot_reload")]
 fn rename_component_entry(
     engine: &mut Engine,
     stable_id: StableComponentId,
@@ -921,12 +958,16 @@ fn rename_component_entry(
     ))
 }
 
+/// A shipping build cannot reach an undo: no manifest was applied to reverse.
+#[cfg(not(feature = "hot_reload"))]
+fn undo_component_entry(_engine: &mut Engine, _undo: ComponentUndo) {}
+
 /// Reverse one applied component entry, best effort.
 ///
 /// A rollback that fails leaves the process half-applied, so the failure is
 /// logged with the component it concerns instead of replacing the original
 /// refusal, which is the error the caller needs.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+#[cfg(feature = "hot_reload")]
 fn undo_component_entry(engine: &mut Engine, undo: ComponentUndo) {
     match undo {
         ComponentUndo::Added { component_id } => {

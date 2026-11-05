@@ -25,6 +25,20 @@ use super::*;
 // Free functions
 // =============================================================================
 
+/// The artifact declares exactly one system: the shell pass. A second
+/// declaration would run two egui passes per frame.
+#[test]
+fn the_shell_declares_one_system() {
+    let mut engine = Engine::new();
+    pill_engine::declarations::register_all_systems(&mut engine);
+    let names: Vec<String> = engine
+        .system_snapshots()
+        .into_iter()
+        .map(|snapshot| snapshot.name)
+        .collect();
+    assert_eq!(names, ["egui_shell"], "{names:?}");
+}
+
 /// A row's hover text is the tooltip its type declared, and the whole key when
 /// the type declared none.
 #[test]

@@ -86,6 +86,7 @@ type Rename<Declaration, Binding, Undo> = fn(
 /// The whole entry is passed because applying a rename retires the predecessor.
 /// Once the data has moved, the registration is gone, so this is the only
 /// description of what was there.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(super) struct RenamePredecessor<'binding, Binding> {
     /// The table key the predecessor is bound under.
     pub(super) identity: StableComponentId,

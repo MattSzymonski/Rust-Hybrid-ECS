@@ -80,8 +80,9 @@ ORIGINAL_SOURCE = ""
 # Helpers
 # =============================================================================
 
-# `rendering` is what this suite measures; `hot_patch` stays on with it because
-# the two are one resolved graph here (the default feature forwards it).
+# `rendering` is what this suite measures; the engine's `development` feature
+# stays on with it because the two are one resolved graph here (the dev host
+# pins it).
 HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
 
 

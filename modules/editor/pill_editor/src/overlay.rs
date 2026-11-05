@@ -294,9 +294,23 @@ impl OverlaySurface {
             textures.clear();
             return Ok(false);
         }
-        // A suboptimal frame is still drawable; any other status means there
-        // is no frame this time. The error goes back to the caller, which logs
-        // it and skips the UI for this frame.
+        // Step 1: apply this frame's texture updates before drawing with
+        // them. One texture may carry several deltas in one frame. The
+        // updates belong to the renderer even when no swapchain frame comes
+        // back, so they are applied before that check; dropping a delta
+        // unapplied trips epaint's debug assertion.
+        for (texture_id, deltas) in &textures.set {
+            for image_delta in deltas {
+                renderer.update_texture(device, queue, *texture_id, image_delta);
+            }
+        }
+        for texture_id in &textures.free {
+            renderer.free_texture(texture_id);
+        }
+        textures.clear();
+        // Step 2: a suboptimal frame is still drawable; any other status means
+        // there is no frame this time. The error goes back to the caller,
+        // which logs it and skips the UI for this frame.
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -312,14 +326,7 @@ impl OverlaySurface {
             ],
             pixels_per_point: pixels_per_point.max(0.01),
         };
-        // Step 1: apply this frame's texture updates before drawing with
-        // them. One texture may carry several deltas in one frame.
-        for (texture_id, deltas) in &textures.set {
-            for image_delta in deltas {
-                renderer.update_texture(device, queue, *texture_id, image_delta);
-            }
-        }
-        // Step 2: record the draw commands. `update_buffers` may produce its
+        // Step 3: record the draw commands. `update_buffers` may produce its
         // own command buffers, which are submitted alongside the pass.
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("pill_editor overlay"),
@@ -357,13 +364,7 @@ impl OverlaySurface {
             let mut pass = pass.forget_lifetime();
             renderer.render(&mut pass, meshes, &screen_descriptor);
         }
-        // Step 3: release the textures the shell asked to free, then submit.
-        for texture_id in &textures.free {
-            renderer.free_texture(texture_id);
-        }
-        // Every delta is applied: an unapplied one trips epaint's debug
-        // assertion when it drops.
-        textures.clear();
+        // Step 4: submit and present.
         queue.submit(user_buffers.into_iter().chain(Some(encoder.finish())));
         queue.present(frame);
         self.has_drawn_content = has_content;

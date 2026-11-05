@@ -27,6 +27,7 @@ fn two_field_layout() -> ColumnLayout {
     }
 }
 
+#[cfg(feature = "development")]
 fn column_with_rows(rows: &[[u8; 8]]) -> ComponentColumn {
     let mut column = ComponentColumn::new(two_field_layout()).expect("a valid layout");
     for row in rows {
@@ -331,6 +332,7 @@ fn applying_a_plan_writes_every_instruction() {
     );
 }
 
+#[cfg(feature = "development")]
 #[test]
 fn relayout_moves_rows_through_the_plan() {
     // Two rows, `a` and `b` each holding a distinct u32.
@@ -397,6 +399,7 @@ fn relayout_moves_rows_through_the_plan() {
     assert_eq!(column.schema_hash(), 2);
 }
 
+#[cfg(feature = "development")]
 #[test]
 fn relayout_of_an_equal_shape_rewrites_rows_in_place() {
     let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0]]);
@@ -457,6 +460,7 @@ fn relayout_of_an_equal_shape_rewrites_rows_in_place() {
     );
 }
 
+#[cfg(feature = "development")]
 #[test]
 fn relayout_keeps_the_row_count_and_capacity() {
     let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0], [3, 0, 0, 0, 4, 0, 0, 0]]);
@@ -484,6 +488,7 @@ fn relayout_keeps_the_row_count_and_capacity() {
     assert_eq!(column.len(), 3);
 }
 
+#[cfg(feature = "development")]
 #[test]
 fn relayout_refuses_a_plan_that_leaves_a_row() {
     let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0]]);
@@ -511,6 +516,7 @@ fn relayout_refuses_a_plan_that_leaves_a_row() {
     );
 }
 
+#[cfg(feature = "development")]
 #[test]
 fn relayout_refuses_a_layout_that_cannot_be_allocated() {
     let mut column = column_with_rows(&[]);
@@ -716,6 +722,7 @@ fn a_columns_ticks_track_its_rows_through_every_mutator() {
 /// across with it. A reshaped component has not been added or changed, so a
 /// system that filters on `Changed<T>` must not see the whole world light up
 /// after a hot reload that only moved a field.
+#[cfg(feature = "development")]
 #[test]
 fn a_relayout_carries_the_column_ticks_across_the_reallocation() {
     let mut column = ComponentColumn::new(two_field_layout()).expect("column");
@@ -757,6 +764,7 @@ fn reserving_rows_preserves_contents() {
 /// because its reload reads old rows with the incoming type. A descriptor
 /// column has no typed read at all: its rows are only reached as bytes at the
 /// layout's stride, so the buffer's alignment is what makes those reads valid.
+#[cfg(feature = "development")]
 #[test]
 fn a_descriptor_relayout_that_widens_alignment_reallocates() {
     // A 12-byte row at align 4: three 4-byte values.

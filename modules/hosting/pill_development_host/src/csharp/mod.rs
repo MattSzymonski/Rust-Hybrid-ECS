@@ -30,7 +30,7 @@ use pill_core::platform::Instant;
 use pill_engine::Engine;
 
 // Current crate
-use crate::watcher::SourceTrigger;
+use crate::watchers::SourceTrigger;
 
 /// Host-side generation of a module's `<module>_Components.g.cs` mirror file.
 mod codegen;

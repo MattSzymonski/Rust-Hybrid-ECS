@@ -312,7 +312,7 @@ pub struct Engine {
     /// Dispatch slots for hot-patchable systems, keyed by registration name
     /// and, when that differs, by the function's qualified path.
     ///
-    /// This field must NOT be behind `#[cfg(feature = "hot_patch")]`. The
+    /// This field must NOT be behind `#[cfg(feature = "development")]`. The
     /// feature would change the struct's layout, and a module built with the
     /// other setting rebuilds `&mut Engine` from a raw pointer through
     /// [`EngineApi`](crate::EngineApi). A layout difference would then corrupt
@@ -659,7 +659,7 @@ impl Engine {
     /// The editor's Systems tab reads this; it never requires knowing the
     /// concrete system type. `hot_patchable` reports whether the system has a
     /// dispatch slot in the hot-patch registry (only present when the host was
-    /// built with the `hot_patch` feature).
+    /// built with the `development` feature).
     pub fn system_snapshots(&self) -> Vec<SystemSnapshot> {
         self.systems
             .iter()
@@ -849,7 +849,7 @@ impl Engine {
         // Box the system. With hot patching on, calls to the user's function
         // go through a dispatch slot the engine keeps a handle to, so a patch
         // replaces one pointer instead of registering the system again.
-        #[cfg(feature = "hot_patch")]
+        #[cfg(feature = "development")]
         let boxed_system = {
             let slot = std::sync::Arc::new(crate::hot_patch::HotSlot::new());
             // The qualified path is what a generated patch reports, and what a
@@ -874,7 +874,7 @@ impl Engine {
             }
             hot_system
         };
-        #[cfg(not(feature = "hot_patch"))]
+        #[cfg(not(feature = "development"))]
         let boxed_system = system.into_system();
 
         (system_name, system_access, boxed_system)
@@ -1821,7 +1821,7 @@ mod tests {
     /// This test only exists with hot patching on: the containment lives in the
     /// dispatch slot a patched system calls through, and without the feature
     /// there is no patch to roll back.
-    #[cfg(feature = "hot_patch")]
+    #[cfg(feature = "development")]
     #[test]
     fn a_panicking_system_is_contained_and_reports_a_fault() {
         let mut engine = Engine::new();

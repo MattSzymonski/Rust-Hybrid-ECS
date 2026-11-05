@@ -1552,7 +1552,7 @@ pub(crate) fn host_cargo_command(packages: &[String]) -> Vec<String> {
         command.push("--timings".to_string());
     }
     command.push("--features".to_string());
-    command.push("pill_engine/hot_patch".to_string());
+    command.push("pill_engine/development".to_string());
     command
 }
 
@@ -3030,8 +3030,8 @@ serde = { version = "1", features = ["derive"] }
         );
         assert_eq!(
             &command[command.len() - 2..],
-            ["--features", "pill_engine/hot_patch"],
-            "the hot-patch feature is package-qualified onto the engine and comes last"
+            ["--features", "pill_engine/development"],
+            "the development feature is package-qualified onto the engine and comes last"
         );
     }
 

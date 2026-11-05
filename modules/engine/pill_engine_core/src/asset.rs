@@ -2017,6 +2017,7 @@ mod tests {
 
     /// The world-side API the reload transaction uses: declaring a type
     /// creates the manager on first use, and the re-home pass runs through it.
+    #[cfg(feature = "development")]
     #[test]
     fn world_registers_and_rehomes_asset_types() {
         use crate::world::World;

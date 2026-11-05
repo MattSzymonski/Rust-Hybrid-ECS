@@ -408,13 +408,30 @@ pub(super) const RESOURCE_SUBJECT: ManifestSubject<
     undo: undo_resource_entry,
 };
 
+/// A shipping build never applies a manifest, so it refuses a rename rather
+/// than moving the value onto a successor.
+#[cfg(not(feature = "hot_reload"))]
+fn rename_resource_entry(
+    _engine: &mut Engine,
+    _identity: StableComponentId,
+    _predecessor: &RenamePredecessor<'_, ResourceBinding>,
+    resource: &ManagedResourceDeclaration,
+) -> Result<(ResourceBinding, Option<ResourceUndo>), CSharpError> {
+    Err(CSharpError::ManifestInvalid {
+        message: format!(
+            "managed resource {} was renamed; a shipping build cannot move storage",
+            resource.full_name
+        ),
+    })
+}
+
 /// Registers the successor of a renamed resource and moves the value across.
 ///
 /// # Errors
 ///
 /// Returns a [`CSharpError`] when the engine refuses the new registration, or
 /// when it refuses to move the stored bytes onto it.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+#[cfg(feature = "hot_reload")]
 fn rename_resource_entry(
     engine: &mut Engine,
     _identity: StableComponentId,
@@ -467,12 +484,16 @@ fn retire_resources(engine: &mut Engine, bindings: &[ResourceBinding]) -> usize 
     engine.world_mut().drop_resources(&resource_ids)
 }
 
+/// A shipping build cannot reach an undo: no manifest was applied to reverse.
+#[cfg(not(feature = "hot_reload"))]
+fn undo_resource_entry(_engine: &mut Engine, _undo: ResourceUndo) {}
+
 /// Moves a renamed resource's value back onto its predecessor, best effort.
 ///
 /// A failed rollback leaves the process mixed. The failure is therefore logged
 /// with the resource it concerns, rather than returned in place of the original
 /// refusal.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+#[cfg(feature = "hot_reload")]
 fn undo_resource_entry(engine: &mut Engine, undo: ResourceUndo) {
     let ResourceUndo::Renamed {
         predecessor,
@@ -623,10 +644,27 @@ fn resource_field_plan(
 /// dropped is left out. A reshaped managed component's rows follow the same
 /// rules, because both build the same plan.
 ///
+/// A shipping build has no manifest apply path, so it refuses a changed
+/// resource layout instead of reshaping the stored bytes.
+#[cfg(not(feature = "hot_reload"))]
+fn relayout_declared_resource(
+    _engine: &mut Engine,
+    _existing: &ResourceBinding,
+    arriving: &ManagedResourceDeclaration,
+) -> Result<(), CSharpError> {
+    Err(CSharpError::ManifestInvalid {
+        message: format!(
+            "managed resource {} changed its layout; a shipping build cannot reshape storage",
+            arriving.full_name
+        ),
+    })
+}
+
 /// # Errors
 ///
 /// Returns a [`CSharpError`] when the engine refuses the new layout or the byte
 /// migration.
+#[cfg(feature = "hot_reload")]
 fn relayout_declared_resource(
     engine: &mut Engine,
     existing: &ResourceBinding,

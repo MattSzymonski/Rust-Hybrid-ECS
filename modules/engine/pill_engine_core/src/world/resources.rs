@@ -120,7 +120,39 @@ impl World {
         self.resource_ticks.insert(id, ComponentTicks::new(tick));
         // Step 3: Record the table too, so a later reload can re-home this
         // value even if the next generation never inserts it again.
+        let table = self.table_keeping_recorded_surface(id, table);
         self.resource_factories.insert(id, table);
+    }
+
+    /// The table to record for `id`: `incoming`, keeping the settings surface an
+    /// earlier registration recorded when the incoming table carries none.
+    ///
+    /// A module that owns a manager records the surface in its own `register`.
+    /// A project that links the module declares the same derived type from its
+    /// own image, and that plain table would otherwise erase the surface,
+    /// leaving the host unable to find the manager's settings asset. The
+    /// surface describes the type, so a declaration that says nothing about
+    /// settings must not remove it.
+    ///
+    /// A foreign table neither gains nor donates one: its bytes have no Rust
+    /// type for an applier to cast to.
+    fn table_keeping_recorded_surface(
+        &self,
+        id: ResourceId,
+        incoming: ErasedResourceOps,
+    ) -> ErasedResourceOps {
+        if incoming.foreign {
+            return incoming;
+        }
+        match self.resource_factories.get(&id) {
+            Some(recorded) if !recorded.foreign && incoming.settings_asset.is_none() => {
+                ErasedResourceOps {
+                    settings_asset: recorded.settings_asset,
+                    ..incoming
+                }
+            }
+            _ => incoming,
+        }
     }
 
     /// Returns a shared reference to the resource, or `None` when nothing is
@@ -262,6 +294,7 @@ impl World {
         if !self.claim_shared_resource_name::<T>() {
             return false;
         }
+        let table = self.table_keeping_recorded_surface(id, table);
         self.resource_factories.insert(id, table);
         self.note_resource_registration(id);
         true
@@ -520,6 +553,7 @@ impl World {
     /// the old or the new payload, and
     /// [`WorldError::ForeignResourceHoldsRustValue`] when a Rust value is stored
     /// under the id.
+    #[cfg(feature = "development")]
     pub fn relayout_foreign_resource(
         &mut self,
         id: ResourceId,
@@ -604,6 +638,7 @@ impl World {
     /// fit the source or the successor payload, and
     /// [`WorldError::ForeignResourceHoldsRustValue`] when a Rust value is
     /// stored under either id.
+    #[cfg(feature = "development")]
     pub fn remap_foreign_resource(
         &mut self,
         source_id: ResourceId,
@@ -735,6 +770,7 @@ impl World {
     /// that registered it, and a reader such as the development host keeps its
     /// answer past that image's retirement, so it must not keep the slices.
     #[must_use]
+    #[cfg(feature = "development")]
     pub fn kept_layout_declaration(&self, id: ResourceId) -> Option<KeptLayoutDeclaration> {
         let resource_ops = self.resource_factories.get(&id)?;
         KeptLayoutDeclaration::from_ops(*resource_ops)
@@ -960,6 +996,7 @@ impl World {
     /// registration paths refuse, though a stale table could still reach it - is
     /// reported rather than installed, since the value would otherwise leak
     /// without a word.
+    #[cfg(feature = "development")]
     pub fn rehome_resources(&mut self) {
         for (id, resource) in &mut self.resources {
             if resource.is_foreign() {
@@ -1111,6 +1148,7 @@ impl World {
     /// removes them at once instead of at the next registration. A dead entry is
     /// never called either way, so this only stops the registry from holding
     /// stale entries.
+    #[cfg(feature = "development")]
     pub fn rehome_assets(&mut self) {
         if let Some(asset_manager) = self.get_resource_mut::<AssetManager>() {
             asset_manager.rehome();

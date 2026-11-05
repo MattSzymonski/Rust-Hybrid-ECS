@@ -372,8 +372,15 @@ pub fn register_all_components(world: &mut World) -> Result<(), WorldError> {
     // Step 1: install this artifact's value types as the layout resolver for
     // the duration of the loop.
     let previous_resolver = install_value_type_layouts(world);
-    // Step 2: register every component this artifact declares.
-    for descriptor in inventory::iter::<PillComponentDescriptor> {
+    // Step 2: register every component this image declares - the entries in
+    // front of the baseline the host took before mapping it. The registry
+    // lists the newest submission first.
+    let baseline = crate::declarations::declaration_baseline().components;
+    let mut descriptors: Vec<&PillComponentDescriptor> = inventory::iter::<PillComponentDescriptor>
+        .into_iter()
+        .collect();
+    descriptors.truncate(descriptors.len().saturating_sub(baseline));
+    for descriptor in descriptors {
         (descriptor.register)(world);
     }
     // Step 3: put the previous resolver back and report the first error a

@@ -185,15 +185,24 @@ mod tests {
     use super::*;
     use pill_engine::Engine;
 
-    /// Registering twice returns zero both times and leaves the `rendering`
-    /// system registered.
+    /// The artifact entry point registers the declared `rendering` system,
+    /// and the reload half declares nothing, so a second registration cannot
+    /// leave a second copy.
     #[test]
     fn registering_the_renderer_adds_the_rendering_system_once() {
         let mut engine = Engine::new();
 
-        assert_eq!(register(&mut engine), 0);
+        assert_eq!(
+            pill_engine::component_registry::run_artifact_registration(&mut engine, register),
+            0
+        );
         assert_eq!(register(&mut engine), 0);
 
-        assert!(engine.is_registered("rendering"));
+        let registered = engine
+            .system_snapshots()
+            .iter()
+            .filter(|snapshot| snapshot.name == "rendering")
+            .count();
+        assert_eq!(registered, 1, "the rendering system is registered once");
     }
 }

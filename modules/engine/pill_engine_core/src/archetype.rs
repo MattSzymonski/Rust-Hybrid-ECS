@@ -1475,6 +1475,7 @@ impl ComponentColumn {
     /// [`WorldError::DescriptorLayoutInvalid`] when the new layout cannot describe
     /// storage, and [`WorldError::DescriptorRowInvalid`] when a planned field reads
     /// or writes past the edge of a row. Nothing is modified in either case.
+    #[cfg(feature = "development")]
     pub fn relayout(
         &mut self,
         layout: ColumnLayout,
@@ -1493,6 +1494,7 @@ impl ComponentColumn {
     /// column it is about to rewrite. That lets a world-level relayout refuse a
     /// bad plan before it touches the first column, instead of migrating some
     /// columns and leaving others unchanged.
+    #[cfg(feature = "development")]
     pub(crate) fn relayout_validated(
         &mut self,
         layout: ColumnLayout,

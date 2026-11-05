@@ -48,7 +48,6 @@ use pill_renderer_api::{PillRenderer, RenderViewport, RendererError};
 
 // Current crate
 use crate::analytics;
-use crate::asset_watcher::AssetChange;
 use crate::config::project_depends_on_crate;
 use crate::csharp::{BuildCollection, BuildOutcome, BuildReport, ModuleExposedComponent};
 use crate::extension::{ExtensionSlot, ReloadOutcome};
@@ -56,7 +55,7 @@ use crate::hot_patch::{BeginOutcome, PatchOutcome};
 use crate::native_library::cleanup_temporary_files;
 use crate::notices::{self, HostNotice};
 use crate::project_module::{LoadedProject, ManagedReloadStart};
-use crate::watcher::spawn_source_watcher;
+use crate::watchers::{spawn_source_watcher, AssetChange};
 use crate::{HostConfig, ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
@@ -187,7 +186,7 @@ pub struct DevHost {
     /// watchers pass `None`, because nothing times a reload from their
     /// signals. A reload takes the entries up to its generation, so each
     /// signal times exactly one reload.
-    source_trigger_log: Arc<crate::watcher::TriggerLog>,
+    source_trigger_log: Arc<crate::watchers::TriggerLog>,
     /// Owners whose systems this host suspended because their binary was built
     /// against a shared component layout another reload has replaced.
     ///
@@ -225,7 +224,7 @@ pub struct DevHost {
     /// Watches the project's `res` and queues the assets whose source or
     /// metadata file changed; `None` when no asset directory is configured or
     /// the watch could not start.
-    asset_watcher: Option<crate::asset_watcher::AssetWatcher>,
+    asset_watcher: Option<crate::watchers::AssetWatcher>,
     /// The project's `res` directory, for the asset browser; `None` when the
     /// configuration did not come from a project directory.
     asset_directory: Option<PathBuf>,
@@ -738,11 +737,11 @@ pub struct RenderingHost {
     /// Watches the renderer data crate's `shader_sources/` tree and queues
     /// what it re-cooks. `None` without a renderer, or when its data crate has
     /// no shaders or the watch could not start.
-    shader_watcher: Option<crate::shader_watcher::ShaderWatcher>,
+    shader_watcher: Option<crate::watchers::ShaderWatcher>,
     /// Watches the project's own shader sources under its asset directory and
     /// queues what it re-cooks. `None` when the project has no asset
     /// directory, or when the watch could not start.
-    project_shader_watcher: Option<crate::shader_watcher::ShaderWatcher>,
+    project_shader_watcher: Option<crate::watchers::ShaderWatcher>,
     /// Set whenever a renderer backend attaches; the next frame then reports
     /// the render data the renderer ignores, once per renderer generation.
     unsupported_data_check_pending: bool,
@@ -1694,7 +1693,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     };
 
     let source_edit_generation = Arc::new(AtomicU64::new(0));
-    let source_trigger_log = Arc::new(crate::watcher::TriggerLog::new());
+    let source_trigger_log = Arc::new(crate::watchers::TriggerLog::new());
     if switches.hot_reloading {
         if let Err(error) = spawn_source_watcher(
             workspace_root.clone(),
@@ -1943,7 +1942,7 @@ fn unsupported_render_components(
 /// A watch that cannot start is reported and leaves the host without shader
 /// reload; nothing else depends on it.
 #[cfg(feature = "rendering")]
-fn start_shader_watcher(host: &DevHost) -> Option<crate::shader_watcher::ShaderWatcher> {
+fn start_shader_watcher(host: &DevHost) -> Option<crate::watchers::ShaderWatcher> {
     if !host.switches.assets_hot_reloading {
         info!(
             target: telemetry_target::HOT_RELOAD,
@@ -1965,7 +1964,7 @@ fn start_shader_watcher(host: &DevHost) -> Option<crate::shader_watcher::ShaderW
         .workspace_root
         .join(slot.crate_directory())
         .join(crate::config::RENDERER_SHADER_SOURCES_DIRECTORY);
-    match crate::shader_watcher::ShaderWatcher::spawn(&data, shaders_directory) {
+    match crate::watchers::ShaderWatcher::spawn(&data, shaders_directory) {
         Ok(watcher) => watcher,
         Err(error) => {
             warn!(
@@ -1993,7 +1992,7 @@ type RendererModule = crate::renderer_module::RendererModule;
 /// A watch that cannot start is reported and leaves the host running the
 /// shaders it already loaded.
 #[cfg(feature = "rendering")]
-fn start_project_shader_watcher(host: &DevHost) -> Option<crate::shader_watcher::ShaderWatcher> {
+fn start_project_shader_watcher(host: &DevHost) -> Option<crate::watchers::ShaderWatcher> {
     if !host.switches.assets_hot_reloading {
         info!(
             target: telemetry_target::HOT_RELOAD,
@@ -2004,7 +2003,7 @@ fn start_project_shader_watcher(host: &DevHost) -> Option<crate::shader_watcher:
     }
     let shaders_directory = host.asset_directory()?.to_owned();
     let tree_label = host.project_module_config.name.clone();
-    match crate::shader_watcher::ShaderWatcher::spawn(&tree_label, shaders_directory) {
+    match crate::watchers::ShaderWatcher::spawn(&tree_label, shaders_directory) {
         Ok(watcher) => watcher,
         Err(error) => {
             warn!(
@@ -2400,7 +2399,7 @@ fn fast_patching_allowed(host: &mut DevHost) -> bool {
 /// Anything patching refuses falls straight through to the full rebuild the
 /// frame loop performs next, so the worst case is that rebuild.
 ///
-/// A no-op without the `hot_patch` feature, so the frame loop reads the same in
+/// A no-op without the `development` feature, so the frame loop reads the same in
 /// both configurations rather than carrying a `cfg` of its own.
 fn try_module_fast_path(host: &mut DevHost, may_start: bool) {
     if !fast_patching_allowed(host) {
@@ -3293,7 +3292,7 @@ pub(crate) fn run_reload_phase(host: &mut DevHost) -> Vec<String> {
 fn start_asset_watcher(
     asset_directory: Option<&Path>,
     assets_hot_reloading: bool,
-) -> Option<crate::asset_watcher::AssetWatcher> {
+) -> Option<crate::watchers::AssetWatcher> {
     if !assets_hot_reloading {
         info!(
             target: telemetry_target::HOT_RELOAD,
@@ -3314,7 +3313,7 @@ fn start_asset_watcher(
             return None;
         }
     }
-    match crate::asset_watcher::AssetWatcher::spawn(asset_directory.to_owned()) {
+    match crate::watchers::AssetWatcher::spawn(asset_directory.to_owned()) {
         Ok(watcher) => watcher,
         Err(error) => {
             warn!(

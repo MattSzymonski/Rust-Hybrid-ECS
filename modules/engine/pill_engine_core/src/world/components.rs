@@ -448,6 +448,7 @@ impl World {
     ///   created it, and that image stays mapped until the migration drops the
     ///   column;
     /// - a type-erased (descriptor) column is left alone.
+    #[cfg(feature = "development")]
     pub fn rehome_native_columns(&mut self) {
         // Step 1: Copy the current per-type function tables out first, so the
         // immutable borrow of `storage_factories` does not overlap the mutable
@@ -505,6 +506,7 @@ impl World {
     /// entity is dropped together with its columns, through the table that is
     /// still mapped while this runs. Returns the number of orphaned component
     /// ids dropped.
+    #[cfg(feature = "development")]
     pub fn drop_columns_without_factory(&mut self) -> usize {
         // Step 1: Collect the orphaned ids across every archetype. Deduplicated
         // by hand: the list is a handful of entries at most, and a `HashSet`
@@ -659,6 +661,7 @@ impl World {
     ///
     /// Panics only if an archetype listed by the verification pass has lost the
     /// column by the time it is migrated, which is an internal-invariant break.
+    #[cfg(feature = "development")]
     pub fn relayout_descriptor_component(
         &mut self,
         component_id: ComponentId,
@@ -772,6 +775,7 @@ impl World {
     /// source without a column, and
     /// [`WorldError::DescriptorComponentMissing`] when the removal of a moved
     /// row finds the source column gone.
+    #[cfg(feature = "development")]
     pub fn remap_descriptor_component(
         &mut self,
         source_component_id: ComponentId,

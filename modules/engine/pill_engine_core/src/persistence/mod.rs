@@ -50,20 +50,24 @@
 
 // Standard library
 use std::collections::hash_map::DefaultHasher;
+#[cfg(feature = "development")]
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 // External crates
-use pill_core::{debug, error, info, warn};
+#[cfg(feature = "development")]
+use pill_core::debug;
+use pill_core::{error, info, warn};
 use serde::{de::DeserializeOwned, Serialize};
 
 // Current crate
 use crate::archetype::ComponentColumns;
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
+#[cfg(feature = "development")]
+use crate::error::PersistenceError;
 use crate::error::{
-    PersistenceError, WorldError, COMPONENT_LAYOUT_CHANGED_REFUSAL,
-    COMPONENT_NAME_COLLISION_REFUSAL,
+    WorldError, COMPONENT_LAYOUT_CHANGED_REFUSAL, COMPONENT_NAME_COLLISION_REFUSAL,
 };
 use crate::resource::{ErasedResource, Resource, ResourceId};
 use crate::world::World;
@@ -73,6 +77,7 @@ use crate::world::World;
 // =============================================================================
 
 mod components;
+#[cfg(feature = "development")]
 mod migration;
 mod registry;
 mod resources;
@@ -118,21 +123,25 @@ mod tests {
 
     /// A persistable component whose column takes 8 bytes per row and is
     /// 4-byte aligned.
+    #[cfg(feature = "development")]
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct LayoutHostComponent {
         a: u32,
         b: u32,
     }
+    #[cfg(feature = "development")]
     impl Component for LayoutHostComponent {}
 
     /// Declares the host's name while widening `b` to `f64`. This is the
     /// widening shape that registers 16 bytes per row with 8-byte alignment
     /// over the host's column.
+    #[cfg(feature = "development")]
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct LayoutWidenedComponent {
         a: u32,
         b: f64,
     }
+    #[cfg(feature = "development")]
     impl Component for LayoutWidenedComponent {
         fn shared_name() -> Option<&'static str> {
             Some(crate::type_names::stable_type_name::<LayoutHostComponent>())
@@ -141,12 +150,14 @@ mod tests {
 
     /// Same name and same alignment, one field more: the add-a-field shape
     /// that must keep registering and keep migrating.
+    #[cfg(feature = "development")]
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct LayoutGrownComponent {
         a: u32,
         b: u32,
         c: u32,
     }
+    #[cfg(feature = "development")]
     impl Component for LayoutGrownComponent {
         fn shared_name() -> Option<&'static str> {
             Some(crate::type_names::stable_type_name::<LayoutHostComponent>())
@@ -170,6 +181,7 @@ mod tests {
     /// refused before anything registers. The host then rolls the reload back,
     /// so the running generation keeps its storage instead of the migration
     /// reading the new alignment out of the old column's slots.
+    #[cfg(feature = "development")]
     #[test]
     fn a_layout_the_old_column_cannot_host_is_refused() {
         let mut world = World::new();
@@ -226,6 +238,7 @@ mod tests {
     /// A size change that keeps the alignment registers, because the old
     /// column's slots stay correctly aligned for the incoming type. The
     /// add-a-field reload cases depend on this.
+    #[cfg(feature = "development")]
     #[test]
     fn a_size_change_that_keeps_the_alignment_registers() {
         let mut world = World::new();
@@ -329,6 +342,7 @@ mod tests {
     /// nothing, so a purge driven by one id would leave the other generation's
     /// rows behind while `forget_component_type` removed all their
     /// registrations.
+    #[cfg(feature = "development")]
     #[test]
     fn forget_strips_rows_for_every_id_sharing_the_name() {
         let mut world = World::new();
@@ -413,6 +427,7 @@ mod tests {
     /// The id-keyed purge removes the rows and all registration entries of the
     /// ids it is given. A rollback generation that re-registers the same name
     /// under a fresh id keeps the name-keyed entries alive.
+    #[cfg(feature = "development")]
     #[test]
     fn stranded_ids_lose_their_rows_and_factories() {
         let mut world = World::new();
@@ -600,6 +615,7 @@ mod tests {
     /// id, live rows), but here the host announces the name as the retiring
     /// generation's. That registration is the predecessor, and replacing its
     /// entries is the path every project reload runs through.
+    #[cfg(feature = "development")]
     #[test]
     fn an_announced_name_replaces_its_live_predecessor() {
         let mut world = World::new();
@@ -648,12 +664,15 @@ mod tests {
 
     /// How many rows each stand-in's destructor has dropped. A migration test
     /// reads these counters to tell which generation released the old values.
+    #[cfg(feature = "development")]
     static RETIRING_GLUE_DROP_COUNT: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(feature = "development")]
     static ARRIVING_GLUE_DROP_COUNT: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
     /// The retiring generation of a shared persistable type.
+    #[cfg(feature = "development")]
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct RetiringGlueComponent {
         // The field gives the type the shape its serde row and the size check
@@ -661,11 +680,13 @@ mod tests {
         #[allow(dead_code)]
         value: u32,
     }
+    #[cfg(feature = "development")]
     impl Component for RetiringGlueComponent {
         fn shared_name() -> Option<&'static str> {
             Some("audit::DropGlue")
         }
     }
+    #[cfg(feature = "development")]
     impl Drop for RetiringGlueComponent {
         fn drop(&mut self) {
             RETIRING_GLUE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -674,17 +695,20 @@ mod tests {
 
     /// The arriving generation: the same declared name and shape, but a
     /// different destructor.
+    #[cfg(feature = "development")]
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct ArrivingGlueComponent {
         // Same shape as the retiring copy. Nothing reads this value either.
         #[allow(dead_code)]
         value: u32,
     }
+    #[cfg(feature = "development")]
     impl Component for ArrivingGlueComponent {
         fn shared_name() -> Option<&'static str> {
             Some("audit::DropGlue")
         }
     }
+    #[cfg(feature = "development")]
     impl Drop for ArrivingGlueComponent {
         fn drop(&mut self) {
             ARRIVING_GLUE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -696,6 +720,7 @@ mod tests {
     /// registration replaces the factory, `rehome_native_columns` points the
     /// still-old column at the arriving function table, and only then does the
     /// migration consume that column.
+    #[cfg(feature = "development")]
     #[test]
     fn in_place_migration_drops_old_rows_through_the_retiring_glue() {
         use std::sync::atomic::Ordering;
@@ -1118,6 +1143,7 @@ mod tests {
     /// `rehome_resources` gives a live resource the arriving function table
     /// but leaves its bytes alone. Without this pass, the arriving generation
     /// would read the old value's memory through the new shape.
+    #[cfg(feature = "development")]
     #[test]
     fn a_reshaped_resource_is_migrated_across_a_reload() {
         let mut world = World::new();
@@ -1151,6 +1177,7 @@ mod tests {
     }
 
     /// An unchanged resource keeps its value untouched across a reload.
+    #[cfg(feature = "development")]
     #[test]
     fn an_unchanged_resource_is_not_migrated() {
         let mut world = World::new();

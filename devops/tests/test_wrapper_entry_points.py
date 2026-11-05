@@ -11,8 +11,8 @@ REQUIREMENTS: Python 3.8+, cargo on PATH. Windows (the reader parses PE
 
 DESCRIPTION
     `#[pill_module]` emits its loadable-artifact exports (`pill_module_init`,
-    the ABI revision, the descriptor count/copy pairs, the hot-patch
-    resolvers) through `__pill_module_entry_points!`, a macro the generated
+    the ABI revision, the registration half, the descriptor count/copy pairs,
+    the hot-patch resolvers) through `__pill_module_entry_points!`, a macro the generated
     `host_module_<name>` wrapper crate expands - the extension itself is a
     plain library and defines no symbols. The wrapper's DLL must carry the
     whole set, because the host resolves them by symbol exactly as it did
@@ -66,6 +66,11 @@ EXPECTED_ENTRY_POINTS = frozenset({
     "pill_module_init",
     "pill_module_abi_version",
     "pill_module_name",
+    # Emitted whenever the module names a `register` half, in every profile:
+    # the macro passes it an empty gate
+    # (`module_register_export(&quote! {}, ...)`), so it is neither a
+    # development-only export nor tied to the hot-patch machinery.
+    "pill_module_register",
     "pill_hot_resolve",
     "pill_hot_resolve_install",
     "pill_hot_resolve_plain",
@@ -100,7 +105,7 @@ name = "host_module_wrapper_probe"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pill_engine = { path = "../../../../engine/pill_engine", features = ["hot_patch"] }
+pill_engine = { path = "../../../../engine/pill_engine", features = ["development"] }
 pill_dummy_color = { path = "../../pill_dummy_color", default-features = false }
 """
 

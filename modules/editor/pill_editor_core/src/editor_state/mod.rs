@@ -312,7 +312,8 @@ pub struct SystemSummary {
     pub owner_label: String,
     /// Whether the system participates in frame execution.
     pub enabled: bool,
-    /// Whether a hot-patch dispatch slot exists (host built with `hot_patch`).
+    /// Whether a hot-patch dispatch slot exists (host built with the engine's
+    /// `development` feature).
     pub hot_patchable: bool,
     /// Whether another system shares this name.
     pub name_is_ambiguous: bool,

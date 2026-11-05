@@ -109,8 +109,9 @@ CYCLE_PAUSE = 2
 
 ORIGINAL_CONTENT: str = ""
 
-# `hot_patch` is a default feature now; this suite measures migration through
-# the plain reload transaction, so it drives the reload-only host posture.
+# The dev host pins the engine's `development` feature in every posture; this
+# suite measures migration through the plain reload transaction, so it drives
+# the reload-only host posture.
 HOST_POSTURE = HOST_DEV
 
 # =============================================================================

@@ -9,10 +9,10 @@ workspace = true
 [dependencies]
 pill_hot_scan = { path = "../pill_hot_scan" }
 # Pinned, not optional: every project and module build this host spawns receives
-# `pill_engine/hot_patch` (see `build_runner::host_engine_features`), and the
+# `pill_engine/development` (see `build_runner::host_engine_features`), and the
 # shared engine dylibs' exported names hash their feature set. A host whose own
 # graph lacked it could not load the modules it builds.
-pill_engine = { path = "../../engine/pill_engine", features = ["hot_patch"] }
+pill_engine = { path = "../../engine/pill_engine", features = ["development"] }
 pill_core = { path = "../../engine/pill_core" }
 # The renderer contract - the backend trait, the frame, the camera, window
 # handles as data - with no wgpu. Linked in every posture.

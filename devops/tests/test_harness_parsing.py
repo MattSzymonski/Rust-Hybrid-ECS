@@ -774,13 +774,13 @@ def check_the_gate_denies_warnings_everywhere() -> None:
     """
     verify_steps = load_module(CI_CD_ROOT / "verify.py", "verify_warning_steps")
     steps = {step.name: step for step in verify_steps.STEPS}
-    for name in ("clippy", "check-hot-patch", "check-shipping", "check-rendering"):
+    for name in ("clippy", "check-development", "check-shipping", "check-rendering"):
         if name not in steps:
             fail(f"verify.py no longer has a {name} step")
     clippy_command = [token for tokens in steps["clippy"].commands for token in tokens]
     if "--all-targets" not in clippy_command:
         fail(f"the clippy step runs {clippy_command}, which leaves the test targets unlinted")
-    for name in ("check-hot-patch", "check-shipping", "check-rendering"):
+    for name in ("check-development", "check-shipping", "check-rendering"):
         for command in steps[name].commands:
             if not command or command[0] != "cargo":
                 continue

@@ -394,6 +394,7 @@ impl World {
     /// The host captures this before a reload replaces the registrations.
     /// Migration then reads the retiring generation's rows through these
     /// serializers, the only code that understands the old layout.
+    #[cfg(feature = "development")]
     pub fn capture_persist_type_metadata(&self) -> HashMap<String, PersistTypeMetadata> {
         let mut metadata_by_name: HashMap<String, PersistTypeMetadata> = HashMap::new();
 
@@ -420,6 +421,7 @@ impl World {
     /// schema. This set lets the migration tell those entities apart from the
     /// ones that need converting. See
     /// [`Self::migrate_changed_persistable_components`].
+    #[cfg(feature = "development")]
     pub fn capture_live_entities(&self) -> HashSet<Entity> {
         let mut entities: HashSet<Entity> = HashSet::new();
         for archetype in self.archetypes.values() {

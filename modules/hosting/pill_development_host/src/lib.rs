@@ -75,21 +75,13 @@ mod renderer_module;
 /// The development host: `DevHost` and `RenderingHost`, with the functions
 /// that set them up, run their frames and reload their modules.
 mod runtime;
-/// Watches the source tree and tells the main thread when to reload.
-mod watcher;
-
-/// Watches the project's `res` folder so an edited asset is imported again
-/// while the host runs.
-mod asset_watcher;
+/// The file watchers: the project's source tree, its asset directory and a
+/// shader source tree, each on its own worker thread.
+mod watchers;
 
 /// The project's assets as a tool sees them: the tree listing, import settings
 /// and moves.
 mod asset_browser;
-
-/// Watches the renderer's shader sources, cooks them again after an edit on a
-/// worker thread, and queues the results.
-#[cfg(feature = "rendering")]
-mod shader_watcher;
 
 /// Test-only helpers: temporary directories and explicit file dates.
 #[cfg(test)]

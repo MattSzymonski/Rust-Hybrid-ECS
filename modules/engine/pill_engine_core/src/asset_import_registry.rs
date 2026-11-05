@@ -1621,6 +1621,7 @@ mod tests {
     /// The world-level registration: the marker is a resource of the world.
     /// Removing it ends the registration, and that is what the host does to a
     /// resource a retired generation no longer claims.
+    #[cfg(feature = "development")]
     #[test]
     fn the_world_registration_lives_as_long_as_its_marker_resource() {
         let mut world = World::new();

@@ -773,7 +773,7 @@ impl PatchRoute {
     /// Whether a call that reaches the function is guaranteed to run the new
     /// code, rather than possibly running an inlined or unreached copy.
     ///
-    /// Only the hot-patch path asks, so without `hot_patch` this has no
+    /// Only the hot-patch path asks, so a build without hot patching has no
     /// caller. That is the same reason [`EventKind`] carries the allow on its
     /// own declaration.
     pub(crate) fn is_provable(self) -> bool {

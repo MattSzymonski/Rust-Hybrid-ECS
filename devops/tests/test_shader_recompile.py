@@ -32,6 +32,11 @@ DESCRIPTION
          `.wgsl` on disk must hold the edited value: that is what separates a
          real re-cook from a reimport of the previous text.
 
+    The edit is written only once the host announces the project's own shader
+    watch. That watch starts with the renderer, which attaches after the
+    project initializes, so an edit written the moment the project is alive
+    would land before anything watches the tree and would never be seen.
+
     Both files are restored byte for byte afterwards - the source, and the
     cooked output the host rewrites from it. The host is terminated on every
     path.
@@ -48,7 +53,9 @@ EXAMPLE USAGE
 
 import argparse
 import os
+import re
 import sys
+import time
 from pathlib import Path
 
 # Standalone-runnable: `devops/` holds `core`, and the suites sit beside it.
@@ -95,6 +102,21 @@ RECOMPILED_TOKEN = "shader recompiled"
 # the project initialized and the host runs its systems.
 PROJECT_ALIVE_TOKEN = "[project]"
 
+# The project's shader watcher is announced by the project's crate name, and
+# only once it is registered with the file system. It starts with the
+# renderer, which attaches after the project's own module has initialized, so
+# an edit written as soon as the project is alive is written before anything
+# watches the tree. The logged line is the message, two spaces, then the
+# fields - a message never contains a two-space run.
+PROJECT_MODULE_NAME = re.search(
+    r'^name\s*=\s*"([^"]+)"',
+    (PROJECT_ROOT / "Cargo.toml").read_text(encoding="utf-8"),
+    re.MULTILINE,
+).group(1)
+PROJECT_SHADER_WATCH_TOKEN = 'watching shader sources for edits  tree="{}"'.format(
+    PROJECT_MODULE_NAME
+)
+
 # The host builds the project DLL on its first run; a cold one is slow.
 STARTUP_TIMEOUT_SECONDS = 240
 # A cook and a reimport are milliseconds once the host is up; this is slack.
@@ -137,23 +159,51 @@ def check_startup_cook(text: str) -> list:
     ]
 
 
+def rebuilds_after_reimport(text: str) -> list:
+    """The shader's rebuild lines that follow the project's shader reimport.
+
+    The rebuild this suite cares about is the one the cook's reimport drives. A
+    source edit also reimports through the asset watcher first, carrying the
+    text the cook has not replaced yet, so a rebuild that precedes the
+    reimport proves only that the stale import reached the GPU.
+    """
+    reimported = first_line_with(text, REIMPORTED_TOKEN)
+    if not reimported:
+        return []
+    after_reimport = text.split(reimported, 1)[1]
+    return [
+        line for line in lines_with(after_reimport, RECOMPILED_TOKEN) if SHADER_ASSET in line
+    ]
+
+
+def wait_for_rebuild_after_reimport(monitor, timeout_seconds: float) -> bool:
+    """Waits until a rebuild line follows the project's shader reimport.
+
+    A plain wait on the rebuild token would return at once on the rebuild the
+    earlier asset-watcher import already logged, so this waits on the pairing
+    instead of on the token.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if rebuilds_after_reimport(monitor.output_since(0)):
+            return True
+        if time.monotonic() >= deadline or not monitor.process_alive():
+            return False
+        # Poll the log: the rebuild is printed by the host's build, which lands
+        # whenever cargo finishes rather than on a cadence this side controls.
+        time.sleep(0.1)
+
+
 def check_live_edit(text: str, cooked_text: str) -> list:
     """One `(ok, description)` pair per assertion about the edited shader."""
     reimported = first_line_with(text, REIMPORTED_TOKEN)
-    # The rebuild this suite cares about is the one after the reimport. A
-    # source edit can also reimport through the asset watcher first, with the
-    # text the cook has not replaced yet, and that rebuild is not the proof.
-    after_reimport = text.split(reimported, 1)[1] if reimported else ""
-    rebuilt_after = [
-        line for line in lines_with(after_reimport, RECOMPILED_TOKEN) if SHADER_ASSET in line
-    ]
     return [
         (
             SHADER_ASSET in reimported,
             "the host reimported the edited shader asset",
         ),
         (
-            bool(rebuilt_after),
+            bool(rebuilds_after_reimport(text)),
             "the renderer rebuilt the shader after the reimport",
         ),
         (
@@ -222,14 +272,27 @@ def main() -> int:
             return 1
         failures += report(check_startup_cook(monitor.output_since(0)))
 
-        # Step 2: Edit the fragment while the host runs, and wait for the two
+        # Step 2: Wait for the project's own shader watch before editing. The
+        # renderer attaches after the project initializes, so its watch is the
+        # last part of startup this step depends on.
+        if not monitor.wait_for(PROJECT_SHADER_WATCH_TOKEN, STARTUP_TIMEOUT_SECONDS * scale):
+            print(
+                "  [FAIL] the host never watched the project's shader sources; "
+                "the last output was:"
+            )
+            print(monitor.output_since(0)[-1500:])
+            return 1
+
+        # Step 3: Edit the fragment while the host runs, and wait for the two
         # lines that carry the edit through the pipeline.
         SOURCE_FILE.write_bytes(edited_source)
         if not monitor.wait_for(REIMPORTED_TOKEN, RELOAD_TIMEOUT_SECONDS * scale):
             print("  [FAIL] the host reimported no project shader; last output was:")
             print(monitor.output_since(0)[-1500:])
             return 1
-        monitor.wait_for(RECOMPILED_TOKEN, RELOAD_TIMEOUT_SECONDS * scale)
+        # The rebuild the reimport drives is logged on the next frame whose
+        # asset revision moved, so wait for one that follows that line.
+        wait_for_rebuild_after_reimport(monitor, RELOAD_TIMEOUT_SECONDS * scale)
         failures += report(
             check_live_edit(monitor.output_since(0), COOKED_FILE.read_text(encoding="utf-8"))
         )
