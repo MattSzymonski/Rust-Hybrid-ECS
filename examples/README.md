@@ -60,6 +60,54 @@ The difference from the folders above is curation: these are the `examples/`
 projects chosen to be built in CI, while an extension example exists for the
 module that ships it and is always run.
 
+## Logging from a project
+
+A project logs through the same `tracing` macros the engine uses, re-exported
+as `pill_engine::tracing`, so the `logging:` settings in its
+`project_settings.yaml` decide what prints:
+
+```rust
+// The project's own target, the values in fields, logged when it changes.
+pill_engine::tracing::info!(target: "project", entities = spawned, "[project] wave spawned");
+```
+
+```text
+[19:11:15:858] INFO  project  [project] wave spawned  entities=12
+```
+
+- **No `println!`.** A print has no time, level or target, so no setting can
+  turn it down, and it breaks the log's layout. Use the `tracing` macros.
+- **Use the project's own target**, never an `engine::` one. A fixed name such
+  as `"project"` works, and so does leaving the target out: the line then
+  carries the module path that logged it (`cube_rust`, `cube_rust::game`).
+- **The message says what happened; the values go in fields.** Write
+  `error = %error, "scene creation failed"`, not `"scene creation failed: {error}"`,
+  so a search for the message finds every occurrence.
+- **Log once, not every frame or every input.** A line per key press or per
+  frame at `info` buries everything else. Log when something changes, or use
+  `debug` and raise it only while you need it.
+- **Pick the level by whether someone has to act**: `error` when the project
+  could not do what it set out to do, `warn` when it carried on in a degraded
+  way (and the line says how), `info` for a step worth seeing, `debug` and
+  `trace` for detail.
+- **The `logging:` settings** choose what prints, per target, at `off`,
+  `error`, `warn`, `info`, `debug` or `trace`:
+
+  ```yaml
+  logging:
+    level: info          # every target at once (optional)
+    targets:
+      project: debug     # this project's own lines, details too
+  ```
+
+  A shipping or web build bakes the same settings into its bundle.
+- **An extension example's ready line** keeps the form its suite waits for:
+  `[<folder name>] ready`, once, when the example has set itself up.
+
+A C# project's `Diagnostics.Info(...)` (and its siblings) reaches the same log
+through the bridge, on the `engine::csharp` target, with the managed category
+in a `managed_target` field.
+
 ## `examples/local`
 
 `examples/local/` is a developer checkout, not repository content: the whole

@@ -219,7 +219,11 @@ pub fn init(engine: &mut Engine) -> u32 {
         match load_chain(assets) {
             Ok(chain) => chain,
             Err(message) => {
-                pill_engine::tracing::error!("render chain failed to load: {message}");
+                pill_engine::tracing::error!(
+                    target: "project",
+                    error = message.as_str(),
+                    "[project] render chain failed to load"
+                );
                 return 1;
             }
         }
@@ -232,7 +236,11 @@ pub fn init(engine: &mut Engine) -> u32 {
     // The project's own shader: importing it is what puts the asset in the
     // store, and the renderer compiles every shader asset it finds there.
     if let Err(message) = import_probe_shader(engine.world_mut()) {
-        pill_engine::tracing::error!("{message}");
+        pill_engine::tracing::error!(
+            target: "project",
+            error = message.as_str(),
+            "[project] probe shader not imported"
+        );
         return 1;
     }
     let (mesh, scene_material, ball_materials, sample_material) = {

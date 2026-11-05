@@ -119,13 +119,13 @@ pub fn init(engine: &mut Engine) -> u32 {
     let assets = match asset_loading::load(engine.world_mut()) {
         Ok(assets) => assets,
         Err(error) => {
-            pill_engine::tracing::error!("asset loading failed: {error}");
+            pill_engine::tracing::error!(target: "project", error = %error, "[project] asset loading failed");
             return 1;
         }
     };
 
     if let Err(error) = scene::create(engine.world_mut(), assets) {
-        pill_engine::tracing::error!("scene creation failed: {error}");
+        pill_engine::tracing::error!(target: "project", error = %error, "[project] scene creation failed");
         return 1;
     }
 

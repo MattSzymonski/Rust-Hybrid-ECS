@@ -42,11 +42,11 @@ pub(crate) fn input_echo_system(input: Res<Input>) -> Result<(), SystemError> {
         return Ok(());
     };
     for key in input.keys_pressed() {
-        pill_engine::tracing::info!("key pressed: {key:?}");
+        pill_engine::tracing::debug!(target: "project", "key pressed: {key:?}");
     }
     for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
         if input.mouse_button_pressed(button) {
-            pill_engine::tracing::info!("mouse button pressed: {button:?}");
+            pill_engine::tracing::debug!(target: "project", "mouse button pressed: {button:?}");
         }
     }
     Ok(())
@@ -74,7 +74,7 @@ pub(crate) fn camera_zoom_system(
         let distance = (transform.translation[2] - lines * ZOOM_STEP)
             .clamp(MINIMUM_DISTANCE, MAXIMUM_DISTANCE);
         transform.translation[2] = distance;
-        pill_engine::tracing::info!("scrolled; camera distance {distance:.2}");
+        pill_engine::tracing::debug!(target: "project", "scrolled; camera distance {distance:.2}");
     }
     Ok(())
 }
