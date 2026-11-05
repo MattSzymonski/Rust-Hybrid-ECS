@@ -2680,7 +2680,7 @@ fn finish_managed_build(host: &mut DevHost, report: BuildReport) {
         BuildOutcome::Failed { diagnostics } => {
             // Errors in the developer's own source; a full build would spend
             // seconds reaching the same diagnostics.
-            error!(
+            warn!(
                 target: telemetry_target::HOT_RELOAD,
                 "{}",
                 pill_core::telemetry::log_block(
@@ -2708,7 +2708,7 @@ fn finish_managed_build(host: &mut DevHost, report: BuildReport) {
                 .poll_managed_reload(host.runtime.engine_mut());
         }
         BuildOutcome::Full(Err(message)) => {
-            error!(
+            warn!(
                 target: telemetry_target::HOT_RELOAD,
                 error = message.as_str(),
                 "C# build failed; keeping the currently loaded C# project assembly"
@@ -3212,7 +3212,7 @@ fn suspend_stale_subjects(host: &mut DevHost) {
                 .engine_mut()
                 .set_systems_enabled_for_owner(owner, false);
             host.stale_suspended_owners.push(owner);
-            error!(
+            warn!(
                 target: telemetry_target::HOT_RELOAD,
                 subject = subject.as_str(),
                 components = %stale.join(", "),

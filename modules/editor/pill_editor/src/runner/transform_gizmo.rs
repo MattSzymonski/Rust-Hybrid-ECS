@@ -797,7 +797,7 @@ impl EditorWindow {
             return;
         };
         if self.gizmo_drag.is_some() {
-            warn!(
+            debug!(
                 target: telemetry_target::EDITOR,
                 "[editor] gizmo drag refused: one is already in flight"
             );

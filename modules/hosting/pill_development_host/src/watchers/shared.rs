@@ -37,7 +37,7 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use pill_core::error::WatcherError;
 use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
-use pill_core::{error, info};
+use pill_core::{info, warn};
 
 // =============================================================================
 // Constants
@@ -310,7 +310,7 @@ where
             // Never panic inside the callback: some backends run it on their
             // own threads. Log the error and carry on.
             Err(error) => {
-                error!(
+                warn!(
                     target: telemetry_target::HOT_RELOAD,
                     error = %error,
                     "{}",

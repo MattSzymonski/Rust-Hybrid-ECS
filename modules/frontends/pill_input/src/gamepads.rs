@@ -31,7 +31,7 @@ use gamepad_library::Gilrs as GamepadContext;
 use gamepad_library::{Axis, Button, EventType, GamepadId};
 use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
-use pill_core::{info, warn};
+use pill_core::{debug, info, warn};
 use pill_engine::input::GAMEPAD_SLOT_COUNT;
 use pill_engine::{ButtonState, GamepadAxis, GamepadButton, InputEvent, PlayerId, RumbleRequest};
 
@@ -209,7 +209,7 @@ impl Gamepads {
             return;
         }
         let Some(index) = self.slots.iter().position(Option::is_none) else {
-            warn!(
+            debug!(
                 target: telemetry_target::ENGINE,
                 slots = GAMEPAD_SLOT_COUNT,
                 "gamepad connected, but every player slot is taken; ignoring it"

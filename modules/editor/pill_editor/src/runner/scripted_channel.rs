@@ -1384,7 +1384,7 @@ impl EditorWindow {
     /// tab shows. The next frame applies it to the history.
     pub(super) fn scripted_console_filter(&mut self, level: &str) {
         let Some(minimum_level) = pill_editor_core::console::level_from_name(level) else {
-            warn!(
+            debug!(
                 target: telemetry_target::EDITOR,
                 level,
                 "[editor] console filter ignored"

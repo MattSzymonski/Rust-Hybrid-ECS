@@ -28,7 +28,7 @@ use std::collections::HashMap;
 
 // External crates
 use pill_core::telemetry::telemetry_target;
-use pill_core::{error, info, warn};
+use pill_core::{debug, error, info, warn};
 
 // Current crate
 #[cfg(feature = "development")]
@@ -1073,7 +1073,7 @@ impl World {
         // The same archetype means there is nothing to do. Adding a component
         // should never end up here.
         if old_archetype_id == new_archetype_id {
-            warn!(
+            debug!(
                 target: telemetry_target::ECS,
                 entity = ?entity,
                 archetype_id = ?new_archetype_id,
@@ -1410,7 +1410,7 @@ impl World {
                     // `WorldError::DescriptorStorageMissing` reports. It is
                     // logged rather than panicked on, because this runs inside
                     // `process_frame` for managed projects.
-                    warn!(
+                    debug!(
                         target: telemetry_target::ECS,
                         component_id = ?component_id,
                         archetype_id = ?archetype.id,

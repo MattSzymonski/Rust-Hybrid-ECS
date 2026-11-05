@@ -589,7 +589,7 @@ impl ReloadTransaction<'_> {
             // generation: init must be idempotent, so running it again restores
             // the systems that were just cleared. No migration runs on this
             // path because the old registrations are still intact.
-            error!(
+            warn!(
                 target: telemetry_target::HOT_RELOAD,
                 module = self.subject,
                 status,
@@ -1234,7 +1234,7 @@ pub(crate) fn build_load_and_commit(
     let output_path = match build(cancel_flag) {
         Ok(path) => path,
         Err(error) => {
-            error!(
+            warn!(
                 target: telemetry_target::HOT_RELOAD,
                 module = subject,
                 error = %error,
@@ -1255,7 +1255,7 @@ pub(crate) fn build_load_and_commit(
     let new_library = match NativeLibrary::load_copy(&output_path, workspace_root, subject) {
         Ok(library) => library,
         Err(error) => {
-            error!(
+            warn!(
                 target: telemetry_target::HOT_RELOAD,
                 module = subject,
                 error = %error,
@@ -1272,7 +1272,7 @@ pub(crate) fn build_load_and_commit(
     };
     if let LoadValidation::ModuleAbi = validation {
         if let Err(error) = new_library.check_module_abi(subject) {
-            error!(
+            warn!(
                 target: telemetry_target::HOT_RELOAD,
                 module = subject,
                 error = %error,

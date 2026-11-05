@@ -36,7 +36,7 @@ use std::sync::Arc;
 use pill_core::error::CSharpError;
 use pill_core::telemetry::telemetry_target;
 #[cfg(feature = "hot_reload")]
-use pill_core::{error, info};
+use pill_core::{error, info, warn};
 use pill_engine::commands::CommandQueue;
 #[cfg(feature = "hot_reload")]
 use pill_engine::SystemOwner;
@@ -1139,7 +1139,7 @@ impl CSharpRuntime {
             // Logged once per distinct code: the poll runs every frame and a
             // persistent unknown status must not flood the terminal.
             if self.last_poll_status != status {
-                error!(
+                warn!(
                     target: telemetry_target::HOT_RELOAD,
                     status,
                     "the managed loader reported an unknown reload status; keeping the currently loaded assembly"
@@ -1276,7 +1276,7 @@ impl CSharpRuntime {
     /// Tells the managed loader to discard the pending version, and says why.
     #[cfg(feature = "hot_reload")]
     fn abort_pending_version(&mut self, reason: &str) {
-        error!(
+        warn!(
             target: telemetry_target::HOT_RELOAD,
             reason,
             "C# reload rejected: the component manifest could not be applied; the running assembly keeps its rows"
