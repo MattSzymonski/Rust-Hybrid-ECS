@@ -102,7 +102,7 @@ pub fn remember_tile_rect(browser: &mut ProjectBrowser, path: &str, rect: egui::
     } else {
         browser.tile_rects.push((path.to_owned(), corners));
     }
-    pill_core::info!(
+    pill_core::debug!(
         target: telemetry_target::EDITOR,
         path,
         min_x = rect.min.x,
@@ -129,7 +129,7 @@ pub fn remember_tree_row_rect(browser: &mut ProjectBrowser, path: &str, rect: eg
     } else {
         browser.tree_rects.push((path.to_owned(), corners));
     }
-    pill_core::info!(
+    pill_core::debug!(
         target: telemetry_target::EDITOR,
         path,
         min_x = rect.min.x,
@@ -148,7 +148,7 @@ pub fn remember_pane_rect(browser: &mut ProjectBrowser, rect: egui::Rect) {
         return;
     }
     browser.pane_rect = Some(corners);
-    pill_core::info!(
+    pill_core::debug!(
         target: telemetry_target::EDITOR,
         min_x = rect.min.x,
         min_y = rect.min.y,

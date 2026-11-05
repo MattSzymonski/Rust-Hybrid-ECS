@@ -152,7 +152,7 @@ pub fn palette_window(
             width: rect.width(),
             height: rect.height(),
         });
-        pill_core::info!(
+        pill_core::debug!(
             target: telemetry_target::EDITOR,
             x = rect.min.x,
             y = rect.min.y,

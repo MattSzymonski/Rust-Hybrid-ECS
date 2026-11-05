@@ -60,7 +60,7 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
         viewer.toolbox.set_origin(view, origin);
     }
     if response.drag_stopped() {
-        pill_core::info!(
+        pill_core::debug!(
             target: telemetry_target::EDITOR,
             view,
             x = origin.x,
@@ -117,7 +117,7 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
     viewer.toolbox.set_faces(view, faces);
     viewer.overlay_regions.push(shell_rect(panel));
     if viewer.toolbox.remember_logged(view, panel) {
-        pill_core::info!(
+        pill_core::debug!(
             target: telemetry_target::EDITOR,
             view,
             x = panel.min.x,
@@ -131,7 +131,7 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
                 .iter()
                 .map(|item| (item.name(), toolbox::item_rect(*item, origin))),
         ) {
-            pill_core::info!(
+            pill_core::debug!(
                 target: telemetry_target::EDITOR,
                 view,
                 item,

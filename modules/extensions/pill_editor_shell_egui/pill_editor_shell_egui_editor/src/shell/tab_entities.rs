@@ -43,7 +43,7 @@ pub fn remember_hierarchy_row_rect(
     if !session.hierarchy_row_rects.remember_exact(entity_key, rect) {
         return;
     }
-    pill_core::info!(
+    pill_core::debug!(
         target: telemetry_target::EDITOR,
         entity = %entity,
         min_x = rect.min.x,

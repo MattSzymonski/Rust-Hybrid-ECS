@@ -777,7 +777,7 @@ pub fn run_frame(
     // still gets samples when 210 frames take longer than its measurement
     // window.
     if frame_index.is_multiple_of(210) || ui_micros >= SLOW_UPDATE_MICROS {
-        pill_core::info!(
+        pill_core::debug!(
             target: telemetry_target::EDITOR,
             frames = frame_index,
             ui_us = ui_micros,

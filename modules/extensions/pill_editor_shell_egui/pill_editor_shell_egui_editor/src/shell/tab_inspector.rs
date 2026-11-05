@@ -186,7 +186,7 @@ pub fn inspector_header(
                 .is_none_or(|logged| !LoggedRects::<String>::same_placement(logged, button.rect))
             {
                 session.add_rect = Some(button.rect);
-                pill_core::info!(
+                pill_core::debug!(
                     target: telemetry_target::EDITOR,
                     x = button.rect.min.x,
                     y = button.rect.min.y,
@@ -253,7 +253,7 @@ pub fn inspector_add_popup(
                                 type_name,
                                 response.rect,
                             ) {
-                                pill_core::info!(
+                                pill_core::debug!(
                                     target: telemetry_target::EDITOR,
                                     component = type_name,
                                     x = response.rect.min.x,
@@ -436,7 +436,7 @@ pub fn inspector_section_header(
         });
     let rect = frame.response.rect;
     if remember_moved_rect(&mut session.section_rects, &component.type_name, rect) {
-        pill_core::info!(
+        pill_core::debug!(
             target: telemetry_target::EDITOR,
             component = component.type_name.as_str(),
             x = rect.min.x,

@@ -53,7 +53,7 @@ pub fn menu_bar(
             let bar_rect = ui.max_rect();
             let mut open_menu: Option<menubar::Menu> = None;
             if session.geometry.remember_exact(MenubarSlot::Bar, bar_rect) {
-                pill_core::info!(
+                pill_core::debug!(
                     target: telemetry_target::EDITOR,
                     x = bar_rect.min.x,
                     y = bar_rect.min.y,
@@ -88,7 +88,7 @@ pub fn menu_bar(
                         .geometry
                         .remember_exact(MenubarSlot::Title(index), title_response.rect)
                     {
-                        pill_core::info!(
+                        pill_core::debug!(
                             target: telemetry_target::EDITOR,
                             name = menu.name(),
                             x = title_response.rect.min.x,
@@ -147,7 +147,7 @@ pub fn menu_body(
                 );
                 let entry_key = format!("{}/{}", menu.name(), label);
                 if session.entries.remember_exact(entry_key, row_response.rect) {
-                    pill_core::info!(
+                    pill_core::debug!(
                         target: telemetry_target::EDITOR,
                         menu = menu.name(),
                         label,

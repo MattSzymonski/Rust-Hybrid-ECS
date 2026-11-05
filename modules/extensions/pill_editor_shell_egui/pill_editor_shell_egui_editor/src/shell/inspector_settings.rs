@@ -628,7 +628,7 @@ pub fn remember_list_row_rect(
     if !session.log_rects {
         return;
     }
-    pill_core::info!(
+    pill_core::debug!(
         target: telemetry_target::EDITOR,
         row = key.as_str(),
         min_x = rect.min.x,

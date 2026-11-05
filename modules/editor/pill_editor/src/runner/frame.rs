@@ -78,7 +78,7 @@ impl EditorWindow {
                 .unwrap_or(0);
             let idle_frame_millis_max = self.idle_frame_millis_max;
             self.idle_frame_millis_max = 0.0;
-            info!(
+            debug!(
                 target: telemetry_target::EDITOR,
                 fps = self.fps,
                 frame = self.frame_index,

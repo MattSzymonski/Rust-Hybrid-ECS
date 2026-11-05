@@ -208,7 +208,7 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
         let badge_key = format!("{view}:{}", badge.entity);
         viewer.inspector.badge_seen.insert(badge_key.clone());
         if remember_moved_rect(&mut viewer.inspector.badge_rects, &badge_key, rect) {
-            pill_core::info!(
+            pill_core::debug!(
                 target: telemetry_target::EDITOR,
                 view = badge.view,
                 entity = %badge.entity,

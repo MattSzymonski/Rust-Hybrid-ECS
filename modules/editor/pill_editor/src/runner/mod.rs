@@ -33,7 +33,7 @@ use std::time::Duration;
 use pill_core::platform::futures::block_on;
 use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
-use pill_core::{info, warn};
+use pill_core::{debug, info, warn};
 use pill_development_host::{take_notices, HostConfig, HostNotice, RenderingHost};
 use pill_editor_core::assets::{self, AssetDialog};
 use pill_editor_core::boundary::{
@@ -1864,7 +1864,7 @@ impl EditorWindow {
             && self.snapshot_changed_field.as_deref() != Some(changed_fields.as_str())
         {
             self.snapshot_changed_field = Some(changed_fields.clone());
-            info!(
+            debug!(
                 target: telemetry_target::EDITOR,
                 fields = changed_fields.as_str(),
                 "[editor] snapshot changed"

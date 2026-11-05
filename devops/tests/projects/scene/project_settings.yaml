@@ -8,3 +8,9 @@ description: "Four meshes, a themed UI layer and a fixed scene for the editor su
 # asset target, and a module list would only add build time to every suite that
 # drives it. The reload and patch anchors live in the `native` fixture.
 modules: []
+
+# The editor suites locate widgets through the editor's rect dumps and pace
+# themselves on its heartbeats, which log at debug.
+logging:
+  targets:
+    engine::editor: debug

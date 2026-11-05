@@ -926,7 +926,7 @@ pub fn remember_entity_row_rect(
     if !session.log_rects {
         return;
     }
-    pill_core::info!(
+    pill_core::debug!(
         target: telemetry_target::EDITOR,
         row = key,
         min_x = rect.min.x,
@@ -989,7 +989,7 @@ pub fn remember_asset_row_rect(
     if !session.log_rects {
         return;
     }
-    pill_core::info!(
+    pill_core::debug!(
         target: telemetry_target::EDITOR,
         row = key,
         min_x = rect.min.x,

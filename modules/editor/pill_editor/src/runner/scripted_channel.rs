@@ -469,7 +469,7 @@ impl EditorWindow {
             };
             let (origin_x, origin_y) = self.view_origin(view);
             let (width, height) = scene.window.size();
-            info!(
+            debug!(
                 target: telemetry_target::EDITOR,
                 view,
                 x = origin_x as i32,
@@ -482,7 +482,7 @@ impl EditorWindow {
         }
         if let Some(game) = &self.game_surface {
             let (width, height) = game.size();
-            info!(
+            debug!(
                 target: telemetry_target::EDITOR,
                 x = game.origin.0,
                 y = game.origin.1,
