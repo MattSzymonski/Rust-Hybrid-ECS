@@ -44,7 +44,6 @@ use crate::resource::{
     ErasedResource, ErasedResourceOps, KeptLayoutDeclaration, Resource, ResourceId,
 };
 use crate::scripting::{ScriptComponent, ScriptContext};
-use crate::settings::{ManagerSettingsEntry, SettingsDocument, SettingsOutcome};
 
 // =============================================================================
 // Module Tree

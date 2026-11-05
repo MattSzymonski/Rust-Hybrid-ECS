@@ -321,12 +321,41 @@ impl EditorWindow {
                 self.read_asset_settings(&row.path)
             };
             let references = self.asset_reference_fields(row.kind.text(), &settings_document);
+            let decorators = self.asset_field_decorators(row.kind.text());
             AssetDetail {
                 row,
                 settings: settings_document,
                 references,
+                decorators,
             }
         });
+    }
+
+    /// Returns how the asset type's document fields draw, as the registry the
+    /// registering crate declared them.
+    ///
+    /// A settings asset states that a value is a range or carries an
+    /// explanation where the document is defined, so the Inspector draws the
+    /// row the type asked for without knowing the type. A type that declares
+    /// none gets the rows an undecorated document gets.
+    pub(super) fn asset_field_decorators(
+        &mut self,
+        asset_type_name: &str,
+    ) -> Vec<pill_editor_core::editor_state::AssetFieldDecorator> {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(registry) = world.get_resource::<pill_engine_core::ImportRegistry>() else {
+            return Vec::new();
+        };
+        registry
+            .field_decorators(asset_type_name)
+            .iter()
+            .map(
+                |(key, decorator)| pill_editor_core::editor_state::AssetFieldDecorator {
+                    key: key.clone(),
+                    decorator: decorator.clone(),
+                },
+            )
+            .collect()
     }
 
     /// Returns the reference fields the asset's type declares, expanded against

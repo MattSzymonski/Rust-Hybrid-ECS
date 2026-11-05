@@ -1447,7 +1447,12 @@ pub(crate) fn mirror_resource(
             ))
         }
     };
-    // Step 3: emit the `Resource` impl and the type row.
+    // Step 3: emit the `Resource` impl, the declaration and the type row.
+    //
+    // The declaration is part of the attribute rather than a separate
+    // `#[derive(PillResource)]`: this macro already writes the `Resource` impl,
+    // and a second impl of it cannot exist. A mirrored resource is a resource
+    // other artifacts read, so it always declares itself.
     let row = type_row(TypeRow {
         ident,
         name: quote! { ::pill_engine::component_registry::MIRROR_TYPE_ROW },
@@ -1457,12 +1462,31 @@ pub(crate) fn mirror_resource(
         arg_names: vec![name.value()],
         trampoline: None,
     });
+    let type_name = quote! {
+        ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#ident))
+    };
+    let register_ident = format_ident!("__pill_register_resource_{}", ident);
     Ok(quote! {
         #item
 
         impl ::pill_engine::Resource for #ident {
             fn shared_name() -> ::core::option::Option<&'static str> {
                 ::core::option::Option::Some(#name)
+            }
+        }
+
+        /// Declares this resource with a world; called by the artifact entry
+        /// point.
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #register_ident(world: &mut ::pill_engine::World) {
+            world.register_resource::<#ident>();
+        }
+
+        ::pill_engine::submit! {
+            ::pill_engine::declarations::PillResourceDescriptor {
+                type_name: #type_name,
+                register: #register_ident,
             }
         }
 

@@ -26,7 +26,7 @@ use std::f32::consts::PI;
 
 // External crates
 use pill_engine::{
-    pill_hot, tracing, Handle, Input, KeyCode, PillComponent, Query, Res, ResMut, Resource,
+    pill_hot, system, tracing, Handle, Input, KeyCode, PillComponent, Query, Res, ResMut, Resource,
     SystemError, World,
 };
 use pill_master_renderer_data::{
@@ -276,6 +276,7 @@ fn scatter_between(seed: u64, minimum: f32, maximum: f32) -> f32 {
 /// focus or a widget listens for keys - the tuning keys belong to the UI.
 /// Typing in the overlay then does not also retune the field.
 #[pill_hot]
+#[system(name = "demo_control", order = 30)]
 pub(crate) fn demo_control_system(
     input: Res<Input>,
     game_ui: Res<GameUi>,

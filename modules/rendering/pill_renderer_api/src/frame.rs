@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 
 // External crates
 use pill_engine::common_components::TransformComponent;
-use pill_engine::Resource;
+use pill_engine::PillResource;
 
 // =============================================================================
 // PassKind
@@ -311,7 +311,13 @@ pub struct ChainSource {
 ///
 /// Everything in it is an owned plain value, so a frame outlives the artifact
 /// that filled it.
-#[derive(Clone, Debug)]
+///
+/// The shared name is a fixed identity rather than a path: the host and the
+/// renderer module find the same resource by this string across the artifact
+/// boundary. It spells the renderer module's path rather than this crate's, and
+/// that spelling is part of the identity, so leave it exactly as it is.
+#[derive(Clone, Debug, PillResource)]
+#[pill(shared = "pill_master_renderer::frame::RenderFrame")]
 pub struct RenderFrame {
     /// Every drawable collected from the world this update, in traversal order.
     pub instances: Vec<RenderInstance>,
@@ -402,15 +408,5 @@ impl Default for RenderFrame {
             sequence: 0,
             ui: pill_ui_frame::UiFrame::default(),
         }
-    }
-}
-
-impl Resource for RenderFrame {
-    fn shared_name() -> Option<&'static str> {
-        // A fixed identity rather than a path: the host and the renderer module
-        // find the same resource by this string across the artifact boundary.
-        // It spells the renderer module's path rather than this crate's, and
-        // that spelling is part of the identity, so leave it exactly as it is.
-        Some("pill_master_renderer::frame::RenderFrame")
     }
 }

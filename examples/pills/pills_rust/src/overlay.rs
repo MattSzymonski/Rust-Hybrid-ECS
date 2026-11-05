@@ -25,7 +25,7 @@
 // External crates
 use pill_core::math::Vector2f;
 use pill_engine::{
-    pill_hot, DebugDraw, DebugStyle, Input, KeyCode, Res, ResMut, SystemError, Time,
+    pill_hot, system, DebugDraw, DebugStyle, Input, KeyCode, Res, ResMut, SystemError, Time,
 };
 // The egui this engine uses, reached through the crate that re-exports it: a
 // project never depends on egui directly, so every artifact shares one copy.
@@ -36,6 +36,7 @@ use pills_rust::{DemoState, PILL_COUNT};
 
 /// Draws the tuning panel: the FPS, the curl noise values and the reset button.
 #[pill_hot]
+#[system(name = "tuning_overlay", order = 40)]
 pub(crate) fn tuning_overlay_system(
     mut game_ui: ResMut<GameUi>,
     input: Res<Input>,
@@ -109,6 +110,7 @@ pub(crate) fn tuning_overlay_system(
 /// Draws the field's bounds, the world axes and the tuning values, and toggles
 /// debug drawing with F3.
 #[pill_hot]
+#[system(name = "debug_overlay", order = 50)]
 pub(crate) fn debug_overlay_system(
     input: Res<Input>,
     mut debug_draw: ResMut<DebugDraw>,

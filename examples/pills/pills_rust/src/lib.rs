@@ -93,11 +93,6 @@ pub fn init(engine: &mut Engine) -> u32 {
         pill_project_ui::ThemeInstall::new(theme).with_override("ui/accent.theme"),
     );
 
-    engine.register_system("camera", camera::camera_system);
-    engine.register_system("curl_noise", curl_noise_system::curl_noise_system);
-    engine.register_system("demo_control", game::demo_control_system);
-    engine.register_system("tuning_overlay", overlay::tuning_overlay_system);
-    engine.register_system("debug_overlay", overlay::debug_overlay_system);
     0
 }
 

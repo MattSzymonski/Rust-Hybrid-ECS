@@ -184,8 +184,14 @@ pub mod scheduler;
 /// that defers structural changes until it is safe to apply them.
 pub mod scripting;
 
-/// Manager settings: the `key: value` document a project configures a
-/// subsystem-owning resource with, and the trait a manager declares it through.
+/// Settings assets that configure manager resources: the bindings that point a
+/// manager at one, the file a host creates when the project has none, and the
+/// change detection that re-applies an edited file.
+pub mod manager_settings;
+
+/// Manager settings: the settings asset a manager resource reads, its
+/// conventional path, and the applier that moves its document into the live
+/// value.
 pub mod settings;
 
 /// The startup scene: the `.scene` a project's settings name, loaded before
@@ -228,7 +234,8 @@ pub use asset::{
 pub use asset_database::{AssetDatabase, AssetRecord, GuidConflict};
 pub use asset_import_registry::AssetIdentity;
 pub use asset_import_registry::{
-    ErasedImportError, ErasedImportOutcome, ImportRegistrationError, ImportRegistry, ScanReport,
+    ErasedImportError, ErasedImportOutcome, FieldDecorator, ImportRegistrationError,
+    ImportRegistry, ScanReport,
 };
 pub use asset_loading::{import_scene_document, load_scene_asset, scene_database};
 pub use asset_metadata::{
@@ -253,6 +260,10 @@ pub use input::{
     ButtonState, GamepadAxis, GamepadButton, Input, InputEvent, KeyCode, Modifiers, MouseButton,
     PlayerId, RumbleRequest, ScrollDelta,
 };
+pub use manager_settings::{
+    ManagerSettingsApplied, ManagerSettingsFailure, ManagerSettingsReport, ManagerSettingsSurface,
+    MissingManagerSettings,
+};
 pub use persistence::{PersistResourceManifestEntry, ResourceSnapshot};
 pub use pill_core::DynamicBuffer;
 pub use query::{
@@ -266,15 +277,18 @@ pub use saved_references::{
 pub use scene::{load_scene, save_scene, Scene, SceneDocument, SceneEntity, SceneLoad, SceneSave};
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
-pub use settings::{
-    ManagerResource, ManagerSettingsEntry, SettingsDocument, SettingsError, SettingsOutcome,
-    SettingsValue,
-};
+pub use settings::{SettingsAssetManager, SettingsAssetOps, SettingsOutcome};
 pub use startup_scene::{apply_startup_scene, queue_startup_scene, StartupScene};
 pub use time::Time;
 
 // Serde derives re-exported so downstream components can derive serialization without a direct dependency.
 pub use serde::{Deserialize, Serialize};
+
+// The type-map crate an asset type implements `TraitAccessible` from, re-exported
+// so a project or module declaring an asset needs no dependency of its own: the
+// macro is reached as `pill_engine::trait_type_map::impl_trait_accessible!`, and
+// its expansion resolves through this path.
+pub use trait_type_map;
 
 // Tracing re-exported to keep telemetry under a single flat namespace.
 pub use tracing;
@@ -284,8 +298,8 @@ pub use tracing;
 // re-exported by the facade, which owns the registries.
 pub use pill_engine_macros::{
     pill_hot, pill_hot_fn, pill_hot_resolver, pill_mirror_fn, pill_mirror_impl, pill_mirror_method,
-    pill_mirror_object, pill_mirror_resource, pill_module, pill_project, pill_value_type,
-    PillComponent, PillLayout, PillMirror,
+    pill_mirror_object, pill_mirror_resource, pill_module, pill_project, pill_value_type, system,
+    PillAsset, PillComponent, PillLayout, PillMirror, PillResource,
 };
 
 // World container and its entity-builder and error types.

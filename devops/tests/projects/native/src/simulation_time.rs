@@ -17,6 +17,7 @@ use pill_engine::*;
 ///
 /// Returns [`SystemError::MissingResource`] when the resource is absent, which
 /// means the project module and host disagree about initialization.
+#[system(name = "simulation_time", order = 10)]
 pub(crate) fn update_time_system(mut time: ResMut<SimulationTime>) -> Result<(), SystemError> {
     let now = Instant::now();
     let Some(mut time) = time.get_mut() else {

@@ -48,15 +48,17 @@ use crate::engine::Engine;
 /// pub unsafe extern "C" fn pill_module_init(api: *const EngineApi) -> u32 {
 ///     let api = unsafe { &*api };
 ///     let engine: &mut Engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
-///     engine.world_mut().register_component::<Position>();
-///     engine.register_system("movement", movement_system);
-///     0
+///     run_artifact_entry(engine, |_engine| {}, register, init)
 /// }
 /// ```
 ///
 /// In practice no artifact writes that by hand: `#[pill_project]` and
 /// `#[pill_module]` generate the entry point, including the `catch_unwind`
-/// guard that keeps a panic from unwinding across the C ABI boundary.
+/// guard that keeps a panic from unwinding across the C ABI boundary, and the
+/// entry point declares what the artifact's macros declare - its components,
+/// systems, resources and asset types - before the artifact's own `register`
+/// runs. An artifact's own code never names its systems, resources or assets;
+/// they arrive by declaration.
 #[repr(C)]
 pub struct EngineApi {
     /// Opaque handle to the engine instance, cast back to `&mut Engine` by the

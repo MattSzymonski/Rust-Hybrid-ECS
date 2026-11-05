@@ -89,7 +89,8 @@ pub use audio_command::AudioCommand;
 pub use audio_listener_component::AudioListenerComponent;
 pub use audio_load_queue::AudioLoadQueue;
 pub use audio_manager::{
-    AudioManager, DEFAULT_AMBIENT_SINK_COUNT, DEFAULT_SPATIAL_SINK_COUNT, EAR_SEPARATION,
+    AudioManager, AudioSettings, AudioSettingsAsset, DEFAULT_AMBIENT_SINK_COUNT,
+    DEFAULT_SPATIAL_SINK_COUNT, EAR_SEPARATION,
 };
 pub use audio_source_component::{AudioSourceComponent, NO_SINK};
 pub use audio_system::audio_system;
@@ -120,10 +121,10 @@ pub fn register(engine: &mut Engine) -> u32 {
             .world_mut()
             .insert_resource(AudioLoadQueue::default());
     }
-    // Step 2: Register the components and the sound asset type.
-    // Register each component through its derive's registrar, so it arrives
-    // with its field layout. The Inspector's rows and the managed codegen read
-    // that layout; without it a component is an opaque blob to both.
+    // Step 2: Register the components. Register each one through its derive's
+    // registrar, so it arrives with its field layout. The Inspector's rows and
+    // the managed codegen read that layout; without it a component is an
+    // opaque blob to both.
     audio_listener_component::register(engine.world_mut());
     audio_source_component::register(engine.world_mut());
     // The playback system reads both positions from the transform, so a module
@@ -132,23 +133,62 @@ pub fn register(engine: &mut Engine) -> u32 {
     // no renderer, which is why the module does it itself. Registration is
     // idempotent, so a world that already has it is unaffected.
     pill_engine::register_transform_component(engine.world_mut());
-    // Declare the asset type this module stores. The world's asset store
-    // outlives a reload of this DLL, so a column's per-type table has to be
-    // re-pointed at the generation still mapped. Registering the type as an
-    // imported asset does that, and it also lets sound files import by
-    // extension.
-    engine.world_mut().register_imported_asset::<Sound>();
+    // The sound asset type needs no call: `Sound` declares itself, and the
+    // entry point declares it before this function runs, which is what
+    // re-points the asset store's table at the generation still mapped.
 
-    // Step 3: Install the manager once, if an output device exists.
+    // Step 3: Declare the settings asset the device is tuned through. The
+    // declaration is repeated on every generation, so the surface never points
+    // at code the reload unloaded.
+    engine
+        .world_mut()
+        .register_settings_asset_manager::<AudioManager>();
+    // The same for how its document draws: the sink counts explain themselves
+    // and cannot be changed while the device runs, and the ear separation is a
+    // slider rather than a free number.
+    if let Some(registry) = engine
+        .world_mut()
+        .get_resource_mut::<pill_engine::ImportRegistry>()
+    {
+        registry.declare_field_decorators(
+            "pill_audio::AudioSettingsAsset",
+            &[
+                (
+                    "ambient_sinks",
+                    pill_engine::FieldDecorator::Tooltip(
+                        "Voices for sounds that play without a position. Fixed when the device opens; restart the host to change it."
+                            .to_owned(),
+                    ),
+                ),
+                (
+                    "spatial_sinks",
+                    pill_engine::FieldDecorator::Tooltip(
+                        "Voices for sounds that play at a position. Fixed when the device opens; restart the host to change it."
+                            .to_owned(),
+                    ),
+                ),
+                (
+                    "ear_separation",
+                    pill_engine::FieldDecorator::Range {
+                        min: 0.1,
+                        max: 10.0,
+                    },
+                ),
+            ],
+        );
+    }
+
+    // Step 4: Install the manager once, if an output device exists.
     // Build the device only once. Registration runs again after every reload,
     // and replacing a live manager would stop whatever is playing.
     if engine.world().get_resource::<AudioManager>().is_none() {
         match AudioManager::with_defaults() {
             Some(audio_manager) => {
-                // The manager registration, not the plain insert: it records
-                // the settings surface the project configures the device with
-                // (`settings/pill_audio_settings.yaml`).
-                engine.world_mut().insert_manager_resource(audio_manager);
+                // The manager insert, not the plain one: it records the
+                // settings surface the project configures the device with.
+                engine
+                    .world_mut()
+                    .insert_settings_asset_manager(audio_manager);
             }
             None => {
                 pill_core::warn!(
@@ -157,16 +197,10 @@ pub fn register(engine: &mut Engine) -> u32 {
                 );
             }
         }
-    } else {
-        // A kept manager re-declares its surface so the stored applier points
-        // at this generation's code.
-        engine
-            .world_mut()
-            .register_manager_resource::<AudioManager>();
     }
-    // Step 4: Register the playback system and log the registration.
-    engine.register_system("pill_audio", audio_system);
-
+    // Step 4: Announce the registration. The playback system needs no call of
+    // its own: `audio_system` declares itself, so the engine registers it
+    // before this function runs, on every generation.
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ECS,
         ambient_sinks = DEFAULT_AMBIENT_SINK_COUNT,

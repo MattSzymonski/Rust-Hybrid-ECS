@@ -122,21 +122,9 @@ def main() -> int:
         in script,
     )
 
-    # A manager's settings document is baked as text rather than packed: a
-    # shipped build has no writable project directory, so the document the
-    # generator read is what the manager applies at startup.
-    expect(
-        "a project without settings bakes no manager documents",
-        generator.load_manager_settings(PROJECT_ROOT) == [],
-    )
-    emitted = "\n".join(
-        generator.build_manager_settings_literal([("fixture", "gain: 2.0\nlabel: \"a\"\n")])
-    )
-    expect(
-        "a baked document becomes a StaticManagerSettings entry",
-        'StaticManagerSettings { name: "fixture", document: "gain: 2.0\\nlabel: \\"a\\"\\n" }'
-        in emitted,
-    )
+    # A manager's settings are an ordinary file under `res/settings`, so the
+    # pack carries them and the player reads them through the asset store,
+    # exactly where the development host reads the project's copy.
     source = generator.build_library_source(
         "bundle_package",
         "Bundle Project",
@@ -145,12 +133,14 @@ def main() -> int:
         "../../example",
         BUNDLE_DIRECTORY,
         REPOSITORY_ROOT / "modules",
-        manager_settings=[("fixture", "gain: 2.0\n")],
     )
     expect(
-        "the bundle's StaticProject carries the baked documents",
-        "manager_settings: MANAGER_SETTINGS," in source
-        and "StaticManagerSettings" in source,
+        "the bundle bakes no manager settings documents",
+        "manager_settings" not in source and "StaticManagerSettings" not in source,
+    )
+    expect(
+        "the settings directory travels in the project's pack",
+        generator.ASSETS_DIRECTORY_NAME == "res",
     )
 
     if failures:

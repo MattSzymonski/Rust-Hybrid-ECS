@@ -6,8 +6,8 @@
 //!   `use pill_engine::*` and every `::pill_engine::...` path the macros emit
 //!   resolve.
 //! - Own the per-DLL `inventory` registries ([`component_registry`],
-//!   [`hot_patch`]) and re-export the hot-patch descriptor types at the crate
-//!   root.
+//!   [`declarations`], [`hot_patch`]) and re-export the hot-patch descriptor
+//!   types at the crate root.
 //! - Re-export the `submit!` macro that the derive and attribute macros
 //!   expand to.
 //!
@@ -30,6 +30,10 @@ pub use pill_engine_core::*;
 
 /// Per-DLL component, value-type, method, accessor and export registries.
 pub mod component_registry;
+
+/// The systems, resources and asset types an artifact declares, registered
+/// from its entry point.
+pub mod declarations;
 
 /// The per-DLL hot-patch registries, built on the core's hot-patch machinery.
 pub mod hot_patch;

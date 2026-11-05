@@ -26,9 +26,9 @@ pub use pill_editor_core::console::{
     self as console, ConsoleChannel, ConsoleFilterSettings, ConsoleLine, ConsoleView,
 };
 pub use pill_editor_core::editor_state::{
-    AssetKind, AssetListing, AssetReferenceField, AssetReferenceLabel, ComponentView,
-    EditorCommand, EditorSelection, EditorSnapshot, EngineAsset, EntityDetail, EntityListEntry,
-    EntityReferenceLabel, ResourceFieldView, ResourceView,
+    AssetFieldDecorator, AssetKind, AssetListing, AssetReferenceField, AssetReferenceLabel,
+    ComponentView, EditorCommand, EditorSelection, EditorSnapshot, EngineAsset, EntityDetail,
+    EntityListEntry, EntityReferenceLabel, ResourceFieldView, ResourceView,
 };
 pub use pill_editor_core::egui;
 pub use pill_editor_core::egui_dock::{
@@ -57,5 +57,6 @@ pub use pill_editor_core::session::{
 pub use pill_editor_core::style;
 pub use pill_editor_core::systems;
 pub use pill_editor_core::toolbox;
+pub use pill_engine::FieldDecorator;
 pub use pill_engine::{pill_hot_fn, Entity, FieldValue, Input};
 pub use serde_json::Value as JsonValue;

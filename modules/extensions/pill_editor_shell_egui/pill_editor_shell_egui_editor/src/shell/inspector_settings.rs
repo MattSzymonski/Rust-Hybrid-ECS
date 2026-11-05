@@ -72,6 +72,10 @@ pub struct SettingsWalk<'a> {
     pub session: &'a mut InspectorSession,
     /// The frame's overlay regions, so a picker's rectangle is the UI's.
     pub overlay_regions: &'a mut Vec<ShellRect>,
+    /// How the asset's type declared its document fields draw: a range as a
+    /// slider, a tooltip as the label's hover text. Empty for a type that
+    /// declares none.
+    pub decorators: &'a [AssetFieldDecorator],
     /// Whether the asset belongs to a module, so nothing writes it.
     pub read_only: bool,
 }
@@ -90,6 +94,23 @@ pub struct ListEntryDrag {
 // =============================================================================
 // Free Functions
 // =============================================================================
+
+/// The hover text one settings row carries: the tooltip its type declared, or
+/// the whole key, which is what says where a short leaf name belongs.
+pub fn settings_row_tooltip<'a>(decorators: &'a [AssetFieldDecorator], key: &'a str) -> &'a str {
+    match AssetFieldDecorator::find(decorators, key) {
+        Some(FieldDecorator::Tooltip(text)) => text.as_str(),
+        _ => key,
+    }
+}
+
+/// The range one settings row draws as a slider, when its type declared one.
+pub fn settings_row_range(decorators: &[AssetFieldDecorator], key: &str) -> Option<(f64, f64)> {
+    match AssetFieldDecorator::find(decorators, key) {
+        Some(FieldDecorator::Range { min, max }) => Some((*min, *max)),
+        _ => None,
+    }
+}
 
 /// The label a settings row carries: the leaf of its key.
 ///
@@ -690,9 +711,15 @@ pub fn asset_settings_row(
         JsonValue::Bool(current) => {
             let mut edited = *current;
             let mut changed = false;
-            row_in(ui, WIDE_ROW_LABEL_WIDTH, &label, Some(&key), &mut |ui| {
-                changed = ui.checkbox(&mut edited, "").changed();
-            });
+            row_in(
+                ui,
+                WIDE_ROW_LABEL_WIDTH,
+                &label,
+                Some(settings_row_tooltip(walk.decorators, &key)),
+                &mut |ui| {
+                    changed = ui.checkbox(&mut edited, "").changed();
+                },
+            );
             if changed {
                 settings_commit(
                     walk.pending,
@@ -710,9 +737,15 @@ pub fn asset_settings_row(
             match current_integer.as_mut() {
                 Some(edited) => {
                     let mut changed = false;
-                    row_in(ui, WIDE_ROW_LABEL_WIDTH, &label, Some(&key), &mut |ui| {
-                        changed = ui.add(egui::DragValue::new(edited)).changed();
-                    });
+                    row_in(
+                        ui,
+                        WIDE_ROW_LABEL_WIDTH,
+                        &label,
+                        Some(settings_row_tooltip(walk.decorators, &key)),
+                        &mut |ui| {
+                            changed = ui.add(egui::DragValue::new(edited)).changed();
+                        },
+                    );
                     if changed {
                         settings_commit(
                             walk.pending,
@@ -726,15 +759,21 @@ pub fn asset_settings_row(
                 None => {
                     let mut edited = current.as_f64().unwrap_or_default();
                     let mut changed = false;
-                    row_in(ui, WIDE_ROW_LABEL_WIDTH, &label, Some(&key), &mut |ui| {
-                        changed = ui
-                            .add(
-                                egui::DragValue::new(&mut edited)
-                                    .speed(0.05)
-                                    .max_decimals(9),
-                            )
-                            .changed();
-                    });
+                    row_in(
+                        ui,
+                        WIDE_ROW_LABEL_WIDTH,
+                        &label,
+                        Some(settings_row_tooltip(walk.decorators, &key)),
+                        &mut |ui| {
+                            changed = ui
+                                .add(
+                                    egui::DragValue::new(&mut edited)
+                                        .speed(0.05)
+                                        .max_decimals(9),
+                                )
+                                .changed();
+                        },
+                    );
                     if changed {
                         if let Some(number) = serde_json::Number::from_f64(edited) {
                             settings_commit(
@@ -752,12 +791,18 @@ pub fn asset_settings_row(
         JsonValue::String(current) => {
             let mut edited = current.clone();
             let mut should_commit = false;
-            row_in(ui, WIDE_ROW_LABEL_WIDTH, &label, Some(&key), &mut |ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut edited).desired_width(ui.available_width()),
-                );
-                should_commit = response.lost_focus() && edited != *current;
-            });
+            row_in(
+                ui,
+                WIDE_ROW_LABEL_WIDTH,
+                &label,
+                Some(settings_row_tooltip(walk.decorators, &key)),
+                &mut |ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut edited).desired_width(ui.available_width()),
+                    );
+                    should_commit = response.lost_focus() && edited != *current;
+                },
+            );
             if should_commit {
                 settings_commit(
                     walk.pending,

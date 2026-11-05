@@ -254,7 +254,7 @@ def run_popouts_and_reloads_steps(state: StepState) -> None:
     # this file's opening compiles only because that glob is there. The
     # probe goes inside the header closure, where a statement is legal.
     systems_anchor = (
-        "        let enabled = snapshot.systems.iter().filter(|row| row.enabled).count();"
+        "        let enabled_system_count = snapshot.systems.iter().filter(|row| row.enabled).count();"
     )
     assert (
         systems_anchor in state.original_systems_source

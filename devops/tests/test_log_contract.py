@@ -370,6 +370,10 @@ def rust_source_files() -> Tuple[Tuple[Path, str], ...]:
         if not relative or not relative.endswith(".rs"):
             continue
         source_path = REPOSITORY_ROOT / relative
+        # A file deleted in the working tree is still tracked until the deletion
+        # is committed, so `git ls-files` lists it; there is no source to scan.
+        if not source_path.is_file():
+            continue
         sources.append(
             (source_path, source_path.read_text(encoding="utf-8", errors="replace"))
         )

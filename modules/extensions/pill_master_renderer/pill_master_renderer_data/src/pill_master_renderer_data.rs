@@ -88,9 +88,9 @@ pub const MODULE_NAME: &str = "pill_master_renderer_data";
 /// module (`pill_master_renderer`), and a headless engine has neither.
 ///
 /// The components go in through [`register_components`]. The six asset types
-/// and the two resources are declared so the tables that hold their values
-/// point at code in the artifact that is still mapped. The [`RenderFrame`] and
-/// [`RenderingManager`] values are only inserted when they are missing.
+/// declare themselves, so the tables that hold their values point at code in
+/// the artifact that is still mapped without a call here. The [`RenderFrame`]
+/// and [`RenderingManager`] values are only inserted when they are missing.
 /// Declaring a type or a resource again changes nothing, so calling this a
 /// second time changes nothing either.
 ///
@@ -109,30 +109,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     // Step 1: Register the components, field layouts included.
     register_components(engine.world_mut());
 
-    // Step 2: Declare the asset types. An asset type's column holds a table of
-    // functions from the artifact that filled it, and the column outlives a
-    // reload, so declaring the type again points that table at the artifact
-    // that is still mapped.
-    //
-    // Mesh and texture files also import by extension in the resource scan, the
-    // file watcher and the editor, so these two calls add their registry
-    // entries as well as their types in the store.
-    engine.world_mut().register_imported_asset::<Mesh>();
-    engine.world_mut().register_imported_asset::<Texture>();
-    // A shader imports like those two: an `.hlsl` source with a `.hlsl.meta`
-    // beside it.
-    engine.world_mut().register_imported_asset::<Shader>();
-    // A material is a file of its own (`.material`), loaded by extension.
-    engine.world_mut().register_standalone_asset::<Material>();
-    // A pass is a file of its own too (`.render_pass`), loaded by extension.
-    engine.world_mut().register_standalone_asset::<RenderPass>();
-    // A chain is a file of its own too (`.pipeline`). The editor creates one
-    // from its dialog, and a project loads it by path.
-    engine
-        .world_mut()
-        .register_standalone_asset::<RenderingPipeline>();
-
-    // Step 3: Declare the reference fields the asset documents use, so the
+    // Step 2: Declare the reference fields the asset documents use, so the
     // editor can draw a picker without knowing any renderer type. Each target
     // is the Rust type the field holds, so a renamed type moves here with the
     // code. A `.*` key stands for a family: `textures.*` is every texture slot
@@ -164,12 +141,12 @@ pub fn register(engine: &mut Engine) -> u32 {
         );
     }
 
-    // Step 4: Declare the resources this crate inserts, before inserting them.
-    // Once the crate is a loaded module, a reload keeps the existing values and
-    // never calls `insert_resource` again, so this declaration is what points
-    // their drop functions at code that is still mapped.
-    engine.world_mut().register_resource::<RenderFrame>();
-    engine.world_mut().register_resource::<RenderingManager>();
+    // Step 3: Store the two resources this crate's systems read, once. A reload
+    // keeps the existing values and never calls `insert_resource` again; the
+    // declarations that point their drop functions at code which is still
+    // mapped need no call here, because `RenderFrame` and `RenderingManager`
+    // both declare themselves and the entry point declares them before this
+    // function runs.
     if engine.world().get_resource::<RenderFrame>().is_none() {
         engine.world_mut().insert_resource(RenderFrame::default());
     }
@@ -179,7 +156,7 @@ pub fn register(engine: &mut Engine) -> u32 {
         engine.world_mut().insert_resource(RenderingManager::new());
     }
 
-    // Step 5: Declare this crate's own assets - the default material the chain
+    // Step 4: Declare this crate's own assets - the default material the chain
     // draws with - from the crate's directory. The store then answers
     // `defaults/pill.pbr.material` by name and the editor lists the folder
     // read-only. A file that went missing stops the engine here instead of
@@ -189,7 +166,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     // so it has no module directory to declare.
     declare_crate_roots();
 
-    // Step 6: Install the pipeline the renderer runs when a project declares
+    // Step 5: Install the pipeline the renderer runs when a project declares
     // none: the PBR chain, installed as assets and pointed at by the manager. A
     // project that sets its own pipeline does so after this call, so its choice
     // wins.

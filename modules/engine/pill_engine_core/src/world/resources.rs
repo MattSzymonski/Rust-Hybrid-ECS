@@ -58,20 +58,42 @@ impl World {
         self.insert_resource_with_table(resource, ErasedResourceOps::of::<T>());
     }
 
-    /// Inserts a manager resource: a subsystem owner a project can configure.
+    /// Inserts a manager resource whose tuning lives in a settings asset.
     ///
     /// The value is stored exactly like [`Self::insert_resource`] stores one,
-    /// and its per-type table additionally carries the settings surface the
-    /// type declared ([`ManagerResource`](crate::settings::ManagerResource)):
-    /// the file stem, the complete default document and the applier. That is
-    /// what lets a host find the manager, write its settings file when the
-    /// project has none, and apply an edited document to the live value.
+    /// and its per-type table carries the surface the type declared
+    /// ([`SettingsAssetManager`](crate::settings::SettingsAssetManager)): the
+    /// settings name, the asset type's extension and the two appliers that
+    /// render a created file and apply an edited one. That is what lets a host
+    /// create, bind and re-apply the manager's settings without knowing its
+    /// document type.
     ///
     /// A manager that must survive a reload needs a `shared_name`: an id built
-    /// from `TypeId` differs in every generation, so the value would be
-    /// retired instead of kept (see [`Resource::shared_name`]).
-    pub fn insert_manager_resource<T: crate::settings::ManagerResource>(&mut self, resource: T) {
-        self.insert_resource_with_table(resource, ErasedResourceOps::of::<T>().with_manager::<T>());
+    /// from `TypeId` differs in every generation, so the value would be retired
+    /// instead of kept (see [`Resource::shared_name`]).
+    pub fn insert_settings_asset_manager<T: crate::settings::SettingsAssetManager>(
+        &mut self,
+        resource: T,
+    ) {
+        self.insert_resource_with_surface(resource, |table| table.with_settings_asset::<T>());
+    }
+
+    /// The insert half both manager paths share: keep whatever surface the
+    /// recorded table already carries, so a type that declares two of them -
+    /// a flat document and a settings asset - keeps both.
+    fn insert_resource_with_surface<T: Resource>(
+        &mut self,
+        resource: T,
+        add_surface: impl FnOnce(ErasedResourceOps) -> ErasedResourceOps,
+    ) {
+        let id = ResourceId::of::<T>();
+        let base = self
+            .resource_factories
+            .get(&id)
+            .copied()
+            .filter(|resource_ops| !resource_ops.foreign)
+            .unwrap_or_else(ErasedResourceOps::of::<T>);
+        self.insert_resource_with_table(resource, add_surface(base));
     }
 
     /// The storage half of every insert path, taking the per-type table the
@@ -177,12 +199,17 @@ impl World {
     /// `insert_resource`, so without this call nothing would contribute a table
     /// pointing at code that is still mapped.
     ///
-    /// Call it from a module's `init` for every resource type the module owns.
-    /// It is idempotent, so a reload that re-runs `init` can call it again. A
-    /// refused claim records its error and leaves the stored table alone, so a
-    /// generation that disagrees about who owns a name, or about the name's
-    /// shape, cannot re-point the live resource at its own code before its init
-    /// fails.
+    /// An artifact does not call this. It derives `PillResource` on the type,
+    /// and the artifact entry point declares every derived type before the
+    /// artifact's own `register` runs - on the first load, on every reload and
+    /// in a statically linked build alike. This method is what the entry point
+    /// calls, and what a host uses for a resource it owns itself.
+    ///
+    /// It is idempotent, so a generation that declares the type again is
+    /// harmless. A refused claim records its error and leaves the stored table
+    /// alone, so a generation that disagrees about who owns a name, or about
+    /// the name's shape, cannot re-point the live resource at its own code
+    /// before its init fails.
     pub fn register_resource<T: Resource>(&mut self) {
         self.register_resource_claiming::<T>();
     }
@@ -190,12 +217,42 @@ impl World {
     /// Declares that this artifact owns a manager resource type, without
     /// inserting a value.
     ///
+    /// Declares that this artifact owns a manager type whose tuning lives in a
+    /// settings asset, without inserting a value.
+    ///
     /// The manager counterpart of [`Self::register_resource`]: the stored table
-    /// gains the type's settings surface, so a host that already holds the
-    /// live value - or that finds no value at all - still knows the manager's
-    /// file stem and default document.
-    pub fn register_manager_resource<T: crate::settings::ManagerResource>(&mut self) {
-        self.register_resource_with_table::<T>(ErasedResourceOps::of::<T>().with_manager::<T>());
+    /// gains the type's settings-asset surface, so a host that already holds the
+    /// live value - or that finds no value at all - still knows the settings
+    /// name, the extension and the appliers.
+    ///
+    /// A manager's crate calls this from its own `register`, which runs on every
+    /// generation: the surface holds function pointers into the image that
+    /// registered it, so each generation re-points them.
+    pub fn register_settings_asset_manager<T: crate::settings::SettingsAssetManager>(&mut self) {
+        self.register_resource_surface::<T>(|table| table.with_settings_asset::<T>());
+    }
+
+    /// The declaration half both manager registrations share.
+    ///
+    /// Whatever surface the recorded table already carries is kept: another
+    /// registration in the same generation put it there, so it points at code
+    /// that is still mapped.
+    fn register_resource_surface<T: Resource>(
+        &mut self,
+        add_surface: impl FnOnce(ErasedResourceOps) -> ErasedResourceOps,
+    ) {
+        let id = ResourceId::of::<T>();
+        if !self.claim_shared_resource_name::<T>() {
+            return;
+        }
+        let base = self
+            .resource_factories
+            .get(&id)
+            .copied()
+            .filter(|resource_ops| !resource_ops.foreign)
+            .unwrap_or_else(ErasedResourceOps::of::<T>);
+        self.resource_factories.insert(id, add_surface(base));
+        self.note_resource_registration(id);
     }
 
     /// The declaration half of every register path, taking the per-type table
@@ -683,71 +740,6 @@ impl World {
         KeptLayoutDeclaration::from_ops(*resource_ops)
     }
 
-    /// Ids of every manager resource the world holds a live value for.
-    ///
-    /// A manager is a registered type whose table carries the settings surface
-    /// its declaration contributed ([`ManagerResource`](crate::settings::ManagerResource)).
-    /// Sorted, so a host that creates one settings file per manager writes
-    /// them in a stable order.
-    #[must_use]
-    pub fn manager_resource_ids(&self) -> Vec<ResourceId> {
-        let mut ids: Vec<ResourceId> = self
-            .resource_factories
-            .iter()
-            .filter(|(id, resource_ops)| {
-                resource_ops.manager.is_some() && self.resources.contains_key(id)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        ids.sort_unstable();
-        ids
-    }
-
-    /// The settings surface registered under `id`, copied out of the artifact
-    /// that registered it.
-    ///
-    /// Returns `None` for an id nothing registered, or whose type is not a
-    /// manager. The names and the default document are copied for the same
-    /// reason [`Self::kept_layout_declaration`] copies its lists: they live in
-    /// the registering image, and a host keeps them past its retirement.
-    #[must_use]
-    pub fn manager_settings(&self, id: ResourceId) -> Option<ManagerSettingsEntry> {
-        let resource_ops = self.resource_factories.get(&id)?;
-        let manager = resource_ops.manager?;
-        Some(ManagerSettingsEntry {
-            declaring_type_name: resource_ops
-                .declaring_type_name
-                .unwrap_or_default()
-                .to_owned(),
-            settings_name: manager.settings_name.to_owned(),
-            default_document: manager.default_document.to_owned(),
-        })
-    }
-
-    /// Applies a parsed document to the live manager stored under `id`.
-    ///
-    /// Returns `None` when nothing is stored under the id or its type declared
-    /// no settings surface, and the manager's own [`SettingsOutcome`]
-    /// otherwise. A refusal is the manager's call: it kept what it had and
-    /// logged why.
-    #[must_use]
-    pub fn apply_manager_settings(
-        &mut self,
-        id: ResourceId,
-        settings: &SettingsDocument,
-    ) -> Option<SettingsOutcome> {
-        let resource_ops = *self.resource_factories.get(&id)?;
-        let manager = resource_ops.manager?;
-        let resource = self.resources.get_mut(&id)?;
-        let value_pointer = resource.value_pointer_mut();
-        // SAFETY: the table was built by the type's own registration
-        // (`insert_manager_resource` or `register_manager_resource`), and the
-        // box under this id was created by that same registration, so the
-        // pointer names a live value of the type the applier expects. The box
-        // outlives the call, and the document is borrowed only for it.
-        Some(unsafe { (manager.apply)(value_pointer, settings) })
-    }
-
     /// Names declared by the shared resources this world holds a claim for,
     /// sorted and deduplicated.
     ///
@@ -1015,14 +1007,24 @@ impl World {
     /// [`ImportRegistry`](crate::asset_import_registry::ImportRegistry).
     ///
     /// Declares the asset type ([`Self::register_asset`]) and records `T`'s
-    /// import entry points, which are compiled into the calling binary. Call it
-    /// in the registration of the module that owns `T`, on every generation.
+    /// import entry points, which are compiled into the calling binary.
+    ///
+    /// An artifact does not call this. The crate that owns `T` derives
+    /// `PillAsset` with `#[pill(imported)]`, and the artifact entry point
+    /// declares every derived type on every generation, before the artifact's
+    /// own `register` runs. This method is what the entry point calls, and what
+    /// a host uses for an asset type it owns itself.
     ///
     /// The entry points live in the calling binary, so this also inserts a
     /// marker resource that the calling generation claims. When the host retires
     /// that claim - because the module stopped registering `T` or was unloaded -
     /// it drops the marker while the image is still mapped, and the registry
     /// stops calling into it.
+    ///
+    /// Registering a type again adds a newer registration that takes
+    /// precedence, so a project that links the crate and a module that owns it
+    /// can both declare it; the older one resumes when the newer generation is
+    /// retired.
     ///
     /// A type whose extension another live type already imports is refused
     /// with [`WorldError::ImportExtensionClaimedTwice`], recorded as a
@@ -1041,7 +1043,8 @@ impl World {
     ///
     /// The standalone counterpart of [`Self::register_imported_asset`], with the
     /// same liveness marker and the same refusal of an extension another type
-    /// already imports.
+    /// already imports. An artifact declares such a type by deriving `PillAsset`
+    /// with `#[pill(standalone)]`, and never by calling this method.
     pub fn register_standalone_asset<T>(&mut self)
     where
         T: crate::asset_standalone::StandaloneAsset,

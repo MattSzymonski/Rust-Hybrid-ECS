@@ -24,7 +24,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 // External crates
 use pill_core::{info, warn};
-use pill_engine::{AssetManager, Component, Entity, Handle, Query, Res, ResMut, SystemError};
+use pill_engine::{
+    system, AssetManager, Component, Entity, Handle, Query, Res, ResMut, SystemError,
+};
 pub use pill_renderer_api::frame::{
     CullMode, PassKind, PassTarget, RenderFrame, RenderInstance, ResolvedPass,
 };
@@ -288,6 +290,7 @@ fn note_ui_producer(producer: u8, producer_name: &str) {
 /// system returns and draws nothing. A world with no enabled camera still gets
 /// a frame, but the primary surface has no view unless a camera is bound to it,
 /// and the renderer skips a frame that has no views at all.
+#[system(name = "rendering", post_update)]
 pub fn rendering_system(
     mut frame: ResMut<RenderFrame>,
     assets: Res<AssetManager>,

@@ -38,7 +38,7 @@ use pill_core::{error, info};
 use pill_core::telemetry::{log_block_colored, Colorize};
 use pill_engine::Engine;
 use pill_engine::EngineApi;
-use pill_engine::{AssetGuid, SystemOwner};
+use pill_engine::{AssetGuid, SettingsOutcome, SystemOwner, World};
 use pill_player::registration::extension_owner;
 #[cfg(feature = "rendering")]
 use pill_player::{AttachedRenderer, RendererWindow};
@@ -229,17 +229,11 @@ pub struct DevHost {
     /// The project's `res` directory, for the asset browser; `None` when the
     /// configuration did not come from a project directory.
     asset_directory: Option<PathBuf>,
-    /// Watches the project's `settings` directory and queues the managers whose
-    /// settings file changed; `None` when no project directory is configured or
-    /// the watch could not start.
-    settings_watcher: Option<crate::settings_watcher::SettingsWatcher>,
-    /// The project's `settings` directory; `None` when the configuration did
-    /// not come from a project directory.
-    settings_directory: Option<PathBuf>,
     /// The [`Self::editor_revision`] the manager settings were last applied for.
     ///
-    /// A reload replaces managers, so the files are applied again after one;
-    /// the revision counter is the signal that something loaded or unloaded.
+    /// A reload replaces managers, so their settings assets are applied again
+    /// after one; the revision counter is the signal that something loaded or
+    /// unloaded.
     manager_settings_editor_revision: u64,
     /// Whether every source asset is kept paired with a `.meta` file; see
     /// [`DevHost::set_ensure_asset_metadata`]. Off unless a frontend asks.
@@ -1788,11 +1782,12 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     }
     // The project's managers take their settings now: every manager exists by
     // this point, because the project's `init` is the last artifact to
-    // register one. A project without `settings/` gets one file per manager,
-    // written from the manager's own defaults.
-    if let Some(directory) = &host_config.settings_directory {
-        crate::manager_settings::apply_all(runtime.engine_mut().world_mut(), directory);
-    }
+    // register one. A project whose `res/settings` holds no file for a manager
+    // gets one written from the manager's own document defaults.
+    apply_manager_settings_at_startup(
+        runtime.engine_mut().world_mut(),
+        host_config.asset_directory.as_deref(),
+    );
     let host = DevHost {
         workspace_root,
         project_module_config,
@@ -1818,8 +1813,6 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
             switches.assets_hot_reloading,
         ),
         asset_directory: host_config.asset_directory.clone(),
-        settings_watcher: start_settings_watcher(host_config.settings_directory.as_deref()),
-        settings_directory: host_config.settings_directory.clone(),
         manager_settings_editor_revision: 0,
         ensure_asset_metadata: false,
         editor_revision: 0,
@@ -3282,10 +3275,11 @@ pub(crate) fn run_reload_phase(host: &mut DevHost) -> Vec<String> {
 
     // Step 8: Apply asset edits, after every reload of this boundary, so they
     // go through the registrations current now.
-    apply_asset_changes(host);
-    // Step 9: The same for manager settings, and for a reload that replaced a
-    // manager under a document the project already had.
-    apply_manager_settings_changes(host);
+    let asset_changes = apply_asset_changes(host);
+    // Step 9: The same for manager settings: a settings file is an asset, so
+    // the watcher above is what notices an edit, and a reload rebuilds the
+    // manager that has to take it again.
+    apply_manager_settings_changes(host, asset_changes);
     reloaded_extensions
 }
 
@@ -3340,69 +3334,176 @@ fn guid_text(guid: Option<AssetGuid>) -> String {
     guid.map_or_else(|| "none".to_owned(), |guid| guid.to_string())
 }
 
-/// Start watching the project's settings directory for manager settings edits.
+/// Applies every manager's settings asset once the project has loaded, writing
+/// a missing file first.
 ///
-/// The directory is created when it does not exist yet: a project that has no
-/// manager settings today may gain one, and a watch that never started cannot
-/// be started later without this path running again.
-fn start_settings_watcher(
-    settings_directory: Option<&Path>,
-) -> Option<crate::settings_watcher::SettingsWatcher> {
-    let settings_directory = settings_directory?;
-    if !settings_directory.is_dir() {
-        if let Err(error) = std::fs::create_dir_all(settings_directory) {
-            warn!(
+/// Runs after the project's `init`, which is the first moment every manager
+/// exists. A project whose `res/settings` holds no file for a manager gets one
+/// written from the manager's own document defaults, so the file a person edits
+/// already spells out every field.
+///
+/// A host with no project directory - a shipped bundle - creates nothing and
+/// applies nothing: the manager keeps the values its document defaults give it.
+fn apply_manager_settings_at_startup(world: &mut World, asset_directory: Option<&Path>) {
+    let Some(directory) = asset_directory else {
+        return;
+    };
+    // Step 1: Write a file for every manager that has none.
+    for missing in world.missing_manager_settings() {
+        let path = directory.join(&missing.path);
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                warn!(
+                    target: telemetry_target::HOT_RELOAD,
+                    manager = missing.settings_name.as_str(),
+                    path = %path.display(),
+                    error = %error,
+                    "[settings] could not create the settings directory; the manager keeps its defaults"
+                );
+                continue;
+            }
+        }
+        match std::fs::write(&path, &missing.bytes) {
+            Ok(()) => info!(
                 target: telemetry_target::HOT_RELOAD,
-                directory = %settings_directory.display(),
+                manager = missing.settings_name.as_str(),
+                path = %path.display(),
+                "[settings] created the manager settings asset"
+            ),
+            Err(error) => warn!(
+                target: telemetry_target::HOT_RELOAD,
+                manager = missing.settings_name.as_str(),
+                path = %path.display(),
                 error = %error,
-                "[settings] could not create the project's settings directory; edits to manager settings will not be applied"
-            );
-            return None;
+                "[settings] could not create a manager's settings asset; the manager keeps its defaults"
+            ),
         }
     }
-    match crate::settings_watcher::SettingsWatcher::spawn(settings_directory.to_owned()) {
-        Ok(watcher) => Some(watcher),
-        Err(error) => {
-            warn!(
-                target: telemetry_target::HOT_RELOAD,
-                directory = %settings_directory.display(),
-                error = %error,
-                "[settings] could not watch the project's manager settings; edits will not be applied"
-            );
-            None
+    // Step 2: Apply each one that now has a file.
+    for manager in world.settings_asset_manager_ids() {
+        let Some(surface) = world.manager_settings_surface(manager) else {
+            continue;
+        };
+        let Some(path) = world.manager_settings_path(manager) else {
+            continue;
+        };
+        if !directory.join(&path).is_file() {
+            continue;
+        }
+        match world.apply_manager_settings_asset(manager) {
+            Some(Ok(outcome)) => {
+                log_manager_settings_applied(
+                    &surface.settings_name,
+                    Path::new(&path),
+                    outcome,
+                    false,
+                );
+            }
+            Some(Err(reason)) => {
+                log_manager_settings_failure(&surface.settings_name, &path, &reason)
+            }
+            None => {}
         }
     }
 }
 
-/// Re-apply the manager settings whose files changed, and every file after a
-/// reload.
+/// Re-applies the manager settings assets whose bytes changed, and every one of
+/// them after a reload.
 ///
 /// A reload replaces managers, so the documents the project already had are
 /// applied again - a manager that was rebuilt has to take them once more. The
 /// editor revision is what says a reload happened; nothing here needs to know
 /// which artifact it replaced.
-fn apply_manager_settings_changes(host: &mut DevHost) {
-    let Some(settings_directory) = host.settings_directory.clone() else {
+///
+/// A settings file is an asset, so the asset watcher is what notices an edit:
+/// the change is read back and applied against the bytes the manager already
+/// took, which is why an edit that changes nothing applies nothing.
+fn apply_manager_settings_changes(host: &mut DevHost, asset_changes: usize) {
+    let reloaded = host.manager_settings_editor_revision != host.editor_revision;
+    if !reloaded && asset_changes == 0 {
         return;
-    };
-    if host.manager_settings_editor_revision != host.editor_revision {
+    }
+    if reloaded {
         host.manager_settings_editor_revision = host.editor_revision;
-        crate::manager_settings::apply_all(
-            host.runtime.engine_mut().world_mut(),
-            &settings_directory,
-        );
     }
-    let Some(settings_watcher) = &host.settings_watcher else {
+    let world = host.runtime.engine_mut().world_mut();
+    if reloaded {
+        for manager in world.settings_asset_manager_ids() {
+            let Some(surface) = world.manager_settings_surface(manager) else {
+                continue;
+            };
+            let Some(path) = world.manager_settings_path(manager) else {
+                continue;
+            };
+            match world.apply_manager_settings_asset(manager) {
+                Some(Ok(outcome)) => {
+                    log_manager_settings_applied(
+                        &surface.settings_name,
+                        Path::new(&path),
+                        outcome,
+                        false,
+                    );
+                }
+                Some(Err(reason)) => {
+                    log_manager_settings_failure(&surface.settings_name, &path, &reason);
+                }
+                None => {}
+            }
+        }
         return;
-    };
-    let changed_managers = settings_watcher.drain();
-    for settings_name in changed_managers {
-        crate::manager_settings::apply_named(
-            host.runtime.engine_mut().world_mut(),
-            &settings_directory,
-            &settings_name,
+    }
+    let report = world.refresh_manager_settings();
+    for applied in &report.applied {
+        log_manager_settings_applied(
+            &applied.settings_name,
+            Path::new(&applied.path),
+            applied.outcome,
+            true,
         );
     }
+    for failure in &report.failures {
+        log_manager_settings_failure(&failure.settings_name, &failure.path, &failure.reason);
+    }
+}
+
+/// Logs what one manager did with its settings document.
+///
+/// `changed` says the file differs from the one already applied, which is what
+/// says an edit reached the running manager rather than a start-up pass
+/// re-reading what it already had.
+fn log_manager_settings_applied(
+    settings_name: &str,
+    path: &Path,
+    outcome: SettingsOutcome,
+    changed: bool,
+) {
+    match outcome {
+        SettingsOutcome::Applied => info!(
+            target: telemetry_target::HOT_RELOAD,
+            manager = settings_name,
+            path = %path.display(),
+            changed,
+            "[settings] applied manager settings"
+        ),
+        SettingsOutcome::Refused => warn!(
+            target: telemetry_target::HOT_RELOAD,
+            manager = settings_name,
+            path = %path.display(),
+            "[settings] refused manager settings; the manager keeps the values it has"
+        ),
+    }
+}
+
+/// Logs a settings asset that could not be read, is not the manager's type, or
+/// does not fit its document.
+fn log_manager_settings_failure(settings_name: &str, path: &str, reason: &str) {
+    warn!(
+        target: telemetry_target::HOT_RELOAD,
+        manager = settings_name,
+        path,
+        reason,
+        "[settings] refused manager settings; the manager keeps the values it has"
+    );
 }
 
 /// Import or reimport every asset the watcher reported, through the world's
@@ -3417,13 +3518,14 @@ fn apply_manager_settings_changes(host: &mut DevHost) {
 /// Nothing here ever removes an asset. A failed reimport leaves the loaded
 /// value in place, and a deleted source stays loaded until the next run,
 /// because components may still hold its handle.
-fn apply_asset_changes(host: &mut DevHost) {
+fn apply_asset_changes(host: &mut DevHost) -> usize {
     let Some(watcher) = &host.asset_watcher else {
-        return;
+        return 0;
     };
     let changes = watcher.drain();
+    let change_count = changes.len();
     if changes.is_empty() {
-        return;
+        return 0;
     }
     let ensure_metadata = host.ensure_asset_metadata;
     // Every path the batch touched, so the asset database follows it once the
@@ -3441,10 +3543,10 @@ fn apply_asset_changes(host: &mut DevHost) {
     // A clone, so the registry can be called against the asset manager, which
     // is a second resource of the same world.
     let Some(registry) = world.get_resource::<pill_engine::ImportRegistry>().cloned() else {
-        return;
+        return change_count;
     };
     let Some(assets) = world.get_resource_mut::<pill_engine::AssetManager>() else {
-        return;
+        return change_count;
     };
     // Only files a registered type imports are assets; the rest of `res`
     // (shaders, configuration, licences) is not this code's business.
@@ -3592,6 +3694,7 @@ fn apply_asset_changes(host: &mut DevHost) {
             "[assets] database refreshed"
         );
     }
+    change_count
 }
 
 /// One scheduler frame and its reporting, run by the wrapped runtime.

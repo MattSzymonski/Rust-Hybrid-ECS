@@ -448,13 +448,19 @@ impl Drop for ValueTypeLayoutScope {
 ///
 /// 1. this artifact's value types become the world's field-layout resolver;
 /// 2. every component the artifact declares is registered;
-/// 3. `before_init` runs - a project loads the startup scene it queued here,
+/// 3. every system the artifact declares is registered, in `(order, name)`
+///    order;
+/// 4. every resource the artifact declares is declared, so a `register` half
+///    that stores a value finds the declaration already in place;
+/// 5. every asset type the artifact declares is declared, so the import
+///    registry points its entry points at this image;
+/// 6. `before_init` runs - a project loads the startup scene it queued here,
 ///    because the component types exist and the project has not yet seeded its
 ///    own entities over them;
-/// 4. the artifact's `register` runs - the half a later generation repeats, so
+/// 7. the artifact's `register` runs - the half a later generation repeats, so
 ///    the systems it registers belong to the image that is running;
-/// 5. the user's one-time `init` runs;
-/// 6. the registration-error slot is read once more, because `before_init`, the
+/// 8. the user's one-time `init` runs;
+/// 9. the registration-error slot is read once more, because `before_init`, the
 ///    registration or the user's `init` can record an error after the drain in
 ///    step 2 already looked at it.
 ///
@@ -471,10 +477,14 @@ pub fn run_artifact_entry(
     // Step 1: install this artifact's value types as the world's layout
     // resolver.
     let scope = ValueTypeLayoutScope::install(engine);
-    // Steps 2-4: register the components, load what `before_init` queued, run
-    // the artifact's registration, then its one-time `init`.
+    // Steps 2-7: register the components, the declared systems, resources and
+    // asset types, load what `before_init` queued, run the artifact's
+    // registration, then its one-time `init`.
     let mut status = match register_all_components(engine.world_mut()) {
         Ok(()) => {
+            crate::declarations::register_all_systems(engine);
+            crate::declarations::register_all_resources(engine.world_mut());
+            crate::declarations::register_all_assets(engine.world_mut());
             before_init(engine);
             match register(engine) {
                 0 => init(engine),
@@ -484,7 +494,7 @@ pub fn run_artifact_entry(
         // The failure was logged; a half-registered artifact must not run.
         Err(_error) => u32::MAX,
     };
-    // Step 5: catch a registration error raised after the drain in step 2.
+    // Step 9: catch a registration error raised after the drain in step 2.
     if status != u32::MAX && engine.world_mut().take_registration_error().is_some() {
         status = u32::MAX;
     }
@@ -505,16 +515,21 @@ pub fn run_artifact_init(
 /// Runs one artifact's registration, and nothing else.
 ///
 /// This is the half a later generation repeats: [the value types and the
-/// components](run_artifact_entry) come back with the new image, and the
-/// artifact's `register` re-registers the systems and resources whose code
-/// moved with it. The one-time work - `before_init`, the user's `init` - is
-/// deliberately absent, so a reload cannot seed a world twice.
+/// components](run_artifact_entry) come back with the new image, the declared
+/// systems, resources and asset types are declared again, and the artifact's
+/// `register` runs last. The one-time work - `before_init`, the user's `init` -
+/// is deliberately absent, so a reload cannot seed a world twice.
 ///
 /// Returns zero on success, exactly like the entry points it serves.
 pub fn run_artifact_registration(engine: &mut Engine, register: fn(&mut Engine) -> u32) -> u32 {
     let scope = ValueTypeLayoutScope::install(engine);
     let mut status = match register_all_components(engine.world_mut()) {
-        Ok(()) => register(engine),
+        Ok(()) => {
+            crate::declarations::register_all_systems(engine);
+            crate::declarations::register_all_resources(engine.world_mut());
+            crate::declarations::register_all_assets(engine.world_mut());
+            register(engine)
+        }
         // The failure was logged; a half-registered artifact must not run.
         Err(_error) => u32::MAX,
     };

@@ -89,6 +89,12 @@ UNDECLARED_EDIT = "\n// layout-fingerprint suite: an edit the witness does not d
 # Host and fixture log lines this suite asserts on.
 RELOAD_STARTED_TOKEN = "building project module"
 RELOAD_COMPLETE_TOKEN = "hot reload complete"
+# The host's own "everything is loaded and watched" line. Every edit below waits
+# for it first: the file watcher takes its baseline when it arms, a moment after
+# the witness enters the world, so an edit written before that baseline exists
+# is never reported as a change and the scenario would wait for a reload that
+# cannot come.
+HOST_READY_TOKEN = "Entering project loop"
 LAYOUT_CHANGED_TOKEN = "resource layout changed"
 WITNESS_INSERTED_TOKEN = "[test] layout witness inserted"
 WITNESS_DROPPED_TOKEN = "[test] layout witness dropped"
@@ -218,6 +224,10 @@ def main() -> int:
 
         # Step 2: An edit the witness does not declare. The project reloads and
         # the value has to survive: no drop line may appear at all.
+        if not monitor.wait_for(HOST_READY_TOKEN, STARTUP_TIMEOUT_SECONDS * scale):
+            print("  [FAIL] the host never entered its project loop; last output was:")
+            print(monitor.output_since(0)[-1500:])
+            return 1
         start = monitor.line_count
         UNDECLARED_FILE.write_bytes(undeclared_bytes + UNDECLARED_EDIT.encode("utf-8"))
         if not monitor.wait_for(RELOAD_STARTED_TOKEN, RELOAD_TIMEOUT_SECONDS * scale, start):

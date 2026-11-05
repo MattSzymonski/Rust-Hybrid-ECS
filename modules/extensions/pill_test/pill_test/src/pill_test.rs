@@ -79,6 +79,7 @@ pub struct ModuleTest {
 /// Registered under the name `module_test_processor`. The scheduler derives
 /// the system's access pattern from the query signature, so it places the
 /// system among the project's systems automatically.
+#[system(name = "module_test_processor", order = 10)]
 fn module_test_processor(mut query: Query<&mut ModuleTest>) -> Result<(), SystemError> {
     for mut state in query.iter_mut() {
         state.processed_frame_count += 1;
@@ -91,22 +92,22 @@ fn module_test_processor(mut query: Query<&mut ModuleTest>) -> Result<(), System
 // Registration
 // =============================================================================
 
-/// Registers the module's system and fills the world up to its entity count.
+/// Fills the world up to the module's entity count.
 ///
-/// This is the half a reload repeats: the systems, resources and entities whose
-/// code moved with the arriving image. It must be idempotent, because a first
-/// load reaches it too, immediately before [`init`], and a failed generation
-/// rolls back by calling it again on the older image.
+/// This is the half a reload repeats: the resources and entities whose code
+/// moved with the arriving image. It must be idempotent, because a first load
+/// reaches it too, immediately before [`init`], and a failed generation rolls
+/// back by calling it again on the older image.
+///
+/// The system needs no registration of its own: [`module_test_processor`]
+/// declares itself, so the engine registers it before this function runs.
 ///
 /// # Errors
 ///
 /// Returns 1 when an entity cannot be created. The host reads any non-zero
 /// status as a failed generation and rolls back to the previous library.
 pub fn register(engine: &mut Engine) -> u32 {
-    // Step 1: Register the system that advances the component.
-    engine.register_system("module_test_processor", module_test_processor);
-
-    // Step 2: Fill the world up to the target count instead of spawning a
+    // Step 1: Fill the world up to the target count instead of spawning a
     // fresh batch, because a reload keeps the entities the previous generation
     // created - and fills back up when a dropped column took them with it.
     let existing_entity_count = {

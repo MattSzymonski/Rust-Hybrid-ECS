@@ -182,14 +182,6 @@ pub struct StaticProject {
     /// A natively linked project gets it before its `init` seeds anything; an
     /// external backend gets it once its `start` has returned.
     pub startup_scene: Option<&'static str>,
-    /// The project's manager settings documents, baked in by the bundle
-    /// generator from `<project>/settings/*.yaml`.
-    ///
-    /// A bundle has no writable project directory, so the documents it applies
-    /// are the ones the project shipped. A manager with none keeps its code
-    /// defaults, which are the values the development host would have written
-    /// into the file.
-    pub manager_settings: &'static [StaticManagerSettings],
 }
 
 impl StaticProject {
@@ -280,75 +272,13 @@ impl StaticProject {
             external = project_guard.is_some(),
             "project linked"
         );
-        // Step 3: The manager settings the bundle baked. After the project,
-        // because a manager may be one the project registers itself.
-        self.apply_manager_settings(engine);
+        // Step 3: Every manager's settings asset, out of the pack the frontend
+        // mounted. After the project, because a manager may be one the project
+        // registers itself. A bundle has no writable project directory, so a
+        // manager without a file keeps its document defaults.
+        apply_manager_settings(engine);
         Ok(project_guard)
     }
-
-    /// Applies every baked manager settings document to the manager it names.
-    ///
-    /// A name no loaded manager answers to is reported and skipped: a project
-    /// can keep a settings file for a module it stopped selecting, and that is
-    /// not a reason to stop the build.
-    fn apply_manager_settings(&self, engine: &mut Engine) {
-        for baked in self.manager_settings {
-            let world = engine.world_mut();
-            let manager_id = world.manager_resource_ids().into_iter().find(|id| {
-                world
-                    .manager_settings(*id)
-                    .is_some_and(|entry| entry.settings_name == baked.name)
-            });
-            let Some(manager_id) = manager_id else {
-                info!(
-                    target: pill_core::telemetry::telemetry_target::LINK,
-                    manager = baked.name,
-                    "a baked manager settings document named no loaded manager"
-                );
-                continue;
-            };
-            let document = match pill_engine::SettingsDocument::parse(baked.document) {
-                Ok(document) => document,
-                Err(error) => {
-                    warn!(
-                        target: pill_core::telemetry::telemetry_target::LINK,
-                        manager = baked.name,
-                        reason = %error,
-                        "a baked manager settings document does not read; the manager keeps its defaults"
-                    );
-                    continue;
-                }
-            };
-            match world.apply_manager_settings(manager_id, &document) {
-                Some(pill_engine::SettingsOutcome::Applied) => info!(
-                    target: pill_core::telemetry::telemetry_target::LINK,
-                    manager = baked.name,
-                    keys = document.len(),
-                    "[settings] applied manager settings"
-                ),
-                Some(pill_engine::SettingsOutcome::Refused) => warn!(
-                    target: pill_core::telemetry::telemetry_target::LINK,
-                    manager = baked.name,
-                    "a baked manager settings document was refused; the manager keeps its defaults"
-                ),
-                None => {}
-            }
-        }
-    }
-}
-
-/// One manager's settings document, compiled into the binary as text.
-///
-/// Text rather than parsed values, for the same reason [`StaticLogging`] is
-/// text: the generated bundle names no engine type beyond this struct, and the
-/// manager's own applier is the one that reads the document.
-#[derive(Clone, Copy, Debug)]
-pub struct StaticManagerSettings {
-    /// The manager's settings name, which is the file stem it was baked from
-    /// (`pill_audio` for `settings/pill_audio_settings.yaml`).
-    pub name: &'static str,
-    /// The document's text, as the project wrote it.
-    pub document: &'static str,
 }
 
 /// A project's logging settings, compiled into the binary as text.
@@ -397,6 +327,50 @@ impl StaticLogging {
 // =============================================================================
 // Free Functions
 // =============================================================================
+
+/// Applies every manager's settings asset, reading each one from the mounted
+/// asset roots - in a bundle, the pack.
+///
+/// A settings asset is an ordinary file under `res/settings`, so a shipped
+/// build needs nothing baked: the pack answers the conventional path the same
+/// way a project directory does. A manager with no file keeps its document
+/// defaults, which is what a bundle that ships no settings for it means.
+///
+/// A refusal is the manager's own call, and a file that does not fit is the
+/// project's - both are logged and neither stops the build.
+fn apply_manager_settings(engine: &mut Engine) {
+    let world = engine.world_mut();
+    for manager in world.settings_asset_manager_ids() {
+        let Some(surface) = world.manager_settings_surface(manager) else {
+            continue;
+        };
+        let Some(path) = world.manager_settings_path(manager) else {
+            continue;
+        };
+        match world.apply_manager_settings_asset(manager) {
+            Some(Ok(pill_engine::SettingsOutcome::Applied)) => info!(
+                target: pill_core::telemetry::telemetry_target::LINK,
+                manager = surface.settings_name.as_str(),
+                path = path.as_str(),
+                "[settings] applied manager settings"
+            ),
+            Some(Ok(pill_engine::SettingsOutcome::Refused)) => warn!(
+                target: pill_core::telemetry::telemetry_target::LINK,
+                manager = surface.settings_name.as_str(),
+                path = path.as_str(),
+                "[settings] refused manager settings; the manager keeps its values"
+            ),
+            Some(Err(reason)) => warn!(
+                target: pill_core::telemetry::telemetry_target::LINK,
+                manager = surface.settings_name.as_str(),
+                path = path.as_str(),
+                reason = reason.as_str(),
+                "[settings] no settings asset was applied; the manager keeps its document defaults"
+            ),
+            None => {}
+        }
+    }
+}
 
 /// Queue and load a project's startup scene, warning when it cannot be read.
 ///
@@ -479,7 +453,6 @@ pub(crate) fn test_project(backend: StaticProjectBackend) -> StaticProject {
         logging: StaticLogging::NONE,
         debug_draw: false,
         startup_scene: None,
-        manager_settings: &[],
     }
 }
 
@@ -588,82 +561,6 @@ mod tests {
         let project = test_project(StaticProjectBackend::Native { init: no_op });
         let guard = project.initialize(&mut engine).expect("it succeeds");
         assert!(guard.is_none());
-    }
-
-    /// A manager the tests give a settings surface.
-    #[derive(Debug, PartialEq)]
-    struct BakeProbe {
-        /// The number the applier reads.
-        gain: f32,
-    }
-
-    impl pill_engine::Resource for BakeProbe {
-        fn shared_name() -> Option<&'static str> {
-            Some("pill_player::static_project::tests::BakeProbe")
-        }
-    }
-
-    impl pill_engine::ManagerResource for BakeProbe {
-        fn settings_name() -> &'static str {
-            "bake_probe"
-        }
-
-        fn default_settings() -> &'static str {
-            "gain: 1.0\n"
-        }
-
-        fn apply_settings(
-            &mut self,
-            settings: &pill_engine::SettingsDocument,
-        ) -> pill_engine::SettingsOutcome {
-            if !settings.unknown_keys(&["gain"]).is_empty() {
-                return pill_engine::SettingsOutcome::Refused;
-            }
-            if let Some(gain) = settings.float("gain") {
-                self.gain = gain as f32;
-            }
-            pill_engine::SettingsOutcome::Applied
-        }
-    }
-
-    /// The manager registers itself in the project's `init`, which is where a
-    /// real project puts one.
-    fn registers_bake_probe(engine: &mut Engine) -> u32 {
-        engine
-            .world_mut()
-            .insert_manager_resource(BakeProbe { gain: 1.0 });
-        0
-    }
-
-    /// A baked document is applied to the manager it names after the project
-    /// starts, and a document naming no manager is skipped.
-    #[test]
-    fn a_baked_document_is_applied_to_the_manager_it_names() {
-        static MANAGER_SETTINGS: &[StaticManagerSettings] = &[
-            StaticManagerSettings {
-                name: "bake_probe",
-                document: "gain: 4.5\n",
-            },
-            StaticManagerSettings {
-                name: "no_such_manager",
-                document: "gain: 1.0\n",
-            },
-        ];
-        let mut engine = Engine::new();
-        let project = StaticProject {
-            manager_settings: MANAGER_SETTINGS,
-            ..test_project(StaticProjectBackend::Native {
-                init: registers_bake_probe,
-            })
-        };
-
-        project.initialize(&mut engine).expect("it succeeds");
-
-        assert_eq!(
-            engine.world().get_resource::<BakeProbe>(),
-            Some(&BakeProbe { gain: 4.5 }),
-            "the baked document is in effect"
-        );
     }
 
     /// An external backend starts after the modules, is handed the components

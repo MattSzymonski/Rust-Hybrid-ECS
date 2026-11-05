@@ -512,7 +512,7 @@ pub fn run_frame(
     // sees the project's data, that the frame counter survives a reload or a
     // patch (which shows the session resource did too), and which entity the
     // snapshot's detail describes.
-    if frame_index.is_multiple_of(210) {
+    if frame_index.is_multiple_of(212) {
         let detail_entity = snapshot
             .detail
             .as_ref()

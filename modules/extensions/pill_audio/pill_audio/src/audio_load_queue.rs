@@ -16,13 +16,20 @@
 // Standard library
 use std::collections::BTreeMap;
 
+// External crates
+use pill_engine::PillResource;
+
 // =============================================================================
 // AudioLoadQueue
 // =============================================================================
 
 /// Queued sound loads, keyed by playback name, waiting for the audio system.
+///
+/// The shared name is what lets a project and this module reach one queue: an
+/// id built from `TypeId` differs between the two images.
 #[repr(C)]
-#[derive(Default)]
+#[derive(Default, PillResource)]
+#[pill(shared = "pill_audio::AudioLoadQueue")]
 pub struct AudioLoadQueue {
     /// The encoded bytes of each queued sound, by playback name.
     pub(crate) sounds: BTreeMap<String, Vec<u8>>,
@@ -35,15 +42,6 @@ impl AudioLoadQueue {
     pub fn load(&mut self, playback_name: &str, encoded_bytes: &[u8]) {
         self.sounds
             .insert(playback_name.to_owned(), encoded_bytes.to_vec());
-    }
-}
-
-// The trait is written with its full path, not imported: the hot-patch
-// inventory is generated at the crate root, where this module's `use` lines
-// are not visible, so the method would be left out of it.
-impl pill_engine::Resource for AudioLoadQueue {
-    fn shared_name() -> Option<&'static str> {
-        Some("pill_audio::AudioLoadQueue")
     }
 }
 

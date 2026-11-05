@@ -39,7 +39,7 @@ use pill_editor_core::editor_state::{EditorSelection, EditorSnapshot};
 use pill_editor_core::notices::EditorNotices;
 use pill_editor_core::panels::{PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest};
 use pill_editor_core::session::EguiShellState;
-use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
+use pill_engine::{pill_hot, pill_module, system, Engine, Res, ResMut};
 
 // Current crate
 // The shell's public items, re-exported so a patch crate's
@@ -139,10 +139,11 @@ pub fn register(engine: &mut Engine) -> u32 {
             draw: shell::spline_tool_panel,
         });
     }
-    // Step 6: the per-frame system that runs the dock. It is a post-update
-    // system, like the renderer's frame build, so it keeps running while the
-    // engine is paused.
-    engine.register_post_update_system("egui_shell", egui_shell_update);
+    // Step 6: the per-frame system that runs the dock needs no call of its
+    // own. `egui_shell_update` declares itself as a post-update system, like
+    // the renderer's frame build, so it keeps running while the engine is
+    // paused; the engine registers it before this function runs, on every
+    // generation.
     // Note: the egui editor's end-to-end suite looks for this exact line.
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ECS,
@@ -177,6 +178,7 @@ pub fn init(engine: &mut Engine) -> u32 {
 /// windows. After it, it drains [`EguiShellFrame`].
 #[allow(clippy::type_complexity)]
 #[pill_hot]
+#[system(name = "egui_shell", post_update)]
 pub fn egui_shell_update(
     resources: (
         ResMut<EguiShellState>,

@@ -101,12 +101,12 @@ pub fn init(engine: &mut Engine) -> u32 {
     0
 }
 
-/// Registers the example's own report system.
+/// The registration half.
 ///
-/// Runs on every generation: a reload replaces the previous generation's copy,
-/// so the project never ends up with two.
-pub fn register(engine: &mut Engine) -> u32 {
-    engine.register_system("audio_example_report", report_playback);
+/// The report system needs no call of its own: [`report_playback`] declares
+/// itself, so the engine registers it on every generation and a reload never
+/// leaves the project with two.
+pub fn register(_engine: &mut Engine) -> u32 {
     0
 }
 
@@ -115,6 +115,7 @@ pub fn register(engine: &mut Engine) -> u32 {
 // =============================================================================
 
 /// Logs once, on the first frame a source reports that it is playing.
+#[system(name = "audio_example_report", order = 10)]
 fn report_playback(mut sources: Query<&AudioSourceComponent>) {
     if PLAYBACK_REPORTED.load(Ordering::Relaxed) {
         return;

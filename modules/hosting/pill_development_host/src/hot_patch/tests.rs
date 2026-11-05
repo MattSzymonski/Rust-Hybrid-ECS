@@ -289,6 +289,7 @@ fn generated_source_namespaces_the_entry_and_the_export() {
         "use pill_engine::*;\n\n#[pill_hot]\nfn movement(value: i32) -> i32 { value * 2 }\n";
     let generated_source = session
         .generate(
+            &session.crate_root,
             source_contents,
             &system_declaration("movement"),
             "project::movement",
@@ -317,6 +318,7 @@ fn a_plain_function_keeps_its_own_attribute() {
 
     let generated_source = session
         .generate(
+            &session.crate_root,
             PLAIN_SOURCE,
             &plain_declaration("get_color_a"),
             "project::get_color_a",
@@ -329,6 +331,70 @@ fn a_plain_function_keeps_its_own_attribute() {
     assert!(!generated_source.contains("pill_hot(name"));
     assert!(generated_source.contains("pill_hot_resolver!(pill_patch_resolve)"));
     assert!(generated_source.contains("133.0"));
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// An import the copied body never names is left out of the generated source.
+///
+/// The patch compiles as its own crate, where a path into a module of the
+/// changed file resolves nothing. Carrying an import the body does not need
+/// fails a patch whose body is otherwise perfectly patchable.
+#[test]
+fn an_import_the_body_never_names_is_left_out() {
+    let directory = ScratchDirectory::new("generate_unused_import");
+    let source_text = "mod physics;\nuse physics::{ball_spawn_state, physics_system};\n\n\
+                       #[pill_hot]\nfn counter_system() { let _threshold = 200.0; }\n";
+    let session = session_over(&directory, source_text);
+
+    let generated_source = session
+        .generate(
+            &session.crate_root,
+            source_text,
+            &system_declaration("counter_system"),
+            "project::counter_system",
+        )
+        .expect("a body-only system must generate");
+
+    assert!(
+        !generated_source.contains("use physics::"),
+        "an import the body never names would fail the patch compile:\n{generated_source}"
+    );
+    assert!(generated_source.contains("use project::*;"));
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A patch for a function in a module file imports that file's own module, so
+/// a type declared beside the function resolves even when the crate root does
+/// not re-export it.
+#[test]
+fn a_module_file_patch_names_its_own_types() {
+    let directory = ScratchDirectory::new("generate_module_types");
+    let session = session_over(&directory, "pub mod audio_manager;\n");
+    let module_source = "use crate::sound::Sound;\n\npub struct AudioSettings;\n\n\
+                         #[pill_hot]\nfn apply_settings(settings: AudioSettings) {}\n";
+    let module_file = directory.write("audio_manager.rs", module_source);
+
+    let generated_source = session
+        .generate(
+            &module_file,
+            module_source,
+            &system_declaration("apply_settings"),
+            "project::audio_manager::apply_settings",
+        )
+        .expect("a system in a module file must generate");
+
+    assert!(
+        generated_source.contains("use project::audio_manager::AudioSettings;"),
+        "a type declared beside the function must be in scope:\n{generated_source}"
+    );
+    // `crate` names the patch crate, which has no `sound` module, and the
+    // body never names `Sound`.
+    assert!(
+        !generated_source.contains("use crate::"),
+        "a `crate`-rooted import cannot resolve in a patch crate:\n{generated_source}"
+    );
 
     let _ = std::fs::remove_dir_all(&directory);
 }
@@ -558,6 +624,7 @@ fn size(&self) -> u32 { 222 }\n}\n";
     };
     let generated_source = session
         .generate(
+            &session.crate_root,
             source_text,
             &beta_declaration,
             "project::<Beta as Shape>::size",
@@ -1387,6 +1454,7 @@ fn generation_reports_a_missing_function() {
     };
     assert!(session
         .generate(
+            &session.crate_root,
             "fn other() {}",
             &system_declaration("movement"),
             "project::movement",

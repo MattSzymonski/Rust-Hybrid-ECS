@@ -57,7 +57,7 @@ pub struct ReportSchedule {
 
 impl Resource for ReportSchedule {}
 
-/// Seeds the world, the report schedule and the one system that advances it.
+/// Seeds the world and the report schedule.
 ///
 /// Returns `0` when the world is ready, or `1` if an entity could not be
 /// created. The host treats any non-zero status as a failed initialization.
@@ -78,9 +78,6 @@ pub fn init(engine: &mut Engine) -> u32 {
             return 1;
         }
     }
-
-    // Step 3: Register the system that advances the tickers.
-    engine.register_system("tick", tick_system);
     0
 }
 
@@ -89,6 +86,7 @@ pub fn init(engine: &mut Engine) -> u32 {
 ///
 /// Missing `Time` or a missing report timer only means no report is logged;
 /// the tickers still advance.
+#[system(name = "tick")]
 fn tick_system(
     time: Res<Time>,
     mut tickers: Query<&mut TickCounter>,

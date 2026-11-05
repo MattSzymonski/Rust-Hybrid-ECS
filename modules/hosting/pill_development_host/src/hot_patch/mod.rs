@@ -53,6 +53,8 @@ use pill_engine::Engine;
 pub(crate) mod compile;
 /// Patch generations: each function's patch history, which a rollback reads.
 pub(crate) mod generations;
+/// The changed file's imports, rooted where a generated patch resolves them.
+mod imports;
 /// Patch routes: where a body is installed and how calls reach it.
 pub(crate) mod routes;
 /// The source scanner, shared with every crate's build script.
@@ -599,6 +601,7 @@ impl HotPatchSession {
             // `slot_lookup_name`.
             let slot_name = self.slot_lookup_name(&path, &declaration);
             match self.prepare_body(
+                &path,
                 &edit.new_contents,
                 &declaration,
                 &qualified,
@@ -863,9 +866,11 @@ impl HotPatchSession {
     /// Generate one body's patch source and collect everything its build needs,
     /// up to but not including running `rustc`.
     ///
-    /// `slot_name` is carried, not read here: activation files the slot route
-    /// under it. `save_stages` receives this body's timings once preparation
-    /// succeeds, so a failed body's partial cost stays out of the report.
+    /// `path` is the changed file: its module path decides where the patch
+    /// roots the imports it carries. `slot_name` is carried, not read here:
+    /// activation files the slot route under it. `save_stages` receives this
+    /// body's timings once preparation succeeds, so a failed body's partial
+    /// cost stays out of the report.
     ///
     /// # Errors
     ///
@@ -875,6 +880,7 @@ impl HotPatchSession {
     /// compiler flags.
     fn prepare_body(
         &mut self,
+        path: &Path,
         new_contents: &str,
         declaration: &source::HotFunction,
         qualified_name: &str,
@@ -894,7 +900,7 @@ impl HotPatchSession {
         // Step 1: Generate the patch source.
         let generate_started = Instant::now();
         let generated = self
-            .generate(new_contents, declaration, qualified_name)
+            .generate(path, new_contents, declaration, qualified_name)
             .map_err(|detail| PatchRefusal::new(failure_code::GENERATE, detail))?;
         // Step 2: Write the generated source into the scratch directory.
         // The directory is per process rather than the system temporary one,
@@ -1241,7 +1247,10 @@ impl HotPatchSession {
     ///
     /// The function is copied as written, and everything it names comes from
     /// the same artifacts the running module linked. That is what keeps type
-    /// layout and `TypeId` identical across the boundary.
+    /// layout and `TypeId` identical across the boundary. The imports it
+    /// carries are the changed file's own module and the file's top-level
+    /// `use` lines the body can name, each rooted where the patch crate
+    /// resolves it.
     ///
     /// # Errors
     ///
@@ -1250,6 +1259,7 @@ impl HotPatchSession {
     /// or its signature text cannot be read.
     fn generate(
         &self,
+        path: &Path,
         new_contents: &str,
         declaration: &source::HotFunction,
         qualified: &str,
@@ -1277,7 +1287,20 @@ impl HotPatchSession {
                 .ok_or_else(|| format!("cannot locate `{function}` in the changed source"))?,
         };
 
-        let imports = source::top_level_use_statements(new_contents).join("\n");
+        let module_path = self.module_segments(path);
+        let import_scope = imports::PatchScope {
+            package: &self.package,
+            source_root: &self.source_root,
+            crate_root: &self.crate_root,
+            module_path: &module_path,
+        };
+        let imports = import_scope
+            .imports_for(
+                new_contents,
+                &source::top_level_use_statements(new_contents),
+                &located_function.text,
+            )
+            .join("\n");
         let package = &self.package;
 
         // An un-annotated function is redirected by overwriting its prologue.

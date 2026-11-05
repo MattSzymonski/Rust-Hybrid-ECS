@@ -149,12 +149,6 @@ SHADER_SOURCES_DIRECTORY_NAME = "shader_sources"
 MODULE_ROOT_DIRECTORY_NAMES = (ASSETS_DIRECTORY_NAME, SHADER_SOURCES_DIRECTORY_NAME)
 ASSETS_CRATE_DIRECTORY = Path("modules") / "assets" / "pill_assets"
 ASSET_PACK_FILE_NAME = "assets.pillpack"
-# The project's per-manager settings, baked as documents rather than packed:
-# a bundled build has no writable project directory, and a manager applies the
-# text its own applier reads. The directory and suffix match the development
-# host's lookup, so one file serves both postures.
-MANAGER_SETTINGS_DIRECTORY = "settings"
-MANAGER_SETTINGS_SUFFIX = "_settings.yaml"
 # Where a web bundle's build script packs it: beside the crate, because a
 # browser fetches it and must not carry it inside the module.
 WEB_PACK_DIRECTORY = "pack"
@@ -347,65 +341,6 @@ def build_logging_literal(logging) -> str:
         f"StaticLogging {{ level: {level_text}, timestamp: {timestamp_text}, "
         f"source_location: {location_text}, targets: &[{pairs}] }}"
     )
-
-
-def load_manager_settings(project_root: Path) -> list:
-    """Loads `<project>/settings/*_settings.yaml` as `(name, document)` pairs.
-
-    The name is the file stem without `_settings`, which is how the development
-    host finds the same document. Sorted by name, so the generated source does
-    not depend on directory order. Anything that is not a manager settings file
-    is ignored. Raises ValueError when a name is not a plain identifier, since
-    such a document could never be applied anyway.
-    """
-    directory = project_root / MANAGER_SETTINGS_DIRECTORY
-    if not directory.is_dir():
-        return []
-    settings = []
-    for path in sorted(directory.iterdir()):
-        if not path.is_file() or not path.name.endswith(MANAGER_SETTINGS_SUFFIX):
-            continue
-        name = path.name[: -len(MANAGER_SETTINGS_SUFFIX)]
-        if not name or not all(character.isascii() and (character.isalnum() or character == "_") for character in name):
-            raise ValueError(
-                f"{path}: a manager settings file needs a plain name before `{MANAGER_SETTINGS_SUFFIX}`"
-            )
-        settings.append((name, path.read_text(encoding="utf-8")))
-    return settings
-
-
-def rust_string_literal(text: str) -> str:
-    """Renders text as a Rust string literal.
-
-    A manager settings document is flat ASCII by construction, so escaping the
-    characters a Rust literal reserves is enough; anything else is passed
-    through as written.
-    """
-    escaped = (
-        text.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\r", "\\r")
-        .replace("\n", "\\n")
-        .replace("\t", "\\t")
-    )
-    return f'"{escaped}"'
-
-
-def build_manager_settings_literal(settings: list) -> list:
-    """Renders the `MANAGER_SETTINGS` constant's lines for the loaded documents."""
-    lines = [
-        "/// The project's manager settings documents, from `settings/*.yaml`.",
-        # Skipped for the same reason as the module list: one entry per line,
-        # whatever rustfmt would join.
-        "#[rustfmt::skip]",
-        "const MANAGER_SETTINGS: &[StaticManagerSettings] = &[",
-    ]
-    for name, document in settings:
-        lines.append(
-            f'    StaticManagerSettings {{ name: "{name}", document: {rust_string_literal(document)} }},'
-        )
-    lines.append("];")
-    return lines
 
 
 def modules_with_renderer_data(renderer, modules: list) -> list:
@@ -764,7 +699,6 @@ def build_library_source(
     renderer=None,
     packs_assets: bool = False,
     logging=(None, None, None, []),
-    manager_settings=(),
     debug_draw: bool = False,
     startup_scene: str = "",
     web: bool = False,
@@ -774,8 +708,6 @@ def build_library_source(
     `renderer` is the GPU crate a windowed build links, or None.
     `packs_assets` packs the project's `res` directory with the build script.
     `logging` is the validated `logging:` section, from `load_logging`.
-    `manager_settings` is the `(name, document)` list from
-    `load_manager_settings`.
     `debug_draw` is the `debug_draw:` key, from `load_debug_draw`.
     `web` emits the browser posture's asset fields: a fetched pack instead of
     an embedded one.
@@ -803,7 +735,7 @@ def build_library_source(
     lines += [
         "",
         "use pill_player::{",
-        "    StaticLogging, StaticManagerSettings, StaticModule, StaticProject, StaticProjectBackend,",
+        "    StaticLogging, StaticModule, StaticProject, StaticProjectBackend,",
         "    StaticRenderer,",
         "};",
         "",
@@ -898,7 +830,6 @@ def build_library_source(
         f"const LOGGING: StaticLogging = {build_logging_literal(logging)};",
         "",
     ]
-    lines += build_manager_settings_literal(list(manager_settings))
     lines += [
         "",
         "/// The complete shipping project: modules first, then the project.",
@@ -931,7 +862,6 @@ def build_library_source(
             if startup_scene
             else "        startup_scene: None,"
         ),
-        "        manager_settings: MANAGER_SETTINGS,",
         "    }",
         "}",
     ]
@@ -1375,7 +1305,6 @@ def main() -> int:
         renderer=linked_renderer,
         packs_assets=packs_assets,
         logging=load_logging(project_root),
-        manager_settings=load_manager_settings(project_root),
         debug_draw=load_debug_draw(project_root),
         startup_scene=load_startup_scene(project_root),
         web=web,

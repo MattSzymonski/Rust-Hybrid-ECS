@@ -2025,6 +2025,453 @@ pub fn pill_hot(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
     expanded.into()
 }
+
+/// Declares an ECS system, so the artifact registers it without a call.
+///
+/// A project or module writes only this attribute. The artifact entry point
+/// registers every declared system before its own `register` and `init` run,
+/// for a first load, every reload and a statically linked build alike, so the
+/// declaration reaches every posture that compiles the artifact.
+///
+/// ```ignore
+/// #[system]
+/// fn movement(query: Query<(&mut Position, &Velocity)>) { }
+///
+/// #[system(name = "ball_physics", order = 10)]
+/// fn physics_system(query: Query<&mut PhysicsState>) { }
+///
+/// #[system(name = "rendering", post_update)]
+/// fn rendering_system(commands: Commands) { }
+/// ```
+///
+/// # Arguments
+///
+/// - `name = "..."` - the display name logs, the editor's Systems tab and a
+///   hot patch use. Defaults to `module_path!()` plus the function's name, the
+///   same identity `#[pill_hot]` uses.
+/// - `order = <integer>` - where this system sits among the artifact's
+///   declared systems: a lower value registers first, and equal values are
+///   ordered by name. The engine runs conflicting systems in registration
+///   order, so this is how a declaration states that one system must precede
+///   another.
+/// - `post_update` - run in the post-update stage, after the command flush,
+///   like `Engine::register_post_update_system`.
+///
+/// An artifact can still register a system by call, in its `register` half;
+/// such a system runs after every declared one.
+#[proc_macro_attribute]
+pub fn system(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    let item_fn = parse_macro_input!(item as ItemFn);
+    let fn_ident = &item_fn.sig.ident;
+
+    // Step 1: Read the optional arguments.
+    let mut name_override: Option<String> = None;
+    let mut order: i32 = 0;
+    let mut post_update = false;
+    if !attribute.is_empty() {
+        let attribute = proc_macro2::TokenStream::from(attribute);
+        let parser = syn::meta::parser(|meta| {
+            if meta.path.is_ident("name") {
+                let name_literal: syn::LitStr = meta.value()?.parse()?;
+                name_override = Some(name_literal.value());
+                return Ok(());
+            }
+            if meta.path.is_ident("order") {
+                let order_literal: syn::LitInt = meta.value()?.parse()?;
+                order = order_literal.base10_parse()?;
+                return Ok(());
+            }
+            if meta.path.is_ident("post_update") {
+                post_update = true;
+                return Ok(());
+            }
+            Err(meta.error(
+                "unknown `system` argument; expected `name = \"...\"`, \
+                 `order = <integer>` or `post_update`",
+            ))
+        });
+        if let Err(error) = syn::parse::Parser::parse2(parser, attribute) {
+            return error.to_compile_error().into();
+        }
+    }
+
+    // Step 2: Refuse the shapes a declaration cannot carry. A generic function
+    // has no single registration, and a method cannot be named without its
+    // receiver type.
+    if !item_fn.sig.generics.params.is_empty() {
+        return syn::Error::new_spanned(
+            &item_fn.sig.generics,
+            "`#[system]` cannot be applied to a generic function: the engine \
+             registers one concrete system",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if item_fn.sig.receiver().is_some() {
+        return syn::Error::new_spanned(
+            &item_fn.sig,
+            "`#[system]` applies to a free function: a method cannot be \
+             registered without naming the type that owns it",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Step 3: Emit the function unchanged, a helper that registers it, and the
+    // descriptor the artifact entry point walks.
+    let name = match &name_override {
+        Some(name) => quote! { #name },
+        None => quote! {
+            ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#fn_ident))
+        },
+    };
+    let register_ident = format_ident!("__pill_system_register_{}", fn_ident);
+    let register_call = if post_update {
+        quote! { engine.register_post_update_system(#name, #fn_ident); }
+    } else {
+        quote! { engine.register_system(#name, #fn_ident); }
+    };
+    let expanded = quote! {
+        #item_fn
+
+        /// Registers this system with the engine; called by the artifact
+        /// entry point.
+        #[doc(hidden)]
+        fn #register_ident(engine: &mut ::pill_engine::Engine) {
+            #register_call
+        }
+
+        ::pill_engine::submit! {
+            ::pill_engine::declarations::PillSystemDescriptor {
+                name: #name,
+                order: #order,
+                post_update: #post_update,
+                register: #register_ident,
+            }
+        }
+    };
+    expanded.into()
+}
+
+/// Declares an ECS resource, so the artifact declares its type without a call.
+///
+/// A project or module writes only this derive. The artifact entry point
+/// declares every derived type before its own `register` and `init` run, for a
+/// first load, every reload and a statically linked build alike, so the
+/// declaration reaches every posture that compiles the artifact. The value is
+/// still stored by `world.insert_resource(..)`, exactly as before; only the
+/// declaration call moves.
+///
+/// ```ignore
+/// #[derive(PillResource)]
+/// pub struct FrameStats { frames: u64 }
+///
+/// #[derive(PillResource)]
+/// #[pill(shared, layout_sources = ["src/frame_stats.rs"])]
+/// pub struct FrameStats { frames: u64 }
+///
+/// #[derive(PillResource)]
+/// #[pill(manager)]
+/// pub struct AudioManager { /* ... */ }
+/// ```
+///
+/// # Arguments
+///
+/// - `shared` - give the type a stable identity instead of a per-binary
+///   `TypeId`, which is what lets a reload keep the value instead of retiring
+///   it. On its own the name is derived from `module_path!()`; `shared =
+///   "..."` pins it, and must be namespaced for the same reason
+///   `PillComponent`'s must be.
+/// - `layout_sources = ["..."]` - the files whose contents define the type's
+///   layout. The development host fingerprints them, so an edit that changes
+///   the layout rebuilds the value instead of keeping bytes that no longer
+///   mean what they did.
+/// - `layout_dependencies = ["..."]` - the crates whose resolved version can
+///   change the type's layout, as package names.
+///
+/// A manager resource declares itself with
+/// `World::register_settings_asset_manager` in its crate's `register` instead:
+/// the settings surface holds function pointers into the image that declared
+/// it, so every generation re-points them.
+#[proc_macro_derive(PillResource, attributes(pill))]
+pub fn derive_pill_resource(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let ident = &input.ident;
+
+    // Step 1: Parse the `#[pill(...)]` helper attribute.
+    let mut shared = false;
+    let mut shared_name_override: Option<String> = None;
+    let mut layout_sources: Option<Vec<String>> = None;
+    let mut layout_dependencies: Option<Vec<String>> = None;
+    for attribute in &input.attrs {
+        if !attribute.path().is_ident("pill") {
+            continue;
+        }
+        if let Err(error) = attribute.parse_nested_meta(|meta| {
+            if meta.path.is_ident("shared") {
+                shared = true;
+                if meta.input.peek(syn::Token![=]) {
+                    let literal: syn::LitStr = meta.value()?.parse()?;
+                    let name = literal.value();
+                    if name.is_empty() {
+                        return Err(syn::Error::new_spanned(
+                            &literal,
+                            "a shared resource name cannot be empty",
+                        ));
+                    }
+                    // The same rule a shared component name follows: the name
+                    // is a process-wide identity, so an unrelated type
+                    // declaring it too would read this resource's bytes.
+                    if !name.contains("::") {
+                        return Err(syn::Error::new_spanned(
+                            &literal,
+                            format!(
+                                "shared resource name `{name}` is not namespaced. A shared \
+                                 name is a process-wide identity, so an unrelated crate \
+                                 declaring `{name}` too would bind to this resource and read \
+                                 its bytes. Qualify it (`my_crate::{name}`), or drop the \
+                                 argument to derive it from `module_path!()`."
+                            ),
+                        ));
+                    }
+                    shared_name_override = Some(name);
+                }
+                return Ok(());
+            }
+            if meta.path.is_ident("layout_sources") {
+                layout_sources = Some(parse_string_list(meta.value()?)?);
+                return Ok(());
+            }
+            if meta.path.is_ident("layout_dependencies") {
+                layout_dependencies = Some(parse_string_list(meta.value()?)?);
+                return Ok(());
+            }
+            Err(meta.error(
+                "unknown `pill` attribute; expected `shared`, \
+                 `layout_sources` or `layout_dependencies`",
+            ))
+        }) {
+            return error.to_compile_error().into();
+        }
+    }
+
+    // Step 2: Reject a generic resource: the engine keys a resource by
+    // `TypeId`, so a generic type has no single identity to declare.
+    if !input.generics.params.is_empty() {
+        return syn::Error::new_spanned(
+            &input.generics,
+            "`PillResource` cannot be derived for a generic type",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Step 3: Emit the trait implementation and the descriptor.
+    let type_name = quote! {
+        ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#ident))
+    };
+    let shared_impl = if shared {
+        let shared_name = match &shared_name_override {
+            Some(name) => quote! { #name },
+            None => type_name.clone(),
+        };
+        quote! {
+            fn shared_name() -> ::core::option::Option<&'static str> {
+                ::core::option::Option::Some(#shared_name)
+            }
+
+            fn shared_identity() -> ::core::option::Option<u128> {
+                // A `const` rather than the trait's default method for the
+                // same reason `PillComponent` computes one: the default hashes
+                // the name on every call, and this folds at compile time.
+                const IDENTITY: u128 =
+                    ::pill_engine::component::shared_component_identity(#shared_name);
+                ::core::option::Option::Some(IDENTITY)
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let layout_sources_impl = layout_field_impl("layout_sources", layout_sources.as_deref());
+    let layout_dependencies_impl =
+        layout_field_impl("layout_dependencies", layout_dependencies.as_deref());
+    let register_ident = format_ident!("__pill_register_resource_{}", ident);
+    let register_call = quote! { world.register_resource::<#ident>(); };
+
+    let expanded = quote! {
+        impl ::pill_engine::Resource for #ident {
+            #shared_impl
+
+            #layout_sources_impl
+
+            #layout_dependencies_impl
+        }
+
+        /// Declares this resource with a world; called by the artifact entry
+        /// point.
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #register_ident(world: &mut ::pill_engine::World) {
+            #register_call
+        }
+
+        ::pill_engine::submit! {
+            ::pill_engine::declarations::PillResourceDescriptor {
+                type_name: #type_name,
+                register: #register_ident,
+            }
+        }
+    };
+
+    expanded.into()
+}
+
+/// Declares an asset type, so the artifact declares it without a call.
+///
+/// A crate that owns an asset type writes only this derive. The artifact entry
+/// point declares every derived type before its own `register` and `init` run,
+/// for a first load, every reload and a statically linked build alike. Loading
+/// (`import`, `load_asset`, `import_standalone`) is unchanged: only the
+/// declaration call moves.
+///
+/// The trait implementations themselves stay hand-written - which source
+/// extensions a type imports, how it decodes them, and its on-disk document
+/// shape are decisions about the type, not something a derive can invent. This
+/// derive only says how the world should declare it.
+///
+/// ```ignore
+/// #[derive(PillAsset)]
+/// #[pill(imported)]
+/// pub struct Sound { /* ... */ }
+///
+/// #[derive(PillAsset)]
+/// #[pill(standalone)]
+/// pub struct Material { /* ... */ }
+/// ```
+///
+/// # Arguments
+///
+/// - `imported` - the type is an `ImportedAsset`, declared with
+///   `World::register_imported_asset`, so it can be imported from a source
+///   file by extension.
+/// - `standalone` - the type is a `StandaloneAsset`, declared with
+///   `World::register_standalone_asset`, so it is stored as its own document
+///   file.
+///
+/// Exactly one of the two is required: a type is one or the other.
+#[proc_macro_derive(PillAsset, attributes(pill))]
+pub fn derive_pill_asset(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let ident = &input.ident;
+
+    // Step 1: Parse the `#[pill(...)]` helper attribute.
+    let mut imported = false;
+    let mut standalone = false;
+    for attribute in &input.attrs {
+        if !attribute.path().is_ident("pill") {
+            continue;
+        }
+        if let Err(error) = attribute.parse_nested_meta(|meta| {
+            if meta.path.is_ident("imported") {
+                imported = true;
+                return Ok(());
+            }
+            if meta.path.is_ident("standalone") {
+                standalone = true;
+                return Ok(());
+            }
+            Err(meta.error("unknown `pill` attribute; expected `imported` or `standalone`"))
+        }) {
+            return error.to_compile_error().into();
+        }
+    }
+    if imported == standalone {
+        return syn::Error::new_spanned(
+            &input.ident,
+            "`PillAsset` needs exactly one of `#[pill(imported)]` or \
+             `#[pill(standalone)]`: a type imports from a source file or is its \
+             own document file, never both",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Step 2: Reject a generic asset type: the world keys an asset by `TypeId`,
+    // so a generic type has no single identity to declare.
+    if !input.generics.params.is_empty() {
+        return syn::Error::new_spanned(
+            &input.generics,
+            "`PillAsset` cannot be derived for a generic type",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Step 3: Emit the declaration the entry point walks.
+    let type_name = quote! {
+        ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#ident))
+    };
+    let register_ident = format_ident!("__pill_register_asset_{}", ident);
+    let register_call = if standalone {
+        quote! { world.register_standalone_asset::<#ident>(); }
+    } else {
+        quote! { world.register_imported_asset::<#ident>(); }
+    };
+
+    let expanded = quote! {
+        /// Declares this asset type with a world; called by the artifact entry
+        /// point.
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #register_ident(world: &mut ::pill_engine::World) {
+            #register_call
+        }
+
+        ::pill_engine::submit! {
+            ::pill_engine::declarations::PillAssetDescriptor {
+                type_name: #type_name,
+                register: #register_ident,
+            }
+        }
+    };
+
+    expanded.into()
+}
+
+/// The `Resource` method that reports a declared list, or nothing when the
+/// derive was given no list.
+fn layout_field_impl(method: &str, values: Option<&[String]>) -> proc_macro2::TokenStream {
+    let Some(values) = values else {
+        return quote! {};
+    };
+    let method = format_ident!("{}", method);
+    quote! {
+        fn #method() -> ::core::option::Option<&'static [&'static str]> {
+            ::core::option::Option::Some(&[#(#values),*])
+        }
+    }
+}
+
+/// Parse a `["a", "b"]` list from one attribute argument.
+fn parse_string_list(input: syn::parse::ParseStream) -> syn::Result<Vec<String>> {
+    let content;
+    syn::bracketed!(content in input);
+    let literals =
+        content.parse_terminated(<syn::LitStr as syn::parse::Parse>::parse, syn::Token![,])?;
+    let mut values = Vec::new();
+    for literal in literals {
+        let value = literal.value();
+        if value.is_empty() {
+            return Err(syn::Error::new_spanned(
+                &literal,
+                "a declared path or crate name cannot be empty",
+            ));
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
 /// Arguments `#[pill_hot_fn]` accepts when it generates a patch body.
 ///
 /// A patch for an inherent method cannot copy the method into a free function,

@@ -25,19 +25,29 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // External crates
-use pill_engine::{Engine, Resource};
+use pill_engine::{Engine, PillResource};
 
 /// The witness's build-time value. Editing this line is editing the layout.
 const WITNESS_BUILD_VALUE: u32 = 1;
-
-/// The single source this resource's layout is made of.
-const WITNESS_SOURCE: &str = "src/layout_witness.rs";
 
 /// Counts witness values dropped in this process, so a suite can tell "the
 /// value was dropped" from "the value never existed".
 static DROPPED_WITNESS_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// A resource that owns heap state and reports its own drop.
+///
+/// It has to be shared: an id built from `TypeId` differs in every generation,
+/// so a reload would retire the old value instead of ever keeping it. A
+/// declared name gives both generations one identity, which is the only
+/// arrangement the decision can be about.
+///
+/// It declares this file as its layout, and only this file, so the suites can
+/// edit the layout without touching anything else the module compiles.
+#[derive(PillResource)]
+#[pill(
+    shared = "native::layout_witness::LayoutWitness",
+    layout_sources = ["src/layout_witness.rs"]
+)]
 pub struct LayoutWitness {
     /// Opaque payload naming the build that created this value.
     payload: String,
@@ -57,22 +67,6 @@ impl LayoutWitness {
     }
 }
 
-impl Resource for LayoutWitness {
-    /// The witness is a shared resource, and it has to be: an id built from
-    /// `TypeId` differs in every generation, so a reload would retire the old
-    /// value instead of ever keeping it. A declared name gives both generations
-    /// one identity, which is the only arrangement the decision can be about.
-    fn shared_name() -> Option<&'static str> {
-        Some("native::layout_witness::LayoutWitness")
-    }
-
-    /// Only this file, so the suites can edit the layout without touching
-    /// anything else the module compiles.
-    fn layout_sources() -> Option<&'static [&'static str]> {
-        Some(&[WITNESS_SOURCE])
-    }
-}
-
 impl Drop for LayoutWitness {
     fn drop(&mut self) {
         let dropped = DROPPED_WITNESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -85,12 +79,13 @@ impl Drop for LayoutWitness {
     }
 }
 
-/// Registers the witness, keeping a live value across a reload.
+/// Inserts the witness, keeping a live value across a reload.
 ///
 /// The value is inserted only when the world has none: a kept value has to
 /// survive, and a value the layout decision dropped has to come back. The
-/// registration itself runs on every generation so the kept value's drop
-/// function points at code that is still mapped.
+/// declaration needs no call of its own - the derive carries it, and the
+/// entry point declares it on every generation, which is what keeps a kept
+/// value's drop function pointing at code that is still mapped.
 pub fn register(engine: &mut Engine) {
     if engine.world().get_resource::<LayoutWitness>().is_none() {
         let witness = LayoutWitness::new();
@@ -101,5 +96,4 @@ pub fn register(engine: &mut Engine) {
         );
         engine.world_mut().insert_resource(witness);
     }
-    engine.world_mut().register_resource::<LayoutWitness>();
 }

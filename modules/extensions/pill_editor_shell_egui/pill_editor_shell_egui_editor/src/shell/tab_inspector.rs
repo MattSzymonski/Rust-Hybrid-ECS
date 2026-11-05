@@ -140,6 +140,7 @@ pub fn inspector_tab(
                     pending,
                     session,
                     overlay_regions,
+                    decorators: detail.decorators.as_slice(),
                     read_only: detail.row.read_only,
                 },
             ),

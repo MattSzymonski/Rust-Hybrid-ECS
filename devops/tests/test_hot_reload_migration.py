@@ -59,8 +59,8 @@ from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario 
 # Configuration
 # =============================================================================
 
-# The migration scenarios drive the native fixture: its components live in
-# `src/migration.rs`, apart from the reload scenarios' anchors in `lib.rs`.
+# The migration scenarios drive the native fixture: its persistable components
+# and the witness systems that print them live in `src/lib.rs`.
 TEST_PROJECT_ROOT = NATIVE_PROJECT_ROOT
 PROJECT_LIB_RS = NATIVE_PROJECT_LIB_RS
 

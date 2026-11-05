@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 
 // External crates
 use pill_engine::{
-    pill_project, AssetLoader, AssetManager, Engine, Handle, Query, Res, SystemError, Time, World,
+    pill_project, system, AssetLoader, AssetManager, Engine, Handle, Query, Res, SystemError, Time,
+    World,
 };
 use pill_master_renderer_data::{
     CameraComponent, Material, Mesh, MeshRendererComponent, TransformComponent,
@@ -43,8 +44,7 @@ const SPIN_RATES_RADIANS_PER_SECOND: [f32; 3] = [0.6, 1.0, 0.3];
 /// Where the camera stands: on +Z, looking down -Z at the cube.
 const CAMERA_TRANSLATION: [f32; 3] = [0.0, 0.0, 5.0];
 
-/// Registers the renderer's data, loads the cube's files, builds the scene and
-/// registers the spin system.
+/// Registers the renderer's data, loads the cube's files and builds the scene.
 ///
 /// Returns `0` when the scene is ready, or `1` after logging why loading the
 /// files or building the scene failed.
@@ -70,9 +70,6 @@ pub fn init(engine: &mut Engine) -> u32 {
         pill_engine::tracing::error!("scene creation failed: {error}");
         return 1;
     }
-
-    // Step 4: Register the system that spins every drawn entity each frame.
-    engine.register_system("spin_cube", spin_cube_system);
     0
 }
 
@@ -172,6 +169,7 @@ fn create_scene(
 ///
 /// The rotation is scaled by the time the frame took, so the spin speed does
 /// not depend on the frame rate.
+#[system(name = "spin_cube")]
 fn spin_cube_system(
     time_resource: Res<Time>,
     mut drawn_entities: Query<(&mut TransformComponent, &MeshRendererComponent)>,

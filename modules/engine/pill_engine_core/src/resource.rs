@@ -46,7 +46,7 @@ use pill_core::error;
 
 use crate::archetype::FieldPlan;
 use crate::error::WorldError;
-use crate::settings::ManagerSettingsOps;
+use crate::settings::SettingsAssetOps;
 use crate::world::World;
 
 // =============================================================================
@@ -407,13 +407,13 @@ pub struct ErasedResourceOps {
     /// changes, so it is what a record written by one generation is matched
     /// against in the next.
     pub declaring_type_name: Option<&'static str>,
-    /// The manager's settings surface, when the type is a
-    /// [`ManagerResource`](crate::settings::ManagerResource).
+    /// The manager's settings-asset surface, when the type is a
+    /// [`SettingsAssetManager`](crate::settings::SettingsAssetManager).
     ///
-    /// The applier points into the artifact that registered the manager, so it
-    /// has the same lifetime rule as `drop_in_place` and is refreshed with the
-    /// rest of the table by `World::rehome_resources`.
-    pub manager: Option<ManagerSettingsOps>,
+    /// The renderer and the applier point into the artifact that registered the
+    /// manager, so they have the same lifetime rule as `drop_in_place` and are
+    /// refreshed with the rest of the table by `World::rehome_resources`.
+    pub settings_asset: Option<SettingsAssetOps>,
 }
 
 impl ErasedResourceOps {
@@ -429,19 +429,18 @@ impl ErasedResourceOps {
             layout_dependencies: T::layout_dependencies(),
             declaring_type_name: Some(std::any::type_name::<T>()),
             // A manager type adds its settings surface with
-            // [`Self::with_manager`]; a plain resource has none.
-            manager: None,
+            // [`Self::with_settings_asset`]; a plain resource has none.
+            settings_asset: None,
         }
     }
 
-    /// Adds the settings surface of a manager type.
+    /// Adds the settings-asset surface of a manager type.
     ///
-    /// Called by `World::insert_manager_resource` and
-    /// `World::register_manager_resource`, which are the only paths a manager
-    /// value should take: a manager registered without it would never be
-    /// found by the host's settings pipeline.
-    pub fn with_manager<T: crate::settings::ManagerResource>(mut self) -> Self {
-        self.manager = Some(ManagerSettingsOps::of::<T>());
+    /// Called by `World::insert_settings_asset_manager` and
+    /// `World::register_settings_asset_manager`, which are the paths a manager
+    /// whose tuning lives in a settings asset takes.
+    pub fn with_settings_asset<T: crate::settings::SettingsAssetManager>(mut self) -> Self {
+        self.settings_asset = Some(SettingsAssetOps::of::<T>());
         self
     }
 
@@ -466,7 +465,7 @@ impl ErasedResourceOps {
             declaring_type_name: None,
             // No Rust type means no applier to call: a managed manager would
             // have to expose its own entry point.
-            manager: None,
+            settings_asset: None,
         }
     }
 }

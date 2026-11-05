@@ -19,7 +19,20 @@ crate-type = ["rlib", "dylib"]
 
 [dependencies]
 # `bytemuck` is part of the feature pin below.
-glam = { version = "0.33", features = ["serde", "bytemuck"] }
+# `approx` and `nostd-libm` are pinned here rather than left to whoever asks:
+# `pill_core.dll`'s symbol names hash the features of every crate below it, so
+# a module whose dependency graph requests `glam` with more features than the
+# host did gets a `glam` build of its own, and the host then refuses to load it
+# as an engine-dylib mismatch. `parry3d`/`glamx`, which a physics module pulls
+# in, request both, so the engine asks for them too and every posture resolves
+# one `glam`.
+glam = { version = "0.33", features = ["serde", "bytemuck", "approx", "nostd-libm"] }
+# The companion pin. `glam`'s `approx` feature makes it implement `approx`
+# traits, so `approx` is in this crate's tree; a module that also pulls
+# `nalgebra` requests `approx` with `std`, and that alone gives the two `glam`
+# builds different inputs even with the features above equal. Naming it here
+# with the union keeps one build per posture.
+approx = { version = "0.5", features = ["std"] }
 pill_core_macros = { path = "../pill_core_macros" }
 # This crate is the one `dylib` every posture links - the shipping and browser
 # builds included - so it names no development-host crate. `notify` (the source

@@ -54,9 +54,6 @@ mod extension;
 /// What a module's resources declared their layouts are made of, and whether
 /// that changed since the last load.
 mod layout_record;
-/// The project's per-manager settings files: created from the manager's
-/// defaults, and applied to the live manager.
-mod manager_settings;
 /// Loads native module libraries from temporary copies that must outlive a
 /// reload.
 mod native_library;
@@ -68,9 +65,6 @@ mod notices;
 mod project_module;
 /// The steps every reload runs once its replacement image is loaded.
 mod reload;
-/// Watches the project's `settings` directory and queues the managers whose
-/// settings file changed.
-mod settings_watcher;
 /// What this run's watchers are allowed to do, read from the `PILL_*` switches.
 mod switches;
 

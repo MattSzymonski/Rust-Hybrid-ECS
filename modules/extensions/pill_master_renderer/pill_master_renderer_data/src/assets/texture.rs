@@ -34,7 +34,7 @@ use std::f32::consts::PI;
 use glam::Vec3;
 use pill_engine::{
     pill_mirror_impl, pill_mirror_method, pill_mirror_object, AssetLoadError, AssetLoadResult,
-    AssetLoader, ImportedAsset, PillMirror,
+    AssetLoader, ImportedAsset, PillAsset, PillMirror,
 };
 use serde::{Deserialize, Serialize};
 
@@ -132,7 +132,8 @@ impl TextureType {
 /// texture, view and sampler, and rebuilds them when the asset's version
 /// changes. A game therefore edits the texture it holds and never touches GPU
 /// state.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PillAsset)]
+#[pill(imported)]
 #[pill_mirror_object(asset, import, shared = "pill_master_renderer::assets::Texture")]
 pub struct Texture {
     /// Label for the GPU resource. The logs and error messages use it too.

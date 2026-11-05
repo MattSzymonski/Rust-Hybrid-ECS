@@ -231,16 +231,21 @@ pub struct SystemSnapshot {
 /// post-update systems run. Systems are registered by name and can be
 /// enabled or disabled while the game runs.
 ///
+/// A project or module never calls [`Self::register_system`]. It declares its
+/// systems with `#[system]`, and the artifact entry point registers every
+/// declared one before the artifact's own `register` runs; components, resources
+/// and asset types arrive the same way, through their derive. The registering
+/// methods on this type are what a *host* uses for the systems it owns - the
+/// renderer's frame build, an editor's own passes - and what the entry point
+/// calls on the artifact's behalf.
+///
 /// # Examples
 /// ```no_run
 /// # use pill_engine::*;
-/// # fn movement_system() {}
-/// # fn collision_system() {}
 /// let mut engine = Engine::new();
-/// engine.register_system("movement", movement_system);
-/// engine.register_system("collision", collision_system);
 ///
-/// // Every frame:
+/// // Every frame - the declared systems run, then the command flush, then the
+/// // post-update systems.
 /// engine.process_frame().unwrap();
 /// ```
 pub struct Engine {
@@ -775,6 +780,15 @@ impl Engine {
     /// The system can be any function whose parameters all implement
     /// [`SystemParam`]. The name is used for debugging and profiling.
     ///
+    /// This is the **host-facing** call: a project or module declares its
+    /// systems with `#[system]` instead, and its entry point registers them
+    /// before the artifact's own code runs. Use this for a system the host
+    /// itself owns, such as a renderer's frame build.
+    ///
+    /// A host that wants the declared systems and the hand-registered ones in
+    /// one list registers the declarations first - the artifact entry points do
+    /// exactly that - because conflicting systems run in registration order.
+    ///
     /// # Examples
     /// ```no_run
     /// # use pill_engine::*;
@@ -801,6 +815,9 @@ impl Engine {
 
     /// Registers a system that runs after the command flush. The commands it
     /// queues apply on the next frame.
+    ///
+    /// Host-facing, like [`Self::register_system`]: an artifact declares a
+    /// post-update system with `#[system(post_update)]`.
     pub fn register_post_update_system<F, Input>(&mut self, name: impl Into<String>, system: F)
     where
         F: IntoSystem<Input>,

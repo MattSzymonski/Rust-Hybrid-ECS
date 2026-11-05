@@ -16,7 +16,7 @@
 //! resources.
 
 // External crates
-use pill_engine::{AssetManager, Query, ResMut, SystemError, TransformComponent};
+use pill_engine::{system, AssetManager, Query, ResMut, SystemError, TransformComponent};
 
 // Current crate
 use crate::audio_command::AudioCommand;
@@ -53,6 +53,7 @@ use crate::AudioLoadQueue;
 /// Returns [`SystemError::Failure`] when the asset store refuses to store a
 /// queued sound under its name. The name is checked first, so this is not
 /// expected to happen.
+#[system(name = "pill_audio")]
 pub fn audio_system(
     mut audio_manager: ResMut<AudioManager>,
     mut asset_manager: ResMut<AssetManager>,

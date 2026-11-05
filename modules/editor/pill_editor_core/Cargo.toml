@@ -85,6 +85,11 @@ kurbo = "0.13"
 read-fonts = "0.41"
 skrifa = "0.44"
 uuid = { version = "1", features = ["std"] }
+# `profiling` reaches this tree from `wgpu`, and a module that links `rapier3d`
+# (the physics extension) names it with its default `procmacros` feature. The
+# world without that module resolved it without, which split this DLL. Naming
+# it here with the union keeps one build per posture.
+profiling = "1"
 
 [dev-dependencies]
 # The asset store's trait-object access for the test asset types, at the

@@ -26,7 +26,7 @@
 // External crates
 use pill_engine::{
     pill_mirror_impl, pill_mirror_method, pill_mirror_object, AssetLoadError, AssetLoadResult,
-    ImportedAsset, PillMirror,
+    ImportedAsset, PillAsset, PillMirror,
 };
 use serde::{Deserialize, Serialize};
 
@@ -71,7 +71,8 @@ pub struct MeshVertex {
 /// The renderer builds a GPU copy once and rebuilds it when the asset's
 /// version moves. A game edits the mesh it holds and lets the renderer notice,
 /// instead of touching buffers itself.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PillAsset)]
+#[pill(imported)]
 #[pill_mirror_object(asset, import, shared = "pill_master_renderer::assets::Mesh")]
 pub struct Mesh {
     /// Name used in logs and error messages, and as the label of the GPU

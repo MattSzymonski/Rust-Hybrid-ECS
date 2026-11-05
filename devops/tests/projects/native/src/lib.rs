@@ -68,11 +68,9 @@ mod spline_probe;
 // Keep the public hot-patch helper available at its original crate-root path.
 pub use physics::simulate_ball;
 
-use physics::{ball_spawn_state, physics_system};
+use physics::ball_spawn_state;
 use settings::*;
-use simulation_time::update_time_system;
-use spline_path::spline_path_system;
-use spline_probe::{spline_probe_system, SplineProbeState};
+use spline_probe::SplineProbeState;
 
 /// The pass the project's own frame draws with, as a file in `res`.
 const PASS_PATH: &str = "dwdw.render_pass";
@@ -93,14 +91,13 @@ const PROBE_SHADER_PATH: &str = "shaders/reload_probe_fragment.hlsl";
 ///
 /// Public so a hot patch can name it: a patched system's signature must be
 /// expressible from outside the crate.
+#[derive(PillResource)]
 pub struct SimulationTime {
     pub last_frame: Instant,
     pub delta_seconds: f32,
 
     pub test: i32,
 }
-
-impl Resource for SimulationTime {}
 
 /// A rigid ball that bounces inside a fixed box, simulated each frame.
 ///
@@ -152,7 +149,8 @@ pub struct SplineSample {
 /// It must be idempotent, because a first load reaches it too, immediately
 /// before [`init`].
 ///
-/// Component registration itself happens from the `PillComponent` derives,
+/// Component and system registration happens from the artifact's own
+/// declarations - the `PillComponent` derives and the `#[system]` attributes -
 /// before this function runs.
 ///
 /// Public so the generated `pill_module_register` export can name it.
@@ -176,10 +174,6 @@ pub fn register(engine: &mut Engine) -> u32 {
     // The settings manager: the host writes its `settings/` document from the
     // manager's own defaults and applies it, live when it is edited.
     settings_probe::register(engine);
-    engine.register_system("simulation_time", update_time_system);
-    engine.register_system("ball_physics", physics_system);
-    engine.register_system("spline_path", spline_path_system);
-    engine.register_system("follow_target", follow_target::follow_target_system);
     // Replaced, not reused. The state holds nothing that has to outlive a
     // generation - a report timestamp and an id string [`init`] derives - and
     // a resource the previous generation inserted is retired by the reload, so
@@ -189,12 +183,6 @@ pub fn register(engine: &mut Engine) -> u32 {
     // A generation that runs against a world the first one filled - every
     // reload - must point the fresh state at the spline that is already there.
     refresh_probe_entity_id(engine);
-    engine.register_system("spline_probe", spline_probe_system);
-    // The migration witnesses: the schema scenarios print these components'
-    // values once per generation.
-    engine.register_system("counter", counter_system);
-    engine.register_system("position_witness", position_witness_system);
-    engine.register_system("trail_witness", trail_witness_system);
     0
 }
 
@@ -672,6 +660,7 @@ fn seed_migration_entities(world: &mut World) {
 
 /// Increments the counter every frame. When it reaches the threshold,
 /// resets and prints a timestamp to the console.
+#[system(name = "counter", order = 60)]
 fn counter_system(mut query: Query<&mut FrameCounter>) {
     const THRESHOLD: u64 = 200;
 
@@ -699,6 +688,7 @@ fn counter_system(mut query: Query<&mut FrameCounter>) {
 }
 
 /// Prints every `SpatialPosition` value once per module generation.
+#[system(name = "position_witness", order = 70)]
 fn position_witness_system(mut query: Query<&SpatialPosition>) {
     if POSITION_WITNESS_PRINTED.swap(true, Ordering::Relaxed) {
         return;
@@ -714,6 +704,7 @@ fn position_witness_system(mut query: Query<&SpatialPosition>) {
 /// Prints every `MarkerTrail` value once per module generation, including the
 /// heap contents migration must carry across (element count, sum, text, and
 /// the engine-owned buffer's length and last element).
+#[system(name = "trail_witness", order = 80)]
 fn trail_witness_system(mut query: Query<&MarkerTrail>) {
     if TRAIL_WITNESS_PRINTED.swap(true, Ordering::Relaxed) {
         return;

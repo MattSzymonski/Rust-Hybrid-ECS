@@ -463,6 +463,28 @@ pub struct AssetDetail {
     /// The reference fields the asset's type declares, expanded: one entry per
     /// picker the Inspector draws, whether or not the document binds it yet.
     pub references: Vec<AssetReferenceField>,
+    /// How the asset's document fields draw, as the type declared them: a range
+    /// draws as a slider, a tooltip as the label's hover text. Empty for a
+    /// type that declares none.
+    pub decorators: Vec<AssetFieldDecorator>,
+}
+
+/// One field decorator an asset type declares, as the Inspector reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssetFieldDecorator {
+    /// The document key the decorator applies to.
+    pub key: String,
+    /// How the row draws.
+    pub decorator: pill_engine::FieldDecorator,
+}
+
+impl AssetFieldDecorator {
+    /// The decorator declared for `key`, if the type declared one.
+    pub fn find<'a>(decorators: &'a [Self], key: &str) -> Option<&'a pill_engine::FieldDecorator> {
+        decorators
+            .iter()
+            .find_map(|entry| (entry.key == key).then_some(&entry.decorator))
+    }
 }
 
 /// One reference field of an asset's settings, as the Inspector draws it.

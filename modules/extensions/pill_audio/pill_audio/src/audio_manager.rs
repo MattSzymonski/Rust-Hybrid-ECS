@@ -19,7 +19,8 @@
 //! pool is therefore also the limit on how many voices play at once.
 
 // External crates
-use pill_engine::{Resource, SettingsDocument, SettingsOutcome};
+use pill_engine::{Asset, AssetLoadResult, AssetManager, PillAsset, PillResource, SettingsOutcome};
+use serde::{Deserialize, Serialize};
 
 // Current crate
 use crate::sound::Sound;
@@ -56,6 +57,11 @@ pub const EAR_SEPARATION: f32 = 1.0;
 /// The manager must outlive every sound playing through it, because dropping
 /// the stream stops all audio. It is a resource for that reason, and because
 /// there is exactly one audio device.
+///
+/// It declares its settings surface in the module's `register`
+/// ([`AudioSettingsAsset`]): the applier points into that image, so every
+/// generation re-points it.
+#[derive(PillResource)]
 pub struct AudioManager {
     /// The output stream. Nothing reads it after construction, but dropping it
     /// silences every sink, so it is held for its lifetime alone.
@@ -92,13 +98,11 @@ unsafe impl Send for AudioManager {}
 // hands out one accessor at a time, so two threads never share the value.
 unsafe impl Sync for AudioManager {}
 
-impl Resource for AudioManager {}
-
 // =============================================================================
 // AudioSettings
 // =============================================================================
 
-/// The audio device's tunable settings, as the project's settings document
+/// The audio device's tunable settings, as the project's settings asset
 /// describes them.
 ///
 /// Pool sizes are fixed when the device opens: a pool grows by allocating a
@@ -106,7 +110,13 @@ impl Resource for AudioManager {}
 /// that changed under it. A document that asks for different sizes is refused
 /// with that reason, and the host is restarted to change them. Ear separation
 /// can move while the device runs, so it is applied live.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// This is the document of [`AudioSettingsAsset`]: the settings file is a real
+/// asset (`res/settings/pill_audio.audio_settings`), so an edit is checked
+/// against this type before it reaches the device, and the Inspector can draw
+/// its fields.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AudioSettings {
     /// Voices for non-positional playback.
     pub ambient_sinks: usize,
@@ -127,110 +137,105 @@ impl std::default::Default for AudioSettings {
     }
 }
 
-impl AudioSettings {
-    /// The keys a document may name.
-    const KEYS: [&'static str; 3] = ["ambient_sinks", "spatial_sinks", "ear_separation"];
+// =============================================================================
+// AudioSettingsAsset
+// =============================================================================
 
-    /// Reads a document over the settings the manager has now.
-    ///
-    /// A key the document leaves out keeps its current value, so a file that
-    /// only widens the stereo image does not restate the pool sizes.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message naming the first problem: a key this manager does not
-    /// know, a value of the wrong type, a pool size of zero, or a separation
-    /// that is not positive.
-    pub fn from_document(current: &Self, settings: &SettingsDocument) -> Result<Self, String> {
-        let unknown_keys = settings.unknown_keys(&Self::KEYS);
-        if !unknown_keys.is_empty() {
-            return Err(format!("unknown key(s) {unknown_keys:?}"));
-        }
-        let mut next = *current;
-        if settings.contains("ambient_sinks") {
-            let count = settings
-                .integer("ambient_sinks")
-                .ok_or("`ambient_sinks` must be a whole number")?;
-            if count <= 0 {
-                return Err("`ambient_sinks` must be at least 1".to_owned());
-            }
-            next.ambient_sinks = count as usize;
-        }
-        if settings.contains("spatial_sinks") {
-            let count = settings
-                .integer("spatial_sinks")
-                .ok_or("`spatial_sinks` must be a whole number")?;
-            if count <= 0 {
-                return Err("`spatial_sinks` must be at least 1".to_owned());
-            }
-            next.spatial_sinks = count as usize;
-        }
-        if settings.contains("ear_separation") {
-            let separation = settings
-                .float("ear_separation")
-                .ok_or("`ear_separation` must be a number")?;
-            if separation <= 0.0 {
-                return Err("`ear_separation` must be greater than 0".to_owned());
-            }
-            next.ear_separation = separation as f32;
-        }
-        Ok(next)
+/// The standalone asset a project tunes the audio device through.
+///
+/// Its document is [`AudioSettings`], so the file at
+/// `res/settings/pill_audio.audio_settings` names the same three fields the
+/// manager applies. The loaded value is only a carrier: the manager reads the
+/// document, not the asset.
+///
+/// The derive declares the type, so every generation of the module registers it
+/// with the world's asset store without a call in `register`.
+#[derive(Debug, Default, PillAsset)]
+#[pill(standalone)]
+pub struct AudioSettingsAsset {
+    /// The settings the file holds.
+    pub settings: AudioSettings,
+}
+
+// Registers the type with the type-erased asset columns, without which the
+// world could load its file but never store or look it up.
+trait_type_map::impl_trait_accessible!(dyn Asset; AudioSettingsAsset);
+
+impl pill_engine::Asset for AudioSettingsAsset {
+    fn shared_name() -> Option<&'static str> {
+        Some("pill_audio::AudioSettingsAsset")
     }
 }
 
-impl pill_engine::ManagerResource for AudioManager {
+impl pill_engine::StandaloneAsset for AudioSettingsAsset {
+    type Document = AudioSettings;
+    const FILE_EXTENSION: &'static str = "audio_settings";
+
+    fn from_document(
+        _name: &str,
+        document: AudioSettings,
+        _assets: &AssetManager,
+    ) -> AssetLoadResult<Self> {
+        Ok(Self { settings: document })
+    }
+}
+
+// =============================================================================
+// SettingsAssetManager
+// =============================================================================
+
+impl pill_engine::SettingsAssetManager for AudioManager {
+    type Settings = AudioSettingsAsset;
+
     fn settings_name() -> &'static str {
         "pill_audio"
     }
 
-    /// Every key, with the value [`AudioManager::with_defaults`] starts from.
-    fn default_settings() -> &'static str {
-        "# Audio settings.\n\
-         # ambient_sinks and spatial_sinks are fixed when the device opens;\n\
-         # restart the host to change them.\n\
-         ambient_sinks: 16\n\
-         spatial_sinks: 16\n\
-         ear_separation: 1.0\n"
-    }
-
-    fn apply_settings(&mut self, settings: &SettingsDocument) -> SettingsOutcome {
+    fn apply_settings(&mut self, settings: &AudioSettings) -> SettingsOutcome {
+        // Step 1: Refuse a document no device could run with. A file is
+        // hand-editable, so zero voices and a zero stereo spread have to be
+        // refused rather than trusted.
+        if settings.ambient_sinks < 1 || settings.spatial_sinks < 1 {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                "[audio] settings refused: both sink counts must be at least 1"
+            );
+            return SettingsOutcome::Refused;
+        }
+        if !settings.ear_separation.is_finite() || settings.ear_separation <= 0.0 {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                "[audio] settings refused: ear_separation must be greater than 0"
+            );
+            return SettingsOutcome::Refused;
+        }
+        // Step 2: A pool size cannot change under a playing source.
         let current = self.settings();
-        let next = match AudioSettings::from_document(&current, settings) {
-            Ok(next) => next,
-            Err(reason) => {
-                pill_core::warn!(
-                    target: pill_core::telemetry::telemetry_target::ECS,
-                    reason,
-                    "[audio] settings refused"
-                );
-                return SettingsOutcome::Refused;
-            }
-        };
-        if next.ambient_sinks != current.ambient_sinks
-            || next.spatial_sinks != current.spatial_sinks
+        if settings.ambient_sinks != current.ambient_sinks
+            || settings.spatial_sinks != current.spatial_sinks
         {
             pill_core::warn!(
                 target: pill_core::telemetry::telemetry_target::ECS,
-                ambient_sinks = next.ambient_sinks,
-                spatial_sinks = next.spatial_sinks,
+                ambient_sinks = settings.ambient_sinks,
+                spatial_sinks = settings.spatial_sinks,
                 "[audio] sink counts are fixed when the device opens; restart the host to change them"
             );
             return SettingsOutcome::Refused;
         }
-        if next.ear_separation != self.ear_separation {
-            // Moving the ears is the one change a running device takes: every
-            // sink already open reads its positions from the device state.
+        // Step 3: Moving the ears is the one change a running device takes:
+        // every sink already open reads its positions from the device state.
+        if settings.ear_separation != self.ear_separation {
             self.set_ears(
-                [-next.ear_separation, 0.0, 0.0],
-                [next.ear_separation, 0.0, 0.0],
+                [-settings.ear_separation, 0.0, 0.0],
+                [settings.ear_separation, 0.0, 0.0],
             );
-            self.ear_separation = next.ear_separation;
+            self.ear_separation = settings.ear_separation;
         }
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ECS,
-            ambient_sinks = next.ambient_sinks,
-            spatial_sinks = next.spatial_sinks,
-            ear_separation = next.ear_separation,
+            ambient_sinks = settings.ambient_sinks,
+            spatial_sinks = settings.spatial_sinks,
+            ear_separation = settings.ear_separation,
             "[audio] settings applied"
         );
         SettingsOutcome::Applied
@@ -480,51 +485,26 @@ mod tests {
     // Current crate
     use super::*;
 
-    /// The default document reads back as the settings `with_defaults` builds.
+    /// The settings asset carries exactly the document it was built from, which
+    /// is what a created file holds and what the applier reads back.
     #[test]
-    fn the_default_document_reads_as_the_default_settings() {
-        let document = SettingsDocument::parse(
-            <AudioManager as pill_engine::ManagerResource>::default_settings(),
+    fn the_settings_asset_carries_its_document() {
+        let settings = AudioSettings {
+            ambient_sinks: 4,
+            spatial_sinks: 5,
+            ear_separation: 0.5,
+        };
+        let asset = <AudioSettingsAsset as pill_engine::StandaloneAsset>::from_document(
+            "settings/pill_audio.audio_settings",
+            settings,
+            &AssetManager::new(),
         )
-        .expect("the default document reads");
+        .expect("the document builds the asset");
 
+        assert_eq!(asset.settings, settings);
         assert_eq!(
-            AudioSettings::from_document(&AudioSettings::default(), &document),
-            Ok(AudioSettings::default())
+            <AudioSettingsAsset as pill_engine::StandaloneAsset>::FILE_EXTENSION,
+            "audio_settings"
         );
-    }
-
-    /// A key the document leaves out keeps its current value, so a file that
-    /// only moves the ears does not restate the pool sizes.
-    #[test]
-    fn a_missing_key_keeps_its_current_value() {
-        let document = SettingsDocument::parse("ear_separation: 0.5\n").expect("it reads");
-
-        let next =
-            AudioSettings::from_document(&AudioSettings::default(), &document).expect("it applies");
-
-        assert_eq!(next.ear_separation, 0.5);
-        assert_eq!(next.ambient_sinks, DEFAULT_AMBIENT_SINK_COUNT);
-        assert_eq!(next.spatial_sinks, DEFAULT_SPATIAL_SINK_COUNT);
-    }
-
-    /// A misspelled key, a non-number and a zero count are each refused with a
-    /// message naming the key.
-    #[test]
-    fn a_bad_document_is_refused_with_its_reason() {
-        let current = AudioSettings::default();
-
-        let unknown = SettingsDocument::parse("ear_sep: 0.5\n").expect("it reads");
-        assert!(AudioSettings::from_document(&current, &unknown).is_err());
-
-        let wrong_type = SettingsDocument::parse("ear_separation: wide\n").expect("it reads");
-        assert!(AudioSettings::from_document(&current, &wrong_type)
-            .unwrap_err()
-            .contains("ear_separation"));
-
-        let zero = SettingsDocument::parse("spatial_sinks: 0\n").expect("it reads");
-        assert!(AudioSettings::from_document(&current, &zero)
-            .unwrap_err()
-            .contains("spatial_sinks"));
     }
 }

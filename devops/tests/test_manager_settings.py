@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-A manager's settings file is created, applied and re-applied live.
+A manager's settings asset is created, applied and re-applied live.
 
-PROTECTS: A project with no settings file gets one written from the manager's own defaults, an edit reaches the running manager with no reload, and a refused document changes nothing.
+PROTECTS: A project with no settings asset gets one written from the manager's own document defaults, an edit reaches the running manager with no reload, and a refused document changes nothing.
 TIER: host
 
 REQUIREMENTS
@@ -11,29 +11,31 @@ REQUIREMENTS
 
 DESCRIPTION
     A manager is a resource that owns a subsystem. It declares a settings
-    surface - a file stem, a complete default document, and an applier - and the
-    development host keeps `<project>/settings/<name>_settings.yaml` in step
-    with it.
+    asset - a standalone asset type whose document is its own tunable shape -
+    and the development host keeps `res/settings/<settings_name>.<extension>` in
+    step with it: created from the document defaults when missing, applied after
+    the project loads, and re-applied when the file's bytes change.
 
     The fixture project carries the subject for this
     (`devops/tests/projects/native/src/settings_probe.rs`): a manager with three
     knobs whose applier prints what it was asked to apply. One host run covers
     the four behaviours:
 
-      1. created - the project starts with no `settings/` directory. The host
-         logs `created the manager settings file` and writes the manager's whole
-         default document, and the manager reports the defaults.
+      1. created - the project starts with no `res/settings` directory. The host
+         logs `created the manager settings asset` and writes an asset file
+         holding the manager's whole default document, and the manager reports
+         the defaults.
       2. live - editing a value in that file re-applies it with
          `changed=true`, the manager reports the new value, and no project
          rebuild happens: the run's reload line never follows the edit.
       3. kept across a reload - a source edit reloads the project, and the
          regenerated manager takes the document again, so the edited value is
          still in effect afterwards.
-      4. refused - a document naming a key the manager does not know is refused
-         by the manager and by the host, and the manager keeps what it had.
+      4. refused - a document with a value the manager cannot use is refused by
+         the manager and by the host, and the manager keeps what it had.
 
-    The `settings/` directory the suite caused is removed again, so the fixture
-    is left byte-identical.
+    The `res/settings` directory the suite caused is removed again, so the
+    fixture is left byte-identical.
 
 USAGE
   python devops/tests/test_manager_settings.py [--timeout-scale S] [--skip-build]
@@ -73,22 +75,26 @@ from core.suite_common import (  # noqa: E402
 
 PROJECT_ROOT = NATIVE_PROJECT_ROOT
 SOURCE_DIRECTORY = PROJECT_ROOT / "src"
-SETTINGS_DIRECTORY = PROJECT_ROOT / "settings"
-SETTINGS_FILE = SETTINGS_DIRECTORY / "fixture_manager_settings.yaml"
+RES_DIRECTORY = PROJECT_ROOT / "res"
+SETTINGS_DIRECTORY = RES_DIRECTORY / "settings"
+SETTINGS_FILE = SETTINGS_DIRECTORY / "fixture_manager.fixture_settings"
 
-# The declared default document, as the fixture spells it.
-DEFAULT_ENABLED = "enabled: true"
-DEFAULT_GAIN = "gain: 1.0"
+# The declared default document, as the fixture's document spells it in JSON.
+DEFAULT_ENABLED = '"enabled": true'
+DEFAULT_GAIN = '"gain": 1.0'
 
 # The edit scenario 2 writes and scenario 3 expects to survive a reload.
-EDITED_GAIN = "gain: 4.5"
+EDITED_GAIN = '"gain": 4.5'
+
+# The value scenario 4 writes: a gain no sound could use.
+REFUSED_GAIN = '"gain": -1.0'
 
 # An unrelated project source, edited to force a reload in scenario 3.
 RELOAD_SOURCE = SOURCE_DIRECTORY / "simulation_time.rs"
 RELOAD_EDIT = "\n// manager-settings suite: an edit that only reloads the project\n"
 
 # Host and fixture log lines this suite asserts on.
-CREATED_TOKEN = "[settings] created the manager settings file"
+CREATED_TOKEN = "[settings] created the manager settings asset"
 APPLIED_TOKEN = "[settings] applied manager settings"
 REFUSED_TOKEN = "[settings] refused manager settings"
 MANAGER_APPLIED_TOKEN = "[test] fixture manager applied"
@@ -141,11 +147,15 @@ def check_created(text: str, file_text: str) -> list:
     return [
         (
             bool(created),
-            "the host reported creating the fixture manager's file",
+            "the host reported creating the fixture manager's settings asset",
         ),
         (
             DEFAULT_ENABLED in file_text and DEFAULT_GAIN in file_text,
             "the created file spells out every default",
+        ),
+        (
+            '"asset_type"' in file_text and '"format_version"' in file_text,
+            "the created file is a settings asset, header included",
         ),
         (
             bool(lines_with(text, MANAGER_APPLIED_TOKEN)),
@@ -190,11 +200,13 @@ def main() -> int:
     print("\n  Manager settings suite")
     print("  Project: {}".format(PROJECT_ROOT))
 
-    # Step 1: The scenario assumes the project has no settings directory. If an
+    # Step 1: The scenario assumes the project has no settings asset. If an
     # earlier run left one behind, it is removed first so the "created" path is
-    # the one under test.
+    # the one under test. The directory is only removed again when this run made
+    # it, so nothing the project tracks is touched.
     if SETTINGS_DIRECTORY.exists():
         shutil.rmtree(SETTINGS_DIRECTORY)
+    created_settings_directory = not SETTINGS_DIRECTORY.exists()
     source_bytes = RELOAD_SOURCE.read_bytes()
 
     ensure_host_lock()
@@ -278,12 +290,14 @@ def main() -> int:
         # keeps what it had.
         start = monitor.line_count
         SETTINGS_FILE.write_text(
-            "# a misspelled key must not be ignored\ngian: 2.0\n",
+            SETTINGS_FILE.read_text(encoding="utf-8").replace(
+                EDITED_GAIN, REFUSED_GAIN
+            ),
             encoding="utf-8",
             newline="",
         )
         if not monitor.wait_for(MANAGER_REFUSED_TOKEN, SETTINGS_TIMEOUT_SECONDS * scale, start):
-            print("  [FAIL] the misspelled document was not refused; last output was:")
+            print("  [FAIL] the out-of-range document was not refused; last output was:")
             print(monitor.output_since(start)[-1500:])
             return 1
         failures += report(
@@ -298,7 +312,7 @@ def main() -> int:
                         for line in lines_with(
                             monitor.output_since(start), MANAGER_APPLIED_TOKEN
                         )
-                        if "gain=2" in line
+                        if "gain=-1" in line
                     ],
                     "the refused document was not applied",
                 ),
@@ -306,7 +320,7 @@ def main() -> int:
         )
     finally:
         RELOAD_SOURCE.write_bytes(source_bytes)
-        if SETTINGS_DIRECTORY.exists():
+        if created_settings_directory and SETTINGS_DIRECTORY.exists():
             shutil.rmtree(SETTINGS_DIRECTORY)
         if process is not None and monitor is not None:
             print("\n  [CLEANUP] Stopping the host...")

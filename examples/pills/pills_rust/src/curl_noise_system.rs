@@ -17,7 +17,7 @@
 
 // External crates
 use glam::Vec3;
-use pill_engine::{pill_hot, Query, Res, SystemError, Time};
+use pill_engine::{pill_hot, system, Query, Res, SystemError, Time};
 use pill_master_renderer_data::TransformComponent;
 
 // Current crate
@@ -200,6 +200,7 @@ fn step_pill(
 
 /// Moves every pill one frame through the field, in parallel.
 #[pill_hot]
+#[system(name = "curl_noise", order = 20)]
 pub(crate) fn curl_noise_system(
     time: Res<Time>,
     demo_state: Res<DemoState>,

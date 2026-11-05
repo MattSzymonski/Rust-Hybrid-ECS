@@ -143,9 +143,6 @@ pub fn init(engine: &mut Engine) -> u32 {
         pill_project_ui::ThemeInstall::new(theme).with_override("ui/accent.theme"),
     );
 
-    engine.register_system("scene_rotation", systems::rotation_system);
-    engine.register_system("input_echo", controls::input_echo_system);
-    engine.register_system("camera_zoom", controls::camera_zoom_system);
     0
 }
 

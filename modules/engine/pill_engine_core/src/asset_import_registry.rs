@@ -567,6 +567,26 @@ impl ImportedTypeEntry {
     }
 }
 
+/// How one field of an asset's settings document draws in the Inspector.
+///
+/// Plain data on purpose: a declaration crosses the registry, which outlives
+/// the crate that made it, so it holds no function pointer and no borrow. The
+/// editor turns a decorator into a widget; anything that does not read it draws
+/// the row exactly as it would without one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldDecorator {
+    /// The value is a number between `min` and `max`, so the row draws as a
+    /// slider.
+    Range {
+        /// The smallest value the row offers.
+        min: f64,
+        /// The largest value the row offers.
+        max: f64,
+    },
+    /// The row's label carries this explanation as hover text.
+    Tooltip(String),
+}
+
 /// The imported asset types of a world, by metadata type name and source
 /// extension.
 ///
@@ -590,6 +610,9 @@ pub struct ImportRegistry {
     /// at. A key that ends in `.*` covers a whole family: `textures.*` is every
     /// texture slot the asset's shader declares.
     references: std::collections::BTreeMap<String, Vec<(String, String)>>,
+    /// The field decorators each type declares, by owner type name. Each pair
+    /// is the document key an edit writes and how its row draws.
+    decorators: std::collections::BTreeMap<String, Vec<(String, FieldDecorator)>>,
 }
 
 impl Resource for ImportRegistry {}
@@ -701,6 +724,43 @@ impl ImportRegistry {
             .map(|entry| entry.type_name.clone())
             .collect();
         self.references.retain(|owner, _| live.contains(owner));
+        self.decorators.retain(|owner, _| live.contains(owner));
+    }
+
+    /// Record how `owner_type`'s document fields draw, as `(document key,
+    /// decorator)` pairs.
+    ///
+    /// This is how a settings asset states that a value is a range or carries
+    /// a tooltip, without the Inspector knowing the type: the manager's crate
+    /// declares it where the document is defined, and the editor reads it back
+    /// through [`Self::field_decorators`].
+    pub fn declare_field_decorators(
+        &mut self,
+        owner_type: &str,
+        decorators: &[(&str, FieldDecorator)],
+    ) {
+        let declared: Vec<(String, FieldDecorator)> = decorators
+            .iter()
+            .map(|(field, decorator)| ((*field).to_owned(), decorator.clone()))
+            .collect();
+        self.decorators.insert(owner_type.to_owned(), declared);
+    }
+
+    /// The decorators `owner_type` declares, as `(document key, decorator)`
+    /// pairs in declaration order.
+    pub fn field_decorators(&self, owner_type: &str) -> &[(String, FieldDecorator)] {
+        self.decorators
+            .get(owner_type)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// The decorator declared for one field of `owner_type`, if any.
+    pub fn field_decorator(&self, owner_type: &str, field: &str) -> Option<&FieldDecorator> {
+        self.decorators
+            .get(owner_type)?
+            .iter()
+            .find_map(|(key, decorator)| (key == field).then_some(decorator))
     }
 
     /// Record the reference fields `owner_type` declares, as `(field key,

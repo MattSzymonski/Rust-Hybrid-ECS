@@ -25,6 +25,60 @@ use super::*;
 // Free functions
 // =============================================================================
 
+/// A row's hover text is the tooltip its type declared, and the whole key when
+/// the type declared none.
+#[test]
+fn a_settings_row_shows_the_tooltip_its_type_declared() {
+    let decorators = [
+        AssetFieldDecorator {
+            key: "ambient_sinks".to_owned(),
+            decorator: FieldDecorator::Tooltip("Voices for sounds in this scene.".to_owned()),
+        },
+        AssetFieldDecorator {
+            key: "ear_separation".to_owned(),
+            decorator: FieldDecorator::Range {
+                min: 0.1,
+                max: 10.0,
+            },
+        },
+    ];
+
+    assert_eq!(
+        inspector_settings::settings_row_tooltip(&decorators, "ambient_sinks"),
+        "Voices for sounds in this scene."
+    );
+    assert_eq!(
+        inspector_settings::settings_row_tooltip(&decorators, "gain"),
+        "gain",
+        "an undeclared row keeps its key as the hover text"
+    );
+}
+
+/// A declared range becomes the slider's bounds, and a row with no range keeps
+/// its drag value.
+#[test]
+fn a_settings_row_draws_the_range_its_type_declared() {
+    let decorators = [AssetFieldDecorator {
+        key: "ear_separation".to_owned(),
+        decorator: FieldDecorator::Range {
+            min: 0.1,
+            max: 10.0,
+        },
+    }];
+
+    assert_eq!(
+        inspector_settings::settings_row_range(&decorators, "ear_separation"),
+        Some((0.1, 10.0))
+    );
+    assert_eq!(
+        inspector_settings::settings_row_range(&decorators, "gain"),
+        None,
+        "a row without a range keeps its drag value"
+    );
+}
+
+// =============================================================================
+
 /// Runs one egui pass for its side effects and discards the output.
 ///
 /// A test has no GPU, so it never applies the texture updates the pass
@@ -721,6 +775,7 @@ fn a_dragged_row_reorders_the_list() {
                             pending,
                             session: inspector_session,
                             overlay_regions: regions,
+                            decorators: &[],
                             read_only: false,
                         },
                     );
@@ -952,6 +1007,7 @@ fn the_inspector_lists_the_selections_components_and_fields() {
             "waves": [{ "amplitude": 1.0 }],
         })),
         references: Vec::new(),
+        decorators: Vec::new(),
     });
     let mut pending = PendingEditorCommands::default();
     let context = egui::Context::default();
