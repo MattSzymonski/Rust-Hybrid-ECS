@@ -7,6 +7,7 @@ from `editor_step_support`, the log vocabulary from `editor_log_tokens`.
 import re
 import json
 
+from core import log_layout
 from core.editor_log_tokens import (
     ASSET_SELECTED_TOKEN,
     CONTEXT_MENU_TOKEN,
@@ -42,7 +43,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     session = state.session
 
     session.wait(
-        re.escape(HISTORY_UNDO_TOKEN) + r'\s+label="set asset flip_v"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_UNDO_TOKEN), r'\s+label="set asset flip_v"'),
         30,
         "the boolean row's edit undid",
         state.begin,
@@ -55,7 +56,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"select asset {texture_asset}")
     session.wait(
-        re.escape(ASSET_SELECTED_TOKEN) + r'\s+path="' + re.escape(texture_asset) + r'"',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_SELECTED_TOKEN), r'\s+path="') + re.escape(texture_asset) + r'"',
         30,
         "the color texture row selected",
         begin,
@@ -70,7 +71,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
         f"edit asset-settings {texture_asset} texture_type {texture_next}"
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="set asset texture_type"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="set asset texture_type"'),
         30,
         "the enum row's edit recorded",
         begin,
@@ -83,7 +84,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("command editor.undo")
     session.wait(
-        re.escape(HISTORY_UNDO_TOKEN) + r'\s+label="set asset texture_type"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_UNDO_TOKEN), r'\s+label="set asset texture_type"'),
         30,
         "the enum row's edit undid",
         begin,
@@ -107,7 +108,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
         begin = session.length()
         session.send("dump systems")
         dumped = session.wait_occurrence(
-            re.escape(SYSTEMS_DUMP_TOKEN) + r"\s+count=(\d+)\s+paused=(true|false)",
+            log_layout.message_then_fields_pattern(re.escape(SYSTEMS_DUMP_TOKEN), r"\s+count=(\d+)\s+paused=(true|false)"),
             seen + 1,
             60,
             "systems dump",
@@ -133,14 +134,13 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send(f"edit system {first_index} off")
     session.wait(
-        re.escape(SYSTEM_EDIT_QUEUED_TOKEN)
-        + rf"\s+index={first_index}\s+enabled=false",
+        log_layout.message_then_fields_pattern(re.escape(SYSTEM_EDIT_QUEUED_TOKEN), rf"\s+index={first_index}\s+enabled=false"),
         30,
         "the system toggle queued",
         begin,
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + rf'\s+label="system {first_index} off"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), rf'\s+label="system {first_index} off"'),
         30,
         "the system toggle recorded",
         begin,
@@ -152,7 +152,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("command editor.undo")
     session.wait(
-        re.escape(HISTORY_UNDO_TOKEN) + rf'\s+label="system {first_index} off"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_UNDO_TOKEN), rf'\s+label="system {first_index} off"'),
         30,
         "the system toggle undid",
         begin,
@@ -167,13 +167,13 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.pause_toggle")
     session.wait(
-        re.escape(PAUSE_TOGGLED_TOKEN) + r"\s+paused=true",
+        log_layout.message_then_fields_pattern(re.escape(PAUSE_TOGGLED_TOKEN), r"\s+paused=true"),
         30,
         "the pause toggle",
         begin,
     )
     session.wait(
-        re.escape(EGUI_ROWS_TOKEN) + r"\s+frames=\d+[^\n]*paused=true",
+        log_layout.message_then_fields_pattern(re.escape(EGUI_ROWS_TOKEN), r"\s+frames=\d+[^\n]*paused=true"),
         60,
         "the rows heartbeat saw the pause",
         begin,
@@ -185,13 +185,13 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.pause_toggle")
     session.wait(
-        re.escape(PAUSE_TOGGLED_TOKEN) + r"\s+paused=false",
+        log_layout.message_then_fields_pattern(re.escape(PAUSE_TOGGLED_TOKEN), r"\s+paused=false"),
         30,
         "the resume toggle",
         begin,
     )
     session.wait(
-        re.escape(EGUI_ROWS_TOKEN) + r"\s+frames=\d+[^\n]*paused=false",
+        log_layout.message_then_fields_pattern(re.escape(EGUI_ROWS_TOKEN), r"\s+frames=\d+[^\n]*paused=false"),
         60,
         "the rows heartbeat saw the resume",
         begin,
@@ -216,21 +216,20 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send(f"select entity {menu_entity}")
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN) + rf"\s+entity={re.escape(menu_entity)}",
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), rf"\s+entity={re.escape(menu_entity)}"),
         30,
         "the entity re-selected for the menu step",
         begin,
     )
     wait_applied(session, applied_before, "the selection command applied")
     session.wait(
-        re.escape(EGUI_ROWS_TOKEN) + rf"[^\n]*detail=\"{re.escape(menu_entity)}\"",
+        log_layout.message_then_fields_pattern(re.escape(EGUI_ROWS_TOKEN), rf"[^\n]*detail=\"{re.escape(menu_entity)}\""),
         60,
         "the re-picked entity reached the Inspector detail",
         begin,
     )
     match = re.search(
-        re.escape(EGUI_ROWS_TOKEN)
-        + rf"[^\n]*detail=\"{re.escape(menu_entity)}\"\s+detail_components=(\d+)",
+        log_layout.message_then_fields_pattern(re.escape(EGUI_ROWS_TOKEN), rf"[^\n]*detail=\"{re.escape(menu_entity)}\"\s+detail_components=(\d+)"),
         session.read_since(begin),
     )
     components_before = int(match.group(1))
@@ -243,7 +242,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"rclick {state.scene_x + 60} {state.scene_y + state.scene_height - 60}")
     session.wait(
-        re.escape(CONTEXT_MENU_TOKEN) + r'\s+area="scene"',
+        log_layout.message_then_fields_pattern(re.escape(CONTEXT_MENU_TOKEN), r'\s+area="scene"'),
         30,
         "the viewport menu opened",
         begin,
@@ -254,8 +253,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.tool_rotate")
     session.wait(
-        re.escape(GIZMO_ANCHOR_TOKEN)
-        + rf'\s+entity={re.escape(menu_entity)}\s+mode="rotate"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_ANCHOR_TOKEN), rf'\s+entity={re.escape(menu_entity)}\s+mode="rotate"'),
         60,
         "the tool switched to rotate",
         begin,
@@ -263,7 +261,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.tool_snap_toggle")
     session.wait(
-        re.escape(GIZMO_ANCHOR_TOKEN) + r"[^\n]*snapped=true",
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_ANCHOR_TOKEN), r"[^\n]*snapped=true"),
         60,
         "snapping toggled on",
         begin,
@@ -271,7 +269,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.tool_snap_toggle")
     session.wait(
-        re.escape(GIZMO_ANCHOR_TOKEN) + r"[^\n]*snapped=false",
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_ANCHOR_TOKEN), r"[^\n]*snapped=false"),
         60,
         "snapping toggled off",
         begin,
@@ -279,7 +277,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.tool_space_toggle")
     session.wait(
-        re.escape(GIZMO_ANCHOR_TOKEN) + r'[^\n]*space="local"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_ANCHOR_TOKEN), r'[^\n]*space="local"'),
         60,
         "the space switched to local",
         begin,
@@ -287,7 +285,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.tool_space_toggle")
     session.wait(
-        re.escape(GIZMO_ANCHOR_TOKEN) + r'[^\n]*space="world"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_ANCHOR_TOKEN), r'[^\n]*space="world"'),
         60,
         "the space switched back",
         begin,
@@ -300,15 +298,14 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send(f"edit remove {menu_entity} {TRANSFORM_COMPONENT}")
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="remove TransformComponent"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="remove TransformComponent"'),
         30,
         "the component detach recorded",
         begin,
     )
     wait_applied(session, applied_before, "component detach applied")
     session.wait(
-        re.escape(EGUI_ROWS_TOKEN)
-        + rf"[^\n]*detail=\"{re.escape(menu_entity)}\""
+        log_layout.message_then_fields_pattern(re.escape(EGUI_ROWS_TOKEN), rf"[^\n]*detail=\"{re.escape(menu_entity)}\"")
         + rf"\s+detail_components={components_before - 1}",
         60,
         "the component count dropped",
@@ -318,15 +315,14 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send(f"edit add {menu_entity} {TRANSFORM_COMPONENT}")
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="add TransformComponent"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="add TransformComponent"'),
         30,
         "the component attach recorded",
         begin,
     )
     wait_applied(session, applied_before, "component attach applied")
     session.wait(
-        re.escape(EGUI_ROWS_TOKEN)
-        + rf"[^\n]*detail=\"{re.escape(menu_entity)}\""
+        log_layout.message_then_fields_pattern(re.escape(EGUI_ROWS_TOKEN), rf"[^\n]*detail=\"{re.escape(menu_entity)}\"")
         + rf"\s+detail_components={components_before}",
         60,
         "the component count came back",
@@ -345,7 +341,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     session.send("command editor.entity_create")
     session.wait(re.escape(NEW_ENTITY_TOKEN), 30, "the new entity queued", begin)
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="new entity"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="new entity"'),
         30,
         "the new entity recorded",
         begin,
@@ -358,7 +354,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     session.send("command editor.entity_delete")
     session.wait(re.escape(DELETE_ENTITY_TOKEN), 30, "the delete queued", begin)
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="delete entity"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="delete entity"'),
         30,
         "the delete recorded",
         begin,
@@ -366,7 +362,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     wait_applied(session, applied_before, "delete applied")
     wait_for_entity_count(session, count_before, "the delete removed one entity")
     session.wait(
-        re.escape(EGUI_ROWS_TOKEN) + r'[^\n]*detail="-"',
+        log_layout.message_then_fields_pattern(re.escape(EGUI_ROWS_TOKEN), r'[^\n]*detail="-"'),
         60,
         "the selection cleared with the delete",
         begin,
@@ -376,7 +372,7 @@ def run_systems_components_and_entities_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("command editor.undo")
     session.wait(
-        re.escape(HISTORY_UNDO_TOKEN) + r'\s+label="delete entity"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_UNDO_TOKEN), r'\s+label="delete entity"'),
         30,
         "the delete undid",
         begin,

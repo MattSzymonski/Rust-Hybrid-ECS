@@ -267,6 +267,14 @@ def scenario_function_hot_patching_off(arguments) -> list:
     try:
         if not wait_until_running(monitor, arguments.timeout_scale):
             return [(False, "the host started with function hot patching off")]
+        # The project's own frames print before its source watcher is armed, and
+        # a change made in that window is never reported. The host says patching
+        # is off once it enters its project loop, after every watcher is armed,
+        # so wait for that line before writing the edit.
+        if not monitor.wait_for(
+            PATCHING_OFF_TOKEN, STARTUP_TIMEOUT_SECONDS * arguments.timeout_scale
+        ):
+            return [(False, "the host said patching is switched off")]
         mark = monitor.line_count
         HOT_SYSTEM_FILE.write_bytes(edited)
         if not monitor.wait_for(

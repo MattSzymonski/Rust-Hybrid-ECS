@@ -7,6 +7,7 @@ from `editor_step_support`, the log vocabulary from `editor_log_tokens`.
 import re
 import time
 
+from core import log_layout
 from core.editor_log_tokens import (
     DELETE_ENTITY_TOKEN,
     ENGINE_COMMANDS_APPLIED_TOKEN,
@@ -214,8 +215,7 @@ def run_material_and_entity_references_steps(state: StepState) -> None:
     reference_rows = [
         match.group(1)
         for match in re.finditer(
-            re.escape(ENTITY_ROW_TOKEN)
-            + r'\s+display="([^"]+)"\s+components="([^"]*)"',
+            log_layout.message_then_fields_pattern(re.escape(ENTITY_ROW_TOKEN), r'\s+display="([^"]+)"\s+components="([^"]*)"'),
             reference_dump,
         )
         if "ShowcaseReferenceComponent" in match.group(2)
@@ -226,7 +226,7 @@ def run_material_and_entity_references_steps(state: StepState) -> None:
     listed_entities = [
         match.group(1)
         for match in re.finditer(
-            re.escape(ENTITY_ROW_TOKEN) + r'\s+display="([^"]+)"', reference_dump
+            log_layout.message_then_fields_pattern(re.escape(ENTITY_ROW_TOKEN), r'\s+display="([^"]+)"'), reference_dump
         )
     ]
     # A carrier no earlier step selected: a row logs its text on its first
@@ -338,8 +338,7 @@ def run_material_and_entity_references_steps(state: StepState) -> None:
     # so the dragged row's rectangle is already there.
     session.send("tab entities")
     hierarchy_row_pattern = (
-        re.escape(HIERARCHY_ROW_RECT_TOKEN)
-        + r"\s+entity="
+        log_layout.message_then_fields_pattern(re.escape(HIERARCHY_ROW_RECT_TOKEN), r"\s+entity=")
         + re.escape(picked_target)
         + r"\b[^\n]*"
     )
@@ -444,7 +443,7 @@ def run_material_and_entity_references_steps(state: StepState) -> None:
     session.send("command editor.entity_create")
     session.wait(re.escape(NEW_ENTITY_TOKEN), 30, "the throwaway entity queued", begin)
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="new entity"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="new entity"'),
         30,
         "the throwaway recorded",
         begin,
@@ -459,7 +458,7 @@ def run_material_and_entity_references_steps(state: StepState) -> None:
     created = [
         match.group(1)
         for match in re.finditer(
-            re.escape(ENTITY_ROW_TOKEN) + r'\s+display="([^"]+)"', after_create
+            log_layout.message_then_fields_pattern(re.escape(ENTITY_ROW_TOKEN), r'\s+display="([^"]+)"'), after_create
         )
         if match.group(1) not in listed_entities
     ]
@@ -484,8 +483,7 @@ def run_material_and_entity_references_steps(state: StepState) -> None:
     begin = session.length()
     session.send("select entity {}".format(throwaway))
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN)
-        + r"\s+entity="
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), r"\s+entity=")
         + re.escape(throwaway)
         + r"\b",
         30,
@@ -495,13 +493,13 @@ def run_material_and_entity_references_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.entity_delete")
     session.wait(
-        re.escape(DELETE_ENTITY_TOKEN) + r"\s+entity=" + re.escape(throwaway) + r"\b",
+        log_layout.message_then_fields_pattern(re.escape(DELETE_ENTITY_TOKEN), r"\s+entity=") + re.escape(throwaway) + r"\b",
         30,
         "the throwaway deleted",
         begin,
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="delete entity"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="delete entity"'),
         30,
         "the delete recorded",
         begin,
@@ -549,7 +547,7 @@ def run_material_and_entity_references_steps(state: StepState) -> None:
     begin = session.length()
     session.send("select entity {}".format(state.prior_entity))
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=1\b',
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), r'\s+entity=[^ ]+\s+count=1\b'),
         30,
         "the prior selection restored",
         begin,

@@ -103,6 +103,13 @@ pub const PROFILE_COARSE_TARGET: &str = telemetry_target::PROFILE_COARSE;
 /// The target of the fine investigative profiling lane.
 pub const PROFILE_FINE_TARGET: &str = telemetry_target::PROFILE_FINE;
 
+/// The text between a line's message and its fields.
+///
+/// A line with no fields has no separator. A block carries it on the prefix
+/// line between its heading and its fields. The source location is not a
+/// field and keeps its own gap.
+pub const FIELD_SEPARATOR: &str = " | ";
+
 // =============================================================================
 // Logging Configuration
 // =============================================================================
@@ -400,8 +407,9 @@ where
         write!(writer, "{} ", styled_level(metadata.level(), accepts_ansi))?;
         write!(writer, "{}", styled_target(metadata.target(), accepts_ansi))?;
 
-        // Message first, then its fields after a two-space gap, so the text
-        // never runs into the first field name.
+        // Message first, then its fields after `FIELD_SEPARATOR`, so a reader
+        // can see where the fixed words end. A line with fields but no
+        // message keeps the fields behind the target, with no separator.
         let mut visitor = StyledFieldVisitor {
             accepts_ansi,
             skip_log_fields: event.is_log(),
@@ -428,7 +436,11 @@ where
             write!(writer, "  {heading}")?;
         }
         if !visitor.fields.is_empty() {
-            write!(writer, "  {}", visitor.fields)?;
+            if heading.is_empty() {
+                write!(writer, "  {}", visitor.fields)?;
+            } else {
+                write!(writer, "{FIELD_SEPARATOR}{}", visitor.fields)?;
+            }
         }
 
         // The source location is opt-in. It trails the line in dark gray, which
@@ -477,8 +489,9 @@ impl StyledFieldVisitor {
         }
     }
 
-    /// The line a reader sees: the message, then its fields after the same
-    /// two-space gap the terminal line puts between them.
+    /// The line a reader sees: the message, then its fields after
+    /// [`FIELD_SEPARATOR`], with a block's fields on its heading line the way
+    /// the terminal formatter puts them.
     pub(crate) fn into_line(self) -> String {
         if self.fields.is_empty() {
             return self.message;
@@ -486,7 +499,20 @@ impl StyledFieldVisitor {
         if self.message.is_empty() {
             return self.fields;
         }
-        format!("{}  {}", self.message, self.fields)
+        let (heading, body) = match self.message.split_once('\n') {
+            Some((heading, body)) => (heading, body.trim_end_matches(['\n', '\r'])),
+            None => (self.message.as_str(), ""),
+        };
+        let mut line = if heading.is_empty() {
+            self.fields
+        } else {
+            format!("{heading}{FIELD_SEPARATOR}{}", self.fields)
+        };
+        if !body.is_empty() {
+            line.push('\n');
+            line.push_str(body);
+        }
+        line
     }
 }
 
@@ -929,7 +955,7 @@ pub enum TelemetryError {
 /// next entry follows directly:
 ///
 /// ```text
-/// [21:51:45:003] INFO  engine::hot_reload  Modules to build:  total=1
+/// [21:51:45:003] INFO  engine::hot_reload  Modules to build: | total=1
 /// 1. pill_spline  extension
 /// ```
 ///
@@ -1248,7 +1274,7 @@ mod tests {
         // Only the start of the prefix line: another test may switch the
         // process-wide source location on while this one runs.
         assert!(
-            lines[0].starts_with("INFO  engine::hot_reload  Modules to build:  total=2"),
+            lines[0].starts_with("INFO  engine::hot_reload  Modules to build: | total=2"),
             "{output}"
         );
         assert_eq!(lines[1..], ["1. pill_spline", "2. project"]);
@@ -1361,7 +1387,7 @@ mod tests {
 
         let hidden = emit();
         assert_eq!(
-            hidden, "INFO  engine::hot_reload  extension loaded  module=\"pill_spline\" owner=2",
+            hidden, "INFO  engine::hot_reload  extension loaded | module=\"pill_spline\" owner=2",
             "the location is off by default"
         );
 
@@ -1375,6 +1401,32 @@ mod tests {
         assert!(
             !shown.contains('\u{1b}'),
             "escape codes in a plain lane: {shown}"
+        );
+    }
+
+    /// A line with no fields has no separator to show.
+    #[test]
+    fn terminal_formatter_omits_the_separator_without_fields() {
+        let output = render_plain(|| {
+            tracing::info!(target: telemetry_target::HOT_RELOAD, "source change detected");
+        });
+        assert!(
+            output.starts_with("INFO  engine::hot_reload  source change detected"),
+            "{output}"
+        );
+        assert!(!output.contains(FIELD_SEPARATOR), "{output}");
+    }
+
+    /// The separator only marks where the fields begin: a message that
+    /// contains a pipe is still a message.
+    #[test]
+    fn terminal_formatter_leaves_a_pipe_in_the_message_alone() {
+        let output = render_plain(|| {
+            tracing::info!(target: telemetry_target::HOT_RELOAD, total = 1, "modules | ready");
+        });
+        assert!(
+            output.starts_with("INFO  engine::hot_reload  modules | ready | total=1"),
+            "{output}"
         );
     }
 

@@ -72,7 +72,7 @@ pill_engine::tracing::info!(target: "project", entities = spawned, "[project] wa
 ```
 
 ```text
-[19:11:15:858] INFO  project  [project] wave spawned  entities=12
+[19:11:15:858] INFO  project  [project] wave spawned | entities=12
 ```
 
 - **No `println!`.** A print has no time, level or target, so no setting can

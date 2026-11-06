@@ -6,6 +6,7 @@ from `editor_step_support`, the log vocabulary from `editor_log_tokens`.
 
 import re
 
+from core import log_layout
 from core.editor_log_tokens import (
     DOCK_DUMP_PATTERN,
     DOCK_LEAF_PATTERN,
@@ -73,8 +74,7 @@ def run_popouts_and_reloads_steps(state: StepState) -> None:
     session.wait(re.escape(FIELD_TOKEN), 30, "the edited field", begin)
     dump = session.read_since(begin)
     assert re.search(
-        re.escape(HISTORY_PUSH_TOKEN)
-        + r'\s+label="set ShowcaseComponent\.lean"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="set ShowcaseComponent\.lean"'),
         dump,
     ), f"the slider edit recorded no step: {dump[-400:]}"
     assert "0.25" in dump, f"the edit did not reach the field: {dump[-400:]}"
@@ -102,19 +102,19 @@ def run_popouts_and_reloads_steps(state: StepState) -> None:
     begin = session.length()
     session.send("popout inspector")
     session.wait(
-        re.escape(POPOUT_MOVED_TOKEN) + r'\s+tab="inspector"\s+redock=false',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_MOVED_TOKEN), r'\s+tab="inspector"\s+redock=false'),
         30,
         "the Inspector popped out",
         begin,
     )
     session.wait(
-        re.escape(POPOUT_OPENED_TOKEN) + r'\s+tab="inspector"',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_OPENED_TOKEN), r'\s+tab="inspector"'),
         60,
         "the pop-out window opened",
         begin,
     )
     session.wait(
-        re.escape(POPOUT_PRESENTED_TOKEN) + r'\s+tab="inspector"',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_PRESENTED_TOKEN), r'\s+tab="inspector"'),
         60,
         "the pop-out window presented a frame",
         begin,
@@ -123,7 +123,7 @@ def run_popouts_and_reloads_steps(state: StepState) -> None:
         "dump tabs", DOCK_DUMP_PATTERN, 30, "dock dump with a pop-out"
     )
     assert re.search(
-        re.escape(DOCK_POPOUT_TOKEN) + r'\s+tab="inspector"', popout_dump
+        log_layout.message_then_fields_pattern(re.escape(DOCK_POPOUT_TOKEN), r'\s+tab="inspector"'), popout_dump
     ), "the dock did not report the popped-out tab: {}".format(popout_dump[-600:])
     held = [
         tabs
@@ -137,13 +137,13 @@ def run_popouts_and_reloads_steps(state: StepState) -> None:
     begin = session.length()
     session.send("popout inspector redock")
     session.wait(
-        re.escape(POPOUT_MOVED_TOKEN) + r'\s+tab="inspector"\s+redock=true',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_MOVED_TOKEN), r'\s+tab="inspector"\s+redock=true'),
         30,
         "the Inspector redocked",
         begin,
     )
     session.wait(
-        re.escape(POPOUT_CLOSED_TOKEN) + r'\s+tab="inspector"',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_CLOSED_TOKEN), r'\s+tab="inspector"'),
         60,
         "the pop-out window closed",
         begin,
@@ -162,26 +162,26 @@ def run_popouts_and_reloads_steps(state: StepState) -> None:
     begin = session.length()
     session.send("popout scene")
     session.wait(
-        re.escape(SCENE_VIEW_REBOUND_TOKEN) + r"\s+surface=\d+\s+popped=true",
+        log_layout.message_then_fields_pattern(re.escape(SCENE_VIEW_REBOUND_TOKEN), r"\s+surface=\d+\s+popped=true"),
         60,
         "the popped-out scene view moved to a top-level window",
         begin,
     )
     session.wait(
-        re.escape(POPOUT_PRESENTED_TOKEN) + r'\s+tab="scene"',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_PRESENTED_TOKEN), r'\s+tab="scene"'),
         60,
         "the scene pop-out presented a frame",
         begin,
     )
     session.send("popout scene redock")
     session.wait(
-        re.escape(SCENE_VIEW_REBOUND_TOKEN) + r"\s+surface=\d+\s+popped=false",
+        log_layout.message_then_fields_pattern(re.escape(SCENE_VIEW_REBOUND_TOKEN), r"\s+surface=\d+\s+popped=false"),
         60,
         "the scene view went back to its child window",
         begin,
     )
     session.wait(
-        re.escape(POPOUT_CLOSED_TOKEN) + r'\s+tab="scene"',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_CLOSED_TOKEN), r'\s+tab="scene"'),
         60,
         "the scene pop-out closed",
         begin,
@@ -194,13 +194,13 @@ def run_popouts_and_reloads_steps(state: StepState) -> None:
     begin = session.length()
     session.send("popout assets")
     session.wait(
-        re.escape(POPOUT_MOVED_TOKEN) + r'\s+tab="assets"\s+redock=false',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_MOVED_TOKEN), r'\s+tab="assets"\s+redock=false'),
         30,
         "the Assets tab popped out",
         begin,
     )
     session.wait(
-        re.escape(POPOUT_PRESENTED_TOKEN) + r'\s+tab="assets"',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_PRESENTED_TOKEN), r'\s+tab="assets"'),
         60,
         "the Assets pop-out presented a frame",
         begin,
@@ -415,7 +415,7 @@ def run_popouts_and_reloads_steps(state: StepState) -> None:
     # generation before the reload had already claimed and never logged a
     # window.
     session.wait_occurrence(
-        re.escape(SHELL_CONTEXT_CLAIMED_TOKEN) + r"\s+entries=\d+\s+windows=1\b",
+        log_layout.message_then_fields_pattern(re.escape(SHELL_CONTEXT_CLAIMED_TOKEN), r"\s+entries=\d+\s+windows=1\b"),
         1,
         60,
         "the reloaded shell claimed the pop-out's context",

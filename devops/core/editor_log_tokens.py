@@ -12,6 +12,7 @@ compose them onto these patterns at the wait.
 
 import re
 
+from core import log_layout
 from core.paths import executable_name
 
 # The suite tokens: the stable halves of the lines this suite asserts on, so
@@ -37,8 +38,7 @@ EDITOR_SHORTCUT_RAN_TOKEN = "[editor] shortcut ran"
 # out its timeout, and `test_log_contract.py` pins the literal against Rust.
 EDITOR_SCRIPTED_REJECTED_TOKEN = "[editor] scripted command rejected"
 REJECTION_PATTERN = re.compile(
-    re.escape(EDITOR_SCRIPTED_REJECTED_TOKEN)
-    + r'\s+command="((?:[^"\\]|\\.)*)"\s+reason="((?:[^"\\]|\\.)*)"'
+    log_layout.message_then_fields_pattern(re.escape(EDITOR_SCRIPTED_REJECTED_TOKEN), r'\s+command="((?:[^"\\]|\\.)*)"\s+reason="((?:[^"\\]|\\.)*)"')
 )
 
 EGUI_EDITOR_BINARY = executable_name("pill_editor")
@@ -139,8 +139,7 @@ CONSOLE_SEARCH_TOKEN = "[editor] console search"
 # One console dump: the filters in force, the counts and the first row the
 # filters left.
 CONSOLE_DUMP_PATTERN = (
-    re.escape(CONSOLE_DUMP_TOKEN)
-    + r'\s+level="(?P<level>\w+)"\s+channel="(?P<channel>\w+)"'
+    log_layout.message_then_fields_pattern(re.escape(CONSOLE_DUMP_TOKEN), r'\s+level="(?P<level>\w+)"\s+channel="(?P<channel>\w+)"')
     + r'\s+search="(?P<search>(?:[^"\\]|\\.)*)"'
     + r"\s+total=(?P<total>\d+)\s+visible=(?P<visible>\d+)"
     + r"\s+engine=(?P<engine>\d+)\s+game=(?P<game>\d+)"
@@ -223,7 +222,10 @@ PREFERENCES_SAVED_TOKEN = "[editor] preferences saved"
 PREFERENCE_EDIT_QUEUED_TOKEN = "[editor] preference edit queued"
 # The editor's theme layers: the executable logs each
 # resolution, the shell logs each install, the dump reports what the shell
-# would install, and a refused or legacy layer says so.
+# would install, and a refused or legacy layer says so. The refusal token
+# stops where a `layer=` value starts inside the message, so the patterns
+# that use it append that value directly; it is message text, not a formatter
+# field, and is not built through `log_layout`.
 EDITOR_THEME_RESOLVED_TOKEN = "[editor] theme resolved"
 EDITOR_THEME_APPLIED_TOKEN = "[editor] theme applied"
 EDITOR_THEME_DUMP_TOKEN = "[test] theme"
@@ -257,13 +259,12 @@ TOAST_TOKEN = "[editor] toast"
 # text: the level (a quoted string field), the notice id and the text the
 # executable produced, whose own pattern each check appends inside the
 # quotes.
-TOAST_PREAMBLE = re.escape(TOAST_TOKEN) + r'\s+level="{}"\s+seq=\d+\s+text="'
+TOAST_PREAMBLE = log_layout.message_then_fields_pattern(re.escape(TOAST_TOKEN), r'\s+level="{}"\s+seq=\d+\s+text="')
 
 # A whole toast line, rectangle included: the level, the id, the text and
 # where the row landed, so a check can click the toast itself.
 TOAST_LINE_PATTERN = (
-    re.escape(TOAST_TOKEN)
-    + r'\s+level="(\w+)"\s+seq=\d+\s+text="((?:[^"\\]|\\.)*)"'
+    log_layout.message_then_fields_pattern(re.escape(TOAST_TOKEN), r'\s+level="(\w+)"\s+seq=\d+\s+text="((?:[^"\\]|\\.)*)"')
     + r"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)\s+width=([0-9.]+)\s+height=([0-9.]+)"
 )
 
@@ -274,7 +275,9 @@ TRANSFORM_COMPONENT = "TransformComponent"
 # One live patch of a named shell function: the host's line names the
 # function it replaced, the milliseconds it took and the route it took. The
 # names are package-qualified, so the pattern only pins the module and the
-# function and leaves the crate prefix free.
+# function and leaves the crate prefix free. This matches a block body line,
+# not a prefix line, so its spaces belong to the message and it is not built
+# through `log_layout`.
 HOT_PATCH_LIVE_PATTERN = (
     # The shell is split file-per-tab, so a body's path
     # carries its module: `...::shell::tab_entities::entities_tab`.
@@ -283,28 +286,25 @@ HOT_PATCH_LIVE_PATTERN = (
 
 # The rows heartbeat's runtime values, in the field order the shell logs them.
 ROWS_PATTERN = (
-    re.escape(EGUI_ROWS_TOKEN) + r"\s+frames=(\d+)\s+entities=(\d+)\s+systems=(\d+)"
+    log_layout.message_then_fields_pattern(re.escape(EGUI_ROWS_TOKEN), r"\s+frames=(\d+)\s+entities=(\d+)\s+systems=(\d+)")
 )
-DOCK_DUMP_PATTERN = re.escape(EGUI_DOCK_DUMP_TOKEN) + r"\s+surfaces=(\d+)"
+DOCK_DUMP_PATTERN = log_layout.message_then_fields_pattern(re.escape(EGUI_DOCK_DUMP_TOKEN), r"\s+surfaces=(\d+)")
 # One leaf of the dock dump: the surface and node that hold it, the tab in
 # front and every tab it holds, in draw order.
 DOCK_LEAF_PATTERN = (
-    re.escape(LAYOUT_LEAF_TOKEN)
-    + r"\s+surface=(\d+)\s+node=(\d+)\s+active=([a-z0-9]*)\s+tabs=([a-z0-9,]*)"
+    log_layout.message_then_fields_pattern(re.escape(LAYOUT_LEAF_TOKEN), r"\s+surface=(\d+)\s+node=(\d+)\s+active=([a-z0-9]*)\s+tabs=([a-z0-9,]*)")
 )
 # The scene view rect's runtime values, in the field order the frontend logs
 # them: view, x, y, width, height, visible.
 SCENE_RECT_PATTERN = (
-    re.escape(SCENE_VIEW_RECT_TOKEN)
-    + r"\s+view=(\d+)\s+x=(-?\d+)\s+y=(-?\d+)\s+width=(\d+)\s+height=(\d+)"
+    log_layout.message_then_fields_pattern(re.escape(SCENE_VIEW_RECT_TOKEN), r"\s+view=(\d+)\s+x=(-?\d+)\s+y=(-?\d+)\s+width=(\d+)\s+height=(\d+)")
     + r"\s+visible=(true|false)"
 )
 # The game view rect's runtime values, in the field order the frontend logs
 # them: x, y, width, height, visible. The game window has no view index - one
 # primary surface, one window.
 GAME_RECT_PATTERN = (
-    re.escape(GAME_VIEW_RECT_TOKEN)
-    + r"\s+x=(-?\d+)\s+y=(-?\d+)\s+width=(\d+)\s+height=(\d+)"
+    log_layout.message_then_fields_pattern(re.escape(GAME_VIEW_RECT_TOKEN), r"\s+x=(-?\d+)\s+y=(-?\d+)\s+width=(\d+)\s+height=(\d+)")
     + r"\s+visible=(true|false)"
 )
 # The floating toolbox's runtime values, in the field order the shell logs
@@ -312,13 +312,11 @@ GAME_RECT_PATTERN = (
 # are the physical pixels of the click injections while the suite runs at a
 # scale factor of 1.
 TOOLBOX_RECT_PATTERN = (
-    re.escape(TOOLBOX_RECT_TOKEN)
-    + r"\s+view=(\d+)\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)"
+    log_layout.message_then_fields_pattern(re.escape(TOOLBOX_RECT_TOKEN), r"\s+view=(\d+)\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)")
     + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
 )
 TOOLBOX_ITEM_PATTERN = (
-    re.escape(TOOLBOX_ITEM_TOKEN)
-    + r'\s+view=(\d+)\s+item="([a-z]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)'
+    log_layout.message_then_fields_pattern(re.escape(TOOLBOX_ITEM_TOKEN), r'\s+view=(\d+)\s+item="([a-z]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)')
     + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
 )
 # The menu bar's runtime values, in the field order the shell logs them: the
@@ -326,53 +324,47 @@ TOOLBOX_ITEM_PATTERN = (
 # points, the physical pixels of the click injections while the suite runs at a
 # scale factor of 1.
 MENU_BAR_RECT_PATTERN = (
-    re.escape(MENU_BAR_RECT_TOKEN)
-    + r"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)\s+width=([0-9.]+)\s+height=([0-9.]+)"
+    log_layout.message_then_fields_pattern(re.escape(MENU_BAR_RECT_TOKEN), r"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)\s+width=([0-9.]+)\s+height=([0-9.]+)")
 )
 MENU_TITLE_RECT_PATTERN = (
-    re.escape(MENU_TITLE_RECT_TOKEN)
-    + r'\s+name="([a-z]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)'
+    log_layout.message_then_fields_pattern(re.escape(MENU_TITLE_RECT_TOKEN), r'\s+name="([a-z]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)')
     + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
 )
 MENU_ENTRY_RECT_PATTERN = (
-    re.escape(MENU_ENTRY_RECT_TOKEN)
-    + r'\s+menu="([a-z]+)"\s+label="([^"]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)'
+    log_layout.message_then_fields_pattern(re.escape(MENU_ENTRY_RECT_TOKEN), r'\s+menu="([a-z]+)"\s+label="([^"]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)')
     + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
 )
 # The Inspector's runtime values: a section header's rectangle (keyed by the
 # registered component type), the Add Component button's, and an addable
 # entry's - all in logical points like the rest of the shell's geometry.
 INSPECTOR_SECTION_RECT_PATTERN = (
-    re.escape(INSPECTOR_SECTION_RECT_TOKEN)
-    + r'\s+component="([^"]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)'
+    log_layout.message_then_fields_pattern(re.escape(INSPECTOR_SECTION_RECT_TOKEN), r'\s+component="([^"]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)')
     + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
 )
 INSPECTOR_ADD_RECT_PATTERN = (
-    re.escape(INSPECTOR_ADD_RECT_TOKEN)
-    + r"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)\s+width=([0-9.]+)\s+height=([0-9.]+)"
+    log_layout.message_then_fields_pattern(re.escape(INSPECTOR_ADD_RECT_TOKEN), r"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)\s+width=([0-9.]+)\s+height=([0-9.]+)")
 )
 INSPECTOR_ADD_ENTRY_PATTERN = (
-    re.escape(INSPECTOR_ADD_ENTRY_TOKEN)
-    + r'\s+component="([^"]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)'
+    log_layout.message_then_fields_pattern(re.escape(INSPECTOR_ADD_ENTRY_TOKEN), r'\s+component="([^"]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)')
     + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
 )
 # One drawn Inspector row, in the field order the shell logs it: the row's
 # kind, the component it belongs to, then whatever that kind carries (a
 # field's name, widget and tooltip, a header's text, a gap's height). The
-# kind logs unquoted because the shell passes it as a literal.
-INSPECTOR_ROW_PATTERN = (
-    re.escape(INSPECTOR_ROW_TOKEN)
-    + r'\s+kind="?([a-z-]+)"?\s+component="([^"]+)"([^\n]*)'
+# kind logs unquoted because the shell passes it as a literal, and it sits
+# inside the message before the separator; the component is the first field.
+INSPECTOR_ROW_PATTERN = log_layout.message_then_fields_pattern(
+    re.escape(INSPECTOR_ROW_TOKEN) + r' kind="?([a-z-]+)"?',
+    r'\s+component="([^"]+)"([^\n]*)',
 )
 # The scene grid's state, in the field order the frontend logs it: the
 # switch, the cell size, and the surfaces the renderer draws it on (empty
 # while it is off).
 SCENE_GRID_PATTERN = (
-    re.escape(SCENE_GRID_TOKEN)
-    + r"\s+enabled=(true|false)\s+cell=([0-9.]+)\s+surfaces=(\S*)"
+    log_layout.message_then_fields_pattern(re.escape(SCENE_GRID_TOKEN), r"\s+enabled=(true|false)\s+cell=([0-9.]+)\s+surfaces=(\S*)")
 )
 # The two answers a scripted scene click can produce, as full patterns.
-PICK_ENTITY_PATTERN = re.escape(SCENE_PICK_ENTITY_TOKEN) + r"\s+entity=(\S+)"
+PICK_ENTITY_PATTERN = log_layout.message_then_fields_pattern(re.escape(SCENE_PICK_ENTITY_TOKEN), r"\s+entity=(\S+)")
 PICK_NOTHING_PATTERN = re.escape(SCENE_PICK_NOTHING_TOKEN)
 # How long one probe click waits for either answer. An answer arrives within a
 # frame or two, so the only way to wait this long is a click the shell took
@@ -381,8 +373,7 @@ PICK_NOTHING_PATTERN = re.escape(SCENE_PICK_NOTHING_TOKEN)
 PICK_PROBE_TIMEOUT = 15
 # One row of a `dump systems`: index, name, owner, state, then the markers.
 SYSTEM_ROW_PATTERN = (
-    re.escape(SYSTEM_ROW_TOKEN)
-    + r'\s+index=(\d+)\s+name="([^"]+)"\s+owner="([^"]+)"\s+enabled=(true|false)'
+    log_layout.message_then_fields_pattern(re.escape(SYSTEM_ROW_TOKEN), r'\s+index=(\d+)\s+name="([^"]+)"\s+owner="([^"]+)"\s+enabled=(true|false)')
     + r"\s+hot_patchable=(?:true|false)\s+ambiguous=(?:true|false)"
 )
 

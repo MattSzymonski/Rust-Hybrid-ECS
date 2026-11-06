@@ -6,6 +6,7 @@ from `editor_step_support`, the log vocabulary from `editor_log_tokens`.
 
 import re
 
+from core import log_layout
 from core.editor_log_tokens import (
     ACTIVE_VIEWPORT_TOKEN,
     CAMERA_GESTURE_TOKEN,
@@ -83,7 +84,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     )
     begin = session.length()
     session.wait(
-        re.escape(EDITOR_FONTS_INSTALLED_TOKEN) + r"\s+signature=([0-9a-f]{16})",
+        log_layout.message_then_fields_pattern(re.escape(EDITOR_FONTS_INSTALLED_TOKEN), r"\s+signature=([0-9a-f]{16})"),
         60,
         "the project's font installed",
         begin,
@@ -141,7 +142,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     begin = session.length()
     session.send("tab game")
     session.wait(
-        re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="game"',
+        log_layout.message_then_fields_pattern(re.escape(TAB_ACTIVATED_TOKEN), r'\s+tab="game"'),
         30,
         "the game tab activated",
         begin,
@@ -160,7 +161,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     begin = session.length()
     session.send("tab scene")
     session.wait(
-        re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="scene"',
+        log_layout.message_then_fields_pattern(re.escape(TAB_ACTIVATED_TOKEN), r'\s+tab="scene"'),
         30,
         "the scene tab back",
         begin,
@@ -173,7 +174,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     # draggable inside the viewport and keeps taking input where it
     # lands, and the second viewport carries its own.
     step_begin = session.length()
-    session.wait(re.escape(TOOLBOX_RECT_TOKEN) + r"\s+view=0", 30, "the toolbox placed")
+    session.wait(log_layout.message_then_fields_pattern(re.escape(TOOLBOX_RECT_TOKEN), r"\s+view=0"), 30, "the toolbox placed")
     session.wait(re.escape(TOOLBOX_ITEM_TOKEN), 30, "the toolbox rows reported")
     panel = toolbox_panel(session, 0)
     viewport = logged_scene_rect(session, 0)
@@ -193,7 +194,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     toolbox_click(session, 0, "translate", "the toolbox switched to translate")
     wait_applied(session, applied_before, "the toolbox tool applied")
     session.wait(
-        re.escape(GIZMO_ANCHOR_TOKEN) + r'[^\n]*mode="translate"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_ANCHOR_TOKEN), r'[^\n]*mode="translate"'),
         60,
         "the anchor carries the toolbox's tool",
         begin,
@@ -234,7 +235,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     begin = session.length()
     toolbox_click(session, 0, "rotate", "the moved toolbox switched to rotate")
     session.wait(
-        re.escape(GIZMO_ANCHOR_TOKEN) + r'[^\n]*mode="rotate"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_ANCHOR_TOKEN), r'[^\n]*mode="rotate"'),
         60,
         "the anchor followed the moved toolbox",
         begin,
@@ -245,13 +246,13 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     begin = session.length()
     session.send("tab scene2")
     session.wait(
-        re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="scene2"',
+        log_layout.message_then_fields_pattern(re.escape(TAB_ACTIVATED_TOKEN), r'\s+tab="scene2"'),
         30,
         "the second viewport's tab activated",
         begin,
     )
     session.wait(
-        re.escape(TOOLBOX_RECT_TOKEN) + r"\s+view=1",
+        log_layout.message_then_fields_pattern(re.escape(TOOLBOX_RECT_TOKEN), r"\s+view=1"),
         30,
         "the second viewport's toolbox placed",
         begin,
@@ -269,7 +270,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     begin = session.length()
     session.send("tab scene")
     session.wait(
-        re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="scene"',
+        log_layout.message_then_fields_pattern(re.escape(TAB_ACTIVATED_TOKEN), r'\s+tab="scene"'),
         30,
         "the scene tab back",
         begin,
@@ -291,7 +292,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     begin = session.length()
     session.send("tab scene2")
     session.wait(
-        re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="scene2"',
+        log_layout.message_then_fields_pattern(re.escape(TAB_ACTIVATED_TOKEN), r'\s+tab="scene2"'),
         30,
         "the second viewport shown again",
         begin,
@@ -308,7 +309,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"click {corner_x} {corner_y}")
     session.wait(
-        re.escape(ACTIVE_VIEWPORT_TOKEN) + r"\s+view=1",
+        log_layout.message_then_fields_pattern(re.escape(ACTIVE_VIEWPORT_TOKEN), r"\s+view=1"),
         30,
         "the second viewport activated",
         begin,
@@ -316,7 +317,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     begin = session.length()
     session.send("dump viewport")
     session.wait(
-        re.escape(VIEWPORT_DUMP_TOKEN) + r'\s+active=1\s+interaction="idle"',
+        log_layout.message_then_fields_pattern(re.escape(VIEWPORT_DUMP_TOKEN), r'\s+active=1\s+interaction="idle"'),
         30,
         "the second viewport is active",
         begin,
@@ -329,8 +330,7 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
         session.send("dump viewport")
         session.wait(re.escape(VIEWPORT_DUMP_TOKEN), 30, "the viewport dumped", begin)
         rows = re.findall(
-            re.escape(VIEWPORT_CAMERA_TOKEN)
-            + r'\s+view=(\d+)\s+eye="([-\d.,]+)"\s+pivot="([-\d.,]+)"'
+            log_layout.message_then_fields_pattern(re.escape(VIEWPORT_CAMERA_TOKEN), r'\s+view=(\d+)\s+eye="([-\d.,]+)"\s+pivot="([-\d.,]+)"')
             + r"\s+distance=([-\d.eE+]+)\s+yaw=([-\d.eE+]+)\s+pitch=([-\d.eE+]+)",
             session.read_since(begin),
         )
@@ -340,28 +340,28 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     begin = session.length()
     session.send("camera orbit 60 20")
     session.wait(
-        re.escape(CAMERA_GESTURE_TOKEN) + r'\s+view=1\s+navigation="orbit"',
+        log_layout.message_then_fields_pattern(re.escape(CAMERA_GESTURE_TOKEN), r'\s+view=1\s+navigation="orbit"'),
         30,
         "the orbit applied",
         begin,
     )
     session.send("camera pan 30 10")
     session.wait(
-        re.escape(CAMERA_GESTURE_TOKEN) + r'\s+view=1\s+navigation="pan"',
+        log_layout.message_then_fields_pattern(re.escape(CAMERA_GESTURE_TOKEN), r'\s+view=1\s+navigation="pan"'),
         30,
         "the pan applied",
         begin,
     )
     session.send("camera dolly 25")
     session.wait(
-        re.escape(CAMERA_GESTURE_TOKEN) + r'\s+view=1\s+navigation="dolly"',
+        log_layout.message_then_fields_pattern(re.escape(CAMERA_GESTURE_TOKEN), r'\s+view=1\s+navigation="dolly"'),
         30,
         "the dolly applied",
         begin,
     )
     session.send("camera zoom 3")
     session.wait(
-        re.escape(CAMERA_ZOOM_TOKEN) + r"\s+view=1",
+        log_layout.message_then_fields_pattern(re.escape(CAMERA_ZOOM_TOKEN), r"\s+view=1"),
         30,
         "the wheel zoom applied",
         begin,
@@ -385,32 +385,32 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.scene_new_view")
     session.wait(
-        re.escape(SCENE_VIEW_ADDED_TOKEN) + r'\s+tab="scene3"\s+view=2\b',
+        log_layout.message_then_fields_pattern(re.escape(SCENE_VIEW_ADDED_TOKEN), r'\s+tab="scene3"\s+view=2\b'),
         30,
         "the third scene view",
         begin,
     )
     session.wait(
-        re.escape(SCENE_VIEW_OPENED_TOKEN) + r"\s+view=2\s+surface=3",
+        log_layout.message_then_fields_pattern(re.escape(SCENE_VIEW_OPENED_TOKEN), r"\s+view=2\s+surface=3"),
         60,
         "the third view's child window",
         begin,
     )
     session.wait(
-        re.escape(SCENE_SURFACE_TOKEN) + r"\s+surface=3\b",
+        log_layout.message_then_fields_pattern(re.escape(SCENE_SURFACE_TOKEN), r"\s+surface=3\b"),
         60,
         "the third view's surface",
         begin,
     )
     session.send("dump scenes")
     session.wait(
-        re.escape(SCENE_VIEW_RECT_TOKEN) + r"\s+view=2\b",
+        log_layout.message_then_fields_pattern(re.escape(SCENE_VIEW_RECT_TOKEN), r"\s+view=2\b"),
         30,
         "the third view's rectangle",
         begin,
     )
     session.wait(
-        re.escape(TOOLBOX_RECT_TOKEN) + r"\s+view=2\b",
+        log_layout.message_then_fields_pattern(re.escape(TOOLBOX_RECT_TOKEN), r"\s+view=2\b"),
         30,
         "the third view's toolbox",
         begin,
@@ -425,14 +425,14 @@ def run_scene_views_and_toolboxes_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"click {third_rect[0] + 6} {third_rect[1] + 6}")
     session.wait(
-        re.escape(ACTIVE_VIEWPORT_TOKEN) + r"\s+view=2",
+        log_layout.message_then_fields_pattern(re.escape(ACTIVE_VIEWPORT_TOKEN), r"\s+view=2"),
         30,
         "the third viewport activated",
         begin,
     )
     session.send("camera orbit -40 15")
     session.wait(
-        re.escape(CAMERA_GESTURE_TOKEN) + r'\s+view=2\s+navigation="orbit"',
+        log_layout.message_then_fields_pattern(re.escape(CAMERA_GESTURE_TOKEN), r'\s+view=2\s+navigation="orbit"'),
         30,
         "the third viewport's orbit",
         begin,

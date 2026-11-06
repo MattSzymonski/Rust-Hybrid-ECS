@@ -6,6 +6,7 @@ from `editor_step_support`, the log vocabulary from `editor_log_tokens`.
 
 import re
 
+from core import log_layout
 from core.editor_log_tokens import (
     ENTITIES_DUMP_TOKEN,
     ENTITY_ROW_TOKEN,
@@ -49,8 +50,7 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
     measured = {
         match.group(1): float(match.group(2))
         for match in re.finditer(
-            re.escape(STATS_TAB_TOKEN)
-            + r'\s+name="(\w+)"\s+us=([0-9.]+)\s+passes=\d+',
+            log_layout.message_then_fields_pattern(re.escape(STATS_TAB_TOKEN), r'\s+name="(\w+)"\s+us=([0-9.]+)\s+passes=\d+'),
             session.read_since(stats_begin),
         )
     }
@@ -74,8 +74,7 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
     begin = session.length()
     session.send("select resource {}".format(GIZMO_RESOURCE_NAME))
     session.wait(
-        re.escape(RESOURCE_SELECTED_TOKEN)
-        + r'\s+resource="{}'.format(re.escape(GIZMO_RESOURCE_NAME)),
+        log_layout.message_then_fields_pattern(re.escape(RESOURCE_SELECTED_TOKEN), r'\s+resource="{}').format(re.escape(GIZMO_RESOURCE_NAME)),
         30,
         "the resource selection",
         begin,
@@ -87,8 +86,7 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
         "the editable resources did not list: {}".format(dump[-600:])
     )
     assert re.search(
-        re.escape(RESOURCE_FIELD_TOKEN)
-        + r'\s+resource="[^"]+"\s+field="settings\.scale_step"\s+label="Scale step"\s+value="0\.1"',
+        log_layout.message_then_fields_pattern(re.escape(RESOURCE_FIELD_TOKEN), r'\s+resource="[^"]+"\s+field="settings\.scale_step"\s+label="Scale step"\s+value="0\.1"'),
         dump,
     ), "the seeded scale step is not the resource's value: {}".format(dump[-800:])
     begin = session.length()
@@ -99,8 +97,7 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
         re.escape(RESOURCE_EDIT_TOKEN), 30, "the resource edit", begin
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN)
-        + r'\s+label="set {}\.settings\.scale_step"'.format(
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="set {}\.settings\.scale_step"').format(
             re.escape(GIZMO_RESOURCE_NAME)
         ),
         30,
@@ -111,15 +108,13 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
         "dump resources", re.escape(RESOURCES_DUMP_TOKEN), 30, "the edited resource"
     )
     assert re.search(
-        re.escape(RESOURCE_FIELD_TOKEN)
-        + r'\s+resource="[^"]+"\s+field="settings\.scale_step"\s+label="Scale step"\s+value="0\.25"',
+        log_layout.message_then_fields_pattern(re.escape(RESOURCE_FIELD_TOKEN), r'\s+resource="[^"]+"\s+field="settings\.scale_step"\s+label="Scale step"\s+value="0\.25"'),
         dump,
     ), "the resource edit did not apply: {}".format(dump[-800:])
     begin = session.length()
     session.send("command editor.undo")
     session.wait(
-        re.escape(HISTORY_UNDO_TOKEN)
-        + r'\s+label="set {}\.settings\.scale_step"'.format(
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_UNDO_TOKEN), r'\s+label="set {}\.settings\.scale_step"').format(
             re.escape(GIZMO_RESOURCE_NAME)
         ),
         30,
@@ -130,8 +125,7 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
         "dump resources", re.escape(RESOURCES_DUMP_TOKEN), 30, "the restored resource"
     )
     assert re.search(
-        re.escape(RESOURCE_FIELD_TOKEN)
-        + r'\s+resource="[^"]+"\s+field="settings\.scale_step"\s+label="Scale step"\s+value="0\.1"',
+        log_layout.message_then_fields_pattern(re.escape(RESOURCE_FIELD_TOKEN), r'\s+resource="[^"]+"\s+field="settings\.scale_step"\s+label="Scale step"\s+value="0\.1"'),
         dump,
     ), "the undo did not restore the resource field: {}".format(dump[-800:])
     print_ok("a resource field edit applied and undid")
@@ -141,8 +135,7 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.undo")
     session.wait(
-        re.escape(SELECTION_RESTORED_TOKEN)
-        + r'\s+entity="(?!none)[^"]+"\s+resource="none"',
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_RESTORED_TOKEN), r'\s+entity="(?!none)[^"]+"\s+resource="none"'),
         30,
         "the resource selection's undo",
         begin,
@@ -159,8 +152,7 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
         (
             match
             for match in re.finditer(
-                re.escape(ENTITY_ROW_TOKEN)
-                + r'\s+display="([^"]+)"\s+components="([^"]*)"',
+                log_layout.message_then_fields_pattern(re.escape(ENTITY_ROW_TOKEN), r'\s+display="([^"]+)"\s+components="([^"]*)"'),
                 dump,
             )
             if SHOWCASE_COMPONENT in match.group(2)
@@ -189,8 +181,7 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
         "edit set {} {} {} 2.5".format(showcase_entity, SHOWCASE_COMPONENT, leaf)
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN)
-        + r'\s+label="set {}[^"]*"'.format(re.escape(SHOWCASE_COMPONENT)),
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="set {}[^"]*"').format(re.escape(SHOWCASE_COMPONENT)),
         30,
         "the collection edit recorded a step",
         begin,
@@ -236,8 +227,7 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
         (
             match
             for match in re.finditer(
-                re.escape(ENTITY_ROW_TOKEN)
-                + r'\s+display="([^"]+)"\s+components="([^"]*)"',
+                log_layout.message_then_fields_pattern(re.escape(ENTITY_ROW_TOKEN), r'\s+display="([^"]+)"\s+components="([^"]*)"'),
                 dump,
             )
             if "MeshRendererComponent" in match.group(2)

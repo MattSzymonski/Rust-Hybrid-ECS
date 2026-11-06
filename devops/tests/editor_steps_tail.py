@@ -8,6 +8,7 @@ import re
 import json
 
 from core import win_clipboard
+from core import log_layout
 from core.editor_log_tokens import (
     CLIPBOARD_WRITTEN_TOKEN,
     DOCK_DUMP_PATTERN,
@@ -43,7 +44,7 @@ def run_tail_steps(state: StepState) -> None:
     session = state.session
 
     assert re.search(
-        re.escape(DOCK_POPOUT_TOKEN) + r'\s+tab="assets"', state.survived
+        log_layout.message_then_fields_pattern(re.escape(DOCK_POPOUT_TOKEN), r'\s+tab="assets"'), state.survived
     ), "the reload lost the popped-out tab: {}".format(state.survived[-600:])
 
     # A window the reloaded generation opens presents like any other: the
@@ -51,13 +52,13 @@ def run_tail_steps(state: StepState) -> None:
     begin = session.length()
     session.send("popout systems")
     session.wait(
-        re.escape(POPOUT_OPENED_TOKEN) + r'\s+tab="systems"',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_OPENED_TOKEN), r'\s+tab="systems"'),
         60,
         "the reloaded shell opened a pop-out window",
         begin,
     )
     session.wait(
-        re.escape(POPOUT_PRESENTED_TOKEN) + r'\s+tab="systems"',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_PRESENTED_TOKEN), r'\s+tab="systems"'),
         60,
         "the reloaded shell's pop-out presented a frame",
         begin,
@@ -67,7 +68,7 @@ def run_tail_steps(state: StepState) -> None:
     session.send("popout systems redock")
     session.send("popout assets redock")
     session.wait(
-        re.escape(POPOUT_CLOSED_TOKEN) + r'\s+tab="assets"',
+        log_layout.message_then_fields_pattern(re.escape(POPOUT_CLOSED_TOKEN), r'\s+tab="assets"'),
         60,
         "the surviving pop-out redocked",
         begin,
@@ -121,14 +122,13 @@ def run_tail_steps(state: StepState) -> None:
     session.send("tab problems")
     session.send("dump problems")
     session.wait(
-        re.escape(PROBLEMS_DUMP_TOKEN) + r"\s+count=([1-9][0-9]*)",
+        log_layout.message_then_fields_pattern(re.escape(PROBLEMS_DUMP_TOKEN), r"\s+count=([1-9][0-9]*)"),
         60,
         "the Problems rows",
         problems_begin,
     )
     row = re.search(
-        re.escape(PROBLEM_ROW_TOKEN)
-        + r'\s+module="[^"]*"\s+severity="error"\s+file="([^"]+)"\s+line=([1-9][0-9]*)',
+        log_layout.message_then_fields_pattern(re.escape(PROBLEM_ROW_TOKEN), r'\s+module="[^"]*"\s+severity="error"\s+file="([^"]+)"\s+line=([1-9][0-9]*)'),
         session.read_since(problems_begin),
     )
     assert row, "the Problems panel showed no located error row"
@@ -160,7 +160,7 @@ def run_tail_steps(state: StepState) -> None:
     cleared_begin = session.length()
     session.send("dump problems")
     session.wait(
-        re.escape(PROBLEMS_DUMP_TOKEN) + r"\s+count=0",
+        log_layout.message_then_fields_pattern(re.escape(PROBLEMS_DUMP_TOKEN), r"\s+count=0"),
         60,
         "the Problems rows cleared",
         cleared_begin,
@@ -175,12 +175,11 @@ def run_tail_steps(state: StepState) -> None:
     # comes before the undock, because the undock's own resize (logged
     # right after the token) is the one this step waits for.
     view_one = (
-        re.escape(SCENE_SURFACE_RESIZED_TOKEN)
-        + r"\s+width=(\d+)\s+height=(\d+)\s+view=1"
+        log_layout.message_then_fields_pattern(re.escape(SCENE_SURFACE_RESIZED_TOKEN), r"\s+width=(\d+)\s+height=(\d+)\s+view=1")
     )
     before = occurrence_count(session, view_one)
     session.send("undock scene2")
-    session.wait_for_match(re.escape(EGUI_TAB_UNDOCKED_TOKEN) + r'\s+tab="scene2"',
+    session.wait_for_match(log_layout.message_then_fields_pattern(re.escape(EGUI_TAB_UNDOCKED_TOKEN), r'\s+tab="scene2"'),
         30,
         "second viewport undock",
     )
@@ -220,7 +219,7 @@ def run_tail_steps(state: StepState) -> None:
     begin = session.length()
     session.send("select entity {}".format(handles[0]))
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=1\b',
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), r'\s+entity=[^ ]+\s+count=1\b'),
         30,
         "the entity re-selected for the copy",
         begin,
@@ -242,7 +241,7 @@ def run_tail_steps(state: StepState) -> None:
     # The quit is where the rearranged dock is written: the undocked tab
     # and the second viewport each float on a surface of their own.
     session.wait(
-        re.escape(LAYOUT_SAVED_TOKEN) + r"\s+surfaces=3\b",
+        log_layout.message_then_fields_pattern(re.escape(LAYOUT_SAVED_TOKEN), r"\s+surfaces=3\b"),
         30,
         "the layout saved on quit",
         begin,

@@ -6,6 +6,7 @@ from `editor_step_support`, the log vocabulary from `editor_log_tokens`.
 
 import re
 
+from core import log_layout
 from core.editor_log_tokens import (
     COMMAND_NO_ACTION_TOKEN,
     CONSOLE_DUMP_TOKEN,
@@ -93,16 +94,14 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     # report their rectangles only when they move, and the splitter drag
     # above moved the window, so the lines read here are the live ones.
     session.wait(
-        re.escape(SCENE_BADGE_RECT_TOKEN)
-        + r"\s+view=\d+\s+entity=\S+\s+min_x=(-?[\d.]+)\s+min_y=(-?[\d.]+)"
+        log_layout.message_then_fields_pattern(re.escape(SCENE_BADGE_RECT_TOKEN), r"\s+view=\d+\s+entity=\S+\s+min_x=(-?[\d.]+)\s+min_y=(-?[\d.]+)")
         + r"\s+max_x=(-?[\d.]+)\s+max_y=(-?[\d.]+)",
         60,
         "a scene badge's rectangle",
         state.badge_begin,
     )
     badge = re.search(
-        re.escape(SCENE_BADGE_RECT_TOKEN)
-        + r"\s+view=\d+\s+entity=(\S+)\s+min_x=(-?[\d.]+)\s+min_y=(-?[\d.]+)"
+        log_layout.message_then_fields_pattern(re.escape(SCENE_BADGE_RECT_TOKEN), r"\s+view=\d+\s+entity=(\S+)\s+min_x=(-?[\d.]+)\s+min_y=(-?[\d.]+)")
         + r"\s+max_x=(-?[\d.]+)\s+max_y=(-?[\d.]+)",
         session.read_since(state.badge_begin),
     )
@@ -113,7 +112,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     # Select another entity first, so the badge's own selection is a
     # change the log states rather than a repeat of the same handle.
     entities = re.findall(
-        re.escape(ENTITY_ROW_TOKEN) + r'\s+display="([^"]+)"',
+        log_layout.message_then_fields_pattern(re.escape(ENTITY_ROW_TOKEN), r'\s+display="([^"]+)"'),
         session.request(
             "dump entities",
             re.escape(ENTITIES_DUMP_TOKEN),
@@ -128,7 +127,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
         begin = session.length()
         session.send("select entity {}".format(other))
         session.wait(
-            re.escape(SELECTION_CHANGED_TOKEN) + rf"\s+entity={re.escape(other)}",
+            log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), rf"\s+entity={re.escape(other)}"),
             60,
             "another entity selected before the badge click",
             begin,
@@ -136,13 +135,13 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"click {badge_x:.0f} {badge_y:.0f}")
     session.wait(
-        re.escape(SCENE_BADGE_TOKEN) + rf"\s+entity={re.escape(badge_entity)}",
+        log_layout.message_then_fields_pattern(re.escape(SCENE_BADGE_TOKEN), rf"\s+entity={re.escape(badge_entity)}"),
         60,
         "the badge's click selected its entity",
         begin,
     )
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN) + rf"\s+entity={re.escape(badge_entity)}",
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), rf"\s+entity={re.escape(badge_entity)}"),
         60,
         "the badge's click moved the shared selection",
         begin,
@@ -153,7 +152,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     restored = session.length()
     session.send(f"select entity {state.picked_entity}")
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN) + rf"\s+entity={re.escape(state.picked_entity)}",
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), rf"\s+entity={re.escape(state.picked_entity)}"),
         60,
         "the picked entity selected again",
         restored,
@@ -168,13 +167,13 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     session.send("tab assets")
     preview_begin = session.length()
     session.wait(
-        re.escape(PREVIEW_REQUESTED_TOKEN) + r'\s+path="[^"]+\.png"',
+        log_layout.message_then_fields_pattern(re.escape(PREVIEW_REQUESTED_TOKEN), r'\s+path="[^"]+\.png"'),
         120,
         "a texture tile's preview request",
         preview_begin,
     )
     session.wait(
-        re.escape(PREVIEW_READY_TOKEN) + r'\s+path="[^"]+\.png"\s+width=128\s+height=128',
+        log_layout.message_then_fields_pattern(re.escape(PREVIEW_READY_TOKEN), r'\s+path="[^"]+\.png"\s+width=128\s+height=128'),
         120,
         "the texture tile's preview image",
         preview_begin,
@@ -185,13 +184,13 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     session.send("browser models")
     mesh_begin = session.length()
     session.wait(
-        re.escape(PREVIEW_REQUESTED_TOKEN) + r'\s+path="[^"]+\.obj"',
+        log_layout.message_then_fields_pattern(re.escape(PREVIEW_REQUESTED_TOKEN), r'\s+path="[^"]+\.obj"'),
         120,
         "a mesh tile's preview request",
         mesh_begin,
     )
     session.wait(
-        re.escape(PREVIEW_READY_TOKEN) + r'\s+path="[^"]+\.obj"\s+width=128\s+height=128',
+        log_layout.message_then_fields_pattern(re.escape(PREVIEW_READY_TOKEN), r'\s+path="[^"]+\.obj"\s+width=128\s+height=128'),
         120,
         "the mesh tile's preview image",
         mesh_begin,
@@ -207,8 +206,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     # reports the detail tier (the selected entity and its component
     # count), which is what the Inspector tab draws.
     detail_pattern = (
-        re.escape(EGUI_ROWS_TOKEN)
-        + rf'\s+frames=\d+[^\n]*detail="{re.escape(state.picked_entity)}"'
+        log_layout.message_then_fields_pattern(re.escape(EGUI_ROWS_TOKEN), rf'\s+frames=\d+[^\n]*detail="{re.escape(state.picked_entity)}"')
         + r"\s+detail_components=(\d+)"
     )
     begin = session.length()
@@ -231,8 +229,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
         f"edit array {state.picked_entity} {TRANSFORM_COMPONENT} translation 0 4.25"
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN)
-        + r'\s+label="set TransformComponent\[0\]\.translation"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="set TransformComponent\[0\]\.translation"'),
         30,
         "the inspector edit pushed one history step",
         begin,
@@ -245,8 +242,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("command editor.undo")
     session.wait(
-        re.escape(HISTORY_UNDO_TOKEN)
-        + r'\s+label="set TransformComponent\[0\]\.translation"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_UNDO_TOKEN), r'\s+label="set TransformComponent\[0\]\.translation"'),
         30,
         "the inspector edit undid",
         begin,
@@ -289,8 +285,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     assert found == PICK_ENTITY_PATTERN, "the gizmo step could not re-select the entity"
     gizmo_entity = re.search(PICK_ENTITY_PATTERN, session.read_since(begin)).group(1)
     session.wait(
-        re.escape(GIZMO_ANCHOR_TOKEN)
-        + rf'\s+entity={re.escape(gizmo_entity)}'
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_ANCHOR_TOKEN), rf'\s+entity={re.escape(gizmo_entity)}')
         + r'\s+mode="translate"\s+space="world"',
         60,
         "the translate handles are drawn for the selection",
@@ -303,28 +298,26 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("gizmo drag x 120 0")
     session.wait(
-        re.escape(GIZMO_DRAG_PRESS_TOKEN) + r'\s+axis="x"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_PRESS_TOKEN), r'\s+axis="x"'),
         30,
         "the press ray was aimed at the X handle",
         begin,
     )
     session.wait(
-        re.escape(SCENE_PICK_HANDLE_TOKEN) + r"\s+handle=\d+",
+        log_layout.message_then_fields_pattern(re.escape(SCENE_PICK_HANDLE_TOKEN), r"\s+handle=\d+"),
         60,
         "the pick answered a handle",
         begin,
     )
     session.wait(
-        re.escape(GIZMO_DRAG_STARTED_TOKEN)
-        + rf'\s+mode="translate"\s+axis="x"\s+entity={re.escape(gizmo_entity)}',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_STARTED_TOKEN), rf'\s+mode="translate"\s+axis="x"\s+entity={re.escape(gizmo_entity)}'),
         60,
         "the drag started on the translate X handle",
         begin,
     )
     session.wait(
-        re.escape(GIZMO_DRAG_ENDED_TOKEN)
-        + r'\s+mode="translate"\s+axis="x"\s+entity=\S+'
-        r'\s+value=\[([-\d.eE+]+),[^\n]*snapped=false',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_ENDED_TOKEN), r'\s+mode="translate"\s+axis="x"\s+entity=\S+')
+        + r'\s+value=\[([-\d.eE+]+),[^\n]*snapped=false',
         60,
         "the drag ended, unsnapped, with a value",
         begin,
@@ -343,7 +336,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("command editor.undo")
     session.wait(
-        re.escape(HISTORY_UNDO_TOKEN) + r'\s+label="gizmo translate"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_UNDO_TOKEN), r'\s+label="gizmo translate"'),
         30,
         "the drag undid as one step",
         begin,
@@ -357,7 +350,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("command editor.redo")
     session.wait(
-        re.escape(HISTORY_REDO_TOKEN) + r'\s+label="gizmo translate"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_REDO_TOKEN), r'\s+label="gizmo translate"'),
         30,
         "the drag redid",
         begin,
@@ -377,7 +370,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     begin = session.length()
     session.send("gizmo rotate")
     session.wait(
-        re.escape(GIZMO_TOOL_TOKEN) + r'\s+mode="rotate"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_TOOL_TOKEN), r'\s+mode="rotate"'),
         30,
         "the rotate tool is active",
         begin,
@@ -385,16 +378,14 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     begin = session.length()
     session.send("gizmo drag y 120 0")
     session.wait(
-        re.escape(GIZMO_DRAG_STARTED_TOKEN)
-        + rf'\s+mode="rotate"\s+axis="y"\s+entity={re.escape(gizmo_entity)}',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_STARTED_TOKEN), rf'\s+mode="rotate"\s+axis="y"\s+entity={re.escape(gizmo_entity)}'),
         60,
         "the drag started on the rotate Y ring",
         begin,
     )
     session.wait(
-        re.escape(GIZMO_DRAG_ENDED_TOKEN)
-        + r'\s+mode="rotate"\s+axis="y"\s+entity=\S+'
-        r"\s+value=\[[-\d.eE+, ]+\]",
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_ENDED_TOKEN), r'\s+mode="rotate"\s+axis="y"\s+entity=\S+')
+        + r"\s+value=\[[-\d.eE+, ]+\]",
         60,
         "the ring drag ended with the quaternion it wrote",
         begin,
@@ -413,7 +404,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     begin = session.length()
     session.send("gizmo scale")
     session.wait(
-        re.escape(GIZMO_TOOL_TOKEN) + r'\s+mode="scale"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_TOOL_TOKEN), r'\s+mode="scale"'),
         30,
         "the scale tool is active",
         begin,
@@ -421,16 +412,14 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     begin = session.length()
     session.send("gizmo drag x 120 0")
     session.wait(
-        re.escape(GIZMO_DRAG_STARTED_TOKEN)
-        + rf'\s+mode="scale"\s+axis="x"\s+entity={re.escape(gizmo_entity)}',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_STARTED_TOKEN), rf'\s+mode="scale"\s+axis="x"\s+entity={re.escape(gizmo_entity)}'),
         60,
         "the drag started on the scale X handle",
         begin,
     )
     session.wait(
-        re.escape(GIZMO_DRAG_ENDED_TOKEN)
-        + r'\s+mode="scale"\s+axis="x"\s+entity=\S+'
-        r"\s+value=\[([-\d.eE+]+),[-\d.eE+, ]*\]\s+snapped=false",
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_ENDED_TOKEN), r'\s+mode="scale"\s+axis="x"\s+entity=\S+')
+        + r"\s+value=\[([-\d.eE+]+),[-\d.eE+, ]*\]\s+snapped=false",
         60,
         "the scale drag ended with the value it wrote",
         begin,
@@ -449,13 +438,13 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     begin = session.length()
     session.send("key e")
     session.wait(
-        re.escape(KEY_INJECTED_TOKEN) + r'\s+chord="e"',
+        log_layout.message_then_fields_pattern(re.escape(KEY_INJECTED_TOKEN), r'\s+chord="e"'),
         30,
         "the key chord injected",
         begin,
     )
     session.wait(
-        re.escape(GIZMO_TOOL_TOKEN) + r'\s+mode="rotate"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_TOOL_TOKEN), r'\s+mode="rotate"'),
         30,
         "the key shortcut switched the tool",
         begin,
@@ -477,14 +466,13 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
         }
     )
     session.wait(
-        re.escape(EDITOR_KEYBINDINGS_APPLIED_TOKEN) + r"\s+preset=unity\s+overrides=2",
+        log_layout.message_then_fields_pattern(re.escape(EDITOR_KEYBINDINGS_APPLIED_TOKEN), r"\s+preset=unity\s+overrides=2"),
         30,
         "the keybindings file applied",
         begin,
     )
     conflict = re.search(
-        re.escape(EDITOR_KEYBINDING_CONFLICT_TOKEN)
-        + r'\s+chord="t"\s+commands="([^"]+)"',
+        log_layout.message_then_fields_pattern(re.escape(EDITOR_KEYBINDING_CONFLICT_TOKEN), r'\s+chord="t"\s+commands="([^"]+)"'),
         session.read_since(begin),
     )
     assert conflict, "the rebinding reported no conflicting chord"
@@ -494,7 +482,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     # (the first command in registration order wins a shared chord).
     session.send("key t")
     session.wait(
-        re.escape(EDITOR_SHORTCUT_RAN_TOKEN) + r'\s+command="editor\.tool_translate"',
+        log_layout.message_then_fields_pattern(re.escape(EDITOR_SHORTCUT_RAN_TOKEN), r'\s+command="editor\.tool_translate"'),
         30,
         "the rebound chord ran its command",
         begin,
@@ -505,8 +493,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     # that toast never reaches the scene: the row's rectangle joins the
     # frame's overlay regions.
     session.wait(
-        re.escape(TOAST_TOKEN)
-        + r'\s+level="warning"[^\n]*text="Keybinding conflict:[^"]*',
+        log_layout.message_then_fields_pattern(re.escape(TOAST_TOKEN), r'\s+level="warning"[^\n]*text="Keybinding conflict:[^"]*'),
         30,
         "the conflict raised a warning toast",
         begin,
@@ -539,14 +526,13 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     begin = session.length()
     session.send("palette translate")
     session.wait(
-        re.escape(PALETTE_QUERY_TOKEN) + r'\s+query="translate"\s+matches=[1-9][0-9]*',
+        log_layout.message_then_fields_pattern(re.escape(PALETTE_QUERY_TOKEN), r'\s+query="translate"\s+matches=[1-9][0-9]*'),
         30,
         "the palette filtered the registry's commands",
         begin,
     )
     filtered = re.search(
-        re.escape(PALETTE_QUERY_TOKEN)
-        + r'\s+query="translate"\s+matches=(\d+)\s+first="([^"]+)"',
+        log_layout.message_then_fields_pattern(re.escape(PALETTE_QUERY_TOKEN), r'\s+query="translate"\s+matches=(\d+)\s+first="([^"]+)"'),
         session.read_since(begin),
     )
     assert filtered, "the palette's filter line carried no match count"
@@ -557,7 +543,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     )
     session.send("palette run")
     session.wait(
-        re.escape(MENU_ACTION_TOKEN) + r'\s+menu="palette"\s+label="Translate"',
+        log_layout.message_then_fields_pattern(re.escape(MENU_ACTION_TOKEN), r'\s+menu="palette"\s+label="Translate"'),
         30,
         "the palette ran its selected command",
         begin,
@@ -571,7 +557,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     begin = session.length()
     session.send("palette scale")
     session.wait(
-        re.escape(PALETTE_QUERY_TOKEN) + r'\s+query="scale"',
+        log_layout.message_then_fields_pattern(re.escape(PALETTE_QUERY_TOKEN), r'\s+query="scale"'),
         30,
         "the palette reopened on a second query",
         begin,
@@ -589,13 +575,13 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
     begin = session.length()
     session.send("palette save layout")
     session.wait(
-        re.escape(COMMAND_NO_ACTION_TOKEN) + r'\s+command="editor\.save_layout"',
+        log_layout.message_then_fields_pattern(re.escape(COMMAND_NO_ACTION_TOKEN), r'\s+command="editor\.save_layout"'),
         30,
         "the palette named the command it cannot run",
         begin,
     )
     session.wait(
-        re.escape(PALETTE_QUERY_TOKEN) + r'\s+query="save layout"\s+matches=0',
+        log_layout.message_then_fields_pattern(re.escape(PALETTE_QUERY_TOKEN), r'\s+query="save layout"\s+matches=0'),
         30,
         "the palette listed no command without an action",
         begin,

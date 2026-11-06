@@ -7,6 +7,7 @@ from `editor_step_support`, the log vocabulary from `editor_log_tokens`.
 import re
 import json
 
+from core import log_layout
 from core.editor_log_tokens import (
     ASSETS_DUMP_TOKEN,
     ASSET_CREATE_QUEUED_TOKEN,
@@ -68,18 +69,18 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
         counts = [
             int(value)
             for value in re.findall(
-                re.escape(ASSET_LISTING_TOKEN) + r"\s+count=(\d+)", session.text()
+                log_layout.message_then_fields_pattern(re.escape(ASSET_LISTING_TOKEN), r"\s+count=(\d+)"), session.text()
             )
         ]
         return counts[-1] if counts else 0
 
     session.wait(
-        re.escape(ASSET_LISTING_TOKEN) + r"\s+count=(\d+)\s+types=(\d+)",
+        log_layout.message_then_fields_pattern(re.escape(ASSET_LISTING_TOKEN), r"\s+count=(\d+)\s+types=(\d+)"),
         120,
         "asset listing refreshed",
     )
     match = re.search(
-        re.escape(ASSET_LISTING_TOKEN) + r"\s+count=(\d+)\s+types=(\d+)",
+        log_layout.message_then_fields_pattern(re.escape(ASSET_LISTING_TOKEN), r"\s+count=(\d+)\s+types=(\d+)"),
         session.text(),
     )
     listed, typed = int(match.group(1)), int(match.group(2))
@@ -90,7 +91,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send("dump assets")
     session.wait(
-        re.escape(ASSETS_DUMP_TOKEN) + r"\s+count=\d+", 30, "assets dumped", begin
+        log_layout.message_then_fields_pattern(re.escape(ASSETS_DUMP_TOKEN), r"\s+count=\d+"), 30, "assets dumped", begin
     )
     dump = session.read_since(begin)
     assert re.search(r'path="?textures/?"?\s+kind="?folder', dump), (
@@ -110,7 +111,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send("browser textures")
     session.wait(
-        re.escape(BROWSER_FOLDER_TOKEN) + r'\s+path="(textures)"',
+        log_layout.message_then_fields_pattern(re.escape(BROWSER_FOLDER_TOKEN), r'\s+path="(textures)"'),
         30,
         "the browser opened the textures folder",
         begin,
@@ -118,27 +119,26 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send("dump browser")
     session.wait(
-        re.escape(BROWSER_DUMP_TOKEN) + r'\s+folder="textures"\s+count=(\d+)',
+        log_layout.message_then_fields_pattern(re.escape(BROWSER_DUMP_TOKEN), r'\s+folder="textures"\s+count=(\d+)'),
         30,
         "browser dumped",
         begin,
     )
     grid = session.read_since(begin)
     assert re.search(
-        re.escape(BROWSER_ITEM_TOKEN)
-        + r'\s+path="?textures/reimport_sample\.png',
+        log_layout.message_then_fields_pattern(re.escape(BROWSER_ITEM_TOKEN), r'\s+path="?textures/reimport_sample\.png'),
         grid,
     ), "the grid misses the textures folder's texture: " + grid[-800:]
     for outside in ("config.ini", "s16_stage.png"):
         assert not re.search(
-            re.escape(BROWSER_ITEM_TOKEN) + r'\s+path="?' + re.escape(outside), grid
+            log_layout.message_then_fields_pattern(re.escape(BROWSER_ITEM_TOKEN), r'\s+path="?') + re.escape(outside), grid
         ), "the grid lists an entry outside the open folder: " + grid[-800:]
     print_ok("the browser's grid lists the open folder")
     # Back to the asset root, the tree's first row, for the steps below.
     begin = session.length()
     session.send("browser root")
     session.wait(
-        re.escape(BROWSER_FOLDER_TOKEN) + r'\s+path=""',
+        log_layout.message_then_fields_pattern(re.escape(BROWSER_FOLDER_TOKEN), r'\s+path=""'),
         30,
         "the browser returned to the asset root",
         begin,
@@ -171,8 +171,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"browser {module_folder}")
     session.wait(
-        re.escape(BROWSER_FOLDER_TOKEN)
-        + r'\s+path="'
+        log_layout.message_then_fields_pattern(re.escape(BROWSER_FOLDER_TOKEN), r'\s+path="')
         + re.escape(module_folder)
         + r'"',
         30,
@@ -184,7 +183,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     session.wait(re.escape(BROWSER_DUMP_TOKEN), 30, "the module folder dumped", begin)
     module_grid = session.read_since(begin)
     assert re.search(
-        re.escape(BROWSER_ITEM_TOKEN) + r'\s+path="?' + re.escape(module_relative), module_grid
+        log_layout.message_then_fields_pattern(re.escape(BROWSER_ITEM_TOKEN), r'\s+path="?') + re.escape(module_relative), module_grid
     ), "the grid misses the module's own file: " + module_grid[-800:]
 
     # Select the module's file: the Inspector draws its section read-only,
@@ -192,7 +191,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"select asset {module_key}")
     session.wait(
-        re.escape(ASSET_SELECTED_TOKEN) + r'\s+path="' + re.escape(module_key) + r'"',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_SELECTED_TOKEN), r'\s+path="') + re.escape(module_key) + r'"',
         30,
         "the module's file selected",
         begin,
@@ -201,7 +200,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     # the row line to appear at all.
     session.send("tab inspector")
     session.wait(
-        re.escape(ASSET_READ_ONLY_ROW_TOKEN) + r'\s+asset="?' + re.escape(module_key) + r'"?',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_READ_ONLY_ROW_TOKEN), r'\s+asset="?') + re.escape(module_key) + r'"?',
         30,
         "the Inspector drew the module asset read-only",
         begin,
@@ -213,7 +212,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send("toolbar delete")
     session.wait(
-        re.escape(ASSET_DELETE_REFUSED_TOKEN) + r'\s+path="' + re.escape(module_key) + r'"',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_DELETE_REFUSED_TOKEN), r'\s+path="') + re.escape(module_key) + r'"',
         30,
         "the module asset's delete refused",
         begin,
@@ -238,7 +237,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send("browser root")
     session.wait(
-        re.escape(BROWSER_FOLDER_TOKEN) + r'\s+path=""',
+        log_layout.message_then_fields_pattern(re.escape(BROWSER_FOLDER_TOKEN), r'\s+path=""'),
         30,
         "the browser returned to the asset root again",
         begin,
@@ -248,8 +247,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     session.send("dump standalone-types")
     session.wait(re.escape(STANDALONE_TYPE_TOKEN), 30, "standalone types dumped", begin)
     found = session.find(
-        re.escape(STANDALONE_TYPE_TOKEN)
-        + r'\s+type_name="([^"]+)"\s+display="([^"]+)"\s+extension="([^"]+)"',
+        log_layout.message_then_fields_pattern(re.escape(STANDALONE_TYPE_TOKEN), r'\s+type_name="([^"]+)"\s+display="([^"]+)"\s+extension="([^"]+)"'),
         begin,
     )
     extension = found.group(3)
@@ -264,7 +262,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send("select asset textures")
     session.wait(
-        re.escape(ASSET_SELECTED_TOKEN) + r'\s+path="(textures)"',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_SELECTED_TOKEN), r'\s+path="(textures)"'),
         30,
         "a folder row selected",
         begin,
@@ -272,7 +270,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send("toolbar create")
     session.wait(
-        re.escape(ASSET_DIALOG_OPENED_TOKEN) + r'\s+dialog="create"',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_DIALOG_OPENED_TOKEN), r'\s+dialog="create"'),
         30,
         "create dialog opened",
         begin,
@@ -283,13 +281,13 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     session.send("dialog submit")
     session.wait(re.escape(ASSET_CREATE_QUEUED_TOKEN), 30, "create queued", begin)
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="create asset s16_probe"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="create asset s16_probe"'),
         30,
         "create recorded",
         begin,
     )
     session.wait(
-        re.escape(ASSET_DIALOG_CLOSED_TOKEN) + r'\s+dialog="create"',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_DIALOG_CLOSED_TOKEN), r'\s+dialog="create"'),
         30,
         "create dialog closed",
         begin,
@@ -310,7 +308,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("command editor.undo")
     session.wait(
-        re.escape(HISTORY_UNDO_TOKEN) + r'\s+label="create asset s16_probe"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_UNDO_TOKEN), r'\s+label="create asset s16_probe"'),
         30,
         "create undone",
         begin,
@@ -321,7 +319,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("command editor.redo")
     session.wait(
-        re.escape(HISTORY_REDO_TOKEN) + r'\s+label="create asset s16_probe"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_REDO_TOKEN), r'\s+label="create asset s16_probe"'),
         30,
         "create redone",
         begin,
@@ -337,8 +335,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"select asset {created}")
     session.wait(
-        re.escape(ASSET_SELECTED_TOKEN)
-        + r'\s+path="'
+        log_layout.message_then_fields_pattern(re.escape(ASSET_SELECTED_TOKEN), r'\s+path="')
         + re.escape(created)
         + r'"',
         30,
@@ -348,7 +345,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send("toolbar rename")
     session.wait(
-        re.escape(ASSET_DIALOG_OPENED_TOKEN) + r'\s+dialog="rename"',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_DIALOG_OPENED_TOKEN), r'\s+dialog="rename"'),
         30,
         "rename dialog opened",
         begin,
@@ -358,8 +355,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("dialog submit")
     session.wait(
-        re.escape(ASSET_RENAME_QUEUED_TOKEN)
-        + r'\s+from="'
+        log_layout.message_then_fields_pattern(re.escape(ASSET_RENAME_QUEUED_TOKEN), r'\s+from="')
         + re.escape(created)
         + r'"\s+to="'
         + re.escape(renamed)
@@ -369,8 +365,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
         begin,
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN)
-        + r'\s+label="rename asset s16_renamed\.'
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="rename asset s16_renamed\.')
         + re.escape(extension)
         + r'"',
         30,
@@ -378,7 +373,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
         begin,
     )
     session.wait(
-        re.escape(SELECTION_FOLLOWED_TOKEN) + r'\s+path="' + re.escape(renamed) + r'"',
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_FOLLOWED_TOKEN), r'\s+path="') + re.escape(renamed) + r'"',
         30,
         "the selection followed the rename",
         begin,
@@ -394,7 +389,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"edit asset move {renamed} {moved}")
     session.wait(
-        re.escape(SELECTION_FOLLOWED_TOKEN) + r'\s+path="' + re.escape(moved) + r'"',
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_FOLLOWED_TOKEN), r'\s+path="') + re.escape(moved) + r'"',
         60,
         "the selection followed the move",
         begin,
@@ -425,14 +420,13 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send("toolbar delete")
     session.wait(
-        re.escape(ASSET_DELETE_QUEUED_TOKEN) + r'\s+path="' + re.escape(moved) + r'"',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_DELETE_QUEUED_TOKEN), r'\s+path="') + re.escape(moved) + r'"',
         30,
         "delete queued",
         begin,
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN)
-        + r'\s+label="delete asset '
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="delete asset ')
         + re.escape(moved)
         + r'"',
         30,
@@ -440,7 +434,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
         begin,
     )
     session.wait(
-        re.escape(SELECTION_CLEARED_TOKEN) + r'\s+path="' + re.escape(moved) + r'"',
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CLEARED_TOKEN), r'\s+path="') + re.escape(moved) + r'"',
         30,
         "the selection cleared with the delete",
         begin,
@@ -450,7 +444,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("command editor.undo")
     session.wait(
-        re.escape(HISTORY_UNDO_TOKEN) + r'\s+label="delete asset ' + re.escape(moved) + r'"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_UNDO_TOKEN), r'\s+label="delete asset ') + re.escape(moved) + r'"',
         30,
         "delete undone",
         begin,
@@ -485,7 +479,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
         "edit asset create pill_master_renderer::assets::RenderingPipeline textures s16_pipeline"
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="create asset s16_pipeline"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="create asset s16_pipeline"'),
         30,
         "pipeline create recorded",
         begin,
@@ -517,7 +511,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send("select asset s16_stage.png")
     session.wait(
-        re.escape(ASSET_SELECTED_TOKEN) + r'\s+path="(s16_stage\.png)"',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_SELECTED_TOKEN), r'\s+path="(s16_stage\.png)"'),
         30,
         "the staged row selected",
         begin,
@@ -526,13 +520,13 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("toolbar meta")
     session.wait(
-        re.escape(ASSET_META_QUEUED_TOKEN) + r'\s+path="(s16_stage\.png)"',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_META_QUEUED_TOKEN), r'\s+path="(s16_stage\.png)"'),
         30,
         "meta queued",
         begin,
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="write meta s16_stage\.png"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="write meta s16_stage\.png"'),
         30,
         "meta recorded",
         begin,
@@ -543,7 +537,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("command editor.undo")
     session.wait(
-        re.escape(HISTORY_UNDO_TOKEN) + r'\s+label="write meta s16_stage\.png"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_UNDO_TOKEN), r'\s+label="write meta s16_stage\.png"'),
         30,
         "meta write undone",
         begin,
@@ -563,7 +557,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"select asset {cube_asset}")
     session.wait(
-        re.escape(ASSET_SELECTED_TOKEN) + r'\s+path="' + re.escape(cube_asset) + r'"',
+        log_layout.message_then_fields_pattern(re.escape(ASSET_SELECTED_TOKEN), r'\s+path="') + re.escape(cube_asset) + r'"',
         30,
         "the cube row selected",
         begin,
@@ -575,7 +569,7 @@ def run_assets_browser_and_pipeline_steps(state: StepState) -> None:
         f"edit asset-settings {cube_asset} flip_v {str(not flip_before).lower()}"
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="set asset flip_v"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="set asset flip_v"'),
         30,
         "the boolean row's edit recorded",
         begin,

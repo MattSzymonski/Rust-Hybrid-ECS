@@ -52,8 +52,8 @@ pub struct LogLine {
     pub level: u8,
     /// The tracing target the line came from (the crate or module path).
     pub target: String,
-    /// The message text, with the event's structured fields appended as
-    /// `name=value`.
+    /// The message text, with the event's structured fields appended after
+    /// the engine's ` | ` separator as `name=value`.
     pub message: String,
 }
 
@@ -215,7 +215,7 @@ pub fn level_value(level: Level) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::telemetry::telemetry_target;
+    use crate::telemetry::{log_block, telemetry_target};
 
     /// A captured line has the same shape as the line the terminal formatter
     /// writes: the same fields, the same spelling for each value, and the
@@ -241,8 +241,34 @@ mod tests {
         let lines = buffer.since(0);
         assert_eq!(lines.len(), 1, "one event, one line");
         assert_eq!(
-            lines[0].message, "texture created  module=\"pill_spline\"",
+            lines[0].message, "texture created | module=\"pill_spline\"",
             "a string field keeps its `Debug` form, as the terminal lane shows it"
+        );
+    }
+
+    /// A block's fields belong on its heading line, as the terminal formatter
+    /// puts them, not after the body.
+    #[test]
+    fn a_captured_block_puts_its_fields_on_the_heading_line() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buffer = LogBuffer::with_capacity(8);
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureLayer::new(buffer.clone(), Level::INFO));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: telemetry_target::HOT_RELOAD,
+                total = 2,
+                "{}",
+                log_block("Modules to build:", ["1. pill_spline", "2. project"])
+            );
+        });
+
+        let lines = buffer.since(0);
+        assert_eq!(lines.len(), 1, "one event, one line");
+        assert_eq!(
+            lines[0].message, "Modules to build: | total=2\n1. pill_spline\n2. project",
+            "the console line must put the fields where the log file does"
         );
     }
 

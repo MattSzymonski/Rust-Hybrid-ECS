@@ -8,6 +8,7 @@ import re
 import json
 
 from core.projects import THEMED_PROJECT_FONT
+from core import log_layout
 from core.editor_log_tokens import (
     EDITOR_THEME_APPLIED_TOKEN,
     EDITOR_THEME_LEGACY_TOKEN,
@@ -45,7 +46,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     wait_applied(session, state.applied_before, "delete undo applied")
     wait_for_entity_count(session, state.count_before + 1, "the undo restored the entity")
     session.wait(
-        re.escape(EGUI_ROWS_TOKEN) + r'[^\n]*detail="(?!-)[^"]+"',
+        log_layout.message_then_fields_pattern(re.escape(EGUI_ROWS_TOKEN), r'[^\n]*detail="(?!-)[^"]+"'),
         60,
         "the selection came back with the restore",
         state.begin,
@@ -83,7 +84,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     # The seed proves the startup read: the live reader applied its cap
     # and the tab's view carries its rows.
     session.wait(
-        re.escape(PREFERENCES_APPLIED_TOKEN) + r"[^\n]*step_cap=400\s",
+        log_layout.message_then_fields_pattern(re.escape(PREFERENCES_APPLIED_TOKEN), r"[^\n]*step_cap=400\s"),
         30,
         "the seeded step cap applied",
     )
@@ -126,7 +127,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.tool_translate")
     session.wait(
-        re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN) + r'\s+project="scene"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN), r'\s+project="scene"'),
         30,
         "the tool choice persisted",
         begin,
@@ -148,7 +149,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.tool_snap_toggle")
     session.wait(
-        re.escape(GIZMO_ANCHOR_TOKEN) + r"[^\n]*snapped=true",
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_ANCHOR_TOKEN), r"[^\n]*snapped=true"),
         60,
         "snapping switched on",
         begin,
@@ -159,14 +160,13 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     begin = session.length()
     session.send("gizmo drag x 30 0")
     session.wait(
-        re.escape(GIZMO_DRAG_STARTED_TOKEN) + r'[^\n]*mode="translate"\s+axis="x"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_STARTED_TOKEN), r'[^\n]*mode="translate"\s+axis="x"'),
         60,
         "the snapped drag started",
         begin,
     )
     session.wait(
-        re.escape(GIZMO_DRAG_ENDED_TOKEN)
-        + r'[^\n]*mode="translate"\s+axis="x"[^\n]*value=\[([-\d.eE+]+),',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_ENDED_TOKEN), r'[^\n]*mode="translate"\s+axis="x"[^\n]*value=\[([-\d.eE+]+),'),
         60,
         "the snapped drag ended",
         begin,
@@ -181,7 +181,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.tool_snap_toggle")
     session.wait(
-        re.escape(GIZMO_ANCHOR_TOKEN) + r"[^\n]*snapped=false",
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_ANCHOR_TOKEN), r"[^\n]*snapped=false"),
         60,
         "snapping switched off",
         begin,
@@ -194,7 +194,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     session.send("edit preference history_step_cap 2")
     session.wait(re.escape(PREFERENCES_SAVED_TOKEN), 30, "the tiny cap saved", begin)
     session.wait(
-        re.escape(PREFERENCES_APPLIED_TOKEN) + r"[^\n]*step_cap=2\s",
+        log_layout.message_then_fields_pattern(re.escape(PREFERENCES_APPLIED_TOKEN), r"[^\n]*step_cap=2\s"),
         30,
         "the tiny cap applied",
         begin,
@@ -203,7 +203,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     begin = session.length()
     session.send("edit preference history_step_cap 500")
     session.wait(
-        re.escape(PREFERENCES_APPLIED_TOKEN) + r"[^\n]*step_cap=500\s",
+        log_layout.message_then_fields_pattern(re.escape(PREFERENCES_APPLIED_TOKEN), r"[^\n]*step_cap=500\s"),
         30,
         "the cap restored",
         begin,
@@ -215,7 +215,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     begin = session.length()
     session.send("command editor.tool_rotate")
     session.wait(
-        re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN) + r'\s+project="scene"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN), r'\s+project="scene"'),
         30,
         "the second tool choice persisted",
         begin,
@@ -250,14 +250,13 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     session.send("edit preference theme theme_user.json")
     session.wait(re.escape(PREFERENCES_SAVED_TOKEN), 30, "the theme row saved", begin)
     session.wait(
-        re.escape(EDITOR_THEME_RESOLVED_TOKEN) + r"\s+layers=code,user\s+generation=\d+",
+        log_layout.message_then_fields_pattern(re.escape(EDITOR_THEME_RESOLVED_TOKEN), r"\s+layers=code,user\s+generation=\d+"),
         60,
         "the user layer merged",
         begin,
     )
     session.wait(
-        re.escape(EDITOR_THEME_APPLIED_TOKEN)
-        + r"\s+layers=code,user\s+user=\S*theme_user\.json",
+        log_layout.message_then_fields_pattern(re.escape(EDITOR_THEME_APPLIED_TOKEN), r"\s+layers=code,user\s+user=\S*theme_user\.json"),
         60,
         "the shell installed the user layer",
         begin,
@@ -279,8 +278,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     )
     begin = session.length()
     session.wait(
-        re.escape(EDITOR_THEME_RESOLVED_TOKEN)
-        + r"\s+layers=code,user,project\s+generation=\d+",
+        log_layout.message_then_fields_pattern(re.escape(EDITOR_THEME_RESOLVED_TOKEN), r"\s+layers=code,user,project\s+generation=\d+"),
         60,
         "the project layer merged",
         begin,
@@ -307,8 +305,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     )
     begin = session.length()
     session.wait(
-        re.escape(EDITOR_THEME_RESOLVED_TOKEN)
-        + r"\s+layers=code,user,project\s+generation=\d+",
+        log_layout.message_then_fields_pattern(re.escape(EDITOR_THEME_RESOLVED_TOKEN), r"\s+layers=code,user,project\s+generation=\d+"),
         60,
         "the edited project layer merged",
         begin,
@@ -338,8 +335,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
     )
     begin = session.length()
     session.wait(
-        re.escape(EDITOR_THEME_RESOLVED_TOKEN)
-        + r"\s+layers=code,user,project\s+generation=\d+",
+        log_layout.message_then_fields_pattern(re.escape(EDITOR_THEME_RESOLVED_TOKEN), r"\s+layers=code,user,project\s+generation=\d+"),
         60,
         "the named project layer merged",
         begin,
@@ -371,7 +367,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
         begin,
     )
     session.wait(
-        re.escape(EDITOR_THEME_RESOLVED_TOKEN) + r"\s+layers=code,user\s+generation=\d+",
+        log_layout.message_then_fields_pattern(re.escape(EDITOR_THEME_RESOLVED_TOKEN), r"\s+layers=code,user\s+generation=\d+"),
         60,
         "the refused project layer skipped",
         begin,
@@ -399,7 +395,7 @@ def run_preferences_and_theme_steps(state: StepState) -> None:
         begin,
     )
     session.wait(
-        re.escape(EDITOR_THEME_RESOLVED_TOKEN) + r"\s+layers=code,project\s+generation=\d+",
+        log_layout.message_then_fields_pattern(re.escape(EDITOR_THEME_RESOLVED_TOKEN), r"\s+layers=code,project\s+generation=\d+"),
         60,
         "the project layer alone applied",
         begin,

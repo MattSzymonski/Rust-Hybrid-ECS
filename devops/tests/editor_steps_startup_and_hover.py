@@ -8,6 +8,7 @@ import re
 import time
 
 from core.editor_session import ScriptedCommandRejected
+from core import log_layout
 from core.editor_log_tokens import (
     CURSOR_ICON_TOKEN,
     EDITOR_WINDOW_CREATED_TOKEN,
@@ -36,14 +37,14 @@ def run_startup_and_hover_steps(state: StepState) -> None:
 
     # Step 1: startup, all the way to both tabs reporting rows.
     session.wait_for_match(re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "startup")
-    session.wait_for_match(re.escape(SCENE_SURFACE_TOKEN) + r"\s+surface=1\s+detached=false",
+    session.wait_for_match(log_layout.message_then_fields_pattern(re.escape(SCENE_SURFACE_TOKEN), r"\s+surface=1\s+detached=false"),
         120,
         "scene surface",
     )
     # Both scene viewports attach at startup: the Scene tab's surface
     # and the second viewport's.
     session.wait_occurrence(
-        re.escape(SCENE_SURFACE_TOKEN) + r"\s+surface=\d+\s+detached=false",
+        log_layout.message_then_fields_pattern(re.escape(SCENE_SURFACE_TOKEN), r"\s+surface=\d+\s+detached=false"),
         2,
         30,
         "second scene surface",
@@ -154,12 +155,12 @@ def run_startup_and_hover_steps(state: StepState) -> None:
         print_ok(f"click at ({click_x:.0f}, {click_y:.0f}) hit nothing, next")
     assert picked_entity, "no grid point hit an entity in the scene view"
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN) + rf"\s+entity={re.escape(picked_entity)}",
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), rf"\s+entity={re.escape(picked_entity)}"),
         60,
         "the pick moved the shared selection",
     )
     session.wait(
-        re.escape(OUTLINE_SET_TOKEN) + rf"\s+entity={re.escape(picked_entity)}",
+        log_layout.message_then_fields_pattern(re.escape(OUTLINE_SET_TOKEN), rf"\s+entity={re.escape(picked_entity)}"),
         60,
         "the outline was published for it",
     )
@@ -180,7 +181,7 @@ def run_startup_and_hover_steps(state: StepState) -> None:
     hover_begin = session.length()
     session.send(f"hover ui {splitter_x:.0f} {splitter_y:.0f}")
     session.wait(
-        re.escape(CURSOR_ICON_TOKEN) + r'\s+icon="ResizeVertical"',
+        log_layout.message_then_fields_pattern(re.escape(CURSOR_ICON_TOKEN), r'\s+icon="ResizeVertical"'),
         30,
         "the resize cursor over the splitter",
         hover_begin,

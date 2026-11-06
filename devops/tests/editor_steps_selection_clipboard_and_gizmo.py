@@ -8,6 +8,7 @@ import re
 import json
 
 from core import win_clipboard
+from core import log_layout
 from core.paths import REPOSITORY_ROOT
 from core.editor_log_tokens import (
     CLIPBOARD_PASTED_TOKEN,
@@ -68,8 +69,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     showcase_entities = [
         match.group(1)
         for match in re.finditer(
-            re.escape(ENTITY_ROW_TOKEN)
-            + r'\s+display="([^"]+)"\s+components="([^"]*)"',
+            log_layout.message_then_fields_pattern(re.escape(ENTITY_ROW_TOKEN), r'\s+display="([^"]+)"\s+components="([^"]*)"'),
             dump,
         )
         if SHOWCASE_COMPONENT in match.group(2)
@@ -93,7 +93,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("select entity {}".format(first))
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=1\b',
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), r'\s+entity=[^ ]+\s+count=1\b'),
         30,
         "the first selection",
         begin,
@@ -101,7 +101,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("select add {}".format(second))
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=2\b',
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), r'\s+entity=[^ ]+\s+count=2\b'),
         30,
         "the Ctrl add",
         begin,
@@ -109,7 +109,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     third_add_begin = session.length()
     session.send("select add {}".format(third))
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=3\b',
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), r'\s+entity=[^ ]+\s+count=3\b'),
         30,
         "the second Ctrl add",
         third_add_begin,
@@ -117,7 +117,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("dump selection")
     session.wait(
-        re.escape(SELECTION_DUMP_TOKEN) + r'\s+count=3\b',
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_DUMP_TOKEN), r'\s+count=3\b'),
         30,
         "the selected set",
         begin,
@@ -154,8 +154,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("edit selection {} scale 2.5".format(SHOWCASE_COMPONENT))
     session.wait(
-        re.escape(SELECTION_EDIT_TOKEN)
-        + r'\s+component="[^"]*{}"\s+field="scale"\s+entities=3\b'.format(
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_EDIT_TOKEN), r'\s+component="[^"]*{}"\s+field="scale"\s+entities=3\b').format(
             re.escape(SHOWCASE_COMPONENT)
         ),
         30,
@@ -163,8 +162,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
         begin,
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN)
-        + r'\s+label="set {}\.scale"'.format(re.escape(SHOWCASE_COMPONENT)),
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="set {}\.scale"').format(re.escape(SHOWCASE_COMPONENT)),
         30,
         "the selection edit recorded one step",
         begin,
@@ -201,7 +199,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("select entity {}".format(prior_entity))
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=1\b',
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), r'\s+entity=[^ ]+\s+count=1\b'),
         30,
         "the resetting click",
         begin,
@@ -236,7 +234,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
     session.send("command editor.paste")
     session.wait(
-        re.escape(CLIPBOARD_PASTED_TOKEN) + r'\s+kind="component"',
+        log_layout.message_then_fields_pattern(re.escape(CLIPBOARD_PASTED_TOKEN), r'\s+kind="component"'),
         30,
         "the component paste",
         begin,
@@ -286,13 +284,13 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("drop {}".format(drop_source))
     session.wait(
-        re.escape(FILES_DROPPED_TOKEN) + r"\s+count=1\b",
+        log_layout.message_then_fields_pattern(re.escape(FILES_DROPPED_TOKEN), r"\s+count=1\b"),
         30,
         "the dropped file",
         begin,
     )
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="import files"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="import files"'),
         30,
         "the import step",
         begin,
@@ -388,7 +386,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("gizmo rotate")
     session.wait(
-        re.escape(GIZMO_TOOL_TOKEN) + r'\s+mode="rotate"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_TOOL_TOKEN), r'\s+mode="rotate"'),
         30,
         "the tool parked on rotate for the next step",
         begin,
@@ -402,7 +400,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("gizmo translate")
     session.wait(
-        re.escape(GIZMO_TOOL_TOKEN) + r'\s+mode="translate"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_TOOL_TOKEN), r'\s+mode="translate"'),
         30,
         "the translate tool is active again",
         begin,
@@ -410,7 +408,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("dump viewport")
     session.wait(
-        re.escape(VIEWPORT_DUMP_TOKEN) + r'\s+active=0\s+interaction="idle"',
+        log_layout.message_then_fields_pattern(re.escape(VIEWPORT_DUMP_TOKEN), r'\s+active=0\s+interaction="idle"'),
         30,
         "the viewport is idle",
         begin,
@@ -422,20 +420,20 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     press_begin = session.length()
     session.send("gizmo press x")
     press_pattern = (
-        re.escape(GIZMO_DRAG_PRESS_TOKEN) + r'\s+axis="x"\s+x=([-\d.]+)\s+y=([-\d.]+)'
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_PRESS_TOKEN), r'\s+axis="x"\s+x=([-\d.]+)\s+y=([-\d.]+)')
     )
     session.wait(press_pattern, 30, "the X handle was pressed", press_begin)
     press = session.find(press_pattern, press_begin)
     press_x, press_y = float(press.group(1)), float(press.group(2))
     session.wait(
-        re.escape(GIZMO_DRAG_STARTED_TOKEN) + r'\s+mode="translate"\s+axis="x"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_STARTED_TOKEN), r'\s+mode="translate"\s+axis="x"'),
         60,
         "the drag started on the press",
         press_begin,
     )
     print_ok("the drag begins on the press, before any release")
     session.wait(
-        re.escape(GIZMO_GUIDES_TOKEN) + r'\s+axis="x"\s+dotted=true',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_GUIDES_TOKEN), r'\s+axis="x"\s+dotted=true'),
         30,
         "the axis guide and the displacement line appeared",
         press_begin,
@@ -443,7 +441,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("dump viewport")
     session.wait(
-        re.escape(VIEWPORT_DUMP_TOKEN) + r'\s+active=0\s+interaction="dragging-axis"',
+        log_layout.message_then_fields_pattern(re.escape(VIEWPORT_DUMP_TOKEN), r'\s+active=0\s+interaction="dragging-axis"'),
         30,
         "the drag owns the viewport",
         begin,
@@ -451,13 +449,13 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("gizmo release")
     session.wait(
-        re.escape(GIZMO_DRAG_RELEASED_TOKEN) + r'\s+mode="translate"\s+axis="x"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_RELEASED_TOKEN), r'\s+mode="translate"\s+axis="x"'),
         60,
         "the release ended the drag",
         begin,
     )
     session.wait(
-        re.escape(GIZMO_GUIDES_TOKEN) + r'\s+guides=false',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_GUIDES_TOKEN), r'\s+guides=false'),
         30,
         "the guides cleared with the drag",
         begin,
@@ -470,7 +468,7 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"hover 0 {press_x:.0f} {press_y:.0f}")
     session.wait(
-        re.escape(GIZMO_HOVER_TOKEN) + r'\s+view=0\s+handle=1',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_HOVER_TOKEN), r'\s+view=0\s+handle=1'),
         30,
         "the X handle highlighted",
         begin,
@@ -491,13 +489,13 @@ def run_selection_clipboard_and_gizmo_steps(state: StepState) -> None:
     begin = session.length()
     session.send("gizmo drag xy 40 30")
     session.wait(
-        re.escape(GIZMO_DRAG_STARTED_TOKEN) + r'\s+mode="translate"\s+plane="xy"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_STARTED_TOKEN), r'\s+mode="translate"\s+plane="xy"'),
         60,
         "the drag started on the XY square",
         begin,
     )
     session.wait(
-        re.escape(GIZMO_DRAG_ENDED_TOKEN) + r'\s+mode="translate"\s+plane="xy"',
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_DRAG_ENDED_TOKEN), r'\s+mode="translate"\s+plane="xy"'),
         60,
         "the plane drag ended",
         begin,

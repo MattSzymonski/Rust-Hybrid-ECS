@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from core import win_clipboard
+from core import log_layout
 from core.editor_log_tokens import EDITOR_WINDOW_CREATED_TOKEN
 from core.editor_session import EditorSession
 from editor_step_areas import StepArea
@@ -192,7 +193,7 @@ def step_11_layout_survives_restart(
         begin = restart.length()
         restart.send("dump scenes")
         restart.wait(
-            re.escape(SCENE_VIEW_RECT_TOKEN) + r"\s+view=2\b",
+            log_layout.message_then_fields_pattern(re.escape(SCENE_VIEW_RECT_TOKEN), r"\s+view=2\b"),
             60,
             "the third view after the restart",
             begin,
@@ -230,7 +231,7 @@ def step_11_layout_survives_restart(
             )
         restart.send("command editor.paste")
         restart.wait(
-            re.escape(CLIPBOARD_PASTED_TOKEN) + r'\s+kind="entity"',
+            log_layout.message_then_fields_pattern(re.escape(CLIPBOARD_PASTED_TOKEN), r'\s+kind="entity"'),
             60,
             "the pasted entity",
             begin,
@@ -410,7 +411,7 @@ def step_12_redraw_cadence(binary: Path, project: str) -> None:
         begin = cadence.length()
         cadence.send("command editor.pause_toggle")
         cadence.wait(
-            re.escape(PAUSE_TOGGLED_TOKEN) + r"\s+paused=true",
+            log_layout.message_then_fields_pattern(re.escape(PAUSE_TOGGLED_TOKEN), r"\s+paused=true"),
             60,
             "the project paused for the cadence step",
             begin,
@@ -419,7 +420,7 @@ def step_12_redraw_cadence(binary: Path, project: str) -> None:
         # a running project draws at the display rate and a paused one stops
         # drawing until something asks for a frame.
         cadence.wait(
-            re.escape(FRAME_IDLE_TOKEN) + r"\s+poll_millis=250\b",
+            log_layout.message_then_fields_pattern(re.escape(FRAME_IDLE_TOKEN), r"\s+poll_millis=250\b"),
             60,
             "the editor settled into its idle poll",
             begin,
@@ -430,8 +431,7 @@ def step_12_redraw_cadence(binary: Path, project: str) -> None:
             cadence.send("dump cadence")
             cadence.wait(re.escape(CADENCE_DUMP_TOKEN), 60, "the cadence dump", begin)
             dump = re.search(
-                re.escape(CADENCE_DUMP_TOKEN)
-                + r"\s+continuous=(?:true|false)\s+frames=(\d+)",
+                log_layout.message_then_fields_pattern(re.escape(CADENCE_DUMP_TOKEN), r"\s+continuous=(?:true|false)\s+frames=(\d+)"),
                 cadence.read_since(begin),
             )
             assert dump is not None, "the cadence dump carried no frame count"
@@ -485,7 +485,7 @@ def step_13_no_overlay_posture(binary: Path, project: str) -> None:
                 log.count(NO_OVERLAY_TOKEN)
             )
         )
-        assert re.search(re.escape(OVERLAY_POSTURE_TOKEN) + r"\s+window_surface=true", log), (
+        assert re.search(log_layout.message_then_fields_pattern(re.escape(OVERLAY_POSTURE_TOKEN), r"\s+window_surface=true"), log), (
             "the posture line did not name the window surface: {}".format(log[-800:])
         )
         # Docks: a tab is activated and undocked, and the dock reports the
@@ -536,7 +536,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
     try:
         panels.wait_for_match(re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "panel startup"
         )
-        panels.wait_for_match(re.escape(PANEL_REGISTERED_TOKEN) + r'\s+id="shell\.demo"',
+        panels.wait_for_match(log_layout.message_then_fields_pattern(re.escape(PANEL_REGISTERED_TOKEN), r'\s+id="shell\.demo"'),
             120,
             "the demo panel registration",
         )
@@ -544,8 +544,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the panel dump"
         )
         row = re.search(
-            re.escape(PANEL_ROW_TOKEN)
-            + r'\s+slot=(\d+)\s+id="shell\.demo"\s+source="[^"]+"\s+alive=true',
+            log_layout.message_then_fields_pattern(re.escape(PANEL_ROW_TOKEN), r'\s+slot=(\d+)\s+id="shell\.demo"\s+source="[^"]+"\s+alive=true'),
             dump,
         )
         assert row is not None, "the demo panel is not registered: {}".format(
@@ -563,13 +562,11 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the armed panel dump"
         )
         assert re.search(
-            re.escape(PANEL_ROW_TOKEN)
-            + r"\s+slot={}\s+.*?slow=true".format(slot),
+            log_layout.message_then_fields_pattern(re.escape(PANEL_ROW_TOKEN), r"\s+slot={}\s+.*?slow=true").format(slot),
             dump,
         ), "the panel's budget badge never armed: {}".format(dump[-800:])
         assert re.search(
-            re.escape(TOAST_TOKEN)
-            + r'\s+level="warning"\s+seq=\d+\s+text="Panel .* over its frame budget',
+            log_layout.message_then_fields_pattern(re.escape(TOAST_TOKEN), r'\s+level="warning"\s+seq=\d+\s+text="Panel .* over its frame budget'),
             panels.text(),
         ), "the over-budget panel queued no toast"
         print_ok("a slow module panel armed its badge and queued a toast")
@@ -581,7 +578,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the unloaded panel dump"
         )
         assert re.search(
-            re.escape(PANEL_ROW_TOKEN) + r"\s+slot={}\s+.*?alive=false".format(slot),
+            log_layout.message_then_fields_pattern(re.escape(PANEL_ROW_TOKEN), r"\s+slot={}\s+.*?alive=false").format(slot),
             dump,
         ), "the unloaded panel still reads alive: {}".format(dump[-800:])
         assert "module not loaded" in dump or "Module not loaded" in panels.text(), (
@@ -600,7 +597,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the restored panel dump"
         )
         assert re.search(
-            re.escape(PANEL_ROW_TOKEN) + r"\s+slot={}\s+.*?alive=true".format(slot),
+            log_layout.message_then_fields_pattern(re.escape(PANEL_ROW_TOKEN), r"\s+slot={}\s+.*?alive=true").format(slot),
             dump,
         ), "the restored panel did not come back: {}".format(dump[-800:])
         print_ok("a panel outlived its module's unload and came back")
@@ -613,8 +610,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the spline panel"
         )
         spline = re.search(
-            re.escape(PANEL_ROW_TOKEN)
-            + r'\s+slot=(\d+)\s+id="shell\.spline_tool"',
+            log_layout.message_then_fields_pattern(re.escape(PANEL_ROW_TOKEN), r'\s+slot=(\d+)\s+id="shell\.spline_tool"'),
             dump,
         )
         assert spline is not None, (
@@ -629,8 +625,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
                 "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the drawn spline panel"
             )
             row = re.search(
-                re.escape(PANEL_ROW_TOKEN)
-                + r"\s+slot={}\s+.*?passes=(\d+)".format(spline_slot),
+                log_layout.message_then_fields_pattern(re.escape(PANEL_ROW_TOKEN), r"\s+slot={}\s+.*?passes=(\d+)").format(spline_slot),
                 dump,
             )
             return row if row is not None and int(row.group(1)) > 0 else None
@@ -660,8 +655,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             (
                 match
                 for match in re.finditer(
-                    re.escape(ENTITY_ROW_TOKEN)
-                    + r'\s+display="([^"]+)"\s+components="([^"]*)"',
+                    log_layout.message_then_fields_pattern(re.escape(ENTITY_ROW_TOKEN), r'\s+display="([^"]+)"\s+components="([^"]*)"'),
                     dump,
                 )
                 if SHOWCASE_COMPONENT in match.group(2)
@@ -697,8 +691,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             queued,
         ), "the panel queued a different write: {}".format(queued[-600:])
         panels.wait(
-            re.escape(HISTORY_PUSH_TOKEN)
-            + r'\s+label="set {}[^"]*"'.format(re.escape(SHOWCASE_COMPONENT)),
+            log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="set {}[^"]*"').format(re.escape(SHOWCASE_COMPONENT)),
             60,
             "the panel edit recorded a step",
             begin,
@@ -738,7 +731,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             re.escape(PANEL_WINDOW_REQUESTED_TOKEN), 60, "the window request", begin
         )
         panels.wait(
-            re.escape(PANEL_WINDOW_OPENED_TOKEN) + r'\s+slot=\d+\s+window="demo\.confirm"',
+            log_layout.message_then_fields_pattern(re.escape(PANEL_WINDOW_OPENED_TOKEN), r'\s+slot=\d+\s+window="demo\.confirm"'),
             60,
             "the panel window",
             begin,
@@ -750,18 +743,18 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "the panel window is not on screen: {}".format(dump[-600:])
         )
         assert re.search(
-            re.escape(WINDOW_ROW_TOKEN) + r'\s+id="demo\.confirm".*?modal=true', dump
+            log_layout.message_then_fields_pattern(re.escape(WINDOW_ROW_TOKEN), r'\s+id="demo\.confirm".*?modal=true'), dump
         ), "the window is not modal: {}".format(dump[-600:])
         begin = panels.length()
         panels.send("key Enter")
         panels.wait(
-            re.escape(PANEL_MODAL_ANSWERED_TOKEN) + r'\s+window="[^"]+"\s+accepted=true',
+            log_layout.message_then_fields_pattern(re.escape(PANEL_MODAL_ANSWERED_TOKEN), r'\s+window="[^"]+"\s+accepted=true'),
             60,
             "the modal answer",
             begin,
         )
         panels.wait(
-            re.escape(PANEL_LOG_TOKEN) + r'\s+text="demo confirmed"',
+            log_layout.message_then_fields_pattern(re.escape(PANEL_LOG_TOKEN), r'\s+text="demo confirmed"'),
             60,
             "the panel's confirmation",
             begin,
@@ -778,7 +771,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         begin = panels.length()
         panels.send("panel window {} demo.confirm".format(slot))
         panels.wait(
-            re.escape(PANEL_WINDOW_OPENED_TOKEN) + r'\s+slot=\d+\s+window="demo\.confirm"',
+            log_layout.message_then_fields_pattern(re.escape(PANEL_WINDOW_OPENED_TOKEN), r'\s+slot=\d+\s+window="demo\.confirm"'),
             60,
             "the reopened window",
             begin,
@@ -803,7 +796,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         begin = panels.length()
         panels.send("panel window {} demo.confirm".format(slot))
         panels.wait(
-            re.escape(PANEL_WINDOW_OPENED_TOKEN) + r'\s+slot=\d+\s+window="demo\.confirm"',
+            log_layout.message_then_fields_pattern(re.escape(PANEL_WINDOW_OPENED_TOKEN), r'\s+slot=\d+\s+window="demo\.confirm"'),
             60,
             "the re-registered window",
             begin,
@@ -812,7 +805,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         begin = panels.length()
         panels.send("key Escape")
         panels.wait(
-            re.escape(PANEL_MODAL_ANSWERED_TOKEN) + r'\s+window="[^"]+"\s+accepted=false',
+            log_layout.message_then_fields_pattern(re.escape(PANEL_MODAL_ANSWERED_TOKEN), r'\s+window="[^"]+"\s+accepted=false'),
             60,
             "the dismiss",
             begin,
@@ -829,8 +822,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         panels.send("scene save {}".format(scene_path))
         panels.wait(re.escape(SCENE_SAVED_TOKEN), 60, "the scene save", begin)
         saved = re.search(
-            re.escape(SCENE_SAVED_TOKEN)
-            + r'\s+path="scenes/egui_suite\.scene"\s+guid=\S+\s+entities=(\d+)',
+            log_layout.message_then_fields_pattern(re.escape(SCENE_SAVED_TOKEN), r'\s+path="scenes/egui_suite\.scene"\s+guid=\S+\s+entities=(\d+)'),
             panels.read_since(begin),
         )
         assert saved is not None, "the save did not name the scene it wrote"
@@ -840,7 +832,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             scene_file
         )
         panels.wait(
-            re.escape(SCENE_TITLE_TOKEN) + r'\s+title="egui_suite\.scene"',
+            log_layout.message_then_fields_pattern(re.escape(SCENE_TITLE_TOKEN), r'\s+title="egui_suite\.scene"'),
             60,
             "the title naming the saved scene",
             begin,
@@ -849,7 +841,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         panels.send("scene new")
         panels.wait(re.escape(SCENE_NEW_TOKEN), 60, "the new scene", begin)
         removed = re.search(
-            re.escape(SCENE_NEW_TOKEN) + r"\s+entities=(\d+)",
+            log_layout.message_then_fields_pattern(re.escape(SCENE_NEW_TOKEN), r"\s+entities=(\d+)"),
             panels.read_since(begin),
         )
         assert removed is not None and int(removed.group(1)) == saved_count, (
@@ -861,8 +853,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         panels.send("scene open {}".format(scene_path))
         panels.wait(re.escape(SCENE_OPENED_TOKEN), 60, "the scene open", begin)
         reopened = re.search(
-            re.escape(SCENE_OPENED_TOKEN)
-            + r'\s+path="scenes/egui_suite\.scene"\s+guid=\S+\s+entities=(\d+)'
+            log_layout.message_then_fields_pattern(re.escape(SCENE_OPENED_TOKEN), r'\s+path="scenes/egui_suite\.scene"\s+guid=\S+\s+entities=(\d+)')
             + r"\s+components=(\d+)",
             panels.read_since(begin),
         )
@@ -874,7 +865,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
         )
         assert int(reopened.group(2)) > 0, "the scene opened with no components"
         panels.wait(
-            re.escape(SCENE_TITLE_TOKEN) + r'\s+title="egui_suite\.scene"',
+            log_layout.message_then_fields_pattern(re.escape(SCENE_TITLE_TOKEN), r'\s+title="egui_suite\.scene"'),
             60,
             "the title naming the opened scene",
             begin,
@@ -929,7 +920,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
             "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the restart's panels"
         )
         assert re.search(
-            re.escape(PANEL_ROW_TOKEN) + r'\s+slot=\d+\s+id="shell\.demo"\s+.*?alive=true',
+            log_layout.message_then_fields_pattern(re.escape(PANEL_ROW_TOKEN), r'\s+slot=\d+\s+id="shell\.demo"\s+.*?alive=true'),
             restored,
         ), "the restarted editor did not register the panel: {}".format(
             restored[-800:]
@@ -987,8 +978,7 @@ def step_14_module_panels(session: EditorSession, binary: Path, project: str) ->
                 "safe mode reported no build error: {}".format(rows)
             )
             located = re.search(
-                re.escape(PROBLEM_ROW_TOKEN)
-                + r'\s+module="[^"]*"\s+severity="error"\s+file="([^"]+)"\s+line=([1-9][0-9]*)',
+                log_layout.message_then_fields_pattern(re.escape(PROBLEM_ROW_TOKEN), r'\s+module="[^"]*"\s+severity="error"\s+file="([^"]+)"\s+line=([1-9][0-9]*)'),
                 safe.read_since(rows_begin),
             )
             assert located and located.group(1).endswith("shell.rs"), (

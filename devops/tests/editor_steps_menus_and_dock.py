@@ -6,6 +6,7 @@ from `editor_step_support`, the log vocabulary from `editor_log_tokens`.
 
 import re
 
+from core import log_layout
 from core.editor_log_tokens import (
     EGUI_ROWS_TOKEN,
     GIZMO_PREFERENCES_WRITTEN_TOKEN,
@@ -54,7 +55,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     session.send("tab scene")
     session.wait(
-        re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="scene"',
+        log_layout.message_then_fields_pattern(re.escape(TAB_ACTIVATED_TOKEN), r'\s+tab="scene"'),
         30,
         "the scene tab back again",
         begin,
@@ -74,7 +75,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     toolbox_click(session, 0, "grid", "the toolbox turned the grid off")
     session.wait(
-        re.escape(SCENE_GRID_STATE_TOKEN) + r"\s+enabled=false",
+        log_layout.message_then_fields_pattern(re.escape(SCENE_GRID_STATE_TOKEN), r"\s+enabled=false"),
         30,
         "the grid switched off",
         begin,
@@ -92,7 +93,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     toolbox_click(session, 0, "grid", "the toolbox turned the grid back on")
     session.wait(
-        re.escape(SCENE_GRID_STATE_TOKEN) + r"\s+enabled=true",
+        log_layout.message_then_fields_pattern(re.escape(SCENE_GRID_STATE_TOKEN), r"\s+enabled=true"),
         30,
         "the grid switched back on",
         begin,
@@ -133,7 +134,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     menu_click(session, "window", "Systems", "Systems")
     session.wait(
-        re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="systems"',
+        log_layout.message_then_fields_pattern(re.escape(TAB_ACTIVATED_TOKEN), r'\s+tab="systems"'),
         30,
         "the Window menu activated the Systems tab",
         begin,
@@ -145,7 +146,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     menu_click(session, "create", "New Entity", "New Entity")
     wait_for_entity_count(session, count_before + 1, "the Create menu's new entity")
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="new entity"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="new entity"'),
         30,
         "the Create menu's step recorded",
         begin,
@@ -153,7 +154,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     menu_click(session, "edit", "Undo", "Undo")
     session.wait(
-        re.escape(HISTORY_UNDO_TOKEN) + r'\s+label="new entity"',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_UNDO_TOKEN), r'\s+label="new entity"'),
         30,
         "the Edit menu undid it",
         begin,
@@ -166,7 +167,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     menu_click(session, "view", "Snap", "Snap")
     session.wait(
-        re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN) + r"[^\n]*snap=true",
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN), r"[^\n]*snap=true"),
         30,
         "the View menu turned snapping on",
         begin,
@@ -174,7 +175,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     menu_click(session, "view", "Snap", "Snap")
     session.wait(
-        re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN) + r"[^\n]*snap=false",
+        log_layout.message_then_fields_pattern(re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN), r"[^\n]*snap=false"),
         30,
         "the View menu turned snapping back off",
         begin,
@@ -191,7 +192,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     session.send("tab inspector")
     session.wait(
-        re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="inspector"',
+        log_layout.message_then_fields_pattern(re.escape(TAB_ACTIVATED_TOKEN), r'\s+tab="inspector"'),
         30,
         "the Inspector tab shown",
         begin,
@@ -203,7 +204,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"select entity {detail_entity}")
     session.wait(
-        re.escape(SELECTION_CHANGED_TOKEN) + rf"\s+entity={re.escape(detail_entity)}",
+        log_layout.message_then_fields_pattern(re.escape(SELECTION_CHANGED_TOKEN), rf"\s+entity={re.escape(detail_entity)}"),
         30,
         "an entity selected for the Inspector",
         begin,
@@ -251,8 +252,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"click {center[0]:.0f} {center[1]:.0f}")
     session.wait(
-        re.escape(INSPECTOR_SECTION_TOKEN)
-        + rf'\s+component="{re.escape(transform_section)}"\s+collapsed=true',
+        log_layout.message_then_fields_pattern(re.escape(INSPECTOR_SECTION_TOKEN), rf'\s+component="{re.escape(transform_section)}"\s+collapsed=true'),
         30,
         "the section collapsed",
         begin,
@@ -268,8 +268,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     center = header_click_point()
     session.send(f"click {center[0]:.0f} {center[1]:.0f}")
     session.wait(
-        re.escape(INSPECTOR_SECTION_TOKEN)
-        + rf'\s+component="{re.escape(transform_section)}"\s+collapsed=false',
+        log_layout.message_then_fields_pattern(re.escape(INSPECTOR_SECTION_TOKEN), rf'\s+component="{re.escape(transform_section)}"\s+collapsed=false'),
         30,
         "the section expanded again",
         begin,
@@ -297,7 +296,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     # heartbeat that carries a selected detail - a bare frame advance can
     # land before the shell reports the new one.
     session.wait(
-        re.escape(EGUI_ROWS_TOKEN) + r'[^\n]*detail="(?!-)[^"]+"',
+        log_layout.message_then_fields_pattern(re.escape(EGUI_ROWS_TOKEN), r'[^\n]*detail="(?!-)[^"]+"'),
         60,
         "a heartbeat after the add list opened",
         begin,
@@ -318,7 +317,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"click {entry_center[0]:.0f} {entry_center[1]:.0f}")
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="add ',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="add '),
         30,
         "the add recorded a step",
         begin,
@@ -331,7 +330,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     session.send(f"edit remove {detail_entity} {chosen}")
     session.wait(
-        re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="remove ',
+        log_layout.message_then_fields_pattern(re.escape(HISTORY_PUSH_TOKEN), r'\s+label="remove '),
         30,
         "the suite removed the added component again",
         begin,
@@ -351,7 +350,7 @@ def run_menus_and_dock_steps(state: StepState) -> None:
     begin = session.length()
     session.send("tab inspector")
     session.wait(
-        re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="inspector"',
+        log_layout.message_then_fields_pattern(re.escape(TAB_ACTIVATED_TOKEN), r'\s+tab="inspector"'),
         30,
         "the Inspector tab shown again",
         begin,

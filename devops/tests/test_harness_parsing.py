@@ -55,10 +55,12 @@ EXAMPLE USAGE
 """
 
 import importlib.util
+import io
 import re
 import subprocess
 import sys
 import tempfile
+import tokenize
 from pathlib import Path
 from typing import Callable, List, Tuple
 
@@ -66,6 +68,7 @@ from typing import Callable, List, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import CI_CD_ROOT, DEVOPS_ROOT, MODULES_ROOT, REPOSITORY_ROOT, TESTS_ROOT  # noqa: E402
+from core import log_layout  # noqa: E402
 from core.projects import NATIVE_PROJECT_LIB_RS  # noqa: E402
 from core.suite_common import (  # noqa: E402
     apply_replacements,
@@ -103,6 +106,9 @@ coverage = load_module(TESTS_ROOT / "test_hot_patch_coverage.py", "test_hot_patc
 # it.
 PILL_HOST_SOURCE = MODULES_ROOT / "hosting" / "pill_development_host" / "src"
 BUILD_RUNNER_SOURCE = PILL_HOST_SOURCE / "build_runner.rs"
+# The formatter that decides the rendered log line, read as text so the
+# separator check fails when either side moves without the other.
+TELEMETRY_SOURCE = MODULES_ROOT / "engine" / "pill_core" / "src" / "telemetry.rs"
 
 # Cargo's configuration hash: `-<16 hex digits>` appended to a crate's filename
 # when the artifact belongs to one resolved configuration. A name without it is
@@ -788,10 +794,148 @@ def check_the_gate_denies_warnings_everywhere() -> None:
                 fail(f"the {name} step runs {command}, which does not deny warnings")
 
 
+def check_log_line_layout_uses_the_pipe() -> None:
+    """The shared log-line grammar joins a message and its fields with a pipe."""
+    if log_layout.SEPARATOR != " | ":
+        fail(f"the separator must be ' | ', got {log_layout.SEPARATOR!r}")
+    rendered = log_layout.message_then_fields("hot reload complete", 'module="native"')
+    if rendered != 'hot reload complete | module="native"':
+        fail(f"the text join is wrong: {rendered!r}")
+    pattern = log_layout.message_then_fields_pattern(
+        re.escape("hot reload complete"), r'module="[^"]+"'
+    )
+    if re.search(pattern, rendered) is None:
+        fail(f"the pattern does not match the rendered line: {pattern!r}")
+    if re.search(pattern, 'hot reload complete  module="native"') is not None:
+        fail("the old two-space layout must not match the pattern")
+
+
+def check_log_layout_separator_matches_the_engine() -> None:
+    """The suites' separator must be the one the engine formatter writes."""
+    source = TELEMETRY_SOURCE.read_text(encoding="utf-8")
+    match = re.search(r'pub const FIELD_SEPARATOR: &str = "([^"]*)";', source)
+    if match is None:
+        fail("FIELD_SEPARATOR is gone from telemetry.rs")
+    if match.group(1) != log_layout.SEPARATOR:
+        fail(
+            "the engine writes {!r}, the suites read {!r}".format(
+                match.group(1), log_layout.SEPARATOR
+            )
+        )
+
+
+def check_log_layout_reads_the_rendered_shapes() -> None:
+    """The helper reads fields, no fields, a block prefix and a field-only line."""
+    entity_pattern = log_layout.message_then_fields_pattern(
+        re.escape("scene pick entity"), r"\s+entity=(\d+)"
+    )
+    match = re.search(entity_pattern, "INFO  engine::editor  scene pick entity | entity=7")
+    if match is None or match.group(1) != "7":
+        fail("a message-with-fields line did not read: {!r}".format(entity_pattern))
+    no_fields = "INFO  engine::editor  scene pick nothing"
+    if log_layout.SEPARATOR in no_fields:
+        fail("a no-fields line carried the separator")
+    if re.search(re.escape("scene pick nothing") + "$", no_fields) is None:
+        fail("a no-fields line must end after its message")
+    block_pattern = log_layout.message_then_fields_pattern(
+        re.escape("reload analytics"), r"\s+modules=(\d+)"
+    )
+    if re.search(block_pattern, "reload analytics | modules=3") is None:
+        fail("a block prefix did not read")
+    if re.search(block_pattern, "1. pill_spline") is not None:
+        fail("a block body must not match the prefix pattern")
+    if log_layout.SEPARATOR in "INFO  engine::ecs  rows=2":
+        fail("a field-only line carried the separator")
+
+
+def literal_body(text: str) -> str:
+    """The text between a Python string literal's quotes, prefix removed."""
+    for index, character in enumerate(text):
+        if character in "'\"":
+            body = text[index + 1 :]
+            if body.endswith(character):
+                body = body[:-1]
+            return body
+    return ""
+
+
+def message_field_joins(path: Path) -> List[Tuple[int, str]]:
+    """`re.escape(NAME) + <gap and field>` joins in one Python file."""
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    skip = {tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT}
+    joins = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not (
+            token.type == tokenize.NAME
+            and token.string == "re"
+            and index + 4 < len(tokens)
+            and tokens[index + 1].string == "."
+            and tokens[index + 2].string == "escape"
+            and tokens[index + 3].string == "("
+        ):
+            index += 1
+            continue
+        close = index + 4
+        while close < len(tokens) and tokens[close].string != ")":
+            close += 1
+        after = close + 1
+        while after < len(tokens) and tokens[after].type in skip:
+            after += 1
+        if after >= len(tokens) or tokens[after].string != "+":
+            index += 1
+            continue
+        value = after + 1
+        while value < len(tokens) and tokens[value].type in skip:
+            value += 1
+        literal = ""
+        if value < len(tokens):
+            if tokens[value].type == tokenize.STRING:
+                literal = tokens[value].string
+            elif (
+                hasattr(tokenize, "FSTRING_START")
+                and tokens[value].type == tokenize.FSTRING_START
+            ):
+                end = value
+                while end < len(tokens) and tokens[end].type != tokenize.FSTRING_END:
+                    literal += tokens[end].string
+                    end += 1
+        body = literal_body(literal)
+        if (body.startswith("\\s+") or body.startswith("[^\\n]*")) and "=" in body:
+            name = tokens[index + 4].string if index + 4 < close else "?"
+            joins.append((tokens[index].start[0], name))
+        index += 1
+    return joins
+
+
+def check_devops_uses_the_log_layout_helper() -> None:
+    """No devops module outside log_layout.py builds a message-to-fields join."""
+    offenders = []
+    paths = sorted((DEVOPS_ROOT / "core").glob("*.py")) + sorted(
+        (DEVOPS_ROOT / "tests").glob("*.py")
+    )
+    for path in paths:
+        if path.name == "log_layout.py":
+            continue
+        for line, name in message_field_joins(path):
+            offenders.append(
+                "{}:{} ({})".format(path.relative_to(REPOSITORY_ROOT), line, name)
+            )
+    if offenders:
+        fail("hand-built log joins: " + "; ".join(offenders[:8]))
+
+
 CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("cargo test totals are summed", check_cargo_test_totals_are_summed),
     ("brace scan survives strings and comments",
      check_function_body_scan_handles_braces_in_strings_and_comments),
+    ("log-line layout uses the pipe", check_log_line_layout_uses_the_pipe),
+    ("log-line separator matches the engine", check_log_layout_separator_matches_the_engine),
+    ("log-line shapes read through the helper", check_log_layout_reads_the_rendered_shapes),
+    ("devops builds log joins through the helper", check_devops_uses_the_log_layout_helper),
     ("associated functions are not candidates",
      check_associated_functions_are_not_offered_as_candidates),
     ("cfg(test) code is excluded", check_test_module_is_excluded_from_runtime_code),

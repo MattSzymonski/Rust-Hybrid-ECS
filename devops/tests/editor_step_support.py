@@ -10,6 +10,7 @@ import json
 import re
 from pathlib import Path
 
+from core import log_layout
 from core.editor_log_tokens import (
     CONSOLE_DUMP_PATTERN,
     EDITOR_THEME_DUMP_TOKEN,
@@ -124,7 +125,7 @@ def toolbox_click(session: EditorSession, view: int, item: str, label: str) -> N
     be swallowed while the panel is moving or the pointer is settling, so a
     miss is retried once with the row's rectangle read again.
     """
-    pattern = re.escape(TOOLBOX_CLICK_TOKEN) + rf'\s+view={view}\s+item="{item}"'
+    pattern = log_layout.message_then_fields_pattern(re.escape(TOOLBOX_CLICK_TOKEN), rf'\s+view={view}\s+item="{item}"')
     for attempt in (1, 2):
         x, y = rect_center(toolbox_row(session, view, item))
         begin = session.length()
@@ -168,7 +169,7 @@ def menu_click(session: EditorSession, menu: str, label: str, action_label: str)
         center = rect_center(menu_title_rect(session, menu))
         session.request(
             f"click {center[0]:.0f} {center[1]:.0f}",
-            re.escape(MENU_OPENED_TOKEN) + rf'\s+menu="{menu}"',
+            log_layout.message_then_fields_pattern(re.escape(MENU_OPENED_TOKEN), rf'\s+menu="{menu}"'),
             30,
             f"the {menu} menu opened",
         )
@@ -185,8 +186,7 @@ def menu_click(session: EditorSession, menu: str, label: str, action_label: str)
         session.send(f"click {x:.0f} {y:.0f}")
         try:
             session.wait(
-                re.escape(MENU_ACTION_TOKEN)
-                + rf'\s+menu="{menu}"\s+label="{re.escape(action_label)}"',
+                log_layout.message_then_fields_pattern(re.escape(MENU_ACTION_TOKEN), rf'\s+menu="{menu}"\s+label="{re.escape(action_label)}"'),
                 30,
                 f"the {menu} menu ran {action_label!r}",
                 begin,
@@ -304,7 +304,7 @@ def wait_for_path(
 
 def entity_count(session: EditorSession) -> int:
     """The entity list's row count, from one anchored dump."""
-    pattern = re.escape(ENTITIES_DUMP_TOKEN) + r"\s+count=(\d+)"
+    pattern = log_layout.message_then_fields_pattern(re.escape(ENTITIES_DUMP_TOKEN), r"\s+count=(\d+)")
     dump = session.request("dump entities", pattern, 60, "the entity list")
     match = re.search(r"count=(\d+)", dump)
     assert match, "the entity dump carried no count: {}".format(dump[-500:])
@@ -362,6 +362,9 @@ def assert_theme(line: str, layers: str, accent: str, panel: str, label: str) ->
     return int(re.search(r"generation=(\d+)", line).group(1))
 
 
+# The two row helpers below select a row with lookaheads over its fields
+# rather than consuming the message-to-fields join; the lookaheads read the
+# whole line, so they are not built through `log_layout`.
 def asset_row_capture(entity: str, field: str) -> str:
     """`entity`'s asset row for `field`, capturing the asset it names."""
     return (
@@ -555,7 +558,7 @@ def wait_for_frames_past(session: EditorSession, highest: int, timeout: float, l
     dump carries the shell's own counter, so the wait asks for the observation
     instead of waiting for the rows heartbeat's 210-frame cadence.
     """
-    pattern = re.escape(VIEWPORT_DUMP_TOKEN) + r"[^\n]*frame=(\d+)"
+    pattern = log_layout.message_then_fields_pattern(re.escape(VIEWPORT_DUMP_TOKEN), r"[^\n]*frame=(\d+)")
 
     def probe(_text: str):
         dump = session.request("dump viewport", pattern, 30, "the viewport dump")
@@ -574,7 +577,7 @@ def wait_for_frames_past(session: EditorSession, highest: int, timeout: float, l
 
 def shell_frame(session: EditorSession) -> int:
     """The shell's frame counter, from one anchored viewport dump."""
-    pattern = re.escape(VIEWPORT_DUMP_TOKEN) + r"[^\n]*frame=(\d+)"
+    pattern = log_layout.message_then_fields_pattern(re.escape(VIEWPORT_DUMP_TOKEN), r"[^\n]*frame=(\d+)")
     dump = session.request("dump viewport", pattern, 30, "the frame counter")
     match = re.search(r"frame=(\d+)", dump)
     assert match, "the viewport dump carried no frame counter: {}".format(dump[-500:])

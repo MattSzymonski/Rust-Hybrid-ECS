@@ -61,6 +61,7 @@ from pathlib import Path
 # Standalone-runnable: `devops/` holds `core`, and the suites sit beside it.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core import log_layout  # noqa: E402
 from core.projects import NATIVE_PROJECT_PATH, NATIVE_PROJECT_ROOT  # noqa: E402
 from core.suite_common import (  # noqa: E402
     HOST_DEV_RENDERING,
@@ -106,15 +107,16 @@ PROJECT_ALIVE_TOKEN = "[project]"
 # only once it is registered with the file system. It starts with the
 # renderer, which attaches after the project's own module has initialized, so
 # an edit written as soon as the project is alive is written before anything
-# watches the tree. The logged line is the message, two spaces, then the
-# fields - a message never contains a two-space run.
+# watches the tree. The shared log-line grammar owns the join between the
+# message and its fields.
 PROJECT_MODULE_NAME = re.search(
     r'^name\s*=\s*"([^"]+)"',
     (PROJECT_ROOT / "Cargo.toml").read_text(encoding="utf-8"),
     re.MULTILINE,
 ).group(1)
-PROJECT_SHADER_WATCH_TOKEN = 'watching shader sources for edits  tree="{}"'.format(
-    PROJECT_MODULE_NAME
+PROJECT_SHADER_WATCH_MESSAGE_TOKEN = "watching shader sources for edits"
+PROJECT_SHADER_WATCH_TOKEN = log_layout.message_then_fields(
+    PROJECT_SHADER_WATCH_MESSAGE_TOKEN, f'tree="{PROJECT_MODULE_NAME}"'
 )
 
 # The host builds the project DLL on its first run; a cold one is slow.

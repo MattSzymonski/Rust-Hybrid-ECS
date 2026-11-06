@@ -65,6 +65,7 @@ from typing import Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import suite_common as common  # noqa: E402
+from core import log_layout  # noqa: E402
 from core.suite_common import *  # noqa: E402,F401,F403
 
 # =============================================================================
@@ -88,8 +89,11 @@ MODULE_NAME = "pill_spline"
 # same posture. See `test_shared_component_identity.py` for the same note.
 HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
 
-# The structured logger puts two spaces between the message and its fields.
-BUILD_STARTED = f'building extension  module="{MODULE_NAME}"'
+# The shared log-line grammar owns the join between a message and its fields.
+BUILD_STARTED_MESSAGE_TOKEN = "building extension"
+BUILD_STARTED = log_layout.message_then_fields(
+    BUILD_STARTED_MESSAGE_TOKEN, f'module="{MODULE_NAME}"'
+)
 CANCELLED_TOKEN = "sources changed again during compilation"
 
 # The fast path's success line. A second save that lands after the build

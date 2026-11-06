@@ -60,6 +60,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.suite_common import *  # noqa: E402,F401,F403
+from core import log_layout  # noqa: E402
 
 # =============================================================================
 # Configuration
@@ -79,9 +80,11 @@ THEME_APPLIED_TOKEN = "[ui] theme applied"
 THEME_REFUSED_TOKEN = "[ui] theme refused"
 
 APPLIED_PATTERN = re.compile(
-    re.escape(THEME_APPLIED_TOKEN)
-    + r'\s+layers=(?P<layers>\S+)\s+path=(?P<path>\S+)\s+generation=(?P<generation>\d+)'
-    + r"\s+accent=(?P<accent>#[0-9a-f]{6})\s+corner=(?P<corner>\d+)"
+    log_layout.message_then_fields_pattern(
+        re.escape(THEME_APPLIED_TOKEN),
+        r'\s+layers=(?P<layers>\S+)\s+path=(?P<path>\S+)\s+generation=(?P<generation>\d+)'
+        r"\s+accent=(?P<accent>#[0-9a-f]{6})\s+corner=(?P<corner>\d+)",
+    )
 )
 # The accent the project's `res/ui/accent.theme` names.
 OVERRIDE_ACCENT = "#33d17a"
