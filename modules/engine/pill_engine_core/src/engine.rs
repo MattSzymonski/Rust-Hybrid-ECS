@@ -187,6 +187,8 @@ struct BatchMember<'a> {
     this_run_tick: u32,
     /// Registration name, for the Tracy span and the failure record.
     name: &'a str,
+    /// The Tracy zone color for this system, from its owner.
+    zone_color: u32,
     /// Whether this member runs in the update phase of this batch.
     runs: bool,
 }
@@ -1562,6 +1564,7 @@ impl Engine {
                         // index.
                         this_run_tick: self.world.increment_change_tick().get(),
                         name: registered_system.name.as_str(),
+                        zone_color: system_zone_color(registered_system.system_owner),
                         runs: registered_system.enabled && !registered_system.post_update,
                     });
                 }
@@ -1614,6 +1617,7 @@ impl Engine {
                     }
 
                     let _zone = crate::profile_scope!(
+                        color = member.zone_color,
                         "system: {}",
                         member.name;
                         [("System position in batch: {}", _position), ("Total systems in this batch: {}", batch_size)]
@@ -1707,6 +1711,18 @@ impl Default for Engine {
 // Free Functions
 // =============================================================================
 
+/// The Tracy zone color of a system with this owner.
+///
+/// A project's systems are drawn in blue so they stand out from the engine's
+/// and the extensions' work, which keep the viewer's default color.
+fn system_zone_color(system_owner: SystemOwner) -> u32 {
+    if system_owner == SystemOwner::PROJECT {
+        crate::profiling::PROJECT_SYSTEM_ZONE_COLOR
+    } else {
+        crate::profiling::DEFAULT_ZONE_COLOR
+    }
+}
+
 /// Runs one registered system on the calling thread.
 ///
 /// The sequential loop, the single-system batch lane and the post-flush phase
@@ -1724,6 +1740,7 @@ fn run_registered_system(
     registered_system: &mut RegisteredSystem,
 ) {
     let _tracy_sys = crate::profile_scope!(
+        color = system_zone_color(registered_system.system_owner),
         "system: {}",
         registered_system.name;
         [("System last ran at tick: {}", registered_system.last_run_tick), ("System splitting hint execution time (ns): {}", registered_system.average_duration)]

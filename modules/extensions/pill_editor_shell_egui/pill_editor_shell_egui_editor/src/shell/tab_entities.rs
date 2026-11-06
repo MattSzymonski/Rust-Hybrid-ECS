@@ -4,9 +4,11 @@
 //!
 //! - `DraggedEntity`: the drag payload a row carries to an Inspector
 //!   entity-reference field.
-//! - `entity_rows`: the rows the tab lists, from the snapshot's entity list.
-//! - `entities_tab`: the rows with their selection and context menus, and the
-//!   empty strip below them.
+//! - `entity_rows` and `entity_row_label`: the rows the tab lists, from the
+//!   snapshot's entity list.
+//! - `entity_row_height`: the one height every row has.
+//! - `entities_tab`: the rows on screen with their selection and context
+//!   menus, and the empty strip below the last one.
 //! - `entity_menu_items`: the row menu's create and delete actions.
 //! - `remember_hierarchy_row_rect`: each row's rectangle, logged for the suites.
 //!
@@ -62,13 +64,25 @@ pub fn entity_rows(snapshot: &EditorSnapshot) -> Vec<(Entity, String)> {
     snapshot
         .entities
         .iter()
-        .map(|entry| {
-            (
-                entry.entity,
-                format!("{}  ({} components)", entry.display, entry.component_count),
-            )
-        })
+        .map(|entry| (entry.entity, entity_row_label(entry)))
         .collect()
+}
+
+/// The label one Entities row shows: the display name and the number of
+/// components attached.
+pub fn entity_row_label(entry: &EntityListEntry) -> String {
+    format!("{}  ({} components)", entry.display, entry.component_count)
+}
+
+/// The height of one Entities row, without the spacing between rows.
+///
+/// A row is a selectable button, which egui sizes to its text plus the button
+/// padding, and never below the interact height. Every row has the same
+/// height, which is what lets the tab lay out only the rows on screen.
+pub fn entity_row_height(ui: &egui::Ui) -> f32 {
+    let text_height = ui.text_style_height(&egui::TextStyle::Button);
+    let padded_height = text_height + 2.0 * ui.spacing().button_padding.y;
+    padded_height.max(ui.spacing().interact_size.y)
 }
 
 /// Adds the entity menu's rows to `ui` and queues the recorded edit of the one
@@ -114,6 +128,11 @@ pub fn entity_menu_items(
 /// Draws the Entities tab: one row per live entity, then an empty strip that
 /// offers the same create action.
 ///
+/// Only the rows inside the visible part of the list are laid out, so the
+/// tab's cost follows the panel's height rather than the world's size. The
+/// empty strip follows the last row, so it shows once the list is scrolled to
+/// its end.
+///
 /// A left click selects the row, `Shift` extends the selection over a range
 /// and `Ctrl` adds to it. A right click selects the row and opens its menu.
 /// Dragging a row carries its entity to an Inspector reference field.
@@ -126,16 +145,15 @@ pub fn entities_tab(
     overlay_regions: &mut Vec<ShellRect>,
     session: &mut InspectorSession,
 ) {
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        // The list's own order, which a Shift-click reads to select a range.
-        let row_entities: Vec<Entity> = entity_rows(snapshot)
-            .into_iter()
-            .map(|(entity, _label)| entity)
-            .collect();
-        // Step 1: the entity rows, one per live entity.
-        for (entity, label) in entity_rows(snapshot) {
+    let total_rows = snapshot.entities.len();
+    let row_height = entity_row_height(ui);
+    egui::ScrollArea::vertical().show_rows(ui, row_height, total_rows, |ui, visible_rows| {
+        let reaches_last_row = visible_rows.end == total_rows;
+        // Step 1: the entity rows on screen.
+        for entry in &snapshot.entities[visible_rows] {
+            let entity = entry.entity;
             let selected = selection.contains(entity);
-            let label_response = ui.selectable_label(selected, label);
+            let label_response = ui.selectable_label(selected, entity_row_label(entry));
             // The selected row: egui fills it with the theme's `selection`
             // colour, and the accent bar marks its left edge.
             if selected {
@@ -153,6 +171,10 @@ pub fn entities_tab(
             remember_hierarchy_row_rect(session, entity, row_interaction.rect);
             if row_interaction.clicked() {
                 let selection_click = ui.input(|input| click_from_modifiers(&input.modifiers));
+                // The list's own order, which a Shift-click reads to select a
+                // range. Built only on a click, since it spans every row.
+                let row_entities: Vec<Entity> =
+                    snapshot.entities.iter().map(|entry| entry.entity).collect();
                 select_entity_click(selection, entity, selection_click, &row_entities);
             }
             // A right click selects the row the menu opens for, replacing the
@@ -164,11 +186,14 @@ pub fn entities_tab(
                 entity_menu_items(ui, Some(entity), selection, pending)
             });
         }
-        // Step 2: the empty strip below the rows. Its menu can only create an
-        // entity; there is no row to delete.
-        let empty = ui.allocate_response(empty_area(ui), egui::Sense::click());
-        context_menu("entities", &empty, overlay_regions, &mut |ui| {
-            entity_menu_items(ui, None, selection, pending)
-        });
+        // Step 2: the empty strip below the rows, once the last row is on
+        // screen. Its menu can only create an entity; there is no row to
+        // delete.
+        if reaches_last_row {
+            let empty = ui.allocate_response(empty_area(ui), egui::Sense::click());
+            context_menu("entities", &empty, overlay_regions, &mut |ui| {
+                entity_menu_items(ui, None, selection, pending)
+            });
+        }
     });
 }

@@ -174,6 +174,17 @@ impl World {
         rows
     }
 
+    /// Returns every live entity, sorted by the entity's slot id.
+    ///
+    /// The handle-only twin of [`Self::entity_rows`], in the same order. No
+    /// component names are copied, so a caller that walks a large world every
+    /// frame pays one allocation for the whole list.
+    pub fn live_entities(&self) -> Vec<Entity> {
+        let mut entities: Vec<Entity> = self.entity_locations.keys().copied().collect();
+        entities.sort_by_key(|entity| entity.id());
+        entities
+    }
+
     /// Returns the component type names of one entity, or `None` when the
     /// entity is not alive.
     ///

@@ -62,6 +62,17 @@ compile_error!("`profiling` and `profiling-minimal` are mutually exclusive. Enab
 // build and re-exported from whichever `enabled` module is compiled. A field
 // added here is compiled by every feature set, including a shipping build's.
 
+/// The zone color that leaves the choice to the Tracy viewer, which by default
+/// colors zones by the thread they ran on.
+pub const DEFAULT_ZONE_COLOR: u32 = 0;
+
+/// The zone color of an ECS system the project registered, `0xRRGGBB`.
+///
+/// Tracy colors every uncolored zone by its thread, so a project's ECS systems
+/// would look like the engine's own work around them. A fixed blue lets a
+/// reader find the project's code on the timeline at a glance.
+pub const PROJECT_SYSTEM_ZONE_COLOR: u32 = 0x2F6FDF;
+
 /// The graphics API a GPU timeline's timestamps come from, so Tracy can label
 /// the timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,11 +149,21 @@ mod enabled {
     }
 
     impl DirectZone {
-        /// Opens a zone called `name`, or `None` when Tracy is not running.
+        /// Opens a zone called `name` drawn in `color` (`0xRRGGBB`, or `0` for
+        /// the viewer's own choice), or `None` when Tracy is not running.
         #[inline(never)]
-        fn open(name: &str, function: &str, file: &str, line: u32) -> Option<Self> {
-            Client::running().map(|client| Self {
-                span: ManuallyDrop::new(client.span_alloc(Some(name), function, file, line, 0)),
+        fn open(name: &str, color: u32, function: &str, file: &str, line: u32) -> Option<Self> {
+            Client::running().map(|client| {
+                // The last argument is the callstack depth to capture, none.
+                let span = client.span_alloc(Some(name), function, file, line, 0);
+                // Tracy sets a zone's color after it opens. Color zero is
+                // left unsent, so the viewer keeps its own choice.
+                if color != super::DEFAULT_ZONE_COLOR {
+                    span.emit_color(color);
+                }
+                Self {
+                    span: ManuallyDrop::new(span),
+                }
             })
         }
 
@@ -206,7 +227,7 @@ mod enabled {
                 return Self { zone: None };
             }
             Self {
-                zone: DirectZone::open(name, function, file, line),
+                zone: DirectZone::open(name, super::DEFAULT_ZONE_COLOR, function, file, line),
             }
         }
 
@@ -215,6 +236,7 @@ mod enabled {
         fn open_lazy(
             fine_lane: bool,
             name: impl FnOnce() -> String,
+            color: u32,
             function: &str,
             file: &str,
             line: u32,
@@ -223,7 +245,7 @@ mod enabled {
                 return Self { zone: None };
             }
             Self {
-                zone: DirectZone::open(&name(), function, file, line),
+                zone: DirectZone::open(&name(), color, function, file, line),
             }
         }
 
@@ -258,7 +280,22 @@ mod enabled {
             file: &str,
             line: u32,
         ) -> Self {
-            Self::open_lazy(false, name, function, file, line)
+            Self::open_lazy(false, name, super::DEFAULT_ZONE_COLOR, function, file, line)
+        }
+
+        /// Same as [`new_dynamic_lazy`](Self::new_dynamic_lazy), drawn in
+        /// `color` (`0xRRGGBB`). [`DEFAULT_ZONE_COLOR`](super::DEFAULT_ZONE_COLOR)
+        /// leaves the color to the viewer.
+        #[doc(hidden)]
+        #[inline]
+        pub fn new_dynamic_lazy_colored(
+            name: impl FnOnce() -> String,
+            color: u32,
+            function: &str,
+            file: &str,
+            line: u32,
+        ) -> Self {
+            Self::open_lazy(false, name, color, function, file, line)
         }
 
         /// Same as [`new_dynamic_lazy`](Self::new_dynamic_lazy) but on the
@@ -271,7 +308,7 @@ mod enabled {
             file: &str,
             line: u32,
         ) -> Self {
-            Self::open_lazy(true, name, function, file, line)
+            Self::open_lazy(true, name, super::DEFAULT_ZONE_COLOR, function, file, line)
         }
 
         /// Adds a diagnostic message to this zone. Tracy shows it in the
@@ -603,6 +640,19 @@ mod enabled {
             Self
         }
 
+        /// Compile-time no-op: creates an empty colored zone guard.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub fn new_dynamic_lazy_colored(
+            _name: impl FnOnce() -> String,
+            _color: u32,
+            _function: &str,
+            _file: &str,
+            _line: u32,
+        ) -> Self {
+            Self
+        }
+
         /// Compile-time no-op: creates an empty fine-lane zone guard.
         #[inline(always)]
         pub fn new_dynamic_lazy_fine(
@@ -880,10 +930,36 @@ macro_rules! profile_init {
 /// let _zone = profile_scope!("movement");                        // static name
 /// let _zone = profile_scope!("movement", [("entities: {}", n)]); // with details
 /// let _zone = profile_scope!("system: {}", name);                // dynamic name
+/// let _zone = profile_scope!(color = 0x2F6FDF, "system: {}", name; [("tick: {}", t)]);
 /// ```
+///
+/// The `color = ...` form draws the zone in that color (`0xRRGGBB`) instead of
+/// the viewer's default, which colors zones by thread. `DEFAULT_ZONE_COLOR`
+/// keeps the viewer's choice. The color form always takes a dynamic name, so
+/// the name is still formatted only when the zone is recorded.
 #[cfg(any(feature = "profiling", feature = "profiling-minimal"))]
 #[macro_export]
 macro_rules! profile_scope {
+    (color = $color:expr, $fmt:literal $(, $fmt_arg:expr)* ; [ $( $detail:tt ),* $(,)? ]) => {{
+        let zone = $crate::profiling::TracyZone::new_dynamic_lazy_colored(
+            || format!($fmt, $($fmt_arg),*),
+            $color,
+            module_path!(),
+            file!(),
+            line!(),
+        );
+        $( $crate::profile_scope_detail!(zone, $detail); )*
+        zone
+    }};
+    (color = $color:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::profiling::TracyZone::new_dynamic_lazy_colored(
+            || format!($fmt, $($arg),*),
+            $color,
+            module_path!(),
+            file!(),
+            line!(),
+        )
+    };
     ($name:literal) => {
         $crate::profiling::TracyZone::new_static($name, module_path!(), file!(), line!())
     };
@@ -916,6 +992,24 @@ macro_rules! profile_scope {
 #[cfg(not(any(feature = "profiling", feature = "profiling-minimal")))]
 #[macro_export]
 macro_rules! profile_scope {
+    (color = $color:expr, $fmt:literal $(, $fmt_arg:expr)* ; [ $( $detail:tt ),* $(,)? ]) => {
+        $crate::profiling::TracyZone::new_dynamic_lazy_colored(
+            || format!($fmt, $($fmt_arg),*),
+            $color,
+            module_path!(),
+            file!(),
+            line!(),
+        )
+    };
+    (color = $color:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::profiling::TracyZone::new_dynamic_lazy_colored(
+            || format!($fmt, $($arg),*),
+            $color,
+            module_path!(),
+            file!(),
+            line!(),
+        )
+    };
     ($name:literal) => {
         $crate::profiling::TracyZone::new_static($name, module_path!(), file!(), line!())
     };

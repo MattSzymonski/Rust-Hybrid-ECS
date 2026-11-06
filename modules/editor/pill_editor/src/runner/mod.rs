@@ -1117,10 +1117,9 @@ impl EditorWindow {
     /// overlay stays readable instead of covering the scene with chips.
     fn publish_badges(&mut self) {
         self.badges.clear();
-        let entity_rows = {
-            let world = self.host.host_mut().engine_mut().world_mut();
-            world.entity_rows()
-        };
+        // Read every translation once, so each view projects the same list
+        // instead of reading the world again.
+        let entity_translations = self.entity_translations();
         for view in 0..self.views.len() {
             if self.views[view]
                 .as_ref()
@@ -1128,19 +1127,18 @@ impl EditorWindow {
             {
                 continue;
             }
-            let Some((width, height)) = self.scene_pixel_size(view) else {
+            // The view's camera terms, taken once for every entity it places.
+            let Some(projection) = self.screen_projection(view) else {
                 continue;
             };
+            let (width, height) = projection.size();
             let (origin_x, origin_y) = self.view_origin(view);
             let mut drawn = 0usize;
-            for row in &entity_rows {
+            for &(entity, translation) in &entity_translations {
                 if drawn >= pill_editor_core::boundary::BADGES_PER_VIEW_MAX {
                     break;
                 }
-                let Some(translation) = self.entity_translation(row) else {
-                    continue;
-                };
-                let Some((x, y)) = self.project_to_screen_in(view, translation) else {
+                let Some((x, y)) = projection.project(translation) else {
                     continue;
                 };
                 if x < 0.0 || y < 0.0 || x > width || y > height {
@@ -1150,42 +1148,56 @@ impl EditorWindow {
                     view,
                     x: (origin_x + x) / self.scale_factor,
                     y: (origin_y + y) / self.scale_factor,
-                    entity: row.entity,
+                    entity,
                 });
                 drawn += 1;
             }
         }
     }
 
-    /// One entity's world translation, read through the generic field path so
-    /// the executable needs no query of its own outside a frame.
-    fn entity_translation(&mut self, row: &pill_engine_core::EntityRow) -> Option<[f32; 3]> {
-        if !row
-            .components
-            .iter()
-            .any(|name| name.ends_with("TransformComponent"))
-        {
-            return None;
-        }
-        let world = self.host.host_mut().engine_mut().world_mut();
-        let component = world
+    /// Every live entity that carries a transform, with its world translation,
+    /// in slot order.
+    ///
+    /// The transform's component id and the `translation` field's place in its
+    /// row are resolved once, and each entity's three floats are then read
+    /// straight from its row bytes. That keeps the walk cheap for a world of
+    /// thousands of entities, which the editor repeats every frame. The field
+    /// layout is the one the generic field path reads, so the executable still
+    /// needs no query of its own outside a frame. A transform whose
+    /// `translation` is not three `f32`s yields no translations at all.
+    fn entity_translations(&mut self) -> Vec<(Entity, [f32; 3])> {
+        const TRANSLATION_BYTES: usize = 3 * std::mem::size_of::<f32>();
+        let world = self.host.host_mut().engine_mut().world();
+        let Some(component) = world
             .resolve_component_id_by_name_any(TRANSFORM_SHARED_NAME)
             .ok()
-            .flatten()?;
-        let name = world.component_registry().get_name(&component)?.to_string();
-        match world.read_component_field(row.entity, &name, "translation") {
-            Ok(FieldValue::Array(values)) => {
-                let mut translation = [0.0f32; 3];
-                for (axis, value) in values.iter().enumerate().take(3) {
-                    translation[axis] = match value {
-                        FieldValue::F32(number) => *number,
-                        _ => return None,
-                    };
-                }
-                Some(translation)
-            }
-            _ => None,
+            .flatten()
+        else {
+            return Vec::new();
+        };
+        let Some(field) = world
+            .component_field_layout(component)
+            .and_then(|fields| fields.iter().find(|field| field.name == "translation"))
+        else {
+            return Vec::new();
+        };
+        if field.type_tag != "array:f32" || field.size != TRANSLATION_BYTES {
+            return Vec::new();
         }
+        let offset = field.offset;
+        world
+            .live_entities()
+            .into_iter()
+            .filter_map(|entity| {
+                let row = world.descriptor_component_bytes(entity, component)?;
+                let bytes = row.get(offset..offset + TRANSLATION_BYTES)?;
+                let mut translation = [0.0f32; 3];
+                for (axis, axis_bytes) in bytes.chunks_exact(4).enumerate() {
+                    translation[axis] = f32::from_ne_bytes(axis_bytes.try_into().ok()?);
+                }
+                Some((entity, translation))
+            })
+            .collect()
     }
 
     /// Apply the recovery document a previous run left behind.

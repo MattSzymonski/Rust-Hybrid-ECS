@@ -2480,6 +2480,35 @@ fn entity_rows_list_live_entities_with_components() {
     assert_eq!(world.entity_component_names(a), None);
 }
 
+/// `live_entities` lists the same entities as `entity_rows`, in the same slot
+/// order, and drops a destroyed one.
+#[test]
+fn live_entities_match_entity_rows_in_slot_order() {
+    let mut world = World::new();
+    world.register_component::<Position>();
+
+    let created: Vec<Entity> = (0..5)
+        .map(|index| {
+            world
+                .create_entity()
+                .with(Position {
+                    x: index as f32,
+                    y: 0.0,
+                })
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let row_entities: Vec<Entity> = world.entity_rows().iter().map(|row| row.entity).collect();
+    assert_eq!(world.live_entities(), row_entities);
+    assert_eq!(world.live_entities(), created);
+
+    let _ = world.destroy_entity(created[2]);
+    let remaining = world.live_entities();
+    assert_eq!(remaining.len(), 4);
+    assert!(!remaining.contains(&created[2]));
+}
+
 /// `entity_component_names` includes runtime-defined (descriptor)
 /// components, and `resolve_entity_component_id` is scoped to the entity's
 /// archetype.

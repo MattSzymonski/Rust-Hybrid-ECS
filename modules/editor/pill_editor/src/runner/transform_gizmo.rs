@@ -280,21 +280,28 @@ impl EditorWindow {
     /// physical pixels. Returns `None` when the view has no window or the
     /// point is at or behind the camera.
     pub(super) fn project_to_screen_in(&self, view: usize, point: [f32; 3]) -> Option<(f32, f32)> {
+        self.screen_projection(view)?.project(point)
+    }
+
+    /// The camera and surface terms that place a world point on one scene
+    /// view, captured once so a caller projecting many points does not
+    /// recompute them per point. Returns `None` when the view has no window.
+    pub(super) fn screen_projection(&self, view: usize) -> Option<ScreenProjection> {
         let (width, height) = self.scene_pixel_size(view)?;
         let (tangent, aspect) = projection_terms(width, height);
         let camera = &self.cameras[view];
-        let eye = camera.eye();
         let forward = camera.forward();
         let right = camera.right();
-        let up = gizmo::cross(right, forward);
-        let eye_to_point = gizmo::sub(point, eye);
-        let depth = gizmo::dot(eye_to_point, forward);
-        if depth <= 1e-4 {
-            return None;
-        }
-        let ndc_x = gizmo::dot(eye_to_point, right) / (depth * tangent * aspect);
-        let ndc_y = gizmo::dot(eye_to_point, up) / (depth * tangent);
-        Some(((ndc_x + 1.0) * 0.5 * width, (1.0 - ndc_y) * 0.5 * height))
+        Some(ScreenProjection {
+            eye: camera.eye(),
+            forward,
+            right,
+            up: gizmo::cross(right, forward),
+            tangent,
+            aspect,
+            width,
+            height,
+        })
     }
 
     /// Begins a drag from a handle pick. The press pixel's ray records the
@@ -923,5 +930,46 @@ impl EditorWindow {
             .get_resource::<GizmoState>()
             .map(|state| state.settings)
             .unwrap_or_default()
+    }
+}
+
+/// One scene view's camera basis and projection terms, in the surface's
+/// physical pixels.
+///
+/// Built by [`EditorWindow::screen_projection`]. Every point a frame projects
+/// into the same view shares these terms, so they are captured once rather
+/// than recomputed for each point.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ScreenProjection {
+    eye: [f32; 3],
+    forward: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    tangent: f32,
+    aspect: f32,
+    width: f32,
+    height: f32,
+}
+
+impl ScreenProjection {
+    /// Where `point` appears on the view's surface, in physical pixels, or
+    /// `None` when it is at or behind the camera.
+    pub(super) fn project(&self, point: [f32; 3]) -> Option<(f32, f32)> {
+        let eye_to_point = gizmo::sub(point, self.eye);
+        let depth = gizmo::dot(eye_to_point, self.forward);
+        if depth <= 1e-4 {
+            return None;
+        }
+        let ndc_x = gizmo::dot(eye_to_point, self.right) / (depth * self.tangent * self.aspect);
+        let ndc_y = gizmo::dot(eye_to_point, self.up) / (depth * self.tangent);
+        Some((
+            (ndc_x + 1.0) * 0.5 * self.width,
+            (1.0 - ndc_y) * 0.5 * self.height,
+        ))
+    }
+
+    /// The surface's size, in physical pixels.
+    pub(super) fn size(&self) -> (f32, f32) {
+        (self.width, self.height)
     }
 }
