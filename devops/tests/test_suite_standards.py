@@ -5,7 +5,7 @@ that keep the shared helpers from being forked again.
 
 PROTECTS: Suites keep their run_all header, stop re-forking the core helpers, say
           why they sleep, anchor their output before they write, name project
-          directories through `core.projects`, leave the fixture set inside
+          directories through `core.projects`, leave the test project set inside
           its weight budget, and define each module-level name once.
 TIER: static
 
@@ -40,9 +40,9 @@ DESCRIPTION
                     never as a literal. A literal is how one project move
                     turned into a list of files to edit, and a stale literal
                     fails as "no such project" only when that suite runs.
-      6. budget   - the fixture set under `devops/tests/projects` stays inside
+      6. budget   - the test project set under `devops/tests/projects` stays inside
                     its weight budget and ships no file twice. The seven
-                    fixtures this set replaced weighed 37.4 MB, almost all of
+                    test projects this set replaced weighed 37.4 MB, almost all of
                     it the same maps and models copied three times, and
                     nothing measured it until an audit did.
       7. poll     - a sleep waits inside a poll loop, or the function that
@@ -135,14 +135,14 @@ def discover_module_files() -> List[Path]:
     return sorted(SUITES_DIRECTORY.glob("*.py"))
 
 
-# Rule 6's two numbers: the whole fixture set's weight, and the size below which
+# Rule 6's two numbers: the whole test project set's weight, and the size below which
 # a repeated file is not worth reporting. A small stub mesh legitimately ships in
-# more than one fixture; a map that size is how the set reached 37.4 MB.
-FIXTURE_BUDGET_MEGABYTES = 10.0
-FIXTURE_DUPLICATE_MINIMUM_BYTES = 4096
+# more than one test project; a map that size is how the set reached 37.4 MB.
+TEST_PROJECT_BUDGET_MEGABYTES = 10.0
+TEST_PROJECT_DUPLICATE_MINIMUM_BYTES = 4096
 
-# A fixture's build output, which is never counted and never committed.
-FIXTURE_BUILD_OUTPUT_NAMES = {"target", "build", "bin", "obj", ".git"}
+# A test project's build output, which is never counted and never committed.
+TEST_PROJECT_BUILD_OUTPUT_NAMES = {"target", "build", "bin", "obj", ".git"}
 
 
 # Every suite this lint covers: the same glob `run_all.py` discovers.
@@ -259,7 +259,7 @@ def anchor_findings(path: Path, text: str) -> List[str]:
 # Rule 5: a project directory is named through `core.projects`.
 #
 # Only a bare literal is reported: a quoted one-segment directory under the
-# examples root or the suite fixture. A path into a file carries another
+# examples root or the suite's test project. A path into a file carries another
 # slash and prose carries spaces, so neither is flagged.
 def project_findings(path: Path, text: str) -> List[str]:
     found = []
@@ -272,40 +272,40 @@ def project_findings(path: Path, text: str) -> List[str]:
     return found
 
 
-# Rule 6: the fixture set is weighed, and no file ships twice.
+# Rule 6: the test project set is weighed, and no file ships twice.
 #
-# Measured over what a fixture commits: its sources and its assets, never the
+# Measured over what a test project commits: its sources and its assets, never the
 # build output a run leaves behind. The duplication half only reports a file
-# large enough to matter, so a stub mesh copied between fixtures stays legal.
-def fixture_findings(
-    fixtures_root: Path = TEST_PROJECTS_ROOT,
+# large enough to matter, so a stub mesh copied between test projects stays legal.
+def project_set_findings(
+    test_projects_root: Path = TEST_PROJECTS_ROOT,
 ) -> Tuple[int, List[str]]:
     found = []
     total_bytes = 0
     owners: Dict[str, List[str]] = {}
-    for path in sorted(fixtures_root.rglob("*")):
+    for path in sorted(test_projects_root.rglob("*")):
         if not path.is_file():
             continue
-        relative = path.relative_to(fixtures_root)
-        if any(part in FIXTURE_BUILD_OUTPUT_NAMES for part in relative.parts):
+        relative = path.relative_to(test_projects_root)
+        if any(part in TEST_PROJECT_BUILD_OUTPUT_NAMES for part in relative.parts):
             continue
         size = path.stat().st_size
         total_bytes += size
-        if size < FIXTURE_DUPLICATE_MINIMUM_BYTES:
+        if size < TEST_PROJECT_DUPLICATE_MINIMUM_BYTES:
             continue
         digest = hashlib.sha1(path.read_bytes()).hexdigest()
         owners.setdefault(digest, []).append(str(relative))
     for paths in owners.values():
-        fixtures = {path.replace("\\", "/").split("/")[0] for path in paths}
-        if len(fixtures) > 1:
+        test_projects = {path.replace("\\", "/").split("/")[0] for path in paths}
+        if len(test_projects) > 1:
             found.append(
-                "the same file ships in several fixtures: " + ", ".join(sorted(paths))
+                "the same file ships in several test projects: " + ", ".join(sorted(paths))
             )
-    limit_bytes = int(FIXTURE_BUDGET_MEGABYTES * 1024 * 1024)
+    limit_bytes = int(TEST_PROJECT_BUDGET_MEGABYTES * 1024 * 1024)
     if total_bytes > limit_bytes:
         found.append(
-            "the fixture set weighs {:.2f} MB, over its {} MB budget".format(
-                total_bytes / (1024 * 1024), FIXTURE_BUDGET_MEGABYTES
+            "the test project set weighs {:.2f} MB, over its {} MB budget".format(
+                total_bytes / (1024 * 1024), TEST_PROJECT_BUDGET_MEGABYTES
             )
         )
     return total_bytes, found
@@ -352,7 +352,7 @@ def collect() -> List[Tuple[str, List[str]]]:
     editor_sources = [
         (path, text) for path, text in sources if path.name == "test_editor_egui.py"
     ]
-    measured_bytes, fixture_problems = fixture_findings()
+    measured_bytes, test_project_problems = project_set_findings()
     return [
         ("rule 1: every suite has the header run_all reads", header_findings()),
         (
@@ -372,11 +372,11 @@ def collect() -> List[Tuple[str, List[str]]]:
             [finding for path, text in sources for finding in project_findings(path, text)],
         ),
         (
-            "rule 6: the fixture set stays inside its {} MB budget "
+            "rule 6: the test project set stays inside its {} MB budget "
             "(measured {:.2f} MB)".format(
-                FIXTURE_BUDGET_MEGABYTES, measured_bytes / (1024 * 1024)
+                TEST_PROJECT_BUDGET_MEGABYTES, measured_bytes / (1024 * 1024)
             ),
-            fixture_problems,
+            test_project_problems,
         ),
         (
             "rule 7: every sleep is a poll interval or a named exception",
@@ -526,25 +526,25 @@ def self_test() -> int:
         run_all.header_field('"""\nTIER: nightly\n"""', "TIER") not in run_all.TIER_ORDER,
     )
     # Rule 6 is measured rather than text-matched, so its self test builds a
-    # fixture tree: the same asset in two fixtures is the finding, in one is not.
+    # test project tree: the same asset in two test projects is the finding, in one is not.
     with tempfile.TemporaryDirectory() as scratch:
         tree = Path(scratch)
         for name in ("native", "scene"):
             assets = tree / name / "res"
             assets.mkdir(parents=True)
-            (assets / "map.png").write_bytes(b"p" * (FIXTURE_DUPLICATE_MINIMUM_BYTES * 2))
+            (assets / "map.png").write_bytes(b"p" * (TEST_PROJECT_DUPLICATE_MINIMUM_BYTES * 2))
         expect(
-            "the same asset in two fixtures is caught",
-            len(fixture_findings(tree)[1]) == 1,
+            "the same asset in two test projects is caught",
+            len(project_set_findings(tree)[1]) == 1,
         )
         (tree / "scene" / "res" / "map.png").unlink()
-        expect("an asset in one fixture passes", fixture_findings(tree)[1] == [])
-        # The build output a run leaves behind is not the fixture's weight.
+        expect("an asset in one test project passes", project_set_findings(tree)[1] == [])
+        # The build output a run leaves behind is not the test project's weight.
         (tree / "native" / "target").mkdir()
         (tree / "native" / "target" / "big.bin").write_bytes(b"b" * 4096)
         expect(
             "build output is not counted",
-            fixture_findings(tree)[0] == FIXTURE_DUPLICATE_MINIMUM_BYTES * 2,
+            project_set_findings(tree)[0] == TEST_PROJECT_DUPLICATE_MINIMUM_BYTES * 2,
         )
     expect("the real suites pass the header rule", header_findings() == [])
     print("PASS: self test." if failures == 0 else f"FAIL: {failures} self test case(s).")

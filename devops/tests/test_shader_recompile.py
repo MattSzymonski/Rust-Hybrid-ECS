@@ -99,7 +99,7 @@ COOKED_EDITED = "0.25f"
 COOKED_TOKEN = "[assets] cooked the project's shader sources"
 REIMPORTED_TOKEN = "[assets] project shader reimported"
 RECOMPILED_TOKEN = "shader recompiled"
-# Printed by the fixture's own system on every frame, so it only appears once
+# Printed by the test project's own system on every frame, so it only appears once
 # the project initialized and the host runs its systems.
 PROJECT_ALIVE_TOKEN = "[project]"
 

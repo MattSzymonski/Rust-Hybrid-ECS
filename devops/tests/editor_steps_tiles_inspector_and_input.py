@@ -632,7 +632,7 @@ def run_tiles_inspector_and_input_steps(state: StepState) -> None:
         "the search did not narrow the rows: " + filtered.group(0)
     )
     # A level filter above the project's lines leaves none of them. `error`,
-    # not `warn`: the fixture's own `TagAlphaComponent` line is a warning, and
+    # not `warn`: the test project's own `TagAlphaComponent` line is a warning, and
     # the step is about a level nothing in the session reaches.
     begin = session.length()
     session.send("console filter error")

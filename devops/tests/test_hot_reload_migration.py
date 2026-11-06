@@ -12,9 +12,9 @@ REQUIREMENTS
 
 DESCRIPTION
     This script launches the standalone host and executes a table-driven migration
-    suite by editing the native fixture's src/lib.rs. Every scenario waits for
+    suite by editing the native test project's src/lib.rs. Every scenario waits for
     hot-reload, checks crash signals, verifies expected migration logs, optionally
-    validates migration entity counts and the fixture's value witnesses (component
+    validates migration entity counts and the test project's value witnesses (component
     values printed once per generation), and that the counter system still ticks.
     One scenario expects the reload to be REJECTED - a size-changing schema edit
     trips an engine guard - and asserts the rollback and continued ticking instead
@@ -59,7 +59,7 @@ from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario 
 # Configuration
 # =============================================================================
 
-# The migration scenarios drive the native fixture: its persistable components
+# The migration scenarios drive the native test project: its persistable components
 # and the witness systems that print them live in `src/lib.rs`.
 TEST_PROJECT_ROOT = NATIVE_PROJECT_ROOT
 PROJECT_LIB_RS = NATIVE_PROJECT_LIB_RS
@@ -67,10 +67,10 @@ PROJECT_LIB_RS = NATIVE_PROJECT_LIB_RS
 # The scenarios rewrite a persistable component's shape. A schema migration
 # while extension modules are loaded overflows the host's stack - the module
 # artifacts bring their own component registries into the same reload - so this
-# suite runs the fixture module-free and restores its settings afterwards. The
+# suite runs the test project module-free and restores its settings afterwards. The
 # reload suites, which never change a schema, keep the usual module list.
-MODULE_FREE_SETTINGS = """name: "Native Fixture"
-build_binary_name: "NativeFixture"
+MODULE_FREE_SETTINGS = """name: "Native Test Project"
+build_binary_name: "NativeTestProject"
 modules: []
 """
 PROJECT_SETTINGS_PATH = TEST_PROJECT_ROOT / "project_settings.yaml"
@@ -85,7 +85,7 @@ LINEAR_VELOCITY_MIGRATE_LOG_TOKEN = "'native::LinearVelocity' -> migrating"
 MARKER_TRAIL_MIGRATE_LOG_TOKEN = "'native::MarkerTrail' -> migrating"
 DESERIALIZE_FAILED_TOKEN = "[persistence] Failed to deserialize"
 
-# Value witnesses: the fixture prints its components once per module generation
+# Value witnesses: the test project prints its components once per module generation
 # (see the witness systems in project/src/lib.rs), so a scenario can assert that
 # migration carried VALUES across, not just entity counts. Without these, a
 # migration that silently reset every field to its default would still pass.
@@ -404,7 +404,7 @@ THRESHOLD_150 = "const THRESHOLD: u64 = 150;"
 
 
 # The scenario model and runner are shared: `core/scenario.py`. Every migration
-# scenario has the same shape - one edit to the fixture source, one reload (or
+# scenario has the same shape - one edit to the test project source, one reload (or
 # the rollback a refused one produces), a counter that must keep ticking, and
 # the migration assertions - so the table below builds them through
 # `migration_scenario` instead of repeating that shape thirteen times.
@@ -475,7 +475,7 @@ def migration_runner() -> ScenarioRunner:
 
 
 def restore_original() -> None:
-    """Restores the fixture source captured at script startup."""
+    """Restores the test project source captured at script startup."""
     if not ORIGINAL_CONTENT:
         print("  [WARN] No original content captured. Skipping restore.")
         return
@@ -528,7 +528,7 @@ def validate_witness_tokens(
     output: str,
     expected_tokens: Sequence[str],
 ) -> bool:
-    """Validates that migrated VALUES survived: the fixture's per-generation
+    """Validates that migrated VALUES survived: the test project's per-generation
     witness lines must contain every expected value string."""
     for token in expected_tokens:
         if token not in output:
@@ -551,7 +551,7 @@ def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
 
 
 def build_scenarios() -> List[Scenario]:
-    """Builds ordered migration scenarios from the fixture's current source.
+    """Builds ordered migration scenarios from the test project's current source.
 
     One edit per scenario, each applied to the source as the previous scenario
     left it: the table is one cumulative chain from the original, which is why
@@ -891,13 +891,13 @@ def run_suite(cycles: int) -> bool:
 # =============================================================================
 
 
-def build_fixture_project() -> bool:
-    """Builds the native fixture crate this suite drives.
+def build_test_project() -> bool:
+    """Builds the native test project crate this suite drives.
 
     The host itself comes from the shared `prepare_host`; this is the one
     build that is not a host posture, so it stays local.
     """
-    print("  [PREP] Building the native fixture crate...")
+    print("  [PREP] Building the native test project crate...")
     try:
         tests_project_result = subprocess.run(
             [
@@ -912,18 +912,18 @@ def build_fixture_project() -> bool:
             timeout=BUILD_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        print(f"  [FAIL] native fixture build timed out after {BUILD_TIMEOUT} seconds.")
+        print(f"  [FAIL] native test project build timed out after {BUILD_TIMEOUT} seconds.")
         return False
     except FileNotFoundError:
         print("  [FAIL] 'cargo' not found. Is Rust installed and on PATH?")
         return False
 
     if tests_project_result.returncode != 0:
-        print("  [FAIL] native fixture build failed:")
+        print("  [FAIL] native test project build failed:")
         print(tests_project_result.stderr[-2000:])
         return False
 
-    print("  [OK] native fixture built.")
+    print("  [OK] native test project built.")
     return True
 
 
@@ -980,7 +980,7 @@ def main() -> None:
     print(f"  Time scale: {args.timeout_scale}x")
     print("=" * 60)
 
-    if not prepare_host(HOST_POSTURE, args, BUILD_TIMEOUT) or not build_fixture_project():
+    if not prepare_host(HOST_POSTURE, args, BUILD_TIMEOUT) or not build_test_project():
         restore_original()
         sys.exit(1)
 

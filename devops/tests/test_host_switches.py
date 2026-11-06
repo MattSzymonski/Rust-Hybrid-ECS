@@ -105,7 +105,7 @@ RELOAD_COMPLETE_TOKEN = "hot reload complete"
 PATCH_INSTALLED_TOKEN = "patch generation installed"
 PATCHING_OFF_TOKEN = "per-function hot patching is switched off"
 ASSETS_OFF_TOKEN = "[assets] asset hot reloading is switched off"
-# Printed by the fixture's own system on every frame, so it only appears once
+# Printed by the test project's own system on every frame, so it only appears once
 # the project initialized and the host runs its systems.
 PROJECT_ALIVE_TOKEN = "[project]"
 
@@ -203,7 +203,7 @@ def scenario_defaults(arguments) -> list:
         # The asset and settings watchers start after the project loop is
         # entered, one or two lines after the liveness token the wait above
         # returns on. Wait for the watcher rather than snapshot in the window
-        # between them: how much a fixture prints while starting up decides
+        # between them: how much a test project prints while starting up decides
         # whether that snapshot happens to be wide enough, which is not a
         # property this check should depend on.
         monitor.wait_for(ASSET_WATCH_TOKEN, STARTUP_TIMEOUT_SECONDS * arguments.timeout_scale)

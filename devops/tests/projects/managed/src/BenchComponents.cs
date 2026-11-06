@@ -14,7 +14,7 @@
 
 using System.Runtime.InteropServices;
 
-namespace ManagedFixture;
+namespace ManagedTestProject;
 
 /// <summary>Two-dimensional position. Mirrors the Rust bench's `Position`.</summary>
 ///

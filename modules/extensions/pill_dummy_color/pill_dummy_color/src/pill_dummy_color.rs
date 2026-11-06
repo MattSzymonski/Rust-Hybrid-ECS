@@ -18,7 +18,7 @@
 //! The crate carries no ECS state. [`register`] is a no-op that only reports
 //! success, and it stays a plain Rust function so the same crate can also be
 //! linked statically into a monolithic build. `pill_spline` depends on it, and
-//! the managed C# fixture in `devops/tests/projects/managed` loads it as a
+//! the managed C# test project in `devops/tests/projects/managed` loads it as a
 //! module.
 
 // External crates

@@ -33,7 +33,7 @@ DESCRIPTION
     the suites define, plus every module-level string constant a
     `wait_for(...)` call passes whatever its name, and requires each one to be
     printable by a Rust string literal - in `modules/` or in the tracked
-    fixture projects, which the host also runs: verbatim, or through the
+    test projects, which the host also runs: verbatim, or through the
     `{...}` placeholders a format string carries, since most host lines are
     built at runtime:
 
@@ -331,8 +331,8 @@ def read_rust_sources() -> str:
     """
     Concatenates every first-party Rust source into one haystack.
 
-    The sources are `modules/` and the tracked fixture projects: a suite may
-    wait on a line the fixture prints, and the fixture is code the host runs.
+    The sources are `modules/` and the tracked test projects: a suite may
+    wait on a line the test project prints, and the test project is code the host runs.
     Decoding errors are replaced rather than raised so that a stray non-UTF-8
     byte in an unrelated file cannot mask a genuine contract break.
     """
@@ -342,7 +342,7 @@ def read_rust_sources() -> str:
 @lru_cache(maxsize=1)
 def rust_source_files() -> Tuple[Tuple[Path, str], ...]:
     """
-    Every first-party Rust source under `modules/` and the fixture projects.
+    Every first-party Rust source under `modules/` and the test projects.
 
     Only git-tracked files count: the host leaves hot-patch copies under
     `modules/pill_standalone_temp/` and generated `host_module_*` crates in the

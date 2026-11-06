@@ -11,7 +11,7 @@ DESCRIPTION
 
     Directory roles, all under `devops/`:
 
-      tests/       standalone pass/fail suites plus their fixture projects
+      tests/       standalone pass/fail suites plus their test projects
       core/        this package: shared code every script imports
       ci_cd/       the CI gate and the shipping builds
       tools/       builders, probes and one-off repository tools

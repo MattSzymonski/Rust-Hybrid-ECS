@@ -13,7 +13,7 @@ DESCRIPTION
     developer runs: the local checkout and the tracked official examples. The
     projects the suites drive live under `devops/tests/projects/` and are named
     by `TEST_PROJECTS_ROOT` / `TEST_PROJECT_NAMES`, so a clean checkout can run
-    the gate without an examples checkout. The functional fixture crate derives
+    the gate without an examples checkout. The functional test project crate derives
     from `TESTS_ROOT` as well.
 
     Each project is exported in two forms, because the callers need different
@@ -50,7 +50,7 @@ from .paths import MODULES_ROOT, REPOSITORY_ROOT, TESTS_ROOT
 EXAMPLES_RELATIVE_PATH = "examples/local"
 EXAMPLES_ROOT = REPOSITORY_ROOT / EXAMPLES_RELATIVE_PATH
 
-# The fixture projects the devops suites drive. They are test-owned rather than
+# The test projects the devops suites drive. They are test-owned rather than
 # examples: a suite edits their sources, asserts their log lines and reverts
 # them, and each one carries the anchors its suite needs. They live beside the
 # suites so a clean checkout can run the gate without a developer's examples
@@ -171,17 +171,17 @@ def example_project_roots() -> list[Path]:
 
 
 def test_project_roots() -> list[Path]:
-    """Returns the fixture projects the suites drive, in name order."""
+    """Returns the test projects the suites drive, in name order."""
     return [TEST_PROJECTS_ROOT / name for name in TEST_PROJECT_NAMES]
 
 
 def project_roots() -> list[Path]:
-    """Returns every project the repository ships: examples plus fixtures."""
+    """Returns every project the repository ships: examples plus test projects."""
     return example_project_roots() + test_project_roots()
 
 
 # =============================================================================
-# The native fixture: the reload, patch, migration, module and shipping anchors
+# The native test project: the reload, patch, migration, module and shipping anchors
 # =============================================================================
 
 # One project carries every anchor the mutation-heavy native suites need: the
@@ -199,7 +199,7 @@ NATIVE_PROJECT_RES = NATIVE_PROJECT_ROOT / "res"
 
 
 # =============================================================================
-# The managed fixture: the C# bridge, analyzer and mirror suites
+# The managed test project: the C# bridge, analyzer and mirror suites
 # =============================================================================
 
 MANAGED_PROJECT_ROOT = TEST_PROJECTS_ROOT / "managed"
@@ -213,7 +213,7 @@ MANAGED_PROJECT_BRIDGE_PROBE_CS = MANAGED_PROJECT_SRC / "BridgeProbe.cs"
 
 
 # =============================================================================
-# The scene fixture: the editor, picking, surface, web, asset and theme target
+# The scene test project: the editor, picking, surface, web, asset and theme target
 # =============================================================================
 
 # One small, deterministic scene carries every read-mostly anchor: one mesh
@@ -221,7 +221,7 @@ MANAGED_PROJECT_BRIDGE_PROBE_CS = MANAGED_PROJECT_SRC / "BridgeProbe.cs"
 # axis for a scripted click to reach, a committed material, a sample map the
 # asset watcher reimports, a themed UI layer, a committed render pass and an
 # editor project layer. Nothing in it is reload- or patch-specific; that is the
-# native fixture's job.
+# native test project's job.
 SCENE_PROJECT_ROOT = TEST_PROJECTS_ROOT / "scene"
 SCENE_PROJECT_PATH = host_project_path(SCENE_PROJECT_ROOT)
 SCENE_PROJECT_SRC = SCENE_PROJECT_ROOT / "src"
@@ -232,13 +232,13 @@ SCENE_PROJECT_RES = SCENE_PROJECT_ROOT / "res"
 
 
 # =============================================================================
-# The themed fixture: the UI theme, game UI and editor suites
+# The themed test project: the UI theme, game UI and editor suites
 # =============================================================================
 
-# The scene fixture ships the theme chain the suites assert: the code default is
+# The scene test project ships the theme chain the suites assert: the code default is
 # `Theme::brutalist()`, `res/ui/accent.theme` overrides the accent to `#33d17a`
 # and the heading size, and the body font is the Silkscreen face - the same
-# three-layer setup the old example drove, now inside the fixture tree so the
+# three-layer setup the old example drove, now inside the test project tree so the
 # gate does not read `examples/`.
 THEMED_PROJECT_ROOT = SCENE_PROJECT_ROOT
 THEMED_PROJECT_PATH = SCENE_PROJECT_PATH
@@ -251,10 +251,10 @@ THEMED_PROJECT_FONT = SCENE_PROJECT_RES / "fonts" / "Silkscreen-Regular.ttf"
 
 
 # =============================================================================
-# The native fixture's crate root: the components the schema scenarios rewrite
+# The native test project's crate root: the components the schema scenarios rewrite
 # =============================================================================
 
-# The migration scenarios run against the native fixture, where the witness
+# The migration scenarios run against the native test project, where the witness
 # components and their seeds live, so both families of scenarios run the same
 # build and there is no second project to keep in step. `NATIVE_PROJECT_LIB_RS`
 # is the file the native scenarios edit and whose restore settles with a

@@ -693,7 +693,7 @@ def check_example_projects_come_from_manifests() -> None:
         if directory not in directories:
             fail(f"{directory} is missing from the shipped projects")
     if "native" not in {crate.name for crate in projects}:
-        fail("the native fixture must read as package `native`")
+        fail("the native test project must read as package `native`")
     if any(not crate.manifest_path.is_file() for crate in projects):
         fail("an example project was constructed without a manifest")
 

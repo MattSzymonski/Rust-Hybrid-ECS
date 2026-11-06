@@ -142,8 +142,8 @@ def workspace_members(modules: Path) -> List[Crate]:
     return members
 
 
-# The example and fixture projects: every `<examples>/*/Cargo.toml` in the local
-# checkout, every official project the catalog names, and every fixture under
+# The example and test projects: every `<examples>/*/Cargo.toml` in the local
+# checkout, every official project the catalog names, and every test project under
 # `devops/tests/projects`. A project without a manifest is a managed-language
 # one and has no cargo tree to measure.
 #
@@ -158,7 +158,7 @@ def example_projects(repository: Path) -> List[Crate]:
     # The catalog's paths are re-rooted under `repository` and then checked
     # there, not on the real checkout: a tree that carries only what it was
     # generated with - the renderer-boundary suite's self test builds one - has
-    # neither the official examples nor the fixtures, and a path a tree does not
+    # neither the official examples nor the test projects, and a path a tree does not
     # hold is not one of its projects.
     catalog = [
         path.relative_to(REPOSITORY_ROOT) for path in OFFICIAL_EXAMPLE_PROJECTS.values()

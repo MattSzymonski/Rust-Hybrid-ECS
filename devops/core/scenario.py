@@ -103,8 +103,8 @@ class Scenario:
 # =============================================================================
 
 
-def settle_token_for_fixture_path(path: Path) -> str:
-    """The token a restore of `path` settles with, for the fixture project.
+def settle_token_for_test_project_path(path: Path) -> str:
+    """The token a restore of `path` settles with, for the test project.
 
     Restoring a project file reloads the project; restoring a module file
     reloads the module, whose reload cascades into the project's own reload
@@ -129,7 +129,7 @@ class ScenarioRunner:
     reload_timeout: float = RELOAD_TIMEOUT
     settle_timeout: float = SETTLE_TIMEOUT
     stability_sleep: float = STABILITY_SLEEP
-    restore_settle_token: Callable[[Path], str] = settle_token_for_fixture_path
+    restore_settle_token: Callable[[Path], str] = settle_token_for_test_project_path
 
 
 # =============================================================================

@@ -1,4 +1,4 @@
-# Project settings for the managed fixture.
+# Project settings for the managed test project.
 #
 # One project carries what the C# suites need: the bridge surface (components,
 # a resource, systems, asset imports), the extension mirrors the bridge asserts,
@@ -9,11 +9,11 @@
 # file base and must contain only letters, digits and underscores. Both are
 # required. `modules` is the extension list, in load order.
 
-name: "Managed Fixture"
-build_binary_name: "ManagedFixture"
+name: "Managed Test Project"
+build_binary_name: "ManagedTestProject"
 version: "0.1.0"
 author: "Matt Szymonski"
-description: "The C# fixture: bridge surface, extension mirrors and the gated iteration benchmark."
+description: "The C# test project: bridge surface, extension mirrors and the gated iteration benchmark."
 
 modules:
   - "pill_spline"

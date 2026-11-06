@@ -324,7 +324,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
         # The shipping posture type-checks against a *generated* bundle, and the
         # tracked one is the project-agnostic stub that deliberately refuses to
         # compile, so a bare `cargo check` here fails on any clean tree. The
-        # gate's own step generates the bundle from the fixture and puts the
+        # gate's own step generates the bundle from the test project and puts the
         # stub back afterwards, which is the only way this check means anything.
         selected.append(verify_check("check-shipping", "runtime changed"))
         selected.append(suite_check("test_shipping_smoke.py", "runtime changed"))

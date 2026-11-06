@@ -114,7 +114,7 @@ pub struct Spline {
     /// How many leading entries of `control_points` are in use.
     pub control_point_count: u32,
     /// A scalar that only [`Self::default`] sets: no method here reads it, and
-    /// the C# fixture copies the value so a spline built in managed code
+    /// the C# test project copies the value so a spline built in managed code
     /// matches the Rust default.
     pub elo: f32,
 }

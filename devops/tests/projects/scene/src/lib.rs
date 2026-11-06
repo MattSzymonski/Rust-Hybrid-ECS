@@ -1,4 +1,4 @@
-//! The fixture scene: a handful of fixed entities, one mesh drawn three times
+//! The scene test project: a handful of fixed entities, one mesh drawn three times
 //! and a themed UI layer, for the editor, picking, surface, web, asset and
 //! theme suites.
 //!

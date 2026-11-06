@@ -91,7 +91,7 @@ UNSHARED_ATTRIBUTE = "#[pill(persistable)]"
 
 # The project must load `pill_spline` as a module *and* link it directly, which
 # is exactly the arrangement that produces two `TypeId`s. `devops/tests/projects/native`
-# does both, so this suite drives it rather than the fixture project.
+# does both, so this suite drives it rather than the test project.
 TEST_PROJECT_SETTINGS = """\
 name: "Shared Identity Test"
 build_binary_name: "SharedIdentityTest"
@@ -807,7 +807,7 @@ def scenario_a_shared_component_survives_a_module_reload() -> bool:
     """A shared component's rows survive a real DLL swap.
 
     The combination nothing else covers. `test_hot_reload_suite.py` reloads
-    `pill_spline` against the fixture project, which does not link the crate,
+    `pill_spline` against the test project, which does not link the crate,
     so only one binary registers `Spline`. Here the project links it as well,
     so the reload makes BOTH binaries re-register the same shared component
     against a column that already holds rows.

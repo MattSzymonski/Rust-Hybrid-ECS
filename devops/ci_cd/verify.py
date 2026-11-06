@@ -435,7 +435,7 @@ STEPS: List[Step] = [
     ),
     # A resource that declares its layout: kept across an edit to a file it does
     # not declare, dropped through the retiring image and rebuilt when the file
-    # its layout lives in changes. The fixture's own drop line is what proves
+    # its layout lives in changes. The test project's own drop line is what proves
     # the old value was released rather than leaked. A host-tier suite, so it
     # runs before the editor lane's build.
     Step(

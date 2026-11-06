@@ -112,7 +112,7 @@ EXCLUDED_DIRECTORY_NAMES = {
 
 # The repository-root `local/` is gitignored scratch - experiment labs, notes,
 # one-off probes - and not engine source. It is matched at the top level only:
-# the game projects under `examples/` and the suites' own fixtures under
+# the game projects under `examples/` and the suites' own test projects under
 # `devops/tests/projects/` are linted like any other project's. Excluding the
 # root here rather than in one caller is what keeps a bare run and a
 # `--root modules` run in agreement.
@@ -996,7 +996,7 @@ def is_reloadable_source(display_path: str) -> bool:
     parts = display_path.split("/")
     if any(part in RELOADABLE_PATH_PARTS for part in parts):
         return True
-    # Every example and fixture project reloads, whichever root a checkout keeps
+    # Every example and test project reloads, whichever root a checkout keeps
     # it under: the official groups, the local-only checkout, and the suites'
     # own projects under `devops/tests/projects`.
     if parts and parts[0] == "examples":
@@ -1072,7 +1072,7 @@ def check_colour_literals(
 # Check - log calls follow the logging guide
 # =============================================================================
 
-# Log calls are linted only under `modules/`: a fixture or example project
+# Log calls are linted only under `modules/`: a test project or example project
 # logs on its own `target: "project"`, which the guide asks of projects.
 LOG_CALL_AREA = "modules/"
 # A `tracing` (or `pill_core`) log macro, with or without its path. `log::`
@@ -2091,7 +2091,7 @@ def self_test() -> int:
             1,
         ),
         (
-            "a fixture project's string target passes",
+            "a test project's string target passes",
             "devops/tests/projects/native/src/lib.rs",
             'pill_engine::tracing::info!(target: "project", "counter tick");\n',
             0,

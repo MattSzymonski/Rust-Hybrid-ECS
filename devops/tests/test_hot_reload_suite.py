@@ -94,7 +94,7 @@ from core.scenario import (  # noqa: E402
     ScenarioPhase,
     ScenarioRunner,
     run_scenario,
-    settle_token_for_fixture_path,
+    settle_token_for_test_project_path,
 )
 
 # =============================================================================
@@ -105,7 +105,7 @@ SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "pill_spline" / "s
 
 # A module the project does not link. Its persistable component is therefore
 # declared by this artifact alone, which makes it the only subject in the
-# fixture a forgotten type can be dropped for: `pill_spline`'s `Spline` is
+# test project a forgotten type can be dropped for: `pill_spline`'s `Spline` is
 # `#[pill(shared)]` and the project registers it from its own copy, so that
 # column is the project's to keep (see `peer_component_names`).
 PILL_TEST_RS = MODULES_ROOT / "extensions" / "pill_test" / "pill_test" / "src" / "pill_test.rs"
@@ -165,7 +165,7 @@ PROBE_MIDPOINT_PATTERN = re.compile(r"midpoint \((-?[0-9.]+), (-?[0-9.]+)\)")
 # this id is what must not change across a reload.
 PROBE_ID_PATTERN = re.compile(r"entityid ([0-9a-f]{32})")
 
-# Printed by the fixture project's one-time `init`, and by nothing else. A
+# Printed by the test project's one-time `init`, and by nothing else. A
 # process must reach that entry point exactly once: a reload repeats the
 # artifact's registration half and never its seeding, so a second occurrence
 # means the world was seeded twice.
@@ -318,7 +318,7 @@ pub fn register(engine: &mut Engine) -> u32 {
 # --- pill_test module edits (whole file, applied from the original source) ----
 
 # The module declares `ModuleTest`, a persistable component no other artifact
-# in the fixture links, and seeds `MODULE_TEST_ENTITY_COUNT` entities carrying
+# in the test project links, and seeds `MODULE_TEST_ENTITY_COUNT` entities carrying
 # it. This stub generation declares nothing at all, which is the one way to
 # make a component type vanish from the world's point of view: dropping the
 # derive alone would leave the rest of the crate querying the type, and a
@@ -707,7 +707,7 @@ def session_settle_token(path: Path) -> str:
     """
     if path == PILL_TEST_RS:
         return PILL_TEST_RELOAD_TOKEN
-    return settle_token_for_fixture_path(path)
+    return settle_token_for_test_project_path(path)
 
 
 def session_runner() -> ScenarioRunner:
@@ -732,7 +732,7 @@ def session_a_scenarios(_monitor: OutputMonitor) -> Sequence[Scenario]:
 
 
 def validate_project_init_ran_once(output: str) -> bool:
-    """The fixture's project `init` must run once per process, not per reload.
+    """The test project's `init` must run once per process, not per reload.
 
     The marker is printed by that one-time entry point itself, not by a system,
     so it counts how often the host reached the entry point: a reload repeats
@@ -840,7 +840,7 @@ def run_session(
                 break
 
         if session_passed:
-            # The scenarios reloaded the project and both modules; the fixture's
+            # The scenarios reloaded the project and both modules; the test project's
             # one-time entry point must still have run exactly once.
             if not validate_project_init_ran_once(monitor.output_since(0)):
                 session_passed = False

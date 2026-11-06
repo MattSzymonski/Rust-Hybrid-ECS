@@ -273,7 +273,7 @@ def run_resources_arrays_and_meshes_steps(state: StepState) -> None:
 
     # The pick: by path, through the recorded step the picker queues. The
     # mesh is not loaded before this, so the step loads it - `cube.obj` is the
-    # second mesh the fixture ships and no entity draws.
+    # second mesh the test project ships and no entity draws.
     begin = session.length()
     session.send(
         "edit set {} MeshRendererComponent mesh models/cube.obj".format(mesh_entity)

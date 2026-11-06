@@ -109,7 +109,7 @@ def check_root(root: Path) -> List[str]:
 
 
 def default_roots() -> List[Path]:
-    """Every example and fixture project's `res` directory."""
+    """Every example and test project's `res` directory."""
     return sorted(
         root / "res" for root in project_roots() if (root / "res").is_dir()
     )

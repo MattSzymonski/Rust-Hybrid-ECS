@@ -26,7 +26,7 @@ asserts on it.
 ## tests/
 
 Pass/fail suites for the hot-reload and persistence architecture, plus the
-`project/` Rust fixture crate they hot-reload against. Each runs standalone:
+`project/` Rust test project they hot-reload against. Each runs standalone:
 
 ```powershell
 # Host-driving regression suites
@@ -34,9 +34,9 @@ python devops/tests/test_hot_reload_suite.py
 python devops/tests/test_hot_reload_migration.py --cycles 2
 python devops/tests/test_csharp_bridge.py
 python devops/tests/test_ui_theme.py            # the UI theme pipeline, `pills_rust`
-python devops/tests/test_render_chains.py       # a committed .pipeline runs the frame, the native fixture
-python devops/tests/test_shader_recompile.py    # an edited project .hlsl reaches the GPU, the native fixture
-python devops/tests/test_resource_layout_fingerprint.py  # a declared resource is kept, dropped or rebuilt, the native fixture
+python devops/tests/test_render_chains.py       # a committed .pipeline runs the frame, the native test project
+python devops/tests/test_shader_recompile.py    # an edited project .hlsl reaches the GPU, the native test project
+python devops/tests/test_resource_layout_fingerprint.py  # a declared resource is kept, dropped or rebuilt, the native test project
 python devops/tests/test_module_resource_assert.py  # a module's declared resource is missing
 python devops/tests/test_shipping_smoke.py
 python devops/tests/test_web_smoke.py          # browser build in headless Chrome/Edge

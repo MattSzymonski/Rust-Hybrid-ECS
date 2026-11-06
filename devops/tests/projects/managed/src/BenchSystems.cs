@@ -27,7 +27,7 @@ using System.Diagnostics;
 // [EcsSystem] attribute - lives in this namespace.
 using TracyLive;
 
-namespace ManagedFixture;
+namespace ManagedTestProject;
 
 // =============================================================================
 // Configuration

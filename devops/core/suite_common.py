@@ -131,7 +131,7 @@ HOST_EXE = executable_name("pill_standalone")
 # host went quiet.
 #
 # THE TRAP. Most tokens below are printed by `pill_development_host`, which nobody edits
-# casually. A few come from the native fixture's project and its `pill_spline`
+# casually. A few come from the native test project and its `pill_spline`
 # module - the files the whole hot-reload demo invites you to type into: the
 # module-register line, the project probe's "N spline(s)" and midpoint. Editing
 # those strings breaks these suites with a "Missing required token", or a
@@ -147,7 +147,7 @@ HOST_EXE = executable_name("pill_standalone")
 STARTUP_TOKEN = "Entering project loop"
 MODULE_LOADED_TOKEN = "module DLL loaded successfully"
 ANALYTICS_REPORT_TOKEN = "BUILD / LINK / HOT-RELOAD ANALYTICS"
-# The native fixture's package name, taken from its directory (the two agree by
+# The native test project's package name, taken from its directory (the two agree by
 # convention), so a rename does not silently strand the reload tokens.
 NATIVE_PROJECT_PACKAGE = NATIVE_PROJECT_ROOT.name
 RELOAD_PROJECT_TOKEN = f"| module={NATIVE_PROJECT_PACKAGE}"
@@ -693,7 +693,7 @@ def has_crash_signals(output: str) -> bool:
 # =============================================================================
 
 # Every script that drives `pill_standalone` kills leftover hosts, builds into
-# the shared `modules/target` and edits shared fixture sources, so two of them
+# the shared `modules/target` and edits shared test project sources, so two of them
 # in one window fight over all three. That was paid for once already: a
 # migration scenario looked flaky until the cause turned out to be a second
 # suite started in parallel, each one's `kill_stale_hosts` killing the other's
@@ -910,7 +910,7 @@ EDITOR_SOURCE_ROOTS = HOST_SOURCE_ROOTS + (
 # The images a `pill_editor` launch resolves beside its executable. Every cargo
 # artifact of this workspace is named `pill_*`, which is what tells them from the
 # images beside them that no build of this workspace writes: the std dylib a
-# build script stages, and the fixture modules other suites build.
+# build script stages, and the test project DLLs other suites build.
 EDITOR_LOAD_SET_GLOB = "pill_*.dll"
 
 # Directories under a source root that are not build inputs: cargo's own
@@ -1185,7 +1185,7 @@ def launch_process(
     do with what it tests - so this is correctness, not tolerance.
 
     Takes the host lock before launching: a process that owns a host owns the
-    shared build directories and fixture sources too.
+    shared build directories and test project sources too.
 
     Automation turns on the host's cargo `--timings` breakdown here, once for
     every suite. The host keeps `--timings` opt-in because it costs build

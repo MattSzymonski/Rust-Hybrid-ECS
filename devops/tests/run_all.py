@@ -36,7 +36,7 @@ DESCRIPTION
     its own.
 
     A suite that fails stops the run by default, because each one edits shared
-    fixture sources and a later suite's result is not trustworthy while an
+    test project sources and a later suite's result is not trustworthy while an
     earlier one left the tree mid-edit. `--keep-going` runs the rest anyway.
 
     `--catalogue` prints the suite table with each suite's last recorded

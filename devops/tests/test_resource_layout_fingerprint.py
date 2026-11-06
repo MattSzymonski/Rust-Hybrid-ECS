@@ -19,7 +19,7 @@ DESCRIPTION
     record, and a reload drops the value whose fingerprint changed so the module
     rebuilds it.
 
-    The fixture project carries the witness for exactly this
+    The test project carries the witness for exactly this
     (`devops/tests/projects/native/src/layout_witness.rs`): a resource holding a
     heap payload, which prints one line when it is inserted and one when it is
     dropped, and whose declaration names its own file as its only source. The
@@ -86,7 +86,7 @@ EDITED_BUILD_VALUE = "const WITNESS_BUILD_VALUE: u32 = 2;"
 UNDECLARED_FILE = SOURCE_DIRECTORY / "simulation_time.rs"
 UNDECLARED_EDIT = "\n// layout-fingerprint suite: an edit the witness does not declare\n"
 
-# Host and fixture log lines this suite asserts on.
+# Host and test project log lines this suite asserts on.
 RELOAD_STARTED_TOKEN = "building project module"
 RELOAD_COMPLETE_TOKEN = "hot reload complete"
 # The host's own "everything is loaded and watched" line. Every edit below waits
@@ -99,7 +99,7 @@ LAYOUT_CHANGED_TOKEN = "resource layout changed"
 WITNESS_INSERTED_TOKEN = "[test] layout witness inserted"
 WITNESS_DROPPED_TOKEN = "[test] layout witness dropped"
 
-# What the fixture prints for the value it was built with, before and after the
+# What the test project prints for the value it was built with, before and after the
 # edit that changes the witness's layout.
 DROPPED_ORIGINAL_PAYLOAD = "payload=layout-witness-1"
 INSERTED_REBUILT_VALUE = "build_value=2"

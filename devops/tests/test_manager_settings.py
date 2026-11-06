@@ -16,7 +16,7 @@ DESCRIPTION
     step with it: created from the document defaults when missing, applied after
     the project loads, and re-applied when the file's bytes change.
 
-    The fixture project carries the subject for this
+    The test project carries the subject for this
     (`devops/tests/projects/native/src/settings_probe.rs`): a manager with three
     knobs whose applier prints what it was asked to apply. One host run covers
     the four behaviours:
@@ -35,7 +35,7 @@ DESCRIPTION
          the manager and by the host, and the manager keeps what it had.
 
     The `res/settings` directory the suite caused is removed again, so the
-    fixture is left byte-identical.
+    test project is left byte-identical.
 
 USAGE
   python devops/tests/test_manager_settings.py [--timeout-scale S] [--skip-build]
@@ -79,7 +79,7 @@ RES_DIRECTORY = PROJECT_ROOT / "res"
 SETTINGS_DIRECTORY = RES_DIRECTORY / "settings"
 SETTINGS_FILE = SETTINGS_DIRECTORY / "fixture_manager.fixture_settings"
 
-# The declared default document, as the fixture's document spells it in JSON.
+# The declared default document, as the test project's document spells it in JSON.
 DEFAULT_ENABLED = '"enabled": true'
 DEFAULT_GAIN = '"gain": 1.0'
 
@@ -93,7 +93,7 @@ REFUSED_GAIN = '"gain": -1.0'
 RELOAD_SOURCE = SOURCE_DIRECTORY / "simulation_time.rs"
 RELOAD_EDIT = "\n// manager-settings suite: an edit that only reloads the project\n"
 
-# Host and fixture log lines this suite asserts on.
+# Host and test project log lines this suite asserts on.
 CREATED_TOKEN = "[settings] created the manager settings asset"
 APPLIED_TOKEN = "[settings] applied manager settings"
 REFUSED_TOKEN = "[settings] refused manager settings"
@@ -189,7 +189,7 @@ def check_live_edit(text: str) -> list:
 
 
 def main() -> int:
-    """Runs the host, drives the four scenarios, and restores the fixture."""
+    """Runs the host, drives the four scenarios, and restores the test project."""
     parser = argparse.ArgumentParser(
         description="Check that a manager's settings file is created and applied."
     )
