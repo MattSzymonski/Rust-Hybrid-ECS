@@ -21,6 +21,9 @@ modules/pill_standalone_temp/
 # Captured run output.
 *.log
 
+# Downloaded packages and installers; nothing here is part of the source tree.
+*.deb
+
 # Host-generated workspace members. The tracked READMEs keep their member
 # globs from matching nothing.
 modules/extensions/*/generated/

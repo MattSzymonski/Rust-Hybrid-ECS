@@ -111,6 +111,19 @@ bytemuck = { version = "1", features = [
     "wasm_simd",
 ] }
 ahash = { version = "0.8", features = ["no-rng", "serde"] }
+# `bitflags` and `miniz_oxide` joined on 2026-11-06, from the same incident: a
+# windowed host and a module build resolved them differently and every module
+# failed to load on Linux with `undefined symbol` (the diagnosis then named the
+# two `libpill_core.so` builds). `bitflags/serde` comes from the UI/renderer
+# stack the host links and a module build does not; `miniz_oxide/simd` is
+# reached from `miette` -> `backtrace`, and only the host's graph asked for it.
+# Both are portable, so they are pinned everywhere. `simd-adler32` is the
+# optional dependency `miniz_oxide/simd` turns on: `miniz_oxide` asks for it
+# with `default-features = false`, while the host's graph asks for it with its
+# defaults, so it is pinned with them too.
+bitflags = { version = "2", features = ["serde"] }
+miniz_oxide = { version = "0.8", features = ["simd"] }
+simd-adler32 = "0.3"
 crossbeam-utils = "0.8"
 either = { version = "1", features = ["std", "use_std"] }
 libm = { version = "0.2", features = ["arch"] }
@@ -163,6 +176,30 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tracing-appender = "0.2"
 pollster = "0.4"
+
+# The Unix half of the feature pin, added on 2026-11-06 for the Linux-only
+# drift that made every module fail to load with `undefined symbol`.
+#
+# A module build contains neither the renderer stack nor `nix`, while the host
+# contains both. `nix` - which `gilrs-core` pulls in only on
+# linux/dragonfly/freebsd - turns on `libc/extra_traits`, and `nix`/`terminal_size`
+# turn on most of `rustix`; `terminal_size` reaches this crate through
+# `miette`. Those features change the `-C metadata` of `libc`, `getrandom`,
+# `ahash`, `miette`, `pill_core` and `pill_engine_core`, so the module's imports
+# named symbols the host's copies do not export. Naming the union here makes
+# every Unix posture resolve the same build. None of these crates is used
+# directly.
+libc = { version = "0.2", features = ["extra_traits"] }
+rustix = { version = "1", features = [
+    "event",
+    "fs",
+    "net",
+    "pipe",
+    "process",
+    "shm",
+    "system",
+    "time",
+] }
 
 # The platform layer on the web: `performance.now()`/`Date.now()` for the
 # clock, the browser console for logs, the browser's event loop for futures.

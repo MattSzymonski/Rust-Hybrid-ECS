@@ -392,15 +392,17 @@ pub enum LibraryError {
     /// Cargo puts the features a dependency resolved into the `-C metadata` of
     /// the crate that uses it, and that hash is part of every symbol name
     /// `pill_core` exports. Two builds that resolved different feature sets
-    /// therefore produce two `pill_core.dll` files with different symbols, and
-    /// an artifact built against one cannot load against the other. Windows
-    /// reports that as `LoadLibrary` error 127, "The specified procedure could
-    /// not be found", which names neither the dylib nor the feature.
+    /// therefore produce two copies of the dylib with different symbols, and an
+    /// artifact built against one cannot load against the other. Neither loader
+    /// names the cause: Windows reports `LoadLibrary` error 127, "The specified
+    /// procedure could not be found", and a Unix loader reports
+    /// `undefined symbol: <one mangled name>`. Both name neither the dylib nor
+    /// the feature that moved.
     ///
-    /// Copying the matching dylib beside the artifact does not help. The loader
-    /// uses the copy already mapped in the process, whatever directory a new
-    /// one sits in, and the host maps `pill_core.dll` before it builds
-    /// anything.
+    /// Copying the matching dylib beside the artifact does not help on its own.
+    /// The loader uses the copy already mapped in the process, whatever
+    /// directory a new one sits in, and the host maps the engine dylibs before
+    /// it builds anything.
     #[message(
         "native library for ",
         name_style(subject),
@@ -410,8 +412,10 @@ pub enum LibraryError {
         " and the artifact links ",
         name_style(module_engine),
         ". The two builds resolved different dependency graphs, which changes ",
-        "every exported symbol name; the usual cause is a headless host against ",
-        "a project that links the renderer. Either run the host with the ",
+        "every exported symbol name. One build contains a crate the other does ",
+        "not, and that crate enables a feature on a dependency of the engine: a ",
+        "headless host against a project that links the renderer, or a windowed ",
+        "host whose module build has no renderer. Either run the host with the ",
         "feature set the project implies (`--features rendering` for the ",
         "renderer), or build the host and the project in one cargo invocation ",
         "so both resolve the same graph"
@@ -423,13 +427,14 @@ pub enum LibraryError {
     },
 
     /// A named import the module needs is not exported by the copy of the
-    /// imported DLL the loader would use.
+    /// imported dylib the loader would use.
     ///
-    /// Windows reports a missing named import as `LoadLibrary` error 127,
-    /// "The specified procedure could not be found", naming neither the DLL
-    /// nor the symbol. Comparing the module's import table with the export
-    /// table of each candidate copy says which symbol is missing and which
-    /// copy was looked at.
+    /// A loader names neither the dylib nor the symbol: Windows reports a
+    /// missing named import as `LoadLibrary` error 127, "The specified procedure
+    /// could not be found", and a Unix loader reports
+    /// `undefined symbol: <name>` for one symbol only. Comparing the module's
+    /// import table with the export table of each candidate copy says which
+    /// symbol is missing and which copy was looked at.
     #[message(
         "native library for ",
         name_style(subject),

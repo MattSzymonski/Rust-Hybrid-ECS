@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 // External crates
 use pill_engine::{
-    pill_project, system, AssetLoader, AssetManager, Engine, Handle, Query, Res, SystemError, Time,
+    pill_hot, pill_project, system, AssetLoader, AssetManager, Engine, Handle, Query, Res, SystemError, Time,
     World,
 };
 use pill_master_renderer_data::{
@@ -39,7 +39,7 @@ const CUBE_MESH_PATH: &str = "models/cube.obj";
 const CUBE_MATERIAL_PATH: &str = "materials/cube.material";
 
 /// Spin speed around X, Y and Z, in radians per second.
-const SPIN_RATES_RADIANS_PER_SECOND: [f32; 3] = [0.6, 1.0, 0.3];
+pub const SPIN_RATES_RADIANS_PER_SECOND: [f32; 3] = [0.6, 1.0, 0.3];
 
 /// Where the camera stands: on +Z, looking down -Z at the cube.
 const CAMERA_TRANSLATION: [f32; 3] = [0.0, 0.0, 5.0];
@@ -169,6 +169,7 @@ fn create_scene(
 ///
 /// The rotation is scaled by the time the frame took, so the spin speed does
 /// not depend on the frame rate.
+#[pill_hot]
 #[system(name = "spin_cube")]
 fn spin_cube_system(
     time_resource: Res<Time>,
@@ -177,7 +178,7 @@ fn spin_cube_system(
     let Some(frame_time) = time_resource.get() else {
         return Ok(());
     };
-    let delta_seconds = frame_time.delta_seconds();
+    let delta_seconds = frame_time.delta_seconds() * 1.0;
     let [x, y, z] = SPIN_RATES_RADIANS_PER_SECOND;
     let frame_rotation = glam::Quat::from_euler(
         glam::EulerRot::XYZ,
