@@ -164,7 +164,7 @@ impl pill_engine::SettingsAssetManager for PhysicsManager {
             max_substeps = settings.max_substeps,
             interpolate,
             debug_draw,
-            "[physics] settings applied"
+            "[settings] physics settings applied"
         );
         SettingsOutcome::Applied
     }

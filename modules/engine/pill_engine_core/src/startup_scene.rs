@@ -116,7 +116,7 @@ fn load_startup_scene(engine: &mut Engine, path: &str) -> Result<SceneLoad, Stri
         components = scene_load.components,
         unknown_components = scene_load.unknown_components.len(),
         unresolved_references = scene_load.unresolved_references,
-        "[engine] startup scene loaded"
+        "startup scene loaded"
     );
     Ok(scene_load)
 }
