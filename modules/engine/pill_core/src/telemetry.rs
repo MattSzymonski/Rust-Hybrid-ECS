@@ -425,8 +425,8 @@ where
         }
         // A message with a line break is a block (see `log_block`): its first
         // line is the heading, which stays on the prefix line as the message,
-        // and the body starts on the next line at the left edge. Wide tables
-        // and trees then keep their full width. The block's closing line
+        // and the body starts on the next line behind the `│ ` gutter. Wide
+        // tables and trees then keep their full width. The block's closing line
         // breaks are dropped, so no empty line follows it.
         let (heading, body) = match visitor.message.split_once('\n') {
             Some((heading, body)) => (heading, Some(body.trim_end_matches(['\n', '\r']))),
@@ -452,8 +452,13 @@ where
                 write!(writer, "  {location}")?;
             }
         }
+        // Every body line opens with a gutter in the timestamp's color, so a
+        // reader sees which lines belong to the block above them.
         if let Some(body) = body.filter(|body| !body.is_empty()) {
-            write!(writer, "\n{body}")?;
+            let gutter = paint(accepts_ansi, BLOCK_GUTTER, |text| text.dimmed());
+            for body_line in body.lines() {
+                write!(writer, "\n{gutter}{body_line}")?;
+            }
         }
         writeln!(writer)?;
         Ok(())
@@ -951,12 +956,13 @@ pub enum TelemetryError {
 /// The formatter prints a message that contains a line break as a block: the
 /// heading stays on the first line as the message, after the time, level and
 /// target and before the fields, and the remaining lines follow at the left
-/// edge. The string ends with a line break, which the formatter drops, so the
-/// next entry follows directly:
+/// edge, each behind a `│ ` gutter in the timestamp's color. The string ends
+/// with a line break, which the formatter drops, so the next entry follows
+/// directly:
 ///
 /// ```text
 /// [21:51:45:003] INFO  engine::hot_reload  Modules to build: | total=1
-/// 1. pill_spline  extension
+/// │ 1. pill_spline  extension
 /// ```
 ///
 /// Pass the result to any logging macro: `info!(target: ..., "{}", block)`.
@@ -1048,6 +1054,9 @@ pub fn strip_color_codes(text: &str) -> String {
     }
     plain
 }
+
+/// The prefix every body line of a block carries, drawn in the timestamp's color.
+const BLOCK_GUTTER: &str = "│ ";
 
 /// The column width of the level, padded to the widest name (`ERROR`, `DEBUG`).
 const LEVEL_WIDTH: usize = 5;
@@ -1241,13 +1250,13 @@ mod tests {
         let output = captured.lock().unwrap().clone();
         assert!(!output.contains('\u{1b}'), "{output}");
         assert!(
-            output.contains("Modules to build:\n1. pill_spline  extension"),
+            output.contains("Modules to build:\n│ 1. pill_spline  extension"),
             "{output}"
         );
     }
 
     /// A multi-line message logs as a block: the heading on the prefix line
-    /// before the fields, then the body from the left edge, with no empty line
+    /// before the fields, then the body behind its gutter, with no empty line
     /// after it.
     #[test]
     fn terminal_formatter_lays_out_a_multi_line_block() {
@@ -1277,8 +1286,8 @@ mod tests {
             lines[0].starts_with("INFO  engine::hot_reload  Modules to build: | total=2"),
             "{output}"
         );
-        assert_eq!(lines[1..], ["1. pill_spline", "2. project"]);
-        assert!(output.ends_with("2. project\n"), "{output:?}");
+        assert_eq!(lines[1..], ["│ 1. pill_spline", "│ 2. project"]);
+        assert!(output.ends_with("│ 2. project\n"), "{output:?}");
     }
 
     /// Render one event through the terminal formatter with no timestamps and
@@ -1316,7 +1325,7 @@ mod tests {
             lines[0].starts_with("INFO  engine::system  system specs"),
             "{output}"
         );
-        assert_eq!(lines[1..], ["CPU: test", "Cores: 4"], "{output}");
+        assert_eq!(lines[1..], ["│ CPU: test", "│ Cores: 4"], "{output}");
     }
 
     /// A coloured heading reaches a plain layer as plain text on the prefix
@@ -1336,7 +1345,7 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains('\u{1b}'), "{output:?}");
-        assert_eq!(lines[1..], ["build=1ms"], "{output}");
+        assert_eq!(lines[1..], ["│ build=1ms"], "{output}");
     }
 
     /// A message that starts with a line break has no heading: the prefix
@@ -1351,7 +1360,7 @@ mod tests {
             lines[0].starts_with("INFO  engine::ecs  rows=2"),
             "{output}"
         );
-        assert_eq!(lines[1..], ["first", "second"], "{output}");
+        assert_eq!(lines[1..], ["│ first", "│ second"], "{output}");
     }
 
     /// The message is separated from its fields, the source location appears

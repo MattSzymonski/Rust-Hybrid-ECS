@@ -285,9 +285,9 @@ impl Runtime {
         // and level the project's `logging:` settings control.
         info!(
             target: telemetry_target::ENGINE,
-            "{:.0} FPS | {} entities",
-            fps,
-            entity_count
+            fps = %format_args!("{fps:.0}"),
+            entity_count,
+            "Heartbeat",
         );
     }
 

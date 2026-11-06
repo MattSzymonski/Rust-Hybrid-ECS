@@ -200,7 +200,7 @@ every time:
    small tail instead and are not echoed. Otherwise they would push the reload
    lines out of the buffer.
 7. **Run the scenarios.** Each scenario edits a file, waits for a log token
-   (`[analytics] reload project`, `extension hot reload complete`, ...), then
+   (`| module=project | `, `extension hot reload complete`, ...), then
    checks the output since the edit: required tokens present, forbidden tokens
    absent, and no crash signal (`panicked at`, `STATUS_ACCESS_VIOLATION`).
 8. **Put the file back between scenarios** with `restore_one`, and wait for the

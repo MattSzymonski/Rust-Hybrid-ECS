@@ -208,7 +208,7 @@ def project_reload_token() -> str:
     """The analytics line the host prints when this project finishes reloading."""
     manifest = (PROJECT_ROOT / "Cargo.toml").read_text(encoding="utf-8")
     package_name = re.search(r'^name\s*=\s*"([^"]+)"', manifest, re.MULTILINE).group(1)
-    return f"[analytics] reload {package_name} "
+    return f"| module={package_name} | "
 
 
 def move_pair(source: Path, target: Path) -> None:

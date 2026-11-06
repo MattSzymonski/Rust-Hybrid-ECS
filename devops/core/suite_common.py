@@ -150,8 +150,8 @@ ANALYTICS_REPORT_TOKEN = "BUILD / LINK / HOT-RELOAD ANALYTICS"
 # The native fixture's package name, taken from its directory (the two agree by
 # convention), so a rename does not silently strand the reload tokens.
 NATIVE_PROJECT_PACKAGE = NATIVE_PROJECT_ROOT.name
-RELOAD_PROJECT_TOKEN = f"[analytics] reload {NATIVE_PROJECT_PACKAGE}"
-RELOAD_MODULE_TOKEN = "[analytics] reload pill_spline"
+RELOAD_PROJECT_TOKEN = f"| module={NATIVE_PROJECT_PACKAGE}"
+RELOAD_MODULE_TOKEN = "| module=pill_spline"
 MODULE_RELOAD_COMPLETE_TOKEN = "extension hot reload complete"
 CASCADE_TOKEN = "queuing a project reload"
 COUNTER_TICK_TOKEN = "counter tick"

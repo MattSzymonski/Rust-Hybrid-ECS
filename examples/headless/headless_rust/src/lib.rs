@@ -24,14 +24,14 @@ use pill_engine::*;
 use serde::{Deserialize, Serialize};
 
 /// How many ticker entities the world is filled up to.
-const TICKER_COUNT: usize = 256;
+pub const TICKER_COUNT: usize = 256;
 
 /// Seconds between two reports.
 ///
 /// The timer counts real time, not frames. A headless host has no vsync, so it
 /// runs the frame loop as fast as the machine allows. A frame-count interval
 /// would print thousands of lines a second.
-const REPORT_INTERVAL_SECONDS: f32 = 1.0;
+pub const REPORT_INTERVAL_SECONDS: f32 = 1.0;
 
 /// One entity's frame counter.
 ///
@@ -86,6 +86,7 @@ pub fn init(engine: &mut Engine) -> u32 {
 ///
 /// Missing `Time` or a missing report timer only means no report is logged;
 /// the tickers still advance.
+#[pill_hot]
 #[system(name = "tick")]
 fn tick_system(
     time: Res<Time>,

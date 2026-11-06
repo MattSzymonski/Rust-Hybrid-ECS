@@ -718,7 +718,7 @@ impl ModuleAnalytics {
 
 /// How a generation of code reached the running process.
 ///
-/// Both kinds print the same `[analytics] reload ...` line, so one parser
+/// Both kinds print the same `Hot reload finished ...` line, so one parser
 /// reads both; the `kind=` field tells them apart. A patch is not a second
 /// format. It is a reload whose phases happen to be much cheaper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -800,7 +800,7 @@ struct ReloadEvent {
     migrate_ms: f64,
     artifact_bytes: u64,
     /// This event's ordinal among every reload and patch of the process, so
-    /// no two events in one session print the same `(reload #N)`.
+    /// no two events in one session print the same `number=N`.
     reload_count: u32,
     /// Crates that actually compiled or linked in this reload's cargo
     /// invocations, with their wall times, sorted by time descending. This is
@@ -850,7 +850,7 @@ struct Analytics {
     /// Function patches that went live in this process.
     patches: u64,
     /// Reloads and patches recorded so far in this process, which numbers
-    /// each event's `(reload #N)`.
+    /// each event's `number=N`.
     reload_events: u32,
     /// Changes the fast path declined to patch, which fell through to a reload.
     patch_refusals: u64,
@@ -1090,7 +1090,7 @@ pub(crate) fn record_patch(
         migrate_ms: 0.0,
         artifact_bytes,
         // Patches and reloads share one session-wide count, so the
-        // `(reload #N)` column names one event whichever kind it was.
+        // `number=N` field names one event whichever kind it was.
         reload_count,
         // No cargo invocation ran, so there is no per-crate breakdown to show.
         cargo_crates: Vec::new(),
@@ -1173,8 +1173,7 @@ fn patch_tally_lines() -> Vec<String> {
         return Vec::new();
     }
     let mut lines = vec![format!(
-        "{} fast path: patches {} | refused {} | failed {}",
-        "[analytics]".cyan().bold(),
+        "Function hot patching: patches {} | refused {} | failed {}",
         collector.patches.to_string().yellow(),
         collector.patch_refusals.to_string().yellow(),
         collector.patch_failures.to_string().yellow(),
@@ -1595,7 +1594,7 @@ fn wrap_list(items: &[&str], width: usize) -> Vec<String> {
 /// plus the queued project reload - and not only the last reload. Returns the
 /// number of reload events reported.
 ///
-/// The `[analytics] reload ...` and `crates rebuilt by cargo:` lines keep the
+/// The `Hot reload finished ...` and `crates rebuilt by cargo:` lines keep the
 /// exact text the suites and `devops/benchmarks/hot_reload_harness.py` parse.
 /// Their colors reach an interactive terminal only (see `log_block_colored`).
 pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
@@ -1608,17 +1607,11 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
     let mut lines = Vec::new();
     for event in &events {
         lines.push(format!(
-            "{} reload {} {} | build={} | stage={}ms | load={}ms | init={}ms | \
-             migrate={}ms | size={} | kind={}{}",
-            "[analytics]".cyan().bold(),
-            event.name.cyan().bold(),
-            format!("(reload #{})", event.reload_count).dimmed(),
-            if event.build_ms > 0 {
-                format_ms(event.build_ms)
-            } else {
-                "-".to_string()
-            }
-            .yellow(),
+            "Hot reload finished | duration=(build={}ms, stage={}ms, load={}ms, init={}ms, \
+             migrate={}ms) | size={} | module={} | kind={} | number={}{}",
+            // The template carries the unit, so every duration prints as a
+            // plain number of milliseconds; a reload that built nothing is 0.
+            event.build_ms.to_string().yellow(),
             format!("{:.1}", event.stage_ms).yellow(),
             format!("{:.1}", event.load_ms).yellow(),
             format!("{:.1}", event.init_ms).yellow(),
@@ -1629,7 +1622,9 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
                 "-".to_string()
             }
             .yellow(),
+            event.name.yellow(),
             event.kind.label().yellow(),
+            event.reload_count.to_string().yellow(),
             // Appended rather than folded into `kind=`, so the field the
             // harness already parses keeps its exact meaning and vocabulary.
             // A reload has no route, and prints none.
@@ -1694,14 +1689,13 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
     lines.extend(patch_tally_lines());
 
     let label = if count > 1 {
-        "cascade total"
+        "Total cascaded reload duration"
     } else {
-        "reload total"
+        "Total reload duration"
     };
     lines.push(format!(
-        "{} {}: {} {}",
-        "[analytics]".cyan().bold(),
-        label.bold(),
+        "{}: {} {}",
+        label,
         format_ms(total_ms).yellow(),
         format!("({total_ms}ms)").dimmed(),
     ));
@@ -1719,7 +1713,7 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
     info!(
         target: telemetry_target::HOT_RELOAD,
         "{}",
-        log_block_colored("Reload analytics".cyan().bold(), lines)
+        log_block_colored("Reload analytics", lines)
     );
     count
 }
@@ -1949,7 +1943,7 @@ const CONCURRENCY_DATA = [
     }
 
     /// A patch and a reload in one session take consecutive numbers from one
-    /// count, so `(reload #N)` never names two events.
+    /// count, so `number=N` never names two events.
     #[test]
     fn patches_and_reloads_share_one_session_count() {
         record_patch(

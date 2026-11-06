@@ -150,7 +150,7 @@ FORGOTTEN_DROP_TOKEN = "dropped orphaned columns for component types no longer r
 # The analytics line a module reload prints, named after the module that
 # reloaded. `RELOAD_MODULE_TOKEN` is the spline's; `pill_test` reloads too, and
 # its scenario has to wait for its own line rather than one the spline prints.
-PILL_TEST_RELOAD_TOKEN = "[analytics] reload pill_test"
+PILL_TEST_RELOAD_TOKEN = "| module=pill_test"
 
 # The project probe's report line, e.g. "midpoint (390.0, 120.0)". Session B's
 # cascade scenario derives the value it expects from the reports the host

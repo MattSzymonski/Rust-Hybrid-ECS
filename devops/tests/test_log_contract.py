@@ -37,11 +37,11 @@ DESCRIPTION
     `{...}` placeholders a format string carries, since most host lines are
     built at runtime:
 
-        "[analytics] reload pill_spline "  <-  "{} reload {} {} | build={} ..."
+        "| module=pill_spline"  <-  "... | size={} | module={} | kind={} ..."
 
     A placeholder stands for one or more non-whitespace characters, and a token
-    may stop in the middle of the literal, because a suite normally waits for
-    the prefix it cares about and the host appends fields it does not. A match
+    may start and stop in the middle of the literal, because a suite waits for
+    the field it cares about and the host prints others around it. A match
     must carry MINIMUM_ANCHOR_CHARACTERS of static text, so that a template the
     log layer applies to every line - a formatter's `[{level}] {location}
     {message}` - cannot vacuously cover a token it has nothing to do with.
@@ -150,6 +150,9 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
         "Composed at runtime from the component's type name and its verdict.",
     "'native::MarkerTrail' -> migrating":
         "Composed at runtime from the component's type name and its verdict.",
+    "[csharp_runtime] reload failed:":
+        "Printed by the managed loader (pill_csharp_runtime, C#), whose source "
+        "is C# rather than Rust.",
     "are still loaded after":
         "Emitted by the .NET bridge (ProjectHost.cs), whose source is C# "
         "rather than Rust.",
@@ -204,12 +207,7 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
 # prints it. An entry here is checked for still being declared and for really
 # being such a coincidence; nothing can require its presence, because the fit it
 # describes is indistinguishable from coverage.
-SHAPE_ONLY_FITS: Dict[str, str] = {
-    "[csharp_runtime] reload failed:":
-        "Printed by the managed loader (pill_csharp_runtime, C#); the "
-        "`[analytics] reload {} {}` line in pill_development_host fits its shape by "
-        "coincidence.",
-}
+SHAPE_ONLY_FITS: Dict[str, str] = {}
 
 # Tokens whose whole point is to distinguish one reload subject from another.
 # Collapsing either pair into a single string would leave the suites unable to
@@ -551,10 +549,21 @@ def token_is_covered(token: str) -> bool:
     if token in read_rust_sources():
         return True
     for entry in rust_literals():
-        if entry.anchor not in token:
-            continue
-        if literal_prints(entry.parts, token):
+        if entry.anchor in token and literal_prints(entry.parts, token):
             return True
+    # A token that starts inside the line, such as one field among several:
+    # every place a static segment holds the token's opening characters is a
+    # possible start, and the rest of the literal must still print the token.
+    # The search for those characters keeps the scan cheap.
+    head = token[:MINIMUM_ANCHOR_CHARACTERS]
+    for entry in rust_literals():
+        for index, segment in enumerate(entry.parts):
+            start = segment.find(head)
+            while start >= 0:
+                suffix = (segment[start:],) + entry.parts[index + 1:]
+                if literal_prints(suffix, token):
+                    return True
+                start = segment.find(head, start + 1)
     return False
 
 
