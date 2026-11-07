@@ -126,14 +126,33 @@ fn engine_dylib_staging_steers_the_loader() -> bool {
     cfg!(windows)
 }
 
-/// Engine dylibs this process loaded from the module world because the host
-/// binary does not link them.
+/// Engine dylibs this process took from the module world because the host
+/// binary does not link them, and the stems already tried.
 ///
 /// They stay mapped for the life of the process: module code holds raw
 /// pointers and vtables into them, so unloading one would leave those
-/// dangling. The `OnceLock` owns the handles rather than leaking them.
+/// dangling. This table owns the handles rather than leaking them.
+///
+/// The set cannot be decided once for the process. Which engine dylibs are
+/// missing depends on which ones the binary links, but which ones a *module*
+/// needs is a property of that module, so a second module can name one the
+/// first never mentioned. Each load therefore adds the stems its own module
+/// names, and `attempted` keeps a stem that could not be loaded from being
+/// retried on every reload.
 #[cfg(not(windows))]
-static PRELOADED_ENGINE_DYLIB: std::sync::OnceLock<Vec<Library>> = std::sync::OnceLock::new();
+#[derive(Default)]
+struct PreloadedEngineDylibs {
+    /// Handles to the dylibs this process preloaded.
+    libraries: Vec<Library>,
+    /// Stems whose preload has been attempted, successful or not.
+    attempted: std::collections::HashSet<&'static str>,
+}
+
+/// The process-wide [`PreloadedEngineDylibs`] table.
+#[cfg(not(windows))]
+static PRELOADED_ENGINE_DYLIBS: std::sync::OnceLock<
+    std::sync::Mutex<PreloadedEngineDylibs>,
+> = std::sync::OnceLock::new();
 
 /// Directory, under the workspace root, where temporary native-library copies
 /// are stored.
@@ -627,53 +646,98 @@ fn mapped_engine_dylibs(workspace_root: &Path) -> HashSet<&'static str> {
 /// in the scope the module's entry is resolved against. A Rust cdylib carries a
 /// `DT_SONAME` equal to its file name, which is what makes the name match.
 ///
+/// Only the stems `module` itself names are tried. A host that links none of
+/// them - the renderer host maps no UI dylib - would otherwise pull the whole
+/// module-world set into its process for a module that needs none of it, and a
+/// second copy of `pill_ui_frame` is exactly what the one-instance rule in
+/// [`ENGINE_DYLIB_STEMS`] forbids.
+///
 /// Best effort: a copy that cannot be loaded is logged and left to the
 /// diagnosis, which names the two builds it compared.
 #[cfg(not(windows))]
-fn preload_unmapped_engine_dylibs(workspace_root: &Path) {
-    PRELOADED_ENGINE_DYLIB.get_or_init(|| {
+fn preload_unmapped_engine_dylibs(workspace_root: &Path, module: &Path) {
+    // Step 1: The stems this module asks for. An image that cannot be read
+    // leaves the whole set to be tried, because a load that is about to fail
+    // for a missing engine dylib must not fail for a missing preload as well.
+    let needed = crate::native_binary::needed_libraries(module);
+    let named = |stem: &str| match &needed {
+        Some(libraries) => libraries
+            .iter()
+            .any(|library| engine_dylib_stem(library) == Some(stem)),
+        None => true,
+    };
+
+    // Step 2: The stems still worth trying. `attempted` is updated here, under
+    // the lock, so a stem is tried once per process however many modules name
+    // it, and a failure cannot turn into a warning on every reload. A poisoned
+    // lock means an earlier preload panicked; its table is still the best
+    // record there is, so it is taken back rather than abandoned.
+    let wanted = {
+        let mut table = match PRELOADED_ENGINE_DYLIBS.get_or_init(Default::default).lock() {
+            Ok(table) => table,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let mapped = mapped_engine_dylibs(workspace_root);
-        let mut preloaded = Vec::new();
+        let mut wanted = Vec::new();
         for stem in ENGINE_DYLIB_STEMS {
-            if mapped.contains(stem) {
+            if mapped.contains(stem) || !named(stem) {
                 continue;
             }
-            let Some(module_engine) = module_world_engine_dylib(workspace_root, stem) else {
-                continue;
-            };
-            // SAFETY: `module_engine` is a dylib this workspace's module build
-            // just wrote, opened by absolute path. `RTLD_NOW` resolves its own
-            // imports eagerly, and `RTLD_GLOBAL` puts it in the scope a later
-            // module's `DT_NEEDED` entry is resolved against. The handle is
-            // owned by the vector the `OnceLock` holds, so it outlives every
-            // module that resolves against it.
-            let loaded = unsafe {
-                unix_loader::Library::open(
-                    Some(module_engine.as_os_str()),
-                    unix_loader::RTLD_GLOBAL | unix_loader::RTLD_NOW,
-                )
-            };
-            match loaded {
-                Ok(library) => {
-                    debug!(
-                        target: telemetry_target::HOT_RELOAD,
-                        stem,
-                        path = %module_engine.display(),
-                        "preloaded an engine dylib this host does not link"
-                    );
-                    preloaded.push(Library::from(library));
-                }
-                Err(error) => warn!(
+            if table.attempted.insert(stem) {
+                wanted.push(stem);
+            }
+        }
+        wanted
+    };
+
+    // Step 3: Load each one. The lock is released first: a mapping can run
+    // static initializers, and none of them may block on this table.
+    let mut preloaded = Vec::new();
+    for stem in wanted {
+        let Some(module_engine) = module_world_engine_dylib(workspace_root, stem) else {
+            continue;
+        };
+        // SAFETY: `module_engine` is a dylib this workspace's module build
+        // just wrote, opened by absolute path. `RTLD_NOW` resolves its own
+        // imports eagerly, and `RTLD_GLOBAL` puts it in the scope a later
+        // module's `DT_NEEDED` entry is resolved against. The handle is kept
+        // in [`PRELOADED_ENGINE_DYLIBS`], so it outlives every module that
+        // resolves against it.
+        let loaded = unsafe {
+            unix_loader::Library::open(
+                Some(module_engine.as_os_str()),
+                unix_loader::RTLD_GLOBAL | unix_loader::RTLD_NOW,
+            )
+        };
+        match loaded {
+            Ok(library) => {
+                debug!(
                     target: telemetry_target::HOT_RELOAD,
                     stem,
                     path = %module_engine.display(),
-                    %error,
-                    "an engine dylib this host does not link could not be preloaded"
-                ),
+                    "preloaded an engine dylib this host does not link"
+                );
+                preloaded.push(Library::from(library));
             }
+            Err(error) => warn!(
+                target: telemetry_target::HOT_RELOAD,
+                stem,
+                path = %module_engine.display(),
+                %error,
+                "an engine dylib this host does not link could not be preloaded"
+            ),
         }
-        preloaded
-    });
+    }
+
+    // Step 4: Own the handles for the life of the process.
+    if preloaded.is_empty() {
+        return;
+    }
+    let mut table = match PRELOADED_ENGINE_DYLIBS.get_or_init(Default::default).lock() {
+        Ok(table) => table,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    table.libraries.append(&mut preloaded);
 }
 
 /// Byte equality for two native library files.
@@ -1068,7 +1132,7 @@ impl NativeLibrary {
         // directory, where cargo never put a copy. Load the module build's
         // copy first, which registers it under the SONAME the module names.
         #[cfg(not(windows))]
-        preload_unmapped_engine_dylibs(workspace_root);
+        preload_unmapped_engine_dylibs(workspace_root, temporary_copy.path());
 
         // Step 3: Load the copy and validate its required exports.
         let load_started = Instant::now();
