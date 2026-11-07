@@ -493,11 +493,27 @@ pub fn inspector_field_row(
     }
 }
 
+/// Whether a file dragged out of the Assets tab may be dropped on an asset row.
+///
+/// `dragged` is the listing key the Assets tab drags. It fits when it is one
+/// of the files the row's own picker offers, which are the listed files of the
+/// field's asset type. Without this check a mesh dropped one row too low, on a
+/// material slot, would be queued and only refused by the engine.
+pub fn asset_drop_fits(dragged: &str, row_input: &AssetRowInput<'_>) -> bool {
+    let (files, _) = inspector::picker_candidates(
+        row_input.assets,
+        row_input.engine_assets,
+        row_input.asset_type,
+    );
+    files.iter().any(|candidate| candidate.key() == dragged)
+}
+
 /// Draws one asset reference row.
 ///
 /// The row is a button naming the referenced asset, which opens a picker of
-/// every asset of the field's type, a clear button, and a drop target for an
-/// asset dragged out of the Assets tab.
+/// every asset of the field's type, a clear button, and a drop target for a
+/// file of the field's asset type dragged out of the Assets tab
+/// ([`asset_drop_fits`]).
 ///
 /// Every choice becomes one recorded `SetFieldAsset` step for the whole
 /// selection. An asset that is not loaded yet is loaded when the step is
@@ -563,19 +579,33 @@ pub fn inspector_asset_row(
             egui::vec2(width, 18.0),
             egui::Button::new(icons::rich(icon, &text).color(color)).truncate(),
         );
-        // A file dragged out of the Assets tab can be dropped on this button.
-        // While one hovers there, the row is outlined so the drop looks
-        // accepted.
-        if response.dnd_hover_payload::<String>().is_some() {
-            ui.painter().rect_stroke(
-                response.rect,
-                2.0,
-                ui.visuals().selection.stroke,
-                egui::StrokeKind::Inside,
-            );
+        // A file dragged out of the Assets tab can be dropped on this button,
+        // but only a file of the field's own asset type. While one hovers, the
+        // row is outlined in the selection colour when the drop fits and in the
+        // danger colour when it does not, so a near miss on the neighbouring
+        // row is visible before the release.
+        if let Some(dragged) = response.dnd_hover_payload::<String>() {
+            let stroke = if asset_drop_fits(&dragged, &row_input) {
+                ui.visuals().selection.stroke
+            } else {
+                egui::Stroke::new(ui.visuals().selection.stroke.width, style::danger())
+            };
+            ui.painter()
+                .rect_stroke(response.rect, 2.0, stroke, egui::StrokeKind::Inside);
         }
-        if let Some(path) = response.dnd_release_payload::<String>() {
-            chosen = Some(Some((*path).clone()));
+        if let Some(dragged) = response.dnd_release_payload::<String>() {
+            if asset_drop_fits(&dragged, &row_input) {
+                chosen = Some(Some((*dragged).clone()));
+            } else {
+                pill_core::debug!(
+                    target: telemetry_target::EDITOR,
+                    entity = %row_input.entity,
+                    field = row_input.field,
+                    asset_type = row_input.asset_type.unwrap_or_default(),
+                    asset = dragged.as_str(),
+                    "[editor] asset drop refused: wrong asset type"
+                );
+            }
         }
         if response.clicked() {
             session.asset_picker = match session.asset_picker.as_deref() {
