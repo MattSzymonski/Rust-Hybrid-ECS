@@ -1,209 +1,178 @@
-# Hybrid ECS Game Engine
+- Hot-reloading (standalone console, standalone window, editor)
+  - Engine
+  - Project
+  - Renderer
+- Speed of loading (especially editor)
+- Persistance/serialization works.
 
-A Rust-based game engine architecture that combines the performance benefits of Entity Component System (ECS) with the intuitive, object-oriented API familiar to Unity developers.
+The standalone host is a generic launcher. It selects the project from the
+`PROJECT_PATH` environment variable and reads that project's
+`project_settings.yaml` for the extension list â€” there is no host-level
+configuration file. Everything else â€” backend, name, watch directory, build
+command, and output paths â€” is inferred from the project's manifest, so no
+project identity is compiled into the host.
 
-## The Problem
+Rust project (headless):
 
-When designing game engine architectures, there's typically a tradeoff:
+- `set PROJECT_PATH=../examples/headless/headless_rust` then `cargo run --package pill_standalone`
+- or, in PowerShell: `$env:PROJECT_PATH = "../examples/headless/headless_rust"; cargo run --package pill_standalone`
 
-### Unity (Pure OOP)
-- ✅ **Intuitive**: `GameObject.Instantiate()`, `AddComponent<T>()`, `GetComponent<T>()`
-- ✅ **Immediate**: Changes happen instantly, no frame delay
-- ❌ **Single-threaded**: Hard to parallelize
-- ❌ **Performance**: Object-oriented overhead
+Rust project (windowed): the same, with `--features rendering` (try
+`../examples/cube/cube_rust`).
 
-### Bevy/Flecs (Pure ECS)
-- ✅ **Performance**: Cache-friendly, data-oriented
-- ✅ **Parallel**: Systems can run concurrently
-- ❌ **Learning curve**: Different mental model
-- ❌ **Deferred operations**: `commands.spawn()` takes effect next frame
-- ❌ **Inconsistent state**: Entity created but not accessible until later
+**The host and the project must resolve the same dependency graph.** Cargo  
+folds a dependency's resolved features into the dependent's `-C metadata`, and  
+that hash is part of every symbol name `pill_core.dll` exports, so a host and a  
+project that resolve different graphs link two incompatible engine dylibs and  
+the project fails to load. That is why a project depends on  
+`pill_master_renderer` with `default-features = false`: `Position` and `Color`  
+come from `pill_engine`, `Sprite` needs only the renderer's data half, and wgpu  
+stays out of the project's graph so a headless host and a windowed one can both  
+load it. Should the two ever diverge anyway, the host names both dylibs rather  
+than letting the loader report it as "The specified procedure could not be  
+found".
 
-## The Solution: Hybrid Architecture
+Live per-function hot patching is on by default in dev builds: a body-only  
+edit to a `#[pill_hot]` system is compiled on its own and swapped into the  
+running engine at the next frame, instead of a full module reload. Everything  
+a patch cannot express (signature or type changes, new components, constants)  
+falls back to the normal reload. To run the pure reload path without the patch  
+machinery - e.g. when measuring reload performance - build the host with  
+`--no-default-features --features development` instead.
 
-This project implements a **hybrid approach** that wraps a high-performance ECS backend with a Unity-like object-oriented API.
+C# project: point `PROJECT_PATH` at the directory containing the `.csproj`,  
+e.g. `../examples/cube/cube_csharp`.
 
-### Architecture Components
+## Examples
 
-```
-┌─────────────────────────────────────────┐
-│  GameObject API (Unity-like)            │  ← Game Developer Interface
-│  - scene.instantiate()                  │
-│  - gameObject.add_component(T)          │
-│  - gameObject.get_component<T>()        │
-└─────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────┐
-│  Command Buffer                         │  ← Solves inconsistent state
-│  - Defers operations                    │
-│  - Maintains thread safety              │
-│  - Executes at frame boundaries         │
-└─────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────┐
-│  ECS Core (Performance)                 │  ← Backend
-│  - Entity/Component storage             │
-│  - Parallel system execution            │
-│  - Cache-friendly data layout           │
-└─────────────────────────────────────────┘
-```
+`examples/` holds the official examples, each a Rust project and a C# project
+running the same demo: `cube`, `cube_no_editor`, `pills` and `headless`.
+`examples/README.md` lists them and shows how to run either half;
+`examples/local/` is a gitignored developer checkout that nothing ships.
 
-## Key Features
+The projects under `devops/tests/projects/` are the suites' own fixtures: the
+hot-reload, C# bridge, renderer and editor suites drive them, and each carries
+the anchors its suite edits and asserts. They are tracked so a clean checkout
+can run the gate.
 
-### 1. **Unity-like GameObject API**
-```rust
-// Create entities naturally
-let player = scene.instantiate();
-player
-    .add_component(Transform::new(0.0, 0.0, 0.0))
-    .add_component(Velocity::new(1.0, 0.0, 0.0))
-    .add_component(Health::new(100.0));
+## Shipping builds
 
-// Access components
-if let Some(health) = player.get_component::<Health>() {
-    health.with(|h| println!("Health: {}", h.current));
-}
+`devops/ci_cd/build_shipping.py` builds the shipping build: `pill_standalone`  
+with the `shipping` feature, which runs the project through `pill_player` and  
+does not compile the development host (`pill_development_host`) at all. It reads the  
+project's scripting language from its manifest: the generated bundle carries  
+the backend, and a managed C# project (`*.csproj`) also gets its assemblies  
+built and copied. A project's `res` directory is packed into the binary at  
+build time and read from there, so the game does not need its asset files  
+beside it. A managed C# build has two shipping modes:
 
-// Modify components
-if let Some(mut health) = player.get_component_mut::<Health>() {
-    health.with(|h| h.current -= 10.0);
-}
-```
+- **Framework-dependent (default):** `dotnet build -c Release` produces the  
+project assembly, and the host boots CoreCLR through hostfxr at runtime. The  
+user's machine must have the .NET 8 runtime installed.
+- **NativeAOT self-contained (`--csharp-aot`):** `dotnet publish -p:PublishAot=true` merges the loader, the gameplay code, and a trimmed  
+runtime into one native library; the host loads it directly with no hostfxr,  
+no .NET install, and no JIT.
 
-### 2. **Command Buffer for Thread Safety**
-Operations are queued and executed at safe synchronization points:
-```rust
-// During gameplay (possibly from parallel systems)
-let projectile = scene.instantiate();  // Queued
-projectile.add_component(Transform::new(0.0, 0.0, 0.0));  // Queued
+```bat
+cd D:\Programming\Rust-Hybrid-ECS
 
-// At frame boundary
-scene.apply_commands();  // All changes applied atomically
-```
+set PROJECT_PATH=devops/tests/projects/native
+python devops\ci_cd\build_shipping.py --features rendering   :: native shipping build
 
-### 3. **ECS Performance Benefits**
-Systems iterate over components efficiently:
-```rust
-impl System for MovementSystem {
-    fn execute(&mut self, world: &mut World, delta_time: f32) {
-        // Iterate efficiently over all Transform+Velocity entities
-        for entity in world.query::<Transform>() {
-            // Update transforms based on velocity
-        }
-    }
-}
+set PROJECT_PATH=devops/tests/projects/managed
+python devops\ci_cd\build_shipping.py --features rendering   :: managed (C#), framework-dependent
+python devops\ci_cd\build_shipping.py --csharp-aot           :: managed (C#), NativeAOT self-contained
 ```
 
-### 4. **Parallel System Execution**
-Systems can run in parallel (with proper dependency management):
-```rust
-let mut executor = SystemExecutor::new();
-executor.add_system(MovementSystem);
-executor.add_system(PhysicsSystem);
-executor.add_system(RenderSystem);
+`PROJECT_PATH` is resolved against the working directory first (the dev  
+convention: from `modules`, `../devops/tests/projects/managed`), falling back to the  
+repository root, so both spellings work from either place.
 
-executor.execute(&mut world, delta_time);  // Can parallelize non-conflicting systems
+Build output lands under the project's `build/<timestamp>/` directory.
+
+## Web builds
+
+A Rust project also runs in the browser, through WebGPU. The web build is the  
+shipping posture compiled for `wasm32-unknown-unknown` and run by `pill_web`:  
+one module, statically linked, no hot reload. C# projects are not supported on  
+the web. Its assets travel beside the page rather than inside the module: the  
+build packs them into `assets.pillpack` next to `index.html`, and the module  
+downloads and mounts it before the project starts (W-0105). Serve the whole  
+directory, not just `pkg/`.
+
+```bat
+:: once: rustup target add wasm32-unknown-unknown  and  cargo install wasm-pack
+python devops\tools\build_web.py devops/tests/projects/scene        :: release (wasm-opt)
+python devops\tools\build_web.py --dev devops/tests/projects/scene  :: faster, unoptimized
+python -m http.server 8000 -d devops/tests/projects/scene/build/web
 ```
 
-## Comparison Table
+Then open http://localhost:8000/ in Chrome or Edge 113+, Safari 18+ or Firefox  
+141+. Like a shipping build, this regenerates `build/pill_shipping_bundle`;  
+put the committed stub back with  
+`python devops/tools/generate_shipping_bundle.py --restore-stub`.
 
-| Feature          | Unity              | Bevy (Pure ECS)    | This Hybrid        |
-|------------------|--------------------|--------------------|---------------------|
-| **API Style**    | OOP, Immediate     | ECS, Deferred      | OOP Wrapper + ECS   |
-| **Create Entity** | `Instantiate()`   | `commands.spawn()` | `scene.instantiate()` |
-| **Add Component** | `AddComponent<T>()` | `.insert(Component)` | `.add_component(T)` |
-| **Access Comp**  | `GetComponent<T>()` | `Query<&T>`       | `.get_component<T>()` |
-| **Parallel Systems** | ✗ Single-threaded | ✓ Automatic       | ✓ Manual/Rayon      |
-| **Intuitive**    | ✓✓ Very natural    | △ Learning curve   | ✓ Natural for Unity |
-| **Performance**  | △ Limited          | ✓✓ Excellent       | ✓ Good (ECS backend) |
-| **Thread Safety** | △ Manual locking  | ✓✓ Automatic       | ✓ CommandBuffer     |
-| **State Sync**   | ✓ Always consistent | △ Frame delay     | ✓ Controlled delay  |
+## Extensions
 
-## Project Structure
+Engine extensions are crates inside `modules/extensions/`, one folder per
+extension (`modules/extensions/<extension>/<crate>/`), built into a `cdylib`
+and loaded by the host next to the project. Each is watched, rebuilt and swapped
+on its own, so editing one module reloads only that module and leaves the
+project and every other module running.
 
-```
-src/
-├── main.rs           - Demo application & examples
-├── ecs_core.rs       - Core ECS implementation (Entity, World, Components)
-├── command_buffer.rs - Deferred operation queue
-├── game_object.rs    - Unity-like GameObject wrapper
-└── systems.rs        - System execution framework
-```
+The `modules` list in the project's `project_settings.yaml` selects which ones  
+to load, in order. An absent or empty list loads none.
 
-## Running the Demo
+- `modules: ["pill_spline"]` in `project_settings.yaml` â€” load the spline module.
+- `modules: ["pill_spline", "pill_physics"]` â€” several modules.
+- `modules: []` (or omitting the key) â€” run with no extensions.
 
-```bash
-cargo run
-```
+### Adding a module
 
-The demo showcases:
-1. Unity-like entity creation
-2. Component manipulation
-3. System execution across multiple frames
-4. Dynamic entity creation during gameplay
-5. Entity destruction
-6. Comparison with Unity and Bevy approaches
+The workspace manifest globs `extensions/*/pill_*`, so a module is discovered
+by existing; nothing lists it by name.
 
-## Usage Example
+1. Create `modules/extensions/<name>/<name>/` with a `Cargo.toml` declaring
+   `crate-type = ["rlib"]` and depending on `pill_engine`. The crate root is
+   `src/<name>.rs`, not `src/lib.rs`, so debuggers and the hot scanner can
+   tell crate roots apart.
+2. Mark the registration entry point with the `#[pill_module]` attribute
+   (or `#[pill_project]` for a project); it exports the module ABI entry
+   points for you.
+3. Add `<name>` to the `modules` list in the project's `project_settings.yaml`.
 
-```rust
-use ecs_hybrid::*;
+Everything else â€” watch directory, build command, output path â€” is derived from
+the directory name, so the host needs no changes. The host **generates** the
+`cdylib` wrapper it actually loads under
+`modules/extensions/<name>/generated/host_module_<name>/` on startup: it is a
+build artifact, never written by hand. See
+`modules/extensions/pill_spline/` for the reference implementation. An
+extension's optional editor part is written against `pill_editor_core`
+(the old `pill_ui` editor part retired with W-0043).
 
-// Create a scene
-let scene = Scene::new();
+Modules must live in this directory rather than anywhere on disk: sharing the  
+workspace lockfile is what makes a module resolve the same dependency graph as  
+the host, which keeps component type identities and the mangled symbols of the  
+shared `pill_core` library in agreement.
 
-// Create entities with Unity-like API
-let player = scene.instantiate();
-player
-    .add_component(Name::new("Player"))
-    .add_component(Transform::new(0.0, 0.0, 0.0))
-    .add_component(Health::new(100.0));
+### Launching outside Cargo
 
-// Create systems
-let mut executor = SystemExecutor::new();
-executor.add_system(MovementSystem);
+The engine workspace links `pill_core` dynamically so the host and every loaded  
+module share one copy of its telemetry state. That also makes the built  
+executable depend on the toolchain's `std-<hash>.dll` at load time. The build  
+script in `pill_standalone` (and `pill_editor`) stages that dylib next to the  
+executable automatically, so `target\debug\pill_standalone.exe` runs directly  
+without any `PATH` adjustment:
 
-// Game loop
-loop {
-    // Execute systems
-    {
-        let world_lock = scene.world();
-        let mut world = world_lock.write();
-        executor.execute(&mut world, delta_time);
-    }
-    
-    // Apply deferred commands
-    scene.apply_commands();
-}
+```powershell
+.\target\debug\pill_standalone.exe
 ```
 
-## Key Insights
+If the staged dylib is missing (for example the toolchain was updated and the  
+binary was not rebuilt), the build script re-copies it on the next `cargo build`.
 
-1. **Unity API**: Natural but single-threaded, immediate changes
-2. **Bevy ECS**: High performance but deferred operations can be confusing
-3. **Hybrid**: Best of both - Unity-like API with ECS performance
-4. **Command Buffer**: Solves the "inconsistent state" problem elegantly
-5. **GameObject Wrapper**: Hides ECS complexity from game developers
-
-## Future Enhancements
-
-- [ ] Actual parallel system execution with Rayon
-- [ ] System dependency graph for automatic parallelization
-- [ ] Prefab/template system
-- [ ] Entity hierarchy (parent-child relationships)
-- [ ] Event system
-- [ ] Resource management (singleton components)
-- [ ] Query builder with multiple component types
-- [ ] Compile-time system conflict detection
-
-## License
-
-This is a demonstration project created for educational purposes.
-
-## Inspiration
-
-This architecture is inspired by discussions about:
-- Unity's GameObject model
-- Bevy's ECS architecture
-- The tradeoffs between OOP and data-oriented design
-- Making high-performance systems accessible to developers familiar with Unity
+- `cargo run --package editor` â€” Run the Rust project in the editor.
+- `dotnet build devops/tests/projects/managed/managed.csproj -c Release --nologo` â€” Build the C# project and its `csharp_runtime` dependency.
+- `dotnet run --project modules/csharp/pill_csharp_runtime/tests/csharp_runtime_tests.csproj -c Release` â€” Run the C# system discovery and scheduler-access tests.
+- `cargo test --workspace` â€” Run all Rust workspace tests.
+- `cargo check --workspace` â€” Type-check the complete Rust workspace without producing release binaries.
