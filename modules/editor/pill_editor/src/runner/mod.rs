@@ -127,6 +127,13 @@ mod windows;
 /// The environment variable that forces the window-surface posture.
 pub const NO_OVERLAY_ENV: &str = "PILL_EDITOR_NO_OVERLAY";
 
+/// The environment variable that keeps the editor on the native Wayland
+/// backend.
+pub const WAYLAND_ENV: &str = "PILL_EDITOR_WAYLAND";
+
+/// The environment variable that keeps a scene view in a top-level window.
+pub const DETACHED_SCENE_ENV: &str = "PILL_EDITOR_DETACHED_SCENE";
+
 /// The shell module's crate name - the editor-only module's convention.
 const SHELL_MODULE_NAME: &str = "pill_editor_shell_egui_editor";
 
@@ -226,6 +233,57 @@ fn no_overlay_requested() -> bool {
         .unwrap_or(false)
 }
 
+/// Picks the display backend the editor's windows need.
+///
+/// Every scene and game view is a child window of the editor window, placed in
+/// the dock's rectangle and moved with the editor: the shell reports the
+/// rectangle, and the view window is then told where to be. Wayland allows
+/// neither half of that - a client cannot choose a window's position, and a
+/// window cannot be made a child of another - so the compositor puts each view
+/// wherever it likes and no placement is ever applied. A view would float
+/// outside the dock and stay there while the editor moves.
+///
+/// The editor therefore runs as an X11 client: through XWayland when the
+/// session is Wayland, which supports both child windows and client placement.
+/// [`WAYLAND_ENV`] keeps the native backend, for the sessions where every view
+/// is popped out into its own window and the docked views do not matter.
+///
+/// Windows has its own child windows and needs none of this.
+fn choose_display_backend() {
+    #[cfg(not(windows))]
+    {
+        // Step 1: an explicit request wins, and it is honoured with the
+        // limitation named, because the views it produces do not stay in the
+        // dock.
+        if std::env::var_os(WAYLAND_ENV).is_some() {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                warn!(
+                    target: telemetry_target::EDITOR,
+                    variable = WAYLAND_ENV,
+                    "[editor] wayland cannot place or nest the scene views; a docked view will not follow the window"
+                );
+            }
+            return;
+        }
+        // Step 2: a session with no X display has nothing to fall back to, so
+        // the native backend is the only one there is.
+        if std::env::var_os("WAYLAND_DISPLAY").is_none()
+            || std::env::var_os("DISPLAY").is_none()
+        {
+            return;
+        }
+        // Step 3: `winit` picks Wayland when it sees the variable and X11 when
+        // it does not, so removing it must happen before the event loop is
+        // created.
+        std::env::remove_var("WAYLAND_DISPLAY");
+        info!(
+            target: telemetry_target::EDITOR,
+            variable = WAYLAND_ENV,
+            "[editor] running on x11: wayland cannot place or nest the scene views"
+        );
+    }
+}
+
 /// Build the UI surface for the posture the editor starts in.
 ///
 /// The composition overlay is the normal case and the window's own surface is
@@ -316,6 +374,9 @@ fn create_window_overlay(
 /// Returns [`EditorError::EventLoopCreation`] when the platform refuses the
 /// event loop, and [`EditorError::EventLoopRun`] when running it fails.
 pub fn run(log_buffer: pill_core::telemetry::capture::LogBuffer) -> Result<(), EditorError> {
+    // Step 1: the backend the view windows need, before `winit` reads it.
+    choose_display_backend();
+    // Step 2: the event loop and the application that owns the windows.
     let event_loop =
         EventLoop::new().map_err(|source| EditorError::EventLoopCreation { source })?;
     let mut application = EditorApplication {
@@ -3451,7 +3512,7 @@ impl SurfaceWindow {
         // Step 1: prefer a child window, so the view is composited inside
         // the editor's content area. winit takes the parent as a raw
         // handle; without one there is no child to try.
-        let force_detached = std::env::var_os("PILL_EDITOR_DETACHED_SCENE").is_some();
+        let force_detached = std::env::var_os(DETACHED_SCENE_ENV).is_some();
         let child_attributes = (!force_detached).then(|| {
             main.window_handle().ok().map(|handle| {
                 // SAFETY: `main` is alive - the caller passes it by reference

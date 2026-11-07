@@ -1304,14 +1304,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "host_project_scene"
+name = "host_project_cube_rust"
 version = "0.1.0"
 dependencies = [
  "glam 0.33.7",
  "pill_engine",
  "pill_master_renderer_data",
- "pill_project_ui",
- "serde",
 ]
 
 [[package]]
