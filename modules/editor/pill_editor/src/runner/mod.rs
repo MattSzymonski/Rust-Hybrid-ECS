@@ -159,6 +159,17 @@ const POPOUT_INITIAL_SIZE: LogicalSize<f64> = LogicalSize::new(520.0, 720.0);
 const SCENE_DEFAULT_TOP_MARGIN: f64 = 32.0;
 const SCENE_DEFAULT_MARGIN: f64 = 4.0;
 
+/// How far, in logical points, a view's window extends past its tab body while
+/// the composition overlay draws the UI above it.
+///
+/// The overlay paints every panel pixel over the child window, so the window is
+/// grown to run under the tab body's padding and outline: without that, whatever
+/// is behind the viewport shows around its edge. Only that posture may grow it.
+/// The window-surface posture has no overlay - the child window is drawn above
+/// the UI - so there the extra margin covers the tab bar and the panels beside
+/// the view, which is what a view that is "too large" looks like.
+const COMPOSITION_VIEW_OVERSHOOT: f64 = 16.0;
+
 /// How much of each new frame goes into the displayed FPS. The rest is the
 /// running average, so the number moves smoothly.
 const FPS_SMOOTHING: f32 = 0.1;

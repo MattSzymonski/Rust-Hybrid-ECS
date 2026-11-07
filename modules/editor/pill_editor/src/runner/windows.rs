@@ -265,8 +265,37 @@ impl EditorWindow {
     ///
     /// The dock's rectangle can overshoot the window while a split is being
     /// dragged.
+    ///
+    /// A view's window is grown by [`COMPOSITION_VIEW_OVERSHOOT`] only while
+    /// the composition overlay draws the UI above it. Without that overlay the
+    /// view window is above the UI, so a grown window hides the tab bar and the
+    /// edge of the panel next to it - the view looks too large and slightly out
+    /// of place.
     pub(super) fn view_rect_pixels(&self, rect: ShellRect) -> (i32, i32, u32, u32) {
+        let rect = if self.overlay_is_composition() {
+            let overshoot = COMPOSITION_VIEW_OVERSHOOT as f32;
+            ShellRect {
+                x: rect.x - overshoot,
+                y: rect.y - overshoot,
+                width: rect.width + 2.0 * overshoot,
+                height: rect.height + 2.0 * overshoot,
+            }
+        } else {
+            rect
+        };
         scaled_view_rect(rect, self.scale_factor, self.size)
+    }
+
+    /// Whether the UI is drawn above the scene and game windows.
+    ///
+    /// Only the composition overlay is: it is a visual over the whole window,
+    /// while the window surface is the main window itself, which a child window
+    /// covers.
+    pub(super) fn overlay_is_composition(&self) -> bool {
+        matches!(
+            self.overlay.as_ref().map(OverlaySurface::mode),
+            Some(OverlayMode::Composition)
+        )
     }
 
     /// Hides one scene view's window because its tab is not shown this pass:

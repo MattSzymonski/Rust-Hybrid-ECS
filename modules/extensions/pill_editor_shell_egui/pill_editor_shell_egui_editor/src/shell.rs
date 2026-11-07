@@ -127,7 +127,6 @@ pub use views::shell_rect;
 pub use views::SCENE_COUNTER_HEIGHT;
 pub use views::SCENE_COUNTER_MARGIN;
 pub use views::SCENE_COUNTER_WIDTH;
-pub use views::SCENE_RECT_OVERSHOOT;
 pub use views::SLOW_UPDATE_MICROS;
 
 /// The [`chrome`] module: the chrome the tabs share: icons, selection moves,
