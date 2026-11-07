@@ -103,6 +103,7 @@ use winit::window::{Window, WindowId};
 
 // Current crate
 use crate::frontend::EditorError;
+use crate::overlay::OverlayError;
 use crate::overlay::OverlayMode;
 use crate::overlay::OverlaySurface;
 use crate::test_channel::{self, TestChannel};
@@ -297,10 +298,11 @@ fn choose_display_backend() {
 
 /// Build the UI surface for the posture the editor starts in.
 ///
-/// The composition overlay is the normal case and the window's own surface is
-/// the fallback. A refusal is logged once and the editor keeps running, with
-/// the UI on the window surface.
+/// The overlay that draws the UI above the scene is the normal case and the
+/// window's own surface is the fallback. A refusal is logged once and the
+/// editor keeps running, with the UI on the window surface.
 fn create_overlay(
+    event_loop: &ActiveEventLoop,
     no_overlay: bool,
     instance: &wgpu::Instance,
     adapter: &wgpu::Adapter,
@@ -316,17 +318,22 @@ fn create_overlay(
         );
         return create_window_overlay(instance, adapter, device, window, size);
     }
-    // The composition overlay is a DirectComposition visual, which exists on
-    // Windows alone; there the window surface is the fallback, and everywhere
-    // else it is the only posture. The two differ visibly - composition is
-    // transparent where the shell drew nothing, the window surface is opaque -
-    // so the line naming the posture is worth keeping on both.
+    // The overlay that paints above the scene exists on both platforms but is
+    // not the same thing there: Windows uses a DirectComposition visual over
+    // the editor window, and Unix uses a transparent window of its own, posted
+    // above the editor. Both are transparent where the shell drew nothing, and
+    // both take no input of their own, so the two postures read alike from the
+    // frontend's side. The line naming the posture is worth keeping on both.
     #[cfg(not(windows))]
     {
-        info!(
-            target: telemetry_target::EDITOR,
-            "[editor] the composition overlay needs DirectComposition; drawing the UI on the window surface"
-        );
+        match create_floating_overlay(event_loop, instance, adapter, device, size) {
+            Ok(overlay) => return Some(overlay),
+            Err(error) => warn!(
+                target: telemetry_target::EDITOR,
+                error = %error,
+                "[editor] the floating overlay was refused; drawing the UI on the window surface"
+            ),
+        }
         return create_window_overlay(instance, adapter, device, window, size);
     }
     #[cfg(windows)]
@@ -348,6 +355,55 @@ fn create_overlay(
             create_window_overlay(instance, adapter, device, window, size)
         }
     }
+}
+
+/// Build the floating overlay window and its transparent surface.
+///
+/// The window is posted above the editor's and takes no input: it is a
+/// picture of the UI, and every pointer event has to reach the window under
+/// it, which is the editor window or one of the scene viewports. It is
+/// unmanaged by the window manager, because it must sit exactly over the
+/// editor's client area: no decorations, no task list entry, and no movement
+/// of its own. [`EditorWindow::sync_floating_overlay`] keeps it there.
+///
+/// # Errors
+///
+/// Returns the reason, which [`create_overlay`] logs before falling back to
+/// the window surface, when the window cannot be created, cannot be made
+/// transparent to the pointer, or has no premultiplied surface to draw into.
+#[cfg(not(windows))]
+fn create_floating_overlay(
+    event_loop: &ActiveEventLoop,
+    instance: &wgpu::Instance,
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    size: (u32, u32),
+) -> Result<OverlaySurface, OverlayError> {
+    use winit::platform::x11::WindowAttributesExtX11;
+    // Step 1: the window. It starts hidden so the first frame can place it
+    // before it is ever shown, and it is transparent so the scene shows
+    // through wherever the shell drew nothing.
+    let attributes = Window::default_attributes()
+        .with_title("Pill overlay")
+        .with_transparent(true)
+        .with_decorations(false)
+        .with_active(false)
+        .with_visible(false)
+        .with_inner_size(LogicalSize::new(size.0 as f64, size.1 as f64))
+        .with_override_redirect(true);
+    let window = Arc::new(
+        event_loop
+            .create_window(attributes)
+            .map_err(|error| format!("the floating window was refused: {error}"))?,
+    );
+    // Step 2: no input of its own. Without this the overlay would swallow
+    // every click meant for the panels or the viewports under it.
+    window
+        .set_cursor_hittest(false)
+        .map_err(|error| format!("the floating window cannot ignore the pointer: {error}"))?;
+    // Step 3: the surface, which must carry premultiplied alpha; the posture
+    // refuses to exist without it.
+    OverlaySurface::new_floating(instance, adapter, device, window, EDITOR_FORMAT, size)
 }
 
 /// Build the window-surface overlay, logging the refusal that stops it.
@@ -555,6 +611,12 @@ impl ApplicationHandler for EditorApplication {
                 }
                 if is_main {
                     editor.focused = focused;
+                    // The floating overlay is a window of its own and is
+                    // stacked above every window, so it has to go with the
+                    // focus at once: waiting for the next frame would leave it
+                    // over whatever the person switched to, and an unfocused
+                    // editor may not draw a frame for a while.
+                    editor.sync_floating_overlay();
                 }
             }
             other => {

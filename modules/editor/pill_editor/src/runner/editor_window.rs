@@ -25,8 +25,11 @@ use super::*;
 
 /// The editor's window, its host, and everything the frame loop owns.
 pub(super) struct EditorWindow {
-    /// The main window: the shell's UI, and the game view's primary surface
-    /// only when the game window could not be created.
+    /// The main window: the editor's own window, and the game view's primary
+    /// surface only when the game window could not be created. The shell's UI
+    /// is drawn into the overlay, not here: the composition visual on Windows
+    /// and the floating window on Unix, with the window surface as the
+    /// fallback posture.
     pub(super) window: Arc<Window>,
     /// The editor's own GPU device, which draws the UI; the project's
     /// renderer keeps its own device inside the host.
@@ -230,6 +233,10 @@ pub(super) struct EditorWindow {
     pub(super) gizmo_persisted: Option<GizmoSettings>,
     /// Whether the main window currently has focus.
     pub(super) focused: bool,
+    /// The screen position and size the floating overlay window was last
+    /// given, in physical pixels. Only the floating posture has one: it is a
+    /// window of its own, so it has to be moved with the editor by hand.
+    pub(super) overlay_placement: Option<(i32, i32, u32, u32)>,
     /// The main window's client size in physical pixels.
     pub(super) size: (u32, u32),
     /// The window's scale factor: how many physical pixels one logical point
@@ -462,6 +469,7 @@ impl EditorWindow {
         );
         let no_overlay = no_overlay_requested();
         let overlay = create_overlay(
+            event_loop,
             no_overlay,
             &instance,
             &adapter,
@@ -473,6 +481,7 @@ impl EditorWindow {
             info!(
                 target: telemetry_target::EDITOR,
                 window_surface = matches!(overlay.mode(), OverlayMode::Window),
+                floating = matches!(overlay.mode(), OverlayMode::Floating),
                 "[editor] overlay posture"
             );
         }
@@ -683,6 +692,7 @@ impl EditorWindow {
             gizmo_project,
             gizmo_persisted: None,
             focused: true,
+            overlay_placement: None,
             size,
             scale_factor,
             frame_index: 0,

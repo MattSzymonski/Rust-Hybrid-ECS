@@ -21,6 +21,48 @@
 use super::*;
 
 impl EditorWindow {
+    /// Keeps the floating overlay window over the editor's client area.
+    ///
+    /// The overlay is a window of its own, so nothing moves it with the editor
+    /// window: it is placed at the client origin and sized to the client area
+    /// whenever either changes, and it is shown only while the editor is
+    /// focused. An unmanaged window is stacked above every other window, so
+    /// leaving it up while the editor is in the background would paint the UI
+    /// over whatever the person switched to.
+    ///
+    /// Every other posture draws into a window the editor already owns, and
+    /// this does nothing there.
+    pub(super) fn sync_floating_overlay(&mut self) {
+        let Some(window) = self
+            .overlay
+            .as_ref()
+            .and_then(OverlaySurface::floating_window)
+            .cloned()
+        else {
+            return;
+        };
+        // Step 1: the client area's screen origin. A window manager that has
+        // not placed the editor yet reports no inner position, and the frames
+        // before that are drawn at the placement that is still unknown.
+        let Some(origin) = self.window.inner_position().ok() else {
+            return;
+        };
+        // Step 2: move and resize only when something changed, so a still
+        // frame costs nothing beyond the two getters above.
+        let placement = (origin.x, origin.y, self.size.0, self.size.1);
+        if self.overlay_placement != Some(placement) {
+            window.set_outer_position(PhysicalPosition::new(origin.x, origin.y));
+            let _ = window.request_inner_size(PhysicalSize::new(
+                placement.2.max(1),
+                placement.3.max(1),
+            ));
+            self.overlay_placement = Some(placement);
+        }
+        // Step 3: hide it with the editor. `set_visible(true)` also raises an
+        // X11 window, so it comes back above the scene viewports every time.
+        window.set_visible(self.focused);
+    }
+
     /// Handles a resize of the main window, in physical pixels.
     pub(super) fn resize(&mut self, width: u32, height: u32) {
         self.size = (width.max(1), height.max(1));
@@ -690,6 +732,9 @@ impl EditorWindow {
     /// main window's frame is skipped, and creating the composition overlay is
     /// retried.
     pub(super) fn present_ui(&mut self, event_loop: &ActiveEventLoop) {
+        // Step 0: the floating overlay follows the editor window, and the
+        // frame about to be drawn is where it must already be.
+        self.sync_floating_overlay();
         // Step 1: take the shell's frame, or build the runner's own minimal
         // one while no shell module is loaded.
         let frame = {
