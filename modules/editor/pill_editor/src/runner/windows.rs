@@ -898,11 +898,19 @@ impl EditorWindow {
     /// The window-surface posture is never retried: either
     /// `PILL_EDITOR_NO_OVERLAY` asked for it, or it was already taken as the
     /// fallback. The composition overlay is the posture that failed, so it is
-    /// the one worth another attempt.
+    /// the one worth another attempt - and it only exists where
+    /// DirectComposition does, which is Windows.
     pub(super) fn retry_overlay(&mut self) {
         if self.no_overlay {
             return;
         }
+        #[cfg(windows)]
+        self.retry_composition_overlay();
+    }
+
+    /// One attempt at the composition overlay, on the retry schedule.
+    #[cfg(windows)]
+    fn retry_composition_overlay(&mut self) {
         if self.frame_index < self.overlay_retry_frame + 120 {
             return;
         }

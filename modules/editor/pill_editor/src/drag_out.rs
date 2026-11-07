@@ -28,16 +28,33 @@
 //! source whether to continue when input arrives, so a drag started with no
 //! button held would leave the editor frozen until more input arrived.
 //! [`start`] reads the button first and starts no drag.
+//!
+//! # Platforms
+//!
+//! An OLE drag source is what makes a file draggable out of the editor, and it
+//! exists on Windows alone. Everywhere else [`start`] answers
+//! [`DragOutOutcome::Unsupported`] without starting anything, and the runner
+//! logs that once per request; nothing else in the editor is affected. winit
+//! offers no drag source on Unix, so a real implementation would have to speak
+//! XDND or the Wayland data-device protocol itself, which is why the platform
+//! split is here and not in a dependency.
 
 // External crates
+#[cfg(windows)]
 use pill_core::telemetry::telemetry_target;
+#[cfg(windows)]
 use windows::core::implement;
+#[cfg(windows)]
 use windows::Win32::Foundation::{BOOL, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, S_OK};
+#[cfg(windows)]
 use windows::Win32::System::Com::CoTaskMemFree;
+#[cfg(windows)]
 use windows::Win32::System::Ole::{
     DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, DROPEFFECT, DROPEFFECT_COPY,
 };
+#[cfg(windows)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+#[cfg(windows)]
 use windows::Win32::UI::Shell::{SHCreateDataObject, SHParseDisplayName};
 
 // =============================================================================
@@ -45,9 +62,11 @@ use windows::Win32::UI::Shell::{SHCreateDataObject, SHParseDisplayName};
 // =============================================================================
 
 /// The drop source OLE calls while the drag runs.
+#[cfg(windows)]
 #[implement(IDropSource)]
 pub struct EditorDropSource;
 
+#[cfg(windows)]
 impl IDropSource_Impl for EditorDropSource_Impl {
     /// Reports whether the drag goes on, ends in a drop, or is cancelled.
     ///
@@ -84,16 +103,66 @@ impl IDropSource_Impl for EditorDropSource_Impl {
 // =============================================================================
 
 /// How a drag out ended, for the caller's log line.
+///
+/// Every outcome but `Unsupported` is produced by the Windows drag source, so
+/// they are unconstructed where that source does not exist. The runner still
+/// matches on all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum DragOutOutcome {
     /// The drop target took the file under this effect.
-    Dropped(DROPEFFECT),
+    Dropped(DropEffect),
     /// The drag ended with no target taking the file.
     Cancelled,
     /// The pointer button was not held, so no drag was started.
     NoButtonHeld,
-    /// The drag could not be prepared, or OLE refused to run it.
+    /// The platform has no source for a file drag, so nothing was started.
+    Unsupported,
+    /// The drag could not be prepared, or the platform refused to run it.
     Failed,
+}
+
+/// The effect a drop target reported, without naming the platform's own type.
+///
+/// `Ole`'s `DROPEFFECT` exists only where the `windows` crate does, and the
+/// outcome has to be nameable everywhere the runner matches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum DropEffect {
+    /// The target copied the file.
+    Copy,
+    /// The target moved the file.
+    Move,
+    /// The target linked to the file.
+    Link,
+    /// Any other effect, kept as the platform's raw code.
+    Other(u32),
+}
+
+impl DropEffect {
+    /// The platform's raw effect code, which the runner logs.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Copy => 1,
+            Self::Move => 2,
+            Self::Link => 4,
+            Self::Other(code) => code,
+        }
+    }
+
+    /// The effect one raw platform code means.
+    ///
+    /// The codes are the documented `DROPEFFECT` values, which are the same
+    /// numbers the log line has always carried.
+    #[cfg(windows)]
+    fn from_code(code: u32) -> Self {
+        match code {
+            1 => Self::Copy,
+            2 => Self::Move,
+            4 => Self::Link,
+            other => Self::Other(other),
+        }
+    }
 }
 
 // =============================================================================
@@ -101,6 +170,7 @@ pub enum DragOutOutcome {
 // =============================================================================
 
 /// Whether the left button is held right now.
+#[cfg(windows)]
 fn left_button_held() -> bool {
     // SAFETY: `GetAsyncKeyState` takes a virtual-key code, reads no pointer and
     // cannot fail. The high bit of its result is set while the key is held.
@@ -115,6 +185,7 @@ fn left_button_held() -> bool {
 ///
 /// A drag started with no button held is refused rather than run, because the
 /// modal loop would freeze the editor until more input arrived.
+#[cfg(windows)]
 pub fn start(absolute_path: &str) -> DragOutOutcome {
     // Step 1: make sure this thread has OLE, which `DoDragDrop` needs.
     if !initialize_ole() {
@@ -184,9 +255,21 @@ pub fn start(absolute_path: &str) -> DragOutOutcome {
     outcome
 }
 
+/// Hands `absolute_path` to the platform as a file drag.
+///
+/// No platform but Windows gives the editor a drag source it can drive (see
+/// the module docs), so this starts nothing and answers
+/// [`DragOutOutcome::Unsupported`]. The runner logs one line for it and the
+/// asset stays where it is; every other shell feature is unaffected.
+#[cfg(not(windows))]
+pub fn start(_absolute_path: &str) -> DragOutOutcome {
+    DragOutOutcome::Unsupported
+}
+
 /// Runs the modal drag over one prepared data object.
 ///
 /// Blocks in OLE's loop until the drop source ends the drag. The effect OLE
+#[cfg(windows)]
 /// reports is the drop target's answer, and zero means no target took the file.
 fn run_modal_drag(data_object: windows::Win32::System::Com::IDataObject) -> DragOutOutcome {
     let drop_source: IDropSource = EditorDropSource.into();
@@ -213,7 +296,7 @@ fn run_modal_drag(data_object: windows::Win32::System::Com::IDataObject) -> Drag
         // file, or the pointer came up over nothing that takes files.
         DragOutOutcome::Cancelled
     } else {
-        DragOutOutcome::Dropped(effect)
+        DragOutOutcome::Dropped(DropEffect::from_code(effect.0))
     }
 }
 
@@ -222,6 +305,7 @@ fn run_modal_drag(data_object: windows::Win32::System::Com::IDataObject) -> Drag
 /// `DoDragDrop` needs an OLE-initialised thread. The editor's main thread owns
 /// the window, so that is where this runs. A failure leaves drag-out
 /// unavailable and is logged once.
+#[cfg(windows)]
 fn initialize_ole() -> bool {
     use std::sync::OnceLock;
     static INITIALISED: OnceLock<bool> = OnceLock::new();

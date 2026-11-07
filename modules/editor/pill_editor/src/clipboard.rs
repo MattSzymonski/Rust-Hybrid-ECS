@@ -10,37 +10,53 @@
 //!
 //! # Design
 //!
-//! The Win32 code lives here because only this executable names the `windows`
-//! crate. A shared dylib must never carry that crate's large `raw-dylib` import
-//! set. The shell does not touch the OS clipboard. It queues a
-//! `ClipboardRequest` on its `EditorClipboard` resource, and the runner carries
-//! the request out here at the frame boundary. That way no OS clipboard handle
-//! crosses the reload boundary.
+//! The shell does not touch the OS clipboard. It queues a `ClipboardRequest` on
+//! its `EditorClipboard` resource, and the runner carries the request out here
+//! at the frame boundary. That way no OS clipboard handle crosses the reload
+//! boundary.
 //!
-//! The write path and the read path both close the clipboard on every path,
-//! because a clipboard left open blocks every other process.
+//! Each platform carries its own backend below.
 //!
-//! A read is bounded by the size the clipboard reports for the block
-//! (`GlobalSize`), never by the terminator the producer was supposed to write.
-//! Any process can set the registered format. A block with no NUL inside its own
-//! size is therefore refused and logged, instead of being read past its end into
-//! this process's heap.
+//! On Windows the Win32 clipboard is driven directly, and that code lives here
+//! because only this executable names the `windows` crate: a shared dylib must
+//! never carry its large `raw-dylib` import set. The write path and the read
+//! path there both close the clipboard on every path, because a clipboard left
+//! open blocks every other process. A read is bounded by the size the clipboard
+//! reports for the block (`GlobalSize`), never by the terminator the producer
+//! was supposed to write: any process can set the registered format, so a block
+//! with no NUL inside its own size is refused and logged instead of being read
+//! past its end into this process's heap.
+//!
+//! Everywhere else the session's own clipboard tool does the work -
+//! `wl-copy`/`wl-paste` on Wayland, `xclip` on X11 - which keeps a second
+//! clipboard implementation and the display-server libraries one needs out of
+//! this crate. The editor's payload *is* the text, so writing it as plain text
+//! keeps a paste from another editor decodable, exactly as the Windows path
+//! does by writing both formats.
 
 // External crates
+#[cfg(windows)]
 use pill_core::telemetry::telemetry_target;
+#[cfg(windows)]
 use pill_core::warn;
+#[cfg(windows)]
 use windows::core::PCWSTR;
+#[cfg(windows)]
 use windows::Win32::Foundation::{GlobalFree, HGLOBAL, HWND};
+#[cfg(windows)]
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     RegisterClipboardFormatW, SetClipboardData,
 };
+#[cfg(windows)]
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
+#[cfg(windows)]
 use windows::Win32::System::Threading::GetCurrentProcessId;
 
 // Current crate
+#[cfg(windows)]
 use pill_editor_core::clipboard::FORMAT_NAME;
 
 // =============================================================================
@@ -49,13 +65,16 @@ use pill_editor_core::clipboard::FORMAT_NAME;
 
 /// `CF_UNICODETEXT`: the plain-text clipboard format that any application can
 /// read.
+#[cfg(windows)]
 const CF_UNICODETEXT: u32 = 13;
 
 /// How many attempts a read makes to open a busy clipboard before it reports
 /// failure.
+#[cfg(windows)]
 const READ_ATTEMPTS: usize = 10;
 
 /// The pause between clipboard read attempts.
+#[cfg(windows)]
 const READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
 // =============================================================================
@@ -67,6 +86,7 @@ const READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(2
 /// Registering the name is idempotent, so every call returns the same id for
 /// the life of the process and nothing needs caching. `None` means Windows
 /// refused the name.
+#[cfg(windows)]
 fn payload_format_id() -> Option<u32> {
     let name: Vec<u16> = FORMAT_NAME
         .encode_utf16()
@@ -89,6 +109,7 @@ fn payload_format_id() -> Option<u32> {
 /// Returns a message naming the step that failed: registering the editor's
 /// format, opening the clipboard, emptying it, allocating the clipboard block,
 /// or handing that block to the clipboard.
+#[cfg(windows)]
 pub fn write(text: &str) -> Result<(), String> {
     // Step 1: find the editor's own clipboard format and open the clipboard
     // for this process.
@@ -112,6 +133,7 @@ pub fn write(text: &str) -> Result<(), String> {
 /// # Errors
 ///
 /// Returns a message naming the failed step: emptying the clipboard, or one of
+#[cfg(windows)]
 /// the two copies [`set_one`] makes.
 fn write_open(text: &str, format: u32) -> Result<(), String> {
     // SAFETY: the clipboard is open (the caller holds it), which is the
@@ -134,6 +156,7 @@ fn write_open(text: &str, format: u32) -> Result<(), String> {
 /// # Errors
 ///
 /// Returns a message when the block cannot be allocated, when it cannot be
+#[cfg(windows)]
 /// locked, or when the clipboard refuses it.
 fn set_one(text: &str, format: u32) -> Result<(), String> {
     let mut units: Vec<u16> = text.encode_utf16().collect();
@@ -182,6 +205,7 @@ fn set_one(text: &str, format: u32) -> Result<(), String> {
 ///
 /// # Errors
 ///
+#[cfg(windows)]
 /// Returns the message from the last failed attempt when the clipboard cannot
 /// be opened within the retries.
 pub fn read() -> Result<Option<String>, String> {
@@ -221,6 +245,7 @@ pub fn read() -> Result<Option<String>, String> {
 ///
 /// # Errors
 ///
+#[cfg(windows)]
 /// No branch returns an error: the signature carries the type [`read`] passes
 /// on, but every failure here ends in `Ok`.
 fn read_open() -> Result<Option<String>, String> {
@@ -291,6 +316,7 @@ fn read_open() -> Result<Option<String>, String> {
 
 /// Returns the id of this process, which the clipboard log lines carry.
 ///
+#[cfg(windows)]
 /// The write and paste lines name it as `writer =` and `reader =`, so a test
 /// that runs more than one editor can tell which process did each step.
 pub fn process_id() -> u32 {
@@ -299,10 +325,230 @@ pub fn process_id() -> u32 {
 }
 
 // =============================================================================
+// Unix Backend
+// =============================================================================
+
+/// Which direction a clipboard command runs in.
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    /// Copy the text from this process to the clipboard.
+    Write,
+    /// Copy the clipboard's text into this process.
+    Read,
+}
+
+/// Which command-line clipboard this session offers.
+///
+/// A Wayland session gets `wl-copy`/`wl-paste`; an X11 session - or a Wayland
+/// session where the tool is missing - gets `xclip`. `None` means neither is
+/// installed, which every operation reports rather than silently doing nothing.
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardBackend {
+    /// `wl-copy` and `wl-paste` from `wl-clipboard`.
+    Wayland,
+    /// `xclip`, which speaks to any X server, XWayland included.
+    X11,
+}
+
+#[cfg(not(windows))]
+impl ClipboardBackend {
+    /// The program and the arguments it needs for one direction.
+    fn command(self, direction: Direction) -> (&'static str, &'static [&'static str]) {
+        match (self, direction) {
+            (Self::Wayland, Direction::Write) => ("wl-copy", &[]),
+            // Without `--no-newline` a copied payload comes back with a
+            // newline this process never wrote, and the decode fails.
+            (Self::Wayland, Direction::Read) => ("wl-paste", &["--no-newline"]),
+            (Self::X11, Direction::Write) => ("xclip", &["-selection", "clipboard", "-i"]),
+            (Self::X11, Direction::Read) => ("xclip", &["-selection", "clipboard", "-o"]),
+        }
+    }
+}
+
+/// Chooses a backend from what the session declares and what is installed.
+///
+/// Kept apart from the environment lookup so the choice can be tested without
+/// a display server. Wayland wins only when the session says it is one *and*
+/// both of its commands are installed; otherwise the X11 tool is the answer,
+/// because it also works under XWayland.
+#[cfg(not(windows))]
+fn choose_backend(
+    wayland_session: bool,
+    have_wayland_tools: bool,
+    have_xclip: bool,
+) -> Option<ClipboardBackend> {
+    if wayland_session && have_wayland_tools {
+        Some(ClipboardBackend::Wayland)
+    } else if have_xclip {
+        Some(ClipboardBackend::X11)
+    } else {
+        None
+    }
+}
+
+/// The backend this process uses, resolved once per process.
+#[cfg(not(windows))]
+fn backend() -> Option<ClipboardBackend> {
+    static BACKEND: std::sync::OnceLock<Option<ClipboardBackend>> = std::sync::OnceLock::new();
+    *BACKEND.get_or_init(|| {
+        choose_backend(
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            executable_on_path("wl-copy") && executable_on_path("wl-paste"),
+            executable_on_path("xclip"),
+        )
+    })
+}
+
+/// Whether `name` names an executable file on `PATH`.
+#[cfg(not(windows))]
+fn executable_on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| {
+            std::fs::metadata(directory.join(name)).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+    })
+}
+
+/// Puts `text` on the session's clipboard as plain text.
+///
+/// The text carries the editor's payload, so a paste from another editor
+/// decodes and a paste from a text editor reads the payload text - which is
+/// what the Windows path produces too, where the same text goes to both the
+/// editor's format and the plain-text one.
+///
+/// # Errors
+///
+/// Returns a message naming the tool when no clipboard tool is installed, when
+/// it cannot be started, or when it reports a failure.
+#[cfg(not(windows))]
+pub fn write(text: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let backend = backend().ok_or_else(no_clipboard_tool_message)?;
+    let (program, arguments) = backend.command(Direction::Write);
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        // Neither stream is inherited: `wl-copy` forks the process that serves
+        // the selection, and a pipe it inherited would keep this call waiting
+        // for the whole selection instead of for the write.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("{program}: {error}"))?;
+    // The tool finishes reading when the pipe closes, so the handle is dropped
+    // as soon as the text is in it.
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|error| format!("{program}: {error}"))?;
+    }
+    let status = child.wait().map_err(|error| format!("{program}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} exited with {status}"))
+    }
+}
+
+/// Returns the text the session's clipboard carries.
+///
+/// `Ok(None)` means nothing usable was there: the selection is empty, or its
+/// owner offers no text. Both tools report that as a failed exit, which is why
+/// a failed exit reads as "nothing" instead of as an error - the runner shows
+/// its empty-clipboard notice for it.
+///
+/// # Errors
+///
+/// Returns a message naming the tool only when it cannot be started at all.
+#[cfg(not(windows))]
+pub fn read() -> Result<Option<String>, String> {
+    use std::process::{Command, Stdio};
+
+    let Some(backend) = backend() else {
+        return Ok(None);
+    };
+    let (program, arguments) = backend.command(Direction::Read);
+    let output = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("{program}: {error}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok((!text.is_empty()).then_some(text))
+}
+
+/// Returns the id of this process, which the clipboard log lines carry.
+///
+/// The write and paste lines name it as `writer =` and `reader =`, so a test
+/// that runs more than one editor can tell which process did each step.
+#[cfg(not(windows))]
+pub fn process_id() -> u32 {
+    std::process::id()
+}
+
+/// The refusal both directions report when neither clipboard tool is
+/// installed. Named once so the write and the read paths cannot drift apart.
+#[cfg(not(windows))]
+fn no_clipboard_tool_message() -> String {
+    "no clipboard tool installed: wl-clipboard (`wl-copy`/`wl-paste`) for Wayland, `xclip` for X11"
+        .to_string()
+}
+
+// =============================================================================
+// Unix Tests
+// =============================================================================
+
+#[cfg(all(test, not(windows)))]
+mod unix_tests {
+    use super::{choose_backend, ClipboardBackend};
+
+    /// The choice follows the session first and the installed tools second.
+    ///
+    /// A Wayland session without `wl-clipboard` still gets a clipboard through
+    /// `xclip` under XWayland; a session with no tool at all reports `None` so
+    /// the paste path can say why it did nothing.
+    #[test]
+    fn the_backend_follows_the_session_and_the_installed_tools() {
+        assert_eq!(
+            choose_backend(true, true, false),
+            Some(ClipboardBackend::Wayland),
+            "a Wayland session with wl-clipboard uses it"
+        );
+        assert_eq!(
+            choose_backend(true, false, true),
+            Some(ClipboardBackend::X11),
+            "XWayland's xclip is the fallback in a Wayland session"
+        );
+        assert_eq!(
+            choose_backend(false, true, true),
+            Some(ClipboardBackend::X11),
+            "an X11 session never uses the Wayland tools"
+        );
+        assert_eq!(
+            choose_backend(true, false, false),
+            None,
+            "no installed tool leaves no backend"
+        );
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

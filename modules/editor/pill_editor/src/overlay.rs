@@ -31,6 +31,9 @@
 use std::sync::Arc;
 
 // External crates
+// Only the composition path logs through the editor target; the window-surface
+// posture has nothing to report, so the import is platform-gated too.
+#[cfg(windows)]
 use pill_core::telemetry::telemetry_target;
 use pill_editor_core::egui::epaint::ClippedPrimitive;
 use pill_editor_core::egui::TexturesDelta;
@@ -58,7 +61,11 @@ const WINDOW_CLEAR: wgpu::Color = wgpu::Color {
 pub type OverlayError = String;
 
 /// Where the UI's pixels go.
+///
+/// `Composition` is only ever constructed by the Windows posture, so it is
+/// unconstructed elsewhere while the runner keeps matching on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum OverlayMode {
     /// The composition visual above the scene: transparent where the shell
     /// drew nothing, so the scene shows through the UI's gaps.
@@ -98,12 +105,17 @@ pub struct OverlaySurface {
 impl OverlaySurface {
     /// Create the composition overlay for `window`.
     ///
+    /// DirectComposition and the `CompositionVisual` surface target wgpu takes
+    /// from it are Windows-only, so this posture exists there alone; every
+    /// other platform starts in [`Self::new_window`] instead.
+    ///
     /// # Errors
     ///
     /// Returns the reason, which the executable logs, when the adapter is not
     /// DX12, when the composition tree cannot be built or committed, when the
     /// surface cannot be created from the visual, or when the swapchain cannot
     /// carry the given format and premultiplied alpha.
+    #[cfg(windows)]
     pub fn new(
         instance: &wgpu::Instance,
         adapter: &wgpu::Adapter,

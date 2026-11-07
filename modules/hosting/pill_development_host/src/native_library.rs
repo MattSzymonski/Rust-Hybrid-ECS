@@ -41,6 +41,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 // External crates
+#[cfg(not(windows))]
+use libloading::os::unix as unix_loader;
 #[cfg(windows)]
 use libloading::os::windows as windows_loader;
 use libloading::{Library, Symbol};
@@ -123,6 +125,15 @@ fn engine_dylib_stem(library_name: &str) -> Option<&'static str> {
 fn engine_dylib_staging_steers_the_loader() -> bool {
     cfg!(windows)
 }
+
+/// Engine dylibs this process loaded from the module world because the host
+/// binary does not link them.
+///
+/// They stay mapped for the life of the process: module code holds raw
+/// pointers and vtables into them, so unloading one would leave those
+/// dangling. The `OnceLock` owns the handles rather than leaking them.
+#[cfg(not(windows))]
+static PRELOADED_ENGINE_DYLIB: std::sync::OnceLock<Vec<Library>> = std::sync::OnceLock::new();
 
 /// Directory, under the workspace root, where temporary native-library copies
 /// are stored.
@@ -572,6 +583,99 @@ fn module_world_engine_dylib(workspace_root: &Path, stem: &str) -> Option<PathBu
     built_library_path.is_file().then_some(built_library_path)
 }
 
+/// The engine dylibs this process already has mapped.
+///
+/// The executable names some in its own `DT_NEEDED`, and those name others, so
+/// the set is walked through the host's build tree rather than read off one
+/// table. Only engine dylibs are followed: nothing else can be preloaded here,
+/// and stopping at them keeps the walk to a handful of files.
+#[cfg(not(windows))]
+fn mapped_engine_dylibs(workspace_root: &Path) -> HashSet<&'static str> {
+    let host_directory = workspace_root.join(crate::config::host_target_directory());
+    let mut mapped = HashSet::new();
+    let mut pending: Vec<String> = std::env::current_exe()
+        .ok()
+        .and_then(|executable| crate::native_binary::needed_libraries(&executable))
+        .unwrap_or_default();
+    while let Some(library_name) = pending.pop() {
+        let Some(stem) = engine_dylib_stem(&library_name) else {
+            continue;
+        };
+        if !mapped.insert(stem) {
+            continue;
+        }
+        // An engine dylib names the ones below it, which were mapped with it.
+        if let Some(libraries) =
+            crate::native_binary::needed_libraries(&host_directory.join(&library_name))
+        {
+            pending.extend(libraries);
+        }
+    }
+    mapped
+}
+
+/// Loads the module-world engine dylibs the host binary does not link.
+///
+/// A module's `DT_NEEDED` reaches every engine dylib it was linked against,
+/// while the host binary links only the ones its own frontend needs: a project
+/// that draws its own egui names `pill_project_ui`, which the editor never
+/// links. That dylib is in no link map at all, so the loader would search the
+/// host's target directory for it, where cargo never wrote a copy - the module
+/// build is the only thing that produces one.
+///
+/// Loading the module build's copy here, by path and with `RTLD_GLOBAL`, puts it
+/// in the scope the module's entry is resolved against. A Rust cdylib carries a
+/// `DT_SONAME` equal to its file name, which is what makes the name match.
+///
+/// Best effort: a copy that cannot be loaded is logged and left to the
+/// diagnosis, which names the two builds it compared.
+#[cfg(not(windows))]
+fn preload_unmapped_engine_dylibs(workspace_root: &Path) {
+    PRELOADED_ENGINE_DYLIB.get_or_init(|| {
+        let mapped = mapped_engine_dylibs(workspace_root);
+        let mut preloaded = Vec::new();
+        for stem in ENGINE_DYLIB_STEMS {
+            if mapped.contains(stem) {
+                continue;
+            }
+            let Some(module_engine) = module_world_engine_dylib(workspace_root, stem) else {
+                continue;
+            };
+            // SAFETY: `module_engine` is a dylib this workspace's module build
+            // just wrote, opened by absolute path. `RTLD_NOW` resolves its own
+            // imports eagerly, and `RTLD_GLOBAL` puts it in the scope a later
+            // module's `DT_NEEDED` entry is resolved against. The handle is
+            // owned by the vector the `OnceLock` holds, so it outlives every
+            // module that resolves against it.
+            let loaded = unsafe {
+                unix_loader::Library::open(
+                    Some(module_engine.as_os_str()),
+                    unix_loader::RTLD_GLOBAL | unix_loader::RTLD_NOW,
+                )
+            };
+            match loaded {
+                Ok(library) => {
+                    debug!(
+                        target: telemetry_target::HOT_RELOAD,
+                        stem,
+                        path = %module_engine.display(),
+                        "preloaded an engine dylib this host does not link"
+                    );
+                    preloaded.push(Library::from(library));
+                }
+                Err(error) => warn!(
+                    target: telemetry_target::HOT_RELOAD,
+                    stem,
+                    path = %module_engine.display(),
+                    %error,
+                    "an engine dylib this host does not link could not be preloaded"
+                ),
+            }
+        }
+        preloaded
+    });
+}
+
 /// Byte equality for two native library files.
 ///
 /// The length is checked first, because both files are multi-megabyte engine
@@ -958,6 +1062,13 @@ impl NativeLibrary {
         if isolated_engine {
             stage_module_engine_dylib(workspace_root, &generation_directory);
         }
+
+        // Step 2c: an engine dylib the host binary does not link is in no link
+        // map at all, so the loader would look for it in the host's target
+        // directory, where cargo never put a copy. Load the module build's
+        // copy first, which registers it under the SONAME the module names.
+        #[cfg(not(windows))]
+        preload_unmapped_engine_dylibs(workspace_root);
 
         // Step 3: Load the copy and validate its required exports.
         let load_started = Instant::now();

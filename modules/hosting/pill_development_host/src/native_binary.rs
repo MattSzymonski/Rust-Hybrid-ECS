@@ -53,6 +53,16 @@ const SECTION_TYPE_DYNAMIC: u32 = 6;
 /// `SHT_DYNSYM`: the dynamic symbol table.
 const SECTION_TYPE_DYNAMIC_SYMBOLS: u32 = 11;
 
+/// Bytes of the fixed ELF header this reader takes: the 64-bit header, which
+/// is the longer of the two.
+const ELF_HEADER_LENGTH: usize = 64;
+
+/// The largest table [`needed_libraries`] will read in one piece.
+///
+/// The tables it reads are kilobytes in every real image; the bound only keeps
+/// a damaged header from asking for an allocation the size of the file.
+const MAX_TABLE_BYTES: usize = 8 * 1024 * 1024;
+
 /// `DT_NEEDED`: a string-table offset holding one dependency's name.
 const DYNAMIC_TAG_NEEDED: i64 = 1;
 /// `DT_NULL`: the end of the dynamic table.
@@ -258,19 +268,10 @@ fn parse_elf(image_bytes: &[u8]) -> Option<ElfImage> {
     // Step 1: Identification, class and byte order. The shortest header this
     // reader reads a field from is the 32-bit one, so a file below that size
     // cannot be an image.
-    if image_bytes.len() < 0x34 || image_bytes[0..4] != ELF_MAGIC {
+    if image_bytes.len() < 0x34 {
         return None;
     }
-    let is_64_bit = match image_bytes[4] {
-        ELF_CLASS_64 => true,
-        ELF_CLASS_32 => false,
-        _ => return None,
-    };
-    let little_endian = match image_bytes[5] {
-        ELF_DATA_LITTLE_ENDIAN => true,
-        ELF_DATA_BIG_ENDIAN => false,
-        _ => return None,
-    };
+    let (is_64_bit, little_endian) = elf_identity(image_bytes)?;
     let reader = ByteReader {
         bytes: image_bytes,
         little_endian,
@@ -279,19 +280,8 @@ fn parse_elf(image_bytes: &[u8]) -> Option<ElfImage> {
     // Step 2: Locate the section table. `e_shnum == 0` means the real count sits
     // in section 0's `sh_size`, which only an image with more than 65,279
     // sections needs; such an image is refused rather than read wrongly.
-    let (section_table_offset, declared_entry_size, section_count) = if is_64_bit {
-        (
-            usize::try_from(reader.u64(0x28)?).ok()?,
-            usize::from(reader.u16(0x3a)?),
-            usize::from(reader.u16(0x3c)?),
-        )
-    } else {
-        (
-            usize::try_from(reader.u32(0x20)?).ok()?,
-            usize::from(reader.u16(0x2e)?),
-            usize::from(reader.u16(0x30)?),
-        )
-    };
+    let (section_table_offset, declared_entry_size, section_count) =
+        section_table_location(&reader, is_64_bit)?;
     let minimum_entry_size = if is_64_bit {
         SECTION_ENTRY_SIZE_64
     } else {
@@ -307,38 +297,15 @@ fn parse_elf(image_bytes: &[u8]) -> Option<ElfImage> {
         return None;
     }
 
-    // Step 3: One section header by index, with the fields this reader uses.
-    // The field offsets differ between the two classes; the 64-bit section
-    // header is 64 bytes, the 32-bit one is 40.
+    // Step 3: One section header by index.
     let section_at = |index: usize| -> Option<SectionHeader> {
-        let header_offset = section_table_offset.checked_add(index.checked_mul(declared_entry_size)?)?;
-        if header_offset.checked_add(minimum_entry_size)? > image_bytes.len() {
-            return None;
-        }
-        let (section_type, offset, size, link, entry_size) = if is_64_bit {
-            (
-                reader.u32(header_offset)?,
-                usize::try_from(reader.u64(header_offset.checked_add(0x18)?)?).ok()?,
-                usize::try_from(reader.u64(header_offset.checked_add(0x20)?)?).ok()?,
-                usize::try_from(reader.u32(header_offset.checked_add(0x28)?)?).ok()?,
-                usize::try_from(reader.u64(header_offset.checked_add(0x38)?)?).ok()?,
-            )
-        } else {
-            (
-                reader.u32(header_offset)?,
-                usize::try_from(reader.u32(header_offset.checked_add(0x10)?)?).ok()?,
-                usize::try_from(reader.u32(header_offset.checked_add(0x14)?)?).ok()?,
-                usize::try_from(reader.u32(header_offset.checked_add(0x18)?)?).ok()?,
-                usize::try_from(reader.u32(header_offset.checked_add(0x24)?)?).ok()?,
-            )
-        };
-        Some(SectionHeader {
-            section_type,
-            offset,
-            size,
-            link,
-            entry_size,
-        })
+        section_header_at(
+            &reader,
+            section_table_offset,
+            declared_entry_size,
+            index,
+            is_64_bit,
+        )
     };
 
     // Step 4: Find the two sections that hold the answer. A shared library has
@@ -381,28 +348,23 @@ fn parse_elf(image_bytes: &[u8]) -> Option<ElfImage> {
             else {
                 break;
             };
-            let (tag, value) = if is_64_bit {
-                (reader.i64(entry_offset), reader.u64(entry_offset.checked_add(8)?))
-            } else {
-                (
-                    reader.i32(entry_offset).map(i64::from),
-                    reader.u32(entry_offset.checked_add(4)?).map(u64::from),
-                )
+            let Some((tag, value)) = dynamic_entry(&reader, is_64_bit, entry_offset) else {
+                break;
             };
-            match (tag, value) {
-                (Some(DYNAMIC_TAG_NULL), _) => break,
-                (Some(DYNAMIC_TAG_NEEDED), Some(value)) => {
-                    let Some(string_table) = string_table else {
-                        break;
-                    };
-                    let Some(name_offset) = usize::try_from(value).ok() else {
-                        continue;
-                    };
-                    if let Some(name) = string_at(&reader, string_table, name_offset) {
-                        libraries.push(name);
-                    }
-                }
-                _ => {}
+            if tag == DYNAMIC_TAG_NULL {
+                break;
+            }
+            if tag != DYNAMIC_TAG_NEEDED {
+                continue;
+            }
+            let Some(string_table) = string_table else {
+                break;
+            };
+            let Some(name_offset) = usize::try_from(value).ok() else {
+                continue;
+            };
+            if let Some(name) = string_at(&reader, string_table, name_offset) {
+                libraries.push(name);
             }
         }
     }
@@ -495,6 +457,242 @@ fn parse_elf(image_bytes: &[u8]) -> Option<ElfImage> {
     })
 }
 
+/// The libraries `path` names as dependencies, without reading its symbols.
+///
+/// [`inspect`] reads the whole file and every dynamic symbol, which a diagnosis
+/// can afford and a load path cannot: the editor's own binary is hundreds of
+/// megabytes, and so is its shared core. Here only the fixed header, the section
+/// table, the dynamic table and the few bytes each dependency name occupies are
+/// read - kilobytes - which is everything a `DT_NEEDED` entry needs.
+///
+/// The PE side reuses the analytics reader, which reads the image; it is only
+/// reached on a Windows host, where the caller that needs this fast path does
+/// not run.
+pub(crate) fn needed_libraries(path: &Path) -> Option<Vec<String>> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    /// Longest dependency name read from a string table.
+    ///
+    /// No loader accepts a longer one - the format's own limit is 255 bytes -
+    /// and a short read keeps this from depending on how large the surrounding
+    /// string table is: a debug build's `.dynstr` can pass eight megabytes.
+    const MAX_DEPENDENCY_NAME: usize = 1024;
+
+    /// Reads `length` bytes at `offset`.
+    fn read_at(file: &mut std::fs::File, offset: u64, length: usize) -> Option<Vec<u8>> {
+        let mut buffer = vec![0u8; length];
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        file.read_exact(&mut buffer).ok()?;
+        Some(buffer)
+    }
+
+    // Step 1: Identify the file from its first bytes.
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).ok()?;
+    if magic[0..2] == *b"MZ" {
+        return crate::analytics::inspect_pe(path).map(|inspection| inspection.import_dlls);
+    }
+    if magic != ELF_MAGIC {
+        return None;
+    }
+
+    // Step 2: The fixed header, then the section table it points at.
+    let header = read_at(&mut file, 0, ELF_HEADER_LENGTH)?;
+    let (is_64_bit, little_endian) = elf_identity(&header)?;
+    let header_reader = ByteReader {
+        bytes: &header,
+        little_endian,
+    };
+    let (section_table_offset, section_entry_size, section_count) =
+        section_table_location(&header_reader, is_64_bit)?;
+    let table_length = section_entry_size.checked_mul(section_count)?;
+    if table_length > MAX_TABLE_BYTES {
+        return None;
+    }
+    let section_table = read_at(&mut file, section_table_offset as u64, table_length)?;
+    let table_reader = ByteReader {
+        bytes: &section_table,
+        little_endian,
+    };
+    let section_at =
+        |index: usize| section_header_at(&table_reader, 0, section_entry_size, index, is_64_bit);
+
+    // Step 3: The dynamic table, whose `DT_NEEDED` entries name the dependencies
+    // from a string table this reader never loads whole.
+    let mut dynamic_section: Option<SectionHeader> = None;
+    for index in 1..section_count {
+        let Some(section) = section_at(index) else {
+            break;
+        };
+        if section.section_type == SECTION_TYPE_DYNAMIC {
+            dynamic_section = Some(section);
+            break;
+        }
+    }
+    let dynamic_section = dynamic_section?;
+    let string_section = section_at(dynamic_section.link)?;
+    if dynamic_section.size > MAX_TABLE_BYTES {
+        return None;
+    }
+    let dynamic_table = read_at(
+        &mut file,
+        dynamic_section.offset as u64,
+        dynamic_section.size,
+    )?;
+    let dynamic_reader = ByteReader {
+        bytes: &dynamic_table,
+        little_endian,
+    };
+    let entry_size = resolved_entry_size(
+        dynamic_section.entry_size,
+        if is_64_bit {
+            DYNAMIC_ENTRY_SIZE_64
+        } else {
+            DYNAMIC_ENTRY_SIZE_32
+        },
+    );
+    if entry_size == 0 {
+        return None;
+    }
+    let mut libraries = Vec::new();
+    for index in 0..dynamic_section.size / entry_size {
+        let Some(entry_offset) = index.checked_mul(entry_size) else {
+            break;
+        };
+        let Some((tag, value)) = dynamic_entry(&dynamic_reader, is_64_bit, entry_offset) else {
+            break;
+        };
+        if tag == DYNAMIC_TAG_NULL {
+            break;
+        }
+        if tag != DYNAMIC_TAG_NEEDED {
+            continue;
+        }
+        let Ok(name_offset) = usize::try_from(value) else {
+            continue;
+        };
+        // One string, bounded by the table it lives in and by the name limit.
+        let Some(name_start) = string_section.offset.checked_add(name_offset) else {
+            continue;
+        };
+        let Some(remaining) = string_section.size.checked_sub(name_offset) else {
+            continue;
+        };
+        let Some(bytes) = read_at(&mut file, name_start as u64, remaining.min(MAX_DEPENDENCY_NAME))
+        else {
+            continue;
+        };
+        let length = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        libraries.push(String::from_utf8_lossy(&bytes[..length]).into_owned());
+    }
+    Some(libraries)
+}
+
+/// `EI_CLASS` and `EI_DATA`: whether the image is 64-bit, and its byte order.
+fn elf_identity(header: &[u8]) -> Option<(bool, bool)> {
+    if header.len() < 6 || header[0..4] != ELF_MAGIC {
+        return None;
+    }
+    let is_64_bit = match header[4] {
+        ELF_CLASS_64 => true,
+        ELF_CLASS_32 => false,
+        _ => return None,
+    };
+    let little_endian = match header[5] {
+        ELF_DATA_LITTLE_ENDIAN => true,
+        ELF_DATA_BIG_ENDIAN => false,
+        _ => return None,
+    };
+    Some((is_64_bit, little_endian))
+}
+
+/// `e_shoff`, `e_shentsize` and `e_shnum`, read from an image header.
+fn section_table_location(
+    reader: &ByteReader<'_>,
+    is_64_bit: bool,
+) -> Option<(usize, usize, usize)> {
+    if is_64_bit {
+        Some((
+            usize::try_from(reader.u64(0x28)?).ok()?,
+            usize::from(reader.u16(0x3a)?),
+            usize::from(reader.u16(0x3c)?),
+        ))
+    } else {
+        Some((
+            usize::try_from(reader.u32(0x20)?).ok()?,
+            usize::from(reader.u16(0x2e)?),
+            usize::from(reader.u16(0x30)?),
+        ))
+    }
+}
+
+/// One section header at `index`, through `reader` whose byte 0 is the section
+/// table's first entry.
+fn section_header_at(
+    reader: &ByteReader<'_>,
+    table_offset: usize,
+    entry_size: usize,
+    index: usize,
+    is_64_bit: bool,
+) -> Option<SectionHeader> {
+    let minimum_entry_size = if is_64_bit {
+        SECTION_ENTRY_SIZE_64
+    } else {
+        SECTION_ENTRY_SIZE_32
+    };
+    let header_offset = table_offset.checked_add(index.checked_mul(entry_size)?)?;
+    if header_offset.checked_add(minimum_entry_size)? > reader.bytes.len() {
+        return None;
+    }
+    let (section_type, offset, size, link, entry_size) = if is_64_bit {
+        (
+            reader.u32(header_offset.checked_add(4)?)?,
+            usize::try_from(reader.u64(header_offset.checked_add(0x18)?)?).ok()?,
+            usize::try_from(reader.u64(header_offset.checked_add(0x20)?)?).ok()?,
+            usize::try_from(reader.u32(header_offset.checked_add(0x28)?)?).ok()?,
+            usize::try_from(reader.u64(header_offset.checked_add(0x38)?)?).ok()?,
+        )
+    } else {
+        (
+            reader.u32(header_offset.checked_add(4)?)?,
+            usize::try_from(reader.u32(header_offset.checked_add(0x10)?)?).ok()?,
+            usize::try_from(reader.u32(header_offset.checked_add(0x14)?)?).ok()?,
+            usize::try_from(reader.u32(header_offset.checked_add(0x18)?)?).ok()?,
+            usize::try_from(reader.u32(header_offset.checked_add(0x24)?)?).ok()?,
+        )
+    };
+    Some(SectionHeader {
+        section_type,
+        offset,
+        size,
+        link,
+        entry_size,
+    })
+}
+
+/// One `(tag, value)` dynamic-table entry at `entry_offset`.
+fn dynamic_entry(
+    reader: &ByteReader<'_>,
+    is_64_bit: bool,
+    entry_offset: usize,
+) -> Option<(i64, u64)> {
+    if is_64_bit {
+        Some((
+            reader.i64(entry_offset)?,
+            reader.u64(entry_offset.checked_add(8)?)?,
+        ))
+    } else {
+        Some((
+            reader.i32(entry_offset).map(i64::from)?,
+            reader.u32(entry_offset.checked_add(4)?).map(u64::from)?,
+        ))
+    }
+}
+
 /// The entry size a section actually uses.
 ///
 /// A section is allowed to declare `sh_entsize == 0`, which means "one entry";
@@ -576,6 +774,11 @@ mod tests {
     }
 
     /// Writes one 64-bit section header at `index`, type and body.
+    ///
+    /// `sh_name` is given the offset of the first real string rather than zero:
+    /// a reader that mistook the name field for the type would then see `1`
+    /// instead of a section type and find nothing, which is what makes this
+    /// fixture able to catch a wrong field offset.
     fn write_section_header(
         image: &mut [u8],
         index: usize,
@@ -586,7 +789,8 @@ mod tests {
         entry_size: u64,
     ) {
         let header = SECTION_TABLE_OFFSET as usize + index * 64;
-        write_u32(image, header, section_type);
+        write_u32(image, header, DEPENDENCY_NAME_OFFSET);
+        write_u32(image, header + 4, section_type);
         write_u64(image, header + 0x18, u64::from(offset));
         write_u64(image, header + 0x20, u64::from(size));
         write_u32(image, header + 0x28, link);
@@ -682,5 +886,20 @@ mod tests {
         assert_eq!(inspection.required_symbols, vec!["imported_symbol"]);
         assert_eq!(inspection.exported_symbols, vec!["exported_symbol"]);
         assert!(inspection.imports.is_empty());
+    }
+
+    /// The dependency-only reader answers from the same image.
+    ///
+    /// It reads the header, the section table and the dynamic table, never the
+    /// symbol table: a load path runs this on files hundreds of megabytes long.
+    #[test]
+    fn dependencies_are_read_without_the_symbol_table() {
+        let directory = ScratchDirectory::new("native_binary_needed");
+        let path = directory.write("libsample.so", synthetic_elf_image());
+
+        assert_eq!(
+            super::needed_libraries(&path),
+            Some(vec!["libc.so.6".to_string()])
+        );
     }
 }

@@ -247,6 +247,20 @@ fn create_overlay(
         );
         return create_window_overlay(instance, adapter, device, window, size);
     }
+    // The composition overlay is a DirectComposition visual, which exists on
+    // Windows alone; there the window surface is the fallback, and everywhere
+    // else it is the only posture. The two differ visibly - composition is
+    // transparent where the shell drew nothing, the window surface is opaque -
+    // so the line naming the posture is worth keeping on both.
+    #[cfg(not(windows))]
+    {
+        info!(
+            target: telemetry_target::EDITOR,
+            "[editor] the composition overlay needs DirectComposition; drawing the UI on the window surface"
+        );
+        return create_window_overlay(instance, adapter, device, window, size);
+    }
+    #[cfg(windows)]
     match OverlaySurface::new(
         instance,
         adapter,
@@ -2844,7 +2858,7 @@ impl EditorWindow {
             crate::drag_out::DragOutOutcome::Dropped(effect) => info!(
                 target: telemetry_target::EDITOR,
                 path = %absolute.display(),
-                effect = effect.0,
+                effect = effect.code(),
                 "[editor] drag out finished"
             ),
             crate::drag_out::DragOutOutcome::Cancelled => info!(
@@ -2858,6 +2872,12 @@ impl EditorWindow {
                 target: telemetry_target::EDITOR,
                 path = %absolute.display(),
                 "[editor] drag out skipped: no button held"
+            ),
+            // Only the Windows shell hands a file to the OS as a drag source.
+            crate::drag_out::DragOutOutcome::Unsupported => info!(
+                target: telemetry_target::EDITOR,
+                path = %absolute.display(),
+                "[editor] drag out skipped: this platform has no file drag source"
             ),
             crate::drag_out::DragOutOutcome::Failed => {}
         }
@@ -4133,6 +4153,10 @@ fn open_in_file_manager(target: &std::path::Path) {
 /// same path can read `res/materials/unlit.material` on Windows, where
 /// Explorer's `/select,` rejects it and opens the user's Documents folder
 /// instead.
+///
+/// Only the Windows reveal path and its test build the string, so the helper
+/// is compiled there and under `test`.
+#[cfg(any(windows, test))]
 fn native_path(target: &std::path::Path) -> std::path::PathBuf {
     target.components().collect()
 }

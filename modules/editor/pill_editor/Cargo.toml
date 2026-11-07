@@ -29,30 +29,14 @@ pill_development_host = { path = "../../hosting/pill_development_host", default-
 ] }
 # The window and event loop: only frontends link winit.
 winit = "0.30"
-# The composition overlay and the popup placement (Stage 21, D23/D24): the
-# DirectComposition device, target and visual that put the overlay above the
-# scene's child window, and the monitor work area the popups flip inside.
-# Pinned to the version wgpu-hal's DX12 backend uses, so the visual pointer
-# it takes and the one this crate hands it are the same COM interface. Only
-# this executable names the `windows` crate: its large raw-dylib import set
-# must never reach a shared dylib (AGENTS.md).
-windows = { version = "0.58", features = [
-    "implement",
-    "Win32_Foundation",
-    "Win32_Graphics_DirectComposition",
-    "Win32_System_Com",
-    "Win32_System_DataExchange",
-    "Win32_System_Memory",
-    "Win32_System_Ole",
-    "Win32_System_SystemServices",
-    "Win32_System_Threading",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_Shell",
-    "Win32_UI_Shell_Common",
-] }
-# The `#[implement]` macro's generated code names `windows_core` directly, so
-# the crate it lives in has to be nameable here.
-windows-core = "0.58"
+# The `windows` crate is a Windows-target dependency: its `Win32` modules and
+# the `#[implement]`/`windows_core` machinery do not exist on another target,
+# where it compiles to an empty stub. The clipboard, the OLE drag-out and the
+# DirectComposition overlay are the three places that name it, and each has a
+# per-platform implementation (`clipboard.rs`, `drag_out.rs`, `overlay.rs`).
+# It is declared at the bottom of this file, for the Windows target alone.
+# Only this executable names the `windows` crate: its large raw-dylib import
+# set must never reach a shared dylib (AGENTS.md).
 # winit's keyboard and mouse events as engine input events, shared with the
 # standalone.
 pill_input = { path = "../../frontends/pill_input", features = ["winit"] }
@@ -80,3 +64,27 @@ pill_editor_core = { path = "../pill_editor_core" }
 pill_ui_theme = { path = "../../ui/pill_ui_theme" }
 # The asset settings documents the Inspector's asset rows edit are JSON.
 serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+# The composition overlay and the popup placement (Stage 21, D23/D24): the
+# DirectComposition device, target and visual that put the overlay above the
+# scene's child window, and the monitor work area the popups flip inside.
+# Pinned to the version wgpu-hal's DX12 backend uses, so the visual pointer
+# it takes and the one this crate hands it are the same COM interface.
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Graphics_DirectComposition",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }
+# The `#[implement]` macro's generated code names `windows_core` directly, so
+# the crate it lives in has to be nameable here.
+windows-core = "0.58"

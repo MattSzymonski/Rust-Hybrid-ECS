@@ -85,6 +85,10 @@ pub(super) struct EditorWindow {
     pub(super) no_overlay: bool,
     /// The frame index of the last overlay creation attempt, so the next
     /// retry waits 120 frames from it.
+    ///
+    /// Only the composition overlay is retried, and it is Windows-only, so the
+    /// bookkeeping is compiled there alone.
+    #[cfg(windows)]
     pub(super) overlay_retry_frame: u64,
     /// The editor's fallback context, used while no shell module is loaded.
     pub(super) fallback_context: egui::Context,
@@ -415,11 +419,17 @@ impl EditorWindow {
         let scale_factor = window.scale_factor() as f32;
         // Step 2: the editor's own instance, adapter and device. The UI is
         // drawn through the overlay surface - composition, or the window
-        // surface when composition is refused - and composition is DX12-only,
-        // so the editor's instance asks for DX12 alone. The project's renderer
-        // keeps its own instance inside the host.
+        // surface when composition is refused. Composition is DirectComposition
+        // over DX12, so that posture exists on Windows alone and only there
+        // does the editor's instance ask for DX12; on every other platform the
+        // window surface is the posture and the instance takes the platform's
+        // own backends. The project's renderer keeps its own instance inside
+        // the host.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            #[cfg(windows)]
             backends: wgpu::Backends::DX12,
+            #[cfg(not(windows))]
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -612,6 +622,7 @@ impl EditorWindow {
             egui_renderer,
             overlay,
             no_overlay,
+            #[cfg(windows)]
             overlay_retry_frame: 0,
             fallback_context: {
                 // The fallback draws the same theme as the shell, so a
