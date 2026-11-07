@@ -4,13 +4,16 @@ This script is the complete Markdown documentation pipeline. It first runs
 ``generate_documentation.py --json`` with Cargo's target directory redirected
 to an automatically cleaned temporary folder, then converts the generated JSON:
 
-    python devops/docs/generate_documentation_markdown.py
+    python devops/tools/generate_documentation_markdown.py
 
 The converter validates and renders every temporary JSON input before deleting
-any existing reference output. It then purges the hardcoded reference directory
-and writes a rustdoc-style Markdown tree: crate/module ``index.md`` files and
-one page per named API item. Temporary Cargo artifacts and JSON files are
-removed automatically when the script finishes or fails.
+any existing output. It then purges its default output directory and writes a
+rustdoc-style Markdown tree there: crate/module ``index.md`` files and one page
+per named API item, plus the VitePress sidebar module inside the tree. All of
+it defaults to the repository's gitignored ``local/docs_build/reference/``
+folder; copying that folder into a website checkout is a separate, deliberate
+step. Temporary Cargo artifacts and JSON files are removed automatically when
+the script finishes or fails.
 
 Rustdoc JSON is an unstable nightly interface. Unknown future type variants are
 rendered conservatively instead of aborting the entire conversion.
@@ -28,19 +31,24 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 # =============================================================================
-# Hardcoded repository locations
+# Repository locations, derived from this script's own path
 # =============================================================================
 
 # The generator and Cargo both run from the Cargo workspace directory, which
 # is modules/ rather than the repository root that holds this script's folder.
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2] / "modules"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE_ROOT = REPOSITORY_ROOT / "modules"
 DOCUMENTATION_GENERATOR_SCRIPT = Path(__file__).resolve().with_name(
     "generate_documentation.py"
 )
-# The generated tree is purged and rewritten on every run; the sidebar module
-# sits beside it, outside the purge root, so a run never deletes its own output.
-OUTPUT_DIRECTORY = Path(r"D:\Programming\Pill-Docs\reference")
-SIDEBAR_DATA_FILE = Path(r"D:\Programming\Pill-Docs\reference-sidebar.ts")
+# The generated tree is purged and rewritten on every run. The sidebar module
+# lives inside that tree; it is safe there because its text is rendered from
+# in-memory data before the purge and written after the pages, and a run that
+# fails before the purge leaves the previous tree, sidebar included, untouched.
+# Both paths stay under the repository's gitignored local/ folder, so a run
+# never touches a website checkout that happens to live beside this repository.
+OUTPUT_DIRECTORY = REPOSITORY_ROOT / "local" / "docs_build" / "reference"
+SIDEBAR_DATA_FILE = OUTPUT_DIRECTORY / "reference-sidebar.ts"
 CODE_REFERENCE_ROUTE = "/reference"
 
 # Primary items appear as full entries in a crate page. Fields, variants, and
@@ -1870,15 +1878,16 @@ def render_sidebar_data(sidebar_items: Sequence[Dict[str, Any]]) -> str:
 
 # Remove stale reference pages only after all temporary JSON has rendered safely.
 def purge_output_directory() -> None:
-    """Delete every existing entry from the exact hardcoded output directory."""
+    """Delete every existing entry from the exact default output directory."""
     # Resolve both paths before comparison so alternate path spellings cannot
-    # bypass the hardcoded destructive-operation guard.
-    expected = Path(r"D:\Programming\Pill-Docs\reference").resolve()
+    # bypass the destructive-operation guard, which repeats the expected
+    # location instead of trusting the constant it protects.
+    expected = (REPOSITORY_ROOT / "local" / "docs_build" / "reference").resolve()
     resolved = OUTPUT_DIRECTORY.resolve()
 
-    # Guard the recursive operation even though the value is hardcoded. Any
-    # future edit that points elsewhere must fail closed instead of deleting a
-    # broader directory such as ``pages`` or the guide repository root.
+    # Guard the recursive operation even though the value is fixed. Any future
+    # edit that points elsewhere must fail closed instead of deleting a broader
+    # directory such as ``local`` or ``docs_build`` itself.
     if resolved != expected or resolved.name != "reference":
         raise RuntimeError("refusing to purge unexpected path: {}".format(resolved))
 
@@ -1920,10 +1929,17 @@ def write_output_file(relative_path: Path, markdown: str) -> Path:
 
 # Replace the single generated VitePress sidebar module with strict path checks.
 def write_sidebar_data(sidebar_data: str) -> Path:
-    """Atomically replace the exact hardcoded generated sidebar module."""
-    # This file lives outside the purged reference tree, so guard its exact path
-    # independently rather than relying on write_output_file's root check.
-    expected = Path(r"D:\Programming\Pill-Docs\reference-sidebar.ts").resolve()
+    """Atomically replace the exact generated sidebar module in its default path."""
+    # The sidebar lives inside the purged reference tree, so this call must stay
+    # after write_output_file's page loop in main. Guard its exact path here too
+    # rather than relying on write_output_file's root check.
+    expected = (
+        REPOSITORY_ROOT
+        / "local"
+        / "docs_build"
+        / "reference"
+        / "reference-sidebar.ts"
+    ).resolve()
     destination = SIDEBAR_DATA_FILE.resolve()
     if destination != expected or destination.name != "reference-sidebar.ts":
         raise RuntimeError(

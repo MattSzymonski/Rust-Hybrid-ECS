@@ -12,7 +12,7 @@
 #
 #     python devops/docs/generate_documentation_markdown.py
 #
-#   Output locations (the website's reference directory and its sidebar data
+#   Output locations (the local docs_build directory and its sidebar data
 #   file) are configured inside that Python script, not here.
 
 # USAGE: bash devops/ci_cd/generate_documentation.sh [--help]
