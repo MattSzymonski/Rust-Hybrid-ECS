@@ -35,11 +35,14 @@
 //! safe to call more than once.
 
 // Standard library
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 // External crates
+#[cfg(not(windows))]
+use libloading::os::unix as unix_loader;
 #[cfg(windows)]
 use libloading::os::windows as windows_loader;
 use libloading::{Library, Symbol};
@@ -78,6 +81,78 @@ pub(crate) const ENGINE_DYLIB_STEMS: [&str; 6] = [
     "pill_editor_core",
     "pill_ui_theme",
 ];
+
+/// File name the loader looks up for the engine dylib `stem`.
+///
+/// The convention is the platform's rather than this crate's: `pill_core.dll`
+/// on Windows, `libpill_core.so` on Linux, `libpill_core.dylib` on macOS.
+/// `std::env::consts` spells it, and every path built for an engine dylib goes
+/// through here - the build output, the host's copy, the staged copy and the
+/// two paths a mismatch report names - so all of them always agree.
+fn engine_dylib_file_name(stem: &str) -> String {
+    format!(
+        "{}{stem}{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    )
+}
+
+/// The engine dylib stem a library name belongs to, if any.
+///
+/// The evidence a failed load is explained from names a library the way its
+/// own format does: a PE import table says `pill_core.dll` whichever host
+/// reads it, and an ELF `DT_NEEDED` entry says `libpill_core.so`. Both
+/// spellings are accepted, so evidence from either format maps to the same
+/// stem.
+fn engine_dylib_stem(library_name: &str) -> Option<&'static str> {
+    ENGINE_DYLIB_STEMS.into_iter().find(|stem| {
+        library_name.eq_ignore_ascii_case(&engine_dylib_file_name(stem))
+            || library_name.eq_ignore_ascii_case(&format!("{stem}.dll"))
+    })
+}
+
+/// Whether staging engine dylibs beside a module can change what the loader
+/// maps.
+///
+/// Only a loader that searches the loaded library's own directory can be
+/// steered that way, and that is what
+/// [`LOAD_WITH_ALTERED_SEARCH_PATH`] asks Windows for. A Unix loader resolves
+/// a `DT_NEEDED` entry by name against the objects already mapped in the
+/// process *before* it searches any path, and this host maps the engine dylibs
+/// at startup, so a copy beside the module is never consulted. Staging there
+/// would copy hundreds of megabytes per load for nothing, and the mismatch is
+/// reported instead - see [`LoadFailureExplanation::EngineDylibMismatch`].
+fn engine_dylib_staging_steers_the_loader() -> bool {
+    cfg!(windows)
+}
+
+/// Engine dylibs this process took from the module world because the host
+/// binary does not link them, and the stems already tried.
+///
+/// They stay mapped for the life of the process: module code holds raw
+/// pointers and vtables into them, so unloading one would leave those
+/// dangling. This table owns the handles rather than leaking them.
+///
+/// The set cannot be decided once for the process. Which engine dylibs are
+/// missing depends on which ones the binary links, but which ones a *module*
+/// needs is a property of that module, so a second module can name one the
+/// first never mentioned. Each load therefore adds the stems its own module
+/// names, and `attempted` keeps a stem that could not be loaded from being
+/// retried on every reload.
+#[cfg(not(windows))]
+#[derive(Default)]
+struct PreloadedEngineDylibs {
+    /// Handles to the dylibs this process preloaded.
+    libraries: Vec<Library>,
+    /// Stems whose preload has been attempted, successful or not.
+    attempted: std::collections::HashSet<&'static str>,
+}
+
+/// The process-wide [`PreloadedEngineDylibs`] table.
+#[cfg(not(windows))]
+static PRELOADED_ENGINE_DYLIBS: std::sync::OnceLock<
+    std::sync::Mutex<PreloadedEngineDylibs>,
+> = std::sync::OnceLock::new();
 
 /// Directory, under the workspace root, where temporary native-library copies
 /// are stored.
@@ -190,29 +265,30 @@ fn first_engine_dylib_mismatch(workspace_root: &Path) -> Option<(PathBuf, PathBu
         let module_engine = module_world_engine_dylib(workspace_root, stem)?;
         let host_engine = workspace_root
             .join(crate::config::host_target_directory())
-            .join(format!("{stem}.dll"));
+            .join(engine_dylib_file_name(stem));
         let copies_match = host_engine.is_file() && files_equal(&module_engine, &host_engine);
         (!copies_match).then_some((host_engine, module_engine))
     })
 }
 
-/// A named import the module needs that a candidate copy of its DLL does
+/// A named import the module needs that a candidate copy of its library does
 /// not export, with the copy the loader would try first.
 #[derive(Debug, PartialEq, Eq)]
 struct UnresolvedImport {
-    /// The DLL as the import table names it.
+    /// The library as the image names it: a PE import table's `pill_core.dll`,
+    /// or an ELF `DT_NEEDED`'s `libpill_core.so`.
     dll: String,
     /// The symbol the module needs from it.
     symbol: String,
-    /// The copy the loader would resolve for that DLL, when any exists.
+    /// The copy the loader would resolve for that library, when any exists.
     path: PathBuf,
 }
 
 /// What the gathered evidence says about a failed load.
 #[derive(Debug, PartialEq, Eq)]
 enum LoadFailureExplanation {
-    /// A named import no candidate copy of its DLL exports; the concrete
-    /// answer, naming the DLL and the symbol.
+    /// A named import no candidate copy of its library exports; the concrete
+    /// answer, naming the library and the symbol.
     MissingImport(UnresolvedImport),
     /// An engine dylib the module was linked against differs from the host's
     /// copy, and the unresolved import belongs to it (or nothing else
@@ -284,46 +360,103 @@ fn explanation_error(
     }
 }
 
-/// The first named import of `artifact` that a candidate copy of its DLL does
+/// The first import of `artifact` that a candidate copy of its library does
 /// not export.
 ///
+/// Two kinds of evidence answer, because the two image formats record
+/// different things.
+///
+/// A PE import table attributes every symbol to the DLL it comes from, so the
+/// first step reads those pairs straight out of it. An ELF image does not
+/// attribute: an undefined symbol is resolved by searching `DT_NEEDED` in
+/// order, so the table says which names are needed, never which library
+/// defines them. The second step turns the question around for the engine
+/// dylibs the artifact names - a symbol this build of the dylib exports, the
+/// host's copy does not, and the artifact needs, is one that cannot resolve
+/// against the copy the process mapped.
+///
 /// The candidates are the copies the loader would consider: the host's own
-/// directory (a DLL the process already mapped wins by file name), the
+/// directory (a library the process already mapped wins by name), the
 /// directory holding the loaded module, and the staged hot directory that the
-/// module builds write. A DLL whose copies are all missing from disk is
+/// module builds write. A library whose copies are all missing from disk is
 /// skipped, because then only the loader's own message can explain the
 /// failure.
 fn first_unresolved_import(artifact: &Path, workspace_root: &Path) -> Option<UnresolvedImport> {
-    let inspection = crate::analytics::inspect_pe(artifact)?;
+    let inspection = crate::native_binary::inspect(artifact)?;
+
+    // Step 1: An import table that names the library each symbol comes from.
     for import in &inspection.imports {
         if import.symbols.is_empty() {
             continue;
         }
-        let candidates = import_candidate_copies(&import.dll, artifact, workspace_root);
+        let candidates = import_candidate_copies(&import.library, artifact, workspace_root);
         for candidate in candidates {
             if !candidate.is_file() {
                 continue;
             }
-            let Some(candidate_inspection) = crate::analytics::inspect_pe(&candidate) else {
+            let Some(candidate_symbols) = exported_symbols(&candidate) else {
                 continue;
             };
             let missing_symbol = import
                 .symbols
                 .iter()
-                .find(|symbol| !candidate_inspection.exports.contains(symbol));
+                .find(|symbol| !candidate_symbols.contains(*symbol));
             if let Some(symbol) = missing_symbol {
                 return Some(UnresolvedImport {
-                    dll: import.dll.clone(),
+                    dll: import.library.clone(),
                     symbol: symbol.clone(),
                     path: candidate,
                 });
             }
         }
     }
+
+    // Step 2: No attribution in the image, so compare its two builds directly.
+    for stem in ENGINE_DYLIB_STEMS {
+        let library_name = engine_dylib_file_name(stem);
+        if !inspection
+            .libraries
+            .iter()
+            .any(|library| library.eq_ignore_ascii_case(&library_name))
+        {
+            continue;
+        }
+        let Some(module_engine) = module_world_engine_dylib(workspace_root, stem) else {
+            continue;
+        };
+        let Some(module_symbols) = exported_symbols(&module_engine) else {
+            continue;
+        };
+        for candidate in import_candidate_copies(&library_name, artifact, workspace_root) {
+            if !candidate.is_file() {
+                continue;
+            }
+            let Some(candidate_symbols) = exported_symbols(&candidate) else {
+                continue;
+            };
+            let missing_symbol = inspection.required_symbols.iter().find(|symbol| {
+                module_symbols.contains(*symbol) && !candidate_symbols.contains(*symbol)
+            });
+            if let Some(symbol) = missing_symbol {
+                return Some(UnresolvedImport {
+                    dll: library_name.clone(),
+                    symbol: symbol.clone(),
+                    path: candidate,
+                });
+            }
+        }
+    }
+
     None
 }
 
-/// The copies of an imported DLL the loader would consider, in its own
+/// The symbol names `path` exports, or `None` when it cannot be read.
+fn exported_symbols(path: &Path) -> Option<HashSet<String>> {
+    let inspection = crate::native_binary::inspect(path)?;
+    Some(inspection.exported_symbols.into_iter().collect())
+}
+
+/// The copies of an imported library the loader would consider, in its own
 /// order: a copy the process already maps (the host's engines), one beside
 /// the loaded module, one in the staged hot directory.
 fn import_candidate_copies(dll: &str, artifact: &Path, workspace_root: &Path) -> Vec<PathBuf> {
@@ -350,29 +483,24 @@ fn unresolved_engine_mismatch(
     unresolved: &UnresolvedImport,
     workspace_root: &Path,
 ) -> Option<(PathBuf, PathBuf)> {
-    let lowercase_dll_name = unresolved.dll.to_ascii_lowercase();
-    let stem = lowercase_dll_name
-        .strip_suffix(".dll")
-        .unwrap_or(&lowercase_dll_name);
-    if !ENGINE_DYLIB_STEMS.contains(&stem) {
-        return None;
-    }
+    let stem = engine_dylib_stem(&unresolved.dll)?;
     let module_engine = module_world_engine_dylib(workspace_root, stem)?;
     let host_engine = workspace_root
         .join(crate::config::host_target_directory())
-        .join(format!("{stem}.dll"));
+        .join(engine_dylib_file_name(stem));
     let copies_match = host_engine.is_file() && files_equal(&module_engine, &host_engine);
     (!copies_match).then_some((host_engine, module_engine))
 }
 
 /// Explains a load failure with the best evidence available.
 ///
-/// The module's own import tables are read first. A symbol that no candidate
-/// copy of its DLL exports is a concrete answer that names both the DLL and
-/// the symbol, where the loader only said "procedure could not be found". The
-/// engine-dylib explanation is used only for the cases it truly covers: the
-/// unresolved import belongs to the mismatching dylib, or nothing else
-/// explains the failure.
+/// The module's own import and export tables are read first. A symbol that no
+/// candidate copy of its library exports is a concrete answer that names both
+/// the library and the symbol, where the loader only said "procedure could not
+/// be found" (Windows) or `undefined symbol: <name>` (Linux). The engine-dylib
+/// explanation is used only for the cases it truly covers: the unresolved
+/// import belongs to the mismatching dylib, or nothing else explains the
+/// failure.
 fn diagnose_load_failure(
     error: LibraryError,
     artifact: &Path,
@@ -420,24 +548,27 @@ fn diagnose_load_failure(
 /// Copies the module-world engine dylibs into `generation_directory`, so a
 /// module loaded from there finds them next to itself instead of using the
 /// host's copies.
+///
+/// Only called where [`engine_dylib_staging_steers_the_loader`] says a copy
+/// beside the module can win; elsewhere the copies would never be consulted.
 fn stage_module_engine_dylib(workspace_root: &Path, generation_directory: &Path) {
     if std::fs::create_dir_all(generation_directory).is_err() {
         return;
     }
     for stem in ENGINE_DYLIB_STEMS {
-        let Some(engine_dll_source) = module_world_engine_dylib(workspace_root, stem) else {
+        let Some(engine_library_source) = module_world_engine_dylib(workspace_root, stem) else {
             continue;
         };
         let _ = std::fs::copy(
-            &engine_dll_source,
-            generation_directory.join(format!("{stem}.dll")),
+            &engine_library_source,
+            generation_directory.join(engine_dylib_file_name(stem)),
         );
 
-        // The build stages the engine DLL in `target/hot`, but its PDB stays
+        // The build stages the engine dylib in `target/hot`, but its PDB stays
         // in the private module artifact directory beside the other
-        // host-spawned outputs. Keep the engine's symbols beside the DLL that
+        // host-spawned outputs. Keep the engine's symbols beside the dylib that
         // was copied here too.
-        let direct_symbol_source = engine_dll_source.with_extension("pdb");
+        let direct_symbol_source = engine_library_source.with_extension("pdb");
         let artifact_symbol_source = workspace_root
             .join(crate::config::module_build_artifact_directory())
             .join(format!("{stem}.pdb"));
@@ -458,29 +589,168 @@ fn stage_module_engine_dylib(workspace_root: &Path, generation_directory: &Path)
 /// hot-load copy when a build has run, otherwise the one still in the private
 /// build directory.
 fn module_world_engine_dylib(workspace_root: &Path, stem: &str) -> Option<PathBuf> {
-    let file_name = format!("{stem}.dll");
-    let staged_dll_path = workspace_root
+    let file_name = engine_dylib_file_name(stem);
+    let staged_library_path = workspace_root
         .join(crate::build_runner::PROJECT_HOT_OUTPUT_SUBDIRECTORY)
         .join(&file_name);
-    if staged_dll_path.is_file() {
-        return Some(staged_dll_path);
+    if staged_library_path.is_file() {
+        return Some(staged_library_path);
     }
-    let built_dll_path = workspace_root
+    let built_library_path = workspace_root
         .join(crate::config::module_build_artifact_directory())
         .join(&file_name);
-    built_dll_path.is_file().then_some(built_dll_path)
+    built_library_path.is_file().then_some(built_library_path)
 }
 
-/// Byte equality for two DLL files.
+/// The engine dylibs this process already has mapped.
+///
+/// The executable names some in its own `DT_NEEDED`, and those name others, so
+/// the set is walked through the host's build tree rather than read off one
+/// table. Only engine dylibs are followed: nothing else can be preloaded here,
+/// and stopping at them keeps the walk to a handful of files.
+#[cfg(not(windows))]
+fn mapped_engine_dylibs(workspace_root: &Path) -> HashSet<&'static str> {
+    let host_directory = workspace_root.join(crate::config::host_target_directory());
+    let mut mapped = HashSet::new();
+    let mut pending: Vec<String> = std::env::current_exe()
+        .ok()
+        .and_then(|executable| crate::native_binary::needed_libraries(&executable))
+        .unwrap_or_default();
+    while let Some(library_name) = pending.pop() {
+        let Some(stem) = engine_dylib_stem(&library_name) else {
+            continue;
+        };
+        if !mapped.insert(stem) {
+            continue;
+        }
+        // An engine dylib names the ones below it, which were mapped with it.
+        if let Some(libraries) =
+            crate::native_binary::needed_libraries(&host_directory.join(&library_name))
+        {
+            pending.extend(libraries);
+        }
+    }
+    mapped
+}
+
+/// Loads the module-world engine dylibs the host binary does not link.
+///
+/// A module's `DT_NEEDED` reaches every engine dylib it was linked against,
+/// while the host binary links only the ones its own frontend needs: a project
+/// that draws its own egui names `pill_project_ui`, which the editor never
+/// links. That dylib is in no link map at all, so the loader would search the
+/// host's target directory for it, where cargo never wrote a copy - the module
+/// build is the only thing that produces one.
+///
+/// Loading the module build's copy here, by path and with `RTLD_GLOBAL`, puts it
+/// in the scope the module's entry is resolved against. A Rust cdylib carries a
+/// `DT_SONAME` equal to its file name, which is what makes the name match.
+///
+/// Only the stems `module` itself names are tried. A host that links none of
+/// them - the renderer host maps no UI dylib - would otherwise pull the whole
+/// module-world set into its process for a module that needs none of it, and a
+/// second copy of `pill_ui_frame` is exactly what the one-instance rule in
+/// [`ENGINE_DYLIB_STEMS`] forbids.
+///
+/// Best effort: a copy that cannot be loaded is logged and left to the
+/// diagnosis, which names the two builds it compared.
+#[cfg(not(windows))]
+fn preload_unmapped_engine_dylibs(workspace_root: &Path, module: &Path) {
+    // Step 1: The stems this module asks for. An image that cannot be read
+    // leaves the whole set to be tried, because a load that is about to fail
+    // for a missing engine dylib must not fail for a missing preload as well.
+    let needed = crate::native_binary::needed_libraries(module);
+    let named = |stem: &str| match &needed {
+        Some(libraries) => libraries
+            .iter()
+            .any(|library| engine_dylib_stem(library) == Some(stem)),
+        None => true,
+    };
+
+    // Step 2: The stems still worth trying. `attempted` is updated here, under
+    // the lock, so a stem is tried once per process however many modules name
+    // it, and a failure cannot turn into a warning on every reload. A poisoned
+    // lock means an earlier preload panicked; its table is still the best
+    // record there is, so it is taken back rather than abandoned.
+    let wanted = {
+        let mut table = match PRELOADED_ENGINE_DYLIBS.get_or_init(Default::default).lock() {
+            Ok(table) => table,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mapped = mapped_engine_dylibs(workspace_root);
+        let mut wanted = Vec::new();
+        for stem in ENGINE_DYLIB_STEMS {
+            if mapped.contains(stem) || !named(stem) {
+                continue;
+            }
+            if table.attempted.insert(stem) {
+                wanted.push(stem);
+            }
+        }
+        wanted
+    };
+
+    // Step 3: Load each one. The lock is released first: a mapping can run
+    // static initializers, and none of them may block on this table.
+    let mut preloaded = Vec::new();
+    for stem in wanted {
+        let Some(module_engine) = module_world_engine_dylib(workspace_root, stem) else {
+            continue;
+        };
+        // SAFETY: `module_engine` is a dylib this workspace's module build
+        // just wrote, opened by absolute path. `RTLD_NOW` resolves its own
+        // imports eagerly, and `RTLD_GLOBAL` puts it in the scope a later
+        // module's `DT_NEEDED` entry is resolved against. The handle is kept
+        // in [`PRELOADED_ENGINE_DYLIBS`], so it outlives every module that
+        // resolves against it.
+        let loaded = unsafe {
+            unix_loader::Library::open(
+                Some(module_engine.as_os_str()),
+                unix_loader::RTLD_GLOBAL | unix_loader::RTLD_NOW,
+            )
+        };
+        match loaded {
+            Ok(library) => {
+                debug!(
+                    target: telemetry_target::HOT_RELOAD,
+                    stem,
+                    path = %module_engine.display(),
+                    "preloaded an engine dylib this host does not link"
+                );
+                preloaded.push(Library::from(library));
+            }
+            Err(error) => warn!(
+                target: telemetry_target::HOT_RELOAD,
+                stem,
+                path = %module_engine.display(),
+                %error,
+                "an engine dylib this host does not link could not be preloaded"
+            ),
+        }
+    }
+
+    // Step 4: Own the handles for the life of the process.
+    if preloaded.is_empty() {
+        return;
+    }
+    let mut table = match PRELOADED_ENGINE_DYLIBS.get_or_init(Default::default).lock() {
+        Ok(table) => table,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    table.libraries.append(&mut preloaded);
+}
+
+/// Byte equality for two native library files.
 ///
 /// The length is checked first, because both files are multi-megabyte engine
-/// dylibs compared on every `load_copy`, and a length mismatch already proves
-/// inequality. Everything else goes through [`files_equal_streaming`].
+/// dylibs compared on every failed `load_copy`, and a length mismatch already
+/// proves inequality. Everything else goes through
+/// [`files_equal_streaming`].
 ///
 /// Timestamps cannot decide: a copied file keeps or renews its timestamp while
 /// staying byte-identical, and two files can share one while differing. The
 /// answer decides whether a module shares the host's engine instance or gets
-/// its own staged copy. A wrong "different" would map `pill_core.dll` twice
+/// its own staged copy. A wrong "different" would map `pill_core` twice
 /// and break the one-instance contract the engine's raw pointers rely on, so
 /// only exact bytes may answer "equal".
 fn files_equal(left: &Path, right: &Path) -> bool {
@@ -738,11 +1008,13 @@ impl NativeLibrary {
         })?;
         // Keeping the build output's own file name lets the PDB beside it keep
         // the name the image records, which is what makes the lookup work.
-        let temporary_path = generation_directory.join(
-            build_output
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("module.dll")),
-        );
+        let temporary_name = build_output
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_else(|| {
+                std::ffi::OsString::from(format!("module{}", std::env::consts::DLL_SUFFIX))
+            });
+        let temporary_path = generation_directory.join(temporary_name);
 
         // Step 2: Give this generation its own handle on the built library.
         // A hard link is preferred. Both paths are under the workspace root, so
@@ -824,29 +1096,43 @@ impl NativeLibrary {
         // Step 2b: Decide whether this module must load against its own engine
         // dylibs instead of the host's.
         //
-        // The host binary maps `pill_core.dll` from the regular target
-        // directory. When the module build produced a different engine dylib
-        // than the host runs (a GUI frontend adds extra features to shared
-        // crates), the module must resolve its own copy or symbol lookup fails
-        // at load time. The build stages the matching copy into the hot-load
+        // The host binary maps `pill_core` from the regular target directory.
+        // When the module build produced a different engine dylib than the
+        // host runs (a GUI frontend adds extra features to shared crates), the
+        // module must resolve its own copy or symbol lookup fails at load
+        // time. The build stages the matching copy into the hot-load
         // directory; when the two copies are byte-identical (a plain CLI host)
         // the module keeps loading the host's single instance.
         //
         // Staging is best effort, not a guarantee. If it does not help, the
         // load fails in Step 3 and the diagnosis names the engine mismatch.
-        // The loader resolves an already-mapped DLL by module name, so a
-        // second `pill_core.dll` only wins where the host has not mapped one,
-        // which on Windows is never.
+        // Only the Windows loader can be pointed at the directory a library
+        // was loaded from, and even there an already-mapped library of the
+        // same name wins, so the staging below is a long shot by design - see
+        // [`engine_dylib_staging_steers_the_loader`].
         //
         // The copies go beside the library, in this generation's own
         // directory, because the altered search path starts at the directory
         // of the library being loaded. A copy anywhere else is never
         // consulted, and a stem the host process has not mapped (the editor
         // crates in a renderer host) has no other place to be found.
-        let isolated_engine = engine_dylib_needs_isolation(workspace_root);
+        //
+        // On the other platforms the copies could not be consulted at all, so
+        // none are made: the load uses the host's instances, and a mismatch
+        // that keeps a symbol from resolving is reported with both builds
+        // named instead of failing silently inside the loader.
+        let isolated_engine = engine_dylib_staging_steers_the_loader()
+            && engine_dylib_needs_isolation(workspace_root);
         if isolated_engine {
             stage_module_engine_dylib(workspace_root, &generation_directory);
         }
+
+        // Step 2c: an engine dylib the host binary does not link is in no link
+        // map at all, so the loader would look for it in the host's target
+        // directory, where cargo never put a copy. Load the module build's
+        // copy first, which registers it under the SONAME the module names.
+        #[cfg(not(windows))]
+        preload_unmapped_engine_dylibs(workspace_root, temporary_copy.path());
 
         // Step 3: Load the copy and validate its required exports.
         let load_started = Instant::now();
@@ -872,7 +1158,9 @@ impl NativeLibrary {
             // either way.
             if isolated_engine {
                 for stem in ENGINE_DYLIB_STEMS {
-                    let _ = std::fs::remove_file(generation_directory.join(format!("{stem}.dll")));
+                    let _ = std::fs::remove_file(
+                        generation_directory.join(engine_dylib_file_name(stem)),
+                    );
                 }
             }
         })
@@ -1792,14 +2080,48 @@ fn remove_staging_directory(path: &Path, pid: u32, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_explanation, explanation_error, files_equal, staging_directories_to_evict,
-        LoadFailureExplanation, TemporaryCopy, UnresolvedImport, MAX_RETAINED_STAGING_DIRECTORIES,
-        STAGING_GRACE_PERIOD,
+        choose_explanation, engine_dylib_file_name, engine_dylib_stem, explanation_error,
+        files_equal, staging_directories_to_evict, LoadFailureExplanation, TemporaryCopy,
+        UnresolvedImport, MAX_RETAINED_STAGING_DIRECTORIES, STAGING_GRACE_PERIOD,
     };
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
     use crate::scratch::ScratchDirectory;
+
+    /// Engine dylibs are named the platform's way, and evidence from either
+    /// image format maps back to the stem.
+    ///
+    /// The name is what connects the build output, the host's copy, the staged
+    /// copy and the two paths a mismatch report names. A host that kept looking
+    /// for `pill_core.dll` on Linux found no module-world copy at all, so a
+    /// mismatch could not be detected and the loader's bare `undefined symbol`
+    /// was all the reader got.
+    #[test]
+    fn an_engine_dylib_name_follows_the_platform_convention() {
+        let name = engine_dylib_file_name("pill_core");
+
+        assert_eq!(
+            name,
+            format!(
+                "{}pill_core{}",
+                std::env::consts::DLL_PREFIX,
+                std::env::consts::DLL_SUFFIX
+            )
+        );
+        assert_eq!(engine_dylib_stem(&name), Some("pill_core"));
+        assert_eq!(
+            engine_dylib_stem(&name.to_ascii_uppercase()),
+            Some("pill_core"),
+            "a loader lookup on a case-insensitive filesystem still matches"
+        );
+        assert_eq!(
+            engine_dylib_stem("pill_engine_core.dll"),
+            Some("pill_engine_core"),
+            "a PE import table names its DLL whatever host reads it"
+        );
+        assert_eq!(engine_dylib_stem("not_an_engine.dll"), None);
+    }
 
     /// A failing load where the artifact imports a symbol that `pill_ui_frame`
     /// does not export, while `pill_core`'s copies differ. The message must

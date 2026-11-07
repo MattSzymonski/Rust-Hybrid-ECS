@@ -178,7 +178,7 @@ fn spin_cube_system(
     let Some(frame_time) = time_resource.get() else {
         return Ok(());
     };
-    let delta_seconds = frame_time.delta_seconds();
+    let delta_seconds = frame_time.delta_seconds() * 1.0;
     let [x, y, z] = SPIN_RATES_RADIANS_PER_SECOND;
     let frame_rotation = glam::Quat::from_euler(
         glam::EulerRot::XYZ,

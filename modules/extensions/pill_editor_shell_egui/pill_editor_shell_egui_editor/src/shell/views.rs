@@ -21,12 +21,6 @@ use pill_editor_shell_egui_editor::shell::*;
 // Constants
 // =============================================================================
 
-/// How far, in logical points, the scene rectangle extends past the measured
-/// tab body. The body's padding and outline sit inside the tab, so the child
-/// window must cover them too; otherwise whatever is behind shows around the
-/// viewport's edge.
-pub const SCENE_RECT_OVERSHOOT: f32 = 16.0;
-
 /// A shell update slower than this logs its own `[editor] egui frame` line,
 /// besides the 210-frame heartbeat. The limit is one whole 60 Hz frame
 /// (16 milliseconds): a debug build's pass takes several milliseconds, so a
@@ -92,11 +86,16 @@ pub fn shell_rect(rect: egui::Rect) -> ShellRect {
     }
 }
 
-/// Returns a scene tab's body rectangle in logical points, grown by
-/// [`SCENE_RECT_OVERSHOOT`] so the child window also covers the tab body's
-/// padding and outline.
+/// Returns a scene tab's body rectangle in logical points.
+///
+/// This is the tab body itself, not a grown one: how far a view's window may
+/// extend past it depends on what draws above that window, which the frontend
+/// knows and a shell module cannot. A composition overlay paints the UI over
+/// the child window and grows the window to hide the seam; the window surface
+/// has the child above the UI, where any growth covers the tab bar and the
+/// panels beside it.
 pub fn scene_body_rect(ui: &egui::Ui) -> ShellRect {
-    shell_rect(ui.max_rect().expand(SCENE_RECT_OVERSHOOT))
+    shell_rect(ui.max_rect())
 }
 
 /// Draws a scene tab's overlay chip: the frame counter in the viewport's

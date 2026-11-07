@@ -54,6 +54,9 @@ mod extension;
 /// What a module's resources declared their layouts are made of, and whether
 /// that changed since the last load.
 mod layout_record;
+/// Reads a native image's dependencies, imports and exports from its bytes, so
+/// a failed load can name the symbol and the dylib behind it.
+mod native_binary;
 /// Loads native module libraries from temporary copies that must outlive a
 /// reload.
 mod native_library;

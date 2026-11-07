@@ -31,6 +31,9 @@
 use std::sync::Arc;
 
 // External crates
+// Only the composition path logs through the editor target; the window-surface
+// posture has nothing to report, so the import is platform-gated too.
+#[cfg(windows)]
 use pill_core::telemetry::telemetry_target;
 use pill_editor_core::egui::epaint::ClippedPrimitive;
 use pill_editor_core::egui::TexturesDelta;
@@ -58,16 +61,36 @@ const WINDOW_CLEAR: wgpu::Color = wgpu::Color {
 pub type OverlayError = String;
 
 /// Where the UI's pixels go.
+///
+/// `Composition` is only ever constructed by the Windows posture and
+/// `Floating` only by the Unix one, so each is unconstructed on the other
+/// platform while the runner keeps matching on both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayMode {
     /// The composition visual above the scene: transparent where the shell
     /// drew nothing, so the scene shows through the UI's gaps.
     Composition,
+    /// A window of the editor's own, drawn by the desktop above the scene's
+    /// child windows and transparent where the shell drew nothing.
+    ///
+    /// This is the Unix counterpart of [`Self::Composition`], which needs
+    /// DirectComposition: a Unix child window is always drawn *above* its
+    /// parent, so UI drawn on the editor's own surface can never cover a
+    /// scene viewport, while a window of its own can.
+    Floating,
     /// The window's own surface, with no composition: `PILL_EDITOR_NO_OVERLAY`
     /// asked for it, or a failed overlay fell back to it. The UI is opaque,
     /// and a scene child window sits above its parent, so it hides whatever
     /// the UI draws under it.
     Window,
+}
+
+impl OverlayMode {
+    /// Whether the surface lets the scene show through where the UI drew
+    /// nothing.
+    pub fn clears_transparent(self) -> bool {
+        matches!(self, OverlayMode::Composition | OverlayMode::Floating)
+    }
 }
 
 // =============================================================================
@@ -85,6 +108,10 @@ pub struct OverlaySurface {
     composition: Option<composition::Tree>,
     /// The overlay's swapchain, drawn through the composition visual.
     surface: wgpu::Surface<'static>,
+    /// The window the floating posture draws into. Only that posture has one:
+    /// the other two draw into a window the editor already owns, whose
+    /// placement is not the overlay's to set.
+    floating_window: Option<Arc<Window>>,
     /// The swapchain's configuration: the window's client area in physical
     /// pixels, the editor's format, the posture's composition mode.
     surface_configuration: wgpu::SurfaceConfiguration,
@@ -98,12 +125,17 @@ pub struct OverlaySurface {
 impl OverlaySurface {
     /// Create the composition overlay for `window`.
     ///
+    /// DirectComposition and the `CompositionVisual` surface target wgpu takes
+    /// from it are Windows-only, so this posture exists there alone; every
+    /// other platform starts in [`Self::new_window`] instead.
+    ///
     /// # Errors
     ///
     /// Returns the reason, which the executable logs, when the adapter is not
     /// DX12, when the composition tree cannot be built or committed, when the
     /// surface cannot be created from the visual, or when the swapchain cannot
     /// carry the given format and premultiplied alpha.
+    #[cfg(windows)]
     pub fn new(
         instance: &wgpu::Instance,
         adapter: &wgpu::Adapter,
@@ -165,6 +197,7 @@ impl OverlaySurface {
             #[cfg(windows)]
             composition: Some(composition),
             surface,
+            floating_window: None,
             surface_configuration,
             has_drawn_content: false,
             frame_count: 0,
@@ -226,6 +259,74 @@ impl OverlaySurface {
             #[cfg(windows)]
             composition: None,
             surface,
+            floating_window: None,
+            surface_configuration,
+            has_drawn_content: false,
+            frame_count: 0,
+        })
+    }
+
+    /// Create the overlay in the floating posture: a window of the editor's
+    /// own, transparent where the shell drew nothing.
+    ///
+    /// A Unix loader has no composition visual, and a child window of the
+    /// editor window is always drawn above it, so UI drawn on the editor's own
+    /// surface can never cover a scene viewport. A window of its own, which
+    /// the desktop compositor paints above the editor, can - and it takes no
+    /// input, so every pointer event still reaches the window underneath.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason, which the executable logs, when the window surface
+    /// cannot be created, does not offer the editor's format, or does not offer
+    /// premultiplied composition - without which the window would paint a
+    /// black rectangle over the scene.
+    #[cfg(not(windows))]
+    pub fn new_floating(
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        window: Arc<Window>,
+        format: wgpu::TextureFormat,
+        window_size: (u32, u32),
+    ) -> Result<OverlaySurface, OverlayError> {
+        // Step 1: the surface, and the format and alpha mode the posture
+        // needs.
+        let surface = instance
+            .create_surface(Arc::clone(&window))
+            .map_err(|error| format!("the floating surface was refused: {error}"))?;
+        let capabilities = surface.get_capabilities(adapter);
+        if !capabilities.formats.contains(&format) {
+            return Err(format!(
+                "the floating surface does not offer the editor's format {format:?}"
+            ));
+        }
+        if !capabilities
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+        {
+            return Err(
+                "the floating surface does not offer premultiplied composition".to_string()
+            );
+        }
+        let surface_configuration = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: window_size.0.max(1),
+            height: window_size.1.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
+            view_formats: vec![],
+            color_space: wgpu::SurfaceColorSpace::Auto,
+        };
+        surface.configure(device, &surface_configuration);
+        Ok(OverlaySurface {
+            mode: OverlayMode::Floating,
+            #[cfg(windows)]
+            composition: None,
+            surface,
+            floating_window: Some(window),
             surface_configuration,
             has_drawn_content: false,
             frame_count: 0,
@@ -235,6 +336,11 @@ impl OverlaySurface {
     /// Returns the posture this surface draws in.
     pub fn mode(&self) -> OverlayMode {
         self.mode
+    }
+
+    /// The window the floating posture draws into, if this is that posture.
+    pub fn floating_window(&self) -> Option<&Arc<Window>> {
+        self.floating_window.as_ref()
     }
 
     /// Resize the swapchain to `window_size` physical pixels (the window's
@@ -341,14 +447,15 @@ impl OverlaySurface {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // The composition posture clears to fully transparent:
-                        // the visual is composited over the scene, so whatever
-                        // the meshes leave out must show the scene through. The
-                        // window posture owns every pixel of its surface, so it
-                        // clears to `WINDOW_CLEAR` instead.
-                        load: wgpu::LoadOp::Clear(match self.mode {
-                            OverlayMode::Composition => wgpu::Color::TRANSPARENT,
-                            OverlayMode::Window => WINDOW_CLEAR,
+                        // The composition and floating postures clear to
+                        // fully transparent: something else is behind the UI
+                        // there, and whatever the meshes leave out must show
+                        // it through. The window posture owns every pixel of
+                        // its surface, so it clears to `WINDOW_CLEAR` instead.
+                        load: wgpu::LoadOp::Clear(if self.mode.clears_transparent() {
+                            wgpu::Color::TRANSPARENT
+                        } else {
+                            WINDOW_CLEAR
                         }),
                         store: wgpu::StoreOp::Store,
                     },

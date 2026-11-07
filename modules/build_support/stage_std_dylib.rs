@@ -2,8 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Copy every `std-*.dll` from the active toolchain into the directory the
-//!   calling package's executable is built into.
+//! - Copy the toolchain's `std` dylib from the active toolchain into the
+//!   directory the calling package's executable is built into.
 //! - Degrade every failure to a `cargo:warning`, never a failed build.
 //!
 //! # Design
@@ -16,17 +16,32 @@
 //! script when this file changes, because rustc lists the file as an input.
 //!
 //! The workspace links with `-C prefer-dynamic`, so every executable built from
-//! it imports `std-<hash>.dll` when the process starts. That dylib lives in the
-//! toolchain's `lib/rustlib/<host>/lib` directory, which Windows does not
-//! search. Without a copy beside the executable, the process fails with
-//! `STATUS_DLL_NOT_FOUND`. Each executable stages its own copy, so none relies
-//! on another one having been built first.
+//! it imports the toolchain's std dylib when the process starts: `std-<hash>.dll`
+//! on Windows, `libstd-<hash>.so` on Linux. That file lives in the toolchain's
+//! `lib/rustlib/<host>/lib` directory, which no loader searches by itself -
+//! Windows has no path to it, and a Unix run path reaches only the directories
+//! it names, which `modules/.cargo/config.toml` sets to `$ORIGIN`. Staging a copy
+//! beside the executable is therefore what makes it findable on both, and it
+//! keeps `target/<profile>` self-contained instead of pinning a toolchain path
+//! into the binary. Each executable stages its own copy, so none relies on
+//! another one having been built first.
 
 // Standard library
-#[cfg(windows)]
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
 use std::process::Command;
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// What the toolchain's std dylib is called, by platform.
+///
+/// Windows spells it `std-<hash>.dll`; a Unix toolchain prefixes the same file
+/// with `lib` and uses the platform's shared-library suffix.
+const STD_DYLIB_PREFIX: &str = if cfg!(windows) { "std-" } else { "libstd-" };
+
+/// The suffix a shared library carries on this platform.
+const STD_DYLIB_SUFFIX: &str = std::env::consts::DLL_SUFFIX;
 
 // =============================================================================
 // Staging
@@ -37,27 +52,20 @@ use std::process::Command;
 /// Call this from a `build.rs` `main`: it finds the output directory through
 /// `OUT_DIR`, so it only works inside a build script. A failure is reported as
 /// a `cargo:warning`, never as a failed build, and running it twice is safe.
-/// On platforms other than Windows it does nothing.
 pub fn stage_std_dylib() {
-    // The std dylib is a Windows artifact; other platforms either find the
-    // dynamic library through the executable's own directory or have no
-    // dylib std at all.
-    #[cfg(windows)]
-    stage_std_dylib_windows();
+    stage_std_dylib_host();
 }
 
 // =============================================================================
-// Windows Staging
+// Staging
 // =============================================================================
 
-/// Copies every `std-*.dll` from the active toolchain into the output
-/// directory.
+/// Copies the toolchain's std dylib into the output directory.
 ///
 /// A missing or moved toolchain produces a warning instead of a failed build.
 /// The binary then needs the std dylib to be somewhere the loader searches;
 /// the next build can still copy it into place.
-#[cfg(windows)]
-fn stage_std_dylib_windows() {
+fn stage_std_dylib_host() {
     // Step 1: Ask the compiler cargo used for its sysroot. This follows
     // toolchain switches instead of using a hardcoded path.
     let sysroot_path = match rust_sysroot() {
@@ -69,8 +77,12 @@ fn stage_std_dylib_windows() {
     };
 
     // Step 2: Build the path to the directory that holds the host's std dylib.
-    let host_triple =
-        std::env::var("HOST").unwrap_or_else(|_| "x86_64-pc-windows-msvc".to_string());
+    // Cargo always sets `HOST`; without it the guard against the wrong
+    // toolchain layout would be gone, so a missing one is reported instead.
+    let Ok(host_triple) = std::env::var("HOST") else {
+        println!("cargo:warning=std dylib not staged: HOST is not set");
+        return;
+    };
     let std_library_directory = PathBuf::from(&sysroot_path)
         .join("lib")
         .join("rustlib")
@@ -123,12 +135,14 @@ fn stage_std_dylib_windows() {
         let Some(file_name) = file_name.to_str() else {
             continue;
         };
-        if file_name.starts_with("std-") && file_name.ends_with(".dll") {
+        if file_name.starts_with(STD_DYLIB_PREFIX) && file_name.ends_with(STD_DYLIB_SUFFIX) {
             candidate_count += 1;
             let destination_path = output_directory.join(file_name);
             // An up-to-date copy is left alone. The running host maps this
-            // file, so copying over it fails with a sharing violation on every
-            // build even though there is nothing to update.
+            // file, so copying over it fails with a sharing violation on
+            // Windows even though there is nothing to update, and on Unix a
+            // copy that is already in place is megabytes of needless work on
+            // every build.
             if staged_copy_is_current(&entry.path(), &destination_path) {
                 staged_count += 1;
                 continue;
@@ -142,7 +156,7 @@ fn stage_std_dylib_windows() {
 
     if candidate_count == 0 {
         println!(
-            "cargo:warning=std dylib not staged: no std-*.dll found in {}",
+            "cargo:warning=std dylib not staged: no {STD_DYLIB_PREFIX}*{STD_DYLIB_SUFFIX} found in {}",
             std_library_directory.display()
         );
     } else if staged_count == 0 {
@@ -158,8 +172,10 @@ fn stage_std_dylib_windows() {
 ///
 /// `std::fs::copy` keeps the source's modification time on Windows, so a
 /// staged copy of the same toolchain file has the same size and is no older.
+/// On Unix the copy carries the time it was written, which is no older either.
 /// A toolchain update changes the source's time, which makes the copy stale.
-#[cfg(windows)]
+/// The name carries the toolchain's hash, so a different toolchain stages a
+/// different file rather than replacing this one.
 fn staged_copy_is_current(source_path: &Path, destination_path: &Path) -> bool {
     let (Ok(source_metadata), Ok(destination_metadata)) = (
         std::fs::metadata(source_path),
@@ -184,7 +200,6 @@ fn staged_copy_is_current(source_path: &Path, destination_path: &Path) -> bool {
 ///
 /// Returns the reason when the compiler cannot be started, exits with a
 /// non-zero status, or writes output that is not UTF-8.
-#[cfg(windows)]
 fn rust_sysroot() -> Result<String, String> {
     let rustc_path = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let sysroot_output = Command::new(&rustc_path)

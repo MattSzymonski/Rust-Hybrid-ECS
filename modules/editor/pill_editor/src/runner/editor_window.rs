@@ -25,8 +25,11 @@ use super::*;
 
 /// The editor's window, its host, and everything the frame loop owns.
 pub(super) struct EditorWindow {
-    /// The main window: the shell's UI, and the game view's primary surface
-    /// only when the game window could not be created.
+    /// The main window: the editor's own window, and the game view's primary
+    /// surface only when the game window could not be created. The shell's UI
+    /// is drawn into the overlay, not here: the composition visual on Windows
+    /// and the floating window on Unix, with the window surface as the
+    /// fallback posture.
     pub(super) window: Arc<Window>,
     /// The editor's own GPU device, which draws the UI; the project's
     /// renderer keeps its own device inside the host.
@@ -85,6 +88,10 @@ pub(super) struct EditorWindow {
     pub(super) no_overlay: bool,
     /// The frame index of the last overlay creation attempt, so the next
     /// retry waits 120 frames from it.
+    ///
+    /// Only the composition overlay is retried, and it is Windows-only, so the
+    /// bookkeeping is compiled there alone.
+    #[cfg(windows)]
     pub(super) overlay_retry_frame: u64,
     /// The editor's fallback context, used while no shell module is loaded.
     pub(super) fallback_context: egui::Context,
@@ -226,6 +233,10 @@ pub(super) struct EditorWindow {
     pub(super) gizmo_persisted: Option<GizmoSettings>,
     /// Whether the main window currently has focus.
     pub(super) focused: bool,
+    /// The screen position and size the floating overlay window was last
+    /// given, in physical pixels. Only the floating posture has one: it is a
+    /// window of its own, so it has to be moved with the editor by hand.
+    pub(super) overlay_placement: Option<(i32, i32, u32, u32)>,
     /// The main window's client size in physical pixels.
     pub(super) size: (u32, u32),
     /// The window's scale factor: how many physical pixels one logical point
@@ -415,11 +426,17 @@ impl EditorWindow {
         let scale_factor = window.scale_factor() as f32;
         // Step 2: the editor's own instance, adapter and device. The UI is
         // drawn through the overlay surface - composition, or the window
-        // surface when composition is refused - and composition is DX12-only,
-        // so the editor's instance asks for DX12 alone. The project's renderer
-        // keeps its own instance inside the host.
+        // surface when composition is refused. Composition is DirectComposition
+        // over DX12, so that posture exists on Windows alone and only there
+        // does the editor's instance ask for DX12; on every other platform the
+        // window surface is the posture and the instance takes the platform's
+        // own backends. The project's renderer keeps its own instance inside
+        // the host.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            #[cfg(windows)]
             backends: wgpu::Backends::DX12,
+            #[cfg(not(windows))]
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -452,6 +469,7 @@ impl EditorWindow {
         );
         let no_overlay = no_overlay_requested();
         let overlay = create_overlay(
+            event_loop,
             no_overlay,
             &instance,
             &adapter,
@@ -463,6 +481,7 @@ impl EditorWindow {
             info!(
                 target: telemetry_target::EDITOR,
                 window_surface = matches!(overlay.mode(), OverlayMode::Window),
+                floating = matches!(overlay.mode(), OverlayMode::Floating),
                 "[editor] overlay posture"
             );
         }
@@ -612,6 +631,7 @@ impl EditorWindow {
             egui_renderer,
             overlay,
             no_overlay,
+            #[cfg(windows)]
             overlay_retry_frame: 0,
             fallback_context: {
                 // The fallback draws the same theme as the shell, so a
@@ -672,6 +692,7 @@ impl EditorWindow {
             gizmo_project,
             gizmo_persisted: None,
             focused: true,
+            overlay_placement: None,
             size,
             scale_factor,
             frame_index: 0,

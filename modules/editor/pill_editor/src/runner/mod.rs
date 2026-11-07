@@ -103,6 +103,7 @@ use winit::window::{Window, WindowId};
 
 // Current crate
 use crate::frontend::EditorError;
+use crate::overlay::OverlayError;
 use crate::overlay::OverlayMode;
 use crate::overlay::OverlaySurface;
 use crate::test_channel::{self, TestChannel};
@@ -126,6 +127,13 @@ mod windows;
 
 /// The environment variable that forces the window-surface posture.
 pub const NO_OVERLAY_ENV: &str = "PILL_EDITOR_NO_OVERLAY";
+
+/// The environment variable that keeps the editor on the native Wayland
+/// backend.
+pub const WAYLAND_ENV: &str = "PILL_EDITOR_WAYLAND";
+
+/// The environment variable that keeps a scene view in a top-level window.
+pub const DETACHED_SCENE_ENV: &str = "PILL_EDITOR_DETACHED_SCENE";
 
 /// The shell module's crate name - the editor-only module's convention.
 const SHELL_MODULE_NAME: &str = "pill_editor_shell_egui_editor";
@@ -151,6 +159,17 @@ const POPOUT_INITIAL_SIZE: LogicalSize<f64> = LogicalSize::new(520.0, 720.0);
 /// rect replaces it on the first frame.
 const SCENE_DEFAULT_TOP_MARGIN: f64 = 32.0;
 const SCENE_DEFAULT_MARGIN: f64 = 4.0;
+
+/// How far, in logical points, a view's window extends past its tab body while
+/// the composition overlay draws the UI above it.
+///
+/// The overlay paints every panel pixel over the child window, so the window is
+/// grown to run under the tab body's padding and outline: without that, whatever
+/// is behind the viewport shows around its edge. Only that posture may grow it.
+/// The window-surface posture has no overlay - the child window is drawn above
+/// the UI - so there the extra margin covers the tab bar and the panels beside
+/// the view, which is what a view that is "too large" looks like.
+const COMPOSITION_VIEW_OVERSHOOT: f64 = 16.0;
 
 /// How much of each new frame goes into the displayed FPS. The rest is the
 /// running average, so the number moves smoothly.
@@ -226,12 +245,64 @@ fn no_overlay_requested() -> bool {
         .unwrap_or(false)
 }
 
+/// Picks the display backend the editor's windows need.
+///
+/// Every scene and game view is a child window of the editor window, placed in
+/// the dock's rectangle and moved with the editor: the shell reports the
+/// rectangle, and the view window is then told where to be. Wayland allows
+/// neither half of that - a client cannot choose a window's position, and a
+/// window cannot be made a child of another - so the compositor puts each view
+/// wherever it likes and no placement is ever applied. A view would float
+/// outside the dock and stay there while the editor moves.
+///
+/// The editor therefore runs as an X11 client: through XWayland when the
+/// session is Wayland, which supports both child windows and client placement.
+/// [`WAYLAND_ENV`] keeps the native backend, for the sessions where every view
+/// is popped out into its own window and the docked views do not matter.
+///
+/// Windows has its own child windows and needs none of this.
+fn choose_display_backend() {
+    #[cfg(not(windows))]
+    {
+        // Step 1: an explicit request wins, and it is honoured with the
+        // limitation named, because the views it produces do not stay in the
+        // dock.
+        if std::env::var_os(WAYLAND_ENV).is_some() {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                warn!(
+                    target: telemetry_target::EDITOR,
+                    variable = WAYLAND_ENV,
+                    "[editor] wayland cannot place or nest the scene views; a docked view will not follow the window"
+                );
+            }
+            return;
+        }
+        // Step 2: a session with no X display has nothing to fall back to, so
+        // the native backend is the only one there is.
+        if std::env::var_os("WAYLAND_DISPLAY").is_none()
+            || std::env::var_os("DISPLAY").is_none()
+        {
+            return;
+        }
+        // Step 3: `winit` picks Wayland when it sees the variable and X11 when
+        // it does not, so removing it must happen before the event loop is
+        // created.
+        std::env::remove_var("WAYLAND_DISPLAY");
+        info!(
+            target: telemetry_target::EDITOR,
+            variable = WAYLAND_ENV,
+            "[editor] running on x11: wayland cannot place or nest the scene views"
+        );
+    }
+}
+
 /// Build the UI surface for the posture the editor starts in.
 ///
-/// The composition overlay is the normal case and the window's own surface is
-/// the fallback. A refusal is logged once and the editor keeps running, with
-/// the UI on the window surface.
+/// The overlay that draws the UI above the scene is the normal case and the
+/// window's own surface is the fallback. A refusal is logged once and the
+/// editor keeps running, with the UI on the window surface.
 fn create_overlay(
+    event_loop: &ActiveEventLoop,
     no_overlay: bool,
     instance: &wgpu::Instance,
     adapter: &wgpu::Adapter,
@@ -247,6 +318,25 @@ fn create_overlay(
         );
         return create_window_overlay(instance, adapter, device, window, size);
     }
+    // The overlay that paints above the scene exists on both platforms but is
+    // not the same thing there: Windows uses a DirectComposition visual over
+    // the editor window, and Unix uses a transparent window of its own, posted
+    // above the editor. Both are transparent where the shell drew nothing, and
+    // both take no input of their own, so the two postures read alike from the
+    // frontend's side. The line naming the posture is worth keeping on both.
+    #[cfg(not(windows))]
+    {
+        match create_floating_overlay(event_loop, instance, adapter, device, size) {
+            Ok(overlay) => return Some(overlay),
+            Err(error) => warn!(
+                target: telemetry_target::EDITOR,
+                error = %error,
+                "[editor] the floating overlay was refused; drawing the UI on the window surface"
+            ),
+        }
+        return create_window_overlay(instance, adapter, device, window, size);
+    }
+    #[cfg(windows)]
     match OverlaySurface::new(
         instance,
         adapter,
@@ -265,6 +355,55 @@ fn create_overlay(
             create_window_overlay(instance, adapter, device, window, size)
         }
     }
+}
+
+/// Build the floating overlay window and its transparent surface.
+///
+/// The window is posted above the editor's and takes no input: it is a
+/// picture of the UI, and every pointer event has to reach the window under
+/// it, which is the editor window or one of the scene viewports. It is
+/// unmanaged by the window manager, because it must sit exactly over the
+/// editor's client area: no decorations, no task list entry, and no movement
+/// of its own. [`EditorWindow::sync_floating_overlay`] keeps it there.
+///
+/// # Errors
+///
+/// Returns the reason, which [`create_overlay`] logs before falling back to
+/// the window surface, when the window cannot be created, cannot be made
+/// transparent to the pointer, or has no premultiplied surface to draw into.
+#[cfg(not(windows))]
+fn create_floating_overlay(
+    event_loop: &ActiveEventLoop,
+    instance: &wgpu::Instance,
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    size: (u32, u32),
+) -> Result<OverlaySurface, OverlayError> {
+    use winit::platform::x11::WindowAttributesExtX11;
+    // Step 1: the window. It starts hidden so the first frame can place it
+    // before it is ever shown, and it is transparent so the scene shows
+    // through wherever the shell drew nothing.
+    let attributes = Window::default_attributes()
+        .with_title("Pill overlay")
+        .with_transparent(true)
+        .with_decorations(false)
+        .with_active(false)
+        .with_visible(false)
+        .with_inner_size(LogicalSize::new(size.0 as f64, size.1 as f64))
+        .with_override_redirect(true);
+    let window = Arc::new(
+        event_loop
+            .create_window(attributes)
+            .map_err(|error| format!("the floating window was refused: {error}"))?,
+    );
+    // Step 2: no input of its own. Without this the overlay would swallow
+    // every click meant for the panels or the viewports under it.
+    window
+        .set_cursor_hittest(false)
+        .map_err(|error| format!("the floating window cannot ignore the pointer: {error}"))?;
+    // Step 3: the surface, which must carry premultiplied alpha; the posture
+    // refuses to exist without it.
+    OverlaySurface::new_floating(instance, adapter, device, window, EDITOR_FORMAT, size)
 }
 
 /// Build the window-surface overlay, logging the refusal that stops it.
@@ -302,6 +441,9 @@ fn create_window_overlay(
 /// Returns [`EditorError::EventLoopCreation`] when the platform refuses the
 /// event loop, and [`EditorError::EventLoopRun`] when running it fails.
 pub fn run(log_buffer: pill_core::telemetry::capture::LogBuffer) -> Result<(), EditorError> {
+    // Step 1: the backend the view windows need, before `winit` reads it.
+    choose_display_backend();
+    // Step 2: the event loop and the application that owns the windows.
     let event_loop =
         EventLoop::new().map_err(|source| EditorError::EventLoopCreation { source })?;
     let mut application = EditorApplication {
@@ -469,6 +611,12 @@ impl ApplicationHandler for EditorApplication {
                 }
                 if is_main {
                     editor.focused = focused;
+                    // The floating overlay is a window of its own and is
+                    // stacked above every window, so it has to go with the
+                    // focus at once: waiting for the next frame would leave it
+                    // over whatever the person switched to, and an unfocused
+                    // editor may not draw a frame for a while.
+                    editor.sync_floating_overlay();
                 }
             }
             other => {
@@ -2856,7 +3004,7 @@ impl EditorWindow {
             crate::drag_out::DragOutOutcome::Dropped(effect) => info!(
                 target: telemetry_target::EDITOR,
                 path = %absolute.display(),
-                effect = effect.0,
+                effect = effect.code(),
                 "[editor] drag out finished"
             ),
             crate::drag_out::DragOutOutcome::Cancelled => info!(
@@ -2870,6 +3018,12 @@ impl EditorWindow {
                 target: telemetry_target::EDITOR,
                 path = %absolute.display(),
                 "[editor] drag out skipped: no button held"
+            ),
+            // Only the Windows shell hands a file to the OS as a drag source.
+            crate::drag_out::DragOutOutcome::Unsupported => info!(
+                target: telemetry_target::EDITOR,
+                path = %absolute.display(),
+                "[editor] drag out skipped: this platform has no file drag source"
             ),
             crate::drag_out::DragOutOutcome::Failed => {}
         }
@@ -3443,7 +3597,7 @@ impl SurfaceWindow {
         // Step 1: prefer a child window, so the view is composited inside
         // the editor's content area. winit takes the parent as a raw
         // handle; without one there is no child to try.
-        let force_detached = std::env::var_os("PILL_EDITOR_DETACHED_SCENE").is_some();
+        let force_detached = std::env::var_os(DETACHED_SCENE_ENV).is_some();
         let child_attributes = (!force_detached).then(|| {
             main.window_handle().ok().map(|handle| {
                 // SAFETY: `main` is alive - the caller passes it by reference
@@ -4145,6 +4299,10 @@ fn open_in_file_manager(target: &std::path::Path) {
 /// same path can read `res/materials/unlit.material` on Windows, where
 /// Explorer's `/select,` rejects it and opens the user's Documents folder
 /// instead.
+///
+/// Only the Windows reveal path and its test build the string, so the helper
+/// is compiled there and under `test`.
+#[cfg(any(windows, test))]
 fn native_path(target: &std::path::Path) -> std::path::PathBuf {
     target.components().collect()
 }
