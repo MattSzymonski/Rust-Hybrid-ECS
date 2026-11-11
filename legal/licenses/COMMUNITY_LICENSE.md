@@ -74,8 +74,7 @@ this license restricts these licensing routes. See the main
 - **Annual Revenue** - the combined gross revenue (not profit) of the User
   and all User Affiliates from all sources, not only from User Projects, in
   their last completed financial year, counted once. For an individual:
-  business revenue, not employment salary. Other currencies convert to USD
-  via PLN at that year's average NBP mid rates.
+  business revenue, not employment salary. 
 
 ## 2. What you may do
 

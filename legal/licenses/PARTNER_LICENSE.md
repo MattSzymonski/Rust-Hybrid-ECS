@@ -50,6 +50,27 @@ the planned non-profit foundation, independent of any company (see
   agreement states.
 - The license gives no seat or vote in the Pill Engine Project's governance.
 
-## Contact
+## Indicative pricing
+
+The Partner License is a flat annual fee set by your Annual Revenue. It
+takes no share of your revenue and does not grow with the success of a
+single User Project.
+
+| Annual Revenue             | Indicative fee                        |
+| -------------------------- | ------------------------------------- |
+| USD 300,000 to 1,000,000   | USD 1,000 per month, billed annually  |
+| USD 1,000,000 to 2,000,000 | USD 2,500 per month, billed annually  |
+| USD 2,000,000 to 4,000,000 | USD 6,000 per month, billed annually  |
+| USD 4,000,000 to 6,000,000 | USD 10,000 per month, billed annually |
+| Above USD 6,000,000        | Set individually                      |
+
+A change of band applies from the next renewal of the agreement.
+
+The first 10 partners get 50% off for 2 years and keep today's prices.
+
+These amounts are an invitation to discuss terms, not an offer. The fee in
+a signed agreement is the one that applies, and this pricing may change.
+
+# Contact
 
 contact@pillengine.org
