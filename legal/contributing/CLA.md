@@ -5,26 +5,24 @@
 This agreement is between you (the **Contributor**) and Mateusz Szymoński,
 residing in Poland, contact@pillengine.org, who leads the **Pill Engine
 Project** (the open-source effort that develops the **Pill Engine**
-software: its repository, community and governance), or the organization
-that takes their place under section 5 (the **Licensor**). If your employer or
-another organization may own your work, it must also sign the
-[Corporate CLA](CCLA.md) or give you written permission to contribute under
-this agreement.
+software), or the organization that takes their place under section 5 (the
+**Licensor**).
 
 **Summary:** you keep your copyright. You give the Licensor a broad, free,
 non-exclusive license, so your contribution can be offered under each of
 Pill Engine's licenses: the Community License, the Partner License and an
-open-source license, currently the LGPLv3 (see section 3.4). Contributing is
+Open Source License, currently the LGPLv3 (see section 3.4). Contributing is
 voluntary and unpaid. Any licensing income, including from Partner Licenses,
-supports the further development of Pill Engine.
+supports the further development of Pill Engine. If the Licensor ever stops
+keeping Pill Engine open source, it may offer your contribution only under
+an Open Source License from then on.
 
 ## 1. Definition of Contributions
 
 A **Contribution** is any work you send to the Pill Engine Project for
-inclusion in Pill Engine, such as code, documentation, assets, tests or
-examples, through pull requests, issues, patches or any other channel, and
-whether you sent it before or after accepting this agreement. Work you
-clearly mark "Not a Contribution" is not a Contribution.
+inclusion in Pill Engine, such as code, documentation or assets, through any
+channel, before or after accepting this agreement. Work you clearly mark
+"Not a Contribution" is not a Contribution.
 
 ## 2. Ownership and moral rights
 
@@ -46,9 +44,10 @@ You will not exercise your moral rights against these uses.
 
 3.1. You grant the Licensor a worldwide, non-exclusive, royalty-free license
 to your Contributions, for the full duration of copyright. To the extent the
-law allows, you cannot terminate it by notice. If it ends for any reason,
-the sublicenses already granted continue. You agree that no remuneration is
-due for it. Any payment to you requires a separate written agreement.
+law allows, you cannot terminate it by notice. If this license, or the
+Licensor's right to sublicense under it, ends for any reason, sublicenses
+already granted continue. No remuneration is due for it unless agreed
+separately in writing.
 
 3.2. The license covers these fields of exploitation:
 
@@ -65,12 +64,10 @@ due for it. Any payment to you requires a separate written agreement.
 based on your Contributions, and to authorize others to do so.
 
 3.4. The Licensor may sublicense your Contributions to anyone, for a fee or
-free of charge, on any terms, including proprietary ones, and in particular
-under:
-
-- the Pill Engine Community License;
-- the GNU Lesser General Public License, version 3 only (LGPLv3); and
-- the Pill Engine Partner License.
+free of charge, on any terms, including proprietary ones, such as the Pill
+Engine Community License, the Pill Engine Partner License and an **Open
+Source License**: the GNU Lesser General Public License, version 3 only
+(LGPLv3), or another license approved by the Open Source Initiative.
 
 A sublicense that lets its holder sublicense your Contributions further on
 any terms may be granted only to an organization that meets the conditions
@@ -79,10 +76,19 @@ receive the software the licensee builds with Pill Engine, as long as those
 customers cannot pass Pill Engine on further on any terms.
 
 Every Contribution the Licensor includes in Pill Engine is available to the
-public under the LGPLv3 or another license approved by the Open Source
-Initiative, no later than when it is first published or licensed. This
-does not require publishing code that the Licensor may not disclose, such
-as code under a platform holder's confidentiality terms.
+public under an Open Source License, no later than when it is first
+published or licensed. This does not require publishing code that a
+platform holder's confidentiality terms forbid the Licensor to disclose. A
+platform holder is a company whose hardware or operating system Pill Engine
+runs on and which licenses its development kit only under confidentiality
+terms, such as a game console maker. This covers only code that reveals that
+kit's non-public interfaces or information. If the Licensor breaks this
+commitment and does not remedy it within 90 days of written notice from any
+Contributor, the Licensor's right to sublicense your Contributions on terms
+other than an Open Source License ends.
+
+3.5. You also license each Contribution to everyone under the LGPLv3, as
+part of Pill Engine.
 
 ## 4. Patent license
 
@@ -90,22 +96,19 @@ You grant the Licensor and every recipient of Pill Engine a perpetual,
 worldwide, non-exclusive, royalty-free license to make, have made, use, sell,
 offer for sale, import and otherwise transfer your Contributions, alone or
 combined with Pill Engine, under your patent claims that they necessarily
-infringe. This patent
-license ends for anyone who starts a lawsuit claiming that Pill Engine
-infringes a patent.
+infringe. This patent license ends for anyone who starts a lawsuit claiming
+that Pill Engine infringes a patent.
 
 ## 5. Transfer to a non-profit foundation
 
-The Licensor plans to found a non-profit foundation for Pill Engine,
-independent of any company, and to hand the Pill Engine Project to it.
-
 You agree in advance that the Licensor may transfer this agreement to a
-non-profit organization, or grant it a sublicense of the full scope of this
+non-profit organization, such as the foundation the Licensor plans to found
+for Pill Engine, or grant it a sublicense of the full scope of this
 agreement, including as part of its founding endowment, provided that the
 organization:
 
-- exists to develop Pill Engine and keeps it available under the LGPLv3
-  or another license approved by the Open Source Initiative;
+- exists to develop Pill Engine and keeps it available under an Open Source
+  License;
 - uses its income only for that purpose; and
 - reports its income and spending publicly each year.
 
@@ -127,8 +130,8 @@ You confirm that:
 - you identify any part of a Contribution generated by an AI tool, and you
   may contribute it under that tool's terms;
 - no employer, client or university owns rights in your Contributions, or
-  that party has signed the Corporate CLA or given you written permission;
-  and
+  that party has signed the [Corporate CLA](CCLA.md) or given you written
+  permission to contribute under this agreement; and
 - you are entitled to grant the licenses in this agreement.
 
 If any of this stops being true, you will tell the Licensor promptly. Apart
@@ -140,23 +143,27 @@ warranties.
 - You are not obliged to contribute, and the Licensor is not obliged to
   accept any Contribution.
 - By written notice, you may stop this agreement from covering Contributions
-  you make after the notice. Contributions made before it stay licensed, and
-  sublicenses already granted continue.
+  you make after the notice. Contributions made before it stay licensed.
 - Your Contributions stay under the version of this agreement you accepted.
   A new version applies only if you accept it.
 - This agreement binds and benefits the parties' legal successors, including
   the Licensor's heirs, who may also complete the transfer described in
   section 5.
-- This agreement is governed by Polish law. Disputes go to the courts for
-  the Capital City of Warsaw, Poland.
+- If a provision is invalid or unenforceable, the rest remains in effect,
+  and the provision is replaced by a valid one that comes closest to its
+  purpose.
+- This agreement is written in English. Any translation is for convenience
+  only.
+- This agreement is governed by Polish law. Disputes go exclusively to the
+  courts of Warsaw, Poland, unless mandatory law gives you another forum.
 
 ## 8. Acceptance
 
 You accept this agreement through the Pill Engine Project's signing form
 (currently CLA Assistant), which records your full name, email, country,
 your account on the platform hosting the project (currently GitHub), the
-agreement version and the time of acceptance. If you are under 18 years of
-age, or under the age of majority in the country where you live, a parent or
-legal guardian must also accept it. The Licensor may ask you to also sign a
-copy by hand or with a qualified electronic signature. Your data is handled
-as described in the [Privacy Notice](PRIVACY.md).
+agreement version and the time of acceptance. If you are under 18, or under
+the age of majority where you live, a parent or legal guardian must also
+accept it. The Licensor may ask you to also sign a copy by hand or with a
+qualified electronic signature. Your data is handled as described in the
+[Privacy Notice](PRIVACY.md).

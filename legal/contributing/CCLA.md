@@ -50,8 +50,15 @@ it.
 including the Licensor's heirs, who may also complete the transfer described
 in section 5 of the Individual CLA.
 
-1.9. This agreement is governed by Polish law. Disputes go to the courts for
-the Capital City of Warsaw, Poland.
+1.9. This agreement is governed by Polish law. Disputes go exclusively to the
+courts of Warsaw, Poland.
+
+1.10. If a provision is invalid or unenforceable, the rest remains in
+effect, and the provision is replaced by a valid one that comes closest to
+its purpose.
+
+1.11. This agreement is written in English. Any translation is for
+convenience only.
 
 ## 2. Authorized Contributors
 

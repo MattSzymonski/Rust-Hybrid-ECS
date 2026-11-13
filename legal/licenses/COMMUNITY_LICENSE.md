@@ -2,6 +2,8 @@
 
 **Version 1.0**
 
+## Overview
+
 The Community License keeps Pill Engine free for everyone who builds with
 it, from a solo developer to a large studio. Small creators get room to
 grow: below USD 300,000 Annual Revenue you may keep your Pill Engine
@@ -12,9 +14,16 @@ This is a **source-available** license. It is not an open-source license by
 the definition of the Open Source Initiative. Alternatively, anyone may use
 Pill Engine under the open-source GNU LGPL, version 3 only
 ([`LGPL-3.0_LICENSE.txt`](LGPL-3.0_LICENSE.txt)), or sign a Partner License
-with the Licensor ([`PARTNER_LICENSE.md`](PARTNER_LICENSE.md)). Nothing in
-this license restricts these licensing routes. See the main
-[`LICENSE`](../../LICENSE) file.
+with the Licensor ([`PARTNER_LICENSE.md`](PARTNER_LICENSE.md)), which lets
+you keep your Pill Engine Modifications private above the Annual Revenue
+threshold. Nothing in this license restricts these licensing routes. See
+the main [`LICENSE`](../../LICENSE) file.
+
+## Acceptance
+
+You accept this license by copying, modifying or using Pill Engine under it.
+If you do not accept it, you have no rights under it, and you may use Pill
+Engine only under the LGPLv3 or a Partner License.
 
 ## 1. Definitions
 
@@ -25,12 +34,16 @@ this license restricts these licensing routes. See the main
   third-party components.
 - **Pill Engine Project** - the open-source effort that develops Pill
   Engine: its repository, community and governance.
-- **Licensor** - Mateusz Szymoński, or a successor that has validly
-  acquired the Licensor's rights.
+- **Licensor** - Mateusz Szymoński, residing in Poland,
+  contact@pillengine.org, or a successor that has validly acquired the
+  Licensor's rights.
 - **Contributor** - anyone whose contribution is in Pill Engine under a Pill
   Engine Contributor License Agreement or section 7.3.
 - **User** ("you") - the person or entity that accepts and uses this
-  license. Only the User receives rights and obligations under it.
+  license. Only the User receives rights and obligations under it. If you
+  use Pill Engine for an organization, such as your employer or client, the
+  User is that organization: you confirm you may accept this license on its
+  behalf, and it is responsible for your use.
 - **User Affiliates** - every person or entity that controls the User, is
   controlled by the User, or is under common control with the User (more
   than 50% of votes or capital, control of management, or decisive influence
@@ -44,11 +57,11 @@ this license restricts these licensing routes. See the main
   Pill Engine, such as a game, simulation, visualization or interactive
   experience, that has substantial content or functionality of its own
   beyond Pill Engine, including its demos, updates and expansions.
-- **User Code** - the code, content and data that the User or the User's
-  contractors create without copying Pill Engine's code, other than Pill
-  Engine Modifications. Code that only calls, links to or extends Pill
-  Engine through the interfaces and extension points it provides is User
-  Code.
+- **User Code** - the code, content and data that the User, User
+  Affiliates or the User's contractors create without copying Pill Engine's
+  code, other than Pill Engine Modifications. Code that only calls, links
+  to or extends Pill Engine through the interfaces and extension points it
+  provides is User Code.
 - **Pill Engine Modification** - any work that changes, contains or is
   derived from Pill Engine's source or object code, in whole or in part,
   other than an unchanged copy of Pill Engine. This includes:
@@ -59,6 +72,19 @@ this license restricts these licensing routes. See the main
   - anything that replaces or alters Pill Engine's own code at build time or
     run time, such as build-time source patches, dependency overrides,
     binary patches, or hooking or substituting its functions.
+
+  It does not include:
+  - User Code, including modules, extensions and systems written against
+    Pill Engine's interfaces;
+  - code that Pill Engine's own tools generate for a User Project;
+  - replacing User Code at run time through Pill Engine's own hot reloading
+    or hot patching;
+  - configuration, settings, shaders, scenes and other data loaded in Pill
+    Engine's documented formats;
+  - choosing among the build options, feature flags and settings that Pill
+    Engine documents, without changing its code, which does not cover the
+    patches and overrides listed above; and
+  - code copied and unchanged from an official Pill Engine release.
 - **Pill Engine Redistribution** - giving anyone other than the User a copy
   of Pill Engine or a Pill Engine Modification, in any form, or letting
   others build their own software with Pill Engine over a network. Examples:
@@ -74,7 +100,11 @@ this license restricts these licensing routes. See the main
 - **Annual Revenue** - the combined gross revenue (not profit) of the User
   and all User Affiliates from all sources, not only from User Projects, in
   their last completed financial year, counted once. For an individual:
-  business revenue, not employment salary. 
+  business revenue, not employment salary. Funding received in that year
+  also counts: equity investment, investor loans, grants, publisher or
+  platform advances, and crowdfunding. An advance counts when it is
+  received, not again when it is earned. Other currencies convert to USD
+  via PLN at that year's average NBP mid rates.
 
 ## 2. What you may do
 
@@ -112,9 +142,10 @@ period in section 7. A User with no completed financial year uses its
 expected revenue for the current year.
 
 An arrangement made mainly to keep Annual Revenue below the threshold, such
-as splitting a business, structuring its ownership or control, or moving
-work to another entity, is disregarded, and the revenue of everyone involved
-is counted together.
+as splitting a business, structuring its ownership or control, moving work
+or revenue to another entity, or shifting revenue or funding between
+financial years, is disregarded, and the revenue of the persons and entities
+in that arrangement is counted together.
 
 ## 5. License grant
 
@@ -126,15 +157,15 @@ convenience, to:
   compiling and linking it;
 - modify, translate and adapt it, and use the results;
 - distribute it in object form as an integrated part of your User Projects,
-  and in source or object form to your User Affiliates for work on your User
-  Projects;
+  and in source or object form to your User Affiliates and your contractors
+  under confidentiality for work on your User Projects;
 - publish your Pill Engine Modifications in source form as section 7
   requires; and
 - make those User Projects available to the public by any means, including
   stores, downloads, streaming and physical media.
 
-These are the fields of exploitation of this license under the Polish
-Copyright Act (articles 41, 50 and 74).
+The rights in this section are granted on the condition that you comply
+with sections 3, 6 and 7.
 
 5.2. You may let the recipients of your User Projects use Pill Engine as part
 of those User Projects, and let your employees and contractors use it to work
@@ -170,7 +201,8 @@ threshold.
 the public a User Project, or an update of one, you must publish every Pill
 Engine Modification that it contains or that is used to develop, build, run
 or serve it, including in editors, tools, asset pipelines and servers, no
-later than that release. You publish them under the LGPLv3.
+later than that release. You publish them under the LGPLv3, and tell the
+Licensor at contact@pillengine.org where you published them.
 
 7.3. For every Pill Engine Modification you publish under section 7.2, you
 also grant the Licensor, free of charge, the licenses and confirmations that
@@ -189,12 +221,19 @@ charge and without registration, at a public location:
   with Pill Engine;
 - for as long as you distribute or make available the User Project, and at
   least 3 years after its last release; and
-- with that location stated in the User Project's notices (section 6) and
-  sent to the Licensor at contact@pillengine.org.
+- with that location stated in the User Project's notices (section 6).
 
 7.5. Only Pill Engine Modifications are published; section 2 still applies
 to your User Code. User Projects released before the transition period
 ended need not be revisited, except when you release an update of them.
+Code that a platform holder's confidentiality terms forbid you to publish
+need not be published. A platform holder is a company whose hardware or
+operating system a User Project runs on and which licenses its development
+kit only under confidentiality terms, such as a game console maker. This
+covers only code that reveals that kit's non-public interfaces or
+information. You must still publish every other part of a Pill Engine
+Modification, and on the Licensor's request confirm in writing which
+platform terms apply.
 
 7.6. Instead of publishing, you may use Pill Engine under the LGPLv3, or keep
 your Pill Engine Modifications private under a Partner License
@@ -202,14 +241,44 @@ your Pill Engine Modifications private under a Partner License
 
 7.7. If your Annual Revenue later falls below the threshold for a full
 financial year, you may keep new Pill Engine Modifications private again.
-What you already published stays published.
+What you already published has to stay published.
+
+7.8. If you did not publish your Pill Engine Modifications when section 7
+required it, you must publish them, or conclude a Partner License with the
+Licensor, within 30 days of the Licensor's written notice or a longer period
+the Licensor agrees in writing. If you do neither within that period, your
+rights under this license end, as this notice also counts as the notice
+under section 11, and you pay the Licensor a contractual penalty of
+USD 1,000 for each started month from when publishing was first required
+until you publish them, conclude a Partner License, or stop distributing
+and making available every User Project concerned, however many User
+Projects are concerned. The penalty does not limit the Licensor's right to
+claim damages exceeding it.
 
 ## 8. Verification
 
 You decide yourself whether you are below the threshold; there is no
 registration or reporting. Once a year the Licensor may ask in writing for
-a signed statement of whether you are, which you provide within 30 days. The
-Licensor keeps it confidential.
+a signed statement of whether you are, which you provide within 30 days. If
+the Licensor has reasonable doubts about it, the Licensor may ask for
+documents that support it, such as filed financial statements or an
+accountant's confirmation. The Licensor keeps everything you provide
+confidential. A statement you know to be false is a breach that cannot be
+cured; your rights under this license end when the Licensor's written
+notice of it reaches you. If you do not provide the statement within 30
+days, you are treated as above the threshold, with no transition period,
+from the date of the request until you provide it. If the statement you
+later provide shows you were below the threshold, nothing released in that
+period needs to be published.
+
+If the documents do not remove the Licensor's reasonable doubts, the
+Licensor may have your Annual Revenue checked by an independent accountant,
+at most once a year. You give the accountant access to the records it
+reasonably needs within 30 days of being asked. The accountant keeps your
+information confidential and tells the Licensor only whether you were below
+the threshold. The Licensor engages and pays the accountant. If you were not
+below the threshold, you repay the reasonable cost of the check within 30
+days of the Licensor's invoice, which includes the accountant's finding.
 
 ## 9. Third-party components
 
@@ -222,8 +291,9 @@ This license does not change those terms.
 Pill Engine is provided free of charge, "as is", without warranties of any
 kind, and the Licensor's statutory liability for defects is excluded. The
 Licensor and Contributors are not liable for any damages arising from Pill
-Engine or this license, except for damage caused intentionally and any
-liability that mandatory law does not allow to be excluded.
+Engine or this license, except for damage caused intentionally or through
+gross negligence, and any liability that mandatory law does not allow to be
+excluded.
 
 ## 11. Termination
 
@@ -233,11 +303,16 @@ infringes a patent. Licenses you granted to recipients of User Projects
 distributed before termination continue, and you may still use the LGPLv3
 licensing route.
 
+A request under section 8 that is not answered within 30 days also counts
+as the notice under this section; your rights end 30 days after the
+request's deadline unless you provide the statement by then.
+
 ## 12. General
 
-12.1. This license is governed by Polish law. Disputes go to the courts for
-the Capital City of Warsaw, Poland, unless mandatory law gives a consumer
-another forum.
+12.1. This license is governed by Polish law, excluding the UN Convention on
+Contracts for the International Sale of Goods. Disputes go exclusively to
+the courts of Warsaw, Poland, unless mandatory law gives a consumer another
+forum.
 
 12.2. New versions of this license apply only to Pill Engine versions
 published with them. They never withdraw rights already granted or change the
@@ -248,4 +323,30 @@ to a successor that has validly acquired the Licensor's rights, such as a
 future non-profit foundation, independent of any company; you consent to
 that in advance.
 
-12.4. If a provision is invalid, the rest remains in effect.
+12.4. If a provision is invalid or unenforceable, the rest remains in
+effect, and the provision is replaced by a valid one that comes closest to
+its purpose.
+
+12.5. If you are unsure whether a planned use is a Pill Engine Modification
+or a Pill Engine Redistribution, you may ask the Licensor at
+contact@pillengine.org. A written answer from the Licensor binds the
+Licensor for that use.
+
+12.6. Notices to you may be sent to any contact address you publish for your
+business or for a User Project, such as in a store listing or a company
+register, or to an address you used to write to the Licensor. A notice
+counts as delivered when it reaches that address.
+
+12.7. Sections 7.3, 7.8, 10, 11 and 12, a check under section 8 requested
+before your rights ended, the confidentiality the Licensor owes under
+section 8, and any amount due under this license, continue after your
+rights under it end.
+
+12.8. If the Licensor does not enforce a provision, or enforces it late, the
+Licensor does not waive it.
+
+12.9. A written agreement between you and the Licensor, such as a Partner
+License, takes precedence over this license where they differ.
+
+12.10. This license is written in English. Any translation is for
+convenience only.

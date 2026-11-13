@@ -1,9 +1,10 @@
 # Pill Engine Privacy Notice
 
 This notice explains how personal data is handled when you contribute to the
-Pill Engine Project, sign a contributor agreement, take a Partner License or
-contact the Licensor. It is given under articles 13 and 14 of the EU General
-Data Protection Regulation (GDPR).
+Pill Engine Project, sign a contributor agreement, use Pill Engine under the
+Community License, take a Partner License or contact the Licensor. It is
+given under articles 13 and 14 of the EU General Data Protection Regulation
+(GDPR).
 
 Pill Engine itself sends no data to the Licensor. A game or application made
 with Pill Engine is responsible for any personal data it processes.
@@ -22,7 +23,8 @@ and this notice is updated to name it.
 | Individual CLA: full name, email, country, platform account (currently GitHub), agreement version, time of acceptance; for a contributor under the age of majority, the same details of the parent or legal guardian who also accepts; a signed copy, if one is requested | To document the license you granted and the origin of Pill Engine's code | (b) contract; (f) legitimate interest in proving the origin of the code and defending claims |
 | Corporate CLA: names, positions and signatures of the signatories; names, emails and platform accounts of the CLA Manager and the Authorized Contributors                                                                                                                 | The same, for the organization's agreement                               | (b) contract, with the organization; (f) legitimate interest                                 |
 | Contributions: the name, email and account recorded in commits, pull requests, issues and reviews                                                                                                                                                                         | To develop Pill Engine in public and keep its history                    | (f) legitimate interest                                                                      |
-| Messages to contact@pillengine.org, including Partner License discussions, revenue statements under Community License section 8, published-modification notices under section 7 and trademark permission requests                                                         | To answer you, and to apply the licenses and the trademark policy        | (b) contract or steps before one; (f) legitimate interest                                    |
+| Messages to contact@pillengine.org, including Partner License discussions, published-modification notices under section 7 and trademark permission requests                                                                                                               | To answer you, and to apply the licenses and the trademark policy        | (b) contract or steps before one; (f) legitimate interest                                    |
+| Community License records: revenue statements and supporting documents under section 8, an accountant's finding, written answers under section 12.5, and the contact addresses notices are sent to, which may come from public store listings and company registers       | To apply the Community License and defend claims under it                | (b) contract; (f) legitimate interest in enforcing the license                               |
 | Partner License records: names, positions and contact details of the people acting for the partner, and invoicing details                                                                                                                                                 | To conclude and carry out the agreement, and for tax and accounting      | (b) contract; (c) legal obligation                                                           |
 
 You do not have to provide this data, but contributions are accepted only
@@ -40,6 +42,10 @@ under a CLA, and a Partner License needs the details of its parties.
   - GitHub, Inc. (USA), which hosts the repository, pull requests, issues
     and the text of the agreements; and
   - OVH SAS, which hosts the contact@pillengine.org mailbox.
+- **Advisers and dispute bodies.** An independent accountant checking
+  Annual Revenue under section 8 of the Community License, legal advisers,
+  and courts or arbitrators in a dispute, each only as far as the matter
+  needs.
 - **A successor.** If the Licensor's rights pass to the planned non-profit
   foundation, independent of any company (see
   [`GOVERNANCE.md`](../GOVERNANCE.md)), the CLA and Partner License records
@@ -58,6 +64,8 @@ clauses.
 - Commit, issue and review history: permanently, as part of the project's
   history.
 - Messages: for as long as needed to handle them and any resulting claims.
+- Community License records: for as long as the license applies to you,
+  and then until claims under it are time-barred.
 - Partner License and invoicing records: for the agreement's term and then
   for the periods required by tax and accounting law.
 
@@ -67,6 +75,10 @@ You may ask for access to your data, its correction or deletion, a
 restriction of its use, or a copy in a portable format, and you may object to
 processing based on legitimate interest. Write to contact@pillengine.org. The
 Licensor may ask you to confirm your identity first.
+
+You may also lodge a complaint with the President of the Personal Data
+Protection Office (UODO, uodo.gov.pl) in Poland, or with the supervisory
+authority where you live or work.
 
 Some data cannot be deleted while it is still needed: a CLA record proves the
 license behind code that is still distributed, and public commit history

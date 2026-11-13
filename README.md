@@ -1,3 +1,8 @@
+> **License:** by using Pill Engine you accept the
+> [Pill Engine Community License](legal/licenses/COMMUNITY_LICENSE.md),
+> unless you use it under the LGPLv3 or a Partner License. See
+> [`LICENSE`](LICENSE).
+
 - Hot-reloading (standalone console, standalone window, editor)
   - Engine
   - Project

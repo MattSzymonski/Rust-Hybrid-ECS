@@ -9,10 +9,10 @@ and the Licensor. Capitalized terms are used as defined in the
 
 The Partner License is a paid agreement that lets you keep your Pill Engine
 Modifications private at any revenue. It is meant mainly for Users whose
-Annual Revenue, together with their User Affiliates and from all sources,
-is above the Community License's threshold of USD 300,000, where that
-license requires them to publish their modifications, but any User may ask
-for one.
+Annual Revenue, together with their User Affiliates, from all sources and
+including funding, is above the Community License's threshold of
+USD 300,000, where that license requires them to publish their
+modifications, but any User may ask for one.
 
 It is always a choice, never a requirement. Above the threshold you may
 instead stay on the Community License and publish your Pill Engine
@@ -26,8 +26,7 @@ the planned non-profit foundation, independent of any company (see
 
 ## Rights granted
 
-- You may keep your Pill Engine Modifications private at any revenue,
-  including those used in your editors, tools, asset pipelines and servers.
+- You may keep your Pill Engine Modifications private at any revenue.
   The publishing duty in section 7 of the Community License does not apply.
 - Everything the Community License allows continues to apply.
 - The license covers you and the User Affiliates named in the agreement.
@@ -71,6 +70,6 @@ The first 10 partners get 50% off for 2 years and keep today's prices.
 These amounts are an invitation to discuss terms, not an offer. The fee in
 a signed agreement is the one that applies, and this pricing may change.
 
-# Contact
+## Contact
 
-contact@pillengine.org
+To discuss a Partner License, write to contact@pillengine.org.

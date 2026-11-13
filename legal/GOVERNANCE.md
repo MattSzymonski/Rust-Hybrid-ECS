@@ -14,8 +14,9 @@ The **Pill Engine Project** is the open-source effort that develops the
 - **Maintainers:** the Licensor may appoint maintainers to review and merge
   contributions in parts of the project.
 - **Decisions:** anyone may propose a change or disagree with a decision in a
-  public issue. Significant changes are discussed there first; the Licensor
-  decides and explains the decision there.
+  public issue in the Pill Engine Project's repository (currently on
+  GitHub). Significant changes are discussed in that issue first; the
+  Licensor decides and explains the decision in the same issue.
 - **Open development:** issues, reviews and design discussion are public,
   except security reports, personal data and confidential commercial terms.
 - **Money does not buy control:** sponsorship, Partner Licenses and corporate
@@ -46,8 +47,7 @@ as follows:
   control of the foundation, or a seat on its Management Board, through its
   funding or agreements; a seat held under the founding act or the statute
   is not.
-- **Transparency:** income and spending, and any agreement between the
-  foundation and a member of its Management Board, are reported publicly
+- **Transparency:** foundation's income and spending are reported publicly
   each year.
 - **Succession:** the statute will say who leads the foundation if the
   Licensor steps down or can no longer act.
