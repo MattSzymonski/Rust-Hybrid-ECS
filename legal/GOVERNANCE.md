@@ -23,8 +23,9 @@ The **Pill Engine Project** is the open-source effort that develops the
   CLAs give no vote, veto or priority in decisions. Paid development work
   goes through normal review and is disclosed on the roadmap. The Licensor
   discloses any paid relationship relevant to a decision.
-- **Licensing:** only the Licensor grants licenses, and only for rights they
-  hold or received through a CLA or section 7.3 of the Community License.
+- **Licensing:** only the Licensor grants the Community License and Partner
+  Licenses, and only for rights they hold or received through a CLA or
+  section 7.3 of the Community License.
 - **Continuity:** licenses already granted, including the LGPLv3 and the
   Community License, continue whatever happens to the Licensor.
 
@@ -47,7 +48,7 @@ as follows:
   control of the foundation, or a seat on its Management Board, through its
   funding or agreements; a seat held under the founding act or the statute
   is not.
-- **Transparency:** foundation's income and spending are reported publicly
+- **Transparency:** the foundation's income and spending are reported publicly
   each year.
 - **Succession:** the statute will say who leads the foundation if the
   Licensor steps down or can no longer act.

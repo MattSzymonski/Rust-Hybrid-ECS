@@ -47,6 +47,9 @@ Follow the
   approval. For Rust crates, [`modules/about.toml`](../../modules/about.toml)
   enforces this list.
 - Identify the origin and license of anything you did not write yourself.
+- If you used an AI tool, check that what it generated does not copy
+  anyone else's code or infringe their rights, and that the tool's terms
+  let you contribute it. You do not need to mark which parts it wrote.
 - Redistributed files are recorded in
   [`legal/THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md).
 

@@ -23,7 +23,7 @@ and this notice is updated to name it.
 | Individual CLA: full name, email, country, platform account (currently GitHub), agreement version, time of acceptance; for a contributor under the age of majority, the same details of the parent or legal guardian who also accepts; a signed copy, if one is requested | To document the license you granted and the origin of Pill Engine's code | (b) contract; (f) legitimate interest in proving the origin of the code and defending claims |
 | Corporate CLA: names, positions and signatures of the signatories; names, emails and platform accounts of the CLA Manager and the Authorized Contributors                                                                                                                 | The same, for the organization's agreement                               | (b) contract, with the organization; (f) legitimate interest                                 |
 | Contributions: the name, email and account recorded in commits, pull requests, issues and reviews                                                                                                                                                                         | To develop Pill Engine in public and keep its history                    | (f) legitimate interest                                                                      |
-| Messages to contact@pillengine.org, including Partner License discussions, published-modification notices under section 7 and trademark permission requests                                                                                                               | To answer you, and to apply the licenses and the trademark policy        | (b) contract or steps before one; (f) legitimate interest                                    |
+| Messages to contact@pillengine.org, including Partner License discussions, published-modification notices under section 7.2 of the Community License and trademark permission requests                                                                                     | To answer you, and to apply the licenses and the trademark policy        | (b) contract or steps before one; (f) legitimate interest                                    |
 | Community License records: revenue statements and supporting documents under section 8, an accountant's finding, written answers under section 12.5, and the contact addresses notices are sent to, which may come from public store listings and company registers       | To apply the Community License and defend claims under it                | (b) contract; (f) legitimate interest in enforcing the license                               |
 | Partner License records: names, positions and contact details of the people acting for the partner, and invoicing details                                                                                                                                                 | To conclude and carry out the agreement, and for tax and accounting      | (b) contract; (c) legal obligation                                                           |
 
@@ -48,8 +48,9 @@ under a CLA, and a Partner License needs the details of its parties.
   needs.
 - **A successor.** If the Licensor's rights pass to the planned non-profit
   foundation, independent of any company (see
-  [`GOVERNANCE.md`](../GOVERNANCE.md)), the CLA and Partner License records
-  pass to it too, because they prove the rights it receives.
+  [`GOVERNANCE.md`](../GOVERNANCE.md)), the CLA, Community License and
+  Partner License records pass to it too, because they prove and enforce
+  the rights it receives.
 
 OVH SAS keeps the data in the European Union, and CLA Assistant stores it
 in Europe. GitHub, Inc. is outside the European Economic Area, and transfers
